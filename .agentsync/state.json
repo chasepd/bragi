@@ -1,0 +1,204 @@
+{
+  "version": 1,
+  "resources": [
+    {
+      "resource_id": "hooks:codex:.codex/hooks.json",
+      "kind": "hook",
+      "source_agent": "codex",
+      "source_paths": [
+        ".codex/hooks.json"
+      ],
+      "source_checksum": "bd5073fec9c54686d8bc64ac69a1231adb45277841a9126e11c7637fbe16d7e0",
+      "targets": [
+        {
+          "agent": "claude",
+          "path": ".claude/settings.json",
+          "native_checksum": "e02755f195b8e77a6151a1af09659c79ca1ca3e5de976152211e07d5260aeb83"
+        },
+        {
+          "agent": "cursor",
+          "path": ".cursor/hooks.json",
+          "native_checksum": "260f57ba0139beef6567a1e2b63f80e3ff88417d7937bc31400197dad238a799"
+        },
+        {
+          "agent": "opencode",
+          "path": ".opencode/plugins/agentsync-hooks.js",
+          "native_checksum": "f0b26224a5aa2d155272b382e35a8ec4907891f6d488f9d0b52e372c0f8e5a82"
+        }
+      ],
+      "diagnostics": [
+        {
+          "severity": "warning",
+          "resource_id": "hooks:codex:.codex/hooks.json",
+          "resource_kind": "hook",
+          "agent": "codex",
+          "message": "hook resource is partially supported; unsupported entries remain report-only"
+        },
+        {
+          "severity": "warning",
+          "resource_id": "hooks:codex:.codex/hooks.json",
+          "resource_kind": "hook",
+          "agent": "codex",
+          "message": "hook.hooks: executable hook behavior requires compatibility mapping"
+        },
+        {
+          "severity": "warning",
+          "resource_id": "hooks:codex:.codex/hooks.json",
+          "resource_kind": "hook",
+          "agent": "codex",
+          "message": "hook.PostToolUse: executable hook behavior requires compatibility mapping"
+        },
+        {
+          "severity": "warning",
+          "resource_id": "hooks:codex:.codex/hooks.json",
+          "resource_kind": "hook",
+          "agent": "codex",
+          "message": "hook.PreToolUse: executable hook behavior requires compatibility mapping"
+        }
+      ],
+      "native_extensions": {
+        "behavior.fields": {
+          "hooks": {
+            "PostToolUse": [
+              {
+                "hooks": [
+                  {
+                    "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/run-tests-for-edited-file.sh\"",
+                    "statusMessage": "Queueing mapped unit tests",
+                    "timeout": 120,
+                    "type": "command"
+                  }
+                ],
+                "matcher": "apply_patch"
+              }
+            ],
+            "PreToolUse": [
+              {
+                "hooks": [
+                  {
+                    "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/enforce-patch-paths.sh\"",
+                    "statusMessage": "Checking patch paths",
+                    "timeout": 10,
+                    "type": "command"
+                  }
+                ],
+                "matcher": "apply_patch"
+              },
+              {
+                "hooks": [
+                  {
+                    "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/enforce-validation-subagents.sh\"",
+                    "statusMessage": "Checking validation command routing",
+                    "timeout": 10,
+                    "type": "command"
+                  }
+                ],
+                "matcher": "exec_command"
+              }
+            ]
+          }
+        },
+        "behavior.kind": "hooks",
+        "native.raw": "{\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"apply_patch\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"bash \\\"$(git rev-parse --show-toplevel)/.codex/hooks/enforce-patch-paths.sh\\\"\",\n            \"timeout\": 10,\n            \"statusMessage\": \"Checking patch paths\"\n          }\n        ]\n      },\n      {\n        \"matcher\": \"exec_command\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"bash \\\"$(git rev-parse --show-toplevel)/.codex/hooks/enforce-validation-subagents.sh\\\"\",\n            \"timeout\": 10,\n            \"statusMessage\": \"Checking validation command routing\"\n          }\n        ]\n      }\n    ],\n    \"PostToolUse\": [\n      {\n        \"matcher\": \"apply_patch\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"bash \\\"$(git rev-parse --show-toplevel)/.codex/hooks/run-tests-for-edited-file.sh\\\"\",\n            \"timeout\": 120,\n            \"statusMessage\": \"Queueing mapped unit tests\"\n          }\n        ]\n      }\n    ]\n  }\n}\n"
+      },
+      "last_synced_at": "2026-05-27T23:55:54.661088468+00:00"
+    },
+    {
+      "resource_id": "rules:agents-md",
+      "kind": "rule_set",
+      "source_agent": "codex",
+      "source_paths": [
+        "AGENTS.md"
+      ],
+      "source_checksum": "31df3476dac2028939f8b7f49e7ecfc24ab6c7a69508405d9b6c68efbf88a629",
+      "targets": [
+        {
+          "agent": "cursor",
+          "path": ".cursor/rules/agentsync.md",
+          "native_checksum": "36a375b989c790fd924a83712bf61a1b6a39a02c60b1e23bdb2a105d06fe2be4"
+        },
+        {
+          "agent": "claude",
+          "path": "CLAUDE.md",
+          "native_checksum": "36a375b989c790fd924a83712bf61a1b6a39a02c60b1e23bdb2a105d06fe2be4"
+        }
+      ],
+      "diagnostics": [],
+      "native_extensions": {},
+      "last_synced_at": "2026-07-06T22:21:14.443597981+00:00"
+    },
+    {
+      "resource_id": "skills:code-review",
+      "kind": "skill",
+      "source_agent": "codex",
+      "source_paths": [
+        ".codex/skills/code-review/SKILL.md"
+      ],
+      "source_checksum": "28c7a1682cdd33ef27765b2b69f64d2e3bc0de7013ce7a49462c2cd0c7485ad2",
+      "targets": [
+        {
+          "agent": "claude",
+          "path": ".claude/skills/code-review/SKILL.md",
+          "native_checksum": "7ebed7b62a079e176eef92f70a5417277d0e02ecb848b45a88035f966c7ec48d"
+        },
+        {
+          "agent": "claude",
+          "path": ".claude/skills/code-review/code-reviewer.md",
+          "native_checksum": "ebd71899fc46cfc9db78dd40ae7a94947c5caf4a3dde64b771102cbb10773f0d"
+        },
+        {
+          "agent": "cursor",
+          "path": ".cursor/skills/code-review/SKILL.md",
+          "native_checksum": "7ebed7b62a079e176eef92f70a5417277d0e02ecb848b45a88035f966c7ec48d"
+        },
+        {
+          "agent": "cursor",
+          "path": ".cursor/skills/code-review/code-reviewer.md",
+          "native_checksum": "ebd71899fc46cfc9db78dd40ae7a94947c5caf4a3dde64b771102cbb10773f0d"
+        },
+        {
+          "agent": "opencode",
+          "path": ".opencode/skills/code-review/SKILL.md",
+          "native_checksum": "7ebed7b62a079e176eef92f70a5417277d0e02ecb848b45a88035f966c7ec48d"
+        },
+        {
+          "agent": "opencode",
+          "path": ".opencode/skills/code-review/code-reviewer.md",
+          "native_checksum": "ebd71899fc46cfc9db78dd40ae7a94947c5caf4a3dde64b771102cbb10773f0d"
+        }
+      ],
+      "diagnostics": [],
+      "native_extensions": {},
+      "last_synced_at": "2026-05-27T17:10:22.639852021+00:00"
+    },
+    {
+      "resource_id": "skills:test-engineering",
+      "kind": "skill",
+      "source_agent": "codex",
+      "source_paths": [
+        ".codex/skills/test-engineering/SKILL.md"
+      ],
+      "source_checksum": "2399b1ba0fa2e97380ed0f60bd2775df977d6e83c7a32489fd6ea85daccea66a",
+      "targets": [
+        {
+          "agent": "claude",
+          "path": ".claude/skills/test-engineering/SKILL.md",
+          "native_checksum": "a0cb83a5fbbc690e9c440a05135b6f8a6d088060c175db6f19243c65a094a9e3"
+        },
+        {
+          "agent": "cursor",
+          "path": ".cursor/skills/test-engineering/SKILL.md",
+          "native_checksum": "a0cb83a5fbbc690e9c440a05135b6f8a6d088060c175db6f19243c65a094a9e3"
+        },
+        {
+          "agent": "opencode",
+          "path": ".opencode/skills/test-engineering/SKILL.md",
+          "native_checksum": "a0cb83a5fbbc690e9c440a05135b6f8a6d088060c175db6f19243c65a094a9e3"
+        }
+      ],
+      "diagnostics": [],
+      "native_extensions": {},
+      "last_synced_at": "2026-07-06T22:21:14.446132503+00:00"
+    }
+  ]
+}

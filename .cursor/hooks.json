@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "postToolUse": [
+      {
+        "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/run-tests-for-edited-file.sh\"",
+        "matcher": "Write",
+        "timeout": 120,
+        "type": "command"
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/enforce-patch-paths.sh\"",
+        "matcher": "Write",
+        "timeout": 10,
+        "type": "command"
+      },
+      {
+        "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/enforce-validation-subagents.sh\"",
+        "matcher": "Shell",
+        "timeout": 10,
+        "type": "command"
+      }
+    ]
+  },
+  "version": 1
+}

@@ -1,0 +1,3 @@
+include bragi_build_backend.py
+recursive-include bragi/data/name_sources *.md *.txt
+recursive-include bragi_web/static *

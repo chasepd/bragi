@@ -1,0 +1,231 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci-scope:
+    name: Detect app validation scope
+    runs-on: ubuntu-latest
+    outputs:
+      app_changed: ${{ steps.changed.outputs.app_changed }}
+      docker_changed: ${{ steps.changed.outputs.docker_changed }}
+      validation_mode: ${{ steps.changed.outputs.validation_mode }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect app-relevant changes
+        id: changed
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+
+          app_changed=false
+          docker_changed=false
+          validation_mode=skip
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "app_changed=true" >> "$GITHUB_OUTPUT"
+            echo "docker_changed=true" >> "$GITHUB_OUTPUT"
+            echo "validation_mode=full" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" = "push" ] && [[ "$HEAD_COMMIT_MESSAGE" == Merge\ pull\ request\ * ]]; then
+            echo "app_changed=false" >> "$GITHUB_OUTPUT"
+            echo "docker_changed=false" >> "$GITHUB_OUTPUT"
+            echo "validation_mode=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="$BEFORE_SHA"
+          fi
+
+          if [ -z "$base" ] || [[ "$base" =~ ^0+$ ]]; then
+            echo "app_changed=true" >> "$GITHUB_OUTPUT"
+            echo "docker_changed=true" >> "$GITHUB_OUTPUT"
+            echo "validation_mode=full" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          while IFS= read -r path; do
+            case "$path" in
+              .dockerignore|Dockerfile|compose.yaml|docker-compose.yml)
+                docker_changed=true
+                ;;
+              bragi_build_backend.py|MANIFEST.in|Makefile|pyproject.toml|uv.lock)
+                docker_changed=true
+                ;;
+              frontend/*|.github/workflows/*)
+                docker_changed=true
+                ;;
+            esac
+
+            case "$path" in
+              AGENTS.md|CLAUDE.md)
+                ;;
+              .agentsync/*|.claude/*|.cursor/*|.opencode/*)
+                ;;
+              .codex/hooks.json|.codex/hooks/*|.codex/skills/*)
+                ;;
+              .github/workflows/agentsync-*.yml)
+                ;;
+              *)
+                app_changed=true
+                ;;
+            esac
+          done < <(git diff --name-only --no-renames "$base" "$HEAD_SHA")
+
+          if [ "$app_changed" = "true" ]; then
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              validation_mode=changed
+            else
+              validation_mode=full
+            fi
+          else
+            docker_changed=false
+          fi
+
+          echo "app_changed=$app_changed" >> "$GITHUB_OUTPUT"
+          echo "docker_changed=$docker_changed" >> "$GITHUB_OUTPUT"
+          echo "validation_mode=$validation_mode" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Validation
+    needs: ci-scope
+    if: ${{ always() }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - name: Fail if CI scope detection failed
+        if: needs.ci-scope.result != 'success'
+        run: |
+          echo "CI scope detection failed; refusing to skip validation."
+          exit 1
+
+      - name: Skip app validation
+        if: needs.ci-scope.outputs.validation_mode == 'skip'
+        run: echo "App validation skipped for this event/scope."
+
+      - name: Check out repository
+        if: needs.ci-scope.outputs.validation_mode != 'skip'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        if: needs.ci-scope.outputs.validation_mode != 'skip'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        if: needs.ci-scope.outputs.validation_mode != 'skip'
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Node
+        if: needs.ci-scope.outputs.validation_mode != 'skip'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install package
+        if: needs.ci-scope.outputs.validation_mode != 'skip'
+        run: uv sync --locked --extra dev
+
+      - name: Validate changed scope
+        if: needs.ci-scope.outputs.validation_mode == 'changed'
+        env:
+          BRAGI_VALIDATION_BASE_REF: ${{ github.event.pull_request.base.sha }}
+        run: python3 .codex/tools/validate.py --changed
+
+      - name: Validate full gate
+        if: needs.ci-scope.outputs.validation_mode == 'full'
+        run: python3 .codex/tools/validate.py --full
+
+  docker-compose:
+    name: Docker Compose smoke
+    needs: ci-scope
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Fail if CI scope detection failed
+        if: needs.ci-scope.result != 'success'
+        run: |
+          echo "CI scope detection failed; refusing to skip Docker smoke."
+          exit 1
+
+      - name: Skip Docker smoke
+        if: needs.ci-scope.outputs.docker_changed != 'true'
+        run: echo "Docker smoke skipped for this event/scope."
+
+      - name: Check out repository
+        if: needs.ci-scope.outputs.docker_changed == 'true'
+        uses: actions/checkout@v4
+
+      - name: Validate Compose config
+        if: needs.ci-scope.outputs.docker_changed == 'true'
+        run: docker compose config
+
+      - name: Build Bragi image
+        if: needs.ci-scope.outputs.docker_changed == 'true'
+        run: docker compose build bragi
+
+      - name: Start Bragi
+        if: needs.ci-scope.outputs.docker_changed == 'true'
+        run: docker compose up -d bragi
+
+      - name: Wait for Bragi healthcheck
+        if: needs.ci-scope.outputs.docker_changed == 'true'
+        run: |
+          for attempt in {1..60}; do
+            container_id="$(docker compose ps -q bragi)"
+            status="$(docker inspect --format='{{.State.Health.Status}}' "$container_id" 2>/dev/null || true)"
+            if [ "$status" = "healthy" ]; then
+              exit 0
+            fi
+            if [ "$status" = "unhealthy" ]; then
+              docker compose logs bragi
+              exit 1
+            fi
+            sleep 2
+          done
+          docker compose logs bragi
+          exit 1
+
+      - name: Smoke API health endpoint
+        if: needs.ci-scope.outputs.docker_changed == 'true'
+        run: curl -fsS http://127.0.0.1:8787/api/health
+
+      - name: Stop Bragi
+        if: always() && needs.ci-scope.outputs.docker_changed == 'true'
+        run: docker compose down -v

@@ -1,0 +1,1463 @@
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+from collections.abc import Iterator, Mapping
+from pathlib import Path
+
+import pytest
+
+from bragi.persistence.migrations import migrate_database
+from bragi.persistence.models import ContextObservationRecord, SaveRecord
+from bragi.persistence.repositories import PersistenceRepositories
+from bragi.providers.contracts import (
+    ChatMessage,
+    ChatRequest,
+    ImageRequest,
+    ImageResponse,
+    ProviderConfigStatus,
+    ProviderModel,
+    StructuredOutputRequest,
+    StructuredOutputResponse,
+)
+from bragi.services.agentic_context import (
+    AGENTIC_CONTEXT_PIPELINE_SETTING,
+    PLAN_FIRST_NARRATOR_SETTING,
+    ContextCurationService,
+    CurationDecision,
+    DatingRouteStageViolation,
+    NarrativeBeat,
+    NarratorCommitDecision,
+    NarratorMessageSpec,
+    NpcIntent,
+    ObservationService,
+    PlayerAgencyConstraint,
+    RequiredFact,
+    StateCommitCandidate,
+    StructuredProviderContextCurator,
+    StructuredProviderNarratorPlanner,
+    StructuredProviderNarratorVerifier,
+    StructuredProviderObservationExtractor,
+    agentic_context_pipeline_enabled,
+    format_narrator_message_spec,
+    narration_evidence_source_ids,
+    plan_first_narrator_enabled,
+)
+from bragi.services.npc_knowledge_audit_service import NpcKnowledgeLeak
+
+
+@pytest.fixture
+def repositories(tmp_path: Path) -> Iterator[PersistenceRepositories]:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        yield PersistenceRepositories(connection)
+
+
+class RecordingStructuredProvider:
+    provider_name = "fake"
+
+    def __init__(self, responses: dict[str, dict[str, object]]) -> None:
+        self.responses = responses
+        self.structured_output_requests: list[StructuredOutputRequest] = []
+
+    async def validate_config(self) -> ProviderConfigStatus:
+        return ProviderConfigStatus(
+            provider=self.provider_name,
+            configured=True,
+            authenticated=True,
+        )
+
+    async def list_models(self) -> list[ProviderModel]:
+        return []
+
+    async def chat(self, request: ChatRequest) -> object:
+        raise AssertionError("agentic context services must not call chat")
+
+    async def generate_image(self, request: ImageRequest) -> ImageResponse:
+        raise AssertionError("agentic context services must not generate images")
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_output_requests.append(request)
+        return StructuredOutputResponse(
+            data=self.responses[request.schema_name],
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+class UnsafeCurator:
+    async def curate(
+        self,
+        *,
+        save_id: str,
+        observations: tuple[ContextObservationRecord, ...],
+    ) -> tuple[CurationDecision, ...]:
+        return (
+            CurationDecision(
+                observation_id=observations[0].id,
+                action="durable_memory",
+                reason="稳定的叙事偏好。",
+                confidence=0.88,
+                memory_body="玩家喜欢简洁、扎实的叙事。",
+                tags=("tone",),
+            ),
+        )
+
+
+def test_agentic_context_pipeline_is_enabled_by_default(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+
+    assert agentic_context_pipeline_enabled(repositories, save_id=save.id) is True
+
+
+def test_agentic_context_pipeline_can_be_disabled_per_save(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=AGENTIC_CONTEXT_PIPELINE_SETTING,
+        value=False,
+    )
+
+    assert agentic_context_pipeline_enabled(repositories, save_id=save.id) is False
+
+
+def test_plan_first_narrator_is_enabled_by_default(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+
+    assert plan_first_narrator_enabled(repositories, save_id=save.id) is True
+
+
+def test_plan_first_narrator_can_be_disabled_per_save(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=PLAN_FIRST_NARRATOR_SETTING,
+        value=False,
+    )
+
+    assert plan_first_narrator_enabled(repositories, save_id=save.id) is False
+
+
+def test_observation_extractor_returns_evidence_backed_candidates(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    messages = tuple(repositories.list_messages(save.id))
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        "observation_type": "player_preference",
+                        "claim": "Mara wants the narrator to stay grounded.",
+                        "evidence_quote": "Keep it grounded",
+                        "source_message_ids": [messages[0].id],
+                        "scope": "durable",
+                        "confidence": 0.91,
+                        "tags": ["tone"],
+                    },
+                    {
+                        "observation_type": "player_preference",
+                        "claim": "This candidate has no valid source.",
+                        "evidence_quote": "not from a known message",
+                        "source_message_ids": ["missing-message"],
+                        "scope": "durable",
+                        "confidence": 0.5,
+                        "tags": [],
+                    },
+                    {
+                        "observation_type": "player_preference",
+                        "claim": "This candidate has an unsupported quote.",
+                        "evidence_quote": "ruby library",
+                        "source_message_ids": [messages[0].id],
+                        "scope": "durable",
+                        "confidence": 0.5,
+                        "tags": [],
+                    }
+                ]
+            }
+        }
+    )
+    extractor = StructuredProviderObservationExtractor(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="observer",
+    )
+
+    observations = asyncio.run(extractor.extract(save_id=save.id, messages=messages))
+
+    assert len(observations) == 1
+    assert observations[0].claim == "Mara wants the narrator to stay grounded."
+    assert provider.structured_output_requests[0].schema_name == (
+        "context_observation_extraction"
+    )
+
+
+def test_observation_service_drops_ungrounded_evidence_quotes(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    messages = tuple(repositories.list_messages(save.id))
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        "observation_type": "player_preference",
+                        "claim": "Mara wants grounded narration.",
+                        "evidence_quote": "Keep it grounded",
+                        "source_message_ids": [messages[0].id],
+                        "scope": "durable",
+                        "confidence": 0.91,
+                        "tags": ["tone"],
+                    },
+                    {
+                        "observation_type": "player_preference",
+                        "claim": "Mara asked for a ruby library.",
+                        "evidence_quote": "ruby library",
+                        "source_message_ids": [messages[0].id],
+                        "scope": "durable",
+                        "confidence": 0.91,
+                        "tags": ["tone"],
+                    },
+                ]
+            }
+        }
+    )
+    service = ObservationService(
+        repositories=repositories,
+        extractor=StructuredProviderObservationExtractor(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="observer",
+        ),
+    )
+
+    result = asyncio.run(
+        service.observe_turn(
+            save_id=save.id,
+            source_message_ids=tuple(message.id for message in messages),
+        )
+    )
+
+    assert result.observed_count == 1
+    assert result.observations[0].claim == "Mara wants grounded narration."
+
+
+def test_observation_service_rejects_unexpected_generated_script(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    messages = tuple(repositories.list_messages(save.id))
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        "observation_type": "player_preference",
+                        "claim": "玩家喜欢简洁叙事。",
+                        "evidence_quote": "Keep it grounded",
+                        "source_message_ids": [messages[0].id],
+                        "scope": "durable",
+                        "confidence": 0.91,
+                        "tags": ["tone"],
+                    }
+                ]
+            }
+        }
+    )
+    service = ObservationService(
+        repositories=repositories,
+        extractor=StructuredProviderObservationExtractor(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="observer",
+            repositories=repositories,
+        ),
+    )
+
+    result = asyncio.run(
+        service.observe_turn(
+            save_id=save.id,
+            source_message_ids=tuple(message.id for message in messages),
+        )
+    )
+
+    assert result.observed_count == 0
+    assert repositories.list_context_observations(save.id) == []
+
+
+def test_context_curation_service_applies_memory_and_context_decisions(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, narrator = repositories.list_messages(save.id)
+    memory_observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara likes concise narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+        tags=["tone"],
+    )
+    context_observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="open_thread",
+        claim="The red lens warning may return.",
+        evidence_quote="riders in the ash",
+        source_message_ids=[narrator.id],
+        scope="save",
+        confidence=0.82,
+        tags=["beacon"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": memory_observation.id,
+                        "action": "durable_memory",
+                        "reason": "Stable narrator preference.",
+                        "confidence": 0.88,
+                        "memory_body": "Mara likes concise, grounded narration.",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                    },
+                    {
+                        "observation_id": context_observation.id,
+                        "action": "save_context",
+                        "reason": "Future plot relevance.",
+                        "confidence": 0.81,
+                        "memory_body": "",
+                        "context_title": "Red lens warning",
+                        "context_body": "The red lens showed riders in the ash.",
+                        "tags": ["beacon"],
+                    },
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 2
+    memories = repositories.list_memories(save.id)
+    assert [memory.body for memory in memories] == [
+        "Mara likes concise, grounded narration."
+    ]
+    assert memories[0].source_message_ids == [player.id]
+    context_source = repositories.list_context_sources(
+        save.id,
+        source_type="observation",
+    )[0]
+    assert context_source.source_id == context_observation.id
+    assert context_source.metadata["source_message_ids"] == [narrator.id]
+    updated_observation = repositories.get_context_observation(memory_observation.id)
+    assert updated_observation is not None
+    assert updated_observation.status == "accepted"
+
+
+def test_context_curation_rejects_unexpected_generated_script(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, narrator = repositories.list_messages(save.id)
+    memory_observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara likes concise narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+        tags=["tone"],
+    )
+    context_observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="open_thread",
+        claim="The red lens warning may return.",
+        evidence_quote="riders in the ash",
+        source_message_ids=[narrator.id],
+        scope="save",
+        confidence=0.82,
+        tags=["beacon"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": memory_observation.id,
+                        "action": "durable_memory",
+                        "reason": "稳定的叙事偏好。",
+                        "confidence": 0.88,
+                        "memory_body": "玩家喜欢简洁、扎实的叙事。",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                    },
+                    {
+                        "observation_id": context_observation.id,
+                        "action": "save_context",
+                        "reason": "未来剧情相关。",
+                        "confidence": 0.81,
+                        "memory_body": "",
+                        "context_title": "红色透镜警告",
+                        "context_body": "红色透镜显示灰烬中的骑手。",
+                        "tags": ["beacon"],
+                    },
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+            repositories=repositories,
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 0
+    assert result.discarded_count == 2
+    assert repositories.list_memories(save.id) == []
+    assert repositories.list_context_sources(save.id, source_type="observation") == []
+    assert repositories.list_context_update_suggestions(save.id) == []
+    updated_observations = [
+        repositories.get_context_observation(observation.id)
+        for observation in (memory_observation, context_observation)
+    ]
+    assert [
+        observation.status for observation in updated_observations if observation
+    ] == ["discarded", "discarded"]
+    for observation in updated_observations:
+        assert observation is not None
+        diagnostic = observation.metadata["script_policy_rejected"]
+        assert isinstance(diagnostic, Mapping)
+        assert diagnostic["script"] == "Han"
+
+
+def test_context_curation_service_rejects_custom_curator_unexpected_script(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, _narrator = repositories.list_messages(save.id)
+    unrelated_multilingual_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="旁白说玩家正在检查灯塔。",
+        provider="fake",
+        model="fake-chat",
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara likes concise narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+        tags=["tone"],
+    )
+    repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="scene_detail",
+        claim="The player checks the beacon.",
+        evidence_quote="玩家正在检查灯塔",
+        source_message_ids=[unrelated_multilingual_message.id],
+        scope="scene",
+        confidence=0.8,
+        tags=["beacon"],
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=UnsafeCurator(),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 0
+    assert result.discarded_count == 1
+    assert repositories.list_memories(save.id) == []
+    updated = repositories.get_context_observation(observation.id)
+    assert updated is not None
+    assert updated.status == "discarded"
+    diagnostic = updated.metadata["script_policy_rejected"]
+    assert isinstance(diagnostic, Mapping)
+    assert diagnostic["script"] == "Han"
+
+
+def test_context_curation_discards_observations_with_ungrounded_evidence(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, _narrator = repositories.list_messages(save.id)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara likes ruby library narration.",
+        evidence_quote="ruby library",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+        tags=["tone"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "Should not be applied.",
+                        "confidence": 0.88,
+                        "memory_body": "Mara likes ruby library narration.",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                    },
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 0
+    assert result.discarded_count == 1
+    assert repositories.list_memories(save.id) == []
+    updated = repositories.get_context_observation(observation.id)
+    assert updated is not None
+    assert updated.status == "discarded"
+
+
+def test_context_curation_discards_observations_with_missing_source_message(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara wants grounded narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=["missing-message"],
+        scope="durable",
+        confidence=0.9,
+        tags=["tone"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "Should not be applied.",
+                        "confidence": 0.88,
+                        "memory_body": "Mara wants grounded narration.",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                    },
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 0
+    assert result.discarded_count == 1
+    assert repositories.list_memories(save.id) == []
+    updated = repositories.get_context_observation(observation.id)
+    assert updated is not None
+    assert updated.status == "discarded"
+
+
+def test_context_curation_queues_durable_memory_when_confirmation_enabled(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    repositories.set_app_setting("manual_confirmation_memories_enabled", True)
+    player, _narrator = repositories.list_messages(save.id)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara likes concise narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+        tags=["tone"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "Stable narrator preference.",
+                        "confidence": 0.88,
+                        "memory_body": "Mara likes concise, grounded narration.",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                    }
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 0
+    assert result.confirmation_count == 1
+    assert repositories.list_memories(save.id) == []
+    suggestions = repositories.list_context_update_suggestions(save.id)
+    assert len(suggestions) == 1
+    assert suggestions[0].entity_type == "memory"
+    assert suggestions[0].update_type == "create"
+    assert suggestions[0].proposed_value == {
+        "body": "Mara likes concise, grounded narration.",
+        "tags": ["tone"],
+        "importance": 0.88,
+        "source_message_id": player.id,
+        "source_message_ids": [player.id],
+        "source_observation_id": observation.id,
+    }
+    updated_observation = repositories.get_context_observation(observation.id)
+    assert updated_observation is not None
+    assert updated_observation.status == "needs_confirmation"
+
+
+def test_context_curation_suppresses_duplicate_durable_memory_records(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, narrator = repositories.list_messages(save.id)
+    observations = (
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="player_preference",
+            claim="Mara likes concise narration.",
+            evidence_quote="Keep it grounded",
+            source_message_ids=[player.id, narrator.id],
+            scope="durable",
+            confidence=0.9,
+            tags=["tone"],
+        ),
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="player_preference",
+            claim="Mara likes concise narration.",
+            evidence_quote="Keep it grounded",
+            source_message_ids=[narrator.id, player.id],
+            scope="durable",
+            confidence=0.9,
+            tags=["tone"],
+        ),
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "Stable narrator preference.",
+                        "confidence": 0.88,
+                        "memory_body": "Mara likes concise, grounded narration.",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                    }
+                    for observation in observations
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 1
+    assert [memory.body for memory in repositories.list_memories(save.id)] == [
+        "Mara likes concise, grounded narration."
+    ]
+    updated_observations = [
+        repositories.get_context_observation(observation.id)
+        for observation in observations
+    ]
+    assert [
+        observation.status for observation in updated_observations if observation
+    ] == ["accepted", "accepted"]
+
+
+def test_context_curation_suppresses_duplicate_memory_suggestions(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    repositories.set_app_setting("manual_confirmation_memories_enabled", True)
+    player, narrator = repositories.list_messages(save.id)
+    observations = (
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="player_preference",
+            claim="Mara likes concise narration.",
+            evidence_quote="Keep it grounded",
+            source_message_ids=[player.id, narrator.id],
+            scope="durable",
+            confidence=0.9,
+            tags=["tone"],
+        ),
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="player_preference",
+            claim="Mara likes concise narration.",
+            evidence_quote="Keep it grounded",
+            source_message_ids=[narrator.id, player.id],
+            scope="durable",
+            confidence=0.9,
+            tags=["tone"],
+        ),
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "Stable narrator preference.",
+                        "confidence": 0.88,
+                        "memory_body": "Mara likes concise, grounded narration.",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                    }
+                    for observation in observations
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.confirmation_count == 1
+    assert len(repositories.list_context_update_suggestions(save.id)) == 1
+    assert repositories.list_memories(save.id) == []
+
+
+def test_narrator_planner_returns_message_spec_from_structured_output() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_plan": {
+                "intent": "Answer the player move.",
+                "thesis": "The beacon warning should be acknowledged.",
+                "narrative_beats": [
+                    {
+                        "description": "Mara reaches the beacon gallery.",
+                        "evidence_source_ids": ["message:player-1"],
+                    },
+                    {
+                        "description": "The red lens warning dominates the room.",
+                        "evidence_source_ids": ["state:beacon.lens"],
+                    },
+                ],
+                "required_facts": [
+                    {
+                        "fact": "The lens is red.",
+                        "evidence_source_ids": ["state:beacon.lens"],
+                    }
+                ],
+                "must_say": ["The lens is red.", "Riders are still distant."],
+                "avoid": ["Do not move Mara without consent."],
+                "agency_constraints": [
+                    {
+                        "constraint": "Mara chooses whether to show the warrant.",
+                        "reason": "The player has not committed to that action.",
+                        "evidence_source_ids": ["message:player-1"],
+                    }
+                ],
+                "tone": "tense and grounded",
+                "uncertainties": ["Whether the riders saw the tower."],
+                "evidence_source_ids": ["message:narrator-1"],
+                "npc_intents": [
+                    {
+                        "character_id": "character:ilyra",
+                        "character_name": "Captain Ilyra",
+                        "stance": "wary ally",
+                        "current_goal": "Keep control of the red lens.",
+                        "next_action": "Demand proof before sharing the failsafe.",
+                        "should_comply": False,
+                        "cooperation_conditions": [
+                            "Mara shows the brass warrant."
+                        ],
+                        "boundaries": ["Will not abandon the tower."],
+                        "route_stage": "introduced",
+                        "max_plausible_escalation": (
+                            "warmth, curiosity, light flirtation, and contact exchange"
+                        ),
+                        "reason": "Her stored motive prioritizes the village.",
+                        "evidence_source_ids": [
+                            "character:ilyra",
+                            "state:beacon.lens",
+                        ],
+                    }
+                ],
+                "state_commit_candidates": [
+                    {
+                        "operation": "upsert",
+                        "state_key": "scene.beacon_lens",
+                        "value": {"status": "red"},
+                        "reason": "The turn may establish the active warning.",
+                        "confidence": 0.82,
+                        "evidence_source_ids": ["state:beacon.lens"],
+                        "evidence_quote": "The lens is red.",
+                    },
+                    {
+                        "operation": "upsert",
+                        "state_key": "scene.unsupported",
+                        "value": {"status": "unsupported"},
+                        "reason": "This candidate lacks evidence.",
+                        "confidence": 0.5,
+                        "evidence_source_ids": ["state:beacon.lens"],
+                        "evidence_quote": "",
+                    }
+                ],
+            }
+        }
+    )
+    planner = StructuredProviderNarratorPlanner(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="planner",
+    )
+    request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(ChatMessage(role="player", body="What do I see?"),),
+    )
+
+    spec = asyncio.run(planner.plan(save_id="save-1", request=request))
+
+    structured_request = provider.structured_output_requests[0]
+    assert structured_request.schema_name == "narrator_message_plan"
+    schema_properties = structured_request.schema["properties"]
+    for field in (
+        "narrative_beats",
+        "required_facts",
+        "agency_constraints",
+        "state_commit_candidates",
+    ):
+        assert field in schema_properties
+        assert field in structured_request.schema["required"]
+    npc_properties = schema_properties["npc_intents"]["items"]["properties"]
+    assert "character_id" in npc_properties
+    assert "route_stage" in npc_properties
+    assert "max_plausible_escalation" in npc_properties
+    assert "character_id" in schema_properties["npc_intents"]["items"]["required"]
+    assert spec.narrative_beats == (
+        NarrativeBeat(
+            description="Mara reaches the beacon gallery.",
+            evidence_source_ids=("message:player-1",),
+        ),
+        NarrativeBeat(
+            description="The red lens warning dominates the room.",
+            evidence_source_ids=("state:beacon.lens",),
+        ),
+    )
+    assert spec.required_facts == (
+        RequiredFact(
+            fact="The lens is red.",
+            evidence_source_ids=("state:beacon.lens",),
+        ),
+    )
+    assert spec.must_say == ("The lens is red.", "Riders are still distant.")
+    assert spec.agency_constraints == (
+        PlayerAgencyConstraint(
+            constraint="Mara chooses whether to show the warrant.",
+            reason="The player has not committed to that action.",
+            evidence_source_ids=("message:player-1",),
+        ),
+    )
+    assert spec.npc_intents == (
+        NpcIntent(
+            character_name="Captain Ilyra",
+            stance="wary ally",
+            current_goal="Keep control of the red lens.",
+            next_action="Demand proof before sharing the failsafe.",
+            should_comply=False,
+            cooperation_conditions=("Mara shows the brass warrant.",),
+            boundaries=("Will not abandon the tower.",),
+            route_stage="introduced",
+            max_plausible_escalation=(
+                "warmth, curiosity, light flirtation, and contact exchange"
+            ),
+            reason="Her stored motive prioritizes the village.",
+            evidence_source_ids=("character:ilyra", "state:beacon.lens"),
+            character_id="character:ilyra",
+        ),
+    )
+    assert spec.state_commit_candidates == (
+        StateCommitCandidate(
+            operation="upsert",
+            state_key="scene.beacon_lens",
+            value={"status": "red"},
+            reason="The turn may establish the active warning.",
+            confidence=0.82,
+            evidence_source_ids=("state:beacon.lens",),
+            evidence_quote="The lens is red.",
+        ),
+    )
+    assert narration_evidence_source_ids(spec) == (
+        "message:narrator-1",
+        "message:player-1",
+        "state:beacon.lens",
+        "character:ilyra",
+    )
+    brief = format_narrator_message_spec(spec)
+    assert "Narration turn plan" in brief
+    assert "Narrative beats:" in brief
+    assert "1. Mara reaches the beacon gallery." in brief
+    assert "Required facts/reveals:" in brief
+    assert "Player-agency constraints:" in brief
+    assert "Character intent/action beats:" in brief
+    assert "Captain Ilyra" in brief
+    assert "id: character:ilyra" in brief
+    assert "route stage: introduced" in brief
+    assert "max plausible escalation: warmth, curiosity" in brief
+    assert "should comply: no" in brief
+    assert "Mara shows the brass warrant." in brief
+    assert "State commit candidates (do not persist automatically):" in brief
+    assert "candidate only" in brief
+
+
+def test_narrator_planner_defaults_missing_new_plan_fields() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_plan": {
+                "intent": "Answer the player move.",
+                "thesis": "The beacon warning should be acknowledged.",
+                "must_say": ["The lens is red."],
+                "avoid": ["Do not move Mara without consent."],
+                "tone": "tense and grounded",
+                "uncertainties": ["Whether the riders saw the tower."],
+                "evidence_source_ids": ["message:narrator-1"],
+                "npc_intents": [
+                    {
+                        "character_name": "Captain Ilyra",
+                        "stance": "wary ally",
+                        "current_goal": "Keep control of the red lens.",
+                        "next_action": "Demand proof before sharing the failsafe.",
+                        "should_comply": False,
+                        "cooperation_conditions": [],
+                        "boundaries": [],
+                        "reason": "Her stored motive prioritizes the village.",
+                        "evidence_source_ids": ["character:ilyra"],
+                    }
+                ],
+            }
+        }
+    )
+    planner = StructuredProviderNarratorPlanner(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="planner",
+    )
+    request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(ChatMessage(role="player", body="What do I see?"),),
+    )
+
+    spec = asyncio.run(planner.plan(save_id="save-1", request=request))
+
+    assert spec.narrative_beats == ()
+    assert spec.required_facts == ()
+    assert spec.agency_constraints == ()
+    assert spec.state_commit_candidates == ()
+    assert spec.npc_intents[0].character_id == ""
+    assert spec.npc_intents[0].route_stage == ""
+    assert spec.npc_intents[0].max_plausible_escalation == ""
+
+
+def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": False,
+                "issues": ["Missed the red lens warning."],
+                "retry_feedback": "Mention the red lens warning before new action.",
+                "confidence": 0.84,
+                "npc_agency_issues": [
+                    "Ilyra reveals the failsafe without proof or leverage."
+                ],
+                "npc_passivity_issues": [
+                    "Mara only gives the player space despite an active alarm."
+                ],
+                "npc_knowledge_leaks": [
+                    {
+                        "speaker_name": "Ilyra",
+                        "claim": "Ilyra knows the riders saw the tower.",
+                        "reason": "The source request never gives Ilyra that fact.",
+                        "target_type": "character",
+                        "target_id": "ilyra",
+                    }
+                ],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Acknowledge the beacon warning.",
+        must_say=("The lens is red.",),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=("message:narrator-1",),
+        npc_intents=(
+            NpcIntent(
+                character_name="Ilyra",
+                stance="guarded",
+                current_goal="Protect the lens failsafe.",
+                next_action="Demand proof before helping.",
+                should_comply=False,
+                cooperation_conditions=("proof of authority",),
+                boundaries=("no free failsafe reveal",),
+                reason="Her agency fields say she protects the lens.",
+                evidence_source_ids=("character:ilyra",),
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="What do I see?"),),
+                retrieved_observations=("Observation: The lens is red.",),
+            ),
+            spec=spec,
+            narrator_body="You see nothing unusual.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.retry_feedback == "Mention the red lens warning before new action."
+    assert result.npc_agency_issues == (
+        "Ilyra reveals the failsafe without proof or leverage.",
+    )
+    assert result.npc_passivity_issues == (
+        "Mara only gives the player space despite an active alarm.",
+    )
+    assert result.npc_knowledge_leaks == (
+        NpcKnowledgeLeak(
+            speaker_name="Ilyra",
+            claim="Ilyra knows the riders saw the tower.",
+            reason="The source request never gives Ilyra that fact.",
+            target_type="character",
+            target_id="ilyra",
+        ),
+    )
+    schema = provider.structured_output_requests[0].schema
+    assert "npc_knowledge_leaks" in schema["properties"]
+    assert "npc_passivity_issues" in schema["properties"]
+    assert "npc_passivity_issues" in schema["required"]
+    prompt_text = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert "Observation: The lens is red." in prompt_text
+    assert "NPC knowledge leaks" in prompt_text
+    assert "unearned NPC compliance" in prompt_text
+    assert "passive NPC/world handling" in prompt_text
+    assert "Ilyra" in prompt_text
+
+
+def test_narrator_verifier_reports_commit_decisions() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.91,
+                "npc_agency_issues": [],
+                "npc_knowledge_leaks": [],
+                "commit_decisions": [
+                    {
+                        "candidate_id": "scene_presence:mara:leave",
+                        "candidate_type": "scene_presence",
+                        "status": "rendered",
+                        "safe_to_commit": True,
+                        "reason": "The response says Mara leaves the gallery.",
+                        "evidence_quote": "Mara slips out through the gallery door.",
+                    },
+                    {
+                        "candidate_id": "memory:mara:0",
+                        "candidate_type": "character_learned_memory",
+                        "status": "omitted",
+                        "safe_to_commit": False,
+                        "reason": "No learned fact is narrated.",
+                        "evidence_quote": "",
+                    },
+                ],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Mara decides whether to stay.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=("message:player-1",),
+        state_commit_candidates=(
+            StateCommitCandidate(
+                operation="update",
+                state_key="scene.presence",
+                value={"action": "leave"},
+                reason="Mara may leave if rendered.",
+                confidence=0.82,
+                evidence_source_ids=("message:player-1",),
+                evidence_quote="Mara slips out through the gallery door.",
+                candidate_id="scene_presence:mara:leave",
+                candidate_type="scene_presence",
+                field_path="present_character_ids",
+                character_id="mara",
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="Does Mara leave?"),),
+            ),
+            spec=spec,
+            narrator_body="Mara slips out through the gallery door.",
+        )
+    )
+
+    schema = provider.structured_output_requests[0].schema
+    assert "commit_decisions" in schema["properties"]
+    decision_schema = schema["properties"]["commit_decisions"]["items"]
+    assert "safe_to_commit" in decision_schema["properties"]
+    assert result.commit_decisions == (
+        NarratorCommitDecision(
+            candidate_id="scene_presence:mara:leave",
+            candidate_type="scene_presence",
+            status="rendered",
+            safe_to_commit=True,
+            reason="The response says Mara leaves the gallery.",
+            evidence_quote="Mara slips out through the gallery door.",
+        ),
+        NarratorCommitDecision(
+            candidate_id="memory:mara:0",
+            candidate_type="character_learned_memory",
+            status="omitted",
+            safe_to_commit=False,
+            reason="No learned fact is narrated.",
+        ),
+    )
+    prompt_text = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert "scene_presence:mara:leave" in prompt_text
+    assert "planned state commit candidates" in prompt_text
+
+
+def test_narrator_verifier_reports_dating_route_stage_violations() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.9,
+                "npc_agency_issues": [],
+                "npc_knowledge_leaks": [],
+                "commit_decisions": [],
+                "dating_route_stage_violations": [
+                    {
+                        "character_name": "Mika Arai",
+                        "character_id": "mika",
+                        "route_stage": "introduced",
+                        "escalation": "exclusivity or commitment language",
+                        "reason": (
+                            "The route only supports warmth and contact exchange."
+                        ),
+                        "evidence_quote": "I want us to be exclusive forever.",
+                    }
+                ],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player's warmth.",
+        thesis="Mika can show interest without overcommitting.",
+        must_say=(),
+        avoid=("Do not make Mika exclusive yet.",),
+        tone="warm and grounded",
+        uncertainties=(),
+        evidence_source_ids=("dating_route_state:route-mika",),
+        npc_intents=(
+            NpcIntent(
+                character_name="Mika Arai",
+                character_id="mika",
+                stance="interested",
+                current_goal="Decide whether to exchange numbers.",
+                next_action="Respond warmly but keep the route early.",
+                should_comply=True,
+                route_stage="introduced",
+                max_plausible_escalation=(
+                    "warmth, curiosity, light flirtation, and contact exchange"
+                ),
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I like you."),),
+            ),
+            spec=spec,
+            narrator_body="Mika says she wants them to be exclusive forever.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.dating_route_stage_violations == (
+        DatingRouteStageViolation(
+            character_name="Mika Arai",
+            character_id="mika",
+            route_stage="introduced",
+            escalation="exclusivity or commitment language",
+            reason="The route only supports warmth and contact exchange.",
+            evidence_quote="I want us to be exclusive forever.",
+        ),
+    )
+    schema = provider.structured_output_requests[0].schema
+    assert "dating_route_stage_violations" in schema["properties"]
+    prompt_text = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert "stage-aware dating-route violations" in prompt_text
+    assert "route stage: introduced" in prompt_text
+    assert "max plausible escalation: warmth, curiosity" in prompt_text
+
+
+def test_narrator_verifier_agency_issue_overrides_passed_flag() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.74,
+                "npc_agency_issues": [
+                    "Ilyra joins the party without motive or leverage."
+                ],
+                "npc_knowledge_leaks": [],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="Come with me."),),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Answer the player request.",
+                thesis="Ilyra should require proof before joining.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=(),
+            ),
+            narrator_body="Ilyra smiles and joins without question.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.npc_agency_issues == (
+        "Ilyra joins the party without motive or leverage.",
+    )
+
+
+def test_narrator_verifier_passivity_issue_overrides_passed_flag() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.74,
+                "npc_agency_issues": [],
+                "npc_passivity_issues": [
+                    "Ilyra only waits to see what the player does next."
+                ],
+                "npc_knowledge_leaks": [],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="Come with me."),),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Answer the player request.",
+                thesis="Ilyra should put pressure on the scene.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=(),
+            ),
+            narrator_body="Ilyra waits to see what you do.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.npc_passivity_issues == (
+        "Ilyra only waits to see what the player does next.",
+    )
+
+
+def _seed_save(repositories: PersistenceRepositories) -> SaveRecord:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="Keep it grounded while I climb toward the beacon lens.",
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The lens flashes red and shows riders in the ash.",
+    )
+    return save

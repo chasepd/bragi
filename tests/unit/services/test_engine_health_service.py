@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
+from bragi.persistence.migrations import migrate_database
+from bragi.persistence.repositories import PersistenceRepositories
+from bragi.services.engine_health_service import EngineHealthService
+from bragi.services.job_lifecycle import JobLifecycleService
+
+
+@pytest.fixture
+def repositories(tmp_path: Path) -> Iterator[PersistenceRepositories]:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        yield PersistenceRepositories(connection)
+
+
+def test_engine_health_does_not_expose_raw_job_errors(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Lantern Keep")
+    jobs = JobLifecycleService(repositories=repositories)
+    failed = jobs.create_running(
+        save_id=save.id,
+        type="context_search",
+        payload={},
+    )
+    jobs.fail(
+        failed.id,
+        error="provider leaked private endpoint https://example.invalid/secret",
+    )
+
+    snapshot = EngineHealthService(repositories).snapshot(save.id)
+
+    assert snapshot.latest_context_search == {
+        "status": "failed",
+        "error_present": True,
+        "result_counts": {},
+        "diagnostics": {},
+    }
+    assert "secret" not in json.dumps(snapshot.latest_context_search)

@@ -1,0 +1,1 @@
+"""Packaged Bragi data resources."""

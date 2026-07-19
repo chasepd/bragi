@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/enforce-patch-paths.sh\"",
+            "timeout": 10,
+            "statusMessage": "Checking patch paths"
+          }
+        ]
+      },
+      {
+        "matcher": "exec_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/enforce-validation-subagents.sh\"",
+            "timeout": 10,
+            "statusMessage": "Checking validation command routing"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/run-tests-for-edited-file.sh\"",
+            "timeout": 120,
+            "statusMessage": "Queueing mapped unit tests"
+          }
+        ]
+      }
+    ]
+  }
+}

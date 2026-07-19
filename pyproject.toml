@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=69", "wheel>=0.43"]
+build-backend = "bragi_build_backend"
+backend-path = ["."]
+
+[project]
+name = "bragi"
+version = "0.1.0"
+description = "Trusted-LAN web roleplaying chronicle with deterministic local state."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "Bragi contributors" }]
+dependencies = [
+  "argon2-cffi>=25.1",
+  "fastapi>=0.111",
+  "keyring>=25",
+  "python-multipart>=0.0.31",
+  "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+  "coverage[toml]>=7.6",
+  "httpx>=0.27",
+  "mypy>=1.10",
+  "py-spy>=0.4.2",
+  "pytest>=8.0",
+  "pytest-cov>=7.1.0",
+  "pytest-xdist>=3.8.0",
+  "ruff>=0.5",
+  "setuptools>=69",
+  "wheel>=0.43",
+]
+
+[project.scripts]
+bragi = "bragi.app:cli_main"
+bragi-web = "bragi_web.main:main"
+
+[tool.setuptools.packages.find]
+include = ["bragi*", "bragi_web*"]
+
+[tool.setuptools.package-data]
+bragi = ["data/name_sources/*.md", "data/name_sources/*.txt"]
+bragi_web = ["static/*", "static/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.coverage.run]
+branch = true
+source = ["bragi", "bragi_common", "bragi_web"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "\\.\\.\\.",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+files = [
+  "bragi",
+  "bragi_common",
+  "bragi_web",
+  "tests",
+  ".codex/hooks",
+  ".codex/tools",
+]
+check_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+warn_unused_ignores = true

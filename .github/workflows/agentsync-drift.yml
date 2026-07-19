@@ -1,0 +1,61 @@
+name: AgentSync Drift
+
+on:
+  pull_request:
+    paths:
+      - AGENTS.md
+      - CLAUDE.md
+      - .agentsync/**
+      - .claude/**
+      - .codex/hooks.json
+      - .codex/hooks/**
+      - .codex/skills/**
+      - .cursor/**
+      - .github/workflows/agentsync-*.yml
+      - .opencode/**
+  push:
+    branches: [main]
+    paths:
+      - AGENTS.md
+      - CLAUDE.md
+      - .agentsync/**
+      - .claude/**
+      - .codex/hooks.json
+      - .codex/hooks/**
+      - .codex/skills/**
+      - .cursor/**
+      - .github/workflows/agentsync-*.yml
+      - .opencode/**
+
+permissions:
+  contents: read
+
+jobs:
+  agentsync:
+    name: Check agent config drift
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.95.0
+
+      - name: Install AgentSync
+        env:
+          AGENTSYNC_REF: a192b2a4ab4b4b13092a629bd21ff4edaa9fe8ef
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/agentsync-source"
+          rm -rf "$source_dir"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin https://github.com/chasepd/AgentSync.git
+          git -C "$source_dir" fetch --depth 1 origin "$AGENTSYNC_REF"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          cargo install --path "$source_dir/crates/agentsync-cli" --locked
+
+      - name: Check drift
+        run: agentsync status --scope project --check

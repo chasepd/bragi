@@ -1,0 +1,21 @@
+services:
+  bragi:
+    build: .
+    image: bragi:local
+    ports:
+      - "8787:8787"
+    environment:
+      BRAGI_WEB_DATA_DIR: /data/bragi
+      BRAGI_WEB_HOST: 0.0.0.0
+      BRAGI_WEB_PORT: "8787"
+      BRAGI_WEB_ALLOWED_HOSTS: ${BRAGI_WEB_ALLOWED_HOSTS:-}
+      BRAGI_WEB_ALLOWED_ORIGINS: ${BRAGI_WEB_ALLOWED_ORIGINS:-}
+      BRAGI_WEB_SECURE_COOKIES: ${BRAGI_WEB_SECURE_COOKIES:-0}
+      BRAGI_WEB_BOOTSTRAP_TOKEN: ${BRAGI_WEB_BOOTSTRAP_TOKEN:-}
+    volumes:
+      - bragi-data:/data/bragi
+    restart: unless-stopped
+
+volumes:
+  bragi-data:
+    name: bragi-data

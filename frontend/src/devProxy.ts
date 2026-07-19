@@ -1,0 +1,4 @@
+export const apiProxy = {
+  target: "http://127.0.0.1:8787",
+  changeOrigin: false
+} as const;

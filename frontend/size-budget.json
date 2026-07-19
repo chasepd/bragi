@@ -1,0 +1,49 @@
+{
+  "generatedAssets": {
+    "javascript": {
+      "extensions": [".js"],
+      "totalRawBytes": 660000,
+      "totalGzipBytes": 176000,
+      "totalBrotliBytes": 152000,
+      "maxFileRawBytes": 260000,
+      "minFileCount": 11,
+      "requiredFilePatterns": [
+        "^authenticatedWorkbench-.*\\.js$",
+        "^workbenchCore-.*\\.js$",
+        "^worldPanel-.*\\.js$",
+        "^charactersPanel-.*\\.js$",
+        "^settingsPanel-.*\\.js$",
+        "^mediaPanel-.*\\.js$",
+        "^scenarioDialog-.*\\.js$",
+        "^characterTextPhone-.*\\.js$"
+      ]
+    },
+    "css": {
+      "extensions": [".css"],
+      "totalRawBytes": 110000,
+      "totalGzipBytes": 22000,
+      "totalBrotliBytes": 18000,
+      "maxFileRawBytes": 100000
+    }
+  },
+  "publicAssets": [
+    {
+      "path": "app-icon-512.png",
+      "width": 512,
+      "height": 512,
+      "maxRawBytes": 220000
+    },
+    {
+      "path": "app-icon-192.png",
+      "width": 192,
+      "height": 192,
+      "maxRawBytes": 38000
+    },
+    {
+      "path": "apple-touch-icon.png",
+      "width": 180,
+      "height": 180,
+      "maxRawBytes": 34000
+    }
+  ]
+}
