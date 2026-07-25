@@ -51,6 +51,14 @@ Sessions use an HttpOnly `bragi_session` cookie with `SameSite=Lax`. The cookie
 is marked secure automatically on HTTPS; set `BRAGI_WEB_SECURE_COOKIES=1` when
 Bragi is behind a TLS-terminating reverse proxy.
 
+The default trusted-LAN setup uses plaintext HTTP and does not encrypt the
+session cookie or application traffic in transit. Anyone able to observe or
+modify traffic on that LAN may be able to capture a session cookie or private
+roleplay content. Use the default only on a network and devices you trust. For
+stronger transport security, put Bragi behind an HTTPS reverse proxy, configure
+the allowed host and origin, and enable secure cookies as described in
+`docs/docker-compose.md`.
+
 Bragi rejects unsafe API writes from untrusted browser origins. Localhost,
 loopback, private/link-local IP hosts, and configured bind hosts are accepted as
 request hosts, but browser write origins are only trusted by default when they
@@ -105,3 +113,11 @@ Privacy review guidance for checked-in fixtures and documentation is in
 
 Agent configuration sync and drift checks are documented in
 `docs/agentsync.md`.
+
+## Open Source
+
+Bragi is available under the MIT License. See `LICENSE`.
+
+Contributions are welcome under `CONTRIBUTING.md`. Security reports, support
+requests, and community participation are covered by `SECURITY.md`,
+`SUPPORT.md`, and `CODE_OF_CONDUCT.md`.

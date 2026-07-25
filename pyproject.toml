@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel>=0.43"]
+requires = ["setuptools>=77", "wheel>=0.43"]
 build-backend = "bragi_build_backend"
 backend-path = ["."]
 
@@ -9,7 +9,8 @@ version = "0.1.0"
 description = "Trusted-LAN web roleplaying chronicle with deterministic local state."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "Proprietary" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Bragi contributors" }]
 dependencies = [
   "argon2-cffi>=25.1",
@@ -29,7 +30,7 @@ dev = [
   "pytest-cov>=7.1.0",
   "pytest-xdist>=3.8.0",
   "ruff>=0.5",
-  "setuptools>=69",
+  "setuptools>=77",
   "wheel>=0.43",
 ]
 

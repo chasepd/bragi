@@ -15,6 +15,13 @@ def test_pyproject_declares_keyring_runtime_dependency() -> None:
     )
 
 
+def test_pyproject_declares_mit_license() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert pyproject["project"]["license"] == "MIT"
+    assert "LICENSE" in pyproject["project"]["license-files"]
+
+
 def test_pyproject_declares_web_runtime_dependencies_and_scripts() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
