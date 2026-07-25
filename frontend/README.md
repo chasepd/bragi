@@ -33,3 +33,8 @@ npm run optimize-icons --prefix frontend
 
 Inspect the generated `frontend/public/*.png` files at native and small launcher
 sizes before committing.
+
+The source icon was AI-generated, and the public icon files are mechanical
+resizes of that source. The project treats this artwork as freely reusable; to
+the extent copyright applies, it is distributed under the repository's MIT
+License.

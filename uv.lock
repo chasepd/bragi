@@ -159,7 +159,7 @@ requires-dist = [
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.8.0" },
     { name = "python-multipart", specifier = ">=0.0.31" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
-    { name = "setuptools", marker = "extra == 'dev'", specifier = ">=69" },
+    { name = "setuptools", marker = "extra == 'dev'", specifier = ">=77" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
     { name = "wheel", marker = "extra == 'dev'", specifier = ">=0.43" },
 ]
