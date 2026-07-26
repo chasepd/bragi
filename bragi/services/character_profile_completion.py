@@ -37,6 +37,9 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
+from bragi.services.scenario_name_sources import (
+    ordinary_character_name_candidate_context,
+)
 from bragi.services.tool_call_helpers import (
     accepted_tool_result,
     append_tool_feedback_messages,
@@ -205,6 +208,7 @@ class CharacterStarterGenerationRequest:
     scenario_context: str
     content: Mapping[str, object]
     save_id: str | None = None
+    name_candidate_context: str = ""
 
 
 @dataclass(frozen=True)
@@ -887,6 +891,7 @@ async def complete_character_starters(
     completer: object | None,
     scenario_type: str,
     content: Mapping[str, object],
+    scenario_types: Iterable[object] | None = None,
     save_id: str | None = None,
 ) -> tuple[ScenarioCharacterStarter, ...]:
     starters = scenario_character_starters_for_content(
@@ -901,6 +906,7 @@ async def complete_character_starters(
         generated_starters = await _generated_character_starters_for_content(
             completer=completer,
             scenario_type=scenario_type,
+            scenario_types=scenario_types,
             content=content,
             save_id=save_id,
         )
@@ -1110,6 +1116,7 @@ async def _generated_character_starters_for_content(
     *,
     completer: object,
     scenario_type: str,
+    scenario_types: Iterable[object] | None,
     content: Mapping[str, object],
     save_id: str | None,
 ) -> tuple[ScenarioCharacterStarter, ...]:
@@ -1124,6 +1131,13 @@ async def _generated_character_starters_for_content(
         ),
         content=content,
         save_id=save_id,
+        name_candidate_context=ordinary_character_name_candidate_context(
+            scenario_type=_name_context_scenario_types(
+                starter_type=scenario_type,
+                scenario_types=scenario_types,
+            ),
+            content=content,
+        ),
     )
     try:
         generated = cast(
@@ -1905,9 +1919,39 @@ def _dating_sim_starter_generation_messages(
         ),
         ChatMessage(
             role="user",
-            body=request.scenario_context,
+            body=_starter_generation_context_text(request),
         ),
     )
+
+
+def _starter_generation_context_text(
+    request: CharacterStarterGenerationRequest,
+) -> str:
+    parts = [request.scenario_context]
+    if request.name_candidate_context:
+        parts.append(request.name_candidate_context)
+        parts.append(
+            "Preserve explicit scenario names. Use the candidate names only when "
+            "a romance option lacks a usable character name or needs a plausible "
+            "ordinary first name."
+        )
+    return "\n\n".join(parts)
+
+
+def _name_context_scenario_types(
+    *,
+    starter_type: str,
+    scenario_types: Iterable[object] | None,
+) -> tuple[object, ...]:
+    values: list[object] = []
+    seen: set[str] = set()
+    for value in (starter_type, *(scenario_types or ())):
+        key = str(getattr(value, "value", value))
+        if key in seen:
+            continue
+        values.append(value)
+        seen.add(key)
+    return tuple(values)
 
 
 def _field_enhancement_messages(

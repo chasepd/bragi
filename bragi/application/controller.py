@@ -2814,6 +2814,7 @@ class BragiRuntime:
         return await complete_character_starters(
             completer=self._character_profile_completer(starter_type),
             scenario_type=starter_type,
+            scenario_types=tuple(genre.value for genre in normalized_genres),
             content=content,
             save_id=save_id,
         )
@@ -2861,6 +2862,7 @@ class BragiRuntime:
                 complete_character_starters(
                     completer=completer,
                     scenario_type=starter_type,
+                    scenario_types=tuple(genre.value for genre in normalized_genres),
                     content=content,
                     save_id=save_id,
                 )
