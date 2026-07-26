@@ -113,6 +113,7 @@ import {
   ModelPricingLine,
   modelOptionLabel,
   modelOptionSelectLabel,
+  modelSelectorPurpose,
   modelPricingDisplayLabel,
   modelPricingCompactLabel,
   npcKnowledgeAuditModeLabel,
@@ -163,6 +164,22 @@ type SettingsSummaryModel = {
   facts?: string[];
   tone?: SettingsSummaryTone;
 };
+type SimpleModelSelectorMeta = readonly [
+  string,
+  readonly string[],
+  readonly ModelCapabilityFamily[],
+  readonly string[],
+  readonly ModelCapabilityFamily[],
+  readonly string[]
+];
+type SimpleModelSelectorGroup = {
+  label: string;
+  mainSelectors: TaskModelSelector[];
+  mainOptions: ModelOption[];
+  fallbackSelectors: TaskModelSelector[];
+  fallbackOptions: ModelOption[];
+  fallbackSettingKeys: readonly string[];
+};
 
 const SETTINGS_SECTION_STALE_MS = 60_000;
 const LOCAL_SETTING_KEYS = new Set([
@@ -172,6 +189,48 @@ const LOCAL_SETTING_KEYS = new Set([
   "fade_to_black_enabled",
   "debug_logging_enabled"
 ]);
+const SIMPLE_MODEL_SELECTOR_GROUPS: readonly SimpleModelSelectorMeta[] = [
+  [
+    "Structured Output / Tool Calls",
+    structuredToolModelPurposes(),
+    ["structured_output", "tool_calling"],
+    ["structured_output_fallback", "tool_call_fallback"],
+    ["structured_output", "tool_calling"],
+    ["structured_output_fallback_enabled", "tool_call_fallback_enabled"]
+  ],
+  [
+    "Prose",
+    routingLanePurposes("narrator", "scenario_writer", "summarization", "image_prompt"),
+    ["chat"],
+    ["narrator_fallback", "chat_fallback"],
+    ["chat"],
+    ["chat_fallback_enabled"]
+  ],
+  [
+    "Image Generation",
+    routingLanePurposes("image_generation"),
+    ["image_generation"],
+    ["image_fallback"],
+    ["image_generation"],
+    ["image_fallback_enabled"]
+  ],
+  [
+    "Image Edit",
+    routingLanePurposes("image_edit"),
+    ["image_to_image"],
+    ["image_edit_fallback"],
+    ["image_to_image"],
+    ["image_fallback_enabled"]
+  ],
+  [
+    "Video Generation",
+    routingLanePurposes("video_generation", "image_animation"),
+    ["text_to_video", "image_to_video"],
+    ["video_fallback"],
+    ["text_to_video"],
+    ["video_fallback_enabled"]
+  ]
+];
 
 function contentRatingLabel(rating: string) {
   return ({ g: "G", pg: "PG", "pg-13": "PG-13", r: "R", unrated: "Unrated" } as Record<string, string>)[rating]
@@ -546,6 +605,22 @@ function pluralCount(count: number, singular: string, plural = `${singular}s`): 
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
+function routingLanePurposes(...laneIds: string[]): string[] {
+  const targetIds = new Set(laneIds);
+  return MODEL_ROUTING_GROUPS
+    .flatMap((group) => group.lanes)
+    .filter((lane) => targetIds.has(lane.id))
+    .flatMap((lane) => lane.targetPurposes);
+}
+
+function structuredToolModelPurposes(): string[] {
+  return MODEL_ROUTING_GROUPS
+    .flatMap((group) => group.lanes)
+    .filter((lane) => lane.capabilities.some((capability) => capability === "structured_output" || capability === "tool_calling"))
+    .flatMap((lane) => lane.targetPurposes)
+    .concat("dating_route_profile");
+}
+
 function AdvancedSettingsSection({
   title,
   summary,
@@ -873,6 +948,7 @@ function ModelSettings({ settings, updateLocal, disabled }: { settings?: Setting
   return (
     <div className="settings-stack">
       <ModelRoutingProfileControls settings={settings} />
+      <SimpleModelSelectorSettings settings={settings} disabled={disabled} />
       <RoleplaySharedModelSettings settings={settings} updateLocal={updateLocal} disabled={disabled} />
       <FallbackBehaviorSettings settings={settings} updateLocal={updateLocal} disabled={disabled} />
       {groups.length || fallbacks.length || otherSelectors.length ? (
@@ -890,6 +966,125 @@ function ModelSettings({ settings, updateLocal, disabled }: { settings?: Setting
         </AdvancedSettingsSection>
       ) : null}
     </div>
+  );
+}
+
+function SimpleModelSelectorSettings({ settings, disabled }: { settings: SettingsModel; disabled: boolean }) {
+  const groups = simpleModelSelectorGroups(settings);
+  if (!groups.length) return null;
+  return (
+    <section className="settings-subsection">
+      <h3>Simple Model Selectors</h3>
+      {groups.map((group) => (
+        <SimpleModelSelectorRow key={group.label} group={group} disabled={disabled} />
+      ))}
+    </section>
+  );
+}
+
+function SimpleModelSelectorRow({ group, disabled }: { group: SimpleModelSelectorGroup; disabled: boolean }) {
+  const client = useQueryClient();
+  const commonMainSelection = commonSelectedModelValue(group.mainSelectors, group.mainOptions);
+  const commonFallbackSelection = commonSelectedModelValue(group.fallbackSelectors, group.fallbackOptions);
+  const [mainValue, setMainValue] = useState(commonMainSelection);
+  const [fallbackValue, setFallbackValue] = useState(commonFallbackSelection);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setMainValue(commonMainSelection);
+    setFallbackValue(commonFallbackSelection);
+  }, [commonMainSelection, commonFallbackSelection, group]);
+
+  const savePreferences = useMutation({
+    mutationFn: async ({ main, fallback }: { main: string; fallback: string }) => {
+      await saveSimpleModelPreferences(group.mainSelectors, main);
+      if (await saveSimpleModelPreferences(group.fallbackSelectors, fallback)) {
+        for (const key of group.fallbackSettingKeys) {
+          await postJson("/api/settings/scoped", { key, value: true });
+        }
+      }
+    },
+    onSuccess: () => {
+      setError("");
+    },
+    onError: (failure) => setError(failure instanceof Error ? failure.message : "Could not save simple model selectors"),
+    onSettled: () => {
+      client.invalidateQueries({ queryKey: ["settings", "full"] });
+      client.invalidateQueries({ queryKey: ["runtime"] });
+    }
+  });
+
+  const controlsDisabled = disabled || savePreferences.isPending;
+  const canApply = Boolean(mainValue || fallbackValue);
+
+  return (
+    <div className="model-routing-row">
+      <strong>{group.label}</strong>
+      <div className="model-routing-actions">
+        <div className="field-label">
+          <span>Main</span>
+          {simpleModelOptionSelect(
+            `${group.label} main model`,
+            mainValue,
+            group.mainOptions,
+            controlsDisabled || !group.mainSelectors.length || !group.mainOptions.length,
+            setMainValue
+          )}
+        </div>
+        <div className="field-label">
+          <span>Fallback</span>
+          {simpleModelOptionSelect(
+            `${group.label} fallback model`,
+            fallbackValue,
+            group.fallbackOptions,
+            controlsDisabled || !group.fallbackSelectors.length || !group.fallbackOptions.length,
+            setFallbackValue
+          )}
+        </div>
+        <button
+          type="button"
+          className="primary-command compact"
+          disabled={controlsDisabled || !canApply}
+          onClick={() => savePreferences.mutate({ main: mainValue, fallback: fallbackValue })}
+        >
+          {savePreferences.isPending ? <Loader2 size={15} /> : <Check size={15} />}
+          Apply
+        </button>
+      </div>
+      {error ? <InlineNotice>{error}</InlineNotice> : null}
+    </div>
+  );
+}
+
+async function saveSimpleModelPreferences(selectors: TaskModelSelector[], value: string): Promise<boolean> {
+  const preference = modelPreferenceFromValue(value);
+  if (!preference) return false;
+  for (const selector of selectors) {
+    await postJson("/api/settings/model-preference", {
+      task: selector.task,
+      provider: preference.provider,
+      model_id: preference.model_id
+    });
+  }
+  return true;
+}
+
+function simpleModelOptionSelect(
+  label: string,
+  value: string,
+  options: ModelOption[],
+  disabled: boolean,
+  onChange: (value: string) => void
+) {
+  return (
+    <select value={value} disabled={disabled} aria-label={label} onChange={(event) => onChange(event.target.value)}>
+      <option value="">{options.length ? "Choose" : "None"}</option>
+      {options.map((option) => (
+        <option key={modelOptionValue(option)} value={modelOptionValue(option)}>
+          {modelOptionSelectLabel(option)}
+        </option>
+      ))}
+    </select>
   );
 }
 
@@ -1230,6 +1425,28 @@ function modelRoutingLanes(settings: SettingsModel, metas: readonly ModelRouting
       options: commonModelOptions(selectors, meta.capabilities)
     }];
   });
+}
+
+function simpleModelSelectorGroups(settings: SettingsModel): SimpleModelSelectorGroup[] {
+  const selectors = allModelSelectors(settings);
+  return SIMPLE_MODEL_SELECTOR_GROUPS.flatMap(([label, mainPurposes, mainCapabilities, fallbackPurposes, fallbackCapabilities, fallbackSettingKeys]) => {
+    const mainSelectors = selectorsForPurposes(selectors, mainPurposes);
+    const fallbackSelectors = selectorsForPurposes(selectors, fallbackPurposes);
+    if (!mainSelectors.length && !fallbackSelectors.length) return [];
+    return [{
+      label,
+      mainSelectors,
+      mainOptions: commonModelOptions(mainSelectors, mainCapabilities),
+      fallbackSelectors,
+      fallbackOptions: commonModelOptions(fallbackSelectors, fallbackCapabilities),
+      fallbackSettingKeys
+    }];
+  });
+}
+
+function selectorsForPurposes(selectors: TaskModelSelector[], purposes: readonly string[]): TaskModelSelector[] {
+  const targetPurposes = new Set(purposes);
+  return selectors.filter((selector) => targetPurposes.has(modelSelectorPurpose(selector.task)));
 }
 
 function selectorsForLane(settings: SettingsModel, meta: ModelRoutingLaneMeta): TaskModelSelector[] {
@@ -1945,6 +2162,11 @@ function modelPreferenceValue(provider: string | null, modelId: string | null) {
   return provider && modelId ? `${provider}\u0000${modelId}` : "";
 }
 
+function modelPreferenceFromValue(value: string): { provider: string; model_id: string } | null {
+  const [provider, model_id] = value.split("\u0000");
+  return provider && model_id ? { provider, model_id } : null;
+}
+
 function modelPreferencePath(task: string, saveId?: string | null) {
   const base = `/api/settings/model-preference/${encodeURIComponent(task)}`;
   return saveId ? `${base}?save_id=${encodeURIComponent(saveId)}` : base;
@@ -2072,26 +2294,6 @@ function modelSearchTokens(query: string): string[] {
 
 function modelOptionMatchLabel(count: number): string {
   return count === 1 ? "1 match" : `${count} matches`;
-}
-
-function modelSelectorPurpose(task: string): string {
-  if (task.startsWith("scenario_generation_section_")) return "scenario_generation";
-  if (
-    task === "chat_full_roleplay" ||
-    task === "chat_fantasy_roleplay" ||
-    task === "chat_science_fiction_roleplay" ||
-    task === "chat_first_contact_exploration" ||
-    task === "chat_survival_expedition" ||
-    task === "chat_time_loop" ||
-    task === "chat_investigation_mystery" ||
-    task === "chat_heist_infiltration" ||
-    task === "chat_political_intrigue" ||
-    task === "chat_dating_sim"
-  ) return "chat";
-  for (const prefix of ["full_roleplay_", "fantasy_roleplay_", "science_fiction_roleplay_", "first_contact_exploration_", "survival_expedition_", "time_loop_", "investigation_mystery_", "heist_infiltration_", "political_intrigue_", "dating_sim_", "shared_roleplay_"]) {
-    if (task.startsWith(prefix)) return task.slice(prefix.length);
-  }
-  return task;
 }
 
 function routingLaneTaskLabel(selector: TaskModelSelector): string {

@@ -9291,7 +9291,7 @@ function settingTooltip(settingKey: string): string {
   return SETTING_TOOLTIPS[settingKey] ?? "Changes how this setting affects Bragi behavior.";
 }
 
-function modelSelectorPurpose(task: string): string {
+export function modelSelectorPurpose(task: string): string {
   if (task.startsWith("scenario_generation_section_")) return "scenario_generation";
   if (
     task === "chat_full_roleplay" ||
