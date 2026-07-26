@@ -7,6 +7,7 @@ import os
 import sqlite3
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -36,6 +37,8 @@ class BundlePreviewState:
 class RuntimeAccessLock:
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._state_lock = threading.Lock()
+        self._executor: ThreadPoolExecutor | None = _runtime_lock_executor()
 
     def __enter__(self) -> RuntimeAccessLock:
         if _running_in_event_loop():
@@ -51,23 +54,83 @@ class RuntimeAccessLock:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self._lock.release()
 
+    def close(self) -> None:
+        with self._state_lock:
+            executor = self._executor
+            self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=False)
+
     @asynccontextmanager
     async def async_access(self) -> AsyncIterator[None]:
-        acquired = threading.Event()
+        loop = asyncio.get_running_loop()
+        acquired: asyncio.Future[None] = loop.create_future()
         release = threading.Event()
 
         def hold_lock_until_released() -> None:
             with self._lock:
-                acquired.set()
+                loop.call_soon_threadsafe(_complete_future, acquired)
                 release.wait()
 
-        holder = asyncio.create_task(asyncio.to_thread(hold_lock_until_released))
+        with self._state_lock:
+            if self._executor is None:
+                self._executor = _runtime_lock_executor()
+            holder = loop.run_in_executor(self._executor, hold_lock_until_released)
+        holder.add_done_callback(
+            lambda future: _complete_acquisition_if_holder_exited(future, acquired)
+        )
+        lock_acquired = False
         try:
-            await asyncio.to_thread(acquired.wait)
+            await acquired
+            lock_acquired = True
             yield
         finally:
             release.set()
-            await asyncio.shield(holder)
+            if lock_acquired:
+                await asyncio.shield(holder)
+            elif holder.done():
+                _consume_future_exception(holder)
+            else:
+                holder.add_done_callback(_consume_future_exception)
+
+
+def _complete_future(future: asyncio.Future[None]) -> None:
+    if not future.done():
+        future.set_result(None)
+
+
+def _consume_future_exception(future: asyncio.Future[Any]) -> None:
+    try:
+        future.exception()
+    except asyncio.CancelledError:
+        pass
+
+
+def _complete_acquisition_if_holder_exited(
+    holder: asyncio.Future[Any],
+    acquired: asyncio.Future[None],
+) -> None:
+    if acquired.done():
+        return
+    try:
+        holder.result()
+    except asyncio.CancelledError:
+        acquired.set_exception(
+            RuntimeError("RuntimeAccessLock async acquisition was cancelled")
+        )
+    except Exception as exc:
+        acquired.set_exception(exc)
+    else:
+        acquired.set_exception(
+            RuntimeError("RuntimeAccessLock holder exited before acquisition")
+        )
+
+
+def _runtime_lock_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="bragi-runtime-lock",
+    )
 
 
 def _running_in_event_loop() -> bool:
@@ -201,6 +264,9 @@ class SaveEventHub:
         self._next_id = 1
         self._events: list[SaveEvent] = []
         self._condition = threading.Condition(threading.RLock())
+        self._waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = (
+            []
+        )
 
     def publish(
         self,
@@ -223,6 +289,7 @@ class SaveEventHub:
             overflow = len(self._events) - self._max_events
             if overflow > 0:
                 del self._events[:overflow]
+            self._notify_waiters_locked()
             self._condition.notify_all()
             return event
 
@@ -235,14 +302,29 @@ class SaveEventHub:
         include_unowned_global: bool = True,
         include_all_global: bool = False,
     ) -> int:
-        return await asyncio.to_thread(
-            self._wait_for_event,
-            save_id,
-            last_event_id,
-            owner_user_id,
-            include_unowned_global,
-            include_all_global,
-        )
+        while True:
+            with self._condition:
+                if self._has_event_after_locked(
+                    save_id,
+                    last_event_id,
+                    owner_user_id=owner_user_id,
+                    include_unowned_global=include_unowned_global,
+                    include_all_global=include_all_global,
+                ):
+                    return last_event_id
+                loop = asyncio.get_running_loop()
+                waiter: asyncio.Future[None] = loop.create_future()
+                self._waiters.append((loop, waiter))
+            try:
+                await asyncio.wait_for(waiter, timeout=30)
+            except TimeoutError:
+                with self._condition:
+                    self._remove_waiter_locked(waiter)
+                return last_event_id
+            except asyncio.CancelledError:
+                with self._condition:
+                    self._remove_waiter_locked(waiter)
+                raise
 
     def events_after(
         self,
@@ -271,27 +353,6 @@ class SaveEventHub:
         with self._condition:
             return self._next_id - 1
 
-    def _wait_for_event(
-        self,
-        save_id: str,
-        last_event_id: int,
-        owner_user_id: str | None,
-        include_unowned_global: bool,
-        include_all_global: bool,
-    ) -> int:
-        with self._condition:
-            self._condition.wait_for(
-                lambda: self._has_event_after_locked(
-                    save_id,
-                    last_event_id,
-                    owner_user_id=owner_user_id,
-                    include_unowned_global=include_unowned_global,
-                    include_all_global=include_all_global,
-                ),
-                timeout=30,
-            )
-            return last_event_id
-
     def _has_event_after_locked(
         self,
         save_id: str,
@@ -312,6 +373,21 @@ class SaveEventHub:
             )
             for event in self._events
         )
+
+    def _notify_waiters_locked(self) -> None:
+        waiters = self._waiters
+        self._waiters = []
+        for loop, waiter in waiters:
+            if waiter.done():
+                continue
+            loop.call_soon_threadsafe(_complete_future, waiter)
+
+    def _remove_waiter_locked(self, waiter: asyncio.Future[None]) -> None:
+        self._waiters = [
+            (loop, future)
+            for loop, future in self._waiters
+            if future is not waiter
+        ]
 
 
 @dataclass
@@ -358,6 +434,7 @@ class WebAppState:
         close = getattr(self.repositories, "close", None)
         if callable(close):
             close()
+        self.lock.close()
 
 
 def create_state() -> WebAppState:

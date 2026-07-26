@@ -109,6 +109,7 @@ async def request_sse_json(
     max_response_bytes: int = MAX_PROVIDER_RESPONSE_BYTES,
 ) -> AsyncIterator[dict[str, Any]]:
     started_at = perf_counter()
+    deadline = _provider_deadline(timeout, started_at=started_at)
     path = urlsplit(url).path
     body = None
     request_headers = dict(headers)
@@ -147,10 +148,13 @@ async def request_sse_json(
     def worker() -> None:
         byte_count = 0
         try:
-            with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
+            with _NO_REDIRECT_OPENER.open(
+                request,
+                timeout=_remaining_provider_timeout(deadline),
+            ) as response:
                 with response_lock:
                     response_holder["response"] = response
-                for event_data in _iter_sse_data(response):
+                for event_data in _iter_sse_data(response, deadline=deadline):
                     if stop_event.is_set():
                         break
                     byte_count += len(event_data.encode("utf-8"))
@@ -169,6 +173,8 @@ async def request_sse_json(
                     if not isinstance(payload, dict):
                         raise ValueError("Provider stream event must be a JSON object")
                     publish(payload)
+            if stop_event.is_set():
+                return
             log_event(
                 "provider.http_stream_succeeded",
                 method=method,
@@ -194,6 +200,8 @@ async def request_sse_json(
                 )
             )
         except URLError as exc:
+            if stop_event.is_set():
+                return
             log_error_event(
                 "provider.http_stream_failed",
                 method=method,
@@ -209,6 +217,8 @@ async def request_sse_json(
                 )
             )
         except TimeoutError as exc:
+            if stop_event.is_set():
+                return
             log_error_event(
                 "provider.http_stream_failed",
                 method=method,
@@ -245,7 +255,25 @@ async def request_sse_json(
 
     try:
         while True:
-            item = await queue.get()
+            try:
+                item = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=_remaining_provider_timeout(deadline),
+                )
+            except TimeoutError as exc:
+                timeout_error = _provider_timeout_error(deadline)
+                log_error_event(
+                    "provider.http_stream_failed",
+                    method=method,
+                    path=path,
+                    duration_ms=_elapsed_ms(started_at),
+                    error_category=ProviderErrorCategory.NETWORK_ERROR.value,
+                    error=str(timeout_error),
+                )
+                raise ProviderError(
+                    category=ProviderErrorCategory.NETWORK_ERROR,
+                    message=str(timeout_error),
+                ) from exc
             if item is done:
                 break
             if isinstance(item, Exception):
@@ -779,9 +807,18 @@ def _provider_timeout_error(deadline: _ProviderDeadline) -> TimeoutError:
     )
 
 
-def _iter_sse_data(handle: Any) -> Iterator[str]:
+def _iter_sse_data(
+    handle: Any,
+    *,
+    deadline: _ProviderDeadline | None = None,
+) -> Iterator[str]:
     data_lines: list[str] = []
-    for raw_line in handle:
+    while True:
+        if deadline is not None:
+            _apply_remaining_provider_timeout(handle, deadline)
+        raw_line = handle.readline()
+        if not raw_line:
+            break
         line = bytes(raw_line).decode("utf-8", errors="replace").rstrip("\r\n")
         if line == "":
             if data_lines:
@@ -789,11 +826,17 @@ def _iter_sse_data(handle: Any) -> Iterator[str]:
                 data_lines.clear()
             continue
         if line.startswith(":"):
+            if deadline is not None:
+                _raise_if_provider_deadline_expired(deadline)
             continue
         field, separator, value = line.partition(":")
         if field != "data":
+            if deadline is not None:
+                _raise_if_provider_deadline_expired(deadline)
             continue
         data_lines.append(value[1:] if separator and value.startswith(" ") else value)
+        if deadline is not None:
+            _raise_if_provider_deadline_expired(deadline)
     if data_lines:
         yield "\n".join(data_lines)
 
