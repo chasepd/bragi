@@ -45,6 +45,7 @@ from bragi.providers.contracts import (
     ProviderCapability,
     ProviderConfigStatus,
     ProviderModel,
+    ProviderToolCall,
     StructuredOutputRequest,
     StructuredOutputResponse,
     ToolCallRequest,
@@ -234,6 +235,54 @@ class RecordingContextAndChatProvider(RecordingChatProvider):
         self.structured_output_requests.append(request)
         return StructuredOutputResponse(
             data={"selections": []},
+            provider=request.provider,
+            model_id=request.model_id,
+            token_usage={"total": 13},
+        )
+
+
+class ToolContextAndChatProvider(RecordingChatProvider):
+    def __init__(
+        self,
+        provider_name: str,
+        *,
+        context_model_id: str,
+        tool_calls: tuple[ProviderToolCall, ...] = (),
+        tool_error: Exception | None = None,
+    ) -> None:
+        super().__init__(provider_name)
+        self.context_model_id = context_model_id
+        self.tool_calls = tool_calls
+        self.tool_error = tool_error
+        self.tool_call_requests: list[ToolCallRequest] = []
+
+    async def list_models(self) -> list[ProviderModel]:
+        return [
+            ProviderModel(
+                provider=self.provider_name,
+                model_id=self.context_model_id,
+                display_name=f"{self.provider_name.title()} Context",
+                capabilities=frozenset({ProviderCapability.TOOL_CALLING}),
+            ),
+            ProviderModel(
+                provider=self.provider_name,
+                model_id=f"{self.provider_name}-chat",
+                display_name=f"{self.provider_name.title()} Chat",
+                capabilities=frozenset({ProviderCapability.CHAT}),
+                context_window=8192,
+            ),
+        ]
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_call_requests.append(request)
+        if self.tool_error is not None:
+            raise self.tool_error
+        return ToolCallResponse(
+            tool_calls=self.tool_calls,
+            body="",
             provider=request.provider,
             model_id=request.model_id,
             token_usage={"total": 13},
@@ -14604,6 +14653,131 @@ def test_submit_player_turn_continues_when_context_search_is_rate_limited(
     persisted_messages = repositories.list_messages(save.id)
     assert [message.role for message in persisted_messages] == ["player", "narrator"]
     assert persisted_messages[1] == result.narrator_message
+
+
+def test_submit_player_turn_uses_degraded_recovered_context(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    source_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="A silver bell rings beneath the bridge.",
+    )
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="Mara distrusts bells that ring without wind.",
+        tags=["bells"],
+        source_message_id=source_message.id,
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-chat",
+        display_name="Fake Chat",
+        capabilities=[ProviderCapability.CHAT.value],
+    )
+    repositories.set_model_preference(
+        task="context_search",
+        provider="fake",
+        model_id="fake-context",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-context",
+        display_name="Fake Context",
+        capabilities=[ProviderCapability.TOOL_CALLING.value],
+    )
+    repositories.set_model_preference(
+        task="tool_call_fallback",
+        provider="fallback",
+        model_id="fallback-tools",
+    )
+    repositories.save_provider_model(
+        provider="fallback",
+        model_id="fallback-tools",
+        display_name="Fallback Tools",
+        capabilities=[ProviderCapability.TOOL_CALLING.value],
+    )
+    primary = ToolContextAndChatProvider(
+        "fake",
+        context_model_id="fake-context",
+        tool_error=ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model not found",
+            status_code=404,
+        ),
+    )
+    fallback = ToolContextAndChatProvider(
+        "fallback",
+        context_model_id="fallback-tools",
+        tool_calls=(
+            ProviderToolCall(
+                id="fallback-memory",
+                name="select_context_source",
+                arguments_json=json.dumps(
+                    {
+                        "source_id": memory.id,
+                        "relevance_note": "The bell concern matters now.",
+                    }
+                ),
+            ),
+        ),
+    )
+    context_search = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": primary, "fallback": fallback},
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": primary, "fallback": fallback},
+        context_search_service=context_search,
+    )
+    progress_events: list[Any] = []
+
+    asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I listen for the bell.",
+            speaker_name="Mara",
+            run_post_turn_jobs=False,
+            turn_progress_callback=progress_events.append,
+        )
+    )
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(fallback.tool_call_requests) == 1
+    assert len(primary.chat_requests) == 1
+    narrator_request = primary.chat_requests[0]
+    assert any(memory.body in item for item in narrator_request.retrieved_memories)
+    status_texts = [event.status_text for event in progress_events]
+    assert "Context selected with degraded retrieval" in status_texts
+    final_statuses = {
+        job.name: job.status
+        for job in progress_events[-1].jobs
+    }
+    assert final_statuses["context_selection"] == "degraded"
+    job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
+    assert job_result["context_search_failed"] is False
+    assert job_result["context_search_degraded"] is True
+    assert job_result["context_search_recovery"] == "provider_fallback"
+    assert job_result["context_search_selected_counts"]["memories"] == 1
+    prompt_diagnostics = job_result["prompt_context_diagnostics"]
+    assert prompt_diagnostics["context_search_failed"] is False
+    assert prompt_diagnostics["context_search_degraded"] is True
+    assert prompt_diagnostics["context_search_recovery"] == "provider_fallback"
 
 
 def test_submit_player_turn_propagates_context_search_configuration_errors(

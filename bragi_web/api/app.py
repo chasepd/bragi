@@ -6851,6 +6851,12 @@ def _diagnostic_context_search_summary(value: object) -> dict[str, object] | Non
         "error_present": bool(value.get("error_present")),
         "result_counts": _diagnostic_int_mapping(value.get("result_counts")),
         "diagnostic_keys": diagnostic_keys,
+        "retrieval_degraded": value.get("retrieval_degraded") is True,
+        "retrieval_recovery": (
+            value.get("retrieval_recovery")
+            if isinstance(value.get("retrieval_recovery"), str)
+            else None
+        ),
     }
 
 

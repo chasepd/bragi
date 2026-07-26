@@ -89,6 +89,49 @@ def test_snapshot_classifies_manual_character_reference_request() -> None:
     }
 
 
+def test_snapshot_includes_context_search_degradation_metadata() -> None:
+    job = JobRecord(
+        id="job-context",
+        save_id="save-1",
+        type="context_search",
+        status="succeeded",
+        payload={"provider": "fake", "model": "fake-context"},
+        result={
+            "retrieval_degraded": True,
+            "retrieval_recovery": "provider_fallback",
+            "final_provider": "fallback",
+            "final_model": "fallback-tools",
+            "fallback_used": True,
+            "fallback_provider": "fallback",
+            "fallback_model": "fallback-tools",
+            "error_category": "model_not_found",
+            "http_status": 404,
+            "raw_prompt": "secret roleplay prompt",
+        },
+        error=None,
+    )
+
+    snapshot = build_job_diagnostic_snapshot(job)
+    public = redact_job_diagnostic_snapshot(snapshot, include_prompt=False)
+
+    assert snapshot["provider"] == {
+        "provider": "fake",
+        "model": "fake-context",
+        "retrieval_degraded": True,
+        "retrieval_recovery": "provider_fallback",
+        "final_provider": "fallback",
+        "final_model": "fallback-tools",
+        "fallback_used": True,
+        "fallback_provider": "fallback",
+        "fallback_model": "fallback-tools",
+        "error_category": "model_not_found",
+        "http_status": 404,
+    }
+    assert public["provider"] == snapshot["provider"]
+    assert "secret roleplay prompt" not in repr(snapshot)
+    assert "secret roleplay prompt" not in repr(public)
+
+
 def test_snapshot_preserves_explicit_text_message_origin_and_admin_prompt() -> None:
     job = JobRecord(
         id="job-2",

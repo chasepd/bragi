@@ -1665,10 +1665,16 @@ class ChatService:
                 )
                 result = ContextSearchResult()
                 failed = True
+            context_status = "degraded" if result.retrieval_degraded else "succeeded"
+            context_status_text = (
+                "Context selected with degraded retrieval"
+                if result.retrieval_degraded
+                else "Context selected"
+            )
             turn_progress.publish(
                 "context_selection",
-                "succeeded",
-                "Context selected",
+                context_status,
+                context_status_text,
             )
             _log_chat_stage(
                 "chat.stage.context_search_finished",
@@ -1676,6 +1682,8 @@ class ChatService:
                 started_at=stage_started,
                 player_message_id=player_message.id,
                 context_search_failed=failed,
+                context_search_degraded=result.retrieval_degraded,
+                context_search_recovery=result.retrieval_recovery,
                 scenario_section_count=len(result.selected_scenario_sections),
                 state_count=len(result.selected_state),
                 memory_count=len(result.selected_memories),
@@ -2572,6 +2580,8 @@ class ChatService:
             prompt_context_diagnostics = _chat_prompt_context_diagnostics(
                 request,
                 context_search_failed=context_search_failed,
+                context_search_degraded=context_result.retrieval_degraded,
+                context_search_recovery=context_result.retrieval_recovery,
             )
             self.jobs.succeed(
                 job.id,
@@ -2583,6 +2593,12 @@ class ChatService:
                     "model": response.model_id,
                     "token_usage": response.token_usage,
                     "context_search_failed": context_search_failed,
+                    "context_search_degraded": context_result.retrieval_degraded,
+                    **(
+                        {"context_search_recovery": context_result.retrieval_recovery}
+                        if context_result.retrieval_recovery is not None
+                        else {}
+                    ),
                     "context_search_selected_counts": (
                         _context_search_selected_counts(context_result)
                     ),
@@ -8336,6 +8352,8 @@ def _chat_prompt_context_diagnostics(
     request: ChatRequest,
     *,
     context_search_failed: bool,
+    context_search_degraded: bool,
+    context_search_recovery: str | None,
 ) -> dict[str, object]:
     baseline_messages = request.messages[:-1] if request.messages else ()
     final_budget = request.context_breakdown.get("final_prompt_budget")
@@ -8343,6 +8361,12 @@ def _chat_prompt_context_diagnostics(
     withheld_chars = request.context_breakdown.get("narrator_context_withheld_chars")
     return {
         "context_search_failed": context_search_failed,
+        "context_search_degraded": context_search_degraded,
+        **(
+            {"context_search_recovery": context_search_recovery}
+            if context_search_recovery is not None
+            else {}
+        ),
         "narrator_mode": request.narrator_prompt_mode,
         "narrator_mode_reason": request.context_breakdown.get(
             "narrator_mode_reason",

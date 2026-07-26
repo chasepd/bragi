@@ -193,6 +193,20 @@ class SequenceToolContextProvider(RecordingStructuredContextProvider):
         )
 
 
+class FallbackToolContextProvider(SequenceToolContextProvider):
+    provider_name = "fallback"
+
+    async def list_models(self) -> list[ProviderModel]:
+        return [
+            ProviderModel(
+                provider=self.provider_name,
+                model_id="fallback-tools",
+                display_name="Fallback Tools",
+                capabilities=frozenset({ProviderCapability.TOOL_CALLING}),
+            )
+        ]
+
+
 class ScenarioSectionSelectingProvider(RecordingStructuredContextProvider):
     def __init__(self, *, selected_text: str) -> None:
         super().__init__()
@@ -1210,6 +1224,248 @@ def test_context_search_tool_no_selection_stays_empty(
     assert jobs[-1]["status"] == "succeeded"
     assert jobs[-1]["result_json"] is not None
     assert "deterministic fallback" not in jobs[-1]["result_json"]
+
+
+def test_context_search_uses_tool_fallback_when_primary_model_not_found(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(
+        repositories,
+        model_capabilities=[ProviderCapability.TOOL_CALLING.value],
+    )
+    source_message = next(
+        message
+        for message in repositories.list_messages(save.id)
+        if message.role == "narrator"
+    )
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="Mara distrusts bells that ring without wind.",
+        tags=["bells"],
+        source_message_id=source_message.id,
+    )
+    _configure_tool_fallback(repositories)
+    primary = SequenceToolContextProvider(
+        responses=[
+            ProviderError(
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "model not found",
+                status_code=404,
+            )
+        ]
+    )
+    fallback = FallbackToolContextProvider(
+        responses=[
+            (
+                ProviderToolCall(
+                    id="fallback-memory",
+                    name="select_context_source",
+                    arguments_json=json.dumps(
+                        {
+                            "source_id": memory.id,
+                            "relevance_note": "The bell concern matters now.",
+                        }
+                    ),
+                ),
+            )
+        ]
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": primary, "fallback": fallback},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(fallback.tool_call_requests) == 1
+    assert fallback.tool_call_requests[0].provider == "fallback"
+    assert fallback.tool_call_requests[0].model_id == "fallback-tools"
+    assert [item.source_id for item in result.selected_memories] == [memory.id]
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "provider_fallback"
+    assert [
+        model.available
+        for model in repositories.list_provider_models("fake")
+        if model.model_id == "fake-context"
+    ] == [False]
+    job_result = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    assert job_result["retrieval_degraded"] is True
+    assert job_result["retrieval_recovery"] == "provider_fallback"
+    assert job_result["fallback_used"] is True
+    assert job_result["fallback_provider"] == "fallback"
+    assert job_result["fallback_model"] == "fallback-tools"
+    assert job_result["error_category"] == ProviderErrorCategory.MODEL_NOT_FOUND.value
+    assert job_result["http_status"] == 404
+
+
+def test_context_search_uses_deterministic_fallback_when_tool_provider_fails(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(
+        repositories,
+        model_capabilities=[ProviderCapability.TOOL_CALLING.value],
+    )
+    state = repositories.list_world_state(save.id)[0]
+    provider = SequenceToolContextProvider(
+        responses=[
+            ProviderError(
+                ProviderErrorCategory.RATE_LIMITED,
+                "rate limited",
+                status_code=429,
+            )
+        ]
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert len(provider.tool_call_requests) == 1
+    assert [item.source_id for item in result.selected_state] == [state.id]
+    assert result.selected_state[0].relevance_note == (
+        "Selected by deterministic fallback after empty context selection."
+    )
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "deterministic_fallback"
+    job_result = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    assert job_result["retrieval_degraded"] is True
+    assert job_result["retrieval_recovery"] == "deterministic_fallback"
+    assert job_result["fallback_used"] is False
+    assert job_result["fallback_skipped_reason"] == "no_fallback_model"
+
+
+def test_context_search_uses_deterministic_fallback_when_tool_fallback_fails(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(
+        repositories,
+        model_capabilities=[ProviderCapability.TOOL_CALLING.value],
+    )
+    state = repositories.list_world_state(save.id)[0]
+    _configure_tool_fallback(repositories)
+    primary = SequenceToolContextProvider(
+        responses=[
+            ProviderError(
+                ProviderErrorCategory.RATE_LIMITED,
+                "rate limited",
+                status_code=429,
+            )
+        ]
+    )
+    fallback = FallbackToolContextProvider(
+        responses=[
+            ProviderError(
+                ProviderErrorCategory.PROVIDER_ERROR,
+                "fallback provider failed",
+                status_code=500,
+            )
+        ]
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": primary, "fallback": fallback},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(fallback.tool_call_requests) == 1
+    assert [item.source_id for item in result.selected_state] == [state.id]
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "deterministic_fallback"
+    job_result = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    assert job_result["retrieval_degraded"] is True
+    assert job_result["retrieval_recovery"] == "deterministic_fallback"
+    assert job_result["fallback_provider"] == "fallback"
+    assert job_result["fallback_model"] == "fallback-tools"
+    assert job_result["fallback_used"] is False
+    assert job_result["error_category"] == ProviderErrorCategory.PROVIDER_ERROR.value
+    assert job_result["http_status"] == 500
+
+
+def test_context_search_circuit_breaks_model_not_found_until_catalog_refresh(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(
+        repositories,
+        model_capabilities=[ProviderCapability.TOOL_CALLING.value],
+    )
+    source_message = next(
+        message
+        for message in repositories.list_messages(save.id)
+        if message.role == "narrator"
+    )
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="Mara promised Orin she would not break the bridge oath.",
+        tags=["orin", "promise"],
+        source_message_id=source_message.id,
+    )
+    provider = SequenceToolContextProvider(
+        responses=[
+            ProviderError(
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "model not found",
+                status_code=404,
+            )
+        ]
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    first = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+    second = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+    provider.responses.append(
+        (
+            ProviderToolCall(
+                id="refreshed-memory",
+                name="select_context_source",
+                arguments_json=json.dumps(
+                    {
+                        "source_id": memory.id,
+                        "relevance_note": "The promise matters after refresh.",
+                    }
+                ),
+            ),
+        )
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-context",
+        display_name="Fake Context",
+        capabilities=[ProviderCapability.TOOL_CALLING.value],
+    )
+    third = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert len(provider.tool_call_requests) == 2
+    assert first.retrieval_recovery == "deterministic_fallback"
+    assert second.retrieval_recovery == "deterministic_fallback"
+    assert [item.source_id for item in third.selected_memories] == [memory.id]
+    assert third.retrieval_degraded is False
+    assert third.retrieval_recovery is None
 
 
 def test_context_search_filters_character_scoped_knowledge_by_present_character(
@@ -2660,8 +2916,86 @@ def test_context_search_uses_structured_fallback_when_primary_blocks(
     assert fallback.structured_output_requests[0].provider == "fallback"
     assert fallback.structured_output_requests[0].model_id == "fallback-structured"
     assert [item.source_id for item in result.selected_memories] == [memory.id]
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "provider_fallback"
     jobs = _context_search_jobs(repositories, save.id)
     assert jobs[-1]["status"] == "succeeded"
+
+
+def test_context_search_uses_structured_fallback_after_primary_model_circuit_break(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    source_message = next(
+        message
+        for message in repositories.list_messages(save.id)
+        if message.role == "narrator"
+    )
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="Mara distrusts bells that ring without wind.",
+        tags=["bells"],
+        source_message_id=source_message.id,
+    )
+    repositories.set_app_setting("structured_output_fallback_enabled", True)
+    repositories.save_provider_model(
+        provider="fallback",
+        model_id="fallback-structured",
+        display_name="Fallback Structured",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task="structured_output_fallback",
+        provider="fallback",
+        model_id="fallback-structured",
+    )
+    primary = FailingStructuredContextProvider(
+        ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "primary structured output model missing",
+            status_code=404,
+        )
+    )
+    fallback = FallbackStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": memory.id,
+                    "relevance_note": "The bell concern matters now.",
+                },
+            ]
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": primary, "fallback": fallback},
+    )
+
+    first = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+    second = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert len(primary.structured_output_requests) == 1
+    assert len(fallback.structured_output_requests) == 2
+    assert [item.source_id for item in first.selected_memories] == [memory.id]
+    assert [item.source_id for item in second.selected_memories] == [memory.id]
+    assert first.retrieval_recovery == "provider_fallback"
+    assert second.retrieval_recovery == "provider_fallback"
+    assert [
+        model.available
+        for model in repositories.list_provider_models("fake")
+        if model.model_id == "fake-context"
+    ] == [False]
+    job_result = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    assert job_result["fallback_used"] is True
+    assert job_result["fallback_provider"] == "fallback"
+    assert job_result["fallback_model"] == "fallback-structured"
 
 
 def test_context_search_structured_empty_selection_stays_empty(
@@ -2743,10 +3077,11 @@ def test_context_search_selected_items_use_selector_visible_excerpt(
     assert job_result["selected_memories"][0]["excerpted"] is True
 
 
-def test_context_search_rejects_unknown_structured_selection_ids(
+def test_context_search_recovers_from_unknown_structured_selection_ids(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(repositories)
+    state = repositories.list_world_state(save.id)[0]
     provider = RecordingStructuredContextProvider(
         {
             "selections": [
@@ -2763,17 +3098,22 @@ def test_context_search_rejects_unknown_structured_selection_ids(
         providers={"fake": provider},
     )
 
-    with pytest.raises(ValueError, match="Unknown context source_id"):
-        asyncio.run(
-            service.search(save_id=save.id, player_message_id=player_message.id)
-        )
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
 
     assert provider.chat_requests == []
     assert len(provider.structured_output_requests) == 1
+    assert [item.source_id for item in result.selected_state] == [state.id]
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "deterministic_fallback"
     jobs = _context_search_jobs(repositories, save.id)
-    assert jobs[-1]["status"] == "failed"
-    assert "Unknown context source_id" in jobs[-1]["error"]
-    assert jobs[-1]["result_json"] is None
+    assert jobs[-1]["status"] == "succeeded"
+    assert jobs[-1]["error"] is None
+    job_result = json.loads(jobs[-1]["result_json"])
+    assert job_result["retrieval_degraded"] is True
+    assert job_result["retrieval_recovery"] == "deterministic_fallback"
+    assert job_result["fallback_used"] is False
 
 
 def test_context_search_normalizes_mismatched_source_type_by_source_id(
@@ -2878,10 +3218,11 @@ def test_context_search_rejects_missing_catalog_row_for_selected_model(
     assert jobs[-1]["result_json"] is None
 
 
-def test_context_search_rejects_unavailable_selected_model(
+def test_context_search_recovers_from_unavailable_selected_model(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(repositories)
+    state = repositories.list_world_state(save.id)[0]
     repositories.mark_missing_provider_models_unavailable(
         provider="fake",
         available_model_ids=set(),
@@ -2892,17 +3233,22 @@ def test_context_search_rejects_unavailable_selected_model(
         providers={"fake": provider},
     )
 
-    with pytest.raises(ValueError, match="model is unavailable"):
-        asyncio.run(
-            service.search(save_id=save.id, player_message_id=player_message.id)
-        )
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
 
     assert provider.chat_requests == []
     assert provider.structured_output_requests == []
+    assert [item.source_id for item in result.selected_state] == [state.id]
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "deterministic_fallback"
     jobs = _context_search_jobs(repositories, save.id)
-    assert jobs[-1]["status"] == "failed"
-    assert "model is unavailable" in jobs[-1]["error"]
-    assert jobs[-1]["result_json"] is None
+    assert jobs[-1]["status"] == "succeeded"
+    assert jobs[-1]["error"] is None
+    job_result = json.loads(jobs[-1]["result_json"])
+    assert job_result["retrieval_degraded"] is True
+    assert job_result["retrieval_recovery"] == "deterministic_fallback"
+    assert job_result["fallback_skipped_reason"] == "no_fallback_model"
 
 
 def test_context_search_marks_job_failed_when_preferred_provider_is_missing(
@@ -3699,9 +4045,11 @@ def test_precompute_next_turn_persists_metadata_only_job_result(
         "message": 2,
     }
     assert result["indexed_retrieval_enabled"] is True
+    assert isinstance(result["indexed_retrieval_query_term_count"], int)
     assert result["indexed_retrieval_hit_count"] == 0
     assert isinstance(result["cache_digest"], str)
     assert isinstance(result["duration_ms"], int)
+    assert "indexed_retrieval_query_terms" not in result
     assert "Bridge of Cinders" not in raw_result
     assert "Cinders drift over the bridge stones." not in raw_result
     assert "silver bell" not in raw_result
@@ -3879,10 +4227,12 @@ def test_context_search_cache_hit_narrows_candidates_with_new_player_message(
     diagnostics = job_result["diagnostics"]
     assert diagnostics["cache_status"] == "hit"
     assert diagnostics["indexed_retrieval_enabled"] is True
+    assert diagnostics["indexed_retrieval_query_term_count"] > 0
     assert diagnostics["indexed_retrieval_hit_count"] >= 1
     assert diagnostics["indexed_retrieval_hit_count"] < MAX_CONTEXT_CANDIDATE_POOL
     assert diagnostics["candidate_count_after_narrowing"] < MAX_CONTEXT_CANDIDATE_POOL
     assert diagnostics["first_pass_source_type_counts"]["memory"] >= 1
+    assert "indexed_retrieval_query_terms" not in diagnostics
     assert "Routine bridge ledger entry 000" not in json.dumps(diagnostics)
 
 
@@ -4169,6 +4519,20 @@ def _save_with_context_search_preference_without_candidates(
         ),
     )
     return save, player_message
+
+
+def _configure_tool_fallback(repositories: PersistenceRepositories) -> None:
+    repositories.set_model_preference(
+        task="tool_call_fallback",
+        provider="fallback",
+        model_id="fallback-tools",
+    )
+    repositories.save_provider_model(
+        provider="fallback",
+        model_id="fallback-tools",
+        display_name="Fallback Tools",
+        capabilities=[ProviderCapability.TOOL_CALLING.value],
+    )
 
 
 def _context_search_jobs(

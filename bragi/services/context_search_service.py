@@ -42,6 +42,7 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolDefinition,
 )
+from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.redaction import redact_text
 from bragi.services.context_assembly import scenario_section_candidates
 from bragi.services.continuity_index_service import ContinuityIndexService
@@ -60,7 +61,9 @@ from bragi.services.model_capabilities import (
     STRUCTURED_OUTPUT_CAPABILITIES,
     TOOL_CALLING_CAPABILITIES,
     check_model_capabilities,
+    find_provider_model,
     model_supports_any_capability,
+    normalized_capabilities,
 )
 from bragi.services.model_preferences import roleplay_model_preference
 from bragi.services.narration_context import (
@@ -72,7 +75,11 @@ from bragi.services.openrouter_routing_settings import (
     request_with_openrouter_routing,
 )
 from bragi.services.provider_fallbacks import (
+    structured_output_fallback_request,
+    structured_output_fallback_skip_reason,
     structured_output_with_fallback,
+    tool_call_fallback_request,
+    tool_call_fallback_skip_reason,
 )
 from bragi.services.tool_call_helpers import (
     CONTEXT_SEARCH_TOOL_RETRY_INSTRUCTION,
@@ -117,6 +124,8 @@ RELATIVE_PATH_PATTERN = re.compile(
 )
 BASE64_LIKE_TOKEN_PATTERN = re.compile(r"\b(?:[A-Za-z0-9+/]{40,}={0,2}\s*){2,}")
 CONTEXT_SEARCH_SELECTION_TOOL = "select_context_source"
+CONTEXT_RETRIEVAL_RECOVERY_PROVIDER_FALLBACK = "provider_fallback"
+CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC = "deterministic_fallback"
 
 
 @dataclass(frozen=True)
@@ -149,6 +158,8 @@ class ContextSearchResult:
     selected_summaries: tuple[SelectedContextItem, ...] = ()
     selected_recent_messages: tuple[SelectedContextItem, ...] = ()
     continuity_index_synced: bool = False
+    retrieval_degraded: bool = False
+    retrieval_recovery: str | None = None
     narration_snapshot: NarrationContextSnapshot | None = field(
         default=None,
         compare=False,
@@ -231,6 +242,16 @@ class _NextTurnContextCacheEntry:
 class _ContextSelectionOutcome:
     result: ContextSearchResult
     fallback_allowed: bool = False
+    primary_provider: str | None = None
+    primary_model_id: str | None = None
+    final_provider: str | None = None
+    final_model_id: str | None = None
+    fallback_used: bool = False
+    fallback_provider: str | None = None
+    fallback_model_id: str | None = None
+    fallback_skipped_reason: str | None = None
+    error_category: str | None = None
+    http_status: int | None = None
 
 
 class ContextSearchService:
@@ -412,44 +433,6 @@ class ContextSearchService:
         )
         try:
             provider = self.providers[preference.provider]
-            requirement_error = _model_requirement_error(
-                repositories=self.repositories,
-                provider=preference.provider,
-                model_id=preference.model_id,
-            )
-            if requirement_error is not None:
-                raise ValueError(requirement_error)
-            supports_tool_calling = _model_supports_tool_calling(
-                repositories=self.repositories,
-                provider=preference.provider,
-                model_id=preference.model_id,
-            )
-            supports_structured_output = _model_supports_structured_output(
-                repositories=self.repositories,
-                provider=preference.provider,
-                model_id=preference.model_id,
-            )
-            if not supports_tool_calling and not supports_structured_output:
-                raise ValueError(
-                    "Context-search model does not advertise structured output "
-                    "or tool calling"
-                )
-            tool_provider = (
-                cast(ToolCallProvider, provider)
-                if supports_tool_calling and isinstance(provider, ToolCallProvider)
-                else None
-            )
-            structured_provider = (
-                cast(StructuredOutputProvider, provider)
-                if supports_structured_output
-                and isinstance(provider, StructuredOutputProvider)
-                else None
-            )
-            if tool_provider is None and structured_provider is None:
-                raise ValueError(
-                    "Context-search provider does not support structured output "
-                    "or tool calling"
-                )
             details = self.repositories.load_save_details(save_id)
             if details is None:
                 raise ValueError(f"Unknown save id: {save_id}")
@@ -564,11 +547,103 @@ class ContextSearchService:
                 cache_status=cache_status,
                 **_candidate_count_fields(candidates),
             )
+            requirement_error = _model_requirement_error(
+                repositories=self.repositories,
+                provider=preference.provider,
+                model_id=preference.model_id,
+            )
+            primary_model_unavailable = _model_is_unavailable(
+                repositories=self.repositories,
+                provider=preference.provider,
+                model_id=preference.model_id,
+            )
+            if requirement_error is not None and not primary_model_unavailable:
+                raise ValueError(requirement_error)
+            supports_tool_calling = _model_supports_tool_calling(
+                repositories=self.repositories,
+                provider=preference.provider,
+                model_id=preference.model_id,
+            )
+            supports_structured_output = _model_supports_structured_output(
+                repositories=self.repositories,
+                provider=preference.provider,
+                model_id=preference.model_id,
+            )
+            advertises_tool_calling = _model_advertises_tool_calling(
+                repositories=self.repositories,
+                provider=preference.provider,
+                model_id=preference.model_id,
+            )
+            advertises_structured_output = _model_advertises_structured_output(
+                repositories=self.repositories,
+                provider=preference.provider,
+                model_id=preference.model_id,
+            )
+            if (
+                not primary_model_unavailable
+                and not supports_tool_calling
+                and not supports_structured_output
+            ):
+                raise ValueError(
+                    "Context-search model does not advertise structured output "
+                    "or tool calling"
+                )
+            tool_provider = (
+                cast(ToolCallProvider, provider)
+                if supports_tool_calling and isinstance(provider, ToolCallProvider)
+                else None
+            )
+            structured_provider = (
+                cast(StructuredOutputProvider, provider)
+                if supports_structured_output
+                and isinstance(provider, StructuredOutputProvider)
+                else None
+            )
+            if (
+                not primary_model_unavailable
+                and tool_provider is None
+                and structured_provider is None
+            ):
+                raise ValueError(
+                    "Context-search provider does not support structured output "
+                    "or tool calling"
+                )
             if not candidates:
-                selection = _ContextSelectionOutcome(ContextSearchResult())
+                selection = _ContextSelectionOutcome(
+                    ContextSearchResult(),
+                    primary_provider=preference.provider,
+                    primary_model_id=preference.model_id,
+                )
+            elif primary_model_unavailable and advertises_tool_calling:
+                selection = await _select_context_with_unavailable_tool_route(
+                    repositories=self.repositories,
+                    providers=self.providers,
+                    provider_name=preference.provider,
+                    model_id=preference.model_id,
+                    save_id=save_id,
+                    scenario=scenario,
+                    player_message=player_message,
+                    candidates=candidates,
+                )
+            elif primary_model_unavailable and advertises_structured_output:
+                selection = await _select_context_with_unavailable_structured_route(
+                    repositories=self.repositories,
+                    providers=self.providers,
+                    provider_name=preference.provider,
+                    model_id=preference.model_id,
+                    save_id=save_id,
+                    scenario=scenario,
+                    player_message=player_message,
+                    candidates=candidates,
+                )
+            elif primary_model_unavailable:
+                raise ValueError(
+                    requirement_error or "Context-search model is unavailable"
+                )
             elif tool_provider is not None:
                 selection = await _select_context_with_tool_calls(
                     repositories=self.repositories,
+                    providers=self.providers,
                     provider=tool_provider,
                     provider_name=preference.provider,
                     model_id=preference.model_id,
@@ -595,6 +670,17 @@ class ContextSearchService:
                 and _context_result_is_empty(result)
             ):
                 result = _fallback_context_result(candidates)
+                result = replace(
+                    result,
+                    retrieval_degraded=True,
+                    retrieval_recovery=CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC,
+                )
+                selection = replace(
+                    selection,
+                    result=result,
+                    fallback_allowed=False,
+                    fallback_used=False,
+                )
                 log_event(
                     "context_search.fallback_selected",
                     save_id=save_id,
@@ -664,6 +750,7 @@ class ContextSearchService:
                     "cache_status": cache_status,
                     **candidate_diagnostics.to_json(),
                 },
+                selection=selection,
             ),
         )
         log_event(
@@ -731,7 +818,7 @@ def _indexed_context_source_retrieval(
         records=tuple(records),
         diagnostics={
             "indexed_retrieval_enabled": True,
-            "indexed_retrieval_query_terms": query_terms,
+            "indexed_retrieval_query_term_count": len(query_terms),
             "indexed_retrieval_hit_count": len(hits),
             "protected_context_source_count": len(protected),
             "indexed_retrieval_duration_ms": _elapsed_ms(started_at),
@@ -1003,7 +1090,14 @@ async def _select_context_with_structured_output(
             task="context_search",
             save_id=save_id,
         )
-    except Exception as exc:
+        result = _context_result_from_structured_data(response.data, candidates)
+    except ProviderError as exc:
+        _mark_provider_model_unavailable_for_error(
+            repositories,
+            provider=provider_name,
+            model_id=model_id,
+            exc=exc,
+        )
         log_error_event(
             "provider.structured_output_failed",
             provider=provider_name,
@@ -1013,7 +1107,28 @@ async def _select_context_with_structured_output(
             candidate_count=len(candidates),
             **exception_log_fields(exc),
         )
-        raise
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=provider_name,
+            primary_model_id=model_id,
+            exc=exc,
+        )
+    except (TimeoutError, ValueError, TypeError) as exc:
+        log_error_event(
+            "provider.structured_output_failed",
+            provider=provider_name,
+            model=model_id,
+            task="context_search",
+            duration_ms=_elapsed_ms(started_at),
+            candidate_count=len(candidates),
+            **exception_log_fields(exc),
+        )
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=provider_name,
+            primary_model_id=model_id,
+            error_category="schema_validation_failed",
+        )
     log_event(
         "provider.structured_output_succeeded",
         provider=response.provider,
@@ -1024,14 +1139,208 @@ async def _select_context_with_structured_output(
         player_message_chars=len(player_message),
         token_usage=response.token_usage,
     )
+    fallback_used = (
+        response.provider != provider_name or response.model_id != model_id
+    )
+    if fallback_used:
+        result = replace(
+            result,
+            retrieval_degraded=True,
+            retrieval_recovery=CONTEXT_RETRIEVAL_RECOVERY_PROVIDER_FALLBACK,
+        )
     return _ContextSelectionOutcome(
-        _context_result_from_structured_data(response.data, candidates)
+        result,
+        primary_provider=provider_name,
+        primary_model_id=model_id,
+        final_provider=response.provider,
+        final_model_id=response.model_id,
+        fallback_used=fallback_used,
+        fallback_provider=response.provider if fallback_used else None,
+        fallback_model_id=response.model_id if fallback_used else None,
+    )
+
+
+async def _select_context_with_unavailable_structured_route(
+    *,
+    repositories: PersistenceRepositories,
+    providers: dict[str, ProviderClient],
+    provider_name: str,
+    model_id: str,
+    save_id: str,
+    scenario: ScenarioRecord | None,
+    player_message: str,
+    candidates: tuple[_ContextCandidate, ...],
+) -> _ContextSelectionOutcome:
+    request = request_with_openrouter_routing(
+        repositories,
+        StructuredOutputRequest(
+            provider=provider_name,
+            model_id=model_id,
+            schema_name="context_search_selection",
+            schema=_context_selection_schema(candidates),
+            messages=_context_selection_messages(
+                scenario=scenario,
+                player_message=player_message,
+                candidates=candidates,
+            ),
+            temperature=0.0,
+        ),
+        task="context_search",
+        save_id=save_id,
+    )
+    log_event(
+        "context_search.primary_model_unavailable",
+        provider=provider_name,
+        model=model_id,
+        task="context_search",
+    )
+    return await _recover_context_structured_selection(
+        repositories=repositories,
+        providers=providers,
+        request=request,
+        candidates=candidates,
+        save_id=save_id,
+        primary_error=None,
+    )
+
+
+async def _recover_context_structured_selection(
+    *,
+    repositories: PersistenceRepositories,
+    providers: dict[str, ProviderClient],
+    request: StructuredOutputRequest,
+    candidates: tuple[_ContextCandidate, ...],
+    save_id: str | None,
+    primary_error: Exception | None,
+) -> _ContextSelectionOutcome:
+    fallback_request = structured_output_fallback_request(
+        repositories=repositories,
+        providers=providers,
+        request=request,
+        save_id=save_id,
+        task="context_search",
+    )
+    if fallback_request is None:
+        reason = structured_output_fallback_skip_reason(
+            repositories=repositories,
+            providers=providers,
+            save_id=save_id,
+        )
+        log_event(
+            "provider.structured_output_fallback_skipped",
+            provider=request.provider,
+            model=request.model_id,
+            task="context_search",
+            reason=reason,
+        )
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=request.provider,
+            primary_model_id=request.model_id,
+            fallback_skipped_reason=reason,
+            exc=primary_error,
+        )
+    fallback_provider: object | None = providers.get(fallback_request.provider)
+    if not isinstance(fallback_provider, StructuredOutputProvider):
+        reason = "fallback_provider_unavailable"
+        log_event(
+            "provider.structured_output_fallback_skipped",
+            provider=request.provider,
+            model=request.model_id,
+            task="context_search",
+            reason=reason,
+        )
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=request.provider,
+            primary_model_id=request.model_id,
+            fallback_provider=fallback_request.provider,
+            fallback_model_id=fallback_request.model_id,
+            fallback_skipped_reason=reason,
+            exc=primary_error,
+        )
+    log_event(
+        "provider.structured_output_fallback_started",
+        provider=fallback_request.provider,
+        model=fallback_request.model_id,
+        task="context_search",
+    )
+    try:
+        response = await fallback_provider.generate_structured_output(
+            fallback_request
+        )
+        result = _context_result_from_structured_data(response.data, candidates)
+    except ProviderError as exc:
+        _mark_provider_model_unavailable_for_error(
+            repositories,
+            provider=fallback_request.provider,
+            model_id=fallback_request.model_id,
+            exc=exc,
+        )
+        log_error_event(
+            "provider.structured_output_fallback_failed",
+            provider=fallback_request.provider,
+            model=fallback_request.model_id,
+            task="context_search",
+            candidate_count=len(candidates),
+            **exception_log_fields(exc),
+        )
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=request.provider,
+            primary_model_id=request.model_id,
+            fallback_provider=fallback_request.provider,
+            fallback_model_id=fallback_request.model_id,
+            exc=exc,
+        )
+    except (TimeoutError, ValueError, TypeError) as exc:
+        log_error_event(
+            "provider.structured_output_fallback_failed",
+            provider=fallback_request.provider,
+            model=fallback_request.model_id,
+            task="context_search",
+            candidate_count=len(candidates),
+            **exception_log_fields(exc),
+        )
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=request.provider,
+            primary_model_id=request.model_id,
+            fallback_provider=fallback_request.provider,
+            fallback_model_id=fallback_request.model_id,
+            error_category="schema_validation_failed",
+        )
+    log_event(
+        "provider.structured_output_succeeded",
+        provider=response.provider,
+        model=response.model_id,
+        task="context_search",
+        candidate_count=len(candidates),
+        token_usage=response.token_usage,
+    )
+    result = replace(
+        result,
+        retrieval_degraded=True,
+        retrieval_recovery=CONTEXT_RETRIEVAL_RECOVERY_PROVIDER_FALLBACK,
+    )
+    return _ContextSelectionOutcome(
+        result,
+        primary_provider=request.provider,
+        primary_model_id=request.model_id,
+        final_provider=response.provider,
+        final_model_id=response.model_id,
+        fallback_used=True,
+        fallback_provider=fallback_request.provider,
+        fallback_model_id=fallback_request.model_id,
+        error_category=_error_category(primary_error),
+        http_status=_http_status(primary_error),
     )
 
 
 async def _select_context_with_tool_calls(
     *,
     repositories: PersistenceRepositories,
+    providers: dict[str, ProviderClient],
     provider: ToolCallProvider,
     provider_name: str,
     model_id: str,
@@ -1073,8 +1382,25 @@ async def _select_context_with_tool_calls(
             candidate_count=len(candidates),
             error=str(exc),
         )
-        return _ContextSelectionOutcome(ContextSearchResult(), fallback_allowed=True)
-    except Exception as exc:
+        return _ContextSelectionOutcome(
+            ContextSearchResult(
+                retrieval_degraded=True,
+                retrieval_recovery=CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC,
+            ),
+            fallback_allowed=True,
+            primary_provider=provider_name,
+            primary_model_id=model_id,
+            final_provider=provider_name,
+            final_model_id=model_id,
+            error_category="schema_validation_failed",
+        )
+    except ProviderError as exc:
+        _mark_provider_model_unavailable_for_error(
+            repositories,
+            provider=provider_name,
+            model_id=model_id,
+            exc=exc,
+        )
         log_error_event(
             "provider.tool_call_failed",
             provider=provider_name,
@@ -1084,7 +1410,32 @@ async def _select_context_with_tool_calls(
             candidate_count=len(candidates),
             **exception_log_fields(exc),
         )
-        raise
+        return await _recover_context_tool_selection(
+            repositories=repositories,
+            providers=providers,
+            request=request,
+            candidates=candidates,
+            save_id=save_id,
+            primary_error=exc,
+        )
+    except TimeoutError as exc:
+        log_error_event(
+            "provider.tool_call_failed",
+            provider=provider_name,
+            model=model_id,
+            task="context_search",
+            duration_ms=_elapsed_ms(started_at),
+            candidate_count=len(candidates),
+            **exception_log_fields(exc),
+        )
+        return await _recover_context_tool_selection(
+            repositories=repositories,
+            providers=providers,
+            request=request,
+            candidates=candidates,
+            save_id=save_id,
+            primary_error=exc,
+        )
     log_event(
         "provider.tool_call_succeeded",
         provider=provider_name,
@@ -1094,7 +1445,253 @@ async def _select_context_with_tool_calls(
         candidate_count=len(candidates),
         player_message_chars=len(player_message),
     )
-    return _ContextSelectionOutcome(result)
+    return _ContextSelectionOutcome(
+        result,
+        primary_provider=provider_name,
+        primary_model_id=model_id,
+        final_provider=provider_name,
+        final_model_id=model_id,
+    )
+
+
+async def _select_context_with_unavailable_tool_route(
+    *,
+    repositories: PersistenceRepositories,
+    providers: dict[str, ProviderClient],
+    provider_name: str,
+    model_id: str,
+    save_id: str,
+    scenario: ScenarioRecord | None,
+    player_message: str,
+    candidates: tuple[_ContextCandidate, ...],
+) -> _ContextSelectionOutcome:
+    request = request_with_openrouter_routing(
+        repositories,
+        ToolCallRequest(
+            provider=provider_name,
+            model_id=model_id,
+            messages=_context_selection_tool_messages(
+                scenario=scenario,
+                player_message=player_message,
+                candidates=candidates,
+            ),
+            tools=_context_selection_tool_definitions(candidates),
+            temperature=0.0,
+        ),
+        task="context_search",
+        save_id=save_id,
+    )
+    log_event(
+        "context_search.primary_model_unavailable",
+        provider=provider_name,
+        model=model_id,
+        task="context_search",
+    )
+    return await _recover_context_tool_selection(
+        repositories=repositories,
+        providers=providers,
+        request=request,
+        candidates=candidates,
+        save_id=save_id,
+        primary_error=None,
+    )
+
+
+async def _recover_context_tool_selection(
+    *,
+    repositories: PersistenceRepositories,
+    providers: dict[str, ProviderClient],
+    request: ToolCallRequest,
+    candidates: tuple[_ContextCandidate, ...],
+    save_id: str | None,
+    primary_error: Exception | None,
+) -> _ContextSelectionOutcome:
+    fallback_request = tool_call_fallback_request(
+        repositories=repositories,
+        providers=providers,
+        request=request,
+        save_id=save_id,
+    )
+    if fallback_request is None:
+        reason = tool_call_fallback_skip_reason(
+            repositories=repositories,
+            providers=providers,
+            save_id=save_id,
+        )
+        log_event(
+            "provider.tool_call_fallback_skipped",
+            provider=request.provider,
+            model=request.model_id,
+            task="context_search",
+            reason=reason,
+        )
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=request.provider,
+            primary_model_id=request.model_id,
+            fallback_skipped_reason=reason,
+            exc=primary_error,
+        )
+    fallback_provider: object | None = providers.get(fallback_request.provider)
+    if not isinstance(fallback_provider, ToolCallProvider):
+        reason = "fallback_provider_unavailable"
+        log_event(
+            "provider.tool_call_fallback_skipped",
+            provider=request.provider,
+            model=request.model_id,
+            task="context_search",
+            reason=reason,
+        )
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=request.provider,
+            primary_model_id=request.model_id,
+            fallback_provider=fallback_request.provider,
+            fallback_model_id=fallback_request.model_id,
+            fallback_skipped_reason=reason,
+            exc=primary_error,
+        )
+    log_event(
+        "provider.tool_call_fallback_started",
+        provider=fallback_request.provider,
+        model=fallback_request.model_id,
+        task="context_search",
+    )
+    try:
+        result = await _select_context_with_tool_feedback(
+            provider=fallback_provider,
+            request=fallback_request,
+            candidates=candidates,
+        )
+    except _ContextSearchToolValidationFailed as exc:
+        log_error_event(
+            "provider.tool_call_failed",
+            provider=fallback_request.provider,
+            model=fallback_request.model_id,
+            task="context_search",
+            candidate_count=len(candidates),
+            error=str(exc),
+        )
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=request.provider,
+            primary_model_id=request.model_id,
+            fallback_provider=fallback_request.provider,
+            fallback_model_id=fallback_request.model_id,
+            error_category="schema_validation_failed",
+        )
+    except ProviderError as exc:
+        _mark_provider_model_unavailable_for_error(
+            repositories,
+            provider=fallback_request.provider,
+            model_id=fallback_request.model_id,
+            exc=exc,
+        )
+        log_error_event(
+            "provider.tool_call_fallback_failed",
+            provider=fallback_request.provider,
+            model=fallback_request.model_id,
+            task="context_search",
+            candidate_count=len(candidates),
+            **exception_log_fields(exc),
+        )
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=request.provider,
+            primary_model_id=request.model_id,
+            fallback_provider=fallback_request.provider,
+            fallback_model_id=fallback_request.model_id,
+            exc=exc,
+        )
+    except TimeoutError as exc:
+        log_error_event(
+            "provider.tool_call_fallback_failed",
+            provider=fallback_request.provider,
+            model=fallback_request.model_id,
+            task="context_search",
+            candidate_count=len(candidates),
+            **exception_log_fields(exc),
+        )
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=request.provider,
+            primary_model_id=request.model_id,
+            fallback_provider=fallback_request.provider,
+            fallback_model_id=fallback_request.model_id,
+            exc=exc,
+        )
+    result = replace(
+        result,
+        retrieval_degraded=True,
+        retrieval_recovery=CONTEXT_RETRIEVAL_RECOVERY_PROVIDER_FALLBACK,
+    )
+    return _ContextSelectionOutcome(
+        result,
+        primary_provider=request.provider,
+        primary_model_id=request.model_id,
+        final_provider=fallback_request.provider,
+        final_model_id=fallback_request.model_id,
+        fallback_used=True,
+        fallback_provider=fallback_request.provider,
+        fallback_model_id=fallback_request.model_id,
+        error_category=_error_category(primary_error),
+        http_status=_http_status(primary_error),
+    )
+
+
+def _deterministic_context_selection(
+    candidates: tuple[_ContextCandidate, ...],
+    *,
+    primary_provider: str,
+    primary_model_id: str,
+    fallback_provider: str | None = None,
+    fallback_model_id: str | None = None,
+    fallback_skipped_reason: str | None = None,
+    exc: Exception | None = None,
+    error_category: str | None = None,
+    http_status: int | None = None,
+) -> _ContextSelectionOutcome:
+    result = replace(
+        _fallback_context_result(candidates),
+        retrieval_degraded=True,
+        retrieval_recovery=CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC,
+    )
+    return _ContextSelectionOutcome(
+        result,
+        primary_provider=primary_provider,
+        primary_model_id=primary_model_id,
+        fallback_used=False,
+        fallback_provider=fallback_provider,
+        fallback_model_id=fallback_model_id,
+        fallback_skipped_reason=fallback_skipped_reason,
+        error_category=error_category or _error_category(exc),
+        http_status=http_status if http_status is not None else _http_status(exc),
+    )
+
+
+def _error_category(exc: Exception | None) -> str | None:
+    return exc.category.value if isinstance(exc, ProviderError) else None
+
+
+def _http_status(exc: Exception | None) -> int | None:
+    return exc.status_code if isinstance(exc, ProviderError) else None
+
+
+def _mark_provider_model_unavailable_for_error(
+    repositories: PersistenceRepositories,
+    *,
+    provider: str,
+    model_id: str,
+    exc: Exception,
+) -> None:
+    if not isinstance(exc, ProviderError):
+        return
+    if exc.category != ProviderErrorCategory.MODEL_NOT_FOUND:
+        return
+    repositories.mark_provider_model_unavailable(
+        provider=provider,
+        model_id=model_id,
+    )
 
 
 async def _select_context_with_tool_feedback(
@@ -1863,6 +2460,57 @@ def _model_supports_tool_calling(
     )
 
 
+def _model_is_unavailable(
+    *,
+    repositories: PersistenceRepositories,
+    provider: str,
+    model_id: str,
+) -> bool:
+    model = find_provider_model(repositories, provider=provider, model_id=model_id)
+    return model is not None and not model.available
+
+
+def _model_advertises_tool_calling(
+    *,
+    repositories: PersistenceRepositories,
+    provider: str,
+    model_id: str,
+) -> bool:
+    return _model_advertises_any_capability(
+        repositories=repositories,
+        provider=provider,
+        model_id=model_id,
+        required=TOOL_CALLING_CAPABILITIES,
+    )
+
+
+def _model_advertises_structured_output(
+    *,
+    repositories: PersistenceRepositories,
+    provider: str,
+    model_id: str,
+) -> bool:
+    return _model_advertises_any_capability(
+        repositories=repositories,
+        provider=provider,
+        model_id=model_id,
+        required=STRUCTURED_OUTPUT_CAPABILITIES,
+    )
+
+
+def _model_advertises_any_capability(
+    *,
+    repositories: PersistenceRepositories,
+    provider: str,
+    model_id: str,
+    required: frozenset[str],
+) -> bool:
+    model = find_provider_model(repositories, provider=provider, model_id=model_id)
+    if model is None:
+        return False
+    return bool(normalized_capabilities(model.capabilities) & required)
+
+
 def _model_requirement_error(
     *,
     repositories: PersistenceRepositories,
@@ -2520,6 +3168,7 @@ def _result_json(
     result: ContextSearchResult,
     *,
     diagnostics: dict[str, object] | None = None,
+    selection: _ContextSelectionOutcome | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "selected_open_obligations": [
@@ -2549,10 +3198,34 @@ def _result_json(
         "selected_recent_messages": [
             _item_json(item) for item in result.selected_recent_messages
         ],
+        "retrieval_degraded": result.retrieval_degraded,
     }
+    if result.retrieval_recovery is not None:
+        payload["retrieval_recovery"] = result.retrieval_recovery
+    if selection is not None:
+        payload.update(_selection_metadata(selection))
     if diagnostics is not None:
         payload["diagnostics"] = diagnostics
     return payload
+
+
+def _selection_metadata(selection: _ContextSelectionOutcome) -> dict[str, object]:
+    metadata: dict[str, object] = {"fallback_used": selection.fallback_used}
+    for key, value in (
+        ("provider", selection.primary_provider),
+        ("model", selection.primary_model_id),
+        ("final_provider", selection.final_provider),
+        ("final_model", selection.final_model_id),
+        ("fallback_provider", selection.fallback_provider),
+        ("fallback_model", selection.fallback_model_id),
+        ("fallback_skipped_reason", selection.fallback_skipped_reason),
+        ("error_category", selection.error_category),
+    ):
+        if value:
+            metadata[key] = value
+    if selection.http_status is not None:
+        metadata["http_status"] = selection.http_status
+    return metadata
 
 
 def _item_json(item: SelectedContextItem) -> dict[str, object]:
