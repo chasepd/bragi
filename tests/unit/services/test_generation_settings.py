@@ -14,6 +14,7 @@ from bragi.services.generation_settings import (
     CHAT_MAX_OUTPUT_TOKENS_SETTING,
     CHAT_TEMPERATURE_ENABLED_SETTING,
     CHAT_TEMPERATURE_SETTING,
+    DEFAULT_IMAGE_DIMENSION_PRESET,
     IMAGE_DIMENSION_PRESET_SETTING,
     MODEL_THINKING_PREFERENCES_SETTING,
     OPENROUTER_CHAT_REASONING_OVERRIDES_SETTING,
@@ -109,10 +110,31 @@ def test_image_generation_dimensions_require_supported_model(
     assert unsupported is None
 
 
+def test_image_generation_dimensions_default_to_square(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="venice",
+        model_id="venice/image",
+        display_name="Venice Image",
+        capabilities=["image_generation"],
+        supported_parameters=["image_dimensions"],
+    )
+
+    dimensions = image_generation_dimensions(
+        repositories,
+        provider="venice",
+        model_id="venice/image",
+    )
+
+    assert DEFAULT_IMAGE_DIMENSION_PRESET == "square_1024x1024"
+    assert dimensions == (1024, 1024)
+
+
 def test_sanitize_image_dimension_preset_rejects_unknown_values() -> None:
     assert sanitize_image_dimension_preset("wide-1024x576") == "wide_1024x576"
-    assert sanitize_image_dimension_preset("nonsense") == "provider_default"
-    assert sanitize_image_dimension_preset(True) == "provider_default"
+    assert sanitize_image_dimension_preset("nonsense") == "square_1024x1024"
+    assert sanitize_image_dimension_preset(True) == "square_1024x1024"
 
 
 def test_openrouter_reasoning_overrides_sanitize_to_safe_configs() -> None:

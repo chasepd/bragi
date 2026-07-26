@@ -2803,7 +2803,7 @@ def test_import_save_sanitizes_image_style_preset_before_reexport(
         repositories.get_app_setting(
             save_image_style_preset_setting_key(imported_save_id)
         )
-        == "none"
+        == "realistic"
     )
     reexport_path = tmp_path / "reexported.bragi-chat"
     service.export_save(imported_save_id, reexport_path)
@@ -2814,7 +2814,7 @@ def test_import_save_sanitizes_image_style_preset_before_reexport(
         data,
         scope="save",
         key=IMAGE_STYLE_PRESET_SETTING,
-    ) == '"none"'
+    ) == '"realistic"'
 
 
 def test_import_save_sanitizes_post_turn_inference_mode_before_reexport(

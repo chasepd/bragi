@@ -216,7 +216,7 @@ class MediaService:
         repositories: PersistenceRepositories,
         providers: dict[str, ProviderClient],
         media_dir: Path,
-        automatic_enabled: bool = True,
+        automatic_enabled: bool = False,
         auto_frequency: int = 3,
     ) -> None:
         self.repositories = repositories
