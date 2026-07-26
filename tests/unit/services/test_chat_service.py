@@ -12064,6 +12064,19 @@ def test_run_state_extraction_retries_applies_once_and_queues_context_retry(
         player_message.id,
         narrator_message.id,
     ]
+    for index in range(51):
+        filler_job = repositories.create_job(
+            save_id=save.id,
+            type="state_extraction",
+            status="running",
+            payload={
+                "source_message_ids": [
+                    f"other-player-{index}",
+                    f"other-narrator-{index}",
+                ]
+            },
+        )
+        repositories.update_job(filler_job.id, status="succeeded")
     repositories.create_job(
         save_id=save.id,
         type="state_extraction_retry",
