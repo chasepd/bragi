@@ -43,6 +43,11 @@ from bragi.application.settings import (
     MAX_SUMMARIZATION_CONTEXT_PRESSURE_THRESHOLD,
     MIN_SUMMARIZATION_CONTEXT_PRESSURE_THRESHOLD,
 )
+from bragi.content_rating_instructions import (
+    CONTENT_RATING_PROHIBITED,
+    content_rating_exceeds,
+    maximum_content_rating,
+)
 from bragi.persistence.models import (
     CharacterRecord,
     MemoryRecord,
@@ -63,6 +68,12 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.retry import exhausted_retry_attempt_count
 from bragi.redaction import redact_text
+from bragi.safety import (
+    CONTENT_FILTER_TRANSITION,
+    CONTENT_FILTER_TRANSITION_KIND,
+    FADE_TO_BLACK_TRANSITION,
+    FADE_TO_BLACK_TRANSITION_KIND,
+)
 from bragi.services.action_choice_flags import (
     content_with_action_choices_enabled,
     scenario_action_choices_enabled,
@@ -129,6 +140,11 @@ from bragi.services.chat_service import (
     timeskip_message_body,
 )
 from bragi.services.content_rating import effective_content_safety_policy
+from bragi.services.content_safety_service import (
+    ContentSafetyAction,
+    ContentSafetyResult,
+    ContentSafetyService,
+)
 from bragi.services.context_cleanup_service import (
     CONTEXT_CLEANUP_ACTIONS_TASK,
     CONTEXT_CLEANUP_SCAN_TASK,
@@ -178,6 +194,10 @@ from bragi.services.save_service import SaveService
 from bragi.services.scenario_bundle_service import (
     ScenarioBundlePreview,
     ScenarioBundleService,
+)
+from bragi.services.scenario_content_rating import (
+    metadata_with_scenario_content_ratings,
+    scenario_content_rating,
 )
 from bragi.services.scenario_name_sources import (
     ordinary_name_starter_generation_context,
@@ -401,6 +421,7 @@ class ActionChoiceModel:
     choice_id: str
     ordinal: int
     body: str
+    content_rating: str = "unclassified"
 
 
 @dataclass(frozen=True)
@@ -952,6 +973,7 @@ class BragiRuntime:
         *,
         narrator_message_id: str,
         active_save_id: str | None | object = ...,
+        current_user_id: str | None = None,
     ) -> RuntimeModel:
         save_id = (
             self.active_save_id
@@ -972,6 +994,7 @@ class BragiRuntime:
             ).generate_for_message(
                 save_id=save_id,
                 narrator_message_id=narrator_message_id,
+                current_user_id=current_user_id,
             )
         except Exception as exc:  # noqa: BLE001 - provider failures become model errors
             log_error_event(
@@ -1221,7 +1244,7 @@ class BragiRuntime:
                 error=f"Scenario provider is unavailable: {preference.provider}",
             )
         try:
-            value = await ScenarioService(
+            section_result = await ScenarioService(
                 repositories=self.repositories,
                 provider=self.providers[preference.provider],
                 provider_name=preference.provider,
@@ -1246,7 +1269,7 @@ class BragiRuntime:
                 **exception_log_fields(exc),
             )
             return self.build_model(error=_user_visible_error(exc))
-        updated_sections = {**sections, section_id: value}
+        updated_sections = {**sections, section_id: section_result.body}
         draft_type, draft_genres, normalized_action_choices_enabled = (
             normalized_scenario_types_and_flag(
                 scenario_type,
@@ -1258,6 +1281,16 @@ class BragiRuntime:
             type=draft_type,
             scenario_types=draft_genres,
             sections=updated_sections,
+            metadata=metadata_with_scenario_content_ratings(
+                None,
+                aggregate_rating=effective_content_safety_policy(
+                    self.repositories,
+                    user_id=current_user_id,
+                ).rating,
+                section_ratings={
+                    section_id: section_result.minimum_rating,
+                },
+            ),
             regeneration_seed=text,
             action_choices_enabled=normalized_action_choices_enabled,
         )
@@ -1371,10 +1404,27 @@ class BragiRuntime:
                     save_id=None,
                 )
             )
+            generated_starters, generated_starters_rating = (
+                await self._review_scenario_character_starters(
+                    starters=generated_starters,
+                    save_id=None,
+                    current_user_id=current_user_id,
+                    roleplay_type=draft_type.value,
+                )
+            )
             draft = ScenarioDraft(
                 type=draft_type,
                 scenario_types=draft_genres,
                 sections=normalized_sections,
+                metadata=metadata_with_scenario_content_ratings(
+                    None,
+                    aggregate_rating=generated_starters_rating or "unclassified",
+                    section_ratings=(
+                        {"character_starters": generated_starters_rating}
+                        if generated_starters_rating is not None
+                        else {}
+                    ),
+                ),
                 action_choices_enabled=normalized_action_choices_enabled,
                 character_starters=(*existing_starters, *generated_starters),
             )
@@ -1428,9 +1478,43 @@ class BragiRuntime:
                 draft_type,
                 sections,
             )
+            reviewed_sections: dict[str, str] = {}
+            section_content_ratings: dict[str, str] = {}
+            for section_id, section_body in normalized_sections.items():
+                safety = await self._review_actor_content(
+                    body=section_body,
+                    save_id=None,
+                    current_user_id=current_user_id,
+                    roleplay_type=draft_type.value,
+                )
+                reviewed_sections[section_id] = safety.body
+                section_content_ratings[section_id] = (
+                    safety.reviewed_content_rating
+                )
+            normalized_sections = reviewed_sections
             normalized_starters = normalize_scenario_character_starters(
                 list(character_starters or ()),
                 strict=True,
+            )
+            (
+                normalized_starters,
+                character_starters_rating,
+            ) = await self._review_scenario_character_starters(
+                starters=normalized_starters,
+                save_id=None,
+                current_user_id=current_user_id,
+                roleplay_type=draft_type.value,
+            )
+            if character_starters_rating is not None:
+                section_content_ratings["character_starters"] = (
+                    character_starters_rating
+                )
+            source_metadata = metadata_with_scenario_content_ratings(
+                source_metadata,
+                aggregate_rating=maximum_content_rating(
+                    tuple(section_content_ratings.values())
+                ),
+                section_ratings=section_content_ratings,
             )
             draft = ScenarioDraft(
                 type=draft_type,
@@ -1452,17 +1536,19 @@ class BragiRuntime:
             opening = draft.sections.get("opening_message", "").strip()
             opening_message_id: str | None = None
             if opening:
-                content_safety = effective_content_safety_policy(
-                    self.repositories,
-                    user_id=current_user_id,
+                safety = await self._review_actor_content(
+                    body=opening,
+                    save_id=save.id,
+                    current_user_id=current_user_id,
                 )
+                opening = safety.body
                 message = self.repositories.append_message(
                     save_id=save.id,
                     role="narrator",
                     speaker_name="Narrator",
                     body=opening,
-                    content_rating=content_safety.rating,
-                    fade_to_black_enabled=content_safety.fade_to_black_enabled,
+                    content_rating=safety.reviewed_content_rating,
+                    safety_transition=_content_safety_transition(safety),
                 )
                 opening_message_id = message.id
             seeded_character_count = seed_continuation_characters(
@@ -1561,6 +1647,7 @@ class BragiRuntime:
             await self._generate_opening_action_choices_if_configured(
                 save_id=save.id,
                 opening_message_id=opening_message_id,
+                current_user_id=current_user_id,
             )
             TurnSnapshotService(self.repositories).capture_current_head_if_dirty(
                 save.id,
@@ -1629,11 +1716,64 @@ class BragiRuntime:
             scenario_types=scenario_types,
             content=content,
         )
+        reviewed_content = dict(content)
+        section_content_ratings: dict[str, str] = {}
+        for section_id, section_body in content.items():
+            if not isinstance(section_body, str) or not section_body.strip():
+                continue
+            safety = self._review_actor_content_blocking(
+                body=section_body,
+                save_id=None,
+                current_user_id=current_user_id,
+                roleplay_type=scenario_type.value,
+            )
+            reviewed_content[section_id] = safety.body
+            section_content_ratings[section_id] = safety.reviewed_content_rating
+        content = reviewed_content
+        starter_type = _character_starter_scenario_type(
+            scenario_type,
+            scenario_types,
+        )
+        starters = scenario_character_starters_for_content(
+            scenario_type=starter_type,
+            content=content,
+        )
+        starters, character_starters_rating = (
+            self._review_scenario_character_starters_blocking(
+                starters=starters,
+                save_id=None,
+                current_user_id=current_user_id,
+                roleplay_type=scenario_type.value,
+            )
+        )
+        content = content_with_character_starters(
+            scenario_type=starter_type,
+            content=content,
+            starters=starters,
+        )
+        if character_starters_rating is not None:
+            section_content_ratings["character_starters"] = (
+                character_starters_rating
+            )
+        title = str(content.get("title", title)).strip() or title
+        premise = str(content.get("premise", premise)).strip() or premise
+        player_role = (
+            str(content.get("player_role", scenario.player_role)).strip()
+            or _required_text(scenario.player_role, "Player role")
+        )
+        source_metadata = content.get("_source")
+        content["_source"] = metadata_with_scenario_content_ratings(
+            source_metadata if isinstance(source_metadata, Mapping) else None,
+            aggregate_rating=maximum_content_rating(
+                tuple(section_content_ratings.values())
+            ),
+            section_ratings=section_content_ratings,
+        )
         record = self.repositories.create_scenario(
             type=scenario_type.value,
             title=title,
             premise=premise,
-            player_role=_required_text(scenario.player_role, "Player role"),
+            player_role=player_role,
             content=content,
         )
         save = SaveService(self.repositories).create_save(
@@ -1645,17 +1785,19 @@ class BragiRuntime:
         opening = opening_value.strip() if isinstance(opening_value, str) else ""
         opening_message_id: str | None = None
         if opening:
-            content_safety = effective_content_safety_policy(
-                self.repositories,
-                user_id=current_user_id,
+            safety = self._review_actor_content_blocking(
+                body=opening,
+                save_id=save.id,
+                current_user_id=current_user_id,
             )
+            opening = safety.body
             message = self.repositories.append_message(
                 save_id=save.id,
                 role="narrator",
                 speaker_name="Narrator",
                 body=opening,
-                content_rating=content_safety.rating,
-                fade_to_black_enabled=content_safety.fade_to_black_enabled,
+                content_rating=safety.reviewed_content_rating,
+                safety_transition=_content_safety_transition(safety),
             )
             opening_message_id = message.id
         seeded_character_count = _seed_initial_character_registry(
@@ -1742,6 +1884,7 @@ class BragiRuntime:
         self._generate_opening_action_choices_if_configured_blocking(
             save_id=save.id,
             opening_message_id=opening_message_id,
+            current_user_id=current_user_id,
         )
         TurnSnapshotService(self.repositories).capture_current_head_if_dirty(
             save.id,
@@ -1771,10 +1914,23 @@ class BragiRuntime:
             active_save_id=save.id,
         )
 
-    def list_saved_scenarios(self) -> tuple[SavedScenarioModel, ...]:
+    def list_saved_scenarios(
+        self,
+        *,
+        current_user_id: str | None = None,
+    ) -> tuple[SavedScenarioModel, ...]:
         save_counts = self.repositories.count_saves_by_scenario()
         scenarios: list[SavedScenarioModel] = []
+        allowed_rating = effective_content_safety_policy(
+            self.repositories,
+            user_id=current_user_id,
+        ).rating
         for scenario in self.repositories.list_scenarios():
+            if content_rating_exceeds(
+                minimum_rating=scenario_content_rating(scenario.content_json),
+                allowed_rating=allowed_rating,
+            ):
+                continue
             content = _scenario_content(scenario.content_json)
             supported = not scenario_record_is_retired(scenario.type, content)
             scenario_type, scenario_types = _saved_scenario_type_values(
@@ -1822,6 +1978,14 @@ class BragiRuntime:
                 error="Unknown scenario id",
             )
             return self.build_model(error=f"Unknown scenario id: {scenario_id}")
+        if content_rating_exceeds(
+            minimum_rating=scenario_content_rating(scenario.content_json),
+            allowed_rating=effective_content_safety_policy(
+                self.repositories,
+                user_id=current_user_id,
+            ).rating,
+        ):
+            return self.build_model(error="Scenario exceeds your content rating")
         if scenario_record_is_retired(
             scenario.type,
             _scenario_content(scenario.content_json),
@@ -1836,17 +2000,19 @@ class BragiRuntime:
         opening = _scenario_opening_message(scenario.content_json) or ""
         opening_message_id: str | None = None
         if opening:
-            content_safety = effective_content_safety_policy(
-                self.repositories,
-                user_id=current_user_id,
+            safety = self._review_actor_content_blocking(
+                body=opening,
+                save_id=save.id,
+                current_user_id=current_user_id,
             )
+            opening = safety.body
             message = self.repositories.append_message(
                 save_id=save.id,
                 role="narrator",
                 speaker_name="Narrator",
                 body=opening,
-                content_rating=content_safety.rating,
-                fade_to_black_enabled=content_safety.fade_to_black_enabled,
+                content_rating=safety.reviewed_content_rating,
+                safety_transition=_content_safety_transition(safety),
             )
             opening_message_id = message.id
         seeded_character_count = seed_continuation_characters(
@@ -1945,6 +2111,7 @@ class BragiRuntime:
         self._generate_opening_action_choices_if_configured_blocking(
             save_id=save.id,
             opening_message_id=opening_message_id,
+            current_user_id=current_user_id,
         )
         TurnSnapshotService(self.repositories).capture_current_head_if_dirty(
             save.id,
@@ -1973,11 +2140,58 @@ class BragiRuntime:
             active_save_id=save.id,
         )
 
+    async def _review_actor_content(
+        self,
+        *,
+        body: str,
+        save_id: str | None,
+        current_user_id: str | None,
+        roleplay_type: str | None = None,
+    ) -> ContentSafetyResult:
+        policy = effective_content_safety_policy(
+            self.repositories,
+            user_id=current_user_id,
+        )
+        return await ContentSafetyService(
+            repositories=self.repositories,
+            providers=self.providers,
+        ).review_narration(
+            body=body,
+            content_rating=policy.rating,
+            fade_to_black_enabled=policy.fade_to_black_enabled,
+            save_id=save_id,
+            roleplay_type=roleplay_type,
+        )
+
+    def _review_actor_content_blocking(
+        self,
+        *,
+        body: str,
+        save_id: str | None,
+        current_user_id: str | None,
+        roleplay_type: str | None = None,
+    ) -> ContentSafetyResult:
+        result: list[ContentSafetyResult] = []
+
+        async def review() -> None:
+            result.append(
+                await self._review_actor_content(
+                    body=body,
+                    save_id=save_id,
+                    current_user_id=current_user_id,
+                    roleplay_type=roleplay_type,
+                )
+            )
+
+        _run_coroutine_blocking(review())
+        return result[0]
+
     async def _generate_opening_action_choices_if_configured(
         self,
         *,
         save_id: str,
         opening_message_id: str | None,
+        current_user_id: str | None = None,
     ) -> None:
         if opening_message_id is None:
             return
@@ -1988,6 +2202,7 @@ class BragiRuntime:
             ).generate_for_message(
                 save_id=save_id,
                 narrator_message_id=opening_message_id,
+                current_user_id=current_user_id,
             )
         except Exception as exc:
             log_error_event(
@@ -2002,11 +2217,13 @@ class BragiRuntime:
         *,
         save_id: str,
         opening_message_id: str | None,
+        current_user_id: str | None = None,
     ) -> None:
         _run_coroutine_blocking(
             self._generate_opening_action_choices_if_configured(
                 save_id=save_id,
                 opening_message_id=opening_message_id,
+                current_user_id=current_user_id,
             )
         )
 
@@ -2902,6 +3119,68 @@ class BragiRuntime:
         )
         return self.build_character_registry_model(active_save_id=save_id)
 
+    async def _review_scenario_character_starters(
+        self,
+        *,
+        starters: tuple[ScenarioCharacterStarter, ...],
+        save_id: str | None,
+        current_user_id: str | None,
+        roleplay_type: str,
+    ) -> tuple[tuple[ScenarioCharacterStarter, ...], str | None]:
+        reviewed: list[ScenarioCharacterStarter] = []
+        ratings: list[str] = []
+        for starter in starters:
+            safety = await self._review_actor_content(
+                body=_scenario_character_starter_safety_body(starter),
+                save_id=save_id,
+                current_user_id=current_user_id,
+                roleplay_type=roleplay_type,
+            )
+            reviewed.append(
+                starter
+                if safety.action is ContentSafetyAction.ALLOW
+                else _scenario_character_starter_with_safe_transition(
+                    starter,
+                    replacement=safety.body,
+                )
+            )
+            ratings.append(safety.reviewed_content_rating)
+        return (
+            tuple(reviewed),
+            maximum_content_rating(tuple(ratings)) if ratings else None,
+        )
+
+    def _review_scenario_character_starters_blocking(
+        self,
+        *,
+        starters: tuple[ScenarioCharacterStarter, ...],
+        save_id: str | None,
+        current_user_id: str | None,
+        roleplay_type: str,
+    ) -> tuple[tuple[ScenarioCharacterStarter, ...], str | None]:
+        reviewed: list[ScenarioCharacterStarter] = []
+        ratings: list[str] = []
+        for starter in starters:
+            safety = self._review_actor_content_blocking(
+                body=_scenario_character_starter_safety_body(starter),
+                save_id=save_id,
+                current_user_id=current_user_id,
+                roleplay_type=roleplay_type,
+            )
+            reviewed.append(
+                starter
+                if safety.action is ContentSafetyAction.ALLOW
+                else _scenario_character_starter_with_safe_transition(
+                    starter,
+                    replacement=safety.body,
+                )
+            )
+            ratings.append(safety.reviewed_content_rating)
+        return (
+            tuple(reviewed),
+            maximum_content_rating(tuple(ratings)) if ratings else None,
+        )
+
     def _content_with_completed_character_starters(
         self,
         *,
@@ -3262,7 +3541,12 @@ class BragiRuntime:
                     await ActionChoiceService(
                         repositories=self.repositories,
                         providers=self.providers,
-                    ).generate_prepared(prepared_action_choices)
+                    ).generate_prepared(
+                        replace(
+                            prepared_action_choices,
+                            current_user_id=current_user_id,
+                        )
+                    )
                 except Exception as exc:
                     log_error_event(
                         "runtime.action_choice_generation_failed",
@@ -4737,13 +5021,38 @@ class BragiRuntime:
 
         try:
             async with self._save_operation_lock(save_id):
+                reviewed_body = body
+                content_rating = "unclassified"
+                safety_transition = ""
+                existing_message = self.repositories.get_message(
+                    save_id=save_id,
+                    message_id=message_id,
+                )
+                if existing_message is not None:
+                    safety = await self._review_actor_content(
+                        body=body,
+                        save_id=save_id,
+                        current_user_id=current_user_id,
+                    )
+                    if existing_message.role == "narrator":
+                        reviewed_body = safety.body
+                        content_rating = safety.reviewed_content_rating
+                        safety_transition = _content_safety_transition(safety)
+                    else:
+                        content_rating = (
+                            safety.minimum_rating
+                            if safety.action is ContentSafetyAction.ALLOW
+                            else CONTENT_RATING_PROHIBITED
+                        )
                 self.repositories.begin_transaction()
                 revision_service = MessageRevisionService(self.repositories)
                 edit = cast(Any, getattr(revision_service, service_method_name))(
                     save_id=save_id,
                     message_id=message_id,
-                    body=body,
+                    body=reviewed_body,
                     current_user_id=current_user_id,
+                    content_rating=content_rating,
+                    safety_transition=safety_transition,
                 )
                 self.repositories.commit_transaction()
 
@@ -5883,6 +6192,7 @@ class BragiRuntime:
         *,
         active_save_id: str,
         character_ids: tuple[str, ...],
+        current_user_id: str | None = None,
     ) -> int:
         save = self.repositories.get_save(active_save_id)
         if save is None:
@@ -5942,6 +6252,20 @@ class BragiRuntime:
             if starter is None:
                 continue
             updated = _apply_completed_character_agency(character, starter)
+            safety = self._review_actor_content_blocking(
+                body=_character_record_safety_body(updated),
+                save_id=active_save_id,
+                current_user_id=current_user_id,
+            )
+            updated = (
+                replace(updated, content_rating=safety.reviewed_content_rating)
+                if safety.action is ContentSafetyAction.ALLOW
+                else _character_record_with_safe_transition(
+                    updated,
+                    replacement=safety.body,
+                    content_rating=safety.reviewed_content_rating,
+                )
+            )
             if updated != character:
                 self.repositories.update_character(updated)
                 updated_count += 1
@@ -5960,6 +6284,7 @@ class BragiRuntime:
         character_id: str,
         field_name: str,
         row: CharacterRegistryRow,
+        current_user_id: str | None = None,
     ) -> CharacterFieldEnhanceResult:
         field_name = _validated_character_enhancement_field(field_name)
         if row.character_id != character_id:
@@ -6040,6 +6365,23 @@ class BragiRuntime:
             field_name=field_name,
             enhanced=enhanced,
             existing_locked_fields=tuple(character.locked_fields),
+        )
+        safety = self._review_actor_content_blocking(
+            body=_character_registry_row_safety_body(enhanced_row),
+            save_id=active_save_id,
+            current_user_id=current_user_id,
+        )
+        enhanced_row = (
+            replace(
+                enhanced_row,
+                content_rating=safety.reviewed_content_rating,
+            )
+            if safety.action is ContentSafetyAction.ALLOW
+            else _character_registry_row_with_safe_transition(
+                enhanced_row,
+                replacement=safety.body,
+                content_rating=safety.reviewed_content_rating,
+            )
         )
         field_changed = _enhanced_character_registry_field_changed(
             row,
@@ -6300,6 +6642,137 @@ def _apply_completed_character_agency(
             preserve_unknown=True,
         ),
     )
+
+
+_CHARACTER_SAFETY_TEXT_FIELDS = (
+    "name",
+    "role",
+    "age",
+    "known_state",
+    "history",
+    "appearance",
+    "visual_notes",
+    "current_clothing",
+    "personality",
+    "voice",
+    "texting_style",
+    "goals",
+    "motivations",
+    "current_intent",
+    "boundaries",
+    "attitude_toward_player",
+    "cooperation_conditions",
+    "status",
+    "private_notes",
+    "contact_name",
+)
+
+
+_SCENARIO_CHARACTER_STARTER_SAFETY_TEXT_FIELDS = (
+    "name",
+    "role",
+    "age",
+    "known_state",
+    "appearance",
+    "visual_notes",
+    "personality",
+    "voice",
+    "texting_style",
+    "goals",
+    "motivations",
+    "current_intent",
+    "boundaries",
+    "attitude_toward_player",
+    "cooperation_conditions",
+    "status",
+)
+
+
+def _scenario_character_starter_safety_body(
+    starter: ScenarioCharacterStarter,
+) -> str:
+    content = {
+        field: getattr(starter, field)
+        for field in _SCENARIO_CHARACTER_STARTER_SAFETY_TEXT_FIELDS
+    }
+    content["aliases"] = starter.aliases
+    content["relationships"] = starter.relationships
+    if starter.reference_image is not None:
+        content["reference_image_prompt"] = starter.reference_image.prompt_preview
+    return json.dumps(content, ensure_ascii=False, sort_keys=True)
+
+
+def _scenario_character_starter_with_safe_transition(
+    starter: ScenarioCharacterStarter,
+    *,
+    replacement: str,
+) -> ScenarioCharacterStarter:
+    updates: dict[str, object] = {
+        field: replacement if getattr(starter, field) else ""
+        for field in _SCENARIO_CHARACTER_STARTER_SAFETY_TEXT_FIELDS
+    }
+    updates["aliases"] = ()
+    updates["relationships"] = {}
+    if starter.reference_image is not None:
+        updates["reference_image"] = replace(
+            starter.reference_image,
+            prompt_preview=(
+                replacement if starter.reference_image.prompt_preview else ""
+            ),
+        )
+    return replace(starter, **updates)  # type: ignore[arg-type]
+
+
+def _character_record_safety_body(character: CharacterRecord) -> str:
+    content = {
+        field: getattr(character, field)
+        for field in _CHARACTER_SAFETY_TEXT_FIELDS
+    }
+    content["aliases"] = character.aliases
+    content["relationships"] = character.relationships
+    return json.dumps(content, ensure_ascii=False, sort_keys=True)
+
+
+def _character_registry_row_safety_body(row: CharacterRegistryRow) -> str:
+    content = {
+        field: getattr(row, field)
+        for field in _CHARACTER_SAFETY_TEXT_FIELDS
+    }
+    content["aliases"] = row.aliases_text
+    content["relationships"] = row.relationships_json
+    return json.dumps(content, ensure_ascii=False, sort_keys=True)
+
+
+def _character_record_with_safe_transition(
+    character: CharacterRecord,
+    *,
+    replacement: str,
+    content_rating: str,
+) -> CharacterRecord:
+    updates: dict[str, object] = {
+        field: replacement if getattr(character, field) else ""
+        for field in _CHARACTER_SAFETY_TEXT_FIELDS
+    }
+    updates["aliases"] = []
+    updates["relationships"] = {}
+    updates["content_rating"] = content_rating
+    return replace(character, **updates)  # type: ignore[arg-type]
+
+
+def _character_registry_row_with_safe_transition(
+    row: CharacterRegistryRow,
+    *,
+    replacement: str,
+    content_rating: str,
+) -> CharacterRegistryRow:
+    updates: dict[str, object] = {
+        field: replacement if getattr(row, field) else ""
+        for field in _CHARACTER_SAFETY_TEXT_FIELDS
+    }
+    updates["aliases_text"] = ""
+    updates["relationships_json"] = "{}"
+    updates["content_rating"] = content_rating
+    return replace(row, **updates)  # type: ignore[arg-type]
 
 
 def _character_profile_field_blank_and_unlocked(
@@ -7116,6 +7589,7 @@ def _seed_initial_character_registry(
     source_message_id: str | None,
     media_service: MediaService | None = None,
 ) -> int:
+    content_rating = _scenario_content_mapping_rating(content)
     normalized_genres = scenario_types or (scenario_type,)
     starter_type = _character_starter_scenario_type(
         scenario_type,
@@ -7130,6 +7604,7 @@ def _seed_initial_character_registry(
         save_id=save_id,
         content=content,
         source_message_id=source_message_id,
+        content_rating=content_rating,
     )
     if not entries:
         if ScenarioType.DATING_SIM in normalized_genres:
@@ -7178,6 +7653,7 @@ def _seed_initial_character_registry(
             source_message_id=source_message_id,
             locked_fields=starter_identity_locked_fields(entry),
             protected_from_maintenance=True,
+            content_rating=content_rating,
         )
         if media_service is not None and entry.reference_image is not None:
             try:
@@ -7212,6 +7688,7 @@ def _seed_player_character_from_scenario(
     save_id: str,
     content: Mapping[str, object],
     source_message_id: str | None,
+    content_rating: str,
 ) -> int:
     player_name = _content_text(content, "player_character_name")
     if not player_name:
@@ -7235,6 +7712,9 @@ def _seed_player_character_from_scenario(
                 status=character.status or "present at scenario start",
                 protected_from_maintenance=True,
                 is_player_character=True,
+                content_rating=maximum_content_rating(
+                    (character.content_rating, content_rating)
+                ),
             )
         )
         return 0
@@ -7251,8 +7731,21 @@ def _seed_player_character_from_scenario(
         source_message_id=source_message_id,
         protected_from_maintenance=True,
         is_player_character=True,
+        content_rating=content_rating,
     )
     return 1
+
+
+def _scenario_content_mapping_rating(content: Mapping[str, object]) -> str:
+    source = content.get("_source")
+    if not isinstance(source, Mapping):
+        return "unclassified"
+    rating = source.get("content_rating")
+    return (
+        rating.strip()
+        if isinstance(rating, str) and rating.strip()
+        else "unclassified"
+    )
 
 
 def _character_matches_name(character: CharacterRecord, name: str) -> bool:
@@ -7754,6 +8247,7 @@ def _action_choices_model(
             choice_id=choice.id,
             ordinal=choice.ordinal,
             body=choice.body,
+            content_rating=choice.content_rating,
         )
         for choice in choices
         if choice.message_id == narrator_message_id
@@ -8194,6 +8688,14 @@ def _required_text(value: str, label: str) -> str:
     if not text:
         raise ValueError(f"{label} is required")
     return text
+
+
+def _content_safety_transition(result: ContentSafetyResult) -> str:
+    if result.body == FADE_TO_BLACK_TRANSITION:
+        return FADE_TO_BLACK_TRANSITION_KIND
+    if result.body == CONTENT_FILTER_TRANSITION:
+        return CONTENT_FILTER_TRANSITION_KIND
+    return ""
 
 
 def _run_coroutine_blocking(coroutine: Coroutine[Any, Any, None]) -> None:

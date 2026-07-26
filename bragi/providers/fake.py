@@ -135,8 +135,16 @@ class FakeProviderClient:
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_output_requests.append(request)
+        data = dict(self.structured_output)
+        if request.schema_name == "content_safety_review" and not data:
+            data = {
+                "action": "allow",
+                "category": "none",
+                "reason": "Fake provider content is suitable for general audiences.",
+                "minimum_rating": "g",
+            }
         return StructuredOutputResponse(
-            data=dict(self.structured_output),
+            data=data,
             provider=request.provider,
             model_id=request.model_id,
             token_usage={"total": 7},

@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -19,7 +20,28 @@ from bragi.providers.contracts import (
     ProviderConfigStatus,
     ProviderModel,
 )
+from bragi.safety import CONTENT_FILTER_TRANSITION
+from bragi.services.content_safety_service import (
+    ContentSafetyAction,
+    ContentSafetyResult,
+    ContentSafetyService,
+)
 from bragi.services.summary_service import SummaryService
+
+
+class BlockingContentSafetyService:
+    def __init__(self) -> None:
+        self.fade_settings: list[bool] = []
+
+    async def review_narration(self, **kwargs: object) -> ContentSafetyResult:
+        self.fade_settings.append(bool(kwargs["fade_to_black_enabled"]))
+        return ContentSafetyResult(
+            body=CONTENT_FILTER_TRANSITION,
+            action=ContentSafetyAction.BLOCK,
+            minimum_rating="r",
+            transition_applied=True,
+            agent_ran=True,
+        )
 
 
 class RecordingSummaryProvider:
@@ -97,7 +119,9 @@ def repositories(tmp_path: Path) -> Iterator[PersistenceRepositories]:
     migrate_database(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        yield PersistenceRepositories(connection)
+        repositories = PersistenceRepositories(connection)
+        repositories.set_app_setting("content_filter_rating", "unrated")
+        yield repositories
 
 
 def test_context_budget_estimator_reports_pressure_and_threshold(
@@ -214,7 +238,11 @@ def test_summary_service_includes_only_canonical_fade_transition_in_coverage(
     fade = repositories.update_message_body(
         save_id=save.id,
         message_id=messages[-1].id,
-        body="Their hands slid beneath her clothes.",
+        body=(
+            "The intimate moment is kept off-screen. Hours later, "
+            "the next scene begins."
+        ),
+        safety_transition="fade_to_black",
     )
     latest_player = repositories.append_message(
         save_id=save.id,
@@ -243,7 +271,11 @@ def test_summary_service_preserves_safe_fade_continuity(
     fade = repositories.update_message_body(
         save_id=save.id,
         message_id=messages[-1].id,
-        body="Their hands slid beneath her clothes.",
+        body=(
+            "The intimate moment is kept off-screen. Hours later, "
+            "the next scene begins."
+        ),
+        safety_transition="fade_to_black",
     )
     provider = RecordingSummaryProvider(
         response_body=(
@@ -540,6 +572,35 @@ def test_summary_service_counts_single_large_active_summary_as_context_pressure(
     assert messages[1].body not in prompt
     assert messages[2].body not in prompt
     assert messages[3].body not in prompt
+
+
+def test_summary_service_safety_reviews_and_rates_generated_summary(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.set_app_setting("content_filter_rating", "pg")
+    save, _messages = _save_with_summary_preference(repositories)
+    summary_provider = RecordingSummaryProvider(
+        response_body="The generated summary crosses the selected ceiling."
+    )
+    safety = BlockingContentSafetyService()
+    service = SummaryService(
+        repositories=repositories,
+        providers={"fake": summary_provider},
+        threshold=0.10,
+        content_safety_service=cast(ContentSafetyService, safety),
+    )
+
+    summary = asyncio.run(
+        service.summarize_if_needed(
+            save_id=save.id,
+            context_window=100,
+        )
+    )
+
+    assert summary is not None
+    assert summary.body == CONTENT_FILTER_TRANSITION
+    assert summary.content_rating == "g"
+    assert safety.fade_settings == [False]
 
 
 def test_summary_service_rolls_up_multiple_active_summaries_without_message_pressure(

@@ -16,6 +16,11 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
+from bragi.content_rating_instructions import (
+    CONTENT_RATING_UNCLASSIFIED,
+    content_rating_exceeds,
+    maximum_content_rating,
+)
 from bragi.persistence.models import (
     CharacterRecord,
     CharacterTextMessageRecord,
@@ -50,6 +55,10 @@ from bragi.services.character_profile_completion import (
     scenario_character_starters_for_content,
 )
 from bragi.services.content_rating import effective_content_safety_policy
+from bragi.services.content_safety_service import (
+    ContentSafetyAction,
+    ContentSafetyService,
+)
 from bragi.services.context_assembly import (
     ContextAssemblyBreakdown,
     ContextAssemblyService,
@@ -60,6 +69,7 @@ from bragi.services.image_style_settings import (
     selected_image_style_preset,
 )
 from bragi.services.job_lifecycle import JobLifecycleService
+from bragi.services.media_content_rating import media_asset_content_rating
 from bragi.services.mention_matching import character_name_is_mentioned
 from bragi.services.model_capabilities import (
     CHAT_CAPABILITIES,
@@ -96,7 +106,6 @@ from bragi.services.openrouter_routing_settings import (
 from bragi.services.provider_fallbacks import chat_with_fallback
 from bragi.services.sexual_content_safety import (
     is_fade_to_black_message,
-    validate_image_prompt,
 )
 
 _THUMBNAIL_WIDTH = 192
@@ -218,12 +227,17 @@ class MediaService:
         media_dir: Path,
         automatic_enabled: bool = False,
         auto_frequency: int = 3,
+        content_safety_service: ContentSafetyService | None = None,
     ) -> None:
         self.repositories = repositories
         self.providers = providers
         self.media_dir = media_dir
         self.automatic_enabled = automatic_enabled
         self.auto_frequency = auto_frequency
+        self.content_safety_service = content_safety_service or ContentSafetyService(
+            repositories=repositories,
+            providers=providers,
+        )
         self.jobs = JobLifecycleService(repositories=repositories)
 
     def upload_scenario_starter_reference_image(
@@ -520,18 +534,14 @@ class MediaService:
         prompt = prompt.strip()
         if not prompt:
             raise ValueError("Image prompt is required")
-        content_safety = None
-        if current_user_id is None:
-            validate_image_prompt(prompt)
-        else:
-            content_safety = effective_content_safety_policy(
+        content_safety = (
+            effective_content_safety_policy(
                 self.repositories,
                 user_id=current_user_id,
             )
-            validate_image_prompt(
-                prompt,
-                allowed_rating=content_safety.rating,
-            )
+            if current_user_id is not None
+            else None
+        )
         original = _media_asset_by_id(
             self.repositories.list_media_assets(save_id),
             media_asset_id,
@@ -544,6 +554,17 @@ class MediaService:
             raise ValueError(
                 f"Image generation provider is unavailable: {original.provider}"
             )
+        safety = await self.content_safety_service.review_media_prompt(
+            prompt=prompt,
+            content_rating=(
+                content_safety.rating if content_safety is not None else "pg-13"
+            ),
+            save_id=save_id,
+            source_provider=original.provider,
+            source_model_id=original.model,
+        )
+        if safety.action is not ContentSafetyAction.ALLOW:
+            raise ValueError("Image prompt exceeds the selected content rating")
         _raise_unless_enforced_safe_mode_provider(
             provider=original.provider,
             force_safe_mode=(
@@ -638,7 +659,7 @@ class MediaService:
         thumbnail_path: str | None = None
         replacement_committed = False
         try:
-            request = self._image_request(
+            request = await self._image_request(
                 provider=preference.provider,
                 model_id=preference.model_id,
                 prompt=prompt,
@@ -652,6 +673,7 @@ class MediaService:
                 task=request_task,
                 route_openrouter=False,
                 current_user_id=current_user_id,
+                reviewed_content_rating=safety.minimum_rating,
             )
             generation = await self._generate_image_without_fallback(
                 save_id=save_id,
@@ -878,7 +900,7 @@ class MediaService:
                 raise ValueError(requirement_error)
             generation = await self._generate_image_with_optional_fallback(
                 save_id=save_id,
-                request=self._image_request(
+                request=await self._image_request(
                     provider=preference.provider,
                     model_id=preference.model_id,
                     prompt=prompt,
@@ -1403,6 +1425,9 @@ class MediaService:
             "text_message_id": text_message.id,
             "thread_id": text_message.thread_id,
             "character_id": character.id,
+            "content_rating": maximum_content_rating(
+                (text_message.content_rating, character.content_rating)
+            ),
         }
         return await self._generate_character_image_asset(
             save_id=save_id,
@@ -1472,6 +1497,9 @@ class MediaService:
                 "thread_id": text_message.thread_id,
                 "character_id": character.id,
                 "character_name": character.name,
+                "content_rating": maximum_content_rating(
+                    (text_message.content_rating, character.content_rating)
+                ),
             },
             job_type="character_text_image_generation",
             request_task="image_generation",
@@ -1860,7 +1888,7 @@ class MediaService:
                 )
             generation = await self._generate_image_with_optional_fallback(
                 save_id=save_id,
-                request=self._image_request(
+                request=await self._image_request(
                     provider=preference.provider,
                     model_id=preference.model_id,
                     prompt=prompt,
@@ -2044,7 +2072,7 @@ class MediaService:
                 raise ValueError(requirement_error)
             generation = await self._generate_image_with_optional_fallback(
                 save_id=save_id,
-                request=self._image_request(
+                request=await self._image_request(
                     provider=preference.provider,
                     model_id=preference.model_id,
                     prompt=prompt,
@@ -2236,7 +2264,7 @@ class MediaService:
                 raise ValueError(requirement_error)
             generation = await self._generate_image_with_optional_fallback(
                 save_id=save_id,
-                request=self._image_request(
+                request=await self._image_request(
                     provider=preference.provider,
                     model_id=preference.model_id,
                     prompt=prompt,
@@ -2425,7 +2453,7 @@ class MediaService:
                 prompt = await prompt_factory()
             generation = await self._generate_video_with_optional_fallback(
                 save_id=save_id,
-                request=self._video_request(
+                request=await self._video_request(
                     provider=preference.provider,
                     model_id=preference.model_id,
                     prompt=prompt,
@@ -2433,6 +2461,12 @@ class MediaService:
                     source_message_id=source_message_id,
                     source_media_asset_id=source_media_asset_id,
                     source_media_path=source_media_path,
+                    source_content_rating=_media_generation_source_rating(
+                        repositories=self.repositories,
+                        save_id=save_id,
+                        source_message_id=source_message_id,
+                        source_media_asset_id=source_media_asset_id,
+                    ),
                     current_user_id=current_user_id,
                 ),
                 required_capability=required_capability,
@@ -2455,7 +2489,10 @@ class MediaService:
                 model=response.model_id,
                 status="succeeded",
                 mime_type=response.mime_type,
-                metadata=response.raw_metadata,
+                metadata={
+                    **response.raw_metadata,
+                    "content_rating": generation.request.content_rating,
+                },
                 source_media_asset_id=source_media_asset_id,
             )
             asset_created = True
@@ -2833,7 +2870,7 @@ class MediaService:
             request_task=CHARACTER_IMAGE_EDIT_PURPOSE,
         )
 
-    def _image_request(
+    async def _image_request(
         self,
         *,
         provider: str,
@@ -2849,12 +2886,24 @@ class MediaService:
         task: str | None = None,
         route_openrouter: bool = True,
         current_user_id: str | None = None,
+        reviewed_content_rating: str | None = None,
     ) -> ImageRequest:
         content_safety = effective_content_safety_policy(
             self.repositories,
             user_id=current_user_id,
         )
-        validate_image_prompt(prompt, allowed_rating=content_safety.rating)
+        minimum_rating = reviewed_content_rating
+        if minimum_rating is None:
+            safety = await self.content_safety_service.review_media_prompt(
+                prompt=prompt,
+                content_rating=content_safety.rating,
+                save_id=save_id,
+                source_provider=provider,
+                source_model_id=model_id,
+            )
+            if safety.action is not ContentSafetyAction.ALLOW:
+                raise ValueError("Image prompt exceeds the selected content rating")
+            minimum_rating = safety.minimum_rating
         _raise_unless_enforced_safe_mode_provider(
             provider=provider,
             force_safe_mode=content_safety.force_venice_safe_mode,
@@ -2885,6 +2934,7 @@ class MediaService:
             source_media_path=source_media_path,
             source_media_asset_ids=source_media_asset_ids,
             source_media_paths=source_media_paths,
+            content_rating=minimum_rating,
             dimensions=image_generation_dimensions(
                 self.repositories,
                 provider=provider,
@@ -3256,7 +3306,7 @@ class MediaService:
                 raise
             return fallback_generation, path, thumbnail_path
 
-    def _video_request(
+    async def _video_request(
         self,
         *,
         provider: str,
@@ -3266,13 +3316,27 @@ class MediaService:
         source_message_id: str,
         source_media_asset_id: str | None = None,
         source_media_path: Path | None = None,
+        source_content_rating: str = CONTENT_RATING_UNCLASSIFIED,
         current_user_id: str | None = None,
     ) -> VideoRequest:
         content_safety = effective_content_safety_policy(
             self.repositories,
             user_id=current_user_id,
         )
-        validate_image_prompt(prompt, allowed_rating=content_safety.rating)
+        safety = await self.content_safety_service.review_media_prompt(
+            prompt=prompt,
+            content_rating=content_safety.rating,
+            save_id=save_id,
+            source_provider=provider,
+            source_model_id=model_id,
+        )
+        if safety.action is not ContentSafetyAction.ALLOW:
+            raise ValueError("Video prompt exceeds the selected content rating")
+        if content_rating_exceeds(
+            minimum_rating=source_content_rating,
+            allowed_rating=content_safety.rating,
+        ):
+            raise ValueError("Source media exceeds the selected content rating")
         _raise_unless_enforced_safe_mode_provider(
             provider=provider,
             force_safe_mode=content_safety.force_venice_safe_mode,
@@ -3290,6 +3354,9 @@ class MediaService:
             source_message_id=source_message_id,
             source_media_asset_id=source_media_asset_id,
             source_media_path=source_media_path,
+            content_rating=maximum_content_rating(
+                (safety.minimum_rating, source_content_rating)
+            ),
             safe_mode=_request_video_safe_mode(
                 repositories=self.repositories,
                 provider=provider,
@@ -4499,6 +4566,11 @@ def _image_asset_metadata(
     generation: _ImageGenerationResult,
 ) -> dict[str, object]:
     result = dict(metadata or {})
+    source_content_rating = result.get("content_rating")
+    ratings = [generation.request.content_rating]
+    if isinstance(source_content_rating, str):
+        ratings.append(source_content_rating)
+    result["content_rating"] = maximum_content_rating(tuple(ratings))
     if (
         generation.request.provider != OPENROUTER_PROVIDER_NAME
         and generation.response.provider != OPENROUTER_PROVIDER_NAME
@@ -4510,6 +4582,38 @@ def _image_asset_metadata(
     else:
         result.pop(_RESPONSE_MODEL_METADATA_KEY, None)
     return result
+
+
+def _media_generation_source_rating(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    source_message_id: str,
+    source_media_asset_id: str | None,
+) -> str:
+    messages = {
+        message.id: message
+        for message in repositories.list_messages(save_id)
+    }
+    media_assets = {
+        asset.id: asset
+        for asset in repositories.list_media_assets(save_id)
+    }
+    if source_media_asset_id is not None:
+        source_asset = media_assets.get(source_media_asset_id)
+        if source_asset is None:
+            return CONTENT_RATING_UNCLASSIFIED
+        return media_asset_content_rating(
+            source_asset,
+            media_assets_by_id=media_assets,
+            source_messages=messages,
+        )
+    source_message = messages.get(source_message_id)
+    return (
+        source_message.content_rating
+        if source_message is not None
+        else CONTENT_RATING_UNCLASSIFIED
+    )
 
 
 def _persisted_image_model(generation: _ImageGenerationResult) -> str:

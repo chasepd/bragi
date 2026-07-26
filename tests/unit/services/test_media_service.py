@@ -27,6 +27,8 @@ from bragi.providers.contracts import (
     ProviderCapability,
     ProviderConfigStatus,
     ProviderModel,
+    StructuredOutputRequest,
+    StructuredOutputResponse,
     VideoRequest,
     VideoResponse,
 )
@@ -35,6 +37,11 @@ from bragi.services import media_service as media_service_module
 from bragi.services.character_profile_completion import (
     ScenarioCharacterStarter,
     ScenarioStarterReferenceImage,
+)
+from bragi.services.content_safety_service import (
+    ContentSafetyAction,
+    ContentSafetyResult,
+    ContentSafetyService,
 )
 from bragi.services.image_style_settings import save_image_style_preset_setting_key
 from bragi.services.media_service import MediaService
@@ -55,6 +62,59 @@ _VALID_PNG_BYTES = bytes.fromhex(
     "0000000049454e44ae426082"
 )
 _VALID_MP4_BYTES = b"\x00\x00\x00\x18ftypmp42bragi-test-video"
+
+
+class BlockingMediaSafetyService(ContentSafetyService):
+    def __init__(self) -> None:
+        pass
+
+    async def review_media_prompt(
+        self,
+        *,
+        prompt: str,
+        content_rating: str,
+        save_id: str,
+        source_provider: str | None = None,
+        source_model_id: str | None = None,
+    ) -> ContentSafetyResult:
+        del (
+            prompt,
+            content_rating,
+            save_id,
+            source_provider,
+            source_model_id,
+        )
+        return ContentSafetyResult(
+            body="",
+            action=ContentSafetyAction.BLOCK,
+            minimum_rating="r",
+            agent_ran=True,
+        )
+
+
+def _mark_message_as_fade_transition(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    message_id: str,
+) -> MessageRecord:
+    repositories.connection.execute(
+        """
+        UPDATE messages
+        SET body = ?, safety_transition = 'fade_to_black'
+        WHERE save_id = ? AND id = ?
+        """,
+        (
+            "The intimate moment is kept off-screen. Hours later, "
+            "the next scene begins.",
+            save_id,
+            message_id,
+        ),
+    )
+    repositories.commit()
+    message = repositories.get_message(save_id=save_id, message_id=message_id)
+    assert message is not None
+    return message
 
 
 def _assert_realistic_prompt(prompt: str, base_prompt: str) -> None:
@@ -100,7 +160,12 @@ class RecordingImageProvider:
                 provider=self.provider_name,
                 model_id="fake-chat",
                 display_name="Fake Chat",
-                capabilities=frozenset({ProviderCapability.CHAT}),
+                capabilities=frozenset(
+                    {
+                        ProviderCapability.CHAT,
+                        ProviderCapability.STRUCTURED_OUTPUT,
+                    }
+                ),
                 context_window=8192,
             ),
             ProviderModel(
@@ -118,6 +183,23 @@ class RecordingImageProvider:
             provider=request.provider,
             model_id=request.model_id,
             token_usage={"total": 13},
+        )
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        if request.schema_name != "content_safety_review":
+            raise AssertionError(f"unexpected structured schema: {request.schema_name}")
+        return StructuredOutputResponse(
+            data={
+                "action": "allow",
+                "category": "none",
+                "reason": "Test fixture content is within the ceiling.",
+                "minimum_rating": "g",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
         )
 
     async def generate_image(self, request: ImageRequest) -> ImageResponse:
@@ -145,7 +227,12 @@ class RecordingVisionProvider(RecordingImageProvider):
                 provider=self.provider_name,
                 model_id="fake-vision",
                 display_name="Fake Vision",
-                capabilities=frozenset({ProviderCapability.VISION}),
+                capabilities=frozenset(
+                    {
+                        ProviderCapability.VISION,
+                        ProviderCapability.STRUCTURED_OUTPUT,
+                    }
+                ),
                 context_window=8192,
             )
         ]
@@ -236,7 +323,12 @@ class RecordingVideoProvider(RecordingImageProvider):
                 provider=self.provider_name,
                 model_id="fake-chat",
                 display_name="Fake Chat",
-                capabilities=frozenset({ProviderCapability.CHAT}),
+                capabilities=frozenset(
+                    {
+                        ProviderCapability.CHAT,
+                        ProviderCapability.STRUCTURED_OUTPUT,
+                    }
+                ),
                 context_window=8192,
             ),
             ProviderModel(
@@ -311,10 +403,10 @@ def test_generate_for_message_rejects_fade_transition_sources(
     tmp_path: Path,
 ) -> None:
     save, messages = _save_with_image_preference(repositories)
-    fade = repositories.update_message_body(
+    fade = _mark_message_as_fade_transition(
+        repositories,
         save_id=save.id,
         message_id=messages[-1].id,
-        body="Their hands slid beneath her clothes.",
     )
     provider = RecordingImageProvider(_VALID_PNG_BYTES)
     service = MediaService(
@@ -683,6 +775,8 @@ def test_generate_character_text_character_image_includes_visual_direction(
     save, opening_message, character_id = _full_roleplay_save(repositories)
     character = repositories.get_character(character_id)
     assert character is not None
+    character = replace(character, content_rating="pg-13")
+    repositories.update_character(character)
     thread = repositories.get_or_create_character_text_thread(
         save_id=save.id,
         character_id=character.id,
@@ -693,6 +787,7 @@ def test_generate_character_text_character_image_includes_visual_direction(
         character_id=character.id,
         sender="character",
         body="The ritual robe survived the rain. Sending proof.",
+        content_rating="r",
     )
     repositories.save_provider_model(
         provider="fake",
@@ -743,7 +838,9 @@ def test_generate_character_text_character_image_includes_visual_direction(
     assert "Wearing: rain-darkened blue glass robes." in request.prompt
     assert "Current action/pose: holding the mirror toward the beads." in request.prompt
     assert "Facial expression: small relieved smile." in request.prompt
-    assert json.loads(asset.metadata_json)["kind"] == "character_text_character_image"
+    metadata = json.loads(asset.metadata_json)
+    assert metadata["kind"] == "character_text_character_image"
+    assert metadata["content_rating"] == "r"
 
 
 def test_generate_character_text_object_image_persists_openrouter_request_alias(
@@ -755,6 +852,7 @@ def test_generate_character_text_object_image_persists_openrouter_request_alias(
         save_id=save.id,
         name="Mika Arai",
         met=True,
+        content_rating="r",
     )
     thread = repositories.get_or_create_character_text_thread(
         save_id=save.id,
@@ -767,6 +865,7 @@ def test_generate_character_text_object_image_persists_openrouter_request_alias(
         character_id=character.id,
         sender="character",
         body="This is the corner booth I mentioned.",
+        content_rating="pg-13",
     )
     requested_model = "google/gemini-3.1-flash-lite-image"
     response_model = "google/gemini-3.1-flash-lite-image-20260630"
@@ -813,6 +912,7 @@ def test_generate_character_text_object_image_persists_openrouter_request_alias(
     assert asset.model == requested_model
     metadata = json.loads(asset.metadata_json)
     assert metadata["kind"] == "character_text_object_context_image"
+    assert metadata["content_rating"] == "r"
     assert metadata["requested_model_id"] == requested_model
     assert metadata["response_model_id"] == response_model
 
@@ -855,6 +955,7 @@ def test_generate_character_text_object_image_enforces_child_content_rating(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        content_safety_service=BlockingMediaSafetyService(),
     )
 
     with pytest.raises(ValueError, match="selected content rating"):
@@ -1558,6 +1659,7 @@ def test_regenerate_asset_with_prompt_replaces_image_without_drafting_prompt(
     assert new_asset.source_message_id == old_asset.source_message_id
     assert new_asset.prompt == "edited lantern prompt"
     assert json.loads(new_asset.metadata_json) == {
+        "content_rating": "g",
         "kind": "scene_image",
         "regenerated_from_media_asset_id": old_asset.id,
     }
@@ -1599,9 +1701,10 @@ def test_regenerate_asset_with_prompt_rejects_intimate_prompt_before_job_or_prov
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        content_safety_service=BlockingMediaSafetyService(),
     )
 
-    with pytest.raises(ValueError, match="cannot contain intimate sexual content"):
+    with pytest.raises(ValueError, match="selected content rating"):
         asyncio.run(
             service.regenerate_asset_with_prompt(
                 save_id=save.id,
@@ -1650,6 +1753,7 @@ def test_regenerate_asset_with_prompt_enforces_child_content_rating(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        content_safety_service=BlockingMediaSafetyService(),
     )
 
     with pytest.raises(ValueError, match="selected content rating"):
@@ -1693,6 +1797,7 @@ def test_regenerate_child_explicit_act_prompt_is_rejected_before_venice(
         repositories=repositories,
         providers={"venice": provider},
         media_dir=tmp_path / "media",
+        content_safety_service=BlockingMediaSafetyService(),
     )
 
     with pytest.raises(ValueError, match="selected content rating"):
@@ -1759,10 +1864,10 @@ def test_regenerate_asset_with_prompt_rejects_fade_transition_source(
     tmp_path: Path,
 ) -> None:
     save, messages = _save_with_image_preference(repositories)
-    source = repositories.update_message_body(
+    source = _mark_message_as_fade_transition(
+        repositories,
         save_id=save.id,
         message_id=messages[-1].id,
-        body="Their hands slid beneath her clothes.",
     )
     old_asset = repositories.create_media_asset(
         save_id=save.id,
@@ -3082,10 +3187,10 @@ def test_automatic_generation_skips_fade_transition_sources(
     tmp_path: Path,
 ) -> None:
     save, messages = _save_with_image_preference(repositories)
-    source = repositories.update_message_body(
+    source = _mark_message_as_fade_transition(
+        repositories,
         save_id=save.id,
         message_id=messages[-1].id,
-        body="Their hands slid beneath her clothes.",
     )
     provider = RecordingImageProvider(_VALID_PNG_BYTES)
     service = _media_service(
@@ -3257,10 +3362,10 @@ def test_generate_prepared_automatic_rechecks_fade_transition_source(
     )
     assert prepared is not None
 
-    repositories.update_message_body(
+    _mark_message_as_fade_transition(
+        repositories,
         save_id=save.id,
         message_id=messages[-1].id,
-        body="Their hands slid beneath her clothes.",
     )
 
     assert asyncio.run(service.generate_prepared_automatic(prepared)) is None
@@ -3680,6 +3785,7 @@ def test_animate_image_generates_video_linked_to_source_media_asset(
         model="fake-image",
         status="succeeded",
         mime_type="image/png",
+        metadata={"content_rating": "g"},
     )
     provider = RecordingVideoProvider(_VALID_MP4_BYTES)
     service = MediaService(
@@ -3713,6 +3819,56 @@ def test_animate_image_generates_video_linked_to_source_media_asset(
     assert jobs[0]["payload"]["source_media_asset_id"] == source_image.id
 
 
+def test_animate_image_rejects_source_message_above_actor_ceiling(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    repositories.connection.execute(
+        "UPDATE messages SET content_rating = 'r' WHERE id = ?",
+        (messages[-1].id,),
+    )
+    repositories.commit()
+    repositories.set_model_preference(
+        task="image_animation",
+        provider="fake",
+        model_id="fake-image-video",
+    )
+    media_dir = tmp_path / "media"
+    source_path = media_dir / "restricted-source.png"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(_VALID_PNG_BYTES)
+    source_image = repositories.create_media_asset(
+        save_id=save.id,
+        source_message_id=messages[-1].id,
+        type="image",
+        path="restricted-source.png",
+        prompt="Benign source prompt",
+        provider="fake",
+        model="fake-image",
+        status="succeeded",
+        metadata={"content_rating": "g"},
+    )
+    provider = RecordingVideoProvider(_VALID_MP4_BYTES)
+
+    with pytest.raises(
+        ValueError,
+        match="Source media exceeds the selected content rating",
+    ):
+        asyncio.run(
+            MediaService(
+                repositories=repositories,
+                providers={"fake": provider},
+                media_dir=media_dir,
+            ).animate_image(
+                save_id=save.id,
+                media_asset_id=source_image.id,
+            )
+        )
+
+    assert provider.video_requests == []
+
+
 def test_animate_image_compacts_venice_prompt_before_provider_call(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -3737,6 +3893,7 @@ def test_animate_image_compacts_venice_prompt_before_provider_call(
         model="fake-image",
         status="succeeded",
         mime_type="image/png",
+        metadata={"content_rating": "g"},
     )
     provider = RecordingVideoProvider(_VALID_MP4_BYTES)
     service = MediaService(
@@ -3784,6 +3941,7 @@ def test_animate_image_rejects_missing_source_file_before_provider_call(
         provider="fake",
         model="fake-image",
         status="succeeded",
+        metadata={"content_rating": "g"},
         mime_type="image/png",
     )
     provider = RecordingVideoProvider(_VALID_MP4_BYTES)
@@ -3830,6 +3988,7 @@ def test_animate_image_failed_job_records_provider_validation_details(
         provider="fake",
         model="fake-image",
         status="succeeded",
+        metadata={"content_rating": "g"},
         mime_type="image/png",
     )
     provider = SequenceVideoProvider(
@@ -5188,6 +5347,7 @@ def test_animate_image_skips_video_fallback_without_matching_video_flow(
         provider="fake",
         model="fake-image",
         status="succeeded",
+        metadata={"content_rating": "g"},
     )
     primary_provider = SequenceVideoProvider(
         provider_name="primary",
@@ -5272,6 +5432,7 @@ def test_animate_image_uses_image_plus_text_video_fallback(
         provider="fake",
         model="fake-image",
         status="succeeded",
+        metadata={"content_rating": "g"},
     )
     primary_provider = SequenceVideoProvider(
         provider_name="primary",
@@ -5664,6 +5825,7 @@ def test_generate_character_reference_persists_character_link(
     assert [item.id for item in media_assets] == [asset.id]
     assert _asset_path(media_dir, asset.path).read_bytes() == _VALID_PNG_BYTES
     assert json.loads(asset.metadata_json) == {
+        "content_rating": "g",
         "kind": "character_reference",
         "character_id": character_id,
     }
@@ -5957,6 +6119,7 @@ def test_scene_generation_uses_present_character_reference(
     assert expected_expression in scene_request.prompt
     assert scene_asset.source_media_asset_id == reference.id
     assert json.loads(scene_asset.metadata_json) == {
+        "content_rating": "g",
         "kind": "scene_image",
         "source_character_reference_asset_id": reference.id,
         "source_character_reference_asset_ids": [reference.id],
@@ -6083,6 +6246,7 @@ def test_scene_generation_uses_present_and_mentioned_character_references_up_to_
     assert omitted_reference.id not in request.source_media_asset_ids
     assert asset.source_media_asset_id == present_reference.id
     assert json.loads(asset.metadata_json) == {
+        "content_rating": "g",
         "kind": "scene_image",
         "source_character_reference_asset_id": present_reference.id,
         "source_character_reference_asset_ids": [
@@ -6230,6 +6394,7 @@ def test_character_image_generation_uses_reference_image_to_image(
     )
     assert asset.source_media_asset_id == character_request.source_media_asset_id
     assert json.loads(asset.metadata_json) == {
+        "content_rating": "g",
         "kind": "character_image",
         "character_id": character_id,
         "character_name": "Oracle of Glass",
@@ -6490,6 +6655,7 @@ def test_character_image_generation_allows_full_roleplay_save(
     assert "Facial expression: expression grounded in this moment" in request.prompt
     assert asset.source_media_asset_id == reference.id
     assert json.loads(asset.metadata_json) == {
+        "content_rating": "g",
         "kind": "character_image",
         "character_id": character.id,
         "character_name": "Mara",
@@ -6605,6 +6771,7 @@ def test_character_registry_image_generation_uses_reference_without_message_link
     assert asset.source_message_id is None
     assert asset.source_media_asset_id == reference.id
     assert json.loads(asset.metadata_json) == {
+        "content_rating": "g",
         "kind": "character_image",
         "character_id": character_id,
         "character_name": "Oracle of Glass",
@@ -7827,6 +7994,7 @@ def test_automatic_scene_generation_uses_present_character_reference(
     assert request.source_media_path == media_dir / reference.path
     assert asset.source_media_asset_id == reference.id
     assert json.loads(asset.metadata_json) == {
+        "content_rating": "g",
         "kind": "scene_image",
         "source_character_reference_asset_id": reference.id,
         "source_character_reference_asset_ids": [reference.id],
@@ -7871,6 +8039,7 @@ def _save_with_image_preference(
             speaker_name="Mara",
             body="I step onto the ash bridge.",
             token_estimate=55,
+            content_rating="g",
         ),
         repositories.append_message(
             save_id=save.id,
@@ -7880,6 +8049,7 @@ def _save_with_image_preference(
             provider="fake",
             model="fake-chat",
             token_estimate=65,
+            content_rating="g",
         ),
         repositories.append_message(
             save_id=save.id,
@@ -7887,6 +8057,7 @@ def _save_with_image_preference(
             speaker_name="Mara",
             body="I ask who rang the bell.",
             token_estimate=45,
+            content_rating="g",
         ),
         repositories.append_message(
             save_id=save.id,
@@ -7896,6 +8067,7 @@ def _save_with_image_preference(
             provider="fake",
             model="fake-chat",
             token_estimate=50,
+            content_rating="g",
         ),
     ]
     repositories.set_model_preference(
@@ -7936,6 +8108,7 @@ def _save_with_custom_ids_and_image_preference(
         body="The echo answers from below.",
         provider="fake",
         model="fake-chat",
+        content_rating="g",
         token_estimate=50,
         message_id=message_id,
     )
@@ -7981,6 +8154,7 @@ def _full_roleplay_save(
         body="The oracle studies your reflection before your face.",
         provider="fake",
         model="fake-chat",
+        content_rating="g",
     )
     character = repositories.add_character(
         save_id=save.id,

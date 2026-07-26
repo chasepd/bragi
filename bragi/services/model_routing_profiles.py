@@ -12,12 +12,18 @@ from bragi.services.generation_settings import (
     MODEL_THINKING_PREFERENCES_SETTING,
     sanitize_model_thinking_preferences,
 )
+from bragi.services.model_capabilities import (
+    STRUCTURED_OUTPUT_CAPABILITIES,
+    model_supports_any_capability,
+)
 from bragi.services.model_preferences import (
+    CONTENT_SAFETY_PURPOSE,
     ROLEPLAY_MODEL_PURPOSES,
     ROLEPLAY_SHARED_MODE_SETTING,
     ROLEPLAY_SHARED_TYPE,
     ROLEPLAY_TYPES,
     SCENARIO_GENERATION_SECTION_GROUPS,
+    roleplay_model_purpose,
     roleplay_model_task,
     scenario_generation_section_model_task,
     shared_roleplay_models_enabled,
@@ -146,6 +152,20 @@ def apply_model_routing_profile(
     if profile is None:
         raise ValueError("Unknown model routing profile")
     model = _profile_model(profile)
+    for preference in model.preferences:
+        if (
+            roleplay_model_purpose(preference.task) == CONTENT_SAFETY_PURPOSE
+            and not model_supports_any_capability(
+                repositories,
+                provider=preference.provider,
+                model_id=preference.model_id,
+                required=STRUCTURED_OUTPUT_CAPABILITIES,
+            )
+        ):
+            raise ValueError(
+                "Saved Safety Agent model is unavailable or does not support "
+                "structured output"
+            )
     repositories.begin_transaction()
     try:
         repositories.set_app_setting(

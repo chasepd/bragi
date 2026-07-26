@@ -38,6 +38,7 @@ ROLEPLAY_TYPES = (
 NARRATOR_FALLBACK_PURPOSE = "narrator_fallback"
 CHAT_FALLBACK_PURPOSE = "chat_fallback"
 CHARACTER_ENHANCEMENT_PURPOSE = "character_enhancement"
+CONTENT_SAFETY_PURPOSE = "content_safety"
 ACTION_CHOICE_GENERATION_PURPOSE = "action_choice_generation"
 CHARACTER_PRESENCE_ASSESSMENT_PURPOSE = "character_presence_assessment"
 CHARACTER_INTENT_PLANNING_PURPOSE = "character_intent_planning"
@@ -70,6 +71,7 @@ ROLEPLAY_MODEL_PURPOSES = (
     "memory_curation",
     "response_planning",
     "response_verification",
+    CONTENT_SAFETY_PURPOSE,
     "director_pressure",
     ACTION_CHOICE_GENERATION_PURPOSE,
     CHARACTER_PRESENCE_ASSESSMENT_PURPOSE,
@@ -560,6 +562,23 @@ def roleplay_model_task(*, roleplay_type: str, purpose: str) -> str:
     if purpose == "chat":
         return _ROLEPLAY_CHAT_TASKS.get(roleplay_type, purpose)
     return f"{roleplay_type}_{purpose}"
+
+
+def roleplay_model_purpose(task: str) -> str:
+    """Return the roleplay purpose represented by a selector task."""
+
+    normalized_task = task.strip()
+    for roleplay_type in (ROLEPLAY_SHARED_TYPE, *ROLEPLAY_TYPES):
+        for purpose in ROLEPLAY_MODEL_PURPOSES:
+            if (
+                roleplay_model_task(
+                    roleplay_type=roleplay_type,
+                    purpose=purpose,
+                )
+                == normalized_task
+            ):
+                return purpose
+    return normalized_task
 
 
 def roleplay_model_preference(

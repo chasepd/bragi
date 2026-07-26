@@ -153,6 +153,7 @@ def test_media_model_omits_assets_above_the_viewer_content_rating(
         provider="fake",
         model="fake-image",
         status="succeeded",
+        metadata={"content_rating": "r"},
     )
 
     unfiltered = media.build_media_model(
@@ -169,6 +170,43 @@ def test_media_model_omits_assets_above_the_viewer_content_rating(
         _value(item, "id") for item in _value(unfiltered, "media_history")
     }
     assert explicit_asset.id not in {
+        _value(item, "id") for item in _value(filtered, "media_history")
+    }
+
+
+def test_media_model_omits_asset_when_its_source_message_exceeds_viewer_rating(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    media = _import_media_without_gtk(monkeypatch)
+    save_id = _save_with_media_history(repositories)
+    restricted_message = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Restricted source narration.",
+        content_rating="r",
+    )
+    asset = repositories.create_media_asset(
+        save_id=save_id,
+        source_message_id=restricted_message.id,
+        type="image",
+        path="media/save-1/mild-derived-image.png",
+        thumbnail_path=None,
+        prompt="A quiet corridor.",
+        provider="fake",
+        model="fake-image",
+        status="succeeded",
+        metadata={"content_rating": "g"},
+    )
+
+    filtered = media.build_media_model(
+        repositories=repositories,
+        save_id=save_id,
+        allowed_rating="pg",
+    )
+
+    assert asset.id not in {
         _value(item, "id") for item in _value(filtered, "media_history")
     }
 

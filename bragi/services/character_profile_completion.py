@@ -140,6 +140,7 @@ class ScenarioStarterReferenceImage:
     source: str = "uploaded"
     created_at: str | None = None
     bundle_path: str | None = None
+    content_rating: str = "unclassified"
 
 
 @dataclass(frozen=True)
@@ -908,6 +909,7 @@ def scenario_starter_reference_image_to_json(
         "prompt_preview": reference.prompt_preview,
         "source": reference.source,
         "created_at": reference.created_at,
+        "content_rating": reference.content_rating,
     }
     if reference.bundle_path is not None:
         payload["bundle_path"] = reference.bundle_path
@@ -1049,6 +1051,7 @@ def _starter_reference_image_from_mapping(
         source=_string(payload.get("source")) or "uploaded",
         created_at=created_at,
         bundle_path=bundle_path,
+        content_rating=_string(payload.get("content_rating")) or "unclassified",
     )
 
 

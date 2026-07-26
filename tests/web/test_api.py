@@ -39,9 +39,11 @@ from bragi.services.character_action_planning_service import (
     CHARACTER_ACTION_PLANNING_ENABLED_SETTING,
     CHARACTER_ACTION_PLANNING_MAX_CONCURRENCY_SETTING,
 )
+from bragi.services.character_profile_completion import ScenarioCharacterStarter
 from bragi.services.character_registry_service import (
     CharacterFieldEnhanceResult,
     CharacterRegistryEdits,
+    CharacterRegistryRow,
     CharacterRegistryService,
 )
 from bragi.services.character_text_revision_service import (
@@ -52,6 +54,7 @@ from bragi.services.model_preferences import SAVE_MODEL_OVERRIDES_SETTING
 from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.secrets import InMemorySecretStore
 from bragi.services.settings_service import SettingsService
+from bragi.services.world_data_service import ScenarioEdit
 from bragi_web.api.app import create_app
 from bragi_web.auth_throttle import AuthAttemptThrottle
 from bragi_web.jobs import JobRecord, JobRegistry, JobRegistryLimits
@@ -927,6 +930,49 @@ def test_save_list_orders_visible_saves_by_latest_message_activity(
     assert runtime.json()["active_save_id"] == older_created_stale_save.id
 
 
+def test_runtime_and_save_list_redact_restricted_scenario_metadata(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(sqlite3.connect(database_path))
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Restricted Scenario Title",
+        premise="Restricted premise.",
+        player_role="Restricted role.",
+        content={"_source": {"content_rating": "r"}},
+    )
+    save = repositories.create_save(
+        scenario_id=scenario.id,
+        title="Restricted Save Title",
+        custom_instructions="Restricted custom instructions.",
+    )
+    repositories.set_app_setting("content_filter_rating", "g")
+    state = _state_double(tmp_path)
+    state.repositories = repositories
+
+    payload = api_app._runtime_json_dict(  # noqa: SLF001
+        cast(WebAppState, state),
+        {
+            "active_save_id": save.id,
+            "active_save_title": save.title,
+            "scenario_title": scenario.title,
+            "scene_title": scenario.title,
+            "custom_instructions": "Restricted custom instructions.",
+            "saves": [],
+            "chronicle": {"messages": []},
+        },
+    )
+
+    assert payload["active_save_title"] == CONTENT_FILTER_TRANSITION
+    assert payload["scenario_title"] == CONTENT_FILTER_TRANSITION
+    assert payload["scene_title"] == CONTENT_FILTER_TRANSITION
+    assert payload["custom_instructions"] == CONTENT_FILTER_TRANSITION
+    assert payload["saves"][0]["title"] == CONTENT_FILTER_TRANSITION
+    assert payload["saves"][0]["scenario_title"] == CONTENT_FILTER_TRANSITION
+
+
 def test_user_with_no_accessible_saves_does_not_fall_back_to_global_save(
     tmp_path: Path,
 ) -> None:
@@ -1530,6 +1576,7 @@ def test_child_read_filters_existing_adult_chronicle_and_media(
         "model": "fake-image",
         "status": "succeeded",
         "source_message": graphic_body,
+        "metadata": {"content_rating": "r"},
     }
 
     class ExistingAdultContentRuntime(_RuntimeDouble):
@@ -1549,6 +1596,7 @@ def test_child_read_filters_existing_adult_chronicle_and_media(
             message["markdown_blocks"] = [
                 {"kind": "paragraph", "text": graphic_body}
             ]
+            message["content_rating"] = "r"
             model["media"] = {
                 "latest_scene_media": dict(explicit_media),
                 "latest_scene_image": dict(explicit_media),
@@ -1582,6 +1630,7 @@ def test_child_read_filters_existing_adult_chronicle_and_media(
         role="narrator",
         speaker_name="Narrator",
         body=graphic_body,
+        content_rating="r",
     )
     media_path = state.paths.media_dir / save.id / "explicit.png"
     thumbnail_path = state.paths.media_dir / save.id / "explicit-thumb.png"
@@ -1599,6 +1648,7 @@ def test_child_read_filters_existing_adult_chronicle_and_media(
         model="fake-image",
         status="succeeded",
         mime_type="image/png",
+        metadata={"content_rating": "r"},
     )
     character = state.repositories.add_character(
         save_id=save.id,
@@ -1613,7 +1663,11 @@ def test_child_read_filters_existing_adult_chronicle_and_media(
         provider="fake",
         model="fake-image",
         status="succeeded",
-        metadata={"kind": "character_reference", "character_id": character.id},
+        metadata={
+            "kind": "character_reference",
+            "character_id": character.id,
+            "content_rating": "r",
+        },
     )
     generated_asset = state.repositories.create_media_asset(
         save_id=save.id,
@@ -1624,7 +1678,11 @@ def test_child_read_filters_existing_adult_chronicle_and_media(
         provider="fake",
         model="fake-image",
         status="succeeded",
-        metadata={"kind": "character_image", "character_id": character.id},
+        metadata={
+            "kind": "character_image",
+            "character_id": character.id,
+            "content_rating": "r",
+        },
     )
     state.repositories.add_entity_link(
         save_id=save.id,
@@ -1723,7 +1781,11 @@ def test_child_read_filters_character_text_preview_and_attachment(
         character_id=npc.id,
         sender="character",
         body=graphic_body,
+        content_rating="r",
     )
+    media_path = state.paths.media_dir / save_id / "text-attachment.png"
+    media_path.parent.mkdir(parents=True)
+    media_path.write_bytes(VALID_PNG_BYTES)
     media_asset = state.repositories.create_media_asset(
         save_id=save_id,
         source_message_id=None,
@@ -1733,7 +1795,12 @@ def test_child_read_filters_character_text_preview_and_attachment(
         provider="fake",
         model="fake-image",
         status="succeeded",
-        metadata={"kind": "character_text_object_context_image"},
+        metadata={
+            "kind": "character_text_object_context_image",
+            "content_rating": "g",
+            "text_message_id": message.id,
+            "character_id": npc.id,
+        },
     )
     state.repositories.add_character_text_message_attachment(
         save_id=save_id,
@@ -1758,6 +1825,9 @@ def test_child_read_filters_character_text_preview_and_attachment(
         thread_response = client.get(
             f"/api/character-texts/threads/{thread.id}?save_id={save_id}"
         )
+        media_response = client.get(
+            f"/api/media/{media_asset.id}?save_id={save_id}"
+        )
 
     assert contacts_response.status_code == 200
     contact = next(
@@ -1770,6 +1840,10 @@ def test_child_read_filters_character_text_preview_and_attachment(
     assert thread_message["body"] == CONTENT_FILTER_TRANSITION
     assert thread_message["attachments"] == []
     assert media_asset.id not in json.dumps(thread_response.json())
+    assert media_response.status_code == 403
+    assert media_response.json() == {
+        "detail": "Media exceeds your content rating",
+    }
 
 
 def test_character_text_contact_update_repairs_manual_contact_state(
@@ -3535,7 +3609,13 @@ def test_scenarios_api_tolerates_legacy_scenario_type(
         title="Old Harbor",
         premise="An older scenario template from a previous version.",
         player_role="Keeper",
-        content={"opening_message": "The old harbor bell rings."},
+        content={
+            "opening_message": "The old harbor bell rings.",
+            "_source": {
+                "content_rating": "g",
+                "section_content_ratings": {"opening_message": "g"},
+            },
+        },
     )
 
     with TestClient(app) as client:
@@ -3563,7 +3643,13 @@ def test_retired_character_interaction_records_are_recovery_only(
         title="Archived Conversation",
         premise="Historical recovery data.",
         player_role="Player",
-        content={"opening_message": "A preserved greeting."},
+        content={
+            "opening_message": "A preserved greeting.",
+            "_source": {
+                "content_rating": "g",
+                "section_content_ratings": {"opening_message": "g"},
+            },
+        },
     )
     save = state.repositories.create_save(
         scenario_id=scenario.id,
@@ -4238,6 +4324,7 @@ def test_runtime_shell_omits_media_and_bounds_chronicle(
             role="narrator",
             speaker_name="Narrator",
             body=f"Message {index}",
+            content_rating="g",
         )
         for index in range(90)
     ]
@@ -4941,6 +5028,7 @@ def test_runtime_model_pages_large_chronicle_and_loads_older_page(
                     role="narrator",
                     speaker_name="Narrator",
                     body=f"Turn {index}",
+                    content_rating="g",
                 )
 
         runtime = client.get("/api/runtime")
@@ -6849,12 +6937,14 @@ def test_save_event_stream_filters_stored_content_for_current_viewer(
                 "thread_id": "thread-1",
                 "sender": "character",
                 "body": graphic_body,
+                "content_rating": "r",
                 "attachments": [
                     {
                         "id": "attachment-1",
                         "media_asset_id": "media-1",
                         "prompt_preview": graphic_body,
                         "mime_type": "image/png",
+                        "content_rating": "r",
                     }
                 ],
             },
@@ -8301,6 +8391,18 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
             self,
             request: StructuredOutputRequest,
         ) -> StructuredOutputResponse:
+            if request.schema_name == "content_safety_review":
+                return StructuredOutputResponse(
+                    data={
+                        "action": "allow",
+                        "category": "none",
+                        "reason": "Test fixture content is within the ceiling.",
+                        "minimum_rating": "g",
+                    },
+                    provider=request.provider,
+                    model_id=request.model_id,
+                    token_usage={"total": 3},
+                )
             return StructuredOutputResponse(
                 data={"selections": []},
                 provider=request.provider,
@@ -8348,10 +8450,22 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
             json={"body": "Light the beacon", "save_id": save.id},
         )
         assert created.status_code == 200
-        job = _wait_for_terminal_job(client, created.json()["id"], save_id=save.id)
+        job_id = created.json()["id"]
+        for _ in range(100):
+            job_record = state.jobs.get(job_id)
+            if job_record is not None and job_record.status in {
+                "succeeded",
+                "failed",
+                "cancelled",
+            }:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("chat turn job did not finish")
 
-    assert job["status"] == "succeeded"
-    result = job["result"]
+    assert job_record is not None
+    assert job_record.status == "succeeded"
+    result = cast(dict[str, Any], job_record.result)
     assert result["kind"] == "chat_turn_delta"
     assert result["version"] == 1
     assert result["save_id"] == save.id
@@ -11622,6 +11736,29 @@ def test_model_preference_update_is_reflected_in_settings(
     assert selector["warning"] == "Selected model is unavailable"
 
 
+def test_content_safety_model_preference_rejects_unknown_model(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BRAGI_WEB_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("BRAGI_WEB_FAKE_PROVIDERS", "1")
+
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/api/settings/model-preference",
+            json={
+                "task": "content_safety",
+                "provider": "fake",
+                "model_id": "fake-unknown-safety-model",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Safety Agent model must support structured output"
+    }
+
+
 def test_model_preference_clear_removes_task_override(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
@@ -11920,7 +12057,12 @@ def test_world_data_apply_and_scenario_definition_edit(
     monkeypatch.setenv("BRAGI_WEB_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("BRAGI_WEB_FAKE_PROVIDERS", "1")
 
-    with TestClient(create_app()) as client:
+    app = create_app()
+    cast(WebAppState, app.state.bragi).repositories.set_app_setting(
+        "content_filter_rating",
+        "unrated",
+    )
+    with TestClient(app) as client:
         created = client.post(
             "/api/scenarios/manual",
             json={
@@ -11977,6 +12119,281 @@ def test_world_data_apply_and_scenario_definition_edit(
     assert definition.json()["model"]["scenario"]["title"] == "Shared Lantern Keep"
 
 
+def test_world_data_apply_filters_new_unclassified_rows_from_response(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BRAGI_WEB_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("BRAGI_WEB_FAKE_PROVIDERS", "1")
+    app = create_app()
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/scenarios/manual",
+            json={
+                "scenario_type": "full_roleplay",
+                "title": "Lantern Keep",
+                "premise": "A watchtower.",
+                "player_role": "Keeper",
+                "opening_message": "The beacon wakes.",
+            },
+        )
+        assert created.status_code == 200
+        world = client.get("/api/world-data").json()
+        applied = client.post(
+            "/api/world-data/apply",
+            json={
+                "active_save_id": world["active_save_id"],
+                "edits": {
+                    "scenario": world["scenario"],
+                    "world_state": [
+                        {
+                            "row_id": "",
+                            "key": "unreviewed",
+                            "category": "note",
+                            "confidence": 1.0,
+                            "value_json": '{"body":"unclassified manual prose"}',
+                            "source_message_id": None,
+                        }
+                    ]
+                },
+            },
+        )
+
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["model"]["world_state"] == []
+    state = cast(WebAppState, app.state.bragi)
+    assert any(
+        row.key == "unreviewed"
+        for row in state.repositories.list_world_state(world["active_save_id"])
+    )
+
+
+def test_scenario_character_starters_are_reviewed_by_safety_agent(
+    tmp_path: Path,
+) -> None:
+    class BlockingSafetyProvider:
+        provider_name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[StructuredOutputRequest] = []
+
+        async def generate_structured_output(
+            self,
+            request: StructuredOutputRequest,
+        ) -> StructuredOutputResponse:
+            self.requests.append(request)
+            return StructuredOutputResponse(
+                data={
+                    "action": "block",
+                    "category": "violence",
+                    "reason": "The starter exceeds the configured ceiling.",
+                    "minimum_rating": "r",
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
+
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(sqlite3.connect(database_path))
+    repositories.set_app_setting("content_filter_rating", "pg")
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-safety",
+        display_name="Fake Safety",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="fake",
+        model_id="fake-safety",
+    )
+    provider = BlockingSafetyProvider()
+    state = cast(
+        WebAppState,
+        SimpleNamespace(
+            repositories=repositories,
+            providers={"fake": cast(ProviderClient, provider)},
+        ),
+    )
+    starter = ScenarioCharacterStarter(
+        name="The Ash Warden",
+        aliases=("Warden",),
+        role="Gaoler",
+        appearance="A detailed visible injury.",
+        relationships={"player": "A frightening threat."},
+    )
+
+    reviewed = asyncio.run(
+        api_app._review_scenario_edit_for_request(  # noqa: SLF001
+            state,
+            ScenarioEdit(
+                title="Lantern Keep",
+                premise="",
+                player_role="Keeper",
+                content={},
+                character_starters=(starter,),
+            ),
+            save_id=None,
+            roleplay_type="full_roleplay",
+            current_user_id=None,
+        )
+    )
+
+    reviewed_starter = reviewed.character_starters[0]
+    assert reviewed_starter.name == CONTENT_FILTER_TRANSITION
+    assert reviewed_starter.role == CONTENT_FILTER_TRANSITION
+    assert reviewed_starter.appearance == CONTENT_FILTER_TRANSITION
+    assert reviewed_starter.aliases == ()
+    assert reviewed_starter.relationships == {}
+    assert dict(reviewed.section_content_ratings)["character_starters"] == "g"
+    starter_request = provider.requests[0]
+    submitted_starter = json.loads(starter_request.messages[1].body)
+    assert submitted_starter["appearance"] == "A detailed visible injury."
+    assert submitted_starter["relationships"] == {
+        "player": "A frightening threat."
+    }
+
+
+def test_manual_character_profiles_are_reviewed_and_rated(
+    tmp_path: Path,
+) -> None:
+    class BlockingSafetyProvider:
+        provider_name = "fake"
+
+        async def generate_structured_output(
+            self,
+            request: StructuredOutputRequest,
+        ) -> StructuredOutputResponse:
+            return StructuredOutputResponse(
+                data={
+                    "action": "block",
+                    "category": "violence",
+                    "reason": "The profile exceeds the configured ceiling.",
+                    "minimum_rating": "r",
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
+
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(sqlite3.connect(database_path))
+    save = _create_auth_save(
+        repositories,
+        title="Lantern Save",
+        owner_user_id=None,
+    )
+    repositories.set_app_setting("content_filter_rating", "pg")
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-safety",
+        display_name="Fake Safety",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="fake",
+        model_id="fake-safety",
+    )
+    state = cast(
+        WebAppState,
+        SimpleNamespace(
+            repositories=repositories,
+            providers={
+                "fake": cast(ProviderClient, BlockingSafetyProvider())
+            },
+        ),
+    )
+    edits = CharacterRegistryEdits(
+        characters=(
+            CharacterRegistryRow(
+                character_id="",
+                name="The Ash Warden",
+                appearance="A lingering graphic injury.",
+                relationships_json='{"player":"A prolonged frightening threat."}',
+            ),
+        )
+    )
+
+    reviewed = asyncio.run(
+        api_app._review_character_edits_for_request(  # noqa: SLF001
+            state,
+            edits,
+            save_id=save.id,
+            current_user_id=None,
+        )
+    )
+    reviewed_row = reviewed.characters[0]
+    assert reviewed_row.name == CONTENT_FILTER_TRANSITION
+    assert reviewed_row.appearance == CONTENT_FILTER_TRANSITION
+    assert reviewed_row.relationships_json == "{}"
+    assert reviewed_row.content_rating == "g"
+
+
+def test_untrusted_bundle_preview_text_is_replaced_when_safety_blocks(
+    tmp_path: Path,
+) -> None:
+    class BlockingSafetyProvider:
+        provider_name = "fake"
+
+        async def generate_structured_output(
+            self,
+            request: StructuredOutputRequest,
+        ) -> StructuredOutputResponse:
+            return StructuredOutputResponse(
+                data={
+                    "action": "block",
+                    "category": "sexual_content",
+                    "reason": "Imported preview text exceeds the ceiling.",
+                    "minimum_rating": "r",
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
+
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(sqlite3.connect(database_path))
+    repositories.set_app_setting("content_filter_rating", "pg")
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-safety",
+        display_name="Fake Safety",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="fake",
+        model_id="fake-safety",
+    )
+    state = _state_double(tmp_path)
+    state.repositories = repositories
+    state.providers = {
+        "fake": cast(ProviderClient, BlockingSafetyProvider())
+    }
+
+    preview = asyncio.run(
+        api_app._review_bundle_preview_for_request(  # noqa: SLF001
+            cast(WebAppState, state),
+            {
+                "save_id": "external-save",
+                "title": "Explicit imported title",
+                "scenario_title": "Explicit imported scenario",
+                "bundle_version": 1,
+            },
+        )
+    )
+
+    assert preview == {
+        "save_id": "external-save",
+        "title": CONTENT_FILTER_TRANSITION,
+        "scenario_title": CONTENT_FILTER_TRANSITION,
+        "bundle_version": 1,
+    }
+
+
 def test_scenario_starter_reference_image_upload_and_remove(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
@@ -11988,6 +12405,7 @@ def test_scenario_starter_reference_image_upload_and_remove(
     app = create_app()
     with TestClient(app) as client:
         state = cast(WebAppState, app.state.bragi)
+        state.repositories.set_app_setting("content_filter_rating", "unrated")
         created = client.post(
             "/api/scenarios/manual",
             json={
@@ -12134,6 +12552,11 @@ def test_scenario_starter_reference_image_serving_requires_starter_media_path(
         private_path = state.paths.media_dir / "save-1" / "private.png"
         private_path.parent.mkdir(parents=True)
         private_path.write_bytes(b"\x89PNG\r\n\x1a\nprivate image bytes")
+        legacy_path = (
+            state.paths.media_dir / "scenario-starters" / "legacy-reference.png"
+        )
+        legacy_path.parent.mkdir(parents=True)
+        legacy_path.write_bytes(b"\x89PNG\r\n\x1a\nlegacy image bytes")
         created = client.post(
             "/api/scenarios/manual",
             json={
@@ -12154,6 +12577,16 @@ def test_scenario_starter_reference_image_serving_requires_starter_media_path(
                     **world["scenario"],
                     "character_starters": [
                         {
+                            "name": "Legacy Captain",
+                            "reference_image": {
+                                "id": "starter-ref-legacy",
+                                "path": "scenario-starters/legacy-reference.png",
+                                "thumbnail_path": None,
+                                "mime_type": "image/png",
+                                "source": "uploaded",
+                            },
+                        },
+                        {
                             "name": "Captain Ilyra",
                             "reference_image": {
                                 "id": "starter-ref-unsafe",
@@ -12161,6 +12594,7 @@ def test_scenario_starter_reference_image_serving_requires_starter_media_path(
                                 "thumbnail_path": None,
                                 "mime_type": "image/png",
                                 "source": "uploaded",
+                                "content_rating": "g",
                             },
                         }
                     ],
@@ -12171,9 +12605,14 @@ def test_scenario_starter_reference_image_serving_requires_starter_media_path(
             "/api/scenarios/"
             f"{scenario_id}/character-starters/reference-images/starter-ref-unsafe",
         )
+        legacy = client.get(
+            "/api/scenarios/"
+            f"{scenario_id}/character-starters/reference-images/starter-ref-legacy",
+        )
 
     assert definition.status_code == 200
     assert unsafe.status_code == 404
+    assert legacy.status_code == 403
 
 
 def test_world_data_apply_accepts_grouped_suggestion_actions(
@@ -13248,6 +13687,8 @@ def _action_ids(message: dict[str, Any]) -> set[str]:
 
 
 class _BlockingCharacterTextProvider:
+    provider_name = "fake"
+
     def __init__(self) -> None:
         self.requests: list[Any] = []
         self._release = threading.Event()
@@ -13265,6 +13706,12 @@ class _BlockingCharacterTextProvider:
             token_usage={"total": 12},
         )
 
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        return _allow_safety_response(request)
+
     def wait_for_entered(self, count: int) -> bool:
         with self._condition:
             return self._condition.wait_for(
@@ -13277,6 +13724,8 @@ class _BlockingCharacterTextProvider:
 
 
 class _RecordingCharacterTextProvider:
+    provider_name = "fake"
+
     def __init__(
         self,
         response_body: str = "Meet me by the arcade after class.",
@@ -13292,6 +13741,29 @@ class _RecordingCharacterTextProvider:
             model_id=getattr(request, "model_id", "fake-chat"),
             token_usage={"total": 12},
         )
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        return _allow_safety_response(request)
+
+
+def _allow_safety_response(
+    request: StructuredOutputRequest,
+) -> StructuredOutputResponse:
+    if request.schema_name != "content_safety_review":
+        raise AssertionError(f"unexpected structured schema: {request.schema_name}")
+    return StructuredOutputResponse(
+        data={
+            "action": "allow",
+            "category": "none",
+            "reason": "Test fixture content is within the ceiling.",
+            "minimum_rating": "g",
+        },
+        provider=request.provider,
+        model_id=request.model_id,
+    )
 
 
 def _seed_character_text_exchange(
@@ -13331,6 +13803,7 @@ def _seed_character_text_exchange(
         character_id=npc.id,
         sender="player",
         body="Can we tak after class?",
+        content_rating="g",
     )
     reply = repositories.append_character_text_message(
         save_id=save_id,
@@ -13340,6 +13813,7 @@ def _seed_character_text_exchange(
         body="Sure, meet me by the lockers.",
         provider="fake",
         model="fake-chat",
+        content_rating="g",
     )
     return player_message.id, reply.id, thread.id
 
@@ -13447,6 +13921,7 @@ def _seed_portability_media_asset(
             provider="fake",
             model="fake-image",
             status="succeeded",
+            metadata={"content_rating": "g"},
         )
     return asset, image_path, thumbnail_path
 
@@ -13936,10 +14411,13 @@ def test_media_upload_character_reference_passes_file_and_save_to_runtime(
             }
 
     runtime = MediaRuntime()
-
-    with TestClient(
-        create_app(cast(WebAppState, _state_double(tmp_path, runtime)))
-    ) as client:
+    state = _state_double(tmp_path, runtime)
+    state.repositories.get_effective_setting = (
+        lambda key, **_kwargs: "unrated"
+        if key == "content_filter_rating"
+        else None
+    )
+    with TestClient(create_app(cast(WebAppState, state))) as client:
         response = client.post(
             "/api/media/character-reference/upload",
             data={"save_id": "save-1", "replace_existing": "true"},
@@ -13953,6 +14431,35 @@ def test_media_upload_character_reference_passes_file_and_save_to_runtime(
     assert runtime.uploads == [
         (b"\x89PNG\r\n\x1a\nimage", "portrait.png", True, "save-1")
     ]
+
+
+def test_rated_reference_upload_is_rejected_before_persistence(
+    tmp_path: Path,
+) -> None:
+    class NoUploadRuntime(_RuntimeDouble):
+        def upload_character_reference_image(self, **_kwargs: object) -> NoReturn:
+            raise AssertionError("rated upload must not reach persistence")
+
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, NoUploadRuntime())))
+    ) as client:
+        response = client.post(
+            "/api/media/character-reference/upload",
+            data={"save_id": "save-1"},
+            files={
+                "file": (
+                    "portrait.png",
+                    b"\x89PNG\r\n\x1a\nimage",
+                    "image/png",
+                )
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Uploaded images cannot be safety-reviewed. Set the content rating "
+        "to Unrated before uploading a reference image."
+    )
 
 
 def test_media_upload_character_reference_maps_runtime_errors(
@@ -13969,9 +14476,13 @@ def test_media_upload_character_reference_maps_runtime_errors(
         ) -> dict[str, object]:
             return {"error": "Unsupported image upload type; use PNG, JPEG, or WebP"}
 
-    with TestClient(
-        create_app(cast(WebAppState, _state_double(tmp_path, FailingUploadRuntime())))
-    ) as client:
+    state = _state_double(tmp_path, FailingUploadRuntime())
+    state.repositories.get_effective_setting = (
+        lambda key, **_kwargs: "unrated"
+        if key == "content_filter_rating"
+        else None
+    )
+    with TestClient(create_app(cast(WebAppState, state))) as client:
         response = client.post(
             "/api/media/character-reference/upload",
             data={"save_id": "save-1"},
@@ -14039,6 +14550,7 @@ def test_media_asset_serves_persisted_video_with_mime_type(tmp_path: Path) -> No
                 id="media-video",
                 path="save-1/motion.webm",
                 mime_type="video/webm",
+                metadata_json='{"content_rating":"g"}',
             )
         ]
 
@@ -14079,6 +14591,7 @@ def test_media_asset_serves_legacy_active_mime_type_as_inert(
                 id="media-active",
                 path="save-1/imported.html",
                 mime_type="text/html",
+                metadata_json='{"content_rating":"g"}',
             )
         ],
     )
@@ -14110,6 +14623,7 @@ def test_media_thumbnail_serves_persisted_thumbnail_with_cache_headers(
             thumbnail_path="save-1/thumbnails/scene.png",
             mime_type="image/png",
             type="image",
+            metadata_json='{"content_rating":"g"}',
         )
     }
     state.repositories = SimpleNamespace(
@@ -14152,6 +14666,7 @@ def test_media_thumbnail_falls_back_to_original_image_when_thumbnail_is_missing(
                 thumbnail_path="save-1/thumbnails/missing.png",
                 mime_type="image/jpeg",
                 type="image",
+                metadata_json='{"content_rating":"g"}',
             )
             if save_id == "save-1" and media_asset_id == "media-image"
             else None
@@ -14192,6 +14707,7 @@ def test_media_thumbnail_falls_back_to_original_for_unusable_placeholder_thumbna
                 thumbnail_path="save-1/thumbnails/scene.png",
                 mime_type="image/png",
                 type="image",
+                metadata_json='{"content_rating":"g"}',
             )
             if save_id == "save-1" and media_asset_id == "media-image"
             else None
@@ -14223,6 +14739,7 @@ def test_media_thumbnail_rejects_paths_that_escape_media_dir(tmp_path: Path) -> 
                 thumbnail_path="../outside.png",
                 mime_type="image/png",
                 type="image",
+                metadata_json='{"content_rating":"g"}',
             )
             if save_id == "save-1" and media_asset_id == "media-image"
             else None
@@ -14254,6 +14771,7 @@ def test_media_thumbnail_returns_not_found_for_video_without_thumbnail(
                 thumbnail_path=None,
                 mime_type="video/webm",
                 type="video",
+                metadata_json='{"content_rating":"g"}',
             )
             if save_id == "save-1" and media_asset_id == "media-video"
             else None
@@ -14286,6 +14804,7 @@ def test_media_asset_returns_not_found_for_missing_file(tmp_path: Path) -> None:
                 id="media-missing",
                 path="save-1/missing.png",
                 mime_type="image/png",
+                metadata_json='{"content_rating":"g"}',
             )
         ],
     )
@@ -14314,6 +14833,7 @@ def test_media_asset_rejects_paths_that_escape_media_dir(tmp_path: Path) -> None
                         id=f"media-escape-{i}",
                         path=path,
                         mime_type="image/png",
+                        metadata_json='{"content_rating":"g"}',
                     )
                 ],
             )
@@ -14336,6 +14856,7 @@ def test_media_prompt_endpoint_returns_raw_prompt(tmp_path: Path) -> None:
                 provider="fake",
                 status="succeeded",
                 prompt="raw provider prompt with exact user-editable details",
+                metadata_json='{"content_rating":"g"}',
             )
             if save_id == "save-1" and media_asset_id == "media-1"
             else None
@@ -14375,6 +14896,7 @@ def test_media_prompt_endpoint_hides_over_rating_prompt_from_child(
         provider="fake",
         model="fake-image",
         status="succeeded",
+        metadata={"content_rating": "r"},
     )
 
     with TestClient(create_app(cast(WebAppState, state)), authenticate=False) as client:
@@ -14388,7 +14910,7 @@ def test_media_prompt_endpoint_hides_over_rating_prompt_from_child(
 
     assert response.status_code == 403
     assert response.json() == {
-        "detail": "Media prompt exceeds your content rating",
+        "detail": "Media exceeds your content rating",
     }
 
 
@@ -14419,6 +14941,9 @@ def test_media_regenerate_creates_job_for_source_message(tmp_path: Path) -> None
     state = _state_double(tmp_path, runtime)
     state.repositories = SimpleNamespace(
         list_saves=lambda: [SimpleNamespace(id="save-1")],
+        list_messages=lambda _save_id: [
+            SimpleNamespace(id="message-1", content_rating="g")
+        ],
         list_media_assets=lambda _save_id: [
             SimpleNamespace(
                 id="media-1",
@@ -14475,6 +15000,9 @@ def test_media_regenerate_with_prompt_replaces_asset_through_runtime(
     state = _state_double(tmp_path, runtime)
     state.repositories = SimpleNamespace(
         list_saves=lambda: [SimpleNamespace(id="save-1")],
+        list_messages=lambda _save_id: [
+            SimpleNamespace(id="message-1", content_rating="g")
+        ],
         list_media_assets=lambda _save_id: [
             SimpleNamespace(
                 id="media-1",
@@ -14628,11 +15156,15 @@ def test_media_animate_creates_job_through_runtime(tmp_path: Path) -> None:
     state = _state_double(tmp_path, runtime)
     state.repositories = SimpleNamespace(
         list_saves=lambda: [SimpleNamespace(id="save-1")],
+        list_messages=lambda _save_id: [
+            SimpleNamespace(id="message-1", content_rating="g")
+        ],
         list_media_assets=lambda _save_id: [
             SimpleNamespace(
                 id="media-1",
                 source_message_id="message-1",
                 type="image",
+                metadata_json='{"content_rating":"g"}',
             )
         ],
     )
@@ -14679,11 +15211,15 @@ def test_media_animate_job_fails_when_runtime_returns_error(
     state = _state_double(tmp_path, FailingAnimationRuntime())
     state.repositories = SimpleNamespace(
         list_saves=lambda: [SimpleNamespace(id="save-1")],
+        list_messages=lambda _save_id: [
+            SimpleNamespace(id="message-1", content_rating="g")
+        ],
         list_media_assets=lambda _save_id: [
             SimpleNamespace(
                 id="media-1",
                 source_message_id="message-1",
                 type="image",
+                metadata_json='{"content_rating":"g"}',
             )
         ],
     )
@@ -14960,6 +15496,7 @@ def _auth_state(tmp_path: Path, runtime: object | None = None) -> SimpleNamespac
     state.repositories = PersistenceRepositories(
         sqlite3.connect(database_path, check_same_thread=False)
     )
+    state.repositories.set_app_setting("content_filter_rating", "unrated")
     state.auth_required = True
     state.auth_attempts = AuthAttemptThrottle()
     state.auth_service = lambda: AuthService(repositories=state.repositories)
@@ -14977,6 +15514,7 @@ def _scoped_auth_state(
         database_path,
         PersistenceRepositories,
     )
+    state.repositories.set_app_setting("content_filter_rating", "unrated")
     state.auth_required = True
     state.auth_attempts = AuthAttemptThrottle()
     state.auth_service = lambda: AuthService(repositories=state.repositories)

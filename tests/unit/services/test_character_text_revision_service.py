@@ -15,7 +15,10 @@ from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     ChatRequest,
     ChatResponse,
+    ProviderCapability,
     ProviderRetryProgressCallback,
+    StructuredOutputRequest,
+    StructuredOutputResponse,
 )
 from bragi.services.character_text_revision_service import CharacterTextRevisionService
 from bragi.services.character_text_service import (
@@ -29,6 +32,8 @@ from bragi.services.character_text_world_update_service import (
 
 
 class RecordingTextProvider:
+    provider_name = "fake"
+
     def __init__(self, response_body: str = "I can meet after class.") -> None:
         self.response_body = response_body
         self.chat_requests: list[ChatRequest] = []
@@ -42,11 +47,51 @@ class RecordingTextProvider:
             token_usage={"total": 11},
         )
 
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        if request.schema_name != "content_safety_review":
+            raise AssertionError(f"unexpected structured schema: {request.schema_name}")
+        return StructuredOutputResponse(
+            data={
+                "action": "allow",
+                "category": "none",
+                "reason": "Test fixture content is within the ceiling.",
+                "minimum_rating": "g",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
 
 class FailingTextProvider(RecordingTextProvider):
     async def chat(self, request: ChatRequest) -> ChatResponse:
         self.chat_requests.append(request)
         raise RuntimeError("text provider failed")
+
+
+class CorrectingSafetyProvider:
+    provider_name = "fake"
+
+    def __init__(self) -> None:
+        self.requests: list[StructuredOutputRequest] = []
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.requests.append(request)
+        return StructuredOutputResponse(
+            data={
+                "action": "allow",
+                "category": "none",
+                "reason": "The corrected text is within the ceiling.",
+                "minimum_rating": "pg",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
 
 
 @pytest.fixture
@@ -111,6 +156,17 @@ def test_correct_character_text_updates_body_and_revision_trail(
     save_id, _thread_id, _player_message_id, reply_id = _seed_text_thread(
         repositories,
     )
+    original_reply = repositories.get_character_text_message(
+        save_id=save_id,
+        message_id=reply_id,
+    )
+    assert original_reply is not None
+    repositories.update_character_text_message_body(
+        save_id=save_id,
+        message_id=reply_id,
+        body=original_reply.body,
+        content_rating="r",
+    )
     npc = next(
         character
         for character in repositories.list_characters(save_id)
@@ -144,6 +200,7 @@ def test_correct_character_text_updates_body_and_revision_trail(
     )
     metadata = repositories.character_text_message_revision_metadata(save_id)
     assert result.message.body == "Sure, meet me by the science wing."
+    assert result.message.content_rating == "r"
     assert len(revisions) == 1
     assert revisions[0].previous_body == "Sure, meet me by the lockers."
     assert revisions[0].new_body == "Sure, meet me by the science wing."
@@ -156,6 +213,43 @@ def test_correct_character_text_updates_body_and_revision_trail(
     assert edge.id not in {
         edge.id for edge in repositories.list_character_knowledge_edges(save_id)
     }
+
+
+def test_correct_character_text_with_safety_reclassifies_the_replacement(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _thread_id, _player_message_id, reply_id = _seed_text_thread(
+        repositories,
+    )
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="fake",
+        model_id="fake-safety",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-safety",
+        display_name="Fake Safety",
+        capabilities=[ProviderCapability.STRUCTURED_OUTPUT.value],
+    )
+    provider = CorrectingSafetyProvider()
+    service = CharacterTextRevisionService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    result = asyncio.run(
+        service.correct_character_text_with_safety(
+            save_id=save_id,
+            text_message_id=reply_id,
+            body="Sure, meet me by the science wing.",
+            current_user_id=None,
+        )
+    )
+
+    assert result.message.body == "Sure, meet me by the science wing."
+    assert result.message.content_rating == "pg"
+    assert len(provider.requests) == 1
 
 
 def test_edit_text_without_resubmit_recomputes_thread_memory(

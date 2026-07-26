@@ -92,7 +92,14 @@ from bragi.services.chat_history_settings import (
     chat_history_window_settings,
     narrator_planner_chat_history_window_settings,
 )
-from bragi.services.content_rating import effective_content_safety_policy
+from bragi.services.content_rating import (
+    CONTENT_RATING_UNRATED,
+    effective_content_safety_policy,
+)
+from bragi.services.content_safety_service import (
+    ContentSafetyAction,
+    ContentSafetyService,
+)
 from bragi.services.context_assembly import (
     ContextSource,
     apply_context_budget,
@@ -218,7 +225,6 @@ from bragi.services.sexual_content_safety import (
     FADE_TO_BLACK_TRANSITION,
     FADE_TO_BLACK_TRANSITION_KIND,
     is_fade_to_black_message,
-    sanitize_narrator_body,
 )
 from bragi.services.state_pruning_service import StatePruningService
 from bragi.services.state_service import (
@@ -522,6 +528,7 @@ class _ChatCompletionResult:
     request: ChatRequest
     diagnostics: dict[str, object]
     safety_transition: str = ""
+    content_rating: str = "unrated"
 
 
 @dataclass
@@ -583,6 +590,7 @@ class SummaryRunner(Protocol):
         save_id: str,
         model_context_window: int | None,
         pending_message: PendingMessageEstimate | None = None,
+        current_user_id: str | None = None,
     ) -> object: ...
 
 
@@ -803,6 +811,7 @@ class ChatService:
         ) = None,
         world_context_retention_service: WorldContextRetentionRunner | None = None,
         npc_knowledge_audit_service: NpcKnowledgeAuditor | None = None,
+        content_safety_service: ContentSafetyService | None = None,
         prompt_inspection_store: PromptInspectionStore | None = None,
         debug_prompt_capture: DebugPromptCapture | None = None,
     ) -> None:
@@ -837,6 +846,10 @@ class ChatService:
                 repositories=repositories,
                 providers=providers,
             )
+        )
+        self.content_safety_service = content_safety_service or ContentSafetyService(
+            repositories=repositories,
+            providers=providers,
         )
         self.prompt_inspection_store = prompt_inspection_store
         self.debug_prompt_capture = debug_prompt_capture
@@ -899,6 +912,13 @@ class ChatService:
 
         stage_started = perf_counter()
         throw_if_cancelled()
+        player_content_rating = await self._classify_submitted_content(
+            body=body,
+            save_id=save_id,
+            current_user_id=current_user_id,
+            provider=preference.provider,
+            model_id=preference.model_id,
+        )
         turn_progress.publish("history", "running", "Checking history")
         try:
             await self._summarize_if_needed(
@@ -906,6 +926,7 @@ class ChatService:
                 provider=preference.provider,
                 model_id=preference.model_id,
                 pending_message=PendingMessageEstimate(body=body),
+                current_user_id=current_user_id,
             )
         except Exception:
             turn_progress.publish("history", "failed", "History check failed")
@@ -925,6 +946,7 @@ class ChatService:
                 role="player",
                 speaker_name=speaker_name,
                 body=body,
+                content_rating=player_content_rating,
             )
             TurnSnapshotService(self.repositories).capture_message_snapshot(
                 save_id=save_id,
@@ -1016,6 +1038,13 @@ class ChatService:
 
         stage_started = perf_counter()
         throw_if_cancelled()
+        timeskip_content_rating = await self._classify_submitted_content(
+            body=directive,
+            save_id=save_id,
+            current_user_id=current_user_id,
+            provider=preference.provider,
+            model_id=preference.model_id,
+        )
         turn_progress.publish("history", "running", "Checking history")
         try:
             await self._summarize_if_needed(
@@ -1023,6 +1052,7 @@ class ChatService:
                 provider=preference.provider,
                 model_id=preference.model_id,
                 pending_message=PendingMessageEstimate(body=directive),
+                current_user_id=current_user_id,
             )
         except Exception:
             turn_progress.publish("history", "failed", "History check failed")
@@ -1042,6 +1072,7 @@ class ChatService:
                 role="system",
                 speaker_name=TIMESKIP_SPEAKER_NAME,
                 body=directive,
+                content_rating=timeskip_content_rating,
             )
             TurnSnapshotService(self.repositories).capture_message_snapshot(
                 save_id=save_id,
@@ -1461,6 +1492,7 @@ class ChatService:
                     provider=preference.provider,
                     model_id=preference.model_id,
                     pending_message=None,
+                    current_user_id=current_user_id,
                 )
             except Exception:
                 turn_progress.publish("history", "failed", "History check failed")
@@ -2487,8 +2519,7 @@ class ChatService:
                 model=response.model_id,
                 token_estimate=response.token_usage.get("total"),
                 safety_transition=completion.safety_transition,
-                content_rating=completion.request.content_rating,
-                fade_to_black_enabled=completion.request.fade_to_black_enabled,
+                content_rating=completion.content_rating,
             )
             activity_cursor = (
                 phone_activity_context.next_cursor
@@ -3242,7 +3273,7 @@ class ChatService:
             try:
                 response = await primary_provider.chat(request)
             except ProviderError as exc:
-                return _apply_narrator_content_safety(
+                return await self._apply_narrator_content_safety(
                     await self._complete_fallback_chat_for_provider_error(
                         save_id=save_id,
                         request=request,
@@ -3250,12 +3281,13 @@ class ChatService:
                         diagnostics=diagnostics,
                         exc=exc,
                     ),
+                    save_id=save_id,
                     enabled=apply_narrator_content_safety,
                 )
         except _StreamingChatFailedAfterDraft:
             raise
         except ProviderError as exc:
-            return _apply_narrator_content_safety(
+            return await self._apply_narrator_content_safety(
                 await self._complete_fallback_chat_for_provider_error(
                     save_id=save_id,
                     request=request,
@@ -3263,11 +3295,12 @@ class ChatService:
                     diagnostics=diagnostics,
                     exc=exc,
                 ),
+                save_id=save_id,
                 enabled=apply_narrator_content_safety,
             )
 
         if not _is_suspected_blocked_response(response):
-            return _apply_narrator_content_safety(
+            return await self._apply_narrator_content_safety(
                 _ChatCompletionResult(
                     response=response,
                     request=request,
@@ -3276,6 +3309,7 @@ class ChatService:
                         **_response_diagnostics(response.raw_metadata),
                     },
                 ),
+                save_id=save_id,
                 enabled=apply_narrator_content_safety,
             )
 
@@ -3298,7 +3332,7 @@ class ChatService:
                 task="chat",
                 reason=diagnostics["fallback_skipped_reason"],
             )
-            return _apply_narrator_content_safety(
+            return await self._apply_narrator_content_safety(
                 _ChatCompletionResult(
                     response=response,
                     request=request,
@@ -3307,15 +3341,93 @@ class ChatService:
                         **_response_diagnostics(response.raw_metadata),
                     },
                 ),
+                save_id=save_id,
                 enabled=apply_narrator_content_safety,
             )
-        return _apply_narrator_content_safety(
+        return await self._apply_narrator_content_safety(
             await self._complete_fallback_chat(
                 request=fallback,
                 diagnostics=diagnostics,
             ),
+            save_id=save_id,
             enabled=apply_narrator_content_safety,
         )
+
+    async def _apply_narrator_content_safety(
+        self,
+        completion: _ChatCompletionResult,
+        *,
+        save_id: str,
+        enabled: bool,
+    ) -> _ChatCompletionResult:
+        if not enabled:
+            return completion
+        safety = await self.content_safety_service.review_narration(
+            body=completion.response.body,
+            content_rating=completion.request.content_rating,
+            fade_to_black_enabled=completion.request.fade_to_black_enabled,
+            save_id=save_id,
+            source_request=completion.request,
+        )
+        safety_diagnostics = {
+            "action": safety.action.value,
+            "minimum_rating": safety.minimum_rating,
+            "category": safety.category,
+            "transition_applied": safety.transition_applied,
+            "agent_ran": safety.agent_ran,
+            "skipped_reason": safety.skipped_reason,
+            "provider": safety.provider,
+            "model": safety.model_id,
+        }
+        diagnostics = {
+            **completion.diagnostics,
+            "content_safety": safety_diagnostics,
+        }
+        if safety.transition_applied:
+            diagnostics["classification"] = "content_safety_transition_applied"
+        return replace(
+            completion,
+            response=replace(completion.response, body=safety.body),
+            diagnostics=diagnostics,
+            safety_transition=(
+                FADE_TO_BLACK_TRANSITION_KIND
+                if safety.body == FADE_TO_BLACK_TRANSITION
+                else CONTENT_FILTER_TRANSITION_KIND
+                if safety.body == CONTENT_FILTER_TRANSITION
+                else ""
+            ),
+            content_rating=safety.reviewed_content_rating,
+        )
+
+    async def _classify_submitted_content(
+        self,
+        *,
+        body: str,
+        save_id: str,
+        current_user_id: str | None,
+        provider: str,
+        model_id: str,
+    ) -> str:
+        """Classify persisted user-authored text without rewriting its source."""
+
+        policy = effective_content_safety_policy(
+            self.repositories,
+            user_id=current_user_id,
+        )
+        safety = await self.content_safety_service.review_narration(
+            body=body,
+            content_rating=policy.rating,
+            fade_to_black_enabled=False,
+            save_id=save_id,
+            source_request=ChatRequest(
+                provider=provider,
+                model_id=model_id,
+                messages=(),
+            ),
+        )
+        if safety.action is not ContentSafetyAction.ALLOW:
+            return "prohibited"
+        return safety.minimum_rating
 
     async def _complete_fallback_chat_for_provider_error(
         self,
@@ -3367,7 +3479,8 @@ class ChatService:
                 if not chunk.delta:
                     continue
                 body_parts.append(chunk.delta)
-                narrator_stream_callback("".join(body_parts))
+                if request.content_rating == CONTENT_RATING_UNRATED:
+                    narrator_stream_callback("".join(body_parts))
         except Exception as exc:
             if "".join(body_parts).strip():
                 raise _StreamingChatFailedAfterDraft(str(exc)) from exc
@@ -4825,6 +4938,7 @@ class ChatService:
         provider: str,
         model_id: str,
         pending_message: PendingMessageEstimate | None,
+        current_user_id: str | None,
     ) -> None:
         if self.summary_service is None:
             return
@@ -4837,6 +4951,7 @@ class ChatService:
                     model_id=model_id,
                 ),
                 pending_message=pending_message,
+                current_user_id=current_user_id,
             )
         except Exception as exc:
             log_error_event(
@@ -9749,42 +9864,6 @@ def _failed_chat_result(
     }
     result.update(_exception_diagnostics(exc))
     return result
-
-
-def _apply_narrator_content_safety(
-    completion: _ChatCompletionResult,
-    *,
-    enabled: bool,
-) -> _ChatCompletionResult:
-    if not enabled:
-        return completion
-    safety = sanitize_narrator_body(
-        completion.response.body,
-        content_rating=completion.request.content_rating,
-        fade_to_black_enabled=completion.request.fade_to_black_enabled,
-    )
-    safety_diagnostics = {
-        "classification": safety.classification.value,
-        "transition_applied": safety.transition_applied,
-    }
-    diagnostics = {
-        **completion.diagnostics,
-        "sexual_content_safety": safety_diagnostics,
-    }
-    if safety.transition_applied:
-        diagnostics["classification"] = "explicit_content_transition_applied"
-    return replace(
-        completion,
-        response=replace(completion.response, body=safety.body),
-        diagnostics=diagnostics,
-        safety_transition=(
-            FADE_TO_BLACK_TRANSITION_KIND
-            if safety.body == FADE_TO_BLACK_TRANSITION
-            else CONTENT_FILTER_TRANSITION_KIND
-            if safety.body == CONTENT_FILTER_TRANSITION
-            else ""
-        ),
-    )
 
 
 def _chat_model_preference_for_save(

@@ -157,8 +157,8 @@ def test_export_import_preserves_message_safety_transition(
 ) -> None:
     save = _seed_bundle_save(repositories, tmp_path / "media")
     repositories.connection.execute(
-        "UPDATE messages SET safety_transition = ? WHERE id = ?",
-        ("fade_to_black", NARRATOR_MESSAGE_ID),
+        "UPDATE messages SET safety_transition = ?, content_rating = ? WHERE id = ?",
+        ("fade_to_black", "r", NARRATOR_MESSAGE_ID),
     )
     repositories.commit()
     service = _chat_bundle_service(repositories, tmp_path / "media")
@@ -182,6 +182,7 @@ def test_export_import_preserves_message_safety_transition(
         "the next scene begins."
     )
     assert imported_messages[1].safety_transition == "fade_to_black"
+    assert imported_messages[1].content_rating == "unclassified"
 
 
 def test_export_import_preserves_unrated_narration_without_resanitizing(
@@ -195,8 +196,6 @@ def test_export_import_preserves_unrated_narration_without_resanitizing(
         role="narrator",
         speaker_name="Narrator",
         body=adult_body,
-        content_rating="unrated",
-        fade_to_black_enabled=False,
     )
     service = _chat_bundle_service(repositories, tmp_path / "media")
     bundle_path = tmp_path / "exports" / "unrated.bragi-chat"
@@ -2049,6 +2048,7 @@ def test_import_save_remaps_colliding_ids_and_preserves_bundle_data(
     assert loaded.scenario.id == imported_save.scenario_id
     assert loaded.scenario.title == "Ashfall Keep: Red Lens"
     assert json.loads(loaded.scenario.content_json) == {
+        "_source": {"content_rating": "unclassified"},
         "opening_message": "The red lens wakes.",
         "starting_scene": "The beacon burns crimson over the ash road.",
     }
@@ -3090,6 +3090,7 @@ def test_export_import_preserves_video_media_metadata_and_source_asset(
     assert imported_video.source_media_asset_id == imported_image.id
     assert imported_video.mime_type == "video/mp4"
     assert json.loads(imported_video.metadata_json) == {
+        "content_rating": "unclassified",
         "duration_seconds": 5,
         "flow": "image_plus_text_to_video",
     }
@@ -4463,9 +4464,10 @@ def test_import_save_strips_deprecated_scenario_update_sections(
     imported_save_id = _imported_save_id(imported)
 
     [imported_update] = repositories.list_save_scenario_updates(imported_save_id)
-    assert json.loads(imported_update.content_json) == (
-        _cleaned_character_list_update_content()
-    )
+    assert json.loads(imported_update.content_json) == {
+        **_cleaned_character_list_update_content(),
+        "_source": {"content_rating": "unclassified"},
+    }
 
 
 def test_import_save_repairs_context_update_suggestion_proposed_sources(

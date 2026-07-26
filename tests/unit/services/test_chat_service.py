@@ -184,6 +184,21 @@ class RecordingChatProvider:
     async def generate_image(self, request: ImageRequest) -> ImageResponse:
         raise AssertionError("chat turns must not request image generation")
 
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        return StructuredOutputResponse(
+            data={
+                "action": "allow",
+                "category": "none",
+                "reason": "The narration stays within the content ceiling.",
+                "minimum_rating": "g",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
 
 class RecordingContextAndChatProvider(RecordingChatProvider):
     def __init__(self, provider_name: str) -> None:
@@ -211,6 +226,11 @@ class RecordingContextAndChatProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return await RecordingChatProvider.generate_structured_output(
+                self,
+                request,
+            )
         self.structured_output_requests.append(request)
         return StructuredOutputResponse(
             data={"selections": []},
@@ -257,6 +277,11 @@ class DatingRouteProfileChatProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return await RecordingChatProvider.generate_structured_output(
+                self,
+                request,
+            )
         self.events.append(request.schema_name)
         self.structured_output_requests.append(request)
         return StructuredOutputResponse(
@@ -331,6 +356,11 @@ class RecordingLookAroundProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return await RecordingChatProvider.generate_structured_output(
+                self,
+                request,
+            )
         self.structured_output_requests.append(request)
         return StructuredOutputResponse(
             data=self.structured_data,
@@ -372,6 +402,11 @@ class RecordingNarratorPlanningProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return await RecordingChatProvider.generate_structured_output(
+                self,
+                request,
+            )
         self.structured_output_requests.append(request)
         return StructuredOutputResponse(
             data=self.plan_payload,
@@ -406,6 +441,11 @@ class RecordingCyoaChatProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return await RecordingChatProvider.generate_structured_output(
+                self,
+                request,
+            )
         self.structured_output_requests.append(request)
         return StructuredOutputResponse(
             data={
@@ -441,6 +481,11 @@ class RecordingCharacterActionChatProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return await RecordingChatProvider.generate_structured_output(
+                self,
+                request,
+            )
         self.events.append(request.schema_name)
         self.structured_output_requests.append(request)
         name = _requested_character_name(request.messages[-1].body)
@@ -509,6 +554,55 @@ class StaticChatProvider(RecordingChatProvider):
             token_usage={"prompt": 11, "completion": 23, "total": 34},
             raw_metadata=self.raw_metadata,
         )
+
+
+class ScriptedContentSafetyProvider(RecordingChatProvider):
+    def __init__(self, *actions: str) -> None:
+        super().__init__("safety")
+        self.actions = actions or ("allow",)
+        self.structured_output_requests: list[StructuredOutputRequest] = []
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        request_index = len(self.structured_output_requests)
+        self.structured_output_requests.append(request)
+        action = self.actions[min(request_index, len(self.actions) - 1)]
+        return StructuredOutputResponse(
+            data={
+                "action": action,
+                "category": (
+                    "sexual_content"
+                    if action == "fade_to_black"
+                    else "violence"
+                    if action == "block"
+                    else "none"
+                ),
+                "reason": "Scripted content-safety decision.",
+                "minimum_rating": (
+                    "r" if action in {"block", "fade_to_black"} else "g"
+                ),
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+def _configure_content_safety_model(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="safety",
+        model_id="safety-model",
+    )
+    repositories.save_provider_model(
+        provider="safety",
+        model_id="safety-model",
+        display_name="Safety Model",
+        capabilities=["structured_output"],
+    )
 
 
 class SequenceChatProvider(RecordingChatProvider):
@@ -700,6 +794,11 @@ class RecordingStateMemoryProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return await RecordingChatProvider.generate_structured_output(
+                self,
+                request,
+            )
         self.events.append("state_memory_extraction")
         self.structured_output_requests.append(request)
         if self.structured_error is not None:
@@ -745,6 +844,11 @@ class RecordingScenarioEvolutionProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return await RecordingChatProvider.generate_structured_output(
+                self,
+                request,
+            )
         self.structured_output_requests.append(request)
         schema_name = request.schema_name.casefold()
         data: dict[str, object]
@@ -793,6 +897,11 @@ class RecordingPostTurnStructuredProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return await RecordingChatProvider.generate_structured_output(
+                self,
+                request,
+            )
         self.structured_output_requests.append(request)
         schema_name = request.schema_name.casefold()
         data: dict[str, object]
@@ -940,6 +1049,11 @@ class RecordingAgenticPipelineProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return await RecordingChatProvider.generate_structured_output(
+                self,
+                request,
+            )
         self.structured_output_requests.append(request)
         schema_name = request.schema_name.casefold()
         if schema_name == "state_memory_extraction":
@@ -1611,6 +1725,7 @@ class RecordingSummaryService:
         save_id: str,
         model_context_window: int | None,
         pending_message: PendingMessageEstimate | None = None,
+        current_user_id: str | None = None,
     ) -> object:
         self.events.append("summarization")
         self.calls.append((save_id, model_context_window))
@@ -1640,6 +1755,7 @@ class FailingSummaryService:
         save_id: str,
         model_context_window: int | None,
         pending_message: PendingMessageEstimate | None = None,
+        current_user_id: str | None = None,
     ) -> object:
         self.events.append("summarization")
         self.calls.append((save_id, model_context_window))
@@ -1924,6 +2040,7 @@ def test_submit_player_turn_persists_messages_and_uses_active_chat_model(
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
@@ -6831,6 +6948,66 @@ def test_submit_player_turn_streams_narrator_drafts_and_persists_final_body(
     assert persisted_messages[1].token_estimate == 12
 
 
+def test_rated_streaming_never_publishes_draft_rejected_by_safety_agent(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(SCRIPT_GUARD_MODE_SETTING, SCRIPT_GUARD_MODE_OFF)
+    repositories.set_scoped_setting(
+        scope="global",
+        key=GENERATED_PHRASE_DENYLIST_SETTING,
+        value="",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="openrouter",
+        model_id="streaming-model",
+    )
+    _configure_content_safety_model(repositories)
+    rejected_draft = "A lingering explicit description."
+    narrator_provider = StreamingChatProvider(
+        "openrouter",
+        (
+            ChatStreamChunk(delta="A lingering explicit"),
+            ChatStreamChunk(
+                delta=" description.",
+                token_usage={"total": 12},
+            ),
+            ChatStreamChunk(token_usage={"total": 12}, done=True),
+        ),
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={
+            "openrouter": narrator_provider,
+            "safety": ScriptedContentSafetyProvider("block"),
+        },
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+    drafts: list[str] = []
+
+    result = asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I close the tower door.",
+            run_post_turn_jobs=False,
+            narrator_stream_callback=drafts.append,
+        )
+    )
+
+    assert drafts == [CONTENT_FILTER_TRANSITION]
+    assert rejected_draft not in repr(drafts)
+    assert result.narrator_message.body == CONTENT_FILTER_TRANSITION
+    assert result.narrator_message.content_rating == "g"
+
+
 def test_submit_player_turn_fades_explicit_narrator_body_before_observers(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -6853,6 +7030,7 @@ def test_submit_player_turn_fades_explicit_narrator_body_before_observers(
         provider="fake",
         model_id="fake-chat",
     )
+    _configure_content_safety_model(repositories)
     rejected_draft = "He thrust into her as she cried out."
     prompt_store = PromptInspectionStore()
     debug_requests: list[ChatRequest] = []
@@ -6862,9 +7040,10 @@ def test_submit_player_turn_fades_explicit_narrator_body_before_observers(
         debug_requests.append(request)
 
     provider = StaticChatProvider("fake", rejected_draft)
+    safety_provider = ScriptedContentSafetyProvider("fade_to_black")
     service = ChatService(
         repositories=repositories,
-        providers={"fake": provider},
+        providers={"fake": provider, "safety": safety_provider},
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
         prompt_inspection_store=prompt_store,
         debug_prompt_capture=capture_debug_prompt,
@@ -6881,21 +7060,22 @@ def test_submit_player_turn_fades_explicit_narrator_body_before_observers(
 
     assert result.narrator_message.body == FADE_TO_BLACK_TRANSITION
     assert result.narrator_message.safety_transition == "fade_to_black"
+    assert result.narrator_message.content_rating == "g"
     assert rejected_draft not in repr(repositories.list_messages(save.id))
     assert rejected_draft not in repr(prompt_store.prompts_by_message_id())
     assert rejected_draft not in repr(debug_requests)
     job = _chat_completion_jobs(repositories, save.id)[0]
     assert job["status"] == "succeeded"
-    assert job["result"]["classification"] == (
-        "explicit_content_transition_applied"
-    )
-    assert job["result"]["sexual_content_safety"] == {
-        "classification": "explicit_disallowed",
+    assert job["result"]["classification"] == "content_safety_transition_applied"
+    assert job["result"]["content_safety"] == {
+        "action": "fade_to_black",
+        "minimum_rating": "r",
+        "category": "sexual_content",
         "transition_applied": True,
-    }
-    assert job["diagnostics"]["provider"]["sexual_content_safety"] == {
-        "classification": "explicit_disallowed",
-        "transition_applied": True,
+        "agent_ran": True,
+        "skipped_reason": "",
+        "provider": "safety",
+        "model": "safety-model",
     }
 
 
@@ -6938,11 +7118,13 @@ def test_submit_player_turn_honors_adult_rating_and_disabled_fade_classifier(
         provider="fake",
         model_id="fake-chat",
     )
+    _configure_content_safety_model(repositories)
     body = "They had sex after returning to the inn."
     provider = StaticChatProvider("fake", body)
+    safety_provider = ScriptedContentSafetyProvider("allow")
     service = ChatService(
         repositories=repositories,
-        providers={"fake": provider},
+        providers={"fake": provider, "safety": safety_provider},
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
 
@@ -6957,6 +7139,88 @@ def test_submit_player_turn_honors_adult_rating_and_disabled_fade_classifier(
 
     assert provider.chat_requests[0].content_rating == "r"
     assert provider.chat_requests[0].fade_to_black_enabled is False
+    assert len(safety_provider.structured_output_requests) == 2
+    assert result.narrator_message.body == body
+    assert result.narrator_message.safety_transition == ""
+
+
+def test_submit_player_turn_persists_safety_agent_rating_for_player_input(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    _configure_content_safety_model(repositories)
+    provider = StaticChatProvider("fake", "The beacon answers.")
+    safety_provider = ScriptedContentSafetyProvider("allow")
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={"fake": provider, "safety": safety_provider},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I close the tower door.",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    [player_message, narrator_message] = repositories.list_messages(save.id)
+    assert player_message.content_rating == "g"
+    assert narrator_message.content_rating == "g"
+    assert len(safety_provider.structured_output_requests) == 2
+
+
+def test_submit_player_turn_does_not_override_safety_agent_allow_with_regexes(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(SCRIPT_GUARD_MODE_SETTING, SCRIPT_GUARD_MODE_OFF)
+    repositories.set_scoped_setting(
+        scope="global",
+        key=GENERATED_PHRASE_DENYLIST_SETTING,
+        value="",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    _configure_content_safety_model(repositories)
+    body = "The safety agent, not an isolated word match, owns this decision."
+    provider = StaticChatProvider("fake", body)
+    safety_provider = ScriptedContentSafetyProvider("allow")
+
+    result = asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={"fake": provider, "safety": safety_provider},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I close the tower door.",
+            run_post_turn_jobs=False,
+        )
+    )
+
     assert result.narrator_message.body == body
     assert result.narrator_message.safety_transition == ""
 
@@ -6983,13 +7247,15 @@ def test_nonsexual_content_filter_transition_is_skipped_by_post_turn_jobs(
         provider="fake",
         model_id="fake-chat",
     )
+    _configure_content_safety_model(repositories)
     provider = StaticChatProvider(
         "fake",
         "The blast dismembered the soldier in graphic detail.",
     )
+    safety_provider = ScriptedContentSafetyProvider("block")
     service = ChatService(
         repositories=repositories,
-        providers={"fake": provider},
+        providers={"fake": provider, "safety": safety_provider},
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
 
@@ -7032,6 +7298,7 @@ def test_submit_player_turn_streams_only_fade_transition_for_rejected_body(
         provider="openrouter",
         model_id="anthropic/claude-3.5-sonnet",
     )
+    _configure_content_safety_model(repositories)
     provider = SequenceStreamingChatProvider(
         "openrouter",
         (
@@ -7047,7 +7314,10 @@ def test_submit_player_turn_streams_only_fade_transition_for_rejected_body(
     )
     service = ChatService(
         repositories=repositories,
-        providers={"openrouter": provider},
+        providers={
+            "openrouter": provider,
+            "safety": ScriptedContentSafetyProvider("fade_to_black"),
+        },
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
     drafts: list[str] = []
@@ -7150,6 +7420,7 @@ def test_submit_player_turn_uses_configured_fallback_after_streaming_retry_failu
         context_window=8192,
     )
     repositories.set_app_setting("chat_fallback_enabled", True)
+    _configure_content_safety_model(repositories)
     primary = StreamingChatProvider(
         "openrouter",
         (ProviderError(ProviderErrorCategory.NETWORK_ERROR, "stream broke"),),
@@ -7164,7 +7435,11 @@ def test_submit_player_turn_uses_configured_fallback_after_streaming_retry_failu
     )
     service = ChatService(
         repositories=repositories,
-        providers={"openrouter": primary, "venice": fallback},
+        providers={
+            "openrouter": primary,
+            "venice": fallback,
+            "safety": ScriptedContentSafetyProvider("fade_to_black"),
+        },
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
     drafts: list[str] = []
@@ -7197,9 +7472,7 @@ def test_submit_player_turn_uses_configured_fallback_after_streaming_retry_failu
     assert job["result"]["fallback_model"] == "venice/fallback-chat"
     assert job["result"]["final_provider"] == "venice"
     assert job["result"]["final_model"] == "venice/fallback-chat"
-    assert job["result"]["classification"] == (
-        "explicit_content_transition_applied"
-    )
+    assert job["result"]["classification"] == "content_safety_transition_applied"
 
 
 def test_submit_player_turn_records_streaming_retry_failure_without_fallback(
@@ -9295,6 +9568,7 @@ def test_submit_player_turn_cancels_running_context_search_child_task(
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
     repositories.set_model_preference(
         task="chat",
         provider="fake",
@@ -9399,6 +9673,7 @@ def test_submit_player_turn_cancels_context_search_from_another_thread(
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
     repositories.set_model_preference(
         task="chat",
         provider="fake",
@@ -18849,15 +19124,17 @@ def test_look_around_applies_child_content_rating_to_provider_output(
         provider="fake",
         model_id="fake-chat",
     )
+    _configure_content_safety_model(repositories)
     provider = RecordingLookAroundProvider(
         "fake",
         answer_body="Blood streaks the floor after the guard is stabbed.",
     )
+    safety_provider = ScriptedContentSafetyProvider("block")
 
     result = asyncio.run(
         ChatService(
             repositories=repositories,
-            providers={"fake": provider},
+            providers={"fake": provider, "safety": safety_provider},
         ).look_around(
             save_id=save.id,
             query="Inspect the floor.",

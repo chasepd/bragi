@@ -11,7 +11,7 @@ from pathlib import Path
 from bragi.model_tasks import is_retired_model_task
 from bragi.private_files import ensure_private_file
 
-CURRENT_SCHEMA_VERSION = 67
+CURRENT_SCHEMA_VERSION = 70
 
 _PRESERVE_SCHEMA_SCRIPT_TRANSACTION: ContextVar[bool] = ContextVar(
     "_PRESERVE_SCHEMA_SCRIPT_TRANSACTION",
@@ -110,7 +110,8 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at TEXT,
-    safety_transition TEXT NOT NULL DEFAULT ''
+    safety_transition TEXT NOT NULL DEFAULT '',
+    content_rating TEXT NOT NULL DEFAULT 'unclassified'
 );
 
 CREATE TABLE IF NOT EXISTS message_revisions (
@@ -264,6 +265,7 @@ CREATE TABLE IF NOT EXISTS characters (
     is_player_character INTEGER NOT NULL DEFAULT 0,
     first_seen_message_id TEXT REFERENCES messages(id),
     last_updated_message_id TEXT REFERENCES messages(id),
+    content_rating TEXT NOT NULL DEFAULT 'unclassified',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     archived_at TEXT,
@@ -385,6 +387,7 @@ CREATE TABLE IF NOT EXISTS summaries (
     body TEXT NOT NULL,
     provider TEXT NOT NULL,
     model TEXT NOT NULL,
+    content_rating TEXT NOT NULL DEFAULT 'unclassified',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     archived_at TEXT
 );
@@ -615,23 +618,47 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 66:
+            if current == 69:
+                _migrate_schema_69_to_70(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 68:
+                _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 67:
+                _migrate_schema_67_to_68(connection)
+                _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 66:
                 _migrate_schema_66_to_67(connection)
+                _migrate_schema_67_to_68(connection)
+                _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 65:
                 _migrate_schema_65_to_66(connection)
                 _migrate_schema_66_to_67(connection)
+                _migrate_schema_67_to_68(connection)
+                _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 64:
                 _migrate_schema_64_to_65(connection)
                 _migrate_schema_65_to_66(connection)
                 _migrate_schema_66_to_67(connection)
+                _migrate_schema_67_to_68(connection)
+                _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 63:
                 _migrate_schema_63_to_64(connection)
                 _migrate_schema_64_to_65(connection)
                 _migrate_schema_65_to_66(connection)
                 _migrate_schema_66_to_67(connection)
+                _migrate_schema_67_to_68(connection)
+                _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 62:
                 _migrate_schema_62_to_63(connection)
@@ -639,6 +666,9 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_64_to_65(connection)
                 _migrate_schema_65_to_66(connection)
                 _migrate_schema_66_to_67(connection)
+                _migrate_schema_67_to_68(connection)
+                _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 61:
                 _migrate_schema_61_to_62(connection)
@@ -647,6 +677,9 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_64_to_65(connection)
                 _migrate_schema_65_to_66(connection)
                 _migrate_schema_66_to_67(connection)
+                _migrate_schema_67_to_68(connection)
+                _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             else:
                 raise RuntimeError(
@@ -940,6 +973,7 @@ def _ensure_message_action_choices_schema(connection: sqlite3.Connection) -> Non
             body TEXT NOT NULL,
             provider TEXT NOT NULL DEFAULT '',
             model TEXT NOT NULL DEFAULT '',
+            content_rating TEXT NOT NULL DEFAULT 'unclassified',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(message_id, ordinal)
@@ -948,6 +982,24 @@ def _ensure_message_action_choices_schema(connection: sqlite3.Connection) -> Non
         CREATE INDEX IF NOT EXISTS idx_message_action_choices_save_message_ordinal
         ON message_action_choices(save_id, message_id, ordinal);
         """
+    )
+    _add_column_if_missing(
+        connection,
+        "message_action_choices",
+        "content_rating",
+        "TEXT NOT NULL DEFAULT 'unclassified'",
+    )
+
+
+def _ensure_generated_content_rating_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    _ensure_message_action_choices_schema(connection)
+    _add_column_if_missing(
+        connection,
+        "summaries",
+        "content_rating",
+        "TEXT NOT NULL DEFAULT 'unclassified'",
     )
 
 
@@ -1541,6 +1593,38 @@ def _migration_stripped_text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _migrate_schema_67_to_68(connection: sqlite3.Connection) -> None:
+    _add_column_if_missing(
+        connection,
+        "messages",
+        "content_rating",
+        "TEXT NOT NULL DEFAULT 'unrated'",
+    )
+    _add_column_if_missing(
+        connection,
+        "character_text_messages",
+        "content_rating",
+        "TEXT NOT NULL DEFAULT 'unrated'",
+    )
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (68)")
+
+
+def _migrate_schema_68_to_69(connection: sqlite3.Connection) -> None:
+    _ensure_generated_content_rating_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (69)")
+
+
+def _migrate_schema_69_to_70(connection: sqlite3.Connection) -> None:
+    _strip_deprecated_scenario_character_sections(connection)
+    _add_column_if_missing(
+        connection,
+        "characters",
+        "content_rating",
+        "TEXT NOT NULL DEFAULT 'unclassified'",
+    )
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (70)")
+
+
 def _remove_retired_model_preferences(connection: sqlite3.Connection) -> None:
     if not _table_exists(connection, "model_preferences"):
         return
@@ -1974,6 +2058,7 @@ def _ensure_character_text_schema(connection: sqlite3.Connection) -> None:
             provider TEXT,
             model TEXT,
             token_estimate INTEGER,
+            content_rating TEXT NOT NULL DEFAULT 'unclassified',
             delivery_status TEXT NOT NULL DEFAULT 'sent',
             delivery_error TEXT,
             delivery_job_id TEXT,
@@ -2233,6 +2318,7 @@ def _rebuild_character_text_tables_for_groups(
                 provider TEXT,
                 model TEXT,
                 token_estimate INTEGER,
+                content_rating TEXT NOT NULL DEFAULT 'unclassified',
                 delivery_status TEXT NOT NULL DEFAULT 'sent',
                 delivery_error TEXT,
                 delivery_job_id TEXT,

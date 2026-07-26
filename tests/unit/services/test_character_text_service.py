@@ -5,7 +5,7 @@ import sqlite3
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, cast
 
 import pytest
 
@@ -35,6 +35,12 @@ from bragi.services.character_text_service import (
     CharacterTextService,
     _update_text_route,
 )
+from bragi.services.content_rating import set_user_content_rating
+from bragi.services.content_safety_service import (
+    ContentSafetyAction,
+    ContentSafetyResult,
+    ContentSafetyService,
+)
 from bragi.services.media_service import CharacterTextUploadedPhoto
 from bragi.services.phrase_denylist import (
     GENERATED_PHRASE_DENYLIST_SETTING,
@@ -50,6 +56,8 @@ from bragi.services.text_script_policy import (
 
 
 class RecordingTextProvider:
+    provider_name = "fake"
+
     def __init__(
         self,
         response_body: str = "Sounds good. Meet me by the arcade after class?",
@@ -84,6 +92,21 @@ class RecordingTextProvider:
             token_usage={"total": 17},
         )
 
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        return StructuredOutputResponse(
+            data={
+                "action": "allow",
+                "category": "none",
+                "reason": "The text stays within the content ceiling.",
+                "minimum_rating": "g",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
 
 class SequenceTextProvider(RecordingTextProvider):
     def __init__(self, response_bodies: tuple[str, ...]) -> None:
@@ -99,6 +122,27 @@ class SequenceTextProvider(RecordingTextProvider):
             provider=request.provider,
             model_id=request.model_id,
             token_usage={"total": 17},
+        )
+
+
+class RecordingContentSafetyService:
+    def __init__(self) -> None:
+        self.ratings: list[tuple[str, bool]] = []
+
+    async def review_narration(
+        self,
+        *,
+        body: str,
+        content_rating: str,
+        fade_to_black_enabled: bool,
+        **_kwargs: object,
+    ) -> ContentSafetyResult:
+        self.ratings.append((content_rating, fade_to_black_enabled))
+        return ContentSafetyResult(
+            body=body,
+            action=ContentSafetyAction.ALLOW,
+            minimum_rating="g",
+            agent_ran=content_rating != "unrated",
         )
 
 
@@ -131,6 +175,8 @@ class StructuredTextWorldProvider(RecordingTextProvider):
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_requests.append(request)
+        if request.schema_name == "content_safety_review":
+            return await super().generate_structured_output(request)
         if isinstance(self.structured_data, Exception):
             raise self.structured_data
         return StructuredOutputResponse(
@@ -169,6 +215,8 @@ class QueuedStructuredTextProvider(RecordingTextProvider):
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_requests.append(request)
+        if request.schema_name == "content_safety_review":
+            return await super().generate_structured_output(request)
         if isinstance(self.structured_responses, Exception):
             raise self.structured_responses
         return StructuredOutputResponse(
@@ -566,6 +614,62 @@ def test_send_text_applies_phrase_guard_before_delivering_character_reply(
     assert "save-only phrase" in provider.chat_requests[1].regeneration_feedback
 
 
+@pytest.mark.parametrize(
+    ("rating", "expected_fade"),
+    (("g", True), ("pg", True), ("unrated", False)),
+)
+def test_character_text_guard_retry_preserves_actor_content_policy(
+    repositories: PersistenceRepositories,
+    rating: str,
+    expected_fade: bool,
+) -> None:
+    save_id = _create_save_with_characters(repositories, scenario_type="dating_sim")
+    npc = _npc_character(repositories, save_id)
+    actor = repositories.create_user(
+        username=f"actor-{rating}",
+        role="user",
+        password_hash="hash",
+    )
+    set_user_content_rating(
+        repositories,
+        user_id=actor.id,
+        rating=rating,
+    )
+    repositories.set_app_setting(
+        SCRIPT_GUARD_MODE_SETTING,
+        SCRIPT_GUARD_MODE_LATIN_ONLY_REJECT,
+    )
+    _configure_text_reply_model(repositories)
+    provider = SequenceTextProvider(
+        ("玩家喜欢简洁叙事。", "Meet me by the arcade."),
+    )
+    safety = RecordingContentSafetyService()
+    service = CharacterTextService(
+        repositories=repositories,
+        providers={"fake": provider},
+        content_safety_service=cast(ContentSafetyService, safety),
+    )
+    _grant_player_has_number(repositories, save_id, npc.id)
+
+    asyncio.run(
+        service.send_text(
+            save_id=save_id,
+            character_id=npc.id,
+            body="Can we talk after class?",
+            current_user_id=actor.id,
+        )
+    )
+
+    assert [
+        (request.content_rating, request.fade_to_black_enabled)
+        for request in provider.chat_requests
+    ] == [(rating, expected_fade), (rating, expected_fade)]
+    assert safety.ratings == [
+        (rating, False),
+        (rating, expected_fade),
+    ]
+
+
 def test_queue_text_send_persists_pending_message_without_provider_call(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -912,7 +1016,11 @@ def test_send_thread_text_generates_capped_group_replies_from_willing_participan
     assert [reply.sender_character_id for reply in result.replies] == [
         npc.id for npc in npcs[:3]
     ]
-    assert [request.schema_name for request in provider.structured_requests] == [
+    assert [
+        request.schema_name
+        for request in provider.structured_requests
+        if request.schema_name == "character_text_group_response_assessment"
+    ] == [
         "character_text_group_response_assessment",
         "character_text_group_response_assessment",
         "character_text_group_response_assessment",
@@ -1057,7 +1165,7 @@ def test_send_thread_text_skips_group_replies_without_structured_assessment(
 
     assert result.player_message.delivery_status == "sent"
     assert result.replies == ()
-    assert len(provider.structured_requests) == 1
+    assert len(provider.structured_requests) == 2
     assert provider.chat_requests == []
     messages = repositories.list_character_text_messages(
         save_id=save_id,
@@ -1388,8 +1496,9 @@ def test_send_text_keeps_reply_text_only_when_attachment_decision_is_none(
     assert result.reply.attachments == ()
     assert media.character_calls == []
     assert media.object_calls == []
-    assert provider.structured_requests[0].schema_name == (
-        "character_text_image_attachment_decision"
+    assert any(
+        request.schema_name == "character_text_image_attachment_decision"
+        for request in provider.structured_requests
     )
     assert repositories.list_character_text_message_attachments(
         save_id=save_id,
@@ -1442,7 +1551,11 @@ def test_send_text_generates_character_image_attachment_for_npc_reply(
     assert "Current action/pose: taking a mirror selfie" in media.character_calls[0][1]
     assert "Facial expression: guarded half-smile" in media.character_calls[0][1]
     assert "Found my old jacket" in media.character_calls[0][2]
-    request = provider.structured_requests[0]
+    request = next(
+        request
+        for request in provider.structured_requests
+        if request.schema_name == "character_text_image_attachment_decision"
+    )
     properties = request.schema["properties"]
     assert isinstance(properties, dict)
     assert set(properties) >= {
@@ -2661,7 +2774,10 @@ def test_send_text_applies_structured_text_world_updates(
     assert result.world_update.character_count == 1
     assert result.world_update.dating_route_count == 1
     assert result.world_update.knowledge_edge_count == 1
-    assert provider.structured_requests[0].schema_name == "character_text_world_update"
+    assert any(
+        request.schema_name == "character_text_world_update"
+        for request in provider.structured_requests
+    )
     details = repositories.load_save_details(save_id)
     assert details is not None
     assert details.messages == []
@@ -4036,7 +4152,9 @@ def test_proactive_text_suppresses_duplicate_recent_character_body(
     assert result.thread is not None
     assert result.message is None
     assert len(provider.chat_requests) == 1
-    assert provider.structured_requests == []
+    assert [request.schema_name for request in provider.structured_requests] == [
+        "content_safety_review"
+    ]
     assert [
         message.body
         for message in repositories.list_character_text_messages(

@@ -17854,6 +17854,80 @@ describe("frontend helpers", () => {
       ]));
   });
 
+  it("disables fade-to-black when content filtering is unrated", async () => {
+    const settingsPayload = modelSettingsPayload({
+      visible_sections: ["local"],
+      content_rating: {
+        setting_key: "content_filter_rating",
+        selected: "unrated",
+        options: ["g", "pg", "pg-13", "r", "unrated"],
+        admin_granted: false
+      },
+      fade_to_black: {
+        setting_key: "fade_to_black_enabled",
+        enabled: true
+      }
+    });
+    vi.stubGlobal("fetch", settingsFetch(settingsPayload));
+    const { SettingsPanel } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <SettingsPanel runJob={vi.fn()} activeSaveId={null} />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Local" }));
+    expect(screen.getByLabelText("Fade Explicit Content to Black")).toBeDisabled();
+    expect(
+      screen.getByText(
+        "Unrated skips Safety Agent review and never triggers fade-to-black."
+      )
+    ).toBeInTheDocument();
+  });
+
+  it("clears content caches and refreshes scenarios when rating changes", async () => {
+    const settingsPayload = modelSettingsPayload({
+      visible_sections: ["local"],
+      content_rating: {
+        setting_key: "content_filter_rating",
+        selected: "r",
+        options: ["g", "pg", "pg-13", "r", "unrated"],
+        admin_granted: false
+      }
+    });
+    vi.stubGlobal("fetch", settingsFetch(settingsPayload));
+    const client = new QueryClient();
+    const resetSpy = vi.spyOn(client, "resetQueries");
+    const refreshScenarios = vi.fn();
+    client.setQueryData(["runtime", "save-1"], { explicit: "cached" });
+    client.setQueryData(["world", "save-1"], { explicit: "cached" });
+    client.setQueryData(["media", "save-1"], { explicit: "cached" });
+    const { SettingsPanel } = await import("./main");
+
+    render(
+      <QueryClientProvider client={client}>
+        <SettingsPanel
+          runJob={vi.fn()}
+          activeSaveId="save-1"
+          onContentSafetyChanged={refreshScenarios}
+        />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Local" }));
+    await userEvent.selectOptions(
+      screen.getByLabelText("Content Filtering Level"),
+      "g"
+    );
+
+    await waitFor(() => expect(refreshScenarios).toHaveBeenCalledOnce());
+    expect(resetSpy).toHaveBeenCalledWith();
+    expect(client.getQueryData(["runtime", "save-1"])).toBeUndefined();
+    expect(client.getQueryData(["world", "save-1"])).toBeUndefined();
+    expect(client.getQueryData(["media", "save-1"])).toBeUndefined();
+  });
+
   it("posts narrator planner history settings with the active save id", async () => {
     const settingsPayload = modelSettingsPayload({
       visible_sections: ["save"],

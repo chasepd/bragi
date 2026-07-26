@@ -22,7 +22,6 @@ from bragi.persistence.models import (
     WorldStateRecord,
 )
 from bragi.persistence.repositories import PersistenceRepositories
-from bragi.services.content_rating import effective_content_safety_policy
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 from bragi.world_time_model import canonical_world_time_from_legacy
 
@@ -234,6 +233,8 @@ class MessageRevisionService:
         message_id: str,
         body: str,
         current_user_id: str | None = None,
+        content_rating: str = "unclassified",
+        safety_transition: str = "",
     ) -> MessageEdit:
         return self._edit_message_body(
             save_id=save_id,
@@ -242,6 +243,8 @@ class MessageRevisionService:
             allowed_roles=frozenset({"narrator"}),
             role_error="Only narrator messages can be edited this way",
             current_user_id=current_user_id,
+            content_rating=content_rating,
+            safety_transition=safety_transition,
         )
 
     def edit_message_without_resubmit(
@@ -251,6 +254,8 @@ class MessageRevisionService:
         message_id: str,
         body: str,
         current_user_id: str | None = None,
+        content_rating: str = "unclassified",
+        safety_transition: str = "",
     ) -> MessageEdit:
         return self._edit_message_body(
             save_id=save_id,
@@ -259,6 +264,8 @@ class MessageRevisionService:
             allowed_roles=frozenset({"player", "narrator"}),
             role_error="Only player and narrator messages can be edited this way",
             current_user_id=current_user_id,
+            content_rating=content_rating,
+            safety_transition=safety_transition,
         )
 
     def _edit_message_body(
@@ -270,6 +277,8 @@ class MessageRevisionService:
         allowed_roles: frozenset[str],
         role_error: str,
         current_user_id: str | None,
+        content_rating: str,
+        safety_transition: str,
     ) -> MessageEdit:
         replacement = body.strip()
         if not replacement:
@@ -283,16 +292,13 @@ class MessageRevisionService:
         if selected.body.strip() == replacement:
             raise ValueError("Message was not changed")
 
-        content_safety = effective_content_safety_policy(
-            self.repositories,
-            user_id=current_user_id,
-        )
+        del current_user_id
         updated = self.repositories.update_message_body(
             save_id=save_id,
             message_id=message_id,
             body=replacement,
-            content_rating=content_safety.rating,
-            fade_to_black_enabled=content_safety.fade_to_black_enabled,
+            content_rating=content_rating,
+            safety_transition=safety_transition,
         )
         revision = self.repositories.add_message_revision(
             save_id=save_id,
@@ -891,6 +897,7 @@ class MessageRevisionService:
                 character_id=character.id,
                 first_seen_message_id=character.first_seen_message_id,
                 last_updated_message_id=character.last_updated_message_id,
+                content_rating=character.content_rating,
             )
             active_character_ids.add(character.id)
 

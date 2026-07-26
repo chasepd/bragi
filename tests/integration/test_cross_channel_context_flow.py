@@ -64,7 +64,12 @@ class CrossChannelProvider:
                 provider=self.provider_name,
                 model_id="fake-chat",
                 display_name="Fake Chat",
-                capabilities=frozenset({ProviderCapability.CHAT}),
+                capabilities=frozenset(
+                    {
+                        ProviderCapability.CHAT,
+                        ProviderCapability.STRUCTURED_OUTPUT,
+                    }
+                ),
                 context_window=8192,
             ),
             ProviderModel(
@@ -115,6 +120,18 @@ class CrossChannelProvider:
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return StructuredOutputResponse(
+                data={
+                    "action": "allow",
+                    "category": "none",
+                    "reason": "Integration fixture content is within the ceiling.",
+                    "minimum_rating": "g",
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
+
         self.structured_output_requests.append(request)
         if request.schema_name == "character_text_world_update":
             return StructuredOutputResponse(

@@ -139,7 +139,7 @@ def test_narrator_prose_safety_uses_selected_rating_and_fade_toggle() -> None:
 
     body = chat_system_body(request)
 
-    assert "R content rating" in body
+    assert "R — Restricted" in body
     assert "fade-to-black" not in body
     assert DEFAULT_PROSE_SAFETY_SECTION not in body
 
@@ -155,7 +155,7 @@ def test_narrator_prose_safety_keeps_fade_guidance_when_enabled() -> None:
 
     body = chat_system_body(request)
 
-    assert "PG content rating" in body
+    assert "PG — Parental guidance suggested" in body
     assert "fade-to-black" in body
 
 

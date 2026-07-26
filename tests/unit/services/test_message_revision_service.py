@@ -11,7 +11,6 @@ import pytest
 
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
-from bragi.safety import FADE_TO_BLACK_TRANSITION
 from bragi.services.content_rating import (
     CONTENT_FILTER_RATING_SETTING,
     FADE_TO_BLACK_ENABLED_SETTING,
@@ -208,7 +207,7 @@ def test_edit_narrator_message_persists_revision_without_deleting_later_turns(
     ]
 
 
-def test_edit_narrator_message_does_not_persist_rejected_body_in_diff(
+def test_edit_narrator_message_leaves_safety_review_to_async_caller(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, ids = _create_revision_save(repositories)
@@ -220,9 +219,9 @@ def test_edit_narrator_message_does_not_persist_rejected_body_in_diff(
         body=rejected,
     )
 
-    assert edit.message.body == FADE_TO_BLACK_TRANSITION
-    assert edit.revision.new_body == FADE_TO_BLACK_TRANSITION
-    assert rejected not in edit.revision.diff_unified
+    assert edit.message.body == rejected
+    assert edit.revision.new_body == rejected
+    assert rejected in edit.revision.diff_unified
 
 
 def test_edit_narrator_message_respects_adult_rating_and_disabled_fade(

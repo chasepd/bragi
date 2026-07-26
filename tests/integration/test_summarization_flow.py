@@ -57,7 +57,12 @@ class SummarizationContextNarratorProvider:
                 provider=self.provider_name,
                 model_id="fake-chat",
                 display_name="Fake Chat",
-                capabilities=frozenset({ProviderCapability.CHAT}),
+                capabilities=frozenset(
+                    {
+                        ProviderCapability.CHAT,
+                        ProviderCapability.STRUCTURED_OUTPUT,
+                    }
+                ),
                 context_window=8192,
             ),
         ]
@@ -124,6 +129,18 @@ class SummarizationContextNarratorProvider:
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_review":
+            return StructuredOutputResponse(
+                data={
+                    "action": "allow",
+                    "category": "none",
+                    "reason": "Integration fixture content is within the ceiling.",
+                    "minimum_rating": "g",
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
+
         if request.schema_name == "context_search_selection":
             self.events.append("context_search")
             prompt = "\n".join(message.body for message in request.messages)

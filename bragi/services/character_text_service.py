@@ -17,6 +17,7 @@ from bragi.app_logging import (
     log_error_event,
     log_event,
 )
+from bragi.content_rating_instructions import CONTENT_RATING_PROHIBITED
 from bragi.persistence.models import (
     ActiveThreadRecord,
     CharacterContactStateRecord,
@@ -64,6 +65,11 @@ from bragi.services.character_text_world_update_service import (
     CharacterTextWorldUpdateService,
     character_text_source_ref,
 )
+from bragi.services.content_rating import effective_content_safety_policy
+from bragi.services.content_safety_service import (
+    ContentSafetyAction,
+    ContentSafetyService,
+)
 from bragi.services.context_assembly import compact_scenario_instructions
 from bragi.services.dating_route_policy import (
     intimacy_profile_guidance,
@@ -80,6 +86,7 @@ from bragi.services.knowledge_boundary import (
     message_visible_to_present_characters,
     normalized_knowledge_target_type,
 )
+from bragi.services.media_content_rating import media_asset_content_rating
 from bragi.services.media_service import CharacterTextUploadedPhoto
 from bragi.services.model_capabilities import (
     STRUCTURED_OUTPUT_CAPABILITIES,
@@ -244,6 +251,7 @@ class CharacterTextContact:
     latest_message_at: str | None = None
     latest_message_read_at: str | None = None
     reference_image: CharacterRegistryReferenceImageRow | None = None
+    latest_message_content_rating: str = "unclassified"
 
 
 @dataclass(frozen=True)
@@ -264,6 +272,7 @@ class CharacterTextMessageAttachment:
     prompt_preview: str
     error: str | None
     created_at: str | None
+    content_rating: str = "unclassified"
 
 
 @dataclass(frozen=True)
@@ -294,6 +303,7 @@ class CharacterTextMessage:
     proactive_trigger_type: str = ""
     revision_count: int = 0
     edited_at: str | None = None
+    content_rating: str = "unclassified"
 
 
 @dataclass(frozen=True)
@@ -407,6 +417,7 @@ class _CharacterTextGenerationResult:
     request: ChatRequest
     response: ChatResponse
     body: str
+    minimum_rating: str = "unrated"
 
 
 @dataclass(frozen=True)
@@ -511,11 +522,16 @@ class CharacterTextService:
         providers: Mapping[str, object],
         media_service: CharacterTextAttachmentMediaRunner | None = None,
         prompt_inspection_store: PromptInspectionStore | None = None,
+        content_safety_service: ContentSafetyService | None = None,
     ) -> None:
         self.repositories = repositories
         self.providers = providers
         self.media_service = media_service
         self.prompt_inspection_store = prompt_inspection_store
+        self.content_safety_service = content_safety_service or ContentSafetyService(
+            repositories=repositories,
+            providers=cast(dict[str, ProviderClient], providers),
+        )
 
     def is_enabled(self, save_id: str) -> bool:
         configured = self.repositories.get_effective_setting(
@@ -540,6 +556,46 @@ class CharacterTextService:
         return self.repositories.character_text_outbound_allowed(
             save_id=save_id,
             character_id=character_id,
+        )
+
+    async def classify_player_text(
+        self,
+        *,
+        save_id: str,
+        body: str,
+        current_user_id: str | None,
+    ) -> str:
+        """Classify player-authored text before it is queued for persistence."""
+
+        details = self.repositories.load_save_details(save_id)
+        if details is None:
+            raise ValueError(f"Unknown save id: {save_id}")
+        preference = roleplay_model_preference(
+            repositories=self.repositories,
+            save_id=save_id,
+            purpose="chat",
+        )
+        if preference is None:
+            raise ValueError("No chat model configured")
+        policy = effective_content_safety_policy(
+            self.repositories,
+            user_id=current_user_id,
+        )
+        safety = await self.content_safety_service.review_narration(
+            body=body,
+            content_rating=policy.rating,
+            fade_to_black_enabled=False,
+            save_id=save_id,
+            source_request=ChatRequest(
+                provider=preference.provider,
+                model_id=preference.model_id,
+                messages=(),
+            ),
+        )
+        return (
+            safety.minimum_rating
+            if safety.action is ContentSafetyAction.ALLOW
+            else CONTENT_RATING_PROHIBITED
         )
 
     def prepare_spontaneous_text(
@@ -860,6 +916,7 @@ class CharacterTextService:
         save_id: str,
         thread_id: str,
         body: str,
+        content_rating: str = CONTENT_RATING_PROHIBITED,
     ) -> CharacterTextQueuedSendResult:
         if not self.is_enabled(save_id):
             raise ValueError("Character texts are not enabled for this save")
@@ -879,6 +936,7 @@ class CharacterTextService:
                 save_id=save_id,
                 character_id=thread.character_id,
                 body=text,
+                content_rating=content_rating,
             )
         if thread.kind != "group":
             raise ValueError(f"Unsupported character text thread kind: {thread.kind}")
@@ -910,6 +968,7 @@ class CharacterTextService:
             sender="player",
             sender_character_id=player.id,
             body=text,
+            content_rating=content_rating,
             delivery_status="pending",
             in_world_sent_at=_current_character_text_in_world_timestamp(
                 repositories=self.repositories,
@@ -948,6 +1007,7 @@ class CharacterTextService:
         save_id: str,
         character_id: str,
         body: str,
+        content_rating: str = CONTENT_RATING_PROHIBITED,
     ) -> CharacterTextQueuedSendResult:
         if not self.is_enabled(save_id):
             raise ValueError("Character texts are not enabled for this save")
@@ -995,6 +1055,7 @@ class CharacterTextService:
             character_id=character.id,
             sender="player",
             body=text,
+            content_rating=content_rating,
             delivery_status="pending",
             in_world_sent_at=_current_character_text_in_world_timestamp(
                 repositories=self.repositories,
@@ -1028,10 +1089,16 @@ class CharacterTextService:
         retry_progress_callback: ProviderRetryProgressCallback | None = None,
         current_user_id: str | None = None,
     ) -> CharacterTextSendResult:
+        content_rating = await self.classify_player_text(
+            save_id=save_id,
+            body=body,
+            current_user_id=current_user_id,
+        )
         queued = self.queue_text_send(
             save_id=save_id,
             character_id=character_id,
             body=body,
+            content_rating=content_rating,
         )
         return await self.complete_queued_text_send(
             save_id=save_id,
@@ -1049,10 +1116,16 @@ class CharacterTextService:
         retry_progress_callback: ProviderRetryProgressCallback | None = None,
         current_user_id: str | None = None,
     ) -> CharacterTextThreadSendResult:
+        content_rating = await self.classify_player_text(
+            save_id=save_id,
+            body=body,
+            current_user_id=current_user_id,
+        )
         queued = self.queue_thread_text_send(
             save_id=save_id,
             thread_id=thread_id,
             body=body,
+            content_rating=content_rating,
         )
         return await self.complete_queued_thread_text_send(
             save_id=save_id,
@@ -1307,6 +1380,7 @@ class CharacterTextService:
                     request=request,
                     chat=chat,
                     identity=identity,
+                    current_user_id=current_user_id,
                 )
                 request = generation.request
                 response = generation.response
@@ -1342,6 +1416,7 @@ class CharacterTextService:
                 model=response.model_id,
                 token_estimate=response.token_usage.get("total"),
                 in_world_sent_at=reply_sent_at,
+                content_rating=generation.minimum_rating,
             )
             await self._generate_attachment_for_character_message(
                 save_id=save_id,
@@ -1358,6 +1433,7 @@ class CharacterTextService:
                 model=response.model_id,
                 token_estimate=response.token_usage.get("total"),
                 in_world_sent_at=reply_sent_at,
+                content_rating=generation.minimum_rating,
             )
             _capture_character_text_prompt(
                 prompt_inspection_store=self.prompt_inspection_store,
@@ -1635,6 +1711,7 @@ class CharacterTextService:
                 request=request,
                 chat=chat,
                 identity=identity,
+                current_user_id=current_user_id,
             )
             request = generation.request
             response = generation.response
@@ -1667,6 +1744,7 @@ class CharacterTextService:
             model=response.model_id,
             token_estimate=response.token_usage.get("total"),
             in_world_sent_at=reply_sent_at,
+            content_rating=generation.minimum_rating,
         )
         updated_thread = self.repositories.get_character_text_thread(
             thread_id=player_message.thread_id,
@@ -1695,6 +1773,7 @@ class CharacterTextService:
             model=response.model_id,
             token_estimate=response.token_usage.get("total"),
             in_world_sent_at=reply_sent_at,
+            content_rating=generation.minimum_rating,
         )
         _capture_character_text_prompt(
             prompt_inspection_store=self.prompt_inspection_store,
@@ -1764,8 +1843,17 @@ class CharacterTextService:
         request: ChatRequest,
         chat: Callable[[ChatRequest], Awaitable[ChatResponse]],
         identity: _CharacterTextIdentity,
+        current_user_id: str | None,
     ) -> _CharacterTextGenerationResult:
-        current_request = request
+        content_safety = effective_content_safety_policy(
+            self.repositories,
+            user_id=current_user_id,
+        )
+        current_request = replace(
+            request,
+            content_rating=content_safety.rating,
+            fade_to_black_enabled=content_safety.fade_to_black_enabled,
+        )
         phrase_denylist = effective_generated_phrase_denylist(
             self.repositories,
             save_id=save_id,
@@ -1798,10 +1886,22 @@ class CharacterTextService:
                 and not phrase_violations
                 and identity_violation is None
             ):
+                safety = await self.content_safety_service.review_narration(
+                    body=body,
+                    content_rating=current_request.content_rating,
+                    fade_to_black_enabled=current_request.fade_to_black_enabled,
+                    save_id=save_id,
+                    source_request=replace(
+                        current_request,
+                        provider=response.provider,
+                        model_id=response.model_id,
+                    ),
+                )
                 return _CharacterTextGenerationResult(
                     request=current_request,
                     response=response,
-                    body=body,
+                    body=safety.body,
+                    minimum_rating=safety.reviewed_content_rating,
                 )
             _log_character_text_guard_violations(
                 save_id=save_id,
@@ -1826,9 +1926,9 @@ class CharacterTextService:
                 attempt=attempt + 1,
             )
             current_request = replace(
-                request,
+                current_request,
                 regeneration_feedback=_combine_regeneration_feedback(
-                    request.regeneration_feedback,
+                    current_request.regeneration_feedback,
                     _character_text_guard_retry_feedback(
                         script_violations=script_violations,
                         phrase_violations=phrase_violations,
@@ -2085,6 +2185,7 @@ class CharacterTextService:
                 request=request,
                 chat=chat,
                 identity=identity,
+                current_user_id=current_user_id,
             )
             request = generation.request
             response = generation.response
@@ -2108,6 +2209,7 @@ class CharacterTextService:
             model=response.model_id,
             token_estimate=response.token_usage.get("total"),
             in_world_sent_at=message_sent_at,
+            content_rating=generation.minimum_rating,
         )
         updated_thread = self.repositories.get_character_text_thread(
             thread_id=queued_message.thread_id,
@@ -2130,6 +2232,7 @@ class CharacterTextService:
             model=response.model_id,
             token_estimate=response.token_usage.get("total"),
             in_world_sent_at=message_sent_at,
+            content_rating=generation.minimum_rating,
         )
         _capture_character_text_prompt(
             prompt_inspection_store=self.prompt_inspection_store,
@@ -2791,6 +2894,7 @@ class CharacterTextService:
                 request=request,
                 chat=chat,
                 identity=identity,
+                current_user_id=current_user_id,
             )
             request = generation.request
             response = generation.response
@@ -2869,6 +2973,7 @@ class CharacterTextService:
             model=response.model_id,
             token_estimate=response.token_usage.get("total"),
             in_world_sent_at=message_sent_at,
+            content_rating=generation.minimum_rating,
         )
         updated_thread = self.repositories.get_character_text_thread(
             thread_id=thread.id,
@@ -2891,6 +2996,7 @@ class CharacterTextService:
             model=response.model_id,
             token_estimate=response.token_usage.get("total"),
             in_world_sent_at=message_sent_at,
+            content_rating=generation.minimum_rating,
         )
         _capture_character_text_prompt(
             prompt_inspection_store=self.prompt_inspection_store,
@@ -3596,6 +3702,9 @@ def _contact_model(
         latest_message_at=latest.created_at if latest is not None else None,
         latest_message_read_at=latest.read_at if latest is not None else None,
         reference_image=reference_image,
+        latest_message_content_rating=(
+            latest.content_rating if latest is not None else "unclassified"
+        ),
     )
 
 
@@ -3764,6 +3873,10 @@ def _message_models(
     media_assets = {
         asset.id: asset for asset in repositories.list_media_assets(save_id)
     }
+    source_messages = {
+        message.id: message for message in repositories.list_messages(save_id)
+    }
+    character_text_messages = {message.id: message for message in messages}
     proactive_by_message: dict[str, CharacterTextProactiveTriggerRecord] = {}
     for trigger in repositories.list_character_text_proactive_triggers(save_id):
         if (
@@ -3777,6 +3890,9 @@ def _message_models(
             revision_metadata=revision_metadata,
             attachments=tuple(attachments_by_message.get(message.id, ())),
             media_assets=media_assets,
+            source_messages=source_messages,
+            character_text_messages=character_text_messages,
+            characters=characters_by_id,
             proactive_trigger=proactive_by_message.get(message.id),
             sender_display_name=_message_sender_display_name(
                 message,
@@ -3793,6 +3909,9 @@ def _message_model(
     revision_metadata: Mapping[str, object] | None = None,
     attachments: tuple[CharacterTextMessageAttachmentRecord, ...] = (),
     media_assets: Mapping[str, MediaAssetRecord] | None = None,
+    source_messages: Mapping[str, MessageRecord] | None = None,
+    character_text_messages: Mapping[str, CharacterTextMessageRecord] | None = None,
+    characters: Mapping[str, CharacterRecord] | None = None,
     proactive_trigger: CharacterTextProactiveTriggerRecord | None = None,
     sender_display_name: str = "",
 ) -> CharacterTextMessage:
@@ -3813,6 +3932,9 @@ def _message_model(
         attachments=_attachment_models(
             attachments,
             media_assets=media_assets or {},
+            source_messages=source_messages or {},
+            character_text_messages=character_text_messages or {},
+            characters=characters or {},
         ),
         actions=_message_actions(message),
         provider=message.provider,
@@ -3833,6 +3955,7 @@ def _message_model(
         ),
         revision_count=revision_count,
         edited_at=edited_at if isinstance(edited_at, str) else None,
+        content_rating=message.content_rating,
     )
 
 
@@ -3862,6 +3985,7 @@ def _completed_character_text_message(
     model: str | None,
     token_estimate: int | None,
     in_world_sent_at: str | None,
+    content_rating: str,
 ) -> CharacterTextMessageRecord:
     return replace(
         message,
@@ -3872,6 +3996,7 @@ def _completed_character_text_message(
         delivery_status="sent",
         delivery_error=None,
         in_world_sent_at=in_world_sent_at or message.in_world_sent_at,
+        content_rating=content_rating,
     )
 
 
@@ -3879,9 +4004,18 @@ def _attachment_models(
     attachments: tuple[CharacterTextMessageAttachmentRecord, ...],
     *,
     media_assets: Mapping[str, MediaAssetRecord],
+    source_messages: Mapping[str, MessageRecord],
+    character_text_messages: Mapping[str, CharacterTextMessageRecord],
+    characters: Mapping[str, CharacterRecord],
 ) -> tuple[CharacterTextMessageAttachment, ...]:
     return tuple(
-        _attachment_model(attachment, media_assets=media_assets)
+        _attachment_model(
+            attachment,
+            media_assets=media_assets,
+            source_messages=source_messages,
+            character_text_messages=character_text_messages,
+            characters=characters,
+        )
         for attachment in attachments
     )
 
@@ -3890,6 +4024,9 @@ def _attachment_model(
     attachment: CharacterTextMessageAttachmentRecord,
     *,
     media_assets: Mapping[str, MediaAssetRecord],
+    source_messages: Mapping[str, MessageRecord],
+    character_text_messages: Mapping[str, CharacterTextMessageRecord],
+    characters: Mapping[str, CharacterRecord],
 ) -> CharacterTextMessageAttachment:
     asset = (
         media_assets.get(attachment.media_asset_id)
@@ -3907,6 +4044,17 @@ def _attachment_model(
         prompt_preview=_attachment_prompt_preview(attachment, asset),
         error=attachment.error,
         created_at=attachment.created_at,
+        content_rating=(
+            media_asset_content_rating(
+                asset,
+                media_assets_by_id=media_assets,
+                source_messages=source_messages,
+                character_text_messages=character_text_messages,
+                characters=characters,
+            )
+            if asset is not None
+            else "unrated"
+        ),
     )
 
 

@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -51,6 +51,9 @@ from bragi.services.model_preferences import (
 from bragi.services.post_turn_inference import (
     POST_TURN_INFERENCE_MODE_SETTING,
     sanitize_post_turn_inference_mode,
+)
+from bragi.services.scenario_content_rating import (
+    metadata_with_scenario_content_ratings,
 )
 from bragi.services.scenario_service import (
     RETIRED_SCENARIO_REASON,
@@ -203,7 +206,7 @@ class ChatBundleService:
                 """
                 SELECT id, save_id, role, speaker_name, body, provider, model,
                        token_estimate, created_at, updated_at, deleted_at,
-                       safety_transition
+                       safety_transition, content_rating
                 FROM messages
                 WHERE save_id = ? AND deleted_at IS NULL
                 ORDER BY created_at, rowid
@@ -244,7 +247,7 @@ class ChatBundleService:
             "message_action_choices": self._rows(
                 """
                 SELECT id, save_id, message_id, ordinal, body, provider, model,
-                       created_at, updated_at
+                       content_rating, created_at, updated_at
                 FROM message_action_choices
                 WHERE save_id = ?
                 ORDER BY message_id, ordinal, rowid
@@ -286,7 +289,7 @@ class ChatBundleService:
                 """
                 SELECT id, save_id, covers_message_start_id,
                        covers_message_end_id, body, provider, model, created_at,
-                       archived_at
+                       content_rating, archived_at
                 FROM summaries
                 WHERE save_id = ? AND archived_at IS NULL
                 ORDER BY created_at, rowid
@@ -424,6 +427,7 @@ class ChatBundleService:
                 """
                 SELECT id, save_id, thread_id, character_id, sender, body,
                        sender_character_id, provider, model, token_estimate,
+                       content_rating,
                        created_at, updated_at, deleted_at, delivery_status,
                        delivery_error,
                        delivery_job_id, delivery_attempt, in_world_sent_at,
@@ -522,7 +526,8 @@ class ChatBundleService:
                        protected_from_maintenance, is_player_character,
                        contact_name,
                        first_seen_message_id,
-                       last_updated_message_id, created_at, updated_at, archived_at
+                       last_updated_message_id, content_rating,
+                       created_at, updated_at, archived_at
                 FROM characters
                 WHERE save_id = ? AND archived_at IS NULL
                 ORDER BY created_at, rowid
@@ -987,6 +992,7 @@ class ChatBundleService:
         scenario_content = strip_deprecated_scenario_character_sections(
             scenario_content,
         )
+        scenario_content = _quarantine_imported_scenario_content(scenario_content)
 
         scenario = self.repositories.create_scenario(
             type=scenario_type,
@@ -1027,6 +1033,7 @@ class ChatBundleService:
                 )
             body = _text(message_data, "body")
             safety_transition = _optional_text(message_data, "safety_transition") or ""
+            content_rating = "unclassified"
             message = self.repositories.append_message(
                 save_id=save.id,
                 role=role,
@@ -1038,8 +1045,7 @@ class ChatBundleService:
                 created_at=_optional_text(message_data, "created_at"),
                 updated_at=_optional_text(message_data, "updated_at"),
                 safety_transition=safety_transition,
-                content_rating="unrated",
-                fade_to_black_enabled=False,
+                content_rating=content_rating,
                 touch_save_updated_at=False,
             )
             safety_transition = message.safety_transition
@@ -1072,9 +1078,9 @@ class ChatBundleService:
                 """
                 INSERT INTO message_action_choices(
                     id, save_id, message_id, ordinal, body, provider, model,
-                    created_at, updated_at
+                    content_rating, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     choice_id,
@@ -1084,6 +1090,7 @@ class ChatBundleService:
                     _text(row, "body"),
                     _optional_text(row, "provider") or "",
                     _optional_text(row, "model") or "",
+                    "unclassified",
                     _optional_text(row, "created_at")
                     or datetime.now(UTC).isoformat(),
                     _optional_text(row, "updated_at")
@@ -1208,6 +1215,7 @@ class ChatBundleService:
                 body=_text(row, "body"),
                 provider=_text(row, "provider"),
                 model=_text(row, "model"),
+                content_rating="unclassified",
             )
             summary_id_map[original_id] = summary.id
         imported_id_maps["summary"] = summary_id_map
@@ -1295,8 +1303,10 @@ class ChatBundleService:
                 title=_text(row, "title"),
                 premise=_text(row, "premise"),
                 player_role=_text(row, "player_role"),
-                content=strip_deprecated_scenario_character_sections(
-                    _json_object(row, "content_json"),
+                content=_quarantine_imported_scenario_content(
+                    strip_deprecated_scenario_character_sections(
+                        _json_object(row, "content_json"),
+                    )
                 ),
                 reason=_text(row, "reason"),
                 provider=_text(row, "provider"),
@@ -1499,7 +1509,7 @@ class ChatBundleService:
                     _optional_text(row, "mime_type"),
                     media_type=_text(row, "type"),
                 ),
-                metadata=_remapped_imported_media_source_metadata(
+                metadata=_quarantined_imported_media_source_metadata(
                     row,
                     live_media_asset_id_map,
                     repair_tracker,
@@ -1951,6 +1961,7 @@ class ChatBundleService:
                 "known_state",
             )
             copied["known_state"] = copied["history"]
+            copied["content_rating"] = "unclassified"
             characters.append(copied)
         _insert_rows(connection, "characters", characters)
 
@@ -2091,6 +2102,7 @@ class ChatBundleService:
                 field_name="character_text_messages.reply_to_message_id",
                 repair_tracker=repair_tracker,
             )
+            copied["content_rating"] = "unclassified"
             character_text_messages.append(copied)
         _insert_rows(connection, "character_text_messages", character_text_messages)
 
@@ -3976,7 +3988,7 @@ def _remap_imported_media_reference_metadata(
         imported_asset_id = media_asset_id_map.get(original_asset_id)
         if imported_asset_id is None:
             continue
-        metadata = _remapped_imported_media_source_metadata(
+        metadata = _quarantined_imported_media_source_metadata(
             row,
             media_asset_id_map,
         )
@@ -4094,6 +4106,40 @@ def _remapped_imported_media_source_metadata(
                 mapped_items.append(mapped)
         remapped[field] = mapped_items
     return remapped
+
+
+def _quarantined_imported_media_source_metadata(
+    row: dict[str, object],
+    media_asset_id_map: dict[str, str],
+    repair_tracker: _BundleImportRepairTracker | None = None,
+) -> dict[str, object]:
+    metadata = _remapped_imported_media_source_metadata(
+        row,
+        media_asset_id_map,
+        repair_tracker,
+    )
+    metadata["content_rating"] = "unclassified"
+    return metadata
+
+
+def _quarantine_imported_scenario_content(
+    content: Mapping[str, object],
+) -> dict[str, object]:
+    quarantined = dict(content)
+    source = quarantined.get("_source")
+    quarantined["_source"] = metadata_with_scenario_content_ratings(
+        source if isinstance(source, Mapping) else None,
+        aggregate_rating="unclassified",
+    )
+    starters = quarantined.get("character_starters")
+    if isinstance(starters, list):
+        for starter in starters:
+            if not isinstance(starter, dict):
+                continue
+            reference = starter.get("reference_image")
+            if isinstance(reference, dict):
+                reference["content_rating"] = "unclassified"
+    return quarantined
 
 
 def _mapped_optional_value(

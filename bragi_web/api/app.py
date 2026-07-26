@@ -13,7 +13,7 @@ import socket
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -1358,11 +1358,21 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 repositories=state.repositories,
                 providers=state.providers,
             )
+        try:
+            content_rating = await service.classify_player_text(
+                save_id=submitted_save_id,
+                body=payload.body,
+                current_user_id=actor_user_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        async with state.lock.async_access():
             try:
                 queued = service.queue_thread_text_send(
                     save_id=submitted_save_id,
                     thread_id=thread_id,
                     body=payload.body,
+                    content_rating=content_rating,
                 )
             except ValueError as exc:
                 detail = str(exc)
@@ -1692,18 +1702,27 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             except _CharacterReferenceUploadTooLarge as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from exc
             uploaded_filename = file.filename
-        async with state.lock.async_access():
-            from bragi.services.character_text_service import CharacterTextService
+        from bragi.services.character_text_service import CharacterTextService
 
-            service = CharacterTextService(
-                repositories=state.repositories,
-                providers=state.providers,
+        service = CharacterTextService(
+            repositories=state.repositories,
+            providers=state.providers,
+        )
+        try:
+            content_rating = await service.classify_player_text(
+                save_id=submitted_save_id,
+                body=body,
+                current_user_id=actor_user_id,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        async with state.lock.async_access():
             try:
                 queued = service.queue_thread_text_send(
                     save_id=submitted_save_id,
                     thread_id=thread_id,
                     body=body,
+                    content_rating=content_rating,
                 )
             except ValueError as exc:
                 detail = str(exc)
@@ -1785,11 +1804,21 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 repositories=state.repositories,
                 providers=state.providers,
             )
+        try:
+            content_rating = await service.classify_player_text(
+                save_id=submitted_save_id,
+                body=payload.body,
+                current_user_id=actor_user_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        async with state.lock.async_access():
             try:
                 queued = service.queue_text_send(
                     save_id=submitted_save_id,
                     character_id=payload.character_id,
                     body=payload.body,
+                    content_rating=content_rating,
                 )
             except ValueError as exc:
                 detail = str(exc)
@@ -1963,18 +1992,27 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             except _CharacterReferenceUploadTooLarge as exc:
                 raise HTTPException(status_code=413, detail=str(exc)) from exc
             uploaded_filename = file.filename
-        async with state.lock.async_access():
-            from bragi.services.character_text_service import CharacterTextService
+        from bragi.services.character_text_service import CharacterTextService
 
-            service = CharacterTextService(
-                repositories=state.repositories,
-                providers=state.providers,
+        service = CharacterTextService(
+            repositories=state.repositories,
+            providers=state.providers,
+        )
+        try:
+            content_rating = await service.classify_player_text(
+                save_id=submitted_save_id,
+                body=body,
+                current_user_id=actor_user_id,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        async with state.lock.async_access():
             try:
                 queued = service.queue_text_send(
                     save_id=submitted_save_id,
                     character_id=character_id,
                     body=body,
+                    content_rating=content_rating,
                 )
             except ValueError as exc:
                 detail = str(exc)
@@ -2192,6 +2230,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     ),
                 )
             text_queue_key = _character_text_thread_job_key(selected.thread_id)
+            actor_user_id = _owner_user_id_for_request(state)
 
         async def worker(handle: JobHandle) -> Any:
             await handle.event("progress", {"label": "Saving text edit"})
@@ -2211,12 +2250,13 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             if selected_for_edit is None:
                 raise RuntimeError(
                     f"Unknown character text message id: {payload.text_message_id}"
-                )
+            )
             if selected_for_edit.sender == "character":
-                edit = service.correct_character_text(
+                edit = await service.correct_character_text_with_safety(
                     save_id=submitted_save_id,
                     text_message_id=payload.text_message_id,
                     body=payload.body,
+                    current_user_id=actor_user_id,
                 )
             else:
                 edit = service.edit_text_without_resubmit(
@@ -2489,7 +2529,13 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
     @app.get("/api/scenarios")
     def list_scenarios(state: StateDep) -> dict[str, Any]:
         with state.lock:
-            return {"scenarios": to_jsonable(state.runtime.list_saved_scenarios())}
+            list_saved_scenarios = state.runtime.list_saved_scenarios
+            kwargs: dict[str, Any] = {}
+            if _call_accepts_keyword(list_saved_scenarios, "current_user_id"):
+                kwargs["current_user_id"] = _owner_user_id_for_request(state)
+            return {
+                "scenarios": to_jsonable(list_saved_scenarios(**kwargs)),
+            }
 
     @app.get("/api/scenarios/{scenario_id}/definition")
     def get_scenario_definition(
@@ -2499,13 +2545,16 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         with state.lock:
             _raise_unless_scenario_supported(state, scenario_id)
             return _json_dict(
-                WorldDataService(state.repositories).build_scenario_definition_model(
-                    scenario_id
-                )
+                WorldDataService(
+                    state.repositories,
+                    allowed_content_rating=_content_safety_policy_for_request(
+                        state
+                    ).rating,
+                ).build_scenario_definition_model(scenario_id)
             )
 
     @app.post("/api/scenarios/{scenario_id}/definition")
-    def update_scenario_definition(
+    async def update_scenario_definition(
         scenario_id: str,
         payload: ScenarioDefinitionApplyRequest,
         state: StateDep,
@@ -2513,11 +2562,25 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         _require_admin_user()
         try:
             edit = _scenario_edit_from_json(payload.edit)
-            with state.lock:
+            async with state.lock.async_access():
                 _raise_unless_scenario_supported(state, scenario_id)
+                scenario = state.repositories.get_scenario(scenario_id)
+                if scenario is None:
+                    raise ValueError(f"Unknown scenario id: {scenario_id}")
+                actor_user_id = _owner_user_id_for_request(state)
+                edit = await _review_scenario_edit_for_request(
+                    state,
+                    edit,
+                    save_id=None,
+                    roleplay_type=scenario.type,
+                    current_user_id=actor_user_id,
+                )
                 return _json_dict(
                     WorldDataService(
                         state.repositories,
+                        allowed_content_rating=(
+                            _content_safety_policy_for_request(state).rating
+                        ),
                     ).apply_scenario_definition_edit(scenario_id, edit)
                 )
         except (TypeError, ValueError) as exc:
@@ -2535,6 +2598,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         _require_admin_user()
         async with state.lock.async_access():
             _raise_unless_scenario_supported(state, scenario_id)
+        _raise_unless_unrated_reference_upload(state)
         try:
             image_bytes = await _read_limited_character_reference_upload(file)
         except _CharacterReferenceUploadTooLarge as exc:
@@ -3306,10 +3370,14 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
 
         async def worker(handle: JobHandle) -> Any:
             await handle.event("progress", {"label": "Regenerating options"})
-            result = await state.runtime.regenerate_action_choices(
-                narrator_message_id=payload.message_id,
-                active_save_id=action_save_id,
-            )
+            regenerate = state.runtime.regenerate_action_choices
+            regenerate_kwargs: dict[str, object] = {
+                "narrator_message_id": payload.message_id,
+                "active_save_id": action_save_id,
+            }
+            if _call_accepts_keyword(regenerate, "current_user_id"):
+                regenerate_kwargs["current_user_id"] = _owner_user_id_for_request(state)
+            result = await regenerate(**regenerate_kwargs)
             error = _runtime_model_error(result)
             if error:
                 raise RuntimeError(error)
@@ -3838,6 +3906,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         resolved_save_id = _require_save_id(save_id)
         _raise_unless_save_action_allowed(state, resolved_save_id, "media")
+        _raise_unless_unrated_reference_upload(state)
         try:
             image_bytes = await _read_limited_character_reference_upload(file)
         except _CharacterReferenceUploadTooLarge as exc:
@@ -3923,6 +3992,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             )
         if asset is None:
             raise HTTPException(status_code=404, detail="Unknown media asset")
+        _raise_if_media_asset_exceeds_request_rating(
+            state,
+            asset,
+            save_id=resolved_save_id,
+        )
         if getattr(asset, "type", None) != "image":
             raise HTTPException(
                 status_code=400,
@@ -3940,16 +4014,18 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             )
         prompt = str(getattr(asset, "prompt", "") or "")
         if current_user is not None:
-            from bragi.services.content_rating import (
-                content_exceeds_rating,
-                effective_content_safety_policy,
-            )
+            from bragi.services.content_rating import effective_content_safety_policy
 
             policy = effective_content_safety_policy(
                 state.repositories,
                 user_id=current_user.id,
             )
-            if content_exceeds_rating(prompt, allowed_rating=policy.rating):
+            if _media_asset_exceeds_rating_for_request(
+                state,
+                asset,
+                save_id=resolved_save_id,
+                allowed_rating=policy.rating,
+            ):
                 raise HTTPException(
                     status_code=403,
                     detail="Media prompt exceeds your content rating",
@@ -3976,6 +4052,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             )
         if asset is None:
             raise HTTPException(status_code=404, detail="Unknown media asset")
+        _raise_if_media_asset_exceeds_request_rating(
+            state,
+            asset,
+            save_id=media_save_id,
+        )
         if getattr(asset, "type", None) != "image":
             raise HTTPException(
                 status_code=400,
@@ -4274,18 +4355,34 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             return _json_dict(_build_world_data_model_for_save(state, save_id))
 
     @app.post("/api/world-data/apply")
-    def apply_world_data(
+    async def apply_world_data(
         payload: WorldDataApplyRequest,
         state: StateDep,
     ) -> dict[str, Any]:
         try:
             edits = _world_data_edits_from_json(payload.edits)
-            with state.lock:
+            async with state.lock.async_access():
                 resolved_save_id = _require_save_id(payload.active_save_id)
                 _raise_unless_save_action_allowed(state, resolved_save_id, "mutate")
+                actor_user_id = _owner_user_id_for_request(state)
+                if edits.scenario is not None:
+                    details = state.repositories.load_save_details(resolved_save_id)
+                    if details is None:
+                        raise ValueError(f"Unknown save id: {resolved_save_id}")
+                    reviewed_scenario = await _review_scenario_edit_for_request(
+                        state,
+                        cast(ScenarioEdit, edits.scenario),
+                        save_id=resolved_save_id,
+                        roleplay_type=details.scenario.type,
+                        current_user_id=actor_user_id,
+                    )
+                    edits = replace(edits, scenario=reviewed_scenario)
                 result = WorldDataService(
                     state.repositories,
                     active_save_id=resolved_save_id,
+                    allowed_content_rating=(
+                        _content_safety_policy_for_request(state).rating
+                    ),
                 ).apply_edits(
                     edits,
                     active_save_id=payload.active_save_id
@@ -4554,6 +4651,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         resolved_save_id = _require_save_id(save_id)
         _raise_unless_save_action_allowed(state, resolved_save_id, "media")
+        _raise_unless_unrated_reference_upload(state)
         try:
             image_bytes = await _read_limited_character_reference_upload(file)
         except _CharacterReferenceUploadTooLarge as exc:
@@ -4667,7 +4765,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             raise HTTPException(status_code=status_code, detail=detail) from exc
 
     @app.post("/api/characters/apply")
-    def apply_characters(
+    async def apply_characters(
         payload: CharacterRegistryApplyRequest,
         state: StateDep,
     ) -> dict[str, Any]:
@@ -4678,9 +4776,15 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     for row in payload.edits.get("characters", ())
                 )
             )
-            with state.lock:
+            async with state.lock.async_access():
                 resolved_save_id = _require_save_id(payload.active_save_id)
                 _raise_unless_save_action_allowed(state, resolved_save_id, "mutate")
+                edits = await _review_character_edits_for_request(
+                    state,
+                    edits,
+                    save_id=resolved_save_id,
+                    current_user_id=_owner_user_id_for_request(state),
+                )
                 result = CharacterRegistryService(
                     state.repositories,
                     active_save_id=resolved_save_id,
@@ -4703,11 +4807,19 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     )
                     if callable(complete_agency):
                         try:
-                            auto_enhanced_count = int(
-                                complete_agency(
-                                    active_save_id=resolved_save_id,
-                                    character_ids=result.created_character_ids,
+                            completion_kwargs: dict[str, object] = {
+                                "active_save_id": resolved_save_id,
+                                "character_ids": result.created_character_ids,
+                            }
+                            if _call_accepts_keyword(
+                                complete_agency,
+                                "current_user_id",
+                            ):
+                                completion_kwargs["current_user_id"] = (
+                                    _owner_user_id_for_request(state)
                                 )
+                            auto_enhanced_count = int(
+                                complete_agency(**completion_kwargs)
                             )
                         except Exception:
                             observe(
@@ -4752,12 +4864,17 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 )
                 if not callable(enhance_field):
                     raise ValueError("Character enhancement model is unavailable")
-                result = enhance_field(
-                    active_save_id=resolved_save_id,
-                    character_id=character_id,
-                    field_name=payload.field_name,
-                    row=row,
-                )
+                enhance_kwargs: dict[str, object] = {
+                    "active_save_id": resolved_save_id,
+                    "character_id": character_id,
+                    "field_name": payload.field_name,
+                    "row": row,
+                }
+                if _call_accepts_keyword(enhance_field, "current_user_id"):
+                    enhance_kwargs["current_user_id"] = (
+                        _owner_user_id_for_request(state)
+                    )
+                result = enhance_field(**enhance_kwargs)
                 payload_dict = _json_dict(result)
             _publish_runtime_changed_from_model_result(
                 state,
@@ -4891,7 +5008,14 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 target_save_id=target_save_id,
             )
             _prune_character_bundle_previews(state)
-        return {"preview_id": preview_id, "preview": to_jsonable(preview)}
+        return {
+            "preview_id": preview_id,
+            "preview": await _review_bundle_preview_for_request(
+                state,
+                preview,
+                save_id=target_save_id,
+            ),
+        }
 
     @app.post("/api/character-bundles/import/{preview_id}")
     def import_character_bundle(
@@ -5143,12 +5267,15 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         with state.lock:
             if checked_save_id is not None:
                 _raise_unless_save_action_allowed(state, checked_save_id, "mutate")
-            state.settings_service().set_model_preference(
-                task=payload.task,
-                provider=payload.provider,
-                model_id=payload.model_id,
-                save_id=checked_save_id,
-            )
+            try:
+                state.settings_service().set_model_preference(
+                    task=payload.task,
+                    provider=payload.provider,
+                    model_id=payload.model_id,
+                    save_id=checked_save_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         if checked_save_id is not None:
             _publish_save_event(
                 state,
@@ -5375,7 +5502,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 owner_user_id=_owner_user_id_for_request(state),
             )
             _prune_bundle_previews(state)
-        return {"preview_id": preview_id, "preview": to_jsonable(preview)}
+        return {
+            "preview_id": preview_id,
+            "preview": await _review_bundle_preview_for_request(state, preview),
+        }
 
     @app.post("/api/bundles/import/{preview_id}")
     def import_bundle(preview_id: str, state: StateDep) -> dict[str, Any]:
@@ -5456,7 +5586,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 owner_user_id=_owner_user_id_for_request(state),
             )
             _prune_scenario_bundle_previews(state)
-        return {"preview_id": preview_id, "preview": to_jsonable(preview)}
+        return {
+            "preview_id": preview_id,
+            "preview": await _review_bundle_preview_for_request(state, preview),
+        }
 
     @app.post("/api/scenario-bundles/import/{preview_id}")
     def import_scenario_bundle(
@@ -5872,6 +6005,18 @@ def _content_safety_policy_for_request(
     )
 
 
+def _raise_unless_unrated_reference_upload(state: WebAppState) -> None:
+    if _content_safety_policy_for_request(state).rating == "unrated":
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Uploaded images cannot be safety-reviewed. Set the content rating "
+            "to Unrated before uploading a reference image."
+        ),
+    )
+
+
 def _owner_user_id_for_request(state: WebAppState) -> str | None:
     user = _save_access_user(state)
     return user.id if user is not None else None
@@ -5953,6 +6098,76 @@ def _request_owns_bundle_preview(
     return user is not None and preview.owner_user_id == user.id
 
 
+async def _review_bundle_preview_for_request(
+    state: WebAppState,
+    preview: object,
+    *,
+    save_id: str | None = None,
+) -> object:
+    serialized = to_jsonable(preview)
+    if not callable(
+        getattr(state.repositories, "get_effective_setting", None)
+    ):
+        return serialized
+    from bragi.services.content_rating import effective_content_safety_policy
+    from bragi.services.content_safety_service import (
+        ContentSafetyAction,
+        ContentSafetyService,
+    )
+
+    policy = effective_content_safety_policy(
+        state.repositories,
+        user_id=_owner_user_id_for_request(state),
+    )
+    safety = await ContentSafetyService(
+        repositories=state.repositories,
+        providers=state.providers,
+    ).review_narration(
+        body=json.dumps(serialized, ensure_ascii=False, sort_keys=True),
+        content_rating=policy.rating,
+        fade_to_black_enabled=policy.fade_to_black_enabled,
+        save_id=save_id,
+    )
+    if safety.action is ContentSafetyAction.ALLOW:
+        return serialized
+    return _replace_untrusted_preview_text(serialized, safety.body)
+
+
+def _replace_untrusted_preview_text(
+    value: object,
+    replacement: str,
+    *,
+    key: str = "",
+) -> object:
+    structural_keys = {
+        "save_id",
+        "scenario_id",
+        "character_id",
+        "scenario_type",
+        "bundle_version",
+        "created_at",
+        "updated_at",
+        "exported_at",
+    }
+    if isinstance(value, str):
+        return value if key in structural_keys else replacement
+    if isinstance(value, list):
+        return [
+            _replace_untrusted_preview_text(item, replacement, key=key)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            item_key: _replace_untrusted_preview_text(
+                item,
+                replacement,
+                key=str(item_key),
+            )
+            for item_key, item in value.items()
+        }
+    return value
+
+
 def _require_owned_bundle_preview(
     state: WebAppState,
     previews: dict[str, BundlePreviewState],
@@ -5998,20 +6213,39 @@ def _save_list_json_for_request(
     active_save_id: object = None,
     current_user: UserRecord | None | object = _CURRENT_USER_SENTINEL,
 ) -> list[dict[str, object]]:
+    from bragi.services.sexual_content_safety import CONTENT_FILTER_TRANSITION
+
     rows: list[dict[str, object]] = []
+    allowed_rating = _content_safety_policy_for_request(
+        state,
+        current_user=current_user,
+    ).rating
     for save in _save_list_for_runtime_payload(
         state,
         current_user=current_user,
     ):
-        supported = not _scenario_is_retired(_active_scenario(state, save.id))
+        scenario = _active_scenario(state, save.id)
+        supported = not _scenario_is_retired(scenario)
+        restricted = _scenario_exceeds_rating(
+            scenario,
+            allowed_rating=allowed_rating,
+        )
         rows.append(
             {
             "save_id": save.id,
-            "title": getattr(save, "title", save.id),
+            "title": (
+                CONTENT_FILTER_TRANSITION
+                if restricted
+                else getattr(save, "title", save.id)
+            ),
             "active": isinstance(active_save_id, str)
             and save.id == active_save_id,
             "scenario_id": getattr(save, "scenario_id", None),
-            "scenario_title": getattr(save, "scenario_title", None),
+            "scenario_title": (
+                CONTENT_FILTER_TRANSITION
+                if restricted
+                else getattr(save, "scenario_title", None)
+            ),
             "created_at": getattr(save, "created_at", None),
             "updated_at": getattr(save, "updated_at", None),
             "last_opened_at": getattr(save, "last_opened_at", None),
@@ -6022,6 +6256,25 @@ def _save_list_json_for_request(
             }
         )
     return rows
+
+
+def _scenario_exceeds_rating(
+    scenario: object | None,
+    *,
+    allowed_rating: str,
+) -> bool:
+    if scenario is None:
+        return False
+    content_json = getattr(scenario, "content_json", None)
+    if not isinstance(content_json, str):
+        return True
+    from bragi.content_rating_instructions import content_rating_exceeds
+    from bragi.services.scenario_content_rating import scenario_content_rating
+
+    return content_rating_exceeds(
+        minimum_rating=scenario_content_rating(content_json),
+        allowed_rating=allowed_rating,
+    )
 
 
 def _request_user_can_access_save(state: WebAppState, save_id: str) -> bool:
@@ -6953,6 +7206,24 @@ def _runtime_json_dict(
         state,
         payload.get("active_save_id"),
     )
+    content_safety = _content_safety_policy_for_request(
+        state,
+        current_user=current_user,
+    )
+    if _scenario_exceeds_rating(
+        _active_scenario(state, payload.get("active_save_id")),
+        allowed_rating=content_safety.rating,
+    ):
+        from bragi.services.sexual_content_safety import CONTENT_FILTER_TRANSITION
+
+        for key in (
+            "active_save_title",
+            "scenario_title",
+            "scene_title",
+            "custom_instructions",
+        ):
+            if isinstance(payload.get(key), str) and payload[key]:
+                payload[key] = CONTENT_FILTER_TRANSITION
     if scrub_for_request:
         _scrub_response_payload_for_request(
             state,
@@ -7351,6 +7622,7 @@ def _build_world_data_model_for_save(
     return WorldDataService(
         state.repositories,
         active_save_id=builder_save_id,
+        allowed_content_rating=_content_safety_policy_for_request(state).rating,
     ).build_model(active_save_id=builder_save_id if builder_save_id else ...)
 
 
@@ -7363,6 +7635,7 @@ def _build_character_registry_model_for_save(
     return CharacterRegistryService(
         state.repositories,
         active_save_id=builder_save_id,
+        allowed_content_rating=_content_safety_policy_for_request(state).rating,
     ).build_model(active_save_id=builder_save_id if builder_save_id else ...)
 
 
@@ -7559,6 +7832,10 @@ def _scrub_response_payload_for_role(
             current_user_role=current_user_role,
             content_safety=content_safety,
         )
+        _scrub_character_payload_for_rating(
+            payload,
+            allowed_rating=content_safety.rating,
+        )
         for value in payload.values():
             _scrub_response_payload_for_role(
                 value,
@@ -7600,23 +7877,25 @@ def _scrub_message_payload_for_role(
             payload.pop("debug_provider_payload", None)
     elif _looks_like_character_text_message(payload):
         blocked_action_ids = _blocked_character_text_action_ids(current_user_role)
+    elif _looks_like_action_choice(payload):
+        blocked_action_ids = frozenset()
     else:
         return
     body = payload.get("body")
-    if isinstance(body, str):
+    minimum_rating = payload.get("content_rating")
+    if isinstance(body, str) and isinstance(minimum_rating, str):
         from bragi.application.chronicle import parse_message_markdown
-        from bragi.services.sexual_content_safety import sanitize_narrator_body
+        from bragi.content_rating_instructions import content_rating_exceeds
+        from bragi.services.sexual_content_safety import CONTENT_FILTER_TRANSITION
 
-        safety = sanitize_narrator_body(
-            body,
-            content_rating=content_safety.rating,
-            fade_to_black_enabled=content_safety.fade_to_black_enabled,
-        )
-        if safety.transition_applied:
-            payload["body"] = safety.body
+        if content_rating_exceeds(
+            minimum_rating=minimum_rating,
+            allowed_rating=content_safety.rating,
+        ):
+            payload["body"] = CONTENT_FILTER_TRANSITION
             if "markdown_blocks" in payload:
                 payload["markdown_blocks"] = to_jsonable(
-                    parse_message_markdown(safety.body)
+                    parse_message_markdown(CONTENT_FILTER_TRANSITION)
                 )
             payload["actions"] = []
             payload.pop("debug_prompt", None)
@@ -7641,23 +7920,70 @@ def _scrub_latest_message_preview(
     content_safety: ContentSafetyPolicy,
 ) -> None:
     body = payload.get("latest_message_body")
-    if not isinstance(body, str):
+    minimum_rating = payload.get("latest_message_content_rating")
+    if not isinstance(body, str) or not isinstance(minimum_rating, str):
         return
     from bragi.application.chronicle import parse_message_markdown
-    from bragi.services.sexual_content_safety import sanitize_narrator_body
+    from bragi.content_rating_instructions import content_rating_exceeds
+    from bragi.services.sexual_content_safety import CONTENT_FILTER_TRANSITION
 
-    safety = sanitize_narrator_body(
-        body,
-        content_rating=content_safety.rating,
-        fade_to_black_enabled=content_safety.fade_to_black_enabled,
-    )
-    if not safety.transition_applied:
+    if not content_rating_exceeds(
+        minimum_rating=minimum_rating,
+        allowed_rating=content_safety.rating,
+    ):
         return
-    payload["latest_message_body"] = safety.body
+    payload["latest_message_body"] = CONTENT_FILTER_TRANSITION
     if "latest_message_markdown_blocks" in payload:
         payload["latest_message_markdown_blocks"] = to_jsonable(
-            parse_message_markdown(safety.body)
+            parse_message_markdown(CONTENT_FILTER_TRANSITION)
         )
+
+
+def _scrub_character_payload_for_rating(
+    payload: dict[str, Any],
+    *,
+    allowed_rating: str,
+) -> None:
+    if not (
+        isinstance(payload.get("character_id"), str)
+        and isinstance(payload.get("content_rating"), str)
+        and "relationships_json" in payload
+    ):
+        return
+    from bragi.content_rating_instructions import content_rating_exceeds
+    from bragi.services.sexual_content_safety import CONTENT_FILTER_TRANSITION
+
+    if not content_rating_exceeds(
+        minimum_rating=payload["content_rating"],
+        allowed_rating=allowed_rating,
+    ):
+        return
+    for key in (
+        "name",
+        "aliases_text",
+        "role",
+        "age",
+        "known_state",
+        "history",
+        "appearance",
+        "visual_notes",
+        "current_clothing",
+        "personality",
+        "voice",
+        "texting_style",
+        "goals",
+        "motivations",
+        "current_intent",
+        "boundaries",
+        "attitude_toward_player",
+        "cooperation_conditions",
+        "status",
+        "private_notes",
+        "contact_name",
+    ):
+        if isinstance(payload.get(key), str) and payload[key]:
+            payload[key] = CONTENT_FILTER_TRANSITION
+    payload["relationships_json"] = "{}"
 
 
 def _scrub_nested_media_references(
@@ -7768,15 +8094,21 @@ def _serialized_media_exceeds_rating(
     *,
     allowed_rating: str,
 ) -> bool:
-    from bragi.services.content_rating import content_exceeds_rating
+    from bragi.content_rating_instructions import content_rating_exceeds
 
-    for key in ("prompt", "prompt_preview", "source_message"):
-        value = payload.get(key)
-        if isinstance(value, str) and content_exceeds_rating(
-            value,
-            allowed_rating=allowed_rating,
-        ):
-            return True
+    metadata = payload.get("metadata")
+    minimum_rating = payload.get("content_rating")
+    if not isinstance(minimum_rating, str):
+        minimum_rating = (
+        metadata.get("content_rating", "unclassified")
+        if isinstance(metadata, dict)
+        else "unclassified"
+        )
+    if content_rating_exceeds(
+        minimum_rating=str(minimum_rating),
+        allowed_rating=allowed_rating,
+    ):
+        return True
     source_media = payload.get("source_media")
     return isinstance(source_media, dict) and _serialized_media_exceeds_rating(
         source_media,
@@ -7788,6 +8120,13 @@ def _looks_like_chronicle_message(payload: dict[str, Any]) -> bool:
     return (
         isinstance(payload.get("message_id"), str)
         and isinstance(payload.get("role"), str)
+    )
+
+
+def _looks_like_action_choice(payload: dict[str, Any]) -> bool:
+    return (
+        isinstance(payload.get("choice_id"), str)
+        and isinstance(payload.get("ordinal"), int)
     )
 
 
@@ -7823,6 +8162,7 @@ def _character_registry_json_or_raise(
     model = CharacterRegistryService(
         state.repositories,
         active_save_id=save_id,
+        allowed_content_rating=_content_safety_policy_for_request(state).rating,
     ).build_model(active_save_id=save_id)
     payload = _json_dict(model)
     error = payload.get("error")
@@ -8823,6 +9163,265 @@ def _raise_for_initial_chat_turn_failure(
     raise RuntimeError(failure_message)
 
 
+async def _review_scenario_edit_for_request(
+    state: WebAppState,
+    edit: ScenarioEdit,
+    *,
+    save_id: str | None,
+    roleplay_type: str,
+    current_user_id: str | None,
+) -> ScenarioEdit:
+    from bragi.content_rating_instructions import maximum_content_rating
+    from bragi.services.character_profile_completion import (
+        ScenarioCharacterStarter,
+    )
+    from bragi.services.content_rating import effective_content_safety_policy
+    from bragi.services.content_safety_service import (
+        ContentSafetyAction,
+        ContentSafetyService,
+    )
+
+    policy = effective_content_safety_policy(
+        state.repositories,
+        user_id=current_user_id,
+    )
+    service = ContentSafetyService(
+        repositories=state.repositories,
+        providers=state.providers,
+    )
+    ratings: dict[str, str] = {}
+
+    async def review(section_id: str, body: str) -> str:
+        if not body.strip():
+            ratings[section_id] = (
+                "unrated" if policy.rating == "unrated" else "g"
+            )
+            return body
+        safety = await service.review_narration(
+            body=body,
+            content_rating=policy.rating,
+            fade_to_black_enabled=policy.fade_to_black_enabled,
+            save_id=save_id,
+            roleplay_type=roleplay_type,
+        )
+        ratings[section_id] = safety.reviewed_content_rating
+        return safety.body
+
+    content = dict(edit.content)
+    for section_id, value in tuple(content.items()):
+        if isinstance(value, str):
+            content[section_id] = await review(section_id, value)
+    reviewed_starters: list[ScenarioCharacterStarter] = []
+    for starter in edit.character_starters:
+        semantic_content = {
+            field.name: getattr(starter, field.name)
+            for field in fields(starter)
+            if field.name
+            not in {
+                "starter_id",
+                "locked_fields",
+                "evidence_source_ids",
+                "reference_image",
+                "met",
+            }
+        }
+        if starter.reference_image is not None:
+            semantic_content["reference_image_prompt"] = (
+                starter.reference_image.prompt_preview
+            )
+        safety = await service.review_narration(
+            body=json.dumps(
+                semantic_content,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            content_rating=policy.rating,
+            fade_to_black_enabled=policy.fade_to_black_enabled,
+            save_id=save_id,
+            roleplay_type=roleplay_type,
+        )
+        ratings["character_starters"] = maximum_content_rating(
+            (
+                ratings.get("character_starters", "g"),
+                safety.reviewed_content_rating,
+            )
+        )
+        reviewed_starters.append(
+            starter
+            if safety.action is ContentSafetyAction.ALLOW
+            else _scenario_starter_with_safe_transition(
+                starter,
+                safety.body,
+            )
+        )
+    return replace(
+        edit,
+        title=await review("title", edit.title),
+        premise=await review("premise", edit.premise),
+        player_character_name=await review(
+            "player_character_name",
+            edit.player_character_name,
+        ),
+        player_role=await review("player_role", edit.player_role),
+        content=content,
+        character_starters=tuple(reviewed_starters),
+        section_content_ratings=tuple(sorted(ratings.items())),
+    )
+
+
+async def _review_character_edits_for_request(
+    state: WebAppState,
+    edits: CharacterRegistryEdits,
+    *,
+    save_id: str,
+    current_user_id: str | None,
+) -> CharacterRegistryEdits:
+    from bragi.services.content_rating import effective_content_safety_policy
+    from bragi.services.content_safety_service import (
+        ContentSafetyAction,
+        ContentSafetyService,
+    )
+
+    policy = effective_content_safety_policy(
+        state.repositories,
+        user_id=current_user_id,
+    )
+    service = ContentSafetyService(
+        repositories=state.repositories,
+        providers=state.providers,
+    )
+    reviewed_rows: list[CharacterRegistryRow] = []
+    for row in edits.characters:
+        existing = (
+            state.repositories.get_character(row.character_id)
+            if row.character_id
+            else None
+        )
+        if row.archived or row.merge_into_character_id is not None:
+            reviewed_rows.append(
+                replace(
+                    row,
+                    content_rating=(
+                        existing.content_rating
+                        if existing is not None
+                        else "unclassified"
+                    ),
+                )
+            )
+            continue
+        semantic_content = {
+            key: getattr(row, key)
+            for key in (
+                "name",
+                "aliases_text",
+                "role",
+                "age",
+                "known_state",
+                "history",
+                "appearance",
+                "visual_notes",
+                "current_clothing",
+                "personality",
+                "voice",
+                "texting_style",
+                "relationships_json",
+                "goals",
+                "motivations",
+                "current_intent",
+                "boundaries",
+                "attitude_toward_player",
+                "cooperation_conditions",
+                "status",
+                "private_notes",
+                "contact_name",
+            )
+        }
+        safety = await service.review_narration(
+            body=json.dumps(semantic_content, ensure_ascii=False, sort_keys=True),
+            content_rating=policy.rating,
+            fade_to_black_enabled=policy.fade_to_black_enabled,
+            save_id=save_id,
+        )
+        reviewed_rows.append(
+            replace(row, content_rating=safety.reviewed_content_rating)
+            if safety.action is ContentSafetyAction.ALLOW
+            else _character_row_with_safe_transition(
+                row,
+                replacement=safety.body,
+                content_rating=safety.reviewed_content_rating,
+            )
+        )
+    return CharacterRegistryEdits(characters=tuple(reviewed_rows))
+
+
+def _character_row_with_safe_transition(
+    row: CharacterRegistryRow,
+    *,
+    replacement: str,
+    content_rating: str,
+) -> CharacterRegistryRow:
+    updates: dict[str, object] = {
+        key: replacement if getattr(row, key) else ""
+        for key in (
+            "name",
+            "aliases_text",
+            "role",
+            "age",
+            "known_state",
+            "history",
+            "appearance",
+            "visual_notes",
+            "current_clothing",
+            "personality",
+            "voice",
+            "texting_style",
+            "goals",
+            "motivations",
+            "current_intent",
+            "boundaries",
+            "attitude_toward_player",
+            "cooperation_conditions",
+            "status",
+            "private_notes",
+            "contact_name",
+        )
+    }
+    updates["relationships_json"] = "{}"
+    updates["content_rating"] = content_rating
+    return replace(row, **updates)  # type: ignore[arg-type]
+
+
+def _scenario_starter_with_safe_transition(
+    starter: Any,
+    replacement: str,
+) -> Any:
+    string_fields = (
+        "name",
+        "role",
+        "age",
+        "known_state",
+        "appearance",
+        "visual_notes",
+        "personality",
+        "voice",
+        "texting_style",
+        "goals",
+        "motivations",
+        "current_intent",
+        "boundaries",
+        "attitude_toward_player",
+        "cooperation_conditions",
+        "status",
+    )
+    updates: dict[str, object] = {
+        field_name: replacement if getattr(starter, field_name, "") else ""
+        for field_name in string_fields
+    }
+    updates["aliases"] = ()
+    updates["relationships"] = {}
+    return replace(starter, **updates)
+
+
 def _world_data_edits_from_json(payload: dict[str, Any]) -> WorldDataEdits:
     return WorldDataEdits(
         scenario=_scenario_edit_from_json(payload["scenario"])
@@ -9735,52 +10334,62 @@ def _media_asset_exceeds_rating_for_request(
     *,
     save_id: str,
     allowed_rating: str,
-    visited_asset_ids: frozenset[str] = frozenset(),
 ) -> bool:
-    from bragi.services.content_rating import content_exceeds_rating
+    from bragi.services.media_content_rating import media_asset_exceeds_rating
 
-    prompt = getattr(asset, "prompt", "")
-    if isinstance(prompt, str) and content_exceeds_rating(
-        prompt,
-        allowed_rating=allowed_rating,
-    ):
-        return True
-    source_message_id = getattr(asset, "source_message_id", None)
-    get_message = getattr(state.repositories, "get_message", None)
-    if isinstance(source_message_id, str) and callable(get_message):
-        source_message = get_message(
-            save_id=save_id,
-            message_id=source_message_id,
-        )
-        body = getattr(source_message, "body", "")
-        if isinstance(body, str) and content_exceeds_rating(
-            body,
-            allowed_rating=allowed_rating,
-        ):
-            return True
-    source_asset_id = getattr(asset, "source_media_asset_id", None)
-    asset_id = getattr(asset, "id", None)
-    if (
-        not isinstance(source_asset_id, str)
-        or source_asset_id in visited_asset_ids
-    ):
-        return False
-    source_asset = _find_media_asset_unlocked(
-        state,
-        source_asset_id,
-        save_id=save_id,
+    list_media_assets = getattr(state.repositories, "list_media_assets", None)
+    media_assets = (
+        list(list_media_assets(save_id))
+        if callable(list_media_assets)
+        else [asset]
     )
-    if source_asset is None:
-        return False
-    next_visited = visited_asset_ids
-    if isinstance(asset_id, str):
-        next_visited = next_visited | {asset_id}
-    return _media_asset_exceeds_rating_for_request(
-        state,
-        source_asset,
-        save_id=save_id,
+    asset_id = getattr(asset, "id", None)
+    if isinstance(asset_id, str) and all(
+        getattr(candidate, "id", None) != asset_id
+        for candidate in media_assets
+    ):
+        media_assets.append(asset)
+    list_messages = getattr(state.repositories, "list_messages", None)
+    messages = list(list_messages(save_id)) if callable(list_messages) else []
+    list_character_text_messages = getattr(
+        state.repositories,
+        "list_character_text_messages",
+        None,
+    )
+    character_text_messages = (
+        list(list_character_text_messages(save_id=save_id))
+        if callable(list_character_text_messages)
+        else []
+    )
+    list_characters = getattr(state.repositories, "list_characters", None)
+    characters = (
+        list(list_characters(save_id))
+        if callable(list_characters)
+        else []
+    )
+    return media_asset_exceeds_rating(
+        asset,
         allowed_rating=allowed_rating,
-        visited_asset_ids=next_visited,
+        media_assets_by_id={
+            str(candidate_id): candidate
+            for candidate in media_assets
+            if isinstance(candidate_id := getattr(candidate, "id", None), str)
+        },
+        source_messages={
+            str(message_id): message
+            for message in messages
+            if isinstance(message_id := getattr(message, "id", None), str)
+        },
+        character_text_messages={
+            str(message_id): message
+            for message in character_text_messages
+            if isinstance(message_id := getattr(message, "id", None), str)
+        },
+        characters={
+            str(character_id): character
+            for character in characters
+            if isinstance(character_id := getattr(character, "id", None), str)
+        },
     )
 
 
@@ -9832,6 +10441,18 @@ def _scenario_starter_reference_image_unlocked(
         reference = starter.get("reference_image")
         if not isinstance(reference, dict) or reference.get("id") != image_id:
             continue
+        from bragi.content_rating_instructions import content_rating_exceeds
+
+        if content_rating_exceeds(
+            minimum_rating=str(
+                reference.get("content_rating", "unclassified")
+            ),
+            allowed_rating=_content_safety_policy_for_request(state).rating,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Starter reference image exceeds your content rating",
+            )
         mime_type = reference.get("mime_type")
         relative_path = reference.get("path")
         using_thumbnail = False

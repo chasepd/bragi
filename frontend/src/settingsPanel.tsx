@@ -124,7 +124,6 @@ import {
   pendingJobsDisplayModeLabel,
   postTurnInferenceModeLabel,
   PreviewModal,
-  runtimeQueryKey,
   SAVE_SCOPED_SETTING_KEYS,
   SegmentedTabs,
   selectedOption,
@@ -261,11 +260,13 @@ function tabUsesFullSettings(tab: SettingsTab): boolean {
 export function SettingsPanel({
   runJob,
   activeSaveId = null,
-  currentUser = null
+  currentUser = null,
+  onContentSafetyChanged
 }: {
   runJob: RunJob;
   activeSaveId?: string | null;
   currentUser?: CurrentUser | null;
+  onContentSafetyChanged?: () => void;
 }) {
   const [tab, setTab] = useState<SettingsTab>("providers");
   const isAdmin = currentUser?.role === "admin";
@@ -329,13 +330,17 @@ export function SettingsPanel({
       if (save_id) payload.save_id = save_id;
       return postJson("/api/settings/scoped", payload);
     },
-    onSuccess: (_data, variables) => {
+    onSuccess: async (_data, variables) => {
       if (SAVE_SCOPED_SETTING_KEYS.has(variables.key)) {
         client.invalidateQueries({ queryKey: ["settings", "full"] });
         client.invalidateQueries({ queryKey: ["runtime"] });
       } else if (LOCAL_SETTING_KEYS.has(variables.key)) {
         client.invalidateQueries({ queryKey: ["settings", "local"] });
         client.invalidateQueries({ queryKey: ["settings", "shell"] });
+        if (variables.key === "content_filter_rating") {
+          onContentSafetyChanged?.();
+          await client.resetQueries();
+        }
       } else {
         client.invalidateQueries({ queryKey: ["settings", "full"] });
       }
@@ -2484,6 +2489,7 @@ function SaveModelOverrideSettings({ settings, activeSaveId }: { settings: Setti
 
 function LocalSettingsControls({ settings, updateLocal, disabled }: { settings?: LocalSettingsModel; updateLocal: (key: string, value: unknown) => void; disabled: boolean }) {
   if (!settings) return null;
+  const unrated = settings.content_rating?.selected === "unrated";
   return (
     <div className="settings-stack">
       <section className="settings-subsection">
@@ -2495,7 +2501,8 @@ function LocalSettingsControls({ settings, updateLocal, disabled }: { settings?:
         <section className="settings-subsection">
           <h3>Content Safety</h3>
           {settings.content_rating ? <ChoiceSetting control={settings.content_rating} disabled={disabled} updateLocal={updateLocal} optionLabel={contentRatingLabel} /> : null}
-          {settings.fade_to_black ? <ToggleSetting control={settings.fade_to_black} disabled={disabled} updateLocal={updateLocal} /> : null}
+          {settings.fade_to_black ? <ToggleSetting control={settings.fade_to_black} disabled={disabled || unrated} updateLocal={updateLocal} /> : null}
+          {unrated ? <p className="muted">Unrated skips Safety Agent review and never triggers fade-to-black.</p> : null}
         </section>
       ) : null}
       {settings.debug_logging ? (

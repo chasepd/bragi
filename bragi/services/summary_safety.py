@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from re import sub
 
 from bragi.persistence.models import MessageRecord, SummaryRecord
-from bragi.services.sexual_content_safety import classify_sexual_content
 
 _DIRECT_PROMPT_PATTERN = re.compile(
     r"\b(?:what do you|what will you|how do you|do you|will you|can you|"
@@ -82,11 +81,6 @@ def validate_summary_output(
     text = _compact_text(body)
     if not text:
         return SummaryValidationResult(False, "summary is empty")
-    if classify_sexual_content(text).value != "acceptable_romance":
-        return SummaryValidationResult(
-            False,
-            "summary rejected because sexual detail must remain off-screen",
-        )
     if _looks_like_direct_prompt(text):
         return SummaryValidationResult(
             False,

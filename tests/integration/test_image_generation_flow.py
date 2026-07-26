@@ -15,6 +15,8 @@ from bragi.providers.contracts import (
     ProviderCapability,
     ProviderConfigStatus,
     ProviderModel,
+    StructuredOutputRequest,
+    StructuredOutputResponse,
 )
 from bragi.services.media_service import MediaService
 
@@ -46,7 +48,12 @@ class FakeImageProvider:
                 provider=self.provider_name,
                 model_id="fake-chat",
                 display_name="Fake Chat",
-                capabilities=frozenset({ProviderCapability.CHAT}),
+                capabilities=frozenset(
+                    {
+                        ProviderCapability.CHAT,
+                        ProviderCapability.STRUCTURED_OUTPUT,
+                    }
+                ),
                 context_window=8192,
             ),
             ProviderModel(
@@ -64,6 +71,23 @@ class FakeImageProvider:
             provider=request.provider,
             model_id=request.model_id,
             token_usage={"total": 11},
+        )
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        if request.schema_name != "content_safety_review":
+            raise AssertionError(f"unexpected structured schema: {request.schema_name}")
+        return StructuredOutputResponse(
+            data={
+                "action": "allow",
+                "category": "none",
+                "reason": "Integration fixture content is within the ceiling.",
+                "minimum_rating": "g",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
         )
 
     async def generate_image(self, request: ImageRequest) -> ImageResponse:
@@ -175,8 +199,10 @@ def test_fake_provider_image_generation_flow_persists_file_metadata_and_ui_model
         assert asset.model == "fake-image"
         assert len(provider.chat_requests) == 1
         assert len(provider.image_requests) == 1
-        assert provider.image_requests[0].prompt == "cinematic drafted image prompt"
-        assert asset.prompt == "cinematic drafted image prompt"
+        generated_prompt = provider.image_requests[0].prompt
+        assert generated_prompt.startswith("cinematic drafted image prompt\n\n")
+        assert "Style preset: Realistic." in generated_prompt
+        assert asset.prompt == generated_prompt
         assert latest is not None
         assert latest.path == asset.path
         assert latest.thumbnail_path == asset.thumbnail_path

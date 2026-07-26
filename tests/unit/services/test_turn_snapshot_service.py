@@ -191,8 +191,6 @@ def test_snapshot_restore_preserves_unrated_narration_without_resanitizing(
         role="narrator",
         speaker_name="Narrator",
         body=adult_body,
-        content_rating="unrated",
-        fade_to_black_enabled=False,
     )
     snapshot = service.capture_message_snapshot(
         save_id=save.id,
@@ -1031,6 +1029,28 @@ def test_export_import_preserves_snapshot_backed_fork(
         value={"color": "red"},
         source_message_id=first.id,
     )
+    repositories.add_save_scenario_update(
+        save_id=save.id,
+        title="Red Lens",
+        premise="The beacon lens turns red.",
+        player_role="Signal warden",
+        content={
+            "character_starters": [
+                {
+                    "name": "Mara",
+                    "reference_image": {
+                        "media_asset_id": "starter-reference",
+                        "content_rating": "r",
+                    },
+                }
+            ],
+            "_source": {"content_rating": "r"},
+        },
+        reason="Snapshot rating quarantine fixture.",
+        provider="fake",
+        model="fake-chat",
+        source_message_id=first.id,
+    )
     service.capture_message_snapshot(save_id=save.id, message_id=first.id)
     second = repositories.append_message(
         save_id=save.id,
@@ -1073,6 +1093,12 @@ def test_export_import_preserves_snapshot_backed_fork(
     fork_messages = repositories.list_messages(fork.save.id)
     assert [message.body for message in fork_messages] == ["I set the lens red."]
     assert repositories.list_world_state(fork.save.id)[0].value == {"color": "red"}
+    [fork_update] = repositories.list_save_scenario_updates(fork.save.id)
+    fork_content = json.loads(fork_update.content_json)
+    assert fork_content["_source"]["content_rating"] == "unclassified"
+    assert fork_content["character_starters"][0]["reference_image"][
+        "content_rating"
+    ] == "unclassified"
 
 
 def test_export_import_preserves_snapshot_only_media_for_fork(

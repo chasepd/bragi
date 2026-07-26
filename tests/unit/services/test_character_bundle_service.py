@@ -91,6 +91,7 @@ def test_export_character_writes_profile_manifest_and_reference_media(
         "contact_name": "",
         "first_seen_message_id": None,
         "last_updated_message_id": None,
+        "content_rating": "unclassified",
         "created_at": data["character"]["created_at"],
         "updated_at": data["character"]["updated_at"],
         "reference_image_asset_id": REFERENCE_ASSET_ID,

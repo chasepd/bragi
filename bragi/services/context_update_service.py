@@ -11,6 +11,7 @@ from time import perf_counter
 from typing import Any, Protocol, cast
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
+from bragi.content_rating_instructions import maximum_content_rating
 from bragi.persistence.models import (
     ActiveThreadRecord,
     CharacterRecord,
@@ -4344,6 +4345,15 @@ class _ContextUpdateApplier:
         return location
 
     def _apply_character(self, extracted: ExtractedCharacter) -> CharacterRecord:
+        source_message = self.repositories.get_message(
+            save_id=self.save_id,
+            message_id=extracted.source_message_id,
+        )
+        source_content_rating = (
+            source_message.content_rating
+            if source_message is not None
+            else "unclassified"
+        )
         resolution = _resolve_character(
             self.snapshot.characters,
             extracted.name,
@@ -4380,6 +4390,7 @@ class _ContextUpdateApplier:
                 location_id=location_id,
                 private_notes=extracted.private_notes.strip(),
                 source_message_id=extracted.source_message_id,
+                content_rating=source_content_rating,
             )
             self._record_applied(
                 operation="created",
@@ -4440,6 +4451,13 @@ class _ContextUpdateApplier:
                 confidence=extracted.confidence,
                 source_message_id=extracted.source_message_id,
                 update=self.repositories.update_character,
+            )
+        combined_rating = maximum_content_rating(
+            (character.content_rating, source_content_rating)
+        )
+        if combined_rating != character.content_rating:
+            character = self.repositories.update_character(
+                replace(character, content_rating=combined_rating)
             )
         self._append_character(character)
         self.snapshot.upsert_character(character)

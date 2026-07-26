@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import Any, cast
 
 from bragi.app_logging import log_error_event, log_event
+from bragi.content_rating_instructions import (
+    CONTENT_RATING_UNCLASSIFIED,
+    content_rating_exceeds,
+    maximum_content_rating,
+)
 from bragi.persistence.models import (
     ActiveThreadRecord,
     CharacterKnowledgeEdgeRecord,
@@ -18,6 +24,7 @@ from bragi.persistence.models import (
     EntityLinkRecord,
     LocationRecord,
     MemoryRecord,
+    MessageRecord,
     MessageVisibilityRecord,
     SaveRecord,
     ScenarioRecord,
@@ -32,7 +39,12 @@ from bragi.services.character_profile_completion import (
     normalize_scenario_character_starters,
     scenario_character_starter_to_json,
 )
+from bragi.services.scenario_content_rating import (
+    metadata_with_scenario_content_ratings,
+    scenario_content_rating,
+)
 from bragi.services.scenario_service import normalize_scenario_definition
+from bragi.services.sexual_content_safety import CONTENT_FILTER_TRANSITION
 from bragi.services.state_preservation import preserve_replaced_world_state_memory
 from bragi.world_time_model import canonical_world_time_from_legacy
 
@@ -198,6 +210,7 @@ class WorldDataCharacterRow:
     locked_fields: tuple[str, ...] = ()
     protected_from_maintenance: bool = False
     is_player_character: bool = False
+    content_rating: str = "unclassified"
     history: str = ""
 
     @property
@@ -452,6 +465,7 @@ class WorldDataScenarioEdit:
     content_sections: tuple[tuple[str, str], ...]
     player_character_name: str = ""
     character_starters: tuple[ScenarioCharacterStarter, ...] = ()
+    section_content_ratings: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -462,6 +476,7 @@ class ScenarioEdit:
     content: dict[str, object]
     player_character_name: str = ""
     character_starters: tuple[ScenarioCharacterStarter, ...] = ()
+    section_content_ratings: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -555,9 +570,11 @@ class WorldDataService:
         repositories: PersistenceRepositories,
         *,
         active_save_id: str | None = None,
+        allowed_content_rating: str | None = None,
     ) -> None:
         self.repositories = repositories
         self.active_save_id = active_save_id
+        self.allowed_content_rating = allowed_content_rating
 
     def build_model(self, active_save_id: str | None | object = ...) -> WorldDataModel:
         requested_save_id = (
@@ -589,30 +606,22 @@ class WorldDataService:
             summary_count=len(self.repositories.list_summaries(active_save.id)),
         )
         _expire_stale_pending_suggestions(self.repositories, active_save.id)
-        scenario_content = _scenario_content(details.scenario.content_json)
         snapshot = self.repositories.get_scene_snapshot(active_save.id)
         suggestion_records = tuple(
             self.repositories.list_context_update_suggestions(active_save.id)
         )
+        messages = tuple(self.repositories.list_messages(active_save.id))
+        message_ratings = {
+            message.id: message.content_rating
+            for message in messages
+        }
+        allowed_rating = self.allowed_content_rating
         return WorldDataModel(
             active_save_id=active_save.id,
             save=active_save,
-            scenario=WorldDataScenarioModel(
-                scenario_id=details.scenario.id,
-                scenario_type=details.scenario.type,
-                title=details.scenario.title,
-                premise=details.scenario.premise,
-                player_character_name=_scenario_player_character_name(
-                    scenario_content
-                ),
-                player_role=details.scenario.player_role,
-                content_sections=tuple(
-                    (key, _section_text(value))
-                    for key, value in scenario_content
-                    if key not in _SCENARIO_NON_SECTION_CONTENT_KEYS
-                ),
-                generation_prompt=_scenario_generation_prompt(scenario_content),
-                character_starters=_scenario_character_starters(scenario_content),
+            scenario=_scenario_model_from_record(
+                details.scenario,
+                allowed_rating=self.allowed_content_rating,
             ),
             world_state=tuple(
                 WorldDataStateRow(
@@ -625,6 +634,11 @@ class WorldDataService:
                     source_message_id=record.source_message_id,
                 )
                 for record in self.repositories.list_world_state(active_save.id)
+                if not _record_exceeds_rating(
+                    record,
+                    allowed_rating=allowed_rating,
+                    message_ratings=message_ratings,
+                )
             ),
             memories=tuple(
                 WorldDataMemoryRow(
@@ -640,10 +654,20 @@ class WorldDataService:
                     ),
                 )
                 for record in self.repositories.list_memories(active_save.id)
+                if not _record_exceeds_rating(
+                    record,
+                    allowed_rating=allowed_rating,
+                    message_ratings=message_ratings,
+                )
             ),
             context_inputs=tuple(
                 _context_input_row(record)
                 for record in self.repositories.list_context_sources(active_save.id)
+                if not _context_source_exceeds_rating(
+                    record,
+                    allowed_rating=allowed_rating,
+                    message_ratings=message_ratings,
+                )
             ),
             summaries=tuple(
                 WorldDataSummaryRow(
@@ -655,23 +679,63 @@ class WorldDataService:
                     covers_message_end_id=record.covers_message_end_id,
                 )
                 for record in self.repositories.list_summaries(active_save.id)
+                if not _summary_exceeds_rating(
+                    record,
+                    allowed_rating=allowed_rating,
+                    messages=messages,
+                )
             ),
-            scene=_scene_row(snapshot) if snapshot else None,
+            scene=(
+                _scene_row(snapshot)
+                if snapshot
+                and not _record_exceeds_rating(
+                    snapshot,
+                    allowed_rating=allowed_rating,
+                    message_ratings=message_ratings,
+                )
+                else None
+            ),
             locations=tuple(
                 _location_row(record)
                 for record in self.repositories.list_locations(active_save.id)
+                if not _record_exceeds_rating(
+                    record,
+                    allowed_rating=allowed_rating,
+                    message_ratings=message_ratings,
+                )
             ),
             characters=tuple(
                 _character_row(record)
                 for record in self.repositories.list_characters(active_save.id)
+                if not (
+                    content_rating_exceeds(
+                        minimum_rating=record.content_rating,
+                        allowed_rating=allowed_rating or "unrated",
+                    )
+                    or _record_exceeds_rating(
+                        record,
+                        allowed_rating=allowed_rating,
+                        message_ratings=message_ratings,
+                    )
+                )
             ),
             threads=tuple(
                 _thread_row(record)
                 for record in self.repositories.list_active_threads(active_save.id)
+                if not _record_exceeds_rating(
+                    record,
+                    allowed_rating=allowed_rating,
+                    message_ratings=message_ratings,
+                )
             ),
             links=tuple(
                 _link_row(record)
                 for record in self.repositories.list_entity_links(active_save.id)
+                if not _record_exceeds_rating(
+                    record,
+                    allowed_rating=allowed_rating,
+                    message_ratings=message_ratings,
+                )
             ),
             knowledge_edges=tuple(
                 _knowledge_edge_row(record)
@@ -679,17 +743,51 @@ class WorldDataService:
                     active_save.id,
                     include_archived=True,
                 )
+                if not _record_exceeds_rating(
+                    record,
+                    allowed_rating=allowed_rating,
+                    message_ratings=message_ratings,
+                )
             ),
             message_visibility=tuple(
                 _message_visibility_row(record)
                 for record in self.repositories.list_message_visibility(active_save.id)
+                if not _record_exceeds_rating(
+                    record,
+                    allowed_rating=allowed_rating,
+                    message_ratings=message_ratings,
+                    extra_source_ids=(record.message_id,),
+                )
             ),
-            suggestions=tuple(_suggestion_row(record) for record in suggestion_records),
-            suggestion_groups=_suggestion_group_rows(suggestion_records),
+            suggestions=tuple(
+                _suggestion_row(record)
+                for record in suggestion_records
+                if not _record_exceeds_rating(
+                    record,
+                    allowed_rating=allowed_rating,
+                    message_ratings=message_ratings,
+                )
+            ),
+            suggestion_groups=_suggestion_group_rows(
+                tuple(
+                    record
+                    for record in suggestion_records
+                    if not _record_exceeds_rating(
+                        record,
+                        allowed_rating=allowed_rating,
+                        message_ratings=message_ratings,
+                    )
+                )
+            ),
             audit=tuple(
                 _audit_row(record)
                 for record in self.repositories.list_context_update_audit(
                     active_save.id
+                )
+                if not _record_exceeds_rating(
+                    record,
+                    allowed_rating=allowed_rating,
+                    message_ratings=message_ratings,
                 )
             ),
             loss_conditions=(),
@@ -708,7 +806,10 @@ class WorldDataService:
         return WorldDataModel(
             active_save_id=None,
             save=None,
-            scenario=_scenario_model_from_record(scenario),
+            scenario=_scenario_model_from_record(
+                scenario,
+                allowed_rating=self.allowed_content_rating,
+            ),
         )
 
     def apply_scenario_definition_edit(
@@ -741,7 +842,11 @@ class WorldDataService:
             player_role=player_role,
             content=visible_content,
         ):
-            content = _content_with_preserved_metadata(visible_content, scenario)
+            content = _content_with_preserved_metadata(
+                visible_content,
+                scenario,
+                section_ratings=dict(edit.section_content_ratings),
+            )
             self.repositories.update_scenario(
                 scenario_id=scenario_id,
                 title=title,
@@ -812,6 +917,9 @@ class WorldDataService:
                 scenario_content = _content_with_preserved_metadata(
                     scenario_visible_content,
                     source_scenario,
+                    section_ratings=dict(
+                        edits.scenario.section_content_ratings
+                    ),
                 )
                 scenario_id = _scenario_id_for_single_save_edit(
                     repositories=self.repositories,
@@ -945,6 +1053,7 @@ class WorldDataService:
                 self.repositories.update_summary(
                     summary_id=summary_data.summary_id,
                     body=summary_body,
+                    content_rating="unclassified",
                 )
             if edits.scene is not None:
                 _upsert_scene_snapshot(
@@ -1279,7 +1388,24 @@ def _scenario_id_for_single_save_edit(
     return scenario.scenario_id
 
 
-def _scenario_model_from_record(scenario: ScenarioRecord) -> WorldDataScenarioModel:
+def _scenario_model_from_record(
+    scenario: ScenarioRecord,
+    *,
+    allowed_rating: str | None = None,
+) -> WorldDataScenarioModel:
+    if allowed_rating is not None and content_rating_exceeds(
+        minimum_rating=scenario_content_rating(scenario.content_json),
+        allowed_rating=allowed_rating,
+    ):
+        return WorldDataScenarioModel(
+            scenario_id=scenario.id,
+            scenario_type=scenario.type,
+            title=CONTENT_FILTER_TRANSITION,
+            premise=CONTENT_FILTER_TRANSITION,
+            player_character_name="",
+            player_role=CONTENT_FILTER_TRANSITION,
+            content_sections=(),
+        )
     scenario_content = _scenario_content(scenario.content_json)
     return WorldDataScenarioModel(
         scenario_id=scenario.id,
@@ -1388,14 +1514,37 @@ def _scenario_generation_prompt(
 def _content_with_preserved_metadata(
     content: dict[str, object],
     scenario: ScenarioRecord | None,
+    *,
+    section_ratings: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     normalized = dict(content)
     if scenario is None:
         return normalized
     scenario_content = dict(_scenario_content(scenario.content_json))
     source = scenario_content.get("_source")
-    if isinstance(source, dict) and source:
-        normalized["_source"] = dict(source)
+    resolved_section_ratings = dict(section_ratings or {})
+    if not resolved_section_ratings:
+        existing_source = source if isinstance(source, Mapping) else {}
+        existing_ratings = existing_source.get("section_content_ratings")
+        prior_ratings = (
+            existing_ratings if isinstance(existing_ratings, Mapping) else {}
+        )
+        resolved_section_ratings = {
+            key: (
+                str(prior_ratings.get(key, CONTENT_RATING_UNCLASSIFIED))
+                if scenario_content.get(key) == value
+                else CONTENT_RATING_UNCLASSIFIED
+            )
+            for key, value in normalized.items()
+            if isinstance(value, str)
+        }
+    normalized["_source"] = metadata_with_scenario_content_ratings(
+        source if isinstance(source, dict) else None,
+        aggregate_rating=maximum_content_rating(
+            tuple(resolved_section_ratings.values())
+        ),
+        section_ratings=resolved_section_ratings,
+    )
     _preserve_scenario_starter_reference_metadata(
         content=normalized,
         existing_content=scenario_content,
@@ -1585,6 +1734,7 @@ def _character_row(record: CharacterRecord) -> WorldDataCharacterRow:
         locked_fields=tuple(record.locked_fields),
         protected_from_maintenance=record.protected_from_maintenance,
         is_player_character=record.is_player_character,
+        content_rating=record.content_rating,
     )
 
 
@@ -1785,6 +1935,103 @@ def _context_input_row(record: ContextSourceRecord) -> WorldDataContextInputRow:
             len(source_message_ids) if isinstance(source_message_ids, list) else 0
         ),
         token_estimate=record.token_estimate,
+    )
+
+
+def _record_exceeds_rating(
+    record: object,
+    *,
+    allowed_rating: str | None,
+    message_ratings: dict[str, str],
+    extra_source_ids: tuple[str, ...] = (),
+) -> bool:
+    if allowed_rating is None:
+        return False
+    source_ids = list(extra_source_ids)
+    for field_name in (
+        "source_message_id",
+        "first_seen_message_id",
+        "last_updated_message_id",
+        "world_time_source_message_id",
+    ):
+        value = getattr(record, field_name, None)
+        if isinstance(value, str) and value:
+            source_ids.append(value)
+    multiple = getattr(record, "source_message_ids", ())
+    if isinstance(multiple, list | tuple):
+        source_ids.extend(
+            value
+            for value in multiple
+            if isinstance(value, str) and value
+        )
+    if not source_ids:
+        return content_rating_exceeds(
+            minimum_rating=CONTENT_RATING_UNCLASSIFIED,
+            allowed_rating=allowed_rating,
+        )
+    return any(
+        content_rating_exceeds(
+            minimum_rating=message_ratings.get(
+                source_id,
+                "unclassified",
+            ),
+            allowed_rating=allowed_rating,
+        )
+        for source_id in dict.fromkeys(source_ids)
+    )
+
+
+def _context_source_exceeds_rating(
+    record: ContextSourceRecord,
+    *,
+    allowed_rating: str | None,
+    message_ratings: dict[str, str],
+) -> bool:
+    source_ids = record.metadata.get("source_message_ids", [])
+    normalized_ids = (
+        tuple(value for value in source_ids if isinstance(value, str))
+        if isinstance(source_ids, list)
+        else ()
+    )
+    if record.source_type == "message":
+        normalized_ids = (*normalized_ids, record.source_id)
+    return _record_exceeds_rating(
+        record,
+        allowed_rating=allowed_rating,
+        message_ratings=message_ratings,
+        extra_source_ids=normalized_ids,
+    )
+
+
+def _summary_exceeds_rating(
+    record: SummaryRecord,
+    *,
+    allowed_rating: str | None,
+    messages: tuple[MessageRecord, ...],
+) -> bool:
+    if allowed_rating is None:
+        return False
+    if content_rating_exceeds(
+        minimum_rating=record.content_rating,
+        allowed_rating=allowed_rating,
+    ):
+        return True
+    positions = {
+        message.id: index
+        for index, message in enumerate(messages)
+    }
+    start = positions.get(record.covers_message_start_id)
+    end = positions.get(record.covers_message_end_id)
+    if start is None or end is None:
+        return True
+    if start > end:
+        start, end = end, start
+    return any(
+        content_rating_exceeds(
+            minimum_rating=message.content_rating,
+            allowed_rating=allowed_rating,
+        )
+        for message in messages[start : end + 1]
     )
 
 
@@ -2193,6 +2440,9 @@ def _character_update_values(*, row: object, model: WorldDataModel) -> Character
         source_message_id=None,
         protected_from_maintenance=current.protected_from_maintenance,
         is_player_character=bool(row.is_player_character),
+        content_rating=(
+            "unclassified" if changed else current.content_rating
+        ),
         locked_fields=merge_character_locked_fields(current.locked_fields, changed),
     )
 

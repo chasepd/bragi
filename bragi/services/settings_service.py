@@ -110,10 +110,16 @@ from bragi.services.manual_confirmation import (
     MANUAL_CONFIRMATION_MEMORIES_SETTING,
     MANUAL_CONFIRMATION_STATE_CHANGES_SETTING,
 )
+from bragi.services.model_capabilities import (
+    STRUCTURED_OUTPUT_CAPABILITIES,
+    model_supports_any_capability,
+)
 from bragi.services.model_preferences import (
+    CONTENT_SAFETY_PURPOSE,
     clear_save_model_override_preference,
     clear_save_model_thinking_preference,
     model_preference_for_selector,
+    roleplay_model_purpose,
     save_model_thinking_preference,
     set_save_model_override_preference,
     set_save_model_thinking_preference,
@@ -436,6 +442,16 @@ class SettingsService:
     ) -> None:
         if is_retired_model_task(task):
             raise ValueError("Model task is retired")
+        if (
+            roleplay_model_purpose(task) == CONTENT_SAFETY_PURPOSE
+            and not model_supports_any_capability(
+                self.repositories,
+                provider=provider,
+                model_id=model_id,
+                required=STRUCTURED_OUTPUT_CAPABILITIES,
+            )
+        ):
+            raise ValueError("Safety Agent model must support structured output")
         if save_id is not None:
             self._set_save_model_preference(
                 task=task,

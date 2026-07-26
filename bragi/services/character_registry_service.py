@@ -7,6 +7,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import cast
 
+from bragi.content_rating_instructions import (
+    content_rating_exceeds,
+    maximum_content_rating,
+)
 from bragi.persistence.models import (
     CharacterKnowledgeEdgeRecord,
     CharacterRecord,
@@ -41,6 +45,7 @@ class CharacterRegistryReferenceImageRow:
     model: str
     created_at: str | None = None
     source: str | None = None
+    content_rating: str = "unclassified"
 
 
 @dataclass(frozen=True)
@@ -101,6 +106,7 @@ class CharacterRegistryRow:
     is_player_character: bool = False
     reference_image: CharacterRegistryReferenceImageRow | None = None
     generated_images: tuple[CharacterRegistryReferenceImageRow, ...] = ()
+    content_rating: str = "unclassified"
 
     @property
     def id(self) -> str:
@@ -190,9 +196,11 @@ class CharacterRegistryService:
         repositories: PersistenceRepositories,
         *,
         active_save_id: str | None = None,
+        allowed_content_rating: str | None = None,
     ) -> None:
         self.repositories = repositories
         self.active_save_id = active_save_id
+        self.allowed_content_rating = allowed_content_rating
 
     def build_model(
         self,
@@ -231,6 +239,28 @@ class CharacterRegistryService:
             state_records=state_records,
             summary_records=summary_records,
         )
+        allowed_location_ids: set[str] | None = None
+        if self.allowed_content_rating is not None:
+            from bragi.services.world_data_service import WorldDataService
+
+            rated_world = WorldDataService(
+                self.repositories,
+                active_save_id=active_save.id,
+                allowed_content_rating=self.allowed_content_rating,
+            ).build_model(active_save_id=active_save.id)
+            allowed_targets = {
+                *(("memory", row.memory_id) for row in rated_world.memories),
+                *(("world_state", row.state_id) for row in rated_world.state_rows),
+                *(("summary", row.summary_id) for row in rated_world.summaries),
+            }
+            allowed_location_ids = {
+                row.location_id for row in rated_world.locations
+            }
+            linked_targets = [
+                target
+                for target in linked_targets
+                if (target.target_type, target.target_id) in allowed_targets
+            ]
         valid_link_targets = {
             (target.target_type, target.target_id) for target in linked_targets
         }
@@ -251,7 +281,13 @@ class CharacterRegistryService:
         )
         characters = tuple(
             _character_row(
-                record,
+                _restricted_character_record(record)
+                if self.allowed_content_rating is not None
+                and content_rating_exceeds(
+                    minimum_rating=record.content_rating,
+                    allowed_rating=self.allowed_content_rating,
+                )
+                else record,
                 present=record.id in present_ids or record.is_player_character,
                 links=links_by_character.get(record.id, frozenset()),
                 reference_image=reference_images_by_character.get(record.id),
@@ -276,7 +312,10 @@ class CharacterRegistryService:
                 for target in linked_targets
             ),
             location_choices=tuple(
-                (location.id, location.name) for location in location_records
+                (location.id, location.name)
+                for location in location_records
+                if allowed_location_ids is None
+                or location.id in allowed_location_ids
             ),
         )
 
@@ -387,6 +426,7 @@ class CharacterRegistryService:
                         ),
                         protected_from_maintenance=row.protected_from_maintenance,
                         is_player_character=row.is_player_character,
+                        content_rating=row.content_rating,
                     )
                     created_count += 1
                     created_character_ids.append(saved.id)
@@ -801,6 +841,7 @@ def _character_row(
         is_player_character=record.is_player_character,
         reference_image=reference_image,
         generated_images=generated_images,
+        content_rating=record.content_rating,
     )
 
 
@@ -840,6 +881,7 @@ def _reference_image_row(
         model=asset.model,
         created_at=asset.created_at,
         source=source if isinstance(source, str) else None,
+        content_rating=str(metadata.get("content_rating", "unclassified")),
     )
 
 
@@ -1264,6 +1306,7 @@ def _record_from_row(
         contact_name=row.contact_name.strip(),
         protected_from_maintenance=row.protected_from_maintenance,
         is_player_character=row.is_player_character,
+        content_rating=row.content_rating,
         locked_fields=(
             merge_character_locked_fields(record.locked_fields, changed)
             if row.locked_fields is None
@@ -1272,6 +1315,41 @@ def _record_from_row(
                 row.locked_fields,
             )
         ),
+    )
+
+
+def _restricted_character_record(record: CharacterRecord) -> CharacterRecord:
+    from bragi.services.sexual_content_safety import CONTENT_FILTER_TRANSITION
+
+    replacement = CONTENT_FILTER_TRANSITION
+    return replace(
+        record,
+        name=replacement,
+        aliases=[],
+        role=replacement if record.role else "",
+        age=replacement if record.age else "",
+        known_state=replacement if record.known_state else "",
+        history=replacement if record.history else "",
+        appearance=replacement if record.appearance else "",
+        visual_notes=replacement if record.visual_notes else "",
+        current_clothing=replacement if record.current_clothing else "",
+        personality=replacement if record.personality else "",
+        voice=replacement if record.voice else "",
+        texting_style=replacement if record.texting_style else "",
+        relationships={},
+        goals=replacement if record.goals else "",
+        motivations=replacement if record.motivations else "",
+        current_intent=replacement if record.current_intent else "",
+        boundaries=replacement if record.boundaries else "",
+        attitude_toward_player=(
+            replacement if record.attitude_toward_player else ""
+        ),
+        cooperation_conditions=(
+            replacement if record.cooperation_conditions else ""
+        ),
+        status=replacement if record.status else "",
+        private_notes=replacement if record.private_notes else "",
+        contact_name=replacement if record.contact_name else "",
     )
 
 
@@ -1339,6 +1417,9 @@ def _merged_character(
         ),
         is_player_character=target.is_player_character or source.is_player_character,
         locked_fields=locked_fields,
+        content_rating=maximum_content_rating(
+            (target.content_rating, source.content_rating)
+        ),
     )
 
 

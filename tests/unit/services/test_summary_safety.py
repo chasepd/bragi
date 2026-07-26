@@ -19,15 +19,13 @@ def test_validate_summary_output_accepts_third_person_factual_summary() -> None:
     assert result.reason == ""
 
 
-def test_validate_summary_output_rejects_explicit_detail() -> None:
+def test_validate_summary_output_leaves_content_rating_to_safety_agent() -> None:
     result = validate_summary_output(
         "Mara and the stranger had sex, then returned to the bridge."
     )
 
-    assert result.accepted is False
-    assert result.reason == (
-        "summary rejected because sexual detail must remain off-screen"
-    )
+    assert result.accepted is True
+    assert result.reason == ""
 
 
 def test_validate_summary_output_rejects_low_compression_source_copy() -> None:

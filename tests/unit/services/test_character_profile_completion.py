@@ -480,6 +480,7 @@ def test_scenario_character_starter_preserves_reference_image_metadata() -> None
         "prompt_preview": "Uploaded character reference image",
         "source": "uploaded",
         "created_at": "2026-07-12T00:00:00+00:00",
+        "content_rating": "unclassified",
     }
 
     [normalized] = normalize_scenario_character_starters([payload], strict=True)

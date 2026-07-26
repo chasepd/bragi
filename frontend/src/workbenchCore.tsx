@@ -38,6 +38,7 @@ import {
   Search,
   Send,
   Settings,
+  ShieldCheck,
   Smartphone,
   Square,
   Trash2,
@@ -526,6 +527,7 @@ type ModelRoutingLaneId =
   "narrator"
   | "narrator_planner"
   | "narrator_verifier"
+  | "content_safety"
   | "character_agents"
   | "action_choices"
   | "director_pressure"
@@ -1523,6 +1525,14 @@ const MODEL_ROUTING_GROUPS: readonly ModelRoutingLaneGroupMeta[] = [
         capabilities: ["structured_output"],
         targetPurposes: ["response_verification", "npc_knowledge_audit"],
         icon: Eye
+      },
+      {
+        id: "content_safety",
+        label: "Safety Agent",
+        title: "Rating-aware content safety review model.",
+        capabilities: ["structured_output"],
+        targetPurposes: ["content_safety"],
+        icon: ShieldCheck
       }
     ]
   },
@@ -1829,6 +1839,7 @@ const TASK_MODEL_TOOLTIPS: Record<string, string> = {
   director_pressure: "Sets the structured-output model Bragi uses to assess story tension and plan external pressure.",
   character_action_planning: "Legacy fallback model for character-agent NPC planning.",
   npc_knowledge_audit: "Sets the structured-output model Bragi uses to audit NPC knowledge boundaries after narrator verification.",
+  content_safety: "Sets the structured-output safety agent Bragi uses to enforce the selected content-rating ceiling.",
   summarization: "Sets the model Bragi uses to summarize older chronicle context.",
   image_prompt: "Sets the model Bragi uses to turn scene context into image prompts.",
   image_generation: "Sets the model Bragi uses to generate scene images.",
@@ -3550,7 +3561,7 @@ function Workbench({
               onKeyDown={onLayoutKeyDown}
             />
           ) : null}
-          <RightPanel panel={panel} model={model} runJob={runJob} currentUser={currentUser} openLookAround={openLookAround} readOnly={!activeSaveSupported} />
+          <RightPanel panel={panel} model={model} runJob={runJob} currentUser={currentUser} openLookAround={openLookAround} readOnly={!activeSaveSupported} onContentSafetyChanged={refreshScenarioLibrary} />
         </>
       ) : (
         <>
@@ -3562,7 +3573,7 @@ function Workbench({
           />
           {activeMobilePanel ? (
             <MobileSheet title={panelLabel(activeMobilePanel)} icon={panelIcon(activeMobilePanel, 18)} onClose={closeMobileSheet}>
-              <RightPanel panel={activeMobilePanel} model={model} runJob={runJob} currentUser={currentUser} openLookAround={openLookAround} readOnly={!activeSaveSupported} />
+              <RightPanel panel={activeMobilePanel} model={model} runJob={runJob} currentUser={currentUser} openLookAround={openLookAround} readOnly={!activeSaveSupported} onContentSafetyChanged={refreshScenarioLibrary} />
             </MobileSheet>
           ) : null}
         </>
@@ -6716,7 +6727,8 @@ function RightPanel({
   runJob,
   currentUser = null,
   openLookAround,
-  readOnly = false
+  readOnly = false,
+  onContentSafetyChanged
 }: {
   panel: PanelName;
   model?: RuntimeModel;
@@ -6724,6 +6736,7 @@ function RightPanel({
   currentUser?: CurrentUser | null;
   openLookAround?: (query: string) => void;
   readOnly?: boolean;
+  onContentSafetyChanged?: () => void;
 }) {
   const effectiveCurrentUser: CurrentUser | null = readOnly
     ? { id: "unsupported-save", username: "Recovery", role: "child", status: "active" }
@@ -6763,7 +6776,7 @@ function RightPanel({
   }
   return (
     <React.Suspense fallback={<RightPanelFallback title="Settings" icon={<Settings size={18} />} />}>
-      <LazySettingsPanel runJob={runJob} activeSaveId={readOnly ? null : model?.active_save_id ?? null} currentUser={effectiveCurrentUser} />
+      <LazySettingsPanel runJob={runJob} activeSaveId={readOnly ? null : model?.active_save_id ?? null} currentUser={effectiveCurrentUser} onContentSafetyChanged={onContentSafetyChanged} />
     </React.Suspense>
   );
 }
@@ -8632,6 +8645,7 @@ const fallbackTaskLabels: Record<string, string> = {
   memory_curation: "Memory Curation",
   response_planning: "Narrator Planner",
   response_verification: "Narrator Verifier",
+  content_safety: "Safety Agent",
   director_pressure: "Director Pressure",
   action_choice_generation: "Action Choice Generation",
   character_presence_assessment: "Character Presence Assessment",

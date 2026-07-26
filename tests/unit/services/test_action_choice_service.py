@@ -4,12 +4,14 @@ import asyncio
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.fake import FakeProviderClient
+from bragi.safety import CONTENT_FILTER_TRANSITION
 from bragi.services.action_choice_service import (
     ACTION_CHOICE_GENERATION_TASK,
     ActionChoiceService,
@@ -17,6 +19,26 @@ from bragi.services.action_choice_service import (
 from bragi.services.character_action_planning_service import (
     CHARACTER_ACTION_PLANNING_TASK,
 )
+from bragi.services.content_safety_service import (
+    ContentSafetyAction,
+    ContentSafetyResult,
+    ContentSafetyService,
+)
+
+
+class BlockingContentSafetyService:
+    def __init__(self) -> None:
+        self.fade_settings: list[bool] = []
+
+    async def review_narration(self, **kwargs: object) -> ContentSafetyResult:
+        self.fade_settings.append(bool(kwargs["fade_to_black_enabled"]))
+        return ContentSafetyResult(
+            body=CONTENT_FILTER_TRANSITION,
+            action=ContentSafetyAction.BLOCK,
+            minimum_rating="r",
+            transition_applied=True,
+            agent_ran=True,
+        )
 
 
 @pytest.fixture
@@ -25,7 +47,9 @@ def repositories(tmp_path: Path) -> Iterator[PersistenceRepositories]:
     migrate_database(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        yield PersistenceRepositories(connection)
+        repositories = PersistenceRepositories(connection)
+        repositories.set_app_setting("content_filter_rating", "unrated")
+        yield repositories
 
 
 def test_action_choice_service_requests_structured_four_choice_schema_and_persists(
@@ -131,6 +155,46 @@ def test_action_choice_service_uses_dedicated_model_preference(
         "Step through the blue shelf-door.",
     ]
     assert provider.structured_output_requests[0].model_id == "fake-chat"
+
+
+def test_action_choice_service_safety_reviews_and_rates_generated_choices(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.set_app_setting("content_filter_rating", "pg")
+    save_id, narrator_id = _create_cyoa_save(repositories)
+    _save_model(
+        repositories,
+        model_id="fake-chat",
+        capabilities=["structured_output"],
+    )
+    choice_provider = FakeProviderClient(
+        structured_output={
+            "choices": [
+                {"body": "Choice one."},
+                {"body": "Choice two."},
+                {"body": "Choice three."},
+                {"body": "Choice four."},
+            ]
+        }
+    )
+    safety = BlockingContentSafetyService()
+    repositories.set_model_preference(
+        task=ACTION_CHOICE_GENERATION_TASK,
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    records = asyncio.run(
+        ActionChoiceService(
+            repositories=repositories,
+            providers={"fake": choice_provider},
+            content_safety_service=cast(ContentSafetyService, safety),
+        ).generate_for_message(save_id=save_id, narrator_message_id=narrator_id)
+    )
+
+    assert [record.body for record in records] == [CONTENT_FILTER_TRANSITION] * 4
+    assert [record.content_rating for record in records] == ["g"] * 4
+    assert safety.fade_settings == [False] * 4
 
 
 def test_action_choice_service_uses_roleplay_specific_action_choice_model_preference(
