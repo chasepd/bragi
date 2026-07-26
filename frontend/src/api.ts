@@ -1361,7 +1361,8 @@ export function watchSave(saveId: string, onEvent: (event: SaveEvent) => void, o
     "saves_changed",
     "save_deleted",
     "scenarios_changed",
-    "character_texts_changed"
+    "character_texts_changed",
+    "world_data_changed"
   ];
   let latestEventId = 0;
   const handleEvent = (eventName: string) => (event: Event) => {

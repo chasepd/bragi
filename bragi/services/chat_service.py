@@ -4020,15 +4020,10 @@ class ChatService:
             return await run_step(name, callbacks[name])
 
         def run_context_barrier() -> None:
-            self._persist_turn_message_scene_presence(
+            self._run_post_turn_context_barrier(
                 save_id=save_id,
                 source_message_ids=(player_message_id, narrator_message_id),
                 source="post_turn_context",
-            )
-            self._update_dating_routes_after_turn(
-                save_id=save_id,
-                player_message_id=player_message_id,
-                narrator_message_id=narrator_message_id,
             )
 
         pending = set(POST_TURN_JOB_ORDER)
@@ -4226,10 +4221,21 @@ class ChatService:
                 save_id=retry_save_id,
                 source_message_ids=source_message_ids,
             ):
+                inference_mode = _state_retry_inference_mode(payload)
+                verified_coverage = verified_post_turn_coverage_from_mapping(
+                    payload.get("verified_plan_coverage")
+                )
+                if not verified_coverage.source_message_ids:
+                    verified_coverage = VerifiedPostTurnCoverage(
+                        source_message_ids=source_message_ids,
+                    )
                 context_retry_job = self._ensure_context_update_retry_job(
                     save_id=retry_save_id,
                     source_message_ids=source_message_ids,
                     reason="state_extraction_retry_succeeded",
+                    full_post_turn_context=True,
+                    inference_mode=inference_mode,
+                    verified_coverage=verified_coverage,
                 )
                 self.jobs.succeed(
                     running.id,
@@ -4347,6 +4353,9 @@ class ChatService:
                 save_id=retry_save_id,
                 source_message_ids=source_message_ids,
                 reason="state_extraction_retry_succeeded",
+                full_post_turn_context=True,
+                inference_mode=inference_mode,
+                verified_coverage=verified_coverage,
             )
             success_result: dict[str, object] = {
                 "source_message_ids": list(source_message_ids),
@@ -4403,6 +4412,94 @@ class ChatService:
                     running.id,
                     error="Retry job is missing source_message_ids",
                 )
+                continue
+            if _context_retry_full_post_turn_context(payload):
+                inference_mode = _context_retry_inference_mode(payload)
+                verified_coverage = verified_post_turn_coverage_from_mapping(
+                    payload.get("verified_plan_coverage")
+                )
+                if not verified_coverage.source_message_ids:
+                    verified_coverage = VerifiedPostTurnCoverage(
+                        source_message_ids=source_message_ids,
+                    )
+                try:
+                    full_context_result = await self._update_context_if_configured(
+                        save_id=retry_save_id,
+                        player_message_id=source_message_ids[0],
+                        narrator_message_id=source_message_ids[-1],
+                        inference_mode=inference_mode,
+                        verified_coverage=verified_coverage,
+                    )
+                except asyncio.CancelledError:
+                    self.jobs.cancel(
+                        running.id,
+                        error="Context update retry drain cancelled",
+                        result={
+                            "source_message_ids": list(source_message_ids),
+                            "retry_attempt": retry_attempt,
+                            "max_retry_attempts": max_retry_attempts,
+                            "full_post_turn_context": True,
+                        },
+                    )
+                    log_event(
+                        "job.cancelled",
+                        job_id=running.id,
+                        job_type=running.type,
+                        save_id=retry_save_id,
+                        retry_attempt=retry_attempt,
+                        max_retry_attempts=max_retry_attempts,
+                    )
+                    raise
+                except Exception as exc:
+                    self.jobs.fail(
+                        running.id,
+                        error=_safe_error_text(exc),
+                        result={
+                            "source_message_ids": list(source_message_ids),
+                            "retry_attempt": retry_attempt,
+                            "max_retry_attempts": max_retry_attempts,
+                            "full_post_turn_context": True,
+                        },
+                    )
+                    log_error_event(
+                        "chat.context_update_retry_failed",
+                        save_id=retry_save_id,
+                        retry_job_id=running.id,
+                        retry_attempt=retry_attempt,
+                        max_retry_attempts=max_retry_attempts,
+                        **exception_log_fields(exc),
+                    )
+                    continue
+                self._run_post_turn_context_barrier(
+                    save_id=retry_save_id,
+                    source_message_ids=source_message_ids,
+                    source="context_retry",
+                )
+                context_status, context_result = _post_turn_step_status_and_result(
+                    full_context_result
+                )
+                full_context_result_payload: dict[str, object] = {
+                    "source_message_ids": list(source_message_ids),
+                    "full_post_turn_context": True,
+                    "context_status": context_status,
+                }
+                if context_result is not None:
+                    full_context_result_payload["context_result"] = context_result
+                retry_pressure = provider_pressure_from_result(context_result)
+                if retry_pressure is not None:
+                    full_context_result_payload["provider_pressure"] = (
+                        retry_pressure.to_result()
+                    )
+                    pressure = retry_pressure
+                if context_status == "failed":
+                    self.jobs.fail(
+                        running.id,
+                        error="Full post-turn context retry failed",
+                        result=full_context_result_payload,
+                    )
+                    continue
+                self.jobs.succeed(running.id, result=full_context_result_payload)
+                completed += 1
                 continue
             service = self._context_update_service_for_retry(
                 retry_save_id,
@@ -4497,7 +4594,7 @@ class ChatService:
             if retry_pressure is not None:
                 success_result["provider_pressure"] = retry_pressure.to_result()
                 pressure = retry_pressure
-            self._persist_turn_message_scene_presence(
+            self._run_post_turn_context_barrier(
                 save_id=retry_save_id,
                 source_message_ids=source_message_ids,
                 source="context_retry",
@@ -4508,6 +4605,26 @@ class ChatService:
             )
             completed += 1
         return completed
+
+    def _run_post_turn_context_barrier(
+        self,
+        *,
+        save_id: str,
+        source_message_ids: tuple[str, ...],
+        source: str,
+    ) -> None:
+        self._persist_turn_message_scene_presence(
+            save_id=save_id,
+            source_message_ids=source_message_ids,
+            source=source,
+        )
+        if len(source_message_ids) < 2:
+            return
+        self._update_dating_routes_after_turn(
+            save_id=save_id,
+            player_message_id=source_message_ids[0],
+            narrator_message_id=source_message_ids[-1],
+        )
 
     def _persist_turn_message_scene_presence(
         self,
@@ -5873,9 +5990,20 @@ class ChatService:
             else None
         )
         if extractor is None:
+            retry_job = self._ensure_state_extraction_retry_job(
+                save_id=save_id,
+                source_message_ids=(player_message_id, narrator_message_id),
+                include_memories=True,
+                inference_mode=inference_mode,
+                verified_coverage=verified_coverage,
+                reason="state_extraction_unavailable",
+                provider=preference.provider,
+                model=preference.model_id,
+            )
             log_error_event(
                 "chat.state_extraction_skipped",
                 save_id=save_id,
+                retry_job_id=retry_job.id,
                 provider=preference.provider,
                 model=preference.model_id,
                 error=(
@@ -5883,7 +6011,18 @@ class ChatService:
                     "or tool calling"
                 ),
             )
-            return "skipped"
+            return _PostTurnStepResult(
+                status="failed",
+                result={
+                    "state_extraction_failed": True,
+                    "failed_reason": "state_extraction_unavailable",
+                    "retry_job_id": retry_job.id,
+                    "source_message_ids": [player_message_id, narrator_message_id],
+                    "retry_attempt": _retry_attempt(retry_job.payload),
+                    "max_retry_attempts": _retry_max_attempts(retry_job.payload),
+                    "verified_plan_coverage": verified_coverage.to_json(),
+                },
+            )
         include_memories = True
         try:
             include_memories = not self._agentic_memory_curation_available(
@@ -6451,6 +6590,9 @@ class ChatService:
         provider: str | None = None,
         model: str | None = None,
         pressure: ProviderPressure | None = None,
+        full_post_turn_context: bool = False,
+        inference_mode: str | None = None,
+        verified_coverage: VerifiedPostTurnCoverage | None = None,
     ) -> JobRecord:
         existing = self._queued_context_update_retry_job(
             save_id=save_id,
@@ -6471,6 +6613,9 @@ class ChatService:
             provider=provider,
             model=model,
             pressure=pressure,
+            full_post_turn_context=full_post_turn_context,
+            inference_mode=inference_mode,
+            verified_coverage=verified_coverage,
         )
         if existing is not None:
             return self.repositories.update_queued_job_payload(
@@ -6921,6 +7066,14 @@ def _state_extraction_step_result(
     if inference_mode == POST_TURN_INFERENCE_MODE_HYBRID:
         return _PostTurnStepResult(status="succeeded", result=result)
     return "succeeded"
+
+
+def _post_turn_step_status_and_result(
+    result: str | _PostTurnStepResult,
+) -> tuple[str, dict[str, object] | None]:
+    if isinstance(result, _PostTurnStepResult):
+        return result.status, result.result
+    return str(result or "succeeded"), None
 
 
 def _narrator_messages(
@@ -9850,6 +10003,9 @@ def _context_update_retry_payload(
     provider: str | None = None,
     model: str | None = None,
     pressure: ProviderPressure | None = None,
+    full_post_turn_context: bool = False,
+    inference_mode: str | None = None,
+    verified_coverage: VerifiedPostTurnCoverage | None = None,
 ) -> dict[str, object]:
     payload = dict(existing_payload or {})
     payload.update(
@@ -9868,6 +10024,12 @@ def _context_update_retry_payload(
         payload["model"] = model
     elif "model" not in payload:
         payload["model"] = None
+    if full_post_turn_context:
+        payload["run_full_post_turn_context"] = True
+    if inference_mode is not None:
+        payload["effective_post_turn_inference_mode"] = inference_mode
+    if verified_coverage is not None:
+        payload["verified_plan_coverage"] = verified_coverage.to_json()
     if pressure is not None:
         payload["last_deferred_reason"] = (
             "provider_pressure" if reason == "provider_pressure_deferred" else reason
@@ -9878,6 +10040,21 @@ def _context_update_retry_payload(
         if pressure.source_job_id is not None:
             payload["last_pressure_job_id"] = pressure.source_job_id
     return payload
+
+
+def _context_retry_full_post_turn_context(payload: dict[str, object]) -> bool:
+    return payload.get("run_full_post_turn_context") is True
+
+
+def _context_retry_inference_mode(payload: dict[str, object]) -> str:
+    value = payload.get("effective_post_turn_inference_mode")
+    if isinstance(value, str) and value in {
+        POST_TURN_INFERENCE_MODE_HYBRID,
+        POST_TURN_INFERENCE_MODE_LEGACY,
+        POST_TURN_INFERENCE_MODE_PLAN_OWNED,
+    }:
+        return value
+    return POST_TURN_INFERENCE_MODE_LEGACY
 
 
 def _state_retry_include_memories(payload: dict[str, object]) -> bool:

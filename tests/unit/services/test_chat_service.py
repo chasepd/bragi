@@ -11891,6 +11891,76 @@ def test_run_post_turn_jobs_queues_state_retry_and_blocks_dependents(
     ]
 
 
+def test_run_post_turn_jobs_queues_state_retry_when_extractor_unavailable(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I climb toward the beacon lens.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon lens hums awake.",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-state-memory",
+        display_name="Fake State Memory",
+        capabilities=["chat"],
+        context_window=8192,
+    )
+    repositories.set_model_preference(
+        task="state_memory",
+        provider="fake",
+        model_id="fake-state-memory",
+    )
+    context_update = RecordingContextUpdateService()
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+        context_update_service=context_update,
+    )
+
+    asyncio.run(
+        service.run_post_turn_jobs(
+            save_id=save.id,
+            player_message_id=player_message.id,
+            narrator_message_id=narrator_message.id,
+        )
+    )
+
+    assert context_update.calls == []
+    coordinator = _post_turn_jobs(repositories, save.id)[0]
+    assert _post_turn_child_status(coordinator, "state") == "failed"
+    assert _post_turn_child_status(coordinator, "context") == "blocked_dependency"
+    state_result = _post_turn_child_result(coordinator, "state")
+    retry_jobs = [
+        job
+        for job in repositories.list_jobs_by_status(("queued",))
+        if job.type == "state_extraction_retry"
+    ]
+    assert len(retry_jobs) == 1
+    assert state_result["retry_job_id"] == retry_jobs[0].id
+    assert retry_jobs[0].payload["reason"] == "state_extraction_unavailable"
+    assert retry_jobs[0].payload["source_message_ids"] == [
+        player_message.id,
+        narrator_message.id,
+    ]
+
+
 def test_run_state_extraction_retries_applies_once_and_queues_context_retry(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -11989,6 +12059,7 @@ def test_run_state_extraction_retries_applies_once_and_queues_context_retry(
     ]
     assert len(context_retries) == 1
     assert context_retries[0].payload["reason"] == "state_extraction_retry_succeeded"
+    assert context_retries[0].payload["run_full_post_turn_context"] is True
     assert context_retries[0].payload["source_message_ids"] == [
         player_message.id,
         narrator_message.id,
@@ -12582,6 +12653,110 @@ def test_update_context_runs_curation_when_continuity_provider_unavailable(
 
     assert result == "skipped"
     assert events == ["observation", "curation"]
+
+
+def test_run_context_update_retries_replays_full_context_after_state_retry(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I climb toward the beacon lens.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The beacon lens hums awake.",
+    )
+    lio = repositories.add_character(save_id=save.id, name="Archivist Lio")
+    retry_job = repositories.create_job(
+        save_id=save.id,
+        type="context_update_retry",
+        status="queued",
+        payload={
+            "source_message_ids": [player_message.id, narrator_message.id],
+            "reason": "state_extraction_retry_succeeded",
+            "run_full_post_turn_context": True,
+        },
+    )
+    events: list[str] = []
+
+    class RecordingObservationService:
+        async def observe_turn(
+            self,
+            *,
+            save_id: str,
+            source_message_ids: tuple[str, ...],
+        ) -> ObservationResult:
+            assert source_message_ids == (player_message.id, narrator_message.id)
+            events.append("observation")
+            return ObservationResult(save_id=save_id, observed_count=0)
+
+    class RecordingCurationService:
+        async def curate_pending(self, save_id: str) -> CurationResult:
+            events.append("curation")
+            return CurationResult(save_id=save_id, considered_count=0)
+
+    class ScenePresenceContextUpdateService:
+        async def update_after_turn(
+            self,
+            *,
+            save_id: str,
+            source_message_ids: tuple[str, ...],
+        ) -> object:
+            assert source_message_ids == (player_message.id, narrator_message.id)
+            events.append("context_update")
+            repositories.upsert_scene_snapshot(
+                save_id=save_id,
+                situation="Lio joins Mara at the beacon lens.",
+                present_character_ids=[lio.id],
+            )
+            return object()
+
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+        context_update_service=ScenePresenceContextUpdateService(),
+        observation_service=RecordingObservationService(),
+        context_curation_service=RecordingCurationService(),
+    )
+
+    completed = asyncio.run(service.run_context_update_retries(save_id=save.id))
+
+    assert completed == 1
+    assert events == ["observation", "context_update", "curation"]
+    succeeded_retry = next(
+        job
+        for job in repositories.list_jobs_by_status(("succeeded",))
+        if job.id == retry_job.id
+    )
+    assert succeeded_retry.result is not None
+    assert succeeded_retry.result["source_message_ids"] == [
+        player_message.id,
+        narrator_message.id,
+    ]
+    assert succeeded_retry.result["full_post_turn_context"] is True
+    assert succeeded_retry.result["context_status"] == "succeeded"
+    context_result = cast(dict[str, object], succeeded_retry.result["context_result"])
+    assert "agentic_context" in context_result
+    for message in (player_message, narrator_message):
+        rows = repositories.list_message_scene_presence(
+            save.id,
+            message_id=message.id,
+        )
+        assert [(row.character_id, row.source) for row in rows] == [
+            (lio.id, "context_retry")
+        ]
 
 
 def test_run_context_update_retries_defers_when_recent_provider_pressure(

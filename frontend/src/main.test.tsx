@@ -1450,6 +1450,30 @@ describe("frontend helpers", () => {
     expect(updates).toHaveBeenNthCalledWith(2, expect.objectContaining({ event_id: 3 }));
   });
 
+  it("delivers world data changed save events", async () => {
+    const { watchSave } = await import("./api");
+    const sources = installEventSourceDouble();
+    const updates = vi.fn();
+
+    const stop = watchSave("save-1", updates);
+
+    act(() => {
+      sources[0].dispatch("world_data_changed", {
+        event_id: 1,
+        save_id: "save-1",
+        type: "world_data_changed",
+        payload: { reason: "state_extraction_retry" }
+      });
+    });
+    stop();
+
+    expect(updates).toHaveBeenCalledWith(expect.objectContaining({
+      event_id: 1,
+      type: "world_data_changed",
+      payload: { reason: "state_extraction_retry" }
+    }));
+  });
+
   it("recovers from malformed save events without delivering stale data", async () => {
     const { watchSave } = await import("./api");
     const sources = installEventSourceDouble();
