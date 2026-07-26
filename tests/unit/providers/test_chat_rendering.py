@@ -42,6 +42,9 @@ def test_provider_chat_messages_include_npc_knowledge_boundary() -> None:
     assert "Avoid routine passive ending beats" in messages[0]["content"]
     assert "give the player space" in messages[0]["content"]
     assert "concrete visible initiative" in messages[0]["content"]
+    assert "full spectrum" in messages[0]["content"]
+    assert "hostile" in messages[0]["content"]
+    assert "unreasonable" in messages[0]["content"]
 
 
 def test_chat_system_body_uses_request_response_style_override() -> None:

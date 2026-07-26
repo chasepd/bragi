@@ -1050,6 +1050,12 @@ def test_narrator_planner_defaults_missing_new_plan_fields() -> None:
     assert spec.npc_intents[0].character_id == ""
     assert spec.npc_intents[0].route_stage == ""
     assert spec.npc_intents[0].max_plausible_escalation == ""
+    prompt_text = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert "full spectrum" in prompt_text
+    assert "hostile" in prompt_text
+    assert "unreasonable" in prompt_text
 
 
 def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
@@ -1148,6 +1154,9 @@ def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
     assert "NPC knowledge leaks" in prompt_text
     assert "unearned NPC compliance" in prompt_text
     assert "passive NPC/world handling" in prompt_text
+    assert "full spectrum" in prompt_text
+    assert "hostile" in prompt_text
+    assert "unreasonable" in prompt_text
     assert "Ilyra" in prompt_text
 
 

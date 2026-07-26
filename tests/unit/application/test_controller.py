@@ -3742,6 +3742,12 @@ def test_save_scenario_draft_seeds_reviewed_full_roleplay_starting_npcs(
             "name": "Captain Ilyra",
             "role": "Exiled commander",
             "known_state": "Captain Ilyra watches the reef gate.",
+            "goals": "Keep the reef gate closed until dawn.",
+            "motivations": "Protect the harbor from a second drowning.",
+            "current_intent": "Demand proof before opening the sealed winch room.",
+            "boundaries": "Will not leave the gate while the bell is ringing.",
+            "attitude_toward_player": "Hostile until Mara proves she has the writ.",
+            "cooperation_conditions": "Helps only after Mara shows the harbor writ.",
         },
         {
             "name": "Brother Senn",
@@ -3778,6 +3784,16 @@ def test_save_scenario_draft_seeds_reviewed_full_roleplay_starting_npcs(
         "Brother Senn",
         "Vey the outrider",
     ]
+    ilyra_starter = content["character_starters"][0]
+    assert ilyra_starter["current_intent"] == (
+        "Demand proof before opening the sealed winch room."
+    )
+    assert ilyra_starter["attitude_toward_player"] == (
+        "Hostile until Mara proves she has the writ."
+    )
+    assert ilyra_starter["cooperation_conditions"] == (
+        "Helps only after Mara shows the harbor writ."
+    )
     characters = repositories.list_characters(active_save_id)
     character_names = {character.name for character in characters}
     assert character_names == {
@@ -3810,6 +3826,29 @@ def test_save_scenario_draft_seeds_reviewed_full_roleplay_starting_npcs(
     assert all(
         "relationships" not in character.locked_fields for character in characters
     )
+    ilyra = next(
+        character for character in characters if character.name == "Captain Ilyra"
+    )
+    assert ilyra.goals == "Keep the reef gate closed until dawn."
+    assert ilyra.motivations == "Protect the harbor from a second drowning."
+    assert ilyra.current_intent == (
+        "Demand proof before opening the sealed winch room."
+    )
+    assert ilyra.boundaries == "Will not leave the gate while the bell is ringing."
+    assert ilyra.attitude_toward_player == (
+        "Hostile until Mara proves she has the writ."
+    )
+    assert ilyra.cooperation_conditions == (
+        "Helps only after Mara shows the harbor writ."
+    )
+    assert {
+        "goals",
+        "motivations",
+        "current_intent",
+        "boundaries",
+        "attitude_toward_player",
+        "cooperation_conditions",
+    } <= set(ilyra.locked_fields)
     vey = next(
         character for character in characters if character.name == "Vey the outrider"
     )

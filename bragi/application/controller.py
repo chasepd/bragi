@@ -6534,6 +6534,12 @@ def _character_profile_starter(character: CharacterRecord) -> ScenarioCharacterS
         voice=character.voice,
         texting_style=character.texting_style,
         relationships=dict(character.relationships),
+        goals=character.goals,
+        motivations=character.motivations,
+        current_intent=character.current_intent,
+        boundaries=character.boundaries,
+        attitude_toward_player=character.attitude_toward_player,
+        cooperation_conditions=character.cooperation_conditions,
         status=character.status,
         met=character.met,
         locked_fields=tuple(character.locked_fields),
@@ -6603,7 +6609,19 @@ def _apply_completed_character_profile(
         ),
         goals=cast(str, updates.get("goals", character.goals)),
         motivations=cast(str, updates.get("motivations", character.motivations)),
+        current_intent=cast(
+            str,
+            updates.get("current_intent", character.current_intent),
+        ),
         boundaries=cast(str, updates.get("boundaries", character.boundaries)),
+        attitude_toward_player=cast(
+            str,
+            updates.get("attitude_toward_player", character.attitude_toward_player),
+        ),
+        cooperation_conditions=cast(
+            str,
+            updates.get("cooperation_conditions", character.cooperation_conditions),
+        ),
         status=cast(str, updates.get("status", character.status)),
         locked_fields=(
             normalize_character_locked_fields(
@@ -6636,7 +6654,16 @@ def _apply_completed_character_agency(
         character,
         goals=updates.get("goals", character.goals),
         motivations=updates.get("motivations", character.motivations),
+        current_intent=updates.get("current_intent", character.current_intent),
         boundaries=updates.get("boundaries", character.boundaries),
+        attitude_toward_player=updates.get(
+            "attitude_toward_player",
+            character.attitude_toward_player,
+        ),
+        cooperation_conditions=updates.get(
+            "cooperation_conditions",
+            character.cooperation_conditions,
+        ),
         locked_fields=normalize_character_locked_fields(
             (*character.locked_fields, *generated_locks),
             preserve_unknown=True,
@@ -7648,7 +7675,10 @@ def _seed_initial_character_registry(
             relationships=dict(entry.relationships or {}),
             goals=entry.goals.strip(),
             motivations=entry.motivations.strip(),
+            current_intent=entry.current_intent.strip(),
             boundaries=entry.boundaries.strip(),
+            attitude_toward_player=entry.attitude_toward_player.strip(),
+            cooperation_conditions=entry.cooperation_conditions.strip(),
             status=entry.status.strip() or "present at scenario start",
             source_message_id=source_message_id,
             locked_fields=starter_identity_locked_fields(entry),

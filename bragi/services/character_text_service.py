@@ -5244,6 +5244,10 @@ def _context_lines(
             "Character profile attitude toward player",
             character.attitude_toward_player,
         ),
+        _join_label(
+            "Character profile cooperation conditions",
+            character.cooperation_conditions,
+        ),
         _route_context(save_id=save_id, character=character, repositories=repositories),
         *_character_scoped_knowledge_context(
             save_id=save_id,
@@ -5317,6 +5321,14 @@ def _phone_context_lines(
         *_phone_time_context_lines(snapshot),
         _join_label("Known character status", character.status),
         _join_label("Known character current intent", character.current_intent),
+        _join_label(
+            "Known character attitude toward player",
+            character.attitude_toward_player,
+        ),
+        _join_label(
+            "Known character cooperation conditions",
+            character.cooperation_conditions,
+        ),
         _phone_location_context_line(character=character, repositories=repositories),
         (
             "Active-scene details omitted from phone context are not known to "
