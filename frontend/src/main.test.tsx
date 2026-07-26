@@ -6879,7 +6879,7 @@ describe("frontend helpers", () => {
 
   it("collapses and restores the top bar controls", async () => {
     installEventSourceDouble();
-    vi.stubGlobal("fetch", workbenchFetch([], runtimeModel({
+    const model = runtimeModel({
       world_time: {
         snapshot_id: "scene-1",
         day_index: 5,
@@ -6891,11 +6891,13 @@ describe("frontend helpers", () => {
         confidence: null,
         display: "Friday festival week evening at 21:15"
       }
-    })));
-    const { Workbench } = await import("./main");
+    });
+    vi.stubGlobal("fetch", workbenchFetch([], model));
+    const client = new QueryClient();
+    const { Workbench, runtimeQueryKey } = await import("./main");
 
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <QueryClientProvider client={client}>
         <Workbench
           currentUser={{ id: "user-1", username: "Mira", role: "user", status: "active" }}
           onLogout={vi.fn()}
@@ -6910,6 +6912,8 @@ describe("frontend helpers", () => {
 
     const collapseButton = screen.getByRole("button", { name: "Collapse top bar" });
     expect(collapseButton).toHaveAttribute("aria-expanded", "true");
+    expect(collapseButton).toHaveStyle({ marginLeft: "auto" });
+    expect(collapseButton.parentElement).toHaveStyle({ marginLeft: "auto" });
     await userEvent.click(collapseButton);
 
     expect(screen.queryByRole("heading", { name: "Lantern Keep" })).not.toBeInTheDocument();
@@ -6918,6 +6922,15 @@ describe("frontend helpers", () => {
     expect(screen.queryByText("Friday festival week evening at 21:15")).not.toBeInTheDocument();
     const expandButton = screen.getByRole("button", { name: "Expand top bar" });
     expect(expandButton).toHaveAttribute("aria-expanded", "false");
+    expect(expandButton).toBe(collapseButton);
+
+    act(() => {
+      const erroredModel = { ...model, error: "Runtime connection lost." };
+      client.setQueryData(runtimeQueryKey(null), erroredModel);
+      client.setQueryData(runtimeQueryKey("save-1"), erroredModel);
+    });
+    const runtimeAlert = await screen.findByText("Runtime connection lost.");
+    expect(runtimeAlert).toHaveAttribute("role", "alert");
 
     await userEvent.click(expandButton);
 

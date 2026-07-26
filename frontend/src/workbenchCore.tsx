@@ -3463,12 +3463,12 @@ function Workbench({
               />
             </div>
           ) : null}
-          <div className="topbar-actions">
+          <div className="topbar-actions" style={{ marginLeft: "auto" }}>
+            {runtimeLoadError || model?.error ? (
+              <p className="topbar-error" role="alert">{runtimeLoadError || model?.error}</p>
+            ) : null}
             {topbarExpanded ? (
               <>
-                {runtimeLoadError || model?.error ? (
-                  <p className="topbar-error" role="alert">{runtimeLoadError || model?.error}</p>
-                ) : null}
                 <button
                   type="button"
                   className="icon-button"
@@ -3517,6 +3517,7 @@ function Workbench({
               title={topbarExpanded ? "Collapse top bar" : "Expand top bar"}
               aria-label={topbarExpanded ? "Collapse top bar" : "Expand top bar"}
               aria-expanded={topbarExpanded}
+              style={{ marginLeft: "auto" }}
               onClick={() => setTopbarExpanded((expanded) => !expanded)}
             >
               {topbarExpanded ? (
