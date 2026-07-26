@@ -18861,8 +18861,10 @@ describe("frontend helpers", () => {
     }));
 
     expect(screen.getByText("Routing Lanes")).toBeInTheDocument();
+    const advancedSection = screen.getByRole("button", { name: /advanced model routing/i }).closest("section");
+    expect(advancedSection).not.toBeNull();
     for (const group of ["Narration", "Cast & Direction", "Context & World", "Authoring & Media"]) {
-      expect(screen.getByRole("heading", { name: group })).toBeInTheDocument();
+      expect(within(advancedSection as HTMLElement).getByRole("heading", { name: group })).toBeInTheDocument();
     }
     for (const label of [
       "Narrator",
@@ -18887,7 +18889,7 @@ describe("frontend helpers", () => {
       "Video Generation",
       "Image Animation"
     ]) {
-      expect(screen.getByText(label)).toBeInTheDocument();
+      expect(within(advancedSection as HTMLElement).getByText(label)).toBeInTheDocument();
     }
     expect(screen.queryByText("Background Text")).not.toBeInTheDocument();
     expect(screen.queryByText("Context Work")).not.toBeInTheDocument();
@@ -18937,6 +18939,264 @@ describe("frontend helpers", () => {
       path === "/api/settings/model-routing-profiles/fast" &&
       init?.method === "DELETE"
     ))).toBe(true);
+  });
+
+  it("renders simple model selectors between model profiles and roleplay model sets", async () => {
+    const chatOptions = [modelOption("chat-a", "Chat A", ["chat"])];
+    const structuredOptions = [modelOption("structured-a", "Structured A", ["structured_output", "tool_calling"])];
+    const imageOptions = [modelOption("image-a", "Image A", ["image_generation"])];
+    const editOptions = [modelOption("edit-a", "Edit A", ["image_to_image"])];
+    const videoOptions = [modelOption("video-a", "Video A", ["text_to_video", "image_plus_text_to_video"])];
+
+    await renderModelSettings(modelSettingsPayload({
+      model_routing_profiles: modelRoutingProfilesSettings(),
+      task_model_selectors: [
+        modelSelector("chat", chatOptions),
+        modelSelector("chat_fallback", chatOptions),
+        modelSelector("response_planning", structuredOptions),
+        modelSelector("structured_output_fallback", structuredOptions),
+        modelSelector("tool_call_fallback", structuredOptions),
+        modelSelector("image_generation", imageOptions),
+        modelSelector("image_fallback", imageOptions),
+        modelSelector("image_to_image_generation", editOptions),
+        modelSelector("image_edit_fallback", editOptions),
+        modelSelector("video_generation", videoOptions),
+        modelSelector("image_animation", videoOptions),
+        modelSelector("video_fallback", videoOptions)
+      ]
+    }));
+
+    const bodyText = document.body.textContent ?? "";
+    expect(bodyText.indexOf("Model Profiles")).toBeLessThan(bodyText.indexOf("Simple Model Selectors"));
+    expect(bodyText.indexOf("Simple Model Selectors")).toBeLessThan(bodyText.indexOf("Roleplay Model Sets"));
+
+    const section = screen.getByRole("heading", { name: "Simple Model Selectors" }).closest("section");
+    expect(section).not.toBeNull();
+    for (const label of ["Structured Output / Tool Calls", "Prose", "Image Generation", "Image Edit", "Video Generation"]) {
+      expect(within(section as HTMLElement).getByText(label)).toBeInTheDocument();
+      expect(within(section as HTMLElement).getByLabelText(`${label} main model`)).toBeInTheDocument();
+      expect(within(section as HTMLElement).getByLabelText(`${label} fallback model`)).toBeInTheDocument();
+    }
+  });
+
+  it("applies the simple prose selector to text tasks and enables chat fallback", async () => {
+    const chatOptions = [
+      modelOption("text-a", "Text A", ["chat"]),
+      modelOption("text-b", "Text B", ["chat"]),
+      modelOption("text-fallback", "Text Fallback", ["chat"])
+    ];
+    const fetchMock = await renderModelSettings(modelSettingsPayload({
+      task_model_selectors: [
+        modelSelector("chat", chatOptions, "text-a"),
+        modelSelector("scenario_generation", chatOptions, "text-a"),
+        modelSelector("summarization", chatOptions, "text-a"),
+        modelSelector("image_prompt", chatOptions, "text-a"),
+        modelSelector("narrator_fallback", chatOptions, "text-a"),
+        modelSelector("chat_fallback", chatOptions, "text-a")
+      ],
+      roleplay_model_groups: [
+        {
+          roleplay_type: "full_roleplay",
+          label: "Generic Roleplay",
+          selectors: [
+            modelSelector("chat_full_roleplay", chatOptions, "text-a"),
+            modelSelector("full_roleplay_summarization", chatOptions, "text-a"),
+            modelSelector("full_roleplay_image_prompt", chatOptions, "text-a"),
+            modelSelector("full_roleplay_narrator_fallback", chatOptions, "text-a"),
+            modelSelector("full_roleplay_chat_fallback", chatOptions, "text-a")
+          ]
+        }
+      ],
+      scenario_section_model_selectors: [
+        modelSelector("scenario_generation_section_opening_message", chatOptions, "text-a", { label: "Opening Message", section_id: "opening_message" })
+      ],
+      chat_fallback: { setting_key: "chat_fallback_enabled", enabled: false }
+    }));
+
+    const mainSelect = screen.getByLabelText("Prose main model");
+    const row = mainSelect.closest(".model-routing-row");
+    expect(row).not.toBeNull();
+    await userEvent.selectOptions(mainSelect, "fake\u0000text-b");
+    await userEvent.selectOptions(within(row as HTMLElement).getByLabelText("Prose fallback model"), "fake\u0000text-fallback");
+    await userEvent.click(within(row as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([path]) => path === "/api/settings/model-preference")).toHaveLength(12));
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/model-preference")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
+        { task: "chat", provider: "fake", model_id: "text-b" },
+        { task: "scenario_generation", provider: "fake", model_id: "text-b" },
+        { task: "summarization", provider: "fake", model_id: "text-b" },
+        { task: "image_prompt", provider: "fake", model_id: "text-b" },
+        { task: "chat_full_roleplay", provider: "fake", model_id: "text-b" },
+        { task: "full_roleplay_summarization", provider: "fake", model_id: "text-b" },
+        { task: "full_roleplay_image_prompt", provider: "fake", model_id: "text-b" },
+        { task: "scenario_generation_section_opening_message", provider: "fake", model_id: "text-b" },
+        { task: "narrator_fallback", provider: "fake", model_id: "text-fallback" },
+        { task: "chat_fallback", provider: "fake", model_id: "text-fallback" },
+        { task: "full_roleplay_narrator_fallback", provider: "fake", model_id: "text-fallback" },
+        { task: "full_roleplay_chat_fallback", provider: "fake", model_id: "text-fallback" }
+      ]);
+    const scopedCalls = fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .map(([, init]) => JSON.parse(String(init.body)));
+    expect(scopedCalls).toEqual([{ key: "chat_fallback_enabled", value: true }]);
+  });
+
+  it("applies the simple structured and tool-call selector to all structured tasks and fallback flags", async () => {
+    const options = [
+      modelOption("structured-a", "Structured A", ["structured_output", "tool_calling"]),
+      modelOption("structured-b", "Structured B", ["structured_output", "tool_calling"]),
+      modelOption("structured-fallback", "Structured Fallback", ["structured_output", "tool_calling"])
+    ];
+    const fetchMock = await renderModelSettings(modelSettingsPayload({
+      task_model_selectors: [
+        modelSelector("response_planning", options, "structured-a"),
+        modelSelector("context_update", options, "structured-a"),
+        modelSelector("dating_route_profile", options, "structured-a"),
+        modelSelector("structured_output_fallback", options, "structured-a"),
+        modelSelector("tool_call_fallback", options, "structured-a")
+      ],
+      roleplay_model_groups: [
+        {
+          roleplay_type: "full_roleplay",
+          label: "Generic Roleplay",
+          selectors: [
+            modelSelector("full_roleplay_response_planning", options, "structured-a"),
+            modelSelector("full_roleplay_context_update", options, "structured-a"),
+            modelSelector("full_roleplay_structured_output_fallback", options, "structured-a"),
+            modelSelector("full_roleplay_tool_call_fallback", options, "structured-a")
+          ]
+        }
+      ],
+      structured_output_fallback: { setting_key: "structured_output_fallback_enabled", enabled: false },
+      tool_call_fallback: { setting_key: "tool_call_fallback_enabled", enabled: false }
+    }));
+
+    const mainSelect = screen.getByLabelText("Structured Output / Tool Calls main model");
+    const row = mainSelect.closest(".model-routing-row");
+    expect(row).not.toBeNull();
+    await userEvent.selectOptions(mainSelect, "fake\u0000structured-b");
+    await userEvent.selectOptions(within(row as HTMLElement).getByLabelText("Structured Output / Tool Calls fallback model"), "fake\u0000structured-fallback");
+    await userEvent.click(within(row as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([path]) => path === "/api/settings/model-preference")).toHaveLength(9));
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/model-preference")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
+        { task: "response_planning", provider: "fake", model_id: "structured-b" },
+        { task: "context_update", provider: "fake", model_id: "structured-b" },
+        { task: "dating_route_profile", provider: "fake", model_id: "structured-b" },
+        { task: "full_roleplay_response_planning", provider: "fake", model_id: "structured-b" },
+        { task: "full_roleplay_context_update", provider: "fake", model_id: "structured-b" },
+        { task: "structured_output_fallback", provider: "fake", model_id: "structured-fallback" },
+        { task: "tool_call_fallback", provider: "fake", model_id: "structured-fallback" },
+        { task: "full_roleplay_structured_output_fallback", provider: "fake", model_id: "structured-fallback" },
+        { task: "full_roleplay_tool_call_fallback", provider: "fake", model_id: "structured-fallback" }
+      ]);
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
+        { key: "structured_output_fallback_enabled", value: true },
+        { key: "tool_call_fallback_enabled", value: true }
+      ]);
+  });
+
+  it("applies simple media selectors including image edit fallback and image animation", async () => {
+    const imageOptions = [
+      modelOption("image-a", "Image A", ["image_generation"]),
+      modelOption("image-b", "Image B", ["image_generation"]),
+      modelOption("image-fallback", "Image Fallback", ["image_generation"])
+    ];
+    const editOptions = [
+      modelOption("edit-a", "Edit A", ["image_to_image"]),
+      modelOption("edit-b", "Edit B", ["image_to_image"]),
+      modelOption("edit-fallback", "Edit Fallback", ["image_to_image"])
+    ];
+    const videoOptions = [
+      modelOption("video-a", "Video A", ["text_to_video", "image_plus_text_to_video"]),
+      modelOption("video-b", "Video B", ["text_to_video", "image_plus_text_to_video"]),
+      modelOption("video-fallback", "Video Fallback", ["text_to_video"])
+    ];
+    const fetchMock = await renderModelSettings(modelSettingsPayload({
+      task_model_selectors: [
+        modelSelector("image_generation", imageOptions, "image-a"),
+        modelSelector("image_fallback", imageOptions, "image-a"),
+        modelSelector("image_to_image_generation", editOptions, "edit-a"),
+        modelSelector("scene_image_edit_generation", editOptions, "edit-a"),
+        modelSelector("character_image_edit_generation", editOptions, "edit-a"),
+        modelSelector("text_message_image_edit_generation", editOptions, "edit-a"),
+        modelSelector("image_edit_fallback", editOptions, "edit-a"),
+        modelSelector("video_generation", videoOptions, "video-a"),
+        modelSelector("image_animation", videoOptions, "video-a"),
+        modelSelector("video_fallback", videoOptions, "video-a")
+      ],
+      roleplay_model_groups: [
+        {
+          roleplay_type: "full_roleplay",
+          label: "Generic Roleplay",
+          selectors: [
+            modelSelector("full_roleplay_image_generation", imageOptions, "image-a"),
+            modelSelector("full_roleplay_image_fallback", imageOptions, "image-a"),
+            modelSelector("full_roleplay_scene_image_edit_generation", editOptions, "edit-a"),
+            modelSelector("full_roleplay_image_edit_fallback", editOptions, "edit-a"),
+            modelSelector("full_roleplay_video_generation", videoOptions, "video-a"),
+            modelSelector("full_roleplay_image_animation", videoOptions, "video-a"),
+            modelSelector("full_roleplay_video_fallback", videoOptions, "video-a")
+          ]
+        }
+      ],
+      image_fallback: { setting_key: "image_fallback_enabled", enabled: false },
+      video_fallback: { setting_key: "video_fallback_enabled", enabled: false }
+    }));
+
+    const imageRow = screen.getByLabelText("Image Generation main model").closest(".model-routing-row");
+    expect(imageRow).not.toBeNull();
+    await userEvent.selectOptions(screen.getByLabelText("Image Generation main model"), "fake\u0000image-b");
+    await userEvent.selectOptions(within(imageRow as HTMLElement).getByLabelText("Image Generation fallback model"), "fake\u0000image-fallback");
+    await userEvent.click(within(imageRow as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    const editRow = screen.getByLabelText("Image Edit main model").closest(".model-routing-row");
+    expect(editRow).not.toBeNull();
+    await userEvent.selectOptions(screen.getByLabelText("Image Edit main model"), "fake\u0000edit-b");
+    await userEvent.selectOptions(within(editRow as HTMLElement).getByLabelText("Image Edit fallback model"), "fake\u0000edit-fallback");
+    await userEvent.click(within(editRow as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    const videoRow = screen.getByLabelText("Video Generation main model").closest(".model-routing-row");
+    expect(videoRow).not.toBeNull();
+    await userEvent.selectOptions(screen.getByLabelText("Video Generation main model"), "fake\u0000video-b");
+    await userEvent.selectOptions(within(videoRow as HTMLElement).getByLabelText("Video Generation fallback model"), "fake\u0000video-fallback");
+    await userEvent.click(within(videoRow as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([path]) => path === "/api/settings/model-preference")).toHaveLength(17));
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/model-preference")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
+        { task: "image_generation", provider: "fake", model_id: "image-b" },
+        { task: "full_roleplay_image_generation", provider: "fake", model_id: "image-b" },
+        { task: "image_fallback", provider: "fake", model_id: "image-fallback" },
+        { task: "full_roleplay_image_fallback", provider: "fake", model_id: "image-fallback" },
+        { task: "image_to_image_generation", provider: "fake", model_id: "edit-b" },
+        { task: "scene_image_edit_generation", provider: "fake", model_id: "edit-b" },
+        { task: "character_image_edit_generation", provider: "fake", model_id: "edit-b" },
+        { task: "text_message_image_edit_generation", provider: "fake", model_id: "edit-b" },
+        { task: "full_roleplay_scene_image_edit_generation", provider: "fake", model_id: "edit-b" },
+        { task: "image_edit_fallback", provider: "fake", model_id: "edit-fallback" },
+        { task: "full_roleplay_image_edit_fallback", provider: "fake", model_id: "edit-fallback" },
+        { task: "video_generation", provider: "fake", model_id: "video-b" },
+        { task: "image_animation", provider: "fake", model_id: "video-b" },
+        { task: "full_roleplay_video_generation", provider: "fake", model_id: "video-b" },
+        { task: "full_roleplay_image_animation", provider: "fake", model_id: "video-b" },
+        { task: "video_fallback", provider: "fake", model_id: "video-fallback" },
+        { task: "full_roleplay_video_fallback", provider: "fake", model_id: "video-fallback" }
+      ]);
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
+        { key: "image_fallback_enabled", value: true },
+        { key: "image_fallback_enabled", value: true },
+        { key: "video_fallback_enabled", value: true }
+      ]);
   });
 
   it("applies the narrator lane to shared and roleplay narrator selectors", async () => {
@@ -19607,10 +19867,12 @@ describe("frontend helpers", () => {
     }));
 
     const routingSelect = screen.getByLabelText("Narrator model");
+    const narratorRow = routingSelect.closest(".model-routing-row");
+    expect(narratorRow).not.toBeNull();
     expect(within(routingSelect).getByRole("option", {
       name: "Chat A - fake/chat-a · $0.15 in / $0.60 out per 1M · cache $0.01 read / $0.02 write per 1M"
     })).toBeInTheDocument();
-    expect(screen.getByText("Input $0.15 / output $0.60 per 1M tokens · Cache read $0.01 / write $0.02 per 1M tokens")).toBeInTheDocument();
+    expect(within(narratorRow as HTMLElement).getByText("Input $0.15 / output $0.60 per 1M tokens · Cache read $0.01 / write $0.02 per 1M tokens")).toBeInTheDocument();
 
     await expandRoutingLane("Narrator");
     const selector = screen.getByText("Chat").closest(".model-selector");
