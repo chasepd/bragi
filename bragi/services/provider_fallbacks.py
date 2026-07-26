@@ -113,6 +113,12 @@ async def chat_with_fallback(
     try:
         response = await provider.chat(request)
     except ProviderError as exc:
+        _mark_model_unavailable_for_error(
+            repositories,
+            provider=request.provider,
+            model_id=request.model_id,
+            exc=exc,
+        )
         if not _should_try_fallback_for_error(exc):
             record_provider_error(
                 task=task,
@@ -167,6 +173,12 @@ async def chat_with_fallback(
         try:
             response = await providers[fallback.provider].chat(fallback)
         except ProviderError as fallback_exc:
+            _mark_model_unavailable_for_error(
+                repositories,
+                provider=fallback.provider,
+                model_id=fallback.model_id,
+                exc=fallback_exc,
+            )
             enriched = _with_fallback_attempted(
                 fallback_exc,
                 provider=fallback.provider,
@@ -234,6 +246,12 @@ async def chat_with_fallback(
     try:
         response = await providers[fallback.provider].chat(fallback)
     except ProviderError as fallback_exc:
+        _mark_model_unavailable_for_error(
+            repositories,
+            provider=fallback.provider,
+            model_id=fallback.model_id,
+            exc=fallback_exc,
+        )
         enriched = _with_fallback_attempted(
             fallback_exc,
             provider=fallback.provider,
@@ -301,6 +319,12 @@ async def structured_output_with_fallback(
     try:
         response = await provider.generate_structured_output(request)
     except ProviderError as exc:
+        _mark_model_unavailable_for_error(
+            repositories,
+            provider=request.provider,
+            model_id=request.model_id,
+            exc=exc,
+        )
         if not _should_try_fallback_for_error(exc):
             record_provider_error(
                 task=task,
@@ -380,6 +404,12 @@ async def structured_output_with_fallback(
                 fallback
             )
         except ProviderError as fallback_exc:
+            _mark_model_unavailable_for_error(
+                repositories,
+                provider=fallback.provider,
+                model_id=fallback.model_id,
+                exc=fallback_exc,
+            )
             enriched = _with_fallback_attempted(
                 fallback_exc,
                 provider=fallback.provider,
@@ -611,6 +641,36 @@ def tool_call_fallback_skip_reason(
     return "fallback_provider_unavailable"
 
 
+def structured_output_fallback_request(
+    *,
+    repositories: PersistenceRepositories,
+    providers: dict[str, ProviderClient],
+    request: StructuredOutputRequest,
+    save_id: str | None,
+    task: str,
+) -> StructuredOutputRequest | None:
+    return _fallback_structured_output_request(
+        repositories=repositories,
+        providers=providers,
+        request=request,
+        save_id=save_id,
+        task=task,
+    )
+
+
+def structured_output_fallback_skip_reason(
+    *,
+    repositories: PersistenceRepositories,
+    providers: dict[str, ProviderClient],
+    save_id: str | None,
+) -> str:
+    return _structured_output_fallback_skip_reason(
+        repositories=repositories,
+        providers=providers,
+        save_id=save_id,
+    )
+
+
 def _structured_output_fallback_skip_reason(
     *,
     repositories: PersistenceRepositories,
@@ -709,6 +769,21 @@ def provider_error_with_fallback_attempted(
     model_id: str,
 ) -> ProviderError:
     return _with_fallback_attempted(exc, provider=provider, model_id=model_id)
+
+
+def _mark_model_unavailable_for_error(
+    repositories: PersistenceRepositories,
+    *,
+    provider: str,
+    model_id: str,
+    exc: ProviderError,
+) -> None:
+    if exc.category != ProviderErrorCategory.MODEL_NOT_FOUND:
+        return
+    repositories.mark_provider_model_unavailable(
+        provider=provider,
+        model_id=model_id,
+    )
 
 
 def _fallback_preference(

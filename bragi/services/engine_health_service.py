@@ -152,6 +152,12 @@ def _latest_job_payload(
             "error_present": bool(job.error),
             "result_counts": _selected_context_counts(result),
             "diagnostics": _context_search_diagnostics(result),
+            "retrieval_degraded": result.get("retrieval_degraded") is True,
+            **(
+                {"retrieval_recovery": result["retrieval_recovery"]}
+                if isinstance(result.get("retrieval_recovery"), str)
+                else {}
+            ),
         }
     return None
 
@@ -264,6 +270,17 @@ def _warnings(
                 message="Latest context search selected no retrieval context.",
             )
         )
+    if _context_search_is_degraded(latest_context_search):
+        warnings.append(
+            EngineHealthWarning(
+                code="degraded_context_search",
+                severity="warning",
+                message=(
+                    "Latest context search recovered after provider or schema "
+                    "failure."
+                ),
+            )
+        )
     baseline_chars = _int_nested(latest_chat_prompt, "baseline_recent_message_chars")
     if baseline_chars is not None and baseline_chars > HIGH_BASELINE_MESSAGE_CHARS:
         warnings.append(
@@ -285,6 +302,14 @@ def _context_search_is_empty(payload: dict[str, object] | None) -> bool:
     counts = payload.get("result_counts")
     return isinstance(counts, dict) and not any(
         isinstance(value, int) and value > 0 for value in counts.values()
+    )
+
+
+def _context_search_is_degraded(payload: dict[str, object] | None) -> bool:
+    return (
+        payload is not None
+        and payload.get("status") == "succeeded"
+        and payload.get("retrieval_degraded") is True
     )
 
 

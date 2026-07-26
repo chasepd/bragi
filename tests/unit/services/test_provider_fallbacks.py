@@ -254,6 +254,46 @@ def test_chat_with_fallback_reports_unavailable_fallback_model(
     assert fields["fallback_skipped_reason"] == "fallback_model_unavailable"
 
 
+def test_chat_with_fallback_marks_model_not_found_unavailable(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="primary",
+        model_id="primary-chat",
+        display_name="Primary Chat",
+        capabilities=["chat"],
+    )
+    primary = RecordingChatProvider(
+        provider_name="primary",
+        error=ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "primary chat model missing",
+            status_code=404,
+        ),
+    )
+
+    with pytest.raises(ProviderError):
+        asyncio.run(
+            chat_with_fallback(
+                repositories=repositories,
+                providers={"primary": primary},
+                request=ChatRequest(
+                    provider="primary",
+                    model_id="primary-chat",
+                    messages=(ChatMessage(role="player", body="Summarize this."),),
+                ),
+                task="summarization",
+                save_id="save-1",
+            )
+        )
+
+    assert [
+        model.available
+        for model in repositories.list_provider_models("primary")
+        if model.model_id == "primary-chat"
+    ] == [False]
+
+
 def test_chat_with_fallback_failure_reports_attempted_fallback(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -659,6 +699,42 @@ def test_structured_output_fallback_attempts_configured_provider(
     assert response.provider == "fallback"
     assert response.model_id == "fallback-structured"
     assert response.data == {"selected": ["memory-1"]}
+
+
+def test_structured_output_fallback_marks_model_not_found_unavailable(
+    repositories: PersistenceRepositories,
+) -> None:
+    _save_primary_structured_model(repositories)
+    _configure_working_structured_fallback(repositories)
+    primary = RecordingStructuredProvider(
+        provider_name="primary",
+        error=ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "primary structured output model missing",
+            status_code=404,
+        ),
+    )
+    fallback = RecordingStructuredProvider(
+        provider_name="fallback",
+        response_data={"selected": ["memory-1"]},
+    )
+
+    response = asyncio.run(
+        structured_output_with_fallback(
+            repositories=repositories,
+            providers={"primary": primary, "fallback": fallback},
+            request=_structured_request(),
+            task="context_search",
+            save_id="save-1",
+        )
+    )
+
+    assert response.provider == "fallback"
+    assert [
+        model.available
+        for model in repositories.list_provider_models("primary")
+        if model.model_id == "primary-structured"
+    ] == [False]
 
 
 def test_structured_output_fallback_failure_reports_attempted_fallback(

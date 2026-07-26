@@ -51,5 +51,50 @@ def test_engine_health_does_not_expose_raw_job_errors(
         "error_present": True,
         "result_counts": {},
         "diagnostics": {},
+        "retrieval_degraded": False,
     }
     assert "secret" not in json.dumps(snapshot.latest_context_search)
+
+
+def test_engine_health_warns_on_degraded_context_search(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Lantern Keep")
+    jobs = JobLifecycleService(repositories=repositories)
+    context_search = jobs.create_running(
+        save_id=save.id,
+        type="context_search",
+        payload={},
+    )
+    jobs.succeed(
+        context_search.id,
+        result={
+            "selected_memories": [{"source_id": "memory-1"}],
+            "retrieval_degraded": True,
+            "retrieval_recovery": "deterministic_fallback",
+            "provider": "fake",
+            "model": "fake-context",
+            "raw_prompt": "Secret chronicle phrase",
+        },
+    )
+
+    snapshot = EngineHealthService(repositories).snapshot(save.id)
+
+    assert snapshot.latest_context_search == {
+        "status": "succeeded",
+        "error_present": False,
+        "result_counts": {"selected_memories": 1},
+        "diagnostics": {},
+        "retrieval_degraded": True,
+        "retrieval_recovery": "deterministic_fallback",
+    }
+    warnings = {warning.code: warning for warning in snapshot.warnings}
+    assert warnings["degraded_context_search"].severity == "warning"
+    assert "Secret chronicle phrase" not in json.dumps(snapshot.latest_context_search)
