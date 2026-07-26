@@ -1335,7 +1335,7 @@ def test_settings_service_persists_chat_fallback_preference(
         "dating_sim_structured_output_fallback",
     ],
 )
-def test_settings_service_auto_enables_structured_output_fallback_when_model_is_set(
+def test_settings_service_preserves_structured_output_fallback_toggle_when_model_is_set(
     tmp_path: Path,
     task: str,
 ) -> None:
@@ -1370,7 +1370,7 @@ def test_settings_service_auto_enables_structured_output_fallback_when_model_is_
                 "structured_output_fallback_enabled",
                 default=False,
             )
-            is True
+            is False
         )
 
 
@@ -1413,7 +1413,7 @@ def test_settings_service_rejects_retired_model_tasks(
         "dating_sim_tool_call_fallback",
     ],
 )
-def test_settings_service_auto_enables_tool_call_fallback_when_model_is_set(
+def test_settings_service_preserves_tool_call_fallback_toggle_when_model_is_set(
     tmp_path: Path,
     task: str,
 ) -> None:
@@ -1448,7 +1448,7 @@ def test_settings_service_auto_enables_tool_call_fallback_when_model_is_set(
                 "tool_call_fallback_enabled",
                 default=False,
             )
-            is True
+            is False
         )
 
 
@@ -1716,14 +1716,14 @@ def test_settings_service_sanitizes_image_style_preset_preference(
         service = _settings_service(repositories)
         repositories.set_app_setting(IMAGE_STYLE_PRESET_SETTING, "comic_book")
 
-        assert service.get_local_setting(IMAGE_STYLE_PRESET_SETTING) == "none"
+        assert service.get_local_setting(IMAGE_STYLE_PRESET_SETTING) == "realistic"
 
         assert (
             service.get_local_setting(
                 IMAGE_STYLE_PRESET_SETTING,
                 save_id=first_save.id,
             )
-            == "none"
+            == "realistic"
         )
         service.set_local_setting(
             IMAGE_STYLE_PRESET_SETTING,
@@ -1760,13 +1760,13 @@ def test_settings_service_sanitizes_image_style_preset_preference(
                 IMAGE_STYLE_PRESET_SETTING,
                 save_id=first_save.id,
             )
-            == "none"
+            == "realistic"
         )
         assert (
             repositories.get_app_setting(
                 save_image_style_preset_setting_key(first_save.id)
             )
-            == "none"
+            == "realistic"
         )
 
 

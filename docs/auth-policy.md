@@ -127,6 +127,7 @@ or per user/session before using a save ID.
 | `/api/scenarios/draft` | Authenticated | Create drafts for the current user. |
 | `/api/scenarios/continuation-draft` | Save-scoped | Create continuation draft only from an accessible save. |
 | `/api/scenarios/draft/save` | Authenticated | Save drafts under current user/admin policy. |
+| `/api/scenarios/draft/character-starters/generate` | Authenticated | Generate draft character starters for the current user; child blocked. |
 | `/api/scenarios/draft/section` | Authenticated | Regenerate draft sections for the current user. |
 | `/api/chat` | Save-scoped | Submit chat only to an accessible save; child allowed for owned or assigned saves. |
 | `/api/chat/look-around` | Save-scoped | Ask side-channel scene questions only for an accessible save; child allowed for owned or assigned saves. |

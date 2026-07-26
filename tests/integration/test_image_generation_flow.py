@@ -199,8 +199,10 @@ def test_fake_provider_image_generation_flow_persists_file_metadata_and_ui_model
         assert asset.model == "fake-image"
         assert len(provider.chat_requests) == 1
         assert len(provider.image_requests) == 1
-        assert provider.image_requests[0].prompt == "cinematic drafted image prompt"
-        assert asset.prompt == "cinematic drafted image prompt"
+        generated_prompt = provider.image_requests[0].prompt
+        assert generated_prompt.startswith("cinematic drafted image prompt\n\n")
+        assert "Style preset: Realistic." in generated_prompt
+        assert asset.prompt == generated_prompt
         assert latest is not None
         assert latest.path == asset.path
         assert latest.thumbnail_path == asset.thumbnail_path

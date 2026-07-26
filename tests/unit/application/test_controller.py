@@ -1014,108 +1014,6 @@ def test_manual_scenario_classifies_every_persisted_text_section(
     assert content["_source"]["content_rating"] == "g"
 
 
-def test_manual_scenario_fails_closed_when_generated_character_starter_review_fails(
-    repositories: PersistenceRepositories,
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    runtime = _import_runtime_without_gtk(monkeypatch)
-    completion_provider = RuntimeStructuredCleanupProvider(
-        [
-            {
-                "characters": [
-                    {
-                        "name": "Captain Ilyra",
-                        "voice": "forbidden generated starter detail",
-                        "relationships": {
-                            "Mara Voss": "forbidden generated starter detail"
-                        },
-                    }
-                ]
-            }
-        ]
-    )
-    safety_provider = RuntimeSelectiveStarterSafetyProvider(
-        fail_on_starter=True
-    )
-    repositories.set_model_preference(
-        task="context_update",
-        provider="fake",
-        model_id="fake-structured",
-    )
-    _save_fake_provider_model(
-        repositories,
-        model_id="fake-structured",
-        capabilities=["structured_output"],
-    )
-    repositories.set_model_preference(
-        task="content_safety",
-        provider="safety",
-        model_id="fake-safety",
-    )
-    repositories.save_provider_model(
-        provider="safety",
-        model_id="fake-safety",
-        display_name="Fake Safety",
-        capabilities=["structured_output"],
-    )
-    child = repositories.create_user(
-        username="Child",
-        role="child",
-        password_hash="hash",
-    )
-    repositories.set_scoped_setting(
-        scope="user",
-        scope_id=child.id,
-        key="content_filter_rating",
-        value="g",
-    )
-    controller = _runtime_controller(
-        runtime,
-        repositories,
-        tmp_path,
-        providers={
-            "fake": completion_provider,
-            "safety": safety_provider,
-        },
-    )
-
-    model = controller.create_manual_scenario(
-        runtime.ManualScenarioInput(
-            scenario_type="full_roleplay",
-            title="Lantern Keep",
-            premise="A beacon guards a storm coast.",
-            player_character_name="Mara Voss",
-            player_role="Signal warden",
-            characters="Captain Ilyra, the exiled commander.",
-            opening_message="The beacon wakes.",
-        ),
-        current_user_id=child.id,
-    )
-
-    save_id = _value(model, "active_save_id")
-    assert save_id is not None
-    save = repositories.get_save(save_id)
-    assert save is not None
-    scenario = repositories.get_scenario(save.scenario_id)
-    assert scenario is not None
-    content = json.loads(scenario.content_json)
-    assert "forbidden generated starter detail" not in json.dumps(content)
-    assert content["character_starters"][0]["name"] == CONTENT_FILTER_TRANSITION
-    assert content["character_starters"][0]["voice"] == (
-        CONTENT_FILTER_TRANSITION
-    )
-    assert content["character_starters"][0]["relationships"] == {}
-    assert content["_source"]["section_content_ratings"][
-        "character_starters"
-    ] == "g"
-    assert any(
-        "forbidden generated starter detail" in request.messages[-1].body
-        for request in safety_provider.structured_requests
-    )
-    assert _error_text(model) == ""
-
-
 def test_runtime_delete_media_asset_archives_asset_and_refreshes_model(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -1495,7 +1393,6 @@ def test_build_model_exposes_scenario_wizard_flows(
         "player_character_name",
         "player_role",
         "mission_profile",
-        "crew_and_command",
         "ship_or_base_status",
         "exploration_target",
         "unknown_intelligence",
@@ -1513,7 +1410,6 @@ def test_build_model_exposes_scenario_wizard_flows(
         "player_role",
         "expedition_goal",
         "route_options",
-        "party_roster",
         "resource_inventory",
         "environmental_conditions",
         "hazards_and_events",
@@ -1548,7 +1444,6 @@ def test_build_model_exposes_scenario_wizard_flows(
         "player_character_name",
         "player_role",
         "case_facts",
-        "suspects",
         "clues",
         "timeline",
         "red_herrings",
@@ -1564,7 +1459,6 @@ def test_build_model_exposes_scenario_wizard_flows(
         "player_role",
         "target_location",
         "objectives_and_stakes",
-        "crew_and_contacts",
         "intel_and_access",
         "security_model",
         "alert_and_heat",
@@ -1582,7 +1476,6 @@ def test_build_model_exposes_scenario_wizard_flows(
         "player_role",
         "political_arena",
         "political_factions",
-        "major_npcs",
         "central_conflict",
         "secrets_and_leverage",
         "reputation_and_standing",
@@ -1600,7 +1493,6 @@ def test_build_model_exposes_scenario_wizard_flows(
         "player_character_name",
         "player_role",
         "settlement_profile",
-        "population_and_residents",
         "resources_and_indicators",
         "projects_and_facilities",
         "threats_and_opportunities",
@@ -1617,7 +1509,6 @@ def test_build_model_exposes_scenario_wizard_flows(
         "target_profile",
         "leads_and_clues",
         "hunt_locations",
-        "rivals_and_factions",
         "preparation_state",
         "hunt_status",
         "tone_genre",
@@ -1630,7 +1521,6 @@ def test_build_model_exposes_scenario_wizard_flows(
         "player_role",
         "journey_profile",
         "route_and_stops",
-        "traveling_party",
         "transport_and_supplies",
         "recurring_pressures",
         "relationship_threads",
@@ -1648,7 +1538,6 @@ def test_build_model_exposes_scenario_wizard_flows(
         "markets_and_stops",
         "contracts_and_debts",
         "route_hazards",
-        "reputation_and_contacts",
         "profit_and_loss",
         "tone_genre",
         "opening_message",
@@ -1659,7 +1548,6 @@ def test_build_model_exposes_scenario_wizard_flows(
         "player_character_name",
         "player_character_profile",
         "player_role",
-        "romance_options",
         "tone_genre",
         "opening_message",
     ]
@@ -1925,7 +1813,6 @@ def test_create_manual_full_roleplay_save_sets_active_and_appends_opening(
         "lore": "The hall was frozen by a failed oath.",
         "locations": "Mirror nave, reliquary, thawing vault.",
         "factions": "The Thawing Choir.",
-        "characters": "Archivist Vale.",
         "tone_genre": "Gothic exploration.",
         "opening_message": "The frost cracks across the mirror floor.",
         "save_title": "First Thaw",
@@ -2062,12 +1949,6 @@ def test_create_manual_hybrid_scenario_persists_fields_and_seeds_routes(
             species_and_intelligences="Human students, uplift envoys, and station AIs.",
             factions_and_institutions="The academy council and rival charter fleets.",
             mission_stakes="Keep the treaty delegation alive through festival week.",
-            romance_options=(
-                "Mika Arai - station diplomat; precise and lonely.\n"
-                "Sora Minase - shuttle racer; bright and restless.\n"
-                "Yuna Kisaragi - xenobiologist; gentle and storm-drawn.\n"
-                "Nozomi Vale - childhood friend; funny and guarded."
-            ),
             tone_genre="Warm science-fiction romance with diplomatic pressure.",
             opening_message="The airlock opens on the first reception.",
             save_title="Orbital Hearts Save",
@@ -2089,26 +1970,11 @@ def test_create_manual_hybrid_scenario_persists_fields_and_seeds_routes(
     assert content["technology_level"] == (
         "Near-future orbital habitat and alien translators."
     )
-    assert content["romance_options"].startswith("Mika Arai - station diplomat")
 
     characters = repositories.list_characters(active_save_id)
-    assert {character.name for character in characters} == {
-        "Ren Takahashi",
-        "Mika Arai",
-        "Sora Minase",
-        "Yuna Kisaragi",
-        "Nozomi Vale",
-    }
+    assert {character.name for character in characters} == {"Ren Takahashi"}
     routes = repositories.list_dating_route_states(active_save_id)
-    route_names = {
-        next(
-            character.name
-            for character in characters
-            if character.id == route.npc_character_id
-        )
-        for route in routes
-    }
-    assert route_names == {"Mika Arai", "Sora Minase", "Yuna Kisaragi", "Nozomi Vale"}
+    assert routes == []
 
 
 def test_create_manual_first_contact_exploration_save_persists_contact_fields(
@@ -2127,10 +1993,6 @@ def test_create_manual_first_contact_exploration_save_persists_contact_fields(
             player_character_name="Dr. Mara Voss",
             player_role="Mission linguist and acting contact lead",
             mission_profile="Survey the hidden ocean and avoid hostile contact.",
-            crew_and_command=(
-                "Commander Reyes - cautious mission commander; "
-                "Dr. Nia Sol - xenobiologist tracking contamination risk"
-            ),
             ship_or_base_status="Habitat Kestrel has 42 hours of stable heat.",
             exploration_target="A black-water cavern beneath the ice shelf.",
             unknown_intelligence=(
@@ -2175,17 +2037,6 @@ def test_create_manual_first_contact_exploration_save_persists_contact_fields(
         "flashes mark attention."
     )
 
-    crew = [
-        character
-        for character in repositories.list_characters(save.id)
-        if not character.is_player_character
-    ]
-    assert [character.name for character in crew] == [
-        "Commander Reyes",
-        "Dr. Nia Sol",
-    ]
-    assert all("Mission linguist" not in character.known_state for character in crew)
-
     messages = repositories.list_messages(save.id)
     assert [(message.role, message.body) for message in messages] == [
         ("narrator", "Blue light pulses under the ice before sonar speaks back."),
@@ -2193,7 +2044,6 @@ def test_create_manual_first_contact_exploration_save_persists_contact_fields(
     state = {row.key: row for row in repositories.list_world_state(save.id)}
     assert tuple(state) == (
         "contact.base",
-        "contact.crew",
         "contact.discoveries",
         "contact.hazards",
         "contact.intelligence",
@@ -2205,7 +2055,6 @@ def test_create_manual_first_contact_exploration_save_persists_contact_fields(
     assert state["contact.mission"].value == {
         "summary": "Survey the hidden ocean and avoid hostile contact."
     }
-    assert state["contact.crew"].category == "character"
     assert state["contact.base"].value == {
         "summary": "Habitat Kestrel has 42 hours of stable heat."
     }
@@ -2240,7 +2089,6 @@ def test_create_manual_investigation_mystery_save_persists_case_fields(
             player_character_name="Inspector Mara Voss",
             player_role="The investigator assigned to the impossible case",
             case_facts="Curator Elian Vale vanished from a sealed gallery.",
-            suspects="Sera Holt had restoration access and a false alibi.",
             clues="Watch log gap from 9:10 to 9:18; undiscovered and reliable.",
             timeline="Public alarm at 9:21; hidden lift movement at 9:12.",
             red_herrings="A bloody glove belongs to a mannequin repair.",
@@ -2259,7 +2107,6 @@ def test_create_manual_investigation_mystery_save_persists_case_fields(
     assert scenario.type == "investigation_mystery"
     content = json.loads(scenario.content_json)
     assert content["case_facts"] == "Curator Elian Vale vanished from a sealed gallery."
-    assert content["suspects"] == "Sera Holt had restoration access and a false alibi."
     assert content["clues"] == (
         "Watch log gap from 9:10 to 9:18; undiscovered and reliable."
     )
@@ -2293,7 +2140,6 @@ def test_create_manual_survival_expedition_seeds_expedition_state(
             player_role="Expedition lead",
             expedition_goal="Reach Northwatch before the fever medicine spoils.",
             route_options="Cliff road, glacier basin, or old mine tunnel.",
-            party_roster="Mara guides two porters and an injured scout.",
             resource_inventory="Food: 9 days. Water: 6 skins. Medicine: 3 doses.",
             environmental_conditions="Late winter whiteouts and brittle ice.",
             hazards_and_events="Avalanche risk, frostbite, and wolves near timberline.",
@@ -2333,7 +2179,6 @@ def test_create_manual_survival_expedition_seeds_expedition_state(
     assert set(state_by_key) >= {
         "expedition.goal",
         "expedition.route",
-        "expedition.party",
         "expedition.resources",
         "expedition.environment",
         "expedition.hazards",
@@ -2369,7 +2214,6 @@ def test_create_manual_heist_infiltration_seeds_heist_state(
             objectives_and_stakes=(
                 "Recover the treaty; copy the ledger if possible; avoid war."
             ),
-            crew_and_contacts="Tavi runs locks; Venn is the inside clerk.",
             intel_and_access="Guard shift changes at bell three; lift code is split.",
             security_model=(
                 "Clockwork cameras, badge checkpoints, two warded locks, and "
@@ -2410,7 +2254,6 @@ def test_create_manual_heist_infiltration_seeds_heist_state(
     assert set(state_by_key) >= {
         "heist.target",
         "heist.objectives",
-        "heist.crew",
         "heist.intel",
         "heist.security",
         "heist.alert",
@@ -2449,10 +2292,6 @@ def test_create_manual_political_intrigue_seeds_social_state(
             player_role="Envoy holding the swing vote",
             political_arena="The harbor council chamber and public galleries.",
             political_factions="Guilds, Old Families, and dock unions.",
-            major_npcs=(
-                "Duchess Salen - regent who needs Mara's vote; "
-                "Guildmaster Orro - broker who owes Mara one favor."
-            ),
             central_conflict="A midnight no-confidence vote can replace the regent.",
             secrets_and_leverage="Only Mara knows Orro moved missing silver.",
             reputation_and_standing="Mara is trusted by reformers.",
@@ -2489,7 +2328,6 @@ def test_create_manual_political_intrigue_seeds_social_state(
     assert set(state_by_key) >= {
         "intrigue.arena",
         "intrigue.factions",
-        "intrigue.npcs",
         "intrigue.conflict",
         "intrigue.secrets",
         "intrigue.standing",
@@ -2511,21 +2349,6 @@ def test_create_manual_political_intrigue_seeds_social_state(
     assert state_by_key["intrigue.pressure"].value == {
         "summary": "The midnight vote proceeds unless delayed."
     }
-
-    npcs = {
-        character.name: character
-        for character in repositories.list_characters(save.id)
-    }
-    assert set(npcs) >= {"Duchess Salen", "Guildmaster Orro"}
-    assert npcs["Duchess Salen"].role == "regent who needs Mara's vote"
-    assert npcs["Duchess Salen"].known_state == (
-        "Duchess Salen - regent who needs Mara's vote"
-    )
-    assert npcs["Guildmaster Orro"].role == "broker who owes Mara one favor"
-    assert npcs["Guildmaster Orro"].known_state == (
-        "Guildmaster Orro - broker who owes Mara one favor"
-    )
-
 
 def test_create_manual_time_loop_seeds_loop_state(
     repositories: PersistenceRepositories,
@@ -2834,7 +2657,6 @@ def test_save_scenario_draft_seeds_continuation_character_metadata(
             scenario_type="full_roleplay",
             sections={
                 **_reviewed_full_roleplay_sections(),
-                "characters": "Mara Voss, Ren the bell debtor.",
             },
             save_title="Chapter Two",
             request_initial_image=False,
@@ -2947,6 +2769,186 @@ def test_generate_scenario_draft_forwards_progress_models(
     )
 
 
+def test_generate_scenario_draft_character_starters_appends_structured_results(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    repositories.set_model_preference(
+        task="dating_sim_context_update",
+        provider="fake",
+        model_id="fake-structured",
+    )
+    _save_fake_provider_model(
+        repositories,
+        model_id="fake-structured",
+        capabilities=[ProviderCapability.STRUCTURED_OUTPUT.value],
+    )
+    provider = RuntimeStructuredCleanupProvider(
+        [
+            {
+                "characters": [
+                    {
+                        "name": "Avery Quinn",
+                        "role": "Emergency lighting technician.",
+                        "known_state": "Avery restores light during the blackout.",
+                        "appearance": "Tool belt and bright vest.",
+                        "visual_notes": "Portable work lamp.",
+                        "personality": "Practical and warm.",
+                        "voice": 'Plainspoken. Example: "Hold this."',
+                        "texting_style": "Brief logistics. Sample text: Found it.",
+                        "goals": "Keep the reception safe.",
+                        "motivations": "Prove competence under pressure.",
+                        "boundaries": "Will not ignore safety hazards.",
+                    }
+                ]
+            }
+        ]
+    )
+    controller = _runtime_controller(runtime, repositories, tmp_path, provider=provider)
+
+    model = asyncio.run(
+        controller.generate_scenario_draft_character_starters(
+            scenario_type="dating_sim",
+            sections=_reviewed_dating_sim_sections(),
+            character_starters=[
+                {
+                    "name": "Mika Arai",
+                    "role": "Student council president",
+                }
+            ],
+            count=1,
+        )
+    )
+
+    assert _error_text(model) == ""
+    assert _status_text(model) == "Character starters generated"
+    draft = _value(model, "scenario_draft")
+    starters = _value(draft, "character_starters")
+    assert [starter["name"] for starter in starters] == ["Mika Arai", "Avery Quinn"]
+    request = provider.structured_requests[0]
+    assert request.schema_name == "scenario_character_starters"
+    assert request.provider == "fake"
+    assert request.model_id == "fake-structured"
+    assert "Create exactly 1 new character starters" in request.messages[0].body
+    request_body = request.messages[1].body
+    assert "Ren Takahashi" in request_body
+    assert "Mika Arai" in request_body
+    assert "Ordinary contemporary name candidates" in request_body
+
+
+def test_generate_scenario_draft_character_starters_reviews_generated_content(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    repositories.set_model_preference(
+        task="dating_sim_context_update",
+        provider="fake",
+        model_id="fake-structured",
+    )
+    _save_fake_provider_model(
+        repositories,
+        model_id="fake-structured",
+        capabilities=[ProviderCapability.STRUCTURED_OUTPUT.value],
+    )
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="safety",
+        model_id="fake-safety",
+    )
+    repositories.save_provider_model(
+        provider="safety",
+        model_id="fake-safety",
+        display_name="Fake Safety",
+        capabilities=[ProviderCapability.STRUCTURED_OUTPUT.value],
+    )
+    generation_provider = RuntimeStructuredCleanupProvider(
+        [
+            {
+                "characters": [
+                    {
+                        "name": "Avery Quinn",
+                        "role": "Emergency lighting technician.",
+                        "known_state": "Avery restores light during the blackout.",
+                        "voice": "forbidden generated starter detail",
+                        "relationships": {
+                            "Mika Arai": "forbidden generated starter detail"
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    safety_provider = RuntimeSelectiveStarterSafetyProvider()
+    child = repositories.create_user(
+        username="Child",
+        role="child",
+        password_hash="hash",
+    )
+    repositories.set_scoped_setting(
+        scope="user",
+        scope_id=child.id,
+        key="content_filter_rating",
+        value="g",
+    )
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        providers={
+            "fake": generation_provider,
+            "safety": safety_provider,
+        },
+    )
+
+    model = asyncio.run(
+        controller.generate_scenario_draft_character_starters(
+            scenario_type="dating_sim",
+            sections=_reviewed_dating_sim_sections(),
+            count=1,
+            current_user_id=child.id,
+        )
+    )
+
+    assert _error_text(model) == ""
+    draft = _value(model, "scenario_draft")
+    [starter] = _value(draft, "character_starters")
+    assert starter["name"] == CONTENT_FILTER_TRANSITION
+    assert starter["voice"] == CONTENT_FILTER_TRANSITION
+    assert starter["relationships"] == {}
+    source_metadata = dict(_value(draft, "source_metadata"))
+    assert source_metadata["section_content_ratings"][
+        "character_starters"
+    ] == "g"
+    assert any(
+        "forbidden generated starter detail" in request.messages[-1].body
+        for request in safety_provider.structured_requests
+    )
+
+
+def test_generate_scenario_draft_character_starters_requires_count_or_description(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+
+    model = asyncio.run(
+        controller.generate_scenario_draft_character_starters(
+            scenario_type="dating_sim",
+            sections=_reviewed_dating_sim_sections(),
+        )
+    )
+
+    assert _error_text(model) == (
+        "Number of characters or custom character description is required"
+    )
+
+
 def test_regenerate_scenario_section_preserves_other_draft_sections(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -2970,7 +2972,6 @@ def test_regenerate_scenario_section_preserves_other_draft_sections(
         "lore": "Reviewed lore.",
         "locations": "Old bell tower.",
         "factions": "Reviewed Tidemarked Guild.",
-        "characters": "Reviewed Captain Ilyra.",
         "tone_genre": "Reviewed nautical noir.",
         "opening_message": "Reviewed opening bell.",
     }
@@ -3036,7 +3037,6 @@ def test_regenerate_scenario_section_uses_section_model_override(
         "lore": "Reviewed lore.",
         "locations": "Old bell tower.",
         "factions": "Reviewed Tidemarked Guild.",
-        "characters": "Reviewed Captain Ilyra.",
         "tone_genre": "Reviewed nautical noir.",
         "opening_message": "Reviewed opening bell.",
     }
@@ -3383,9 +3383,7 @@ def test_save_survival_expedition_draft_seeds_expedition_state(
     assert state["expedition.route"].value == {
         "summary": "North wells, glass canyon, or direct salt road."
     }
-    assert state["expedition.party"].value == {
-        "summary": "Navigator, mechanic, medic, and two drivers."
-    }
+    assert "expedition.party" not in state
     assert state["expedition.environment"].category == "expedition"
     assert state["expedition.hazards"].category == "threat"
 
@@ -3738,19 +3736,32 @@ def test_save_scenario_draft_seeds_reviewed_full_roleplay_starting_npcs(
 ) -> None:
     runtime = _import_runtime_without_gtk(monkeypatch)
     controller = _runtime_controller(runtime, repositories, tmp_path)
-    reviewed_sections = {
-        **_reviewed_full_roleplay_sections(),
-        "characters": (
-            "Captain Ilyra, an exiled commander, and Brother Senn, "
-            "her informant, Vey the outrider, Vey the scout."
-        ),
-    }
+    reviewed_sections = _reviewed_full_roleplay_sections()
+    character_starters: list[dict[str, object]] = [
+        {
+            "name": "Captain Ilyra",
+            "role": "Exiled commander",
+            "known_state": "Captain Ilyra watches the reef gate.",
+        },
+        {
+            "name": "Brother Senn",
+            "role": "Informant",
+            "known_state": "Brother Senn carries harbor rumors.",
+        },
+        {
+            "name": "Vey the outrider",
+            "aliases": ["Vey"],
+            "role": "Outrider",
+            "known_state": "Vey scouts the drowned road.",
+        },
+    ]
 
     model = asyncio.run(
         _save_scenario_draft(
             controller,
             scenario_type="full_roleplay",
             sections=reviewed_sections,
+            character_starters=character_starters,
             save_title="Reviewed Save",
             request_initial_image=False,
         )
@@ -3779,9 +3790,6 @@ def test_save_scenario_draft_seeds_reviewed_full_roleplay_starting_npcs(
         character for character in characters if character.name == "Mara Voss"
     )
     assert player.is_player_character is True
-    assert "an exiled commander" not in character_names
-    assert "her informant" not in character_names
-    assert "Vey the scout" not in character_names
     assert all(character.protected_from_maintenance for character in characters)
     identity_locks = {
         "name",
@@ -3809,7 +3817,7 @@ def test_save_scenario_draft_seeds_reviewed_full_roleplay_starting_npcs(
     assert all(character.save_id == active_save_id for character in characters)
 
 
-def test_save_scenario_draft_reviews_generated_character_starter_content(
+def test_save_scenario_draft_reviews_submitted_character_starter_content(
     repositories: PersistenceRepositories,
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -3881,6 +3889,17 @@ def test_save_scenario_draft_reviews_generated_character_starter_content(
         controller.save_scenario_draft(
             scenario_type="full_roleplay",
             sections=sections,
+            character_starters=[
+                {
+                    "name": "Captain Ilyra",
+                    "role": "Exiled commander",
+                    "known_state": "Captain Ilyra guards the storm coast.",
+                    "voice": "forbidden generated starter detail",
+                    "relationships": {
+                        "Mara Voss": "forbidden generated starter detail"
+                    },
+                }
+            ],
             save_title="Reviewed Save",
             current_user_id=child.id,
         )
@@ -3949,120 +3968,92 @@ def test_save_scenario_draft_persists_reviewed_investigation_mystery_sections(
     )
 
 
-def test_save_scenario_draft_seeds_dating_sim_player_and_romance_options(
+def test_save_scenario_draft_seeds_dating_sim_player_and_explicit_starters(
     repositories: PersistenceRepositories,
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
     runtime = _import_runtime_without_gtk(monkeypatch)
-    repositories.set_model_preference(
-        task="context_update",
-        provider="fake",
-        model_id="fake-structured",
-    )
-    repositories.save_provider_model(
-        provider="fake",
-        model_id="fake-structured",
-        display_name="Fake Structured",
-        capabilities=[ProviderCapability.STRUCTURED_OUTPUT.value],
-    )
-    provider = RuntimeStructuredCleanupProvider(
-        [
-            {
-                "characters": [
-                    {
-                        "name": "Mika Arai",
-                        "role": (
-                            "Female class president and precise festival organizer."
-                        ),
-                        "known_state": (
-                            "Mika Arai is ambitious, secretly lonely, and "
-                            "drawn to Ren's patience."
-                        ),
-                        "appearance": (
-                            "Sharp blazer, neat braid, and a silver student "
-                            "council pin."
-                        ),
-                        "visual_notes": (
-                            "Always carrying a festival clipboard marked in "
-                            "three ink colors."
-                        ),
-                        "personality": (
-                            "Disciplined, lonely, and quietly protective."
-                        ),
-                        "voice": "Crisp formal phrasing that softens when surprised.",
-                        "goals": "Keep the festival schedule from collapsing.",
-                        "motivations": (
-                            "Prove she can be trusted beyond student council work."
-                        ),
-                        "boundaries": "Will not let Ren take blame for her mistakes.",
-                    },
-                    {
-                        "name": "Sora Minase",
-                        "role": "Female swimmer with bright competitive energy.",
-                        "known_state": (
-                            "Sora is terrified of leaving home after summer."
-                        ),
-                        "appearance": "Sun-browned shoulders and wind-tossed hair.",
-                        "visual_notes": "Always smells faintly of pool water.",
-                        "personality": "Bright, competitive, and anxious.",
-                        "voice": "Fast, teasing, and earnest under pressure.",
-                        "goals": "Win the summer meet before leaving home.",
-                        "motivations": "Prove she can choose her own next step.",
-                        "boundaries": "Will not be pushed to abandon her team.",
-                    },
-                    {
-                        "name": "Yuna Kisaragi",
-                        "role": "Female art-club dreamer drawn to storms.",
-                        "known_state": "Yuna sketches Ren during a rain delay.",
-                        "appearance": "Paint-stained fingers and storm-gray eyes.",
-                        "visual_notes": "Keeps a sketchbook hugged to her chest.",
-                        "personality": "Gentle, strange, and observant.",
-                        "voice": "Soft, elliptical, and vivid.",
-                        "goals": "Capture the storm festival in a final sketch.",
-                        "motivations": "Find someone who sees the world slantwise.",
-                        "boundaries": "Will not let her art be mocked as childish.",
-                    },
-                    {
-                        "name": "Nozomi Vale",
-                        "role": "Female childhood friend tired of being overlooked.",
-                        "known_state": (
-                            "Nozomi knows Ren well enough to call out his evasions."
-                        ),
-                        "appearance": "Short dark curls and a crooked grin.",
-                        "visual_notes": "Wears a worn festival volunteer sash.",
-                        "personality": "Funny, guarded, and loyal.",
-                        "voice": "Dry jokes with sudden emotional honesty.",
-                        "goals": "Make Ren stop dodging their shared history.",
-                        "motivations": (
-                            "Protect old loyalty without disappearing inside it."
-                        ),
-                        "boundaries": "Will not be treated as a fallback choice.",
-                    }
-                ]
-            }
-        ]
-    )
+    provider = RuntimeStructuredCleanupProvider([])
     controller = _runtime_controller(runtime, repositories, tmp_path, provider=provider)
-    reviewed_sections = {
-        **_reviewed_dating_sim_sections(),
-        "romance_options": (
-            "Mika Arai is the student council president, precise and secretly "
-            "lonely. Her hook: she asks Ren to help save the festival schedule.\n\n"
-            "Sora Minase, 21, is a competitive swimmer terrified of leaving "
-            "home. Her hook: she dares Ren to race her after practice.\n\n"
-            "Yuna Kisaragi, 22, is an art-club dreamer drawn to storms. Her "
-            "hook: she sketches Ren during a rain delay.\n\n"
-            "Nozomi Vale, 23, is Ren's childhood friend, funny and guarded. "
-            "Her hook: she knows him well enough to call out his evasions."
-        ),
-    }
+    reviewed_sections = _reviewed_dating_sim_sections()
+    character_starters: list[dict[str, object]] = [
+        {
+            "name": "Mika Arai",
+            "role": "Female class president and precise festival organizer.",
+            "known_state": (
+                "Mika Arai is ambitious, secretly lonely, and drawn to Ren's patience."
+            ),
+            "appearance": "Sharp blazer, neat braid, and a silver student council pin.",
+            "visual_notes": (
+                "Always carrying a festival clipboard marked in three ink colors."
+            ),
+            "personality": "Disciplined, lonely, and quietly protective.",
+            "voice": "Crisp formal phrasing that softens when surprised.",
+            "goals": "Keep the festival schedule from collapsing.",
+            "motivations": "Prove she can be trusted beyond student council work.",
+            "boundaries": "Will not let Ren take blame for her mistakes.",
+            "relationships": {
+                "Ren Takahashi": "romance option for Ren Takahashi",
+            },
+            "status": "available romance option at scenario start",
+        },
+        {
+            "name": "Sora Minase",
+            "role": "Female swimmer with bright competitive energy.",
+            "known_state": "Sora is terrified of leaving home after summer.",
+            "appearance": "Sun-browned shoulders and wind-tossed hair.",
+            "visual_notes": "Always smells faintly of pool water.",
+            "personality": "Bright, competitive, and anxious.",
+            "voice": "Fast, teasing, and earnest under pressure.",
+            "goals": "Win the summer meet before leaving home.",
+            "motivations": "Prove she can choose her own next step.",
+            "boundaries": "Will not be pushed to abandon her team.",
+            "relationships": {
+                "Ren Takahashi": "romance option for Ren Takahashi",
+            },
+            "status": "available romance option at scenario start",
+        },
+        {
+            "name": "Yuna Kisaragi",
+            "role": "Female art-club dreamer drawn to storms.",
+            "known_state": "Yuna sketches Ren during a rain delay.",
+            "appearance": "Paint-stained fingers and storm-gray eyes.",
+            "visual_notes": "Keeps a sketchbook hugged to her chest.",
+            "personality": "Gentle, strange, and observant.",
+            "voice": "Soft, elliptical, and vivid.",
+            "goals": "Capture the storm festival in a final sketch.",
+            "motivations": "Find someone who sees the world slantwise.",
+            "boundaries": "Will not let her art be mocked as childish.",
+            "relationships": {
+                "Ren Takahashi": "romance option for Ren Takahashi",
+            },
+            "status": "available romance option at scenario start",
+        },
+        {
+            "name": "Nozomi Vale",
+            "role": "Female childhood friend tired of being overlooked.",
+            "known_state": "Nozomi knows Ren well enough to call out his evasions.",
+            "appearance": "Short dark curls and a crooked grin.",
+            "visual_notes": "Wears a worn festival volunteer sash.",
+            "personality": "Funny, guarded, and loyal.",
+            "voice": "Dry jokes with sudden emotional honesty.",
+            "goals": "Make Ren stop dodging their shared history.",
+            "motivations": "Protect old loyalty without disappearing inside it.",
+            "boundaries": "Will not be treated as a fallback choice.",
+            "relationships": {
+                "Ren Takahashi": "romance option for Ren Takahashi",
+            },
+            "status": "available romance option at scenario start",
+        },
+    ]
 
     model = asyncio.run(
         _save_scenario_draft(
             controller,
             scenario_type="dating_sim",
             sections=reviewed_sections,
+            character_starters=character_starters,
             save_title="Reviewed Dating Save",
             request_initial_image=False,
         )
@@ -4149,9 +4140,7 @@ def test_save_scenario_draft_seeds_dating_sim_player_and_romance_options(
     assert starter["goals"] == mika.goals
     assert starter["motivations"] == mika.motivations
     assert starter["boundaries"] == mika.boundaries
-    assert [request.schema_name for request in provider.structured_requests] == [
-        "dating_sim_character_starters"
-    ]
+    assert provider.structured_requests == []
 
 
 def test_save_hybrid_science_fiction_dating_sim_draft_seeds_both_genres(
@@ -4195,26 +4184,11 @@ def test_save_hybrid_science_fiction_dating_sim_draft_seeds_both_genres(
         "dating_sim",
     ]
     assert content["technology_level"] == reviewed_sections["technology_level"]
-    assert content["romance_options"] == reviewed_sections["romance_options"]
 
     characters = repositories.list_characters(active_save_id)
-    assert {character.name for character in characters} == {
-        "Ren Takahashi",
-        "Mika Arai",
-        "Sora Minase",
-        "Yuna Kisaragi",
-        "Nozomi Vale",
-    }
+    assert {character.name for character in characters} == {"Ren Takahashi"}
     routes = repositories.list_dating_route_states(active_save_id)
-    route_names = {
-        next(
-            character.name
-            for character in characters
-            if character.id == route.npc_character_id
-        )
-        for route in routes
-    }
-    assert route_names == {"Mika Arai", "Sora Minase", "Yuna Kisaragi", "Nozomi Vale"}
+    assert routes == []
 
 
 def test_runtime_completes_sparse_character_profiles_without_overwriting_user_fields(
@@ -9303,7 +9277,10 @@ def test_generate_image_for_narrator_message_updates_latest_image(
 
     assert len(provider.chat_requests) == 1
     assert len(provider.image_requests) == 1
-    assert provider.image_requests[0].prompt == "cinematic drafted image prompt"
+    assert provider.image_requests[0].prompt.startswith(
+        "cinematic drafted image prompt\n\n"
+    )
+    assert "Style preset: Realistic." in provider.image_requests[0].prompt
     latest_image = _latest_image(model)
     assert _value(latest_image, "source_message_id") == narrator_id
     assert _value(latest_image, "provider") == "fake"
@@ -9452,7 +9429,10 @@ def test_generate_image_accepts_captured_save_id_when_active_save_changed(
 
     assert len(provider.chat_requests) == 1
     assert len(provider.image_requests) == 1
-    assert provider.image_requests[0].prompt == "cinematic drafted image prompt"
+    assert provider.image_requests[0].prompt.startswith(
+        "cinematic drafted image prompt\n\n"
+    )
+    assert "Style preset: Realistic." in provider.image_requests[0].prompt
     save_a_images = repositories.list_media_assets(save_a_id)
     save_b_images = repositories.list_media_assets(save_b_id)
     assert len(save_a_images) == 1
@@ -10655,7 +10635,6 @@ def _reviewed_first_contact_exploration_sections() -> dict[str, str]:
         "player_character_name": "Dr. Mara Voss",
         "player_role": "Mission linguist and acting contact lead",
         "mission_profile": "Survey the hidden ocean and keep the crew alive.",
-        "crew_and_command": "Commander Reyes, Dr. Sol, and a nervous pilot.",
         "ship_or_base_status": "Habitat Kestrel has heat for forty-two hours.",
         "exploration_target": "A black-water cavern under the ice shelf.",
         "unknown_intelligence": "An unseen singer answers sonar with pressure songs.",
@@ -10682,7 +10661,6 @@ def _reviewed_survival_expedition_sections() -> dict[str, str]:
         "player_role": "Caravan navigator",
         "expedition_goal": "Cross 120 miles of salt flats to repair the relay.",
         "route_options": "North wells, glass canyon, or direct salt road.",
-        "party_roster": "Navigator, mechanic, medic, and two drivers.",
         "resource_inventory": "Water: 18 canteens. Fuel: 4 drums. Medicine: 2 kits.",
         "environmental_conditions": "Heat haze, dust storms, and cold nights.",
         "hazards_and_events": "Sink crust, engine overheating, and raider signals.",
@@ -10735,10 +10713,6 @@ def _reviewed_investigation_mystery_sections() -> dict[str, str]:
         "case_facts": (
             "Curator Elian Vale vanished from the sealed east gallery during a gala."
         ),
-        "suspects": (
-            "Sera Holt has restoration access and a false alibi. "
-            "Director Iven Rusk needs the insurance payout."
-        ),
         "clues": (
             "Broken display dust found outside the gallery door; undiscovered. "
             "Watch log gap from 9:10 to 9:18; reliable and tied to Sera's alibi."
@@ -10768,10 +10742,6 @@ def _reviewed_political_intrigue_sections() -> dict[str, str]:
         "player_role": "Envoy holding the swing vote",
         "political_arena": "The harbor council chamber and public galleries.",
         "political_factions": "Guilds, Old Families, and dock unions.",
-        "major_npcs": (
-            "Duchess Salen - regent who needs Mara's vote; "
-            "Guildmaster Orro - broker who owes Mara one favor."
-        ),
         "central_conflict": "A midnight no-confidence vote can replace the regent.",
         "secrets_and_leverage": "Only Mara knows Orro moved missing silver.",
         "reputation_and_standing": "Mara is trusted by reformers.",
@@ -10796,9 +10766,6 @@ def _reviewed_settlement_builder_sections() -> dict[str, str]:
         "settlement_profile": (
             "Hearthstone Landing is a timber-and-stone river town founded after "
             "the old bridge collapsed."
-        ),
-        "population_and_residents": (
-            "Forty families, five apprentices, a weary miller, and two masons."
         ),
         "resources_and_indicators": (
             "Food low, lumber useful, morale fragile, defenses unfinished."
@@ -10829,7 +10796,6 @@ def _reviewed_monster_hunt_bounty_sections() -> dict[str, str]:
             "Three-toed tracks at Mill Creek and blue sap on broken arrows."
         ),
         "hunt_locations": "Mill Creek, old orchard, and collapsed toll road.",
-        "rivals_and_factions": "A rival guild wants the bounty.",
         "preparation_state": "Silver wire, oil snares, two hounds, and one debt.",
         "hunt_status": "Unresolved; target wounded but adapting.",
         "tone_genre": "Tense investigative wilderness hunt.",
@@ -10848,9 +10814,6 @@ def _reviewed_road_trip_pilgrimage_sections() -> dict[str, str]:
         ),
         "route_and_stops": (
             "Salt road to Lantern Ford, then Crow Market, then the hill shrine."
-        ),
-        "traveling_party": (
-            "Nell, Brother Tom, Sera the driver, and two quarrelling cousins."
         ),
         "transport_and_supplies": "One wagon, two mules, six days of oats.",
         "recurring_pressures": "Border patrols, summer storms, and a silent pursuer.",
@@ -10877,9 +10840,6 @@ def _reviewed_merchant_trade_route_sections() -> dict[str, str]:
             "Deliver ten jars to Red Harbor in twelve days or double the debt."
         ),
         "route_hazards": "Tariff patrols, bridge bandits, storms, and rivals.",
-        "reputation_and_contacts": (
-            "Trusted by Kesh brokers; watched by Red Harbor taxmen."
-        ),
         "profit_and_loss": "Current margin is thin; one lost crate erases profit.",
         "tone_genre": "Economy-lite caravan drama with hard bargains.",
         "opening_message": "The creditor stamps the contract before the ink dries.",
@@ -10908,16 +10868,6 @@ def _reviewed_dating_sim_sections() -> dict[str, str]:
             "future, club, and relationship will define his last summer."
         ),
         "player_role": "The central romantic lead.",
-        "romance_options": (
-            "Mika Arai - female class president; precise, ambitious, and "
-            "secretly lonely.\n"
-            "Sora Minase - female swimmer; bright, competitive, and terrified "
-            "of leaving home.\n"
-            "Yuna Kisaragi - female art-club dreamer; gentle, strange, and "
-            "drawn to storms.\n"
-            "Nozomi Vale - female childhood friend; funny, guarded, and tired "
-            "of being overlooked."
-        ),
         "tone_genre": "Warm romantic drama with comedy and school-life stakes.",
         "opening_message": "The station doors open onto salt air and festival banners.",
     }
@@ -10951,11 +10901,13 @@ async def _save_scenario_draft(
     request_initial_image: bool,
     action_choices_enabled: bool = False,
     source_metadata: dict[str, object] | None = None,
+    character_starters: list[dict[str, object]] | None = None,
 ) -> object:
     model = await controller.save_scenario_draft(
         scenario_type=scenario_type,
         scenario_types=scenario_types,
         sections=sections,
+        character_starters=character_starters,
         action_choices_enabled=action_choices_enabled,
         save_title=save_title,
         source_metadata=source_metadata,

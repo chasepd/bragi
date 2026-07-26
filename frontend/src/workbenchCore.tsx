@@ -437,6 +437,41 @@ type ScenarioStarterReferencePatch = Pick<
   ScenarioEditorStarter,
   "starter_id" | "reference_image"
 >;
+type ScenarioStarterTextField =
+  | "aliases_text"
+  | "role"
+  | "age"
+  | "status"
+  | "locked_fields_text"
+  | "known_state"
+  | "appearance"
+  | "visual_notes"
+  | "personality"
+  | "voice"
+  | "texting_style"
+  | "goals"
+  | "motivations"
+  | "boundaries"
+  | "relationships_json";
+const STARTER_INPUT_FIELDS = [
+  ["aliases_text", "Aliases", "aliases"],
+  ["role", "Role", "role"],
+  ["age", "Age", "age"],
+  ["status", "Status", "status"],
+  ["locked_fields_text", "Locked Fields", "locked fields"]
+] as const satisfies readonly (readonly [ScenarioStarterTextField, string, string])[];
+const STARTER_TEXTAREA_FIELDS = [
+  ["known_state", "History", "history"],
+  ["appearance", "Appearance", "appearance"],
+  ["visual_notes", "Visual Notes", "visual notes"],
+  ["personality", "Personality", "personality"],
+  ["voice", "Voice", "voice"],
+  ["texting_style", "Texting Style", "texting style"],
+  ["goals", "Goals", "goals"],
+  ["motivations", "Motivations", "motivations"],
+  ["boundaries", "Boundaries", "boundaries"],
+  ["relationships_json", "Relationships", "relationships"]
+] as const satisfies readonly (readonly [ScenarioStarterTextField, string, string])[];
 type ScenarioEditorCore = {
   title: string;
   premise: string;
@@ -1087,7 +1122,7 @@ function openDownloadInNewTab(url: string) {
 
 const SCENARIO_CORE_SECTION_IDS = new Set(["title", "premise", "setup_line", "starting_scene", "player_character_name", "player_role", "character_starters"]);
 const FULL_ROLEPLAY_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
-  { label: "World", section_ids: ["worldbuilding", "lore", "locations", "factions", "characters"] },
+  { label: "World", section_ids: ["worldbuilding", "lore", "locations", "factions"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
   { label: "Continuity", section_ids: ["current_scene"] }
 ];
@@ -1102,7 +1137,7 @@ const SCIENCE_FICTION_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "Continuity", section_ids: ["current_scene"] }
 ];
 const FIRST_CONTACT_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
-  { label: "Mission", section_ids: ["mission_profile", "crew_and_command", "ship_or_base_status"] },
+  { label: "Mission", section_ids: ["mission_profile", "ship_or_base_status"] },
   { label: "Discovery", section_ids: ["exploration_target", "knowledge_state", "discoveries_and_samples", "hazards_and_escalation"] },
   { label: "Contact", section_ids: ["unknown_intelligence", "translation_progress"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
@@ -1110,10 +1145,10 @@ const FIRST_CONTACT_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
 ];
 const SURVIVAL_EXPEDITION_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "Expedition", section_ids: ["expedition_goal", "route_options", "travel_progress"] },
-  { label: "Party & Supplies", section_ids: ["party_roster", "resource_inventory"] },
+  { label: "Supplies", section_ids: ["resource_inventory"] },
   { label: "Conditions", section_ids: ["environmental_conditions", "hazards_and_events", "camp_status"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
-  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "characters", "current_scene"] }
+  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "current_scene"] }
 ];
 const TIME_LOOP_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "Loop Rules", section_ids: ["loop_premise", "reset_trigger", "loop_duration", "objective", "failure_conditions"] },
@@ -1121,69 +1156,68 @@ const TIME_LOOP_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "Schedule", section_ids: ["loop_schedule", "current_loop_state"] },
   { label: "Persistence", section_ids: ["persistent_knowledge", "persistence_exceptions", "npc_memory_rules"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
-  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "characters", "current_scene"] }
+  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "current_scene"] }
 ];
 const INVESTIGATION_MYSTERY_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
-  { label: "Case", section_ids: ["case_facts", "suspects", "case_status"] },
+  { label: "Case", section_ids: ["case_facts", "case_status"] },
   { label: "Evidence", section_ids: ["clues", "timeline", "red_herrings", "hidden_truth"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
-  { label: "Continuity", section_ids: ["locations", "factions", "characters", "current_scene"] }
+  { label: "Continuity", section_ids: ["locations", "factions", "current_scene"] }
 ];
 const HEIST_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "Target & Objectives", section_ids: ["target_location", "objectives_and_stakes"] },
-  { label: "Crew & Intel", section_ids: ["crew_and_contacts", "intel_and_access"] },
+  { label: "Intel", section_ids: ["intel_and_access"] },
   { label: "Security", section_ids: ["security_model", "alert_and_heat"] },
   { label: "Tools & Complications", section_ids: ["loadout_and_tools", "complications"] },
   { label: "Exit & Consequences", section_ids: ["extraction_routes", "aftermath"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
-  { label: "Continuity", section_ids: ["locations", "factions", "characters", "current_scene"] }
+  { label: "Continuity", section_ids: ["locations", "factions", "current_scene"] }
 ];
 const POLITICAL_INTRIGUE_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "Arena", section_ids: ["political_arena", "central_conflict"] },
-  { label: "Factions & NPCs", section_ids: ["political_factions", "major_npcs", "alliances_and_rivalries"] },
+  { label: "Factions", section_ids: ["political_factions", "alliances_and_rivalries"] },
   { label: "Leverage", section_ids: ["secrets_and_leverage", "reputation_and_standing", "obligations_and_favors", "public_private_knowledge"] },
   { label: "Pressure", section_ids: ["event_calendar", "political_pressure"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
-  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "characters", "current_scene"] }
+  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "current_scene"] }
 ];
 const SETTLEMENT_BUILDER_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
-  { label: "Community", section_ids: ["settlement_profile", "population_and_residents"] },
+  { label: "Community", section_ids: ["settlement_profile"] },
   { label: "Operations", section_ids: ["resources_and_indicators", "projects_and_facilities"] },
   { label: "Pressure", section_ids: ["threats_and_opportunities", "calendar_and_deadlines"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
-  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "characters", "current_scene"] }
+  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "current_scene"] }
 ];
 const MONSTER_HUNT_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "Hunt", section_ids: ["hunt_profile", "target_profile", "hunt_status"] },
   { label: "Investigation", section_ids: ["leads_and_clues", "hunt_locations"] },
-  { label: "Pressure", section_ids: ["rivals_and_factions", "preparation_state"] },
+  { label: "Pressure", section_ids: ["preparation_state"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
-  { label: "Continuity", section_ids: ["locations", "factions", "characters", "current_scene"] }
+  { label: "Continuity", section_ids: ["locations", "factions", "current_scene"] }
 ];
 const ROAD_TRIP_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "Journey", section_ids: ["journey_profile", "route_and_stops", "journey_progress"] },
-  { label: "Party", section_ids: ["traveling_party", "relationship_threads"] },
+  { label: "Relationship Threads", section_ids: ["relationship_threads"] },
   { label: "Road Pressure", section_ids: ["transport_and_supplies", "recurring_pressures"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
-  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "characters", "current_scene"] }
+  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "current_scene"] }
 ];
 const MERCHANT_TRADE_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "Trade Route", section_ids: ["trade_profile", "markets_and_stops"] },
   { label: "Cargo & Contracts", section_ids: ["cargo_inventory", "contracts_and_debts"] },
-  { label: "Risk & Standing", section_ids: ["route_hazards", "reputation_and_contacts", "profit_and_loss"] },
+  { label: "Risk & Standing", section_ids: ["route_hazards", "profit_and_loss"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
-  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "characters", "current_scene"] }
+  { label: "Continuity", section_ids: ["worldbuilding", "lore", "locations", "factions", "current_scene"] }
 ];
 const DATING_SIM_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "Player", section_ids: ["player_character_profile"] },
-  { label: "Romance Options", section_ids: ["romance_options"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
-  { label: "World", section_ids: ["worldbuilding", "lore", "locations", "factions", "characters", "current_scene"] }
+  { label: "World", section_ids: ["worldbuilding", "lore", "locations", "factions", "current_scene"] }
 ];
 const CYOA_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "Choices", section_ids: ["choice_style"] },
   { label: "Opening", section_ids: ["tone_genre", "opening_message"] },
-  { label: "World", section_ids: ["worldbuilding", "lore", "locations", "factions", "characters", "current_scene"] }
+  { label: "World", section_ids: ["worldbuilding", "lore", "locations", "factions", "current_scene"] }
 ];
 const SCENARIO_TYPE_LABELS: Record<string, string> = {
   full_roleplay: "Generic Roleplay",
@@ -1211,7 +1245,6 @@ type ScenarioForm = {
   player_role: string;
   player_character_name: string;
   player_character_profile: string;
-  romance_options: string;
   magic_system: string;
   realms_and_places: string;
   factions_and_orders: string;
@@ -1223,7 +1256,6 @@ type ScenarioForm = {
   factions_and_institutions: string;
   mission_stakes: string;
   mission_profile: string;
-  crew_and_command: string;
   ship_or_base_status: string;
   exploration_target: string;
   unknown_intelligence: string;
@@ -1233,7 +1265,6 @@ type ScenarioForm = {
   hazards_and_escalation: string;
   expedition_goal: string;
   route_options: string;
-  party_roster: string;
   resource_inventory: string;
   environmental_conditions: string;
   hazards_and_events: string;
@@ -1252,7 +1283,6 @@ type ScenarioForm = {
   npc_memory_rules: string;
   current_loop_state: string;
   case_facts: string;
-  suspects: string;
   clues: string;
   timeline: string;
   red_herrings: string;
@@ -1260,7 +1290,6 @@ type ScenarioForm = {
   case_status: string;
   target_location: string;
   objectives_and_stakes: string;
-  crew_and_contacts: string;
   intel_and_access: string;
   security_model: string;
   alert_and_heat: string;
@@ -1270,7 +1299,6 @@ type ScenarioForm = {
   aftermath: string;
   political_arena: string;
   political_factions: string;
-  major_npcs: string;
   central_conflict: string;
   secrets_and_leverage: string;
   reputation_and_standing: string;
@@ -1280,7 +1308,6 @@ type ScenarioForm = {
   political_pressure: string;
   public_private_knowledge: string;
   settlement_profile: string;
-  population_and_residents: string;
   resources_and_indicators: string;
   projects_and_facilities: string;
   threats_and_opportunities: string;
@@ -1289,12 +1316,10 @@ type ScenarioForm = {
   target_profile: string;
   leads_and_clues: string;
   hunt_locations: string;
-  rivals_and_factions: string;
   preparation_state: string;
   hunt_status: string;
   journey_profile: string;
   route_and_stops: string;
-  traveling_party: string;
   transport_and_supplies: string;
   recurring_pressures: string;
   relationship_threads: string;
@@ -1304,7 +1329,6 @@ type ScenarioForm = {
   markets_and_stops: string;
   contracts_and_debts: string;
   route_hazards: string;
-  reputation_and_contacts: string;
   profit_and_loss: string;
   tone_genre: string;
   choice_style: string;
@@ -1321,7 +1345,6 @@ const MANUAL_BASE_SECTION_IDS = new Set(["title", "premise", "player_character_n
 const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
   "premise",
   "player_character_profile",
-  "romance_options",
   "magic_system",
   "realms_and_places",
   "factions_and_orders",
@@ -1333,7 +1356,6 @@ const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
   "factions_and_institutions",
   "mission_stakes",
   "mission_profile",
-  "crew_and_command",
   "ship_or_base_status",
   "exploration_target",
   "unknown_intelligence",
@@ -1343,7 +1365,6 @@ const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
   "hazards_and_escalation",
   "expedition_goal",
   "route_options",
-  "party_roster",
   "resource_inventory",
   "environmental_conditions",
   "hazards_and_events",
@@ -1362,7 +1383,6 @@ const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
   "npc_memory_rules",
   "current_loop_state",
   "case_facts",
-  "suspects",
   "clues",
   "timeline",
   "red_herrings",
@@ -1370,7 +1390,6 @@ const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
   "case_status",
   "target_location",
   "objectives_and_stakes",
-  "crew_and_contacts",
   "intel_and_access",
   "security_model",
   "alert_and_heat",
@@ -1380,7 +1399,6 @@ const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
   "aftermath",
   "political_arena",
   "political_factions",
-  "major_npcs",
   "central_conflict",
   "secrets_and_leverage",
   "reputation_and_standing",
@@ -1390,7 +1408,6 @@ const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
   "political_pressure",
   "public_private_knowledge",
   "settlement_profile",
-  "population_and_residents",
   "resources_and_indicators",
   "projects_and_facilities",
   "threats_and_opportunities",
@@ -1399,12 +1416,10 @@ const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
   "target_profile",
   "leads_and_clues",
   "hunt_locations",
-  "rivals_and_factions",
   "preparation_state",
   "hunt_status",
   "journey_profile",
   "route_and_stops",
-  "traveling_party",
   "transport_and_supplies",
   "recurring_pressures",
   "relationship_threads",
@@ -1414,7 +1429,6 @@ const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
   "markets_and_stops",
   "contracts_and_debts",
   "route_hazards",
-  "reputation_and_contacts",
   "profit_and_loss",
   "tone_genre",
   "choice_style",
@@ -6956,9 +6970,26 @@ function scenarioEditPayload(scenario: ScenarioEditorValue): { edit: ScenarioEdi
     seen.add(key);
     contentSections.push([key, section.value]);
   }
+  const starterPayload = scenarioStarterPayload(scenario.character_starters);
+  if ("error" in starterPayload) return starterPayload;
+  return {
+    edit: {
+      title,
+      premise,
+      player_character_name: scenario.player_character_name.trim(),
+      player_role: playerRole,
+      content_sections: contentSections,
+      character_starters: starterPayload.value
+    }
+  };
+}
+
+function scenarioStarterPayload(
+  starters: ScenarioEditorStarter[]
+): { value: ScenarioEditPayload["character_starters"] } | { error: string } {
   const characterStarters: ScenarioEditPayload["character_starters"] = [];
   const seenStarterNames = new Set<string>();
-  for (const starter of scenario.character_starters) {
+  for (const starter of starters) {
     const name = starter.name.trim();
     if (!name) return { error: "Starter name is required" };
     const key = name.toLocaleLowerCase();
@@ -6988,16 +7019,7 @@ function scenarioEditPayload(scenario: ScenarioEditorValue): { edit: ScenarioEdi
       reference_image: starter.reference_image
     });
   }
-  return {
-    edit: {
-      title,
-      premise,
-      player_character_name: scenario.player_character_name.trim(),
-      player_role: playerRole,
-      content_sections: contentSections,
-      character_starters: characterStarters
-    }
-  };
+  return { value: characterStarters };
 }
 
 function textValue(value: unknown): string {
@@ -7504,38 +7526,19 @@ function ScenarioStructuredEditor({
                     onChange={(event) => updateStarter(starter.id, { name: event.target.value })}
                   />
                 </label>
-                <label className="field-label">
-                  <span>Aliases</span>
-                  <input
-                    aria-label={`Starter ${starter.name || index + 1} aliases`}
-                    value={starter.aliases_text}
-                    onChange={(event) => updateStarter(starter.id, { aliases_text: event.target.value })}
-                  />
-                </label>
-                <label className="field-label">
-                  <span>Role</span>
-                  <input
-                    aria-label={`Starter ${starter.name || index + 1} role`}
-                    value={starter.role}
-                    onChange={(event) => updateStarter(starter.id, { role: event.target.value })}
-                  />
-                </label>
-                <label className="field-label">
-                  <span>Age</span>
-                  <input
-                    aria-label={`Starter ${starter.name || index + 1} age`}
-                    value={starter.age}
-                    onChange={(event) => updateStarter(starter.id, { age: event.target.value })}
-                  />
-                </label>
-                <label className="field-label">
-                  <span>Status</span>
-                  <input
-                    aria-label={`Starter ${starter.name || index + 1} status`}
-                    value={starter.status}
-                    onChange={(event) => updateStarter(starter.id, { status: event.target.value })}
-                  />
-                </label>
+                {STARTER_INPUT_FIELDS.map(([field, label, suffix]) => (
+                  <label className="field-label" key={field}>
+                    <span>{label}</span>
+                    <input
+                      aria-label={`Starter ${starter.name || index + 1} ${suffix}`}
+                      value={starter[field]}
+                      onChange={(event) => updateStarter(
+                        starter.id,
+                        { [field]: event.target.value } as Partial<ScenarioEditorStarter>
+                      )}
+                    />
+                  </label>
+                ))}
                 <label className="toggle-row compact-toggle scenario-starter-met">
                   <input
                     type="checkbox"
@@ -7554,95 +7557,20 @@ function ScenarioStructuredEditor({
 	                    onPendingChange={updateStarterImagePending}
 	                  />
                 ) : null}
-                <label className="field-label scenario-starter-wide">
-                  <span>History</span>
-                  <textarea
-                    aria-label={`Starter ${starter.name || index + 1} history`}
-                    value={starter.known_state}
-                    onChange={(event) => updateStarter(starter.id, { known_state: event.target.value })}
-                  />
-                </label>
-                <label className="field-label scenario-starter-wide">
-                  <span>Appearance</span>
-                  <textarea
-                    aria-label={`Starter ${starter.name || index + 1} appearance`}
-                    value={starter.appearance}
-                    onChange={(event) => updateStarter(starter.id, { appearance: event.target.value })}
-                  />
-                </label>
-                <label className="field-label scenario-starter-wide">
-                  <span>Visual Notes</span>
-                  <textarea
-                    aria-label={`Starter ${starter.name || index + 1} visual notes`}
-                    value={starter.visual_notes}
-                    onChange={(event) => updateStarter(starter.id, { visual_notes: event.target.value })}
-                  />
-                </label>
-                <label className="field-label scenario-starter-wide">
-                  <span>Personality</span>
-                  <textarea
-                    aria-label={`Starter ${starter.name || index + 1} personality`}
-                    value={starter.personality}
-                    onChange={(event) => updateStarter(starter.id, { personality: event.target.value })}
-                  />
-                </label>
-                <label className="field-label scenario-starter-wide">
-                  <span>Voice</span>
-                  <textarea
-                    aria-label={`Starter ${starter.name || index + 1} voice`}
-                    value={starter.voice}
-                    onChange={(event) => updateStarter(starter.id, { voice: event.target.value })}
-                  />
-                </label>
-                <label className="field-label scenario-starter-wide">
-                  <span>Texting Style</span>
-                  <textarea
-                    aria-label={`Starter ${starter.name || index + 1} texting style`}
-                    value={starter.texting_style}
-                    onChange={(event) => updateStarter(starter.id, { texting_style: event.target.value })}
-                  />
-                </label>
-                <label className="field-label scenario-starter-wide">
-                  <span>Goals</span>
-                  <textarea
-                    aria-label={`Starter ${starter.name || index + 1} goals`}
-                    value={starter.goals}
-                    onChange={(event) => updateStarter(starter.id, { goals: event.target.value })}
-                  />
-                </label>
-                <label className="field-label scenario-starter-wide">
-                  <span>Motivations</span>
-                  <textarea
-                    aria-label={`Starter ${starter.name || index + 1} motivations`}
-                    value={starter.motivations}
-                    onChange={(event) => updateStarter(starter.id, { motivations: event.target.value })}
-                  />
-                </label>
-                <label className="field-label scenario-starter-wide">
-                  <span>Boundaries</span>
-                  <textarea
-                    aria-label={`Starter ${starter.name || index + 1} boundaries`}
-                    value={starter.boundaries}
-                    onChange={(event) => updateStarter(starter.id, { boundaries: event.target.value })}
-                  />
-                </label>
-                <label className="field-label scenario-starter-wide">
-                  <span>Relationships</span>
-                  <textarea
-                    className="json-editor compact-json-editor"
-                    aria-label={`Starter ${starter.name || index + 1} relationships`}
-                    value={starter.relationships_json}
-                    onChange={(event) => updateStarter(starter.id, { relationships_json: event.target.value })}
-                  />
-                </label>
-                <label className="field-label">
-                  <span>Locked Fields</span>
-                  <input
-                    aria-label={`Starter ${starter.name || index + 1} locked fields`}
-                    value={starter.locked_fields_text}
-                    onChange={(event) => updateStarter(starter.id, { locked_fields_text: event.target.value })}
-                  />
-                </label>
+                {STARTER_TEXTAREA_FIELDS.map(([field, label, suffix]) => (
+                  <label className="field-label scenario-starter-wide" key={field}>
+                    <span>{label}</span>
+                    <textarea
+                      className={field === "relationships_json" ? "json-editor compact-json-editor" : undefined}
+                      aria-label={`Starter ${starter.name || index + 1} ${suffix}`}
+                      value={starter[field]}
+                      onChange={(event) => updateStarter(
+                        starter.id,
+                        { [field]: event.target.value } as Partial<ScenarioEditorStarter>
+                      )}
+                    />
+                  </label>
+                ))}
               </div>
               <div className="scenario-starter-tools">
                 <button
@@ -9215,7 +9143,8 @@ function jobTypeLabel(type: string) {
     state_pruning: "Cleaning world state",
     model_refresh: "Refreshing models",
     scenario_draft: "Drafting scenario",
-    scenario_section: "Regenerating section"
+    scenario_section: "Regenerating section",
+    scenario_character_starters: "Generating character starters"
   };
   return labels[type] ?? labelize(type);
 }
@@ -9305,7 +9234,7 @@ function settingTooltip(settingKey: string): string {
   return SETTING_TOOLTIPS[settingKey] ?? "Changes how this setting affects Bragi behavior.";
 }
 
-function modelSelectorPurpose(task: string): string {
+export function modelSelectorPurpose(task: string): string {
   if (task.startsWith("scenario_generation_section_")) return "scenario_generation";
   if (
     task === "chat_full_roleplay" ||
@@ -9571,11 +9500,11 @@ function defaultFlows(): ScenarioWizardFlow[] {
     {
       flow_id: "first_contact_exploration",
       label: "First Contact / Exploration",
-      seed_prompt: "Describe the first contact or exploration mission, unknown world or anomaly, crew and ship/base status, alien or ambiguous intelligence, translation progress, discoveries, hazards, tone, and visible opening narration.",
-      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "mission_profile", "crew_and_command", "ship_or_base_status", "exploration_target", "unknown_intelligence", "knowledge_state", "translation_progress", "discoveries_and_samples", "hazards_and_escalation", "tone_genre", "opening_message"],
+      seed_prompt: "Describe the first contact or exploration mission, unknown world or anomaly, ship/base status, alien or ambiguous intelligence, translation progress, discoveries, hazards, tone, and visible opening narration.",
+      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "mission_profile", "ship_or_base_status", "exploration_target", "unknown_intelligence", "knowledge_state", "translation_progress", "discoveries_and_samples", "hazards_and_escalation", "tone_genre", "opening_message"],
       review_groups: [
         { label: "Core", section_ids: ["title", "premise", "player_character_name", "player_role"] },
-        { label: "Mission", section_ids: ["mission_profile", "crew_and_command", "ship_or_base_status"] },
+        { label: "Mission", section_ids: ["mission_profile", "ship_or_base_status"] },
         { label: "Discovery", section_ids: ["exploration_target", "knowledge_state", "discoveries_and_samples", "hazards_and_escalation"] },
         { label: "Contact", section_ids: ["unknown_intelligence", "translation_progress"] },
         { label: "Opening", section_ids: ["tone_genre", "opening_message"] }
@@ -9584,12 +9513,12 @@ function defaultFlows(): ScenarioWizardFlow[] {
     {
       flow_id: "survival_expedition",
       label: "Survival Expedition",
-      seed_prompt: "Describe the survival expedition premise, player role, goal, route options, party, supplies, environmental conditions, hazards, camp status, travel progress, tone, and visible opening narration.",
-      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "expedition_goal", "route_options", "party_roster", "resource_inventory", "environmental_conditions", "hazards_and_events", "camp_status", "travel_progress", "tone_genre", "opening_message"],
+      seed_prompt: "Describe the survival expedition premise, player role, goal, route options, supplies, environmental conditions, hazards, camp status, travel progress, tone, and visible opening narration.",
+      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "expedition_goal", "route_options", "resource_inventory", "environmental_conditions", "hazards_and_events", "camp_status", "travel_progress", "tone_genre", "opening_message"],
       review_groups: [
         { label: "Core", section_ids: ["title", "premise", "player_character_name", "player_role"] },
         { label: "Expedition", section_ids: ["expedition_goal", "route_options", "travel_progress"] },
-        { label: "Party & Supplies", section_ids: ["party_roster", "resource_inventory"] },
+        { label: "Supplies", section_ids: ["resource_inventory"] },
         { label: "Conditions", section_ids: ["environmental_conditions", "hazards_and_events", "camp_status"] },
         { label: "Opening", section_ids: ["tone_genre", "opening_message"] }
       ],
@@ -9611,11 +9540,11 @@ function defaultFlows(): ScenarioWizardFlow[] {
     {
       flow_id: "investigation_mystery",
       label: "Investigation Mystery",
-      seed_prompt: "Describe the mystery premise, case facts, suspects, clues, timeline, red herrings, hidden truth, case status, tone, and visible opening narration.",
-      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "case_facts", "suspects", "clues", "timeline", "red_herrings", "hidden_truth", "case_status", "tone_genre", "opening_message"],
+      seed_prompt: "Describe the mystery premise, case facts, clues, timeline, red herrings, hidden truth, case status, tone, and visible opening narration.",
+      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "case_facts", "clues", "timeline", "red_herrings", "hidden_truth", "case_status", "tone_genre", "opening_message"],
       review_groups: [
         { label: "Core", section_ids: ["title", "premise", "player_character_name", "player_role"] },
-        { label: "Case", section_ids: ["case_facts", "suspects", "case_status"] },
+        { label: "Case", section_ids: ["case_facts", "case_status"] },
         { label: "Evidence", section_ids: ["clues", "timeline", "red_herrings", "hidden_truth"] },
         { label: "Opening", section_ids: ["tone_genre", "opening_message"] }
       ],
@@ -9623,12 +9552,12 @@ function defaultFlows(): ScenarioWizardFlow[] {
     {
       flow_id: "heist_infiltration",
       label: "Heist / Infiltration",
-      seed_prompt: "Describe the heist or infiltration target, objectives, crew, contacts, intel, access, security model, alert or heat state, loadout, complications, extraction, aftermath, tone, and visible opening narration.",
-      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "target_location", "objectives_and_stakes", "crew_and_contacts", "intel_and_access", "security_model", "alert_and_heat", "loadout_and_tools", "complications", "extraction_routes", "aftermath", "tone_genre", "opening_message"],
+      seed_prompt: "Describe the heist or infiltration target, objectives, intel, access, security model, alert or heat state, loadout, complications, extraction, aftermath, tone, and visible opening narration.",
+      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "target_location", "objectives_and_stakes", "intel_and_access", "security_model", "alert_and_heat", "loadout_and_tools", "complications", "extraction_routes", "aftermath", "tone_genre", "opening_message"],
       review_groups: [
         { label: "Core", section_ids: ["title", "premise", "player_character_name", "player_role"] },
         { label: "Target & Objectives", section_ids: ["target_location", "objectives_and_stakes"] },
-        { label: "Crew & Intel", section_ids: ["crew_and_contacts", "intel_and_access"] },
+        { label: "Intel", section_ids: ["intel_and_access"] },
         { label: "Security", section_ids: ["security_model", "alert_and_heat"] },
         { label: "Tools & Complications", section_ids: ["loadout_and_tools", "complications"] },
         { label: "Exit & Consequences", section_ids: ["extraction_routes", "aftermath"] },
@@ -9638,12 +9567,12 @@ function defaultFlows(): ScenarioWizardFlow[] {
     {
       flow_id: "political_intrigue",
       label: "Political Intrigue",
-      seed_prompt: "Describe the political arena, factions, major NPCs, central conflict, secrets, reputation, obligations, alliances, event calendar, timed political pressure, public and private knowledge, tone, and visible opening narration.",
-      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "political_arena", "political_factions", "major_npcs", "central_conflict", "secrets_and_leverage", "reputation_and_standing", "obligations_and_favors", "alliances_and_rivalries", "event_calendar", "political_pressure", "public_private_knowledge", "tone_genre", "opening_message"],
+      seed_prompt: "Describe the political arena, factions, central conflict, secrets, reputation, obligations, alliances, event calendar, timed political pressure, public and private knowledge, tone, and visible opening narration.",
+      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "political_arena", "political_factions", "central_conflict", "secrets_and_leverage", "reputation_and_standing", "obligations_and_favors", "alliances_and_rivalries", "event_calendar", "political_pressure", "public_private_knowledge", "tone_genre", "opening_message"],
       review_groups: [
         { label: "Core", section_ids: ["title", "premise", "player_character_name", "player_role"] },
         { label: "Arena", section_ids: ["political_arena", "central_conflict"] },
-        { label: "Factions & NPCs", section_ids: ["political_factions", "major_npcs", "alliances_and_rivalries"] },
+        { label: "Factions", section_ids: ["political_factions", "alliances_and_rivalries"] },
         { label: "Leverage", section_ids: ["secrets_and_leverage", "reputation_and_standing", "obligations_and_favors", "public_private_knowledge"] },
         { label: "Pressure", section_ids: ["event_calendar", "political_pressure"] },
         { label: "Opening", section_ids: ["tone_genre", "opening_message"] }
@@ -9652,11 +9581,11 @@ function defaultFlows(): ScenarioWizardFlow[] {
     {
       flow_id: "settlement_builder",
       label: "Settlement Builder",
-      seed_prompt: "Describe the settlement premise, residents, resources, projects, facilities, threats, opportunities, calendar pressure, tone, and visible opening narration.",
-      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "settlement_profile", "population_and_residents", "resources_and_indicators", "projects_and_facilities", "threats_and_opportunities", "calendar_and_deadlines", "tone_genre", "opening_message"],
+      seed_prompt: "Describe the settlement premise, resources, projects, facilities, threats, opportunities, calendar pressure, tone, and visible opening narration.",
+      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "settlement_profile", "resources_and_indicators", "projects_and_facilities", "threats_and_opportunities", "calendar_and_deadlines", "tone_genre", "opening_message"],
       review_groups: [
         { label: "Core", section_ids: ["title", "premise", "player_character_name", "player_role"] },
-        { label: "Community", section_ids: ["settlement_profile", "population_and_residents"] },
+        { label: "Community", section_ids: ["settlement_profile"] },
         { label: "Operations", section_ids: ["resources_and_indicators", "projects_and_facilities"] },
         { label: "Pressure", section_ids: ["threats_and_opportunities", "calendar_and_deadlines"] },
         { label: "Opening", section_ids: ["tone_genre", "opening_message"] }
@@ -9665,25 +9594,25 @@ function defaultFlows(): ScenarioWizardFlow[] {
     {
       flow_id: "monster_hunt_bounty",
       label: "Monster Hunt / Bounty",
-      seed_prompt: "Describe the hunt or bounty premise, target, clues, locations, rivals, preparation state, current hunt status, tone, and visible opening narration.",
-      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "hunt_profile", "target_profile", "leads_and_clues", "hunt_locations", "rivals_and_factions", "preparation_state", "hunt_status", "tone_genre", "opening_message"],
+      seed_prompt: "Describe the hunt or bounty premise, target, clues, locations, preparation state, current hunt status, tone, and visible opening narration.",
+      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "hunt_profile", "target_profile", "leads_and_clues", "hunt_locations", "preparation_state", "hunt_status", "tone_genre", "opening_message"],
       review_groups: [
         { label: "Core", section_ids: ["title", "premise", "player_character_name", "player_role"] },
         { label: "Hunt", section_ids: ["hunt_profile", "target_profile", "hunt_status"] },
         { label: "Investigation", section_ids: ["leads_and_clues", "hunt_locations"] },
-        { label: "Pressure", section_ids: ["rivals_and_factions", "preparation_state"] },
+        { label: "Pressure", section_ids: ["preparation_state"] },
         { label: "Opening", section_ids: ["tone_genre", "opening_message"] }
       ],
     },
     {
       flow_id: "road_trip_pilgrimage",
       label: "Road Trip / Pilgrimage",
-      seed_prompt: "Describe the journey premise, route, stops, traveling party, transport, supplies, recurring pressures, relationships, progress, tone, and visible opening narration.",
-      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "journey_profile", "route_and_stops", "traveling_party", "transport_and_supplies", "recurring_pressures", "relationship_threads", "journey_progress", "tone_genre", "opening_message"],
+      seed_prompt: "Describe the journey premise, route, stops, transport, supplies, recurring pressures, relationships, progress, tone, and visible opening narration.",
+      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "journey_profile", "route_and_stops", "transport_and_supplies", "recurring_pressures", "relationship_threads", "journey_progress", "tone_genre", "opening_message"],
       review_groups: [
         { label: "Core", section_ids: ["title", "premise", "player_character_name", "player_role"] },
         { label: "Journey", section_ids: ["journey_profile", "route_and_stops", "journey_progress"] },
-        { label: "Party", section_ids: ["traveling_party", "relationship_threads"] },
+        { label: "Relationship Threads", section_ids: ["relationship_threads"] },
         { label: "Road Pressure", section_ids: ["transport_and_supplies", "recurring_pressures"] },
         { label: "Opening", section_ids: ["tone_genre", "opening_message"] }
       ],
@@ -9691,29 +9620,28 @@ function defaultFlows(): ScenarioWizardFlow[] {
     {
       flow_id: "merchant_trade_route",
       label: "Merchant / Trade Route",
-      seed_prompt: "Describe the trade premise, route, cargo, markets, contracts, debts, route hazards, reputation, contacts, profit and loss pressure, tone, and visible opening narration.",
-      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "trade_profile", "cargo_inventory", "markets_and_stops", "contracts_and_debts", "route_hazards", "reputation_and_contacts", "profit_and_loss", "tone_genre", "opening_message"],
+      seed_prompt: "Describe the trade premise, route, cargo, markets, contracts, debts, route hazards, profit and loss pressure, tone, and visible opening narration.",
+      editable_section_ids: ["title", "premise", "player_character_name", "player_role", "trade_profile", "cargo_inventory", "markets_and_stops", "contracts_and_debts", "route_hazards", "profit_and_loss", "tone_genre", "opening_message"],
       review_groups: [
         { label: "Core", section_ids: ["title", "premise", "player_character_name", "player_role"] },
         { label: "Trade Route", section_ids: ["trade_profile", "markets_and_stops"] },
         { label: "Cargo & Contracts", section_ids: ["cargo_inventory", "contracts_and_debts"] },
-        { label: "Risk & Standing", section_ids: ["route_hazards", "reputation_and_contacts", "profit_and_loss"] },
+        { label: "Risk & Standing", section_ids: ["route_hazards", "profit_and_loss"] },
         { label: "Opening", section_ids: ["tone_genre", "opening_message"] }
       ],
     },
     {
       flow_id: "dating_sim",
       label: "Dating Sim",
-      seed_prompt: "Describe the player character, dating sim premise, romance option preferences, tone, and visible opening narration. Unless you specify otherwise, Bragi will target four opposite-gender romance options.",
-      editable_section_ids: ["title", "premise", "player_character_name", "player_character_profile", "player_role", "romance_options", "tone_genre", "opening_message"],
+      seed_prompt: "Describe the player character, dating sim premise, tone, and visible opening narration.",
+      editable_section_ids: ["title", "premise", "player_character_name", "player_character_profile", "player_role", "tone_genre", "opening_message"],
       review_groups: [
         { label: "Core", section_ids: ["title", "premise", "player_character_name", "player_character_profile", "player_role"] },
-        { label: "Romance Options", section_ids: ["romance_options"] },
         { label: "Opening", section_ids: ["tone_genre", "opening_message"] }
       ],
     },
   ];
 }
 
-export { actionIcon, apiRead, App, applyCharacterTextJobResult, canUseAdminControls, canUseChildRestrictedControls, capabilityLabel, CHARACTER_AUTO_ENHANCE_FIELD_SET, CHARACTER_AUTO_ENHANCE_LABELS, CHARACTER_LOCK_FIELD_ALIASES, CHARACTER_LOCK_FIELD_IDS, CHARACTER_LOCK_FIELDS, CHARACTER_TEXT_ESTIMATED_ROW_HEIGHT, CHARACTER_TEXT_ROW_GAP, CHARACTER_TEXT_ROW_OVERSCAN, charactersPath, characterTextContactPath, characterTextSeenStorageKey, characterTextsPath, characterTextThreadPath, characterTextThreadReadPath, chatHistoryPath, Chronicle, chronicleMessages, compactInlineTitle, Composer, conciseRowPreview, ConfirmModal, CyoaActionPicker, DataViewer, defaultFlows, defaultSecondaryScenarioType, DIAGNOSTICS_STALE_MS, diagnosticsBundleFilename, diagnosticsQueryOptions, DialogForm, DialogPanel, EditorDirtyStatus, EMPTY_DIAGNOSTICS_FILTERS, EmptyState, fallbackTaskLabels, focusableElements, formatUsd, hasAction, imageDimensionPresetLabel, imageStylePresetLabel, incomingCharacterTextContacts, initialMediaDraftLabel, initialVirtualBottomOffset, InlineNotice, installGlobalErrorLogging, invalidateScenePresenceQueries, isCharacterRegistryModel, isRuntimeModel, jobDiagnosticsPath, jobStepsPath, jobTypeLabel, labelize, LeftRail, MANUAL_BASE_SECTION_IDS, MANUAL_SCENARIO_TEXTAREA_FIELDS, MarkdownView, matchingWorldRows, mediaAssetPath, mediaAssetPromptPath, mediaAssetThumbnailPath, mediaPath, mergeChroniclePage, ModalBackdrop, MODEL_CAPABILITY_ALIASES, MODEL_FALLBACK_LANES, MODEL_ROUTING_GROUPS, modelOptionLabel, modelOptionSelectLabel, modelPricingCompactLabel, modelPricingDisplayLabel, ModelPricingLine, mountApp, normalizedScenarioTypes, npcKnowledgeAuditModeLabel, observeVirtualElementOffset, observeVirtualElementRect, openDownloadInNewTab, OPENROUTER_MAX_PRICE_TOOLTIPS, OPENROUTER_QUANTIZATION_TOOLTIPS, OPENROUTER_ROUTING_TOOLTIPS, PanelHeader, pendingJobsDisplayModeLabel, PendingJobsTray, postTurnInferenceModeLabel, PreviewModal, progressLabel, queryClient as workbenchQueryClient, runtimeQueryKey, runtimeResultError, SAVE_SCOPED_SETTING_KEYS, ScenarioBundleUpload, scenarioCreationFlow, scenarioSectionEditorGroups, scenarioSectionResultText, scriptGuardModeLabel, SegmentedTabs, selectedOption, setScrollTopAndNotify, settingLabel, SETTINGS_TAB_TOOLTIPS, settingsPath, settingsQueryOptions, settingTooltip, taskLabel, taskModelTooltip, terminalJobsPath, THINKING_LEVEL_OFF, THINKING_LEVEL_PROVIDER_DEFAULT, thinkingLevelLabel, touchActionClassName, TouchActionContents, trackedActiveJob, useDialogFocus, useDialogJobWatcher, useJobActionRunner, useMediaQuery, VIRTUAL_LIST_INITIAL_RECT, virtualElementRect, Workbench, WORKBENCH_MOBILE_QUERY, WorldDataExplorer, worldDataPath, worldRows, worldRowSubtitle, worldRowTitle };
-export type { CharacterEditorTab, CharacterTextSendVariables, CharacterTextSpontaneousVariables, CurrentUser, DiagnosticsFilters, LocalCharacterTextMessage, ModelCapabilityFamily, ModelRoutingLane, ModelRoutingLaneGroup, ModelRoutingLaneGroupMeta, ModelRoutingLaneMeta, ModelSelectorGroup, RunJob, ScenarioDraftPrefill, ScenarioForm, ScenarioFormTextField, SegmentOption, TerminalJobStatusFilter };
+export { actionIcon, apiRead, App, applyCharacterTextJobResult, canUseAdminControls, canUseChildRestrictedControls, capabilityLabel, CHARACTER_AUTO_ENHANCE_FIELD_SET, CHARACTER_AUTO_ENHANCE_LABELS, CHARACTER_LOCK_FIELD_ALIASES, CHARACTER_LOCK_FIELD_IDS, CHARACTER_LOCK_FIELDS, CHARACTER_TEXT_ESTIMATED_ROW_HEIGHT, CHARACTER_TEXT_ROW_GAP, CHARACTER_TEXT_ROW_OVERSCAN, charactersPath, characterTextContactPath, characterTextSeenStorageKey, characterTextsPath, characterTextThreadPath, characterTextThreadReadPath, chatHistoryPath, Chronicle, chronicleMessages, compactInlineTitle, Composer, conciseRowPreview, ConfirmModal, CyoaActionPicker, DataViewer, defaultFlows, defaultSecondaryScenarioType, DIAGNOSTICS_STALE_MS, diagnosticsBundleFilename, diagnosticsQueryOptions, DialogForm, DialogPanel, EditorDirtyStatus, EMPTY_DIAGNOSTICS_FILTERS, EmptyState, fallbackTaskLabels, focusableElements, formatUsd, hasAction, imageDimensionPresetLabel, imageStylePresetLabel, incomingCharacterTextContacts, initialMediaDraftLabel, initialVirtualBottomOffset, InlineNotice, installGlobalErrorLogging, invalidateScenePresenceQueries, isCharacterRegistryModel, isRuntimeModel, jobDiagnosticsPath, jobStepsPath, jobTypeLabel, labelize, LeftRail, MANUAL_BASE_SECTION_IDS, MANUAL_SCENARIO_TEXTAREA_FIELDS, MarkdownView, matchingWorldRows, mediaAssetPath, mediaAssetPromptPath, mediaAssetThumbnailPath, mediaPath, mergeChroniclePage, ModalBackdrop, MODEL_CAPABILITY_ALIASES, MODEL_FALLBACK_LANES, MODEL_ROUTING_GROUPS, modelOptionLabel, modelOptionSelectLabel, modelPricingCompactLabel, modelPricingDisplayLabel, ModelPricingLine, mountApp, normalizedScenarioTypes, npcKnowledgeAuditModeLabel, observeVirtualElementOffset, observeVirtualElementRect, openDownloadInNewTab, OPENROUTER_MAX_PRICE_TOOLTIPS, OPENROUTER_QUANTIZATION_TOOLTIPS, OPENROUTER_ROUTING_TOOLTIPS, PanelHeader, pendingJobsDisplayModeLabel, PendingJobsTray, postTurnInferenceModeLabel, PreviewModal, progressLabel, queryClient as workbenchQueryClient, runtimeQueryKey, runtimeResultError, SAVE_SCOPED_SETTING_KEYS, ScenarioBundleUpload, scenarioCreationFlow, scenarioEditorStarters, STARTER_INPUT_FIELDS, scenarioSectionEditorGroups, scenarioSectionResultText, STARTER_TEXTAREA_FIELDS, scenarioStarterPayload, scriptGuardModeLabel, SegmentedTabs, selectedOption, setScrollTopAndNotify, settingLabel, SETTINGS_TAB_TOOLTIPS, settingsPath, settingsQueryOptions, settingTooltip, taskLabel, taskModelTooltip, terminalJobsPath, THINKING_LEVEL_OFF, THINKING_LEVEL_PROVIDER_DEFAULT, thinkingLevelLabel, touchActionClassName, TouchActionContents, trackedActiveJob, useDialogFocus, useDialogJobWatcher, useJobActionRunner, useMediaQuery, VIRTUAL_LIST_INITIAL_RECT, virtualElementRect, Workbench, WORKBENCH_MOBILE_QUERY, WorldDataExplorer, worldDataPath, worldRows, worldRowSubtitle, worldRowTitle };
+export type { CharacterEditorTab, CharacterTextSendVariables, CharacterTextSpontaneousVariables, CurrentUser, DiagnosticsFilters, LocalCharacterTextMessage, ModelCapabilityFamily, ModelRoutingLane, ModelRoutingLaneGroup, ModelRoutingLaneGroupMeta, ModelRoutingLaneMeta, ModelSelectorGroup, RunJob, ScenarioDraftPrefill, ScenarioEditorStarter, ScenarioForm, ScenarioFormTextField, SegmentOption, TerminalJobStatusFilter };

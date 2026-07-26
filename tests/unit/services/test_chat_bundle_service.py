@@ -65,6 +65,10 @@ def test_export_save_writes_manifest_data_and_referenced_media(
 ) -> None:
     media_dir = tmp_path / "media"
     save = _seed_bundle_save(repositories, media_dir)
+    _replace_seed_scenario_update_content(
+        repositories,
+        _legacy_character_list_update_content(),
+    )
     bundle_path = tmp_path / "exports" / "night-watch.bragi-chat"
     service = _chat_bundle_service(repositories, media_dir)
 
@@ -104,6 +108,13 @@ def test_export_save_writes_manifest_data_and_referenced_media(
         assert "save_assignments" not in data
         assert data["scenario"]["id"] == SCENARIO_ID
         assert data["scenario"]["title"] == "Ashfall Keep"
+        scenario_updates = data["save_scenario_updates"]
+        assert isinstance(scenario_updates, list)
+        [scenario_update] = scenario_updates
+        assert isinstance(scenario_update, dict)
+        assert json.loads(cast(str, scenario_update["content_json"])) == (
+            _cleaned_character_list_update_content()
+        )
         assert [message["id"] for message in data["messages"]] == [
             PLAYER_MESSAGE_ID,
             NARRATOR_MESSAGE_ID,
@@ -460,7 +471,6 @@ def test_export_import_preserves_political_intrigue_world_state(
             "player_role": "Envoy holding the swing vote",
             "political_arena": "The harbor council chamber and public galleries.",
             "political_factions": "Guilds, Old Families, and dock unions.",
-            "major_npcs": "Duchess Salen; Guildmaster Orro.",
             "central_conflict": "A midnight no-confidence vote can replace the regent.",
             "secrets_and_leverage": "Only Mara knows Orro moved missing silver.",
             "reputation_and_standing": "Mara is trusted by reformers.",
@@ -553,7 +563,6 @@ def test_export_import_preserves_first_contact_world_state(
             "player_character_name": "Dr. Mara Voss",
             "player_role": "Mission linguist",
             "mission_profile": "Survey the hidden ocean.",
-            "crew_and_command": "Commander Reyes - cautious commander.",
             "ship_or_base_status": "Habitat heat stable for 42 hours.",
             "exploration_target": "A black-water cavern beneath the ice.",
             "unknown_intelligence": "An unseen singer answers sonar.",
@@ -2803,7 +2812,7 @@ def test_import_save_sanitizes_image_style_preset_before_reexport(
         repositories.get_app_setting(
             save_image_style_preset_setting_key(imported_save_id)
         )
-        == "none"
+        == "realistic"
     )
     reexport_path = tmp_path / "reexported.bragi-chat"
     service.export_save(imported_save_id, reexport_path)
@@ -2814,7 +2823,7 @@ def test_import_save_sanitizes_image_style_preset_before_reexport(
         data,
         scope="save",
         key=IMAGE_STYLE_PRESET_SETTING,
-    ) == '"none"'
+    ) == '"realistic"'
 
 
 def test_import_save_sanitizes_post_turn_inference_mode_before_reexport(
@@ -4427,6 +4436,40 @@ def test_import_save_repairs_unknown_scenario_update_sources(
     ]
 
 
+def test_import_save_strips_deprecated_scenario_update_sections(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    service, manifest, data, bundle_media_path = _export_bundle_payloads(
+        repositories,
+        tmp_path,
+    )
+    scenario_updates = data["save_scenario_updates"]
+    assert isinstance(scenario_updates, list)
+    [scenario_update] = scenario_updates
+    assert isinstance(scenario_update, dict)
+    scenario_update["content_json"] = json.dumps(
+        _legacy_character_list_update_content(),
+    )
+    bundle_path = tmp_path / "night-watch-legacy-scenario-update.bragi-chat"
+    _write_bundle_with_member(
+        bundle_path,
+        manifest=manifest,
+        data=data,
+        bundle_name=bundle_media_path,
+        payload=MEDIA_BYTES,
+    )
+
+    imported = service.import_save(bundle_path)
+    imported_save_id = _imported_save_id(imported)
+
+    [imported_update] = repositories.list_save_scenario_updates(imported_save_id)
+    assert json.loads(imported_update.content_json) == {
+        **_cleaned_character_list_update_content(),
+        "_source": {"content_rating": "unclassified"},
+    }
+
+
 def test_import_save_repairs_context_update_suggestion_proposed_sources(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -5269,6 +5312,40 @@ def _seed_bundle_save(
         media_path.parent.mkdir(parents=True)
         media_path.write_bytes(MEDIA_BYTES)
     return save
+
+
+def _replace_seed_scenario_update_content(
+    repositories: PersistenceRepositories,
+    content: dict[str, object],
+) -> None:
+    repositories.connection.execute(
+        "UPDATE save_scenario_updates SET content_json = ? WHERE id = ?",
+        (json.dumps(content, sort_keys=True), SCENARIO_UPDATE_ID),
+    )
+    repositories.commit()
+
+
+def _legacy_character_list_update_content() -> dict[str, object]:
+    return {
+        "opening_message": "The red lens wakes.",
+        "starting_scene": "The beacon burns crimson over the ash road.",
+        "factions": "Beacon wardens",
+        "characters": "Captain Rell guards the cracked stair.",
+        "rivals_and_factions": "Ash riders scout the ridge.",
+        "reputation_and_contacts": "The old patrol owes Mara a warning.",
+    }
+
+
+def _cleaned_character_list_update_content() -> dict[str, object]:
+    return {
+        "opening_message": "The red lens wakes.",
+        "starting_scene": "The beacon burns crimson over the ash road.",
+        "factions": (
+            "Beacon wardens\n\n"
+            "Ash riders scout the ridge.\n\n"
+            "The old patrol owes Mara a warning."
+        ),
+    }
 
 
 def _seed_loss_bundle_save(

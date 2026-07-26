@@ -127,7 +127,6 @@ def _create_first_contact_save(
         player_role="Mission linguist",
         content={
             "mission_profile": "Survey the hidden ocean.",
-            "crew_and_command": "Commander Reyes leads the landing team.",
             "ship_or_base_status": "Habitat heat is stable for 42 hours.",
             "exploration_target": "A black-water cavern beneath the ice.",
             "unknown_intelligence": "An unseen singer answers sonar.",
@@ -195,7 +194,7 @@ def test_retired_character_interaction_type_has_no_evolution_specialization() ->
     assert "for character interactions" not in instruction.casefold()
     assert "character_voice" not in sections
     assert "current_scene" in sections
-    assert "characters" in sections
+    assert "characters" not in sections
 
 
 def test_first_contact_evolution_instruction_targets_discovery_progress() -> None:
@@ -204,7 +203,6 @@ def test_first_contact_evolution_instruction_targets_discovery_progress() -> Non
         {
             "title": "Songs Under Europa",
             "mission_profile": "Survey the hidden ocean.",
-            "crew_and_command": "Commander Reyes leads the landing team.",
             "ship_or_base_status": "Habitat heat is stable for 42 hours.",
             "exploration_target": "A black-water cavern beneath the ice.",
             "unknown_intelligence": "An unseen singer answers sonar.",
@@ -304,7 +302,6 @@ def test_political_intrigue_evolution_targets_social_consequences() -> None:
             "title": "Council of Ash",
             "political_arena": "The harbor council.",
             "political_factions": "Guilds and Old Families.",
-            "major_npcs": "Duchess Salen and Guildmaster Orro.",
             "reputation_and_standing": "Mara is trusted by reformers.",
             "obligations_and_favors": "Orro owes Mara one endorsement.",
             "political_pressure": "Midnight vote proceeds unless delayed.",
@@ -446,7 +443,6 @@ def test_structured_evolver_builds_schema_messages_and_parses_content_updates(
             "turn_level_change",
         ]
         assert section_schema["enum"] == [
-            "characters",
             "current_scene",
             "factions",
             "locations",
@@ -457,8 +453,8 @@ def test_structured_evolver_builds_schema_messages_and_parses_content_updates(
         assert "turn_level_change" in request.messages[0].body
         assert "no_phase_shift" in request.messages[0].body
         assert (
-            "Evolvable sections: characters, current_scene, factions, "
-            "locations, lore, worldbuilding"
+            "Evolvable sections: current_scene, factions, locations, lore, "
+            "worldbuilding"
         ) in request.messages[1].body
         assert "tone" in request.messages[1].body
         assert evolution == ScenarioEvolution(

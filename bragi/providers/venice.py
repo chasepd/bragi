@@ -8,7 +8,7 @@ import binascii
 import ipaddress
 import json
 import mimetypes
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -16,6 +16,7 @@ from time import perf_counter
 from typing import Any
 from urllib.parse import ParseResult, urlparse
 
+from bragi.app_logging import log_error_event
 from bragi.providers.chat_rendering import provider_chat_message, provider_chat_messages
 from bragi.providers.contracts import (
     ChatReasoningConfig,
@@ -634,14 +635,23 @@ class VeniceClient:
                 "model": _payload_model(payload),
                 "schema_name": _schema_name(payload),
             }
-        response = await asyncio.to_thread(
-            self.transport,
-            method=method,
-            url=_provider_url(self.base_url, path),
-            headers=self._headers(),
-            payload=payload,
+        response = await _await_provider_transport(
+            asyncio.to_thread(
+                self.transport,
+                method=method,
+                url=_provider_url(self.base_url, path),
+                headers=self._headers(),
+                payload=payload,
+                timeout=timeout,
+                **transport_kwargs,
+            ),
             timeout=timeout,
-            **transport_kwargs,
+            method=method,
+            path=path,
+            provider=self.provider_name,
+            task=task,
+            model=_payload_model(payload),
+            schema_name=_schema_name(payload),
         )
         try:
             return ensure_success(response)
@@ -763,18 +773,26 @@ class VeniceClient:
                 "task": task,
                 "model": _payload_model(payload),
             }
-        return await asyncio.to_thread(
-            self.binary_transport,
-            method=method,
-            url=_provider_url(
-                self.base_url,
-                path,
-                allowed_absolute_hosts=allowed_absolute_hosts,
+        return await _await_provider_transport(
+            asyncio.to_thread(
+                self.binary_transport,
+                method=method,
+                url=_provider_url(
+                    self.base_url,
+                    path,
+                    allowed_absolute_hosts=allowed_absolute_hosts,
+                ),
+                headers=self._headers() if include_auth else {},
+                payload=payload,
+                timeout=timeout,
+                **transport_kwargs,
             ),
-            headers=self._headers() if include_auth else {},
-            payload=payload,
             timeout=timeout,
-            **transport_kwargs,
+            method=method,
+            path=path,
+            provider=self.provider_name,
+            task=task,
+            model=_payload_model(payload),
         )
 
     def _headers(self) -> dict[str, str]:
@@ -1218,6 +1236,49 @@ def _payload_model(payload: dict[str, Any] | None) -> str | None:
         return None
     model = payload.get("model")
     return model if isinstance(model, str) else None
+
+
+async def _await_provider_transport[T](
+    operation: Awaitable[T],
+    *,
+    timeout: float,
+    method: str,
+    path: str,
+    provider: str,
+    task: str,
+    model: str | None = None,
+    schema_name: str | None = None,
+) -> T:
+    started_at = perf_counter()
+    normalized_timeout = max(0.0, timeout)
+    if normalized_timeout <= 0:
+        return await operation
+    try:
+        return await asyncio.wait_for(operation, timeout=normalized_timeout)
+    except TimeoutError as exc:
+        message = _provider_timeout_message(normalized_timeout)
+        log_fields: dict[str, object] = {
+            "method": method,
+            "path": path,
+            "duration_ms": int((perf_counter() - started_at) * 1000),
+            "error_category": ProviderErrorCategory.NETWORK_ERROR.value,
+            "error": message,
+            "provider": provider,
+            "task": task,
+        }
+        if model:
+            log_fields["model"] = model
+        if schema_name:
+            log_fields["schema_name"] = schema_name
+        log_error_event("provider.http_failed", **log_fields)
+        raise ProviderError(
+            category=ProviderErrorCategory.NETWORK_ERROR,
+            message=message,
+        ) from exc
+
+
+def _provider_timeout_message(timeout: float) -> str:
+    return f"Provider request timed out after {timeout:g} seconds"
 
 
 def _schema_name(payload: dict[str, Any] | None) -> str | None:

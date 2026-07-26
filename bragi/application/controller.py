@@ -97,11 +97,14 @@ from bragi.services.character_profile_completion import (
     CHARACTER_STARTER_IDENTITY_LOCK_FIELDS,
     CharacterFieldEnhancementRequest,
     CharacterProfileCompletionRequest,
+    CharacterStarterGenerationRequest,
     ScenarioCharacterStarter,
     StructuredProviderCharacterProfileCompleter,
     ToolCallingProviderCharacterProfileCompleter,
     complete_character_starters,
     content_with_character_starters,
+    normalize_scenario_character_starters,
+    scenario_character_starter_to_json,
     scenario_character_starters_for_content,
     scenario_context_text,
     starter_identity_locked_fields,
@@ -196,6 +199,9 @@ from bragi.services.scenario_content_rating import (
     metadata_with_scenario_content_ratings,
     scenario_content_rating,
 )
+from bragi.services.scenario_name_sources import (
+    ordinary_name_starter_generation_context,
+)
 from bragi.services.scenario_service import (
     CHOOSE_YOUR_OWN_ADVENTURE_ALLOWED_SECTIONS,
     CHOOSE_YOUR_OWN_ADVENTURE_SECTIONS,
@@ -258,7 +264,6 @@ class ManualScenarioInput:
     lore: str = ""
     locations: str = ""
     factions: str = ""
-    characters: str = ""
     magic_system: str = ""
     realms_and_places: str = ""
     factions_and_orders: str = ""
@@ -270,7 +275,6 @@ class ManualScenarioInput:
     factions_and_institutions: str = ""
     mission_stakes: str = ""
     mission_profile: str = ""
-    crew_and_command: str = ""
     ship_or_base_status: str = ""
     exploration_target: str = ""
     unknown_intelligence: str = ""
@@ -280,7 +284,6 @@ class ManualScenarioInput:
     hazards_and_escalation: str = ""
     expedition_goal: str = ""
     route_options: str = ""
-    party_roster: str = ""
     resource_inventory: str = ""
     environmental_conditions: str = ""
     hazards_and_events: str = ""
@@ -299,7 +302,6 @@ class ManualScenarioInput:
     npc_memory_rules: str = ""
     current_loop_state: str = ""
     case_facts: str = ""
-    suspects: str = ""
     clues: str = ""
     timeline: str = ""
     red_herrings: str = ""
@@ -307,7 +309,6 @@ class ManualScenarioInput:
     case_status: str = ""
     target_location: str = ""
     objectives_and_stakes: str = ""
-    crew_and_contacts: str = ""
     intel_and_access: str = ""
     security_model: str = ""
     alert_and_heat: str = ""
@@ -317,7 +318,6 @@ class ManualScenarioInput:
     aftermath: str = ""
     political_arena: str = ""
     political_factions: str = ""
-    major_npcs: str = ""
     central_conflict: str = ""
     secrets_and_leverage: str = ""
     reputation_and_standing: str = ""
@@ -327,7 +327,6 @@ class ManualScenarioInput:
     political_pressure: str = ""
     public_private_knowledge: str = ""
     settlement_profile: str = ""
-    population_and_residents: str = ""
     resources_and_indicators: str = ""
     projects_and_facilities: str = ""
     threats_and_opportunities: str = ""
@@ -336,12 +335,10 @@ class ManualScenarioInput:
     target_profile: str = ""
     leads_and_clues: str = ""
     hunt_locations: str = ""
-    rivals_and_factions: str = ""
     preparation_state: str = ""
     hunt_status: str = ""
     journey_profile: str = ""
     route_and_stops: str = ""
-    traveling_party: str = ""
     transport_and_supplies: str = ""
     recurring_pressures: str = ""
     relationship_threads: str = ""
@@ -351,11 +348,9 @@ class ManualScenarioInput:
     markets_and_stops: str = ""
     contracts_and_debts: str = ""
     route_hazards: str = ""
-    reputation_and_contacts: str = ""
     profit_and_loss: str = ""
     tone_genre: str = ""
     player_character_profile: str = ""
-    romance_options: str = ""
     starting_scene: str = ""
     action_choices_enabled: bool = False
     choice_style: str = ""
@@ -405,6 +400,7 @@ class ScenarioDraftModel:
     source_metadata: tuple[tuple[str, object], ...] = ()
     action_choices_enabled: bool = False
     scenario_types: tuple[str, ...] = ()
+    character_starters: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -438,21 +434,6 @@ ScenarioDraftProgressCallback = Callable[
     [ScenarioDraftProgressModel],
     Awaitable[None] | None,
 ]
-
-
-@dataclass(frozen=True)
-class _InitialCharacterEntry:
-    name: str
-    aliases: tuple[str, ...] = ()
-    role: str = ""
-    age: str = ""
-    known_state: str = ""
-    appearance: str = ""
-    visual_notes: str = ""
-    personality: str = ""
-    voice: str = ""
-    relationships: dict[str, object] | None = None
-    status: str = ""
 
 
 @dataclass(frozen=True)
@@ -1322,12 +1303,159 @@ class BragiRuntime:
         )
         return self._model_with_draft(draft, status="Section regenerated")
 
+    async def generate_scenario_draft_character_starters(
+        self,
+        *,
+        scenario_type: str,
+        scenario_types: Iterable[str] | None = None,
+        sections: dict[str, str],
+        character_starters: Iterable[Mapping[str, object]] | None = None,
+        count: int | None = None,
+        custom_description: str = "",
+        action_choices_enabled: bool = False,
+        current_user_id: str | None = None,
+    ) -> RuntimeModel:
+        try:
+            draft_type, draft_genres, normalized_action_choices_enabled = (
+                normalized_scenario_types_and_flag(
+                    scenario_type,
+                    scenario_types=scenario_types,
+                    action_choices_enabled=action_choices_enabled,
+                )
+            )
+            normalized_sections = normalize_scenario_draft_sections(
+                draft_type,
+                sections,
+            )
+            existing_starters = normalize_scenario_character_starters(
+                list(character_starters or ()),
+                strict=True,
+            )
+            description = custom_description.strip()
+            if description:
+                requested_count = 1
+            else:
+                if count is None or isinstance(count, bool):
+                    return self.build_model(
+                        error=(
+                            "Number of characters or custom character "
+                            "description is required"
+                        )
+                    )
+                requested_count = count
+            if requested_count < 1 or requested_count > 12:
+                return self.build_model(
+                    error="Number of characters must be between 1 and 12"
+                )
+            starter_type = _character_starter_scenario_type(
+                draft_type,
+                draft_genres,
+            )
+            preference = _context_update_preference_for_scenario_type(
+                repositories=self.repositories,
+                scenario_type=starter_type,
+            )
+            if preference is None:
+                return self.build_model(
+                    error="No context update model preference configured",
+                )
+            if preference.provider not in self.providers:
+                return self.build_model(
+                    error=(
+                        "Context Update provider is unavailable: "
+                        f"{preference.provider}"
+                    ),
+                )
+            provider = self.providers[preference.provider]
+            structured_completer = self._structured_character_profile_completer(
+                preference,
+                provider,
+            )
+            if structured_completer is None:
+                return self.build_model(
+                    error=(
+                        "Character starter generation requires a "
+                        "structured-output model"
+                    ),
+                )
+            player_name = normalized_sections.get("player_character_name", "")
+            name_context = ordinary_name_starter_generation_context(
+                scenario_type=tuple(genre.value for genre in draft_genres),
+                seed=normalized_sections.get("premise", ""),
+                sections=normalized_sections,
+                player_character_name=player_name,
+                existing_starter_names=_starter_generation_existing_names(
+                    existing_starters
+                ),
+            )
+            generated_starters = await structured_completer.generate_starters(
+                CharacterStarterGenerationRequest(
+                    scenario_type=starter_type,
+                    scenario_types=tuple(genre.value for genre in draft_genres),
+                    scenario_context=scenario_context_text(
+                        scenario_type=starter_type,
+                        content=normalized_sections,
+                    ),
+                    content=normalized_sections,
+                    existing_starters=existing_starters,
+                    count=requested_count,
+                    custom_description=description,
+                    name_candidate_context=name_context,
+                    save_id=None,
+                )
+            )
+            generated_starters, generated_starters_rating = (
+                await self._review_scenario_character_starters(
+                    starters=generated_starters,
+                    save_id=None,
+                    current_user_id=current_user_id,
+                    roleplay_type=draft_type.value,
+                )
+            )
+            draft = ScenarioDraft(
+                type=draft_type,
+                scenario_types=draft_genres,
+                sections=normalized_sections,
+                metadata=metadata_with_scenario_content_ratings(
+                    None,
+                    aggregate_rating=generated_starters_rating or "unclassified",
+                    section_ratings=(
+                        {"character_starters": generated_starters_rating}
+                        if generated_starters_rating is not None
+                        else {}
+                    ),
+                ),
+                action_choices_enabled=normalized_action_choices_enabled,
+                character_starters=(*existing_starters, *generated_starters),
+            )
+            log_event(
+                "runtime.scenario_draft_character_starters_generated",
+                scenario_type=draft_type.value,
+                scenario_types=tuple(genre.value for genre in draft_genres),
+                provider=preference.provider,
+                model=preference.model_id,
+                generated_count=len(generated_starters),
+                current_user_id=current_user_id,
+            )
+            return self._model_with_draft(
+                draft,
+                status="Character starters generated",
+            )
+        except Exception as exc:
+            log_error_event(
+                "runtime.scenario_draft_character_starters_failed",
+                scenario_type=scenario_type,
+                **exception_log_fields(exc),
+            )
+            return self.build_model(error=_user_visible_error(exc))
+
     async def save_scenario_draft(
         self,
         *,
         scenario_type: str,
         scenario_types: Iterable[str] | None = None,
         sections: dict[str, str],
+        character_starters: Iterable[Mapping[str, object]] | None = None,
         action_choices_enabled: bool = False,
         save_title: str = "",
         source_metadata: dict[str, object] | None = None,
@@ -1364,16 +1492,15 @@ class BragiRuntime:
                     safety.reviewed_content_rating
                 )
             normalized_sections = reviewed_sections
-            character_starters = await self._complete_character_starters_for_scenario(
-                scenario_type=draft_type.value,
-                scenario_types=draft_genres,
-                content=normalized_sections,
+            normalized_starters = normalize_scenario_character_starters(
+                list(character_starters or ()),
+                strict=True,
             )
             (
-                character_starters,
+                normalized_starters,
                 character_starters_rating,
             ) = await self._review_scenario_character_starters(
-                starters=character_starters,
+                starters=normalized_starters,
                 save_id=None,
                 current_user_id=current_user_id,
                 roleplay_type=draft_type.value,
@@ -1395,11 +1522,11 @@ class BragiRuntime:
                 sections=normalized_sections,
                 metadata=source_metadata,
                 action_choices_enabled=action_choices_enabled,
+                character_starters=normalized_starters,
             )
             scenario_id = _persist_scenario_draft(
                 self.repositories,
                 draft,
-                character_starters=character_starters,
             )
             save = SaveService(self.repositories).create_save(
                 scenario_id=scenario_id,
@@ -2992,32 +3119,6 @@ class BragiRuntime:
         )
         return self.build_character_registry_model(active_save_id=save_id)
 
-    async def _complete_character_starters_for_scenario(
-        self,
-        *,
-        scenario_type: str | ScenarioType,
-        scenario_types: Iterable[str | ScenarioType] | None = None,
-        content: Mapping[str, object],
-        save_id: str | None = None,
-    ) -> tuple[ScenarioCharacterStarter, ...]:
-        normalized_type, normalized_genres, _action_choices_enabled = (
-            normalized_scenario_types_and_flag(
-                scenario_type,
-                scenario_types=scenario_types,
-                action_choices_enabled=False,
-            )
-        )
-        starter_type = _character_starter_scenario_type(
-            normalized_type,
-            normalized_genres,
-        )
-        return await complete_character_starters(
-            completer=self._character_profile_completer(starter_type),
-            scenario_type=starter_type,
-            content=content,
-            save_id=save_id,
-        )
-
     async def _review_scenario_character_starters(
         self,
         *,
@@ -3123,6 +3224,7 @@ class BragiRuntime:
                 complete_character_starters(
                     completer=completer,
                     scenario_type=starter_type,
+                    scenario_types=tuple(genre.value for genre in normalized_genres),
                     content=content,
                     save_id=save_id,
                 )
@@ -3189,7 +3291,7 @@ class BragiRuntime:
         self,
         preference: ModelPreferenceRecord,
         provider: ProviderClient,
-    ) -> object | None:
+    ) -> StructuredProviderCharacterProfileCompleter | None:
         if not (
             _model_supports_structured_output(
                 repositories=self.repositories,
@@ -3255,6 +3357,10 @@ class BragiRuntime:
                 source_metadata=tuple((draft.metadata or {}).items()),
                 action_choices_enabled=draft.action_choices_enabled,
                 scenario_types=tuple(genre.value for genre in draft.scenario_types),
+                character_starters=tuple(
+                    scenario_character_starter_to_json(starter)
+                    for starter in draft.character_starters
+                ),
             ),
             model_indicator=base.model_indicator,
             status=base.status,
@@ -7459,6 +7565,16 @@ def _csv_text(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _starter_generation_existing_names(
+    starters: Iterable[ScenarioCharacterStarter],
+) -> tuple[str, ...]:
+    names: list[str] = []
+    for starter in starters:
+        names.append(starter.name)
+        names.extend(starter.aliases)
+    return tuple(name for name in names if name.strip())
+
+
 def _compact_text_key(value: str) -> str:
     return re.sub(r"\W+", " ", value.casefold()).strip()
 
@@ -7652,108 +7768,6 @@ def _scenario_source_metadata_without_loss_conditions(
     return sanitized or None
 
 
-def _initial_character_entries(
-    *,
-    scenario_type: ScenarioType,
-    content: Mapping[str, object],
-) -> tuple[_InitialCharacterEntry, ...]:
-    return _full_roleplay_initial_entries(content)
-
-
-def _full_roleplay_initial_entries(
-    content: Mapping[str, object],
-) -> tuple[_InitialCharacterEntry, ...]:
-    characters_text = _content_text(content, "characters")
-    if not characters_text:
-        return ()
-    player_name = _character_key(_content_text(content, "player_character_name"))
-    entries: list[_InitialCharacterEntry] = []
-    seen: set[str] = set()
-    for fragment in _character_fragments(characters_text):
-        entry = _initial_character_entry_from_fragment(fragment)
-        if entry is None:
-            continue
-        key = _character_key(entry.name)
-        if not key or key == player_name or key in seen:
-            continue
-        entries.append(entry)
-        seen.add(key)
-    return tuple(entries)
-
-
-def _character_fragments(characters_text: str) -> tuple[str, ...]:
-    lines = [
-        _clean_character_fragment(line)
-        for line in characters_text.replace(";", "\n").splitlines()
-    ]
-    fragments: list[str] = []
-    for line in lines:
-        if not line:
-            continue
-        parts = line.split(",") if "," in line else [line]
-        fragments.extend(_clean_character_fragment(part) for part in parts)
-    return tuple(fragment for fragment in fragments if fragment)
-
-
-def _initial_character_entry_from_fragment(
-    fragment: str,
-) -> _InitialCharacterEntry | None:
-    name_text = fragment
-    detail = ""
-    for separator in (" - ", " -- ", ": "):
-        if separator in fragment:
-            name_text, detail = fragment.split(separator, 1)
-            break
-    name = _clean_character_name(name_text)
-    if not name or not _looks_like_character_name(name):
-        return None
-    aliases: tuple[str, ...] = ()
-    role = detail.strip()
-    match = re.match(r"^(?P<name>[A-Z][\w' -]{1,80}) the (?P<role>[^.]+)$", name)
-    if match:
-        aliases = (match.group("name").strip(),)
-        role = role or match.group("role").strip()
-    elif not role:
-        title_role = _leading_title_role(name)
-        if title_role:
-            role = title_role
-    return _InitialCharacterEntry(
-        name=name,
-        aliases=aliases,
-        role=role,
-        known_state=fragment,
-    )
-
-
-def _leading_title_role(name: str) -> str:
-    title_match = re.match(
-        r"^(Captain|Commander|Doctor|Dr|Professor|Prof|Brother|Sister|Father|"
-        r"Mother|Lord|Lady|Sir|Dame|King|Queen|Prince|Princess|Archivist|"
-        r"Inspector|Warden|General|Admiral|Sergeant|Lieutenant)\b",
-        name,
-    )
-    if title_match is None:
-        return ""
-    role = title_match.group(1)
-    return {"Dr": "Doctor", "Prof": "Professor"}.get(role, role)
-
-
-def _clean_character_fragment(value: str) -> str:
-    fragment = value.strip().strip("-*0123456789. \t\r\n")
-    return re.sub(r"^(?:and|or)\s+", "", fragment, flags=re.IGNORECASE)
-
-
-def _clean_character_name(value: str) -> str:
-    return value.strip().strip("\"'`()[]{}")
-
-
-def _looks_like_character_name(value: str) -> bool:
-    first_word = value.split(maxsplit=1)[0]
-    if not first_word:
-        return False
-    return first_word[0].isupper()
-
-
 def _content_text(content: Mapping[str, object], key: str) -> str:
     value = content.get(key)
     return value.strip() if isinstance(value, str) else ""
@@ -7762,7 +7776,6 @@ def _content_text(content: Mapping[str, object], key: str) -> str:
 _SURVIVAL_EXPEDITION_STATE_SEEDS = (
     ("expedition_goal", "expedition.goal", "expedition"),
     ("route_options", "expedition.route", "expedition"),
-    ("party_roster", "expedition.party", "expedition"),
     ("resource_inventory", "expedition.resources", "inventory"),
     ("environmental_conditions", "expedition.environment", "expedition"),
     ("hazards_and_events", "expedition.hazards", "threat"),
@@ -7773,7 +7786,6 @@ _SURVIVAL_EXPEDITION_STATE_SEEDS = (
 
 _FIRST_CONTACT_EXPLORATION_STATE_SEEDS = (
     ("mission_profile", "contact.mission", "mission"),
-    ("crew_and_command", "contact.crew", "character"),
     ("ship_or_base_status", "contact.base", "base"),
     ("exploration_target", "contact.target", "location"),
     ("unknown_intelligence", "contact.intelligence", "contact"),
@@ -7799,7 +7811,6 @@ _TIME_LOOP_STATE_SEEDS = (
 _HEIST_INFILTRATION_STATE_SEEDS = (
     ("target_location", "heist.target", "location"),
     ("objectives_and_stakes", "heist.objectives", "objective"),
-    ("crew_and_contacts", "heist.crew", "character"),
     ("intel_and_access", "heist.intel", "intel"),
     ("security_model", "heist.security", "security"),
     ("alert_and_heat", "heist.alert", "threat"),
@@ -7812,7 +7823,6 @@ _HEIST_INFILTRATION_STATE_SEEDS = (
 _POLITICAL_INTRIGUE_STATE_SEEDS = (
     ("political_arena", "intrigue.arena", "intrigue"),
     ("political_factions", "intrigue.factions", "faction"),
-    ("major_npcs", "intrigue.npcs", "character"),
     ("central_conflict", "intrigue.conflict", "objective"),
     ("secrets_and_leverage", "intrigue.secrets", "leverage"),
     ("reputation_and_standing", "intrigue.standing", "reputation"),
@@ -7825,7 +7835,6 @@ _POLITICAL_INTRIGUE_STATE_SEEDS = (
 
 _SETTLEMENT_BUILDER_STATE_SEEDS = (
     ("settlement_profile", "settlement.profile", "settlement"),
-    ("population_and_residents", "settlement.population", "character"),
     ("resources_and_indicators", "settlement.resources", "resource"),
     ("projects_and_facilities", "settlement.projects", "project"),
     ("threats_and_opportunities", "settlement.pressures", "threat"),
@@ -7837,7 +7846,6 @@ _MONSTER_HUNT_BOUNTY_STATE_SEEDS = (
     ("target_profile", "hunt.target", "threat"),
     ("leads_and_clues", "hunt.leads", "clue"),
     ("hunt_locations", "hunt.locations", "location"),
-    ("rivals_and_factions", "hunt.rivals", "faction"),
     ("preparation_state", "hunt.preparation", "inventory"),
     ("hunt_status", "hunt.status", "objective"),
 )
@@ -7845,7 +7853,6 @@ _MONSTER_HUNT_BOUNTY_STATE_SEEDS = (
 _ROAD_TRIP_PILGRIMAGE_STATE_SEEDS = (
     ("journey_profile", "journey.profile", "journey"),
     ("route_and_stops", "journey.route", "location"),
-    ("traveling_party", "journey.party", "character"),
     ("transport_and_supplies", "journey.supplies", "inventory"),
     ("recurring_pressures", "journey.pressures", "threat"),
     ("relationship_threads", "journey.relationships", "relationship"),
@@ -7858,7 +7865,6 @@ _MERCHANT_TRADE_ROUTE_STATE_SEEDS = (
     ("markets_and_stops", "trade.markets", "location"),
     ("contracts_and_debts", "trade.contracts", "contract"),
     ("route_hazards", "trade.hazards", "threat"),
-    ("reputation_and_contacts", "trade.reputation", "reputation"),
     ("profit_and_loss", "trade.ledger", "finance"),
 )
 
@@ -8336,7 +8342,6 @@ def _manual_scenario_content(
                 "player_character_name": scenario.player_character_name.strip(),
                 "player_character_profile": scenario.player_character_profile.strip(),
                 "player_role": scenario.player_role.strip(),
-                "romance_options": scenario.romance_options.strip(),
                 "tone_genre": scenario.tone_genre.strip(),
                 "opening_message": scenario.opening_message.strip(),
             },
@@ -8391,7 +8396,6 @@ def _manual_scenario_content(
                 "player_character_name": scenario.player_character_name.strip(),
                 "player_role": scenario.player_role.strip(),
                 "mission_profile": scenario.mission_profile.strip(),
-                "crew_and_command": scenario.crew_and_command.strip(),
                 "ship_or_base_status": scenario.ship_or_base_status.strip(),
                 "exploration_target": scenario.exploration_target.strip(),
                 "unknown_intelligence": scenario.unknown_intelligence.strip(),
@@ -8414,7 +8418,6 @@ def _manual_scenario_content(
                 "player_role": scenario.player_role.strip(),
                 "expedition_goal": scenario.expedition_goal.strip(),
                 "route_options": scenario.route_options.strip(),
-                "party_roster": scenario.party_roster.strip(),
                 "resource_inventory": scenario.resource_inventory.strip(),
                 "environmental_conditions": (
                     scenario.environmental_conditions.strip()
@@ -8461,7 +8464,6 @@ def _manual_scenario_content(
                 "player_character_name": scenario.player_character_name.strip(),
                 "player_role": scenario.player_role.strip(),
                 "case_facts": scenario.case_facts.strip(),
-                "suspects": scenario.suspects.strip(),
                 "clues": scenario.clues.strip(),
                 "timeline": scenario.timeline.strip(),
                 "red_herrings": scenario.red_herrings.strip(),
@@ -8482,7 +8484,6 @@ def _manual_scenario_content(
                 "player_role": scenario.player_role.strip(),
                 "target_location": scenario.target_location.strip(),
                 "objectives_and_stakes": scenario.objectives_and_stakes.strip(),
-                "crew_and_contacts": scenario.crew_and_contacts.strip(),
                 "intel_and_access": scenario.intel_and_access.strip(),
                 "security_model": scenario.security_model.strip(),
                 "alert_and_heat": scenario.alert_and_heat.strip(),
@@ -8505,7 +8506,6 @@ def _manual_scenario_content(
                 "player_role": scenario.player_role.strip(),
                 "political_arena": scenario.political_arena.strip(),
                 "political_factions": scenario.political_factions.strip(),
-                "major_npcs": scenario.major_npcs.strip(),
                 "central_conflict": scenario.central_conflict.strip(),
                 "secrets_and_leverage": scenario.secrets_and_leverage.strip(),
                 "reputation_and_standing": (
@@ -8536,9 +8536,6 @@ def _manual_scenario_content(
                 "player_character_name": scenario.player_character_name.strip(),
                 "player_role": scenario.player_role.strip(),
                 "settlement_profile": scenario.settlement_profile.strip(),
-                "population_and_residents": (
-                    scenario.population_and_residents.strip()
-                ),
                 "resources_and_indicators": (
                     scenario.resources_and_indicators.strip()
                 ),
@@ -8568,7 +8565,6 @@ def _manual_scenario_content(
                 "target_profile": scenario.target_profile.strip(),
                 "leads_and_clues": scenario.leads_and_clues.strip(),
                 "hunt_locations": scenario.hunt_locations.strip(),
-                "rivals_and_factions": scenario.rivals_and_factions.strip(),
                 "preparation_state": scenario.preparation_state.strip(),
                 "hunt_status": scenario.hunt_status.strip(),
                 "tone_genre": scenario.tone_genre.strip(),
@@ -8586,7 +8582,6 @@ def _manual_scenario_content(
                 "player_role": scenario.player_role.strip(),
                 "journey_profile": scenario.journey_profile.strip(),
                 "route_and_stops": scenario.route_and_stops.strip(),
-                "traveling_party": scenario.traveling_party.strip(),
                 "transport_and_supplies": (
                     scenario.transport_and_supplies.strip()
                 ),
@@ -8611,9 +8606,6 @@ def _manual_scenario_content(
                 "markets_and_stops": scenario.markets_and_stops.strip(),
                 "contracts_and_debts": scenario.contracts_and_debts.strip(),
                 "route_hazards": scenario.route_hazards.strip(),
-                "reputation_and_contacts": (
-                    scenario.reputation_and_contacts.strip()
-                ),
                 "profit_and_loss": scenario.profit_and_loss.strip(),
                 "tone_genre": scenario.tone_genre.strip(),
                 "opening_message": scenario.opening_message.strip(),
@@ -8631,7 +8623,6 @@ def _manual_scenario_content(
             "lore": scenario.lore.strip(),
             "locations": scenario.locations.strip(),
             "factions": scenario.factions.strip(),
-            "characters": scenario.characters.strip(),
             "tone_genre": scenario.tone_genre.strip(),
             "starting_scene": scenario.starting_scene.strip(),
             "opening_message": scenario.opening_message.strip(),
@@ -9270,7 +9261,9 @@ def _persist_scenario_draft(
                 sections,
                 draft.scenario_types,
             ),
-            starters=character_starters,
+            starters=draft.character_starters
+            if character_starters is None
+            else character_starters,
         ),
         enabled=draft.action_choices_enabled,
     )

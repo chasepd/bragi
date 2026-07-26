@@ -106,6 +106,9 @@ class JobRegistry:
         self._operation_queue_waiters: list[
             tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]
         ] = []
+        self._event_waiters: list[
+            tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]
+        ] = []
 
     async def create(
         self,
@@ -265,7 +268,23 @@ class JobRegistry:
         )
 
     async def wait_for_event(self, job_id: str, last_index: int) -> int:
-        return await asyncio.to_thread(self._wait_for_event, job_id, last_index)
+        while True:
+            with self._condition:
+                if self._has_event_after_locked(job_id, last_index):
+                    return last_index
+                loop = asyncio.get_running_loop()
+                waiter: asyncio.Future[None] = loop.create_future()
+                self._event_waiters.append((loop, waiter))
+            try:
+                await asyncio.wait_for(waiter, timeout=30)
+            except TimeoutError:
+                with self._condition:
+                    self._remove_event_waiter_locked(waiter)
+                return last_index
+            except asyncio.CancelledError:
+                with self._condition:
+                    self._remove_event_waiter_locked(waiter)
+                raise
 
     async def _run(self, record: JobRecord, worker: JobWorker) -> None:
         try:
@@ -454,14 +473,6 @@ class JobRegistry:
             **result_shape(jsonable_payload),
         )
 
-    def _wait_for_event(self, job_id: str, last_index: int) -> int:
-        with self._condition:
-            self._condition.wait_for(
-                lambda: self._has_event_after_locked(job_id, last_index),
-                timeout=30,
-            )
-            return last_index
-
     def _has_event_after_locked(self, job_id: str, last_index: int) -> bool:
         record = self._jobs.get(job_id)
         if record is None:
@@ -485,6 +496,7 @@ class JobRegistry:
         if overflow > 0:
             del record.events[:overflow]
             record.event_offset += overflow
+        self._notify_event_waiters_locked()
         return jsonable_payload
 
     def _active_count_locked(self) -> int:
@@ -552,7 +564,22 @@ class JobRegistry:
         for loop, waiter in waiters:
             if waiter.done():
                 continue
-            loop.call_soon_threadsafe(waiter.set_result, None)
+            loop.call_soon_threadsafe(_complete_waiter, waiter)
+
+    def _notify_event_waiters_locked(self) -> None:
+        waiters = self._event_waiters
+        self._event_waiters = []
+        for loop, waiter in waiters:
+            if waiter.done():
+                continue
+            loop.call_soon_threadsafe(_complete_waiter, waiter)
+
+    def _remove_event_waiter_locked(self, waiter: asyncio.Future[None]) -> None:
+        self._event_waiters = [
+            (loop, future)
+            for loop, future in self._event_waiters
+            if future is not waiter
+        ]
 
     def _prune_completed_locked(self, now: float) -> None:
         pruned = False
@@ -579,6 +606,7 @@ class JobRegistry:
             del self._jobs[record.id]
             pruned = True
         if pruned:
+            self._notify_event_waiters_locked()
             self._condition.notify_all()
 
     def _snapshot_locked(self, record: JobRecord) -> JobRecord:
@@ -742,6 +770,11 @@ def _repository_scope_context(
     return repository_scope()
 
 
+def _complete_waiter(waiter: asyncio.Future[None]) -> None:
+    if not waiter.done():
+        waiter.set_result(None)
+
+
 def job_summary(record: JobRecord) -> dict[str, Any]:
     return {
         "id": record.id,
@@ -882,6 +915,8 @@ def _provider_task_for_job_type(job_type: str) -> str | None:
         return "video_generation"
     if job_type in {"scenario_draft", "scenario_section"}:
         return "scenario_generation"
+    if job_type == "scenario_character_starters":
+        return "context_update"
     if job_type in {"context_cleanup", "guided_context_cleanup"}:
         return "context_cleanup"
     if job_type == "summary_backfill":

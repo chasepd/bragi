@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from bragi.services.scenario_name_sources import (
+    ordinary_character_name_candidate_context,
     ordinary_name_candidate_context,
     ordinary_name_candidates,
+    ordinary_name_starter_generation_context,
     repeated_first_names,
 )
 
@@ -10,14 +12,14 @@ from bragi.services.scenario_name_sources import (
 def test_ordinary_name_candidates_are_deterministic_and_exclude_used_names() -> None:
     first = ordinary_name_candidates(
         scenario_type="dating_sim",
-        section_id="romance_options",
+        section_id="character_starters",
         seed="Emily and James are already central to this story.",
         sections={"premise": "Michael waits near the ticket counter."},
         per_bucket=1000,
     )
     second = ordinary_name_candidates(
         scenario_type="dating_sim",
-        section_id="romance_options",
+        section_id="character_starters",
         seed="Emily and James are already central to this story.",
         sections={"premise": "Michael waits near the ticket counter."},
         per_bucket=1000,
@@ -34,7 +36,7 @@ def test_ordinary_name_candidates_are_deterministic_and_exclude_used_names() -> 
 def test_ordinary_name_candidate_context_skips_fantasy_roleplay() -> None:
     context = ordinary_name_candidate_context(
         scenario_type="fantasy_roleplay",
-        section_id="characters",
+        section_id="character_starters",
         seed="A moonlit court with repeating names.",
         sections={},
     )
@@ -45,7 +47,7 @@ def test_ordinary_name_candidate_context_skips_fantasy_roleplay() -> None:
 def test_ordinary_name_candidate_context_skips_multi_genre_with_fantasy() -> None:
     context = ordinary_name_candidate_context(
         scenario_type=("fantasy_roleplay", "dating_sim"),
-        section_id="romance_options",
+        section_id="character_starters",
         seed="A moonlit court with repeating names.",
         sections={},
     )
@@ -56,7 +58,7 @@ def test_ordinary_name_candidate_context_skips_multi_genre_with_fantasy() -> Non
 def test_ordinary_name_candidate_context_formats_optional_prompt_guidance() -> None:
     context = ordinary_name_candidate_context(
         scenario_type="dating_sim",
-        section_id="romance_options",
+        section_id="character_starters",
         seed="A contemporary speed dating night.",
         sections={},
     )
@@ -66,6 +68,64 @@ def test_ordinary_name_candidate_context_formats_optional_prompt_guidance() -> N
     assert "Masculine:" in context
     assert "Neutral:" in context
     assert "Do not repeat first names" in context
+
+
+def test_ordinary_character_name_candidate_context_excludes_content_names() -> None:
+    context = ordinary_character_name_candidate_context(
+        scenario_type="dating_sim",
+        content={
+            "player_character_name": "Emily Harper",
+            "premise": "Michael hosts a contemporary speed dating night.",
+            "character_starters": [
+                {"name": "James Carter"},
+                {"name": "Taylor Brooks"},
+            ],
+        },
+        per_bucket=1000,
+    )
+
+    assert "Ordinary contemporary name candidates" in context
+    assert "Feminine:" in context
+    assert "Masculine:" in context
+    assert "Neutral:" in context
+    assert "Emily" not in context
+    assert "Michael" not in context
+    assert "James" not in context
+    assert "Taylor" not in context
+
+
+def test_ordinary_character_name_candidate_context_skips_hybrid_fantasy() -> None:
+    context = ordinary_character_name_candidate_context(
+        scenario_type=("fantasy_roleplay", "dating_sim"),
+        content={
+            "character_starters": [{"name": "Emily Vale"}],
+        },
+    )
+
+    assert context == ""
+
+
+def test_ordinary_name_starter_generation_context_excludes_existing_names() -> None:
+    context = ordinary_name_starter_generation_context(
+        scenario_type="dating_sim",
+        seed="Emily and James are already central to this story.",
+        sections={"premise": "Michael hosts a contemporary speed dating night."},
+        player_character_name="Emily Harper",
+        existing_starter_names=("James Carter", "Taylor Brooks"),
+        per_bucket=1000,
+    )
+
+    assert (
+        "Ordinary contemporary name candidates for new character starters"
+        in context
+    )
+    assert "Feminine:" in context
+    assert "Masculine:" in context
+    assert "Neutral:" in context
+    assert "Emily" not in context
+    assert "James" not in context
+    assert "Michael" not in context
+    assert "Taylor" not in context
 
 
 def test_repeated_first_names_detects_obvious_cast_duplicates() -> None:

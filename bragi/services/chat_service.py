@@ -3549,10 +3549,6 @@ class ChatService:
         save_id: str,
         request: ChatRequest,
     ) -> ChatRequest | None:
-        if not bool(
-            self.repositories.get_app_setting("chat_fallback_enabled")
-        ):
-            return None
         preference = narrator_fallback_model_preference(
             repositories=self.repositories,
             save_id=save_id,
@@ -9730,8 +9726,6 @@ def _fallback_skip_reason(
     providers: dict[str, ProviderClient],
     save_id: str,
 ) -> str:
-    if not bool(repositories.get_app_setting("chat_fallback_enabled")):
-        return "disabled"
     preference = narrator_fallback_model_preference(
         repositories=repositories,
         save_id=save_id,

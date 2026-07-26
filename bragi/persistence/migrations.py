@@ -11,7 +11,7 @@ from pathlib import Path
 from bragi.model_tasks import is_retired_model_task
 from bragi.private_files import ensure_private_file
 
-CURRENT_SCHEMA_VERSION = 69
+CURRENT_SCHEMA_VERSION = 70
 
 _PRESERVE_SCHEMA_SCRIPT_TRANSACTION: ContextVar[bool] = ContextVar(
     "_PRESERVE_SCHEMA_SCRIPT_TRANSACTION",
@@ -48,6 +48,23 @@ _MIGRATION_TIME_OF_DAY_ALIASES = {
 _MIGRATION_CLOCK_RE = re.compile(
     r"\b([01]?\d|2[0-3])(?::([0-5]\d))?\s*([ap]\.?m\.?)?\b",
     flags=re.IGNORECASE,
+)
+_DEPRECATED_SCENARIO_CHARACTER_SECTION_KEYS = (
+    "characters",
+    "romance_options",
+    "suspects",
+    "crew_and_command",
+    "party_roster",
+    "crew_and_contacts",
+    "major_npcs",
+    "population_and_residents",
+    "rivals_and_factions",
+    "traveling_party",
+    "reputation_and_contacts",
+)
+_DEPRECATED_SCENARIO_FACTION_APPEND_KEYS = (
+    "rivals_and_factions",
+    "reputation_and_contacts",
 )
 
 
@@ -601,23 +618,30 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 68:
+            if current == 69:
+                _migrate_schema_69_to_70(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 68:
                 _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 67:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 66:
                 _migrate_schema_66_to_67(connection)
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 65:
                 _migrate_schema_65_to_66(connection)
                 _migrate_schema_66_to_67(connection)
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 64:
                 _migrate_schema_64_to_65(connection)
@@ -625,6 +649,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_66_to_67(connection)
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 63:
                 _migrate_schema_63_to_64(connection)
@@ -633,6 +658,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_66_to_67(connection)
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 62:
                 _migrate_schema_62_to_63(connection)
@@ -642,6 +668,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_66_to_67(connection)
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 61:
                 _migrate_schema_61_to_62(connection)
@@ -652,6 +679,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_66_to_67(connection)
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
+                _migrate_schema_69_to_70(connection)
                 current = CURRENT_SCHEMA_VERSION
             else:
                 raise RuntimeError(
@@ -1498,6 +1526,74 @@ def _migrate_schema_65_to_66(connection: sqlite3.Connection) -> None:
 
 
 def _migrate_schema_66_to_67(connection: sqlite3.Connection) -> None:
+    _strip_deprecated_scenario_character_sections(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (67)")
+
+
+def _strip_deprecated_scenario_character_sections(
+    connection: sqlite3.Connection,
+) -> None:
+    for table_name in ("scenarios", "save_scenario_updates"):
+        _strip_deprecated_scenario_character_sections_from_table(
+            connection,
+            table_name,
+        )
+
+
+def _strip_deprecated_scenario_character_sections_from_table(
+    connection: sqlite3.Connection,
+    table_name: str,
+) -> None:
+    if table_name not in {"scenarios", "save_scenario_updates"}:
+        raise ValueError(f"Unsupported scenario content table: {table_name}")
+    if not _table_exists(connection, table_name):
+        return
+    if not {"id", "content_json"} <= _column_names(connection, table_name):
+        return
+    rows = connection.execute(f"SELECT id, content_json FROM {table_name}").fetchall()
+    for row_id, content_json in rows:
+        try:
+            content = json.loads(str(content_json or "{}"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(content, dict):
+            continue
+        updated = False
+        faction_fragments = [_migration_stripped_text(content.get("factions"))]
+        for key in _DEPRECATED_SCENARIO_CHARACTER_SECTION_KEYS:
+            if key not in content:
+                continue
+            value = content.pop(key)
+            updated = True
+            if key in _DEPRECATED_SCENARIO_FACTION_APPEND_KEYS:
+                text = _migration_stripped_text(value)
+                if text:
+                    faction_fragments.append(text)
+        nonblank_factions = [fragment for fragment in faction_fragments if fragment]
+        if nonblank_factions:
+            merged_factions = "\n\n".join(nonblank_factions)
+            if content.get("factions") != merged_factions:
+                content["factions"] = merged_factions
+                updated = True
+        elif content.get("factions") == "":
+            content.pop("factions", None)
+            updated = True
+        if not updated:
+            continue
+        connection.execute(
+            f"UPDATE {table_name} SET content_json = ? WHERE id = ?",
+            (
+                json.dumps(content, sort_keys=True, separators=(",", ":")),
+                row_id,
+            ),
+        )
+
+
+def _migration_stripped_text(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _migrate_schema_67_to_68(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(
         connection,
         "messages",
@@ -1510,22 +1606,23 @@ def _migrate_schema_66_to_67(connection: sqlite3.Connection) -> None:
         "content_rating",
         "TEXT NOT NULL DEFAULT 'unrated'",
     )
-    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (67)")
-
-
-def _migrate_schema_67_to_68(connection: sqlite3.Connection) -> None:
-    _ensure_generated_content_rating_schema(connection)
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (68)")
 
 
 def _migrate_schema_68_to_69(connection: sqlite3.Connection) -> None:
+    _ensure_generated_content_rating_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (69)")
+
+
+def _migrate_schema_69_to_70(connection: sqlite3.Connection) -> None:
+    _strip_deprecated_scenario_character_sections(connection)
     _add_column_if_missing(
         connection,
         "characters",
         "content_rating",
         "TEXT NOT NULL DEFAULT 'unclassified'",
     )
-    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (69)")
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (70)")
 
 
 def _remove_retired_model_preferences(connection: sqlite3.Connection) -> None:

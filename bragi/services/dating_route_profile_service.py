@@ -784,7 +784,6 @@ def _scenario_content_lines(scenario: ScenarioRecord) -> tuple[str, ...]:
     keys = (
         "player_character_name",
         "player_character_profile",
-        "romance_options",
         "current_scene",
         "tone_genre",
     )

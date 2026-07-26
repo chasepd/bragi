@@ -24,30 +24,10 @@ _NAME_CANDIDATE_SECTION_IDS = frozenset(
     {
         "player_character_name",
         "character_name",
-        "romance_options",
-        "characters",
-        "suspects",
-        "crew_and_command",
-        "party_roster",
-        "major_npcs",
-        "crew_and_contacts",
-        "population_and_residents",
-        "traveling_party",
+        "character_starters",
     }
 )
-_CAST_DEDUPE_SECTION_IDS = frozenset(
-    {
-        "romance_options",
-        "characters",
-        "suspects",
-        "crew_and_command",
-        "party_roster",
-        "major_npcs",
-        "crew_and_contacts",
-        "population_and_residents",
-        "traveling_party",
-    }
-)
+_CAST_DEDUPE_SECTION_IDS = frozenset({"character_starters"})
 _PROSE_NAME_MARKERS = (
     " is ",
     " was ",
@@ -139,6 +119,89 @@ def ordinary_name_candidate_context(
     return "\n".join(lines)
 
 
+def ordinary_character_name_candidate_context(
+    *,
+    scenario_type: Any,
+    content: Mapping[str, object],
+    per_bucket: int = 12,
+) -> str:
+    return ordinary_name_starter_generation_context(
+        scenario_type=scenario_type,
+        seed=_source_generation_prompt(content),
+        sections=_string_content_sections(content),
+        player_character_name=_content_text(content, "player_character_name"),
+        existing_starter_names=_character_starter_names_from_content(content),
+        per_bucket=per_bucket,
+    )
+
+
+def ordinary_name_starter_generation_context(
+    *,
+    scenario_type: Any,
+    seed: str,
+    sections: Mapping[str, str],
+    player_character_name: str = "",
+    existing_starter_names: Iterable[str] = (),
+    per_bucket: int = 12,
+) -> str:
+    if _has_fantasy_scenario_type(scenario_type) or per_bucket <= 0:
+        return ""
+    excluded_names = tuple(
+        name.strip()
+        for name in (player_character_name, *tuple(existing_starter_names))
+        if isinstance(name, str) and name.strip()
+    )
+    used_text = "\n".join(
+        value.strip()
+        for value in (
+            seed,
+            *(section_value for section_value in sections.values()),
+            *excluded_names,
+        )
+        if value.strip()
+    )
+    salt = _candidate_salt(
+        scenario_type=scenario_type,
+        section_id="character_starters",
+        seed=seed,
+        sections={**sections, "_starter_exclusions": "\n".join(excluded_names)},
+    )
+    pools = _ordinary_name_pools()
+    candidates = OrdinaryNameCandidates(
+        feminine=_stable_name_sample(
+            _exclude_used_names(pools["feminine"], used_text),
+            per_bucket=per_bucket,
+            salt=f"{salt}:feminine",
+        ),
+        masculine=_stable_name_sample(
+            _exclude_used_names(pools["masculine"], used_text),
+            per_bucket=per_bucket,
+            salt=f"{salt}:masculine",
+        ),
+        neutral=_stable_name_sample(
+            _exclude_used_names(pools["neutral"], used_text),
+            per_bucket=per_bucket,
+            salt=f"{salt}:neutral",
+        ),
+    )
+    if not candidates.any():
+        return ""
+    lines = [
+        "Ordinary contemporary name candidates for new character starters "
+        "(optional; use only when they fit):"
+    ]
+    if candidates.feminine:
+        lines.append(f"Feminine: {', '.join(candidates.feminine)}")
+    if candidates.masculine:
+        lines.append(f"Masculine: {', '.join(candidates.masculine)}")
+    if candidates.neutral:
+        lines.append(f"Neutral: {', '.join(candidates.neutral)}")
+    lines.append(
+        "Do not use the player character name or any existing starter name."
+    )
+    return "\n".join(lines)
+
+
 def ordinary_name_candidates(
     *,
     scenario_type: Any,
@@ -215,6 +278,50 @@ def repeated_first_names(text: str) -> tuple[str, ...]:
             repeated_keys.add(key)
         seen.add(key)
     return tuple(repeated)
+
+
+def _string_content_sections(content: Mapping[str, object]) -> dict[str, str]:
+    return {
+        key: value.strip()
+        for key, value in content.items()
+        if isinstance(value, str) and value.strip()
+    }
+
+
+def _source_generation_prompt(content: Mapping[str, object]) -> str:
+    source = content.get("_source")
+    if not isinstance(source, Mapping):
+        return ""
+    prompt = source.get("generation_prompt")
+    return prompt.strip() if isinstance(prompt, str) else ""
+
+
+def _content_text(content: Mapping[str, object], key: str) -> str:
+    value = content.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _character_starter_names_from_content(
+    content: Mapping[str, object],
+) -> tuple[str, ...]:
+    value = content.get("character_starters")
+    if not isinstance(value, list):
+        return ()
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+        aliases = item.get("aliases")
+        if isinstance(aliases, list | tuple):
+            names.extend(
+                alias.strip()
+                for alias in aliases
+                if isinstance(alias, str)
+            )
+    return tuple(name for name in names if name)
 
 
 @cache

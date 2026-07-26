@@ -11802,7 +11802,6 @@ describe("frontend helpers", () => {
       player_role: "Keeper",
       player_character_name: "Mara",
       player_character_profile: "",
-      romance_options: "",
       magic_system: "",
       realms_and_places: "",
       factions_and_orders: "",
@@ -11814,7 +11813,6 @@ describe("frontend helpers", () => {
       factions_and_institutions: "",
       mission_stakes: "",
       mission_profile: "",
-      crew_and_command: "",
       ship_or_base_status: "",
       exploration_target: "",
       unknown_intelligence: "",
@@ -11824,7 +11822,6 @@ describe("frontend helpers", () => {
       hazards_and_escalation: "",
       expedition_goal: "",
       route_options: "",
-      party_roster: "",
       resource_inventory: "",
       environmental_conditions: "",
       hazards_and_events: "",
@@ -11843,7 +11840,6 @@ describe("frontend helpers", () => {
       npc_memory_rules: "",
       current_loop_state: "",
       case_facts: "",
-      suspects: "",
       clues: "",
       timeline: "",
       red_herrings: "",
@@ -11851,7 +11847,6 @@ describe("frontend helpers", () => {
       case_status: "",
       target_location: "",
       objectives_and_stakes: "",
-      crew_and_contacts: "",
       intel_and_access: "",
       security_model: "",
       alert_and_heat: "",
@@ -11861,7 +11856,6 @@ describe("frontend helpers", () => {
       aftermath: "",
       political_arena: "",
       political_factions: "",
-      major_npcs: "",
       central_conflict: "",
       secrets_and_leverage: "",
       reputation_and_standing: "",
@@ -11871,7 +11865,6 @@ describe("frontend helpers", () => {
       political_pressure: "",
       public_private_knowledge: "",
       settlement_profile: "",
-      population_and_residents: "",
       resources_and_indicators: "",
       projects_and_facilities: "",
       threats_and_opportunities: "",
@@ -11880,12 +11873,10 @@ describe("frontend helpers", () => {
       target_profile: "",
       leads_and_clues: "",
       hunt_locations: "",
-      rivals_and_factions: "",
       preparation_state: "",
       hunt_status: "",
       journey_profile: "",
       route_and_stops: "",
-      traveling_party: "",
       transport_and_supplies: "",
       recurring_pressures: "",
       relationship_threads: "",
@@ -11895,7 +11886,6 @@ describe("frontend helpers", () => {
       markets_and_stops: "",
       contracts_and_debts: "",
       route_hazards: "",
-      reputation_and_contacts: "",
       profit_and_loss: "",
       tone_genre: "",
       choice_style: "",
@@ -11940,7 +11930,8 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Premise"), "A diplomatic station turns courtship into first contact.");
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Envoy-pilot");
     await userEvent.type(within(dialog).getByLabelText("Technology Level"), "Near-future orbital habitat and alien translators.");
-    await userEvent.type(within(dialog).getByLabelText("Romance Options"), "A xenolinguist, station marshal, and visiting envoy.");
+    await userEvent.type(within(dialog).getByLabelText("Player Character Profile"), "Mara is a translator trained for tense receptions.");
+    expect(within(dialog).queryByLabelText("Romance Options")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Opening Message"), "The airlock opens on the first reception.");
     await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
 
@@ -11953,7 +11944,7 @@ describe("frontend helpers", () => {
       premise: "A diplomatic station turns courtship into first contact.",
       player_role: "Envoy-pilot",
       technology_level: "Near-future orbital habitat and alien translators.",
-      romance_options: "A xenolinguist, station marshal, and visiting envoy.",
+      player_character_profile: "Mara is a translator trained for tense receptions.",
       opening_message: "The airlock opens on the first reception."
     });
     expect(onRuntimeChanged).toHaveBeenCalledWith(expect.objectContaining({
@@ -11990,7 +11981,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Premise"), "A curator vanishes during a gala.");
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Lead investigator");
     await userEvent.type(within(dialog).getByLabelText("Case Facts"), "The east gallery was sealed.");
-    await userEvent.type(within(dialog).getByLabelText("Suspects"), "Sera Holt has a false alibi.");
+    expect(within(dialog).queryByLabelText("Suspects")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Clues"), "The watch log skips eight minutes.");
     await userEvent.type(within(dialog).getByLabelText("Timeline"), "Public alarm at 9:21; hidden lift movement at 9:12.");
     await userEvent.type(within(dialog).getByLabelText("Red Herrings"), "The bloody glove is from a mannequin.");
@@ -12007,7 +11998,6 @@ describe("frontend helpers", () => {
       premise: "A curator vanishes during a gala.",
       player_role: "Lead investigator",
       case_facts: "The east gallery was sealed.",
-      suspects: "Sera Holt has a false alibi.",
       clues: "The watch log skips eight minutes.",
       timeline: "Public alarm at 9:21; hidden lift movement at 9:12.",
       red_herrings: "The bloody glove is from a mannequin.",
@@ -12050,7 +12040,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Crew planner");
     await userEvent.type(within(dialog).getByLabelText("Target Location"), "Skybank vault above the storm moorings.");
     await userEvent.type(within(dialog).getByLabelText("Objectives And Stakes"), "Recover the treaty and avoid war.");
-    await userEvent.type(within(dialog).getByLabelText("Crew And Contacts"), "Tavi runs locks; Venn is the inside clerk.");
+    expect(within(dialog).queryByLabelText("Crew And Contacts")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Intel And Access"), "Guard shift changes at bell three.");
     await userEvent.type(within(dialog).getByLabelText("Security Model"), "Clockwork cameras and a silent alarm.");
     await userEvent.type(within(dialog).getByLabelText("Alert And Heat"), "Suspicion low; alarm inactive.");
@@ -12070,7 +12060,6 @@ describe("frontend helpers", () => {
       player_role: "Crew planner",
       target_location: "Skybank vault above the storm moorings.",
       objectives_and_stakes: "Recover the treaty and avoid war.",
-      crew_and_contacts: "Tavi runs locks; Venn is the inside clerk.",
       intel_and_access: "Guard shift changes at bell three.",
       security_model: "Clockwork cameras and a silent alarm.",
       alert_and_heat: "Suspicion low; alarm inactive.",
@@ -12115,7 +12104,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Swing-vote envoy");
     await userEvent.type(within(dialog).getByLabelText("Political Arena"), "Harbor council chamber and public galleries.");
     await userEvent.type(within(dialog).getByLabelText("Political Factions"), "Guilds, Old Families, and dock unions.");
-    await userEvent.type(within(dialog).getByLabelText("Major Npcs"), "Duchess Salen needs Mara's vote; Orro owes a favor.");
+    expect(within(dialog).queryByLabelText("Major Npcs")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Central Conflict"), "A midnight vote can replace the regent.");
     await userEvent.type(within(dialog).getByLabelText("Secrets And Leverage"), "Only Mara knows Orro moved missing silver.");
     await userEvent.type(within(dialog).getByLabelText("Reputation And Standing"), "Mara is trusted by reformers.");
@@ -12136,7 +12125,6 @@ describe("frontend helpers", () => {
       player_role: "Swing-vote envoy",
       political_arena: "Harbor council chamber and public galleries.",
       political_factions: "Guilds, Old Families, and dock unions.",
-      major_npcs: "Duchess Salen needs Mara's vote; Orro owes a favor.",
       central_conflict: "A midnight vote can replace the regent.",
       secrets_and_leverage: "Only Mara knows Orro moved missing silver.",
       reputation_and_standing: "Mara is trusted by reformers.",
@@ -12181,7 +12169,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Premise"), "A survey crew finds patterned signals under the ice.");
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Mission linguist");
     await userEvent.type(within(dialog).getByLabelText("Mission Profile"), "Survey the hidden ocean.");
-    await userEvent.type(within(dialog).getByLabelText("Crew And Command"), "Commander Reyes leads the mission.");
+    expect(within(dialog).queryByLabelText("Crew And Command")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Ship Or Base Status"), "Habitat heat is stable for 42 hours.");
     await userEvent.type(within(dialog).getByLabelText("Exploration Target"), "A black-water cavern beneath the ice.");
     await userEvent.type(within(dialog).getByLabelText("Unknown Intelligence"), "An unseen singer answers sonar.");
@@ -12200,7 +12188,6 @@ describe("frontend helpers", () => {
       premise: "A survey crew finds patterned signals under the ice.",
       player_role: "Mission linguist",
       mission_profile: "Survey the hidden ocean.",
-      crew_and_command: "Commander Reyes leads the mission.",
       ship_or_base_status: "Habitat heat is stable for 42 hours.",
       exploration_target: "A black-water cavern beneath the ice.",
       unknown_intelligence: "An unseen singer answers sonar.",
@@ -12245,7 +12232,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Expedition lead");
     await userEvent.type(within(dialog).getByLabelText("Expedition Goal"), "Reach Northwatch before the fever spreads.");
     await userEvent.type(within(dialog).getByLabelText("Route Options"), "Cliff road is faster; forest route has fuel.");
-    await userEvent.type(within(dialog).getByLabelText("Party Roster"), "Mara guides two scouts and a medic.");
+    expect(within(dialog).queryByLabelText("Party Roster")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Resource Inventory"), "Food for nine days; medicine for three patients.");
     await userEvent.type(within(dialog).getByLabelText("Environmental Conditions"), "Late winter whiteout with ice-glazed slopes.");
     await userEvent.type(within(dialog).getByLabelText("Hazards And Events"), "Avalanches, frostbite, and wolf sign.");
@@ -12264,7 +12251,6 @@ describe("frontend helpers", () => {
       player_role: "Expedition lead",
       expedition_goal: "Reach Northwatch before the fever spreads.",
       route_options: "Cliff road is faster; forest route has fuel.",
-      party_roster: "Mara guides two scouts and a medic.",
       resource_inventory: "Food for nine days; medicine for three patients.",
       environmental_conditions: "Late winter whiteout with ice-glazed slopes.",
       hazards_and_events: "Avalanches, frostbite, and wolf sign.",
@@ -12311,7 +12297,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Markets And Stops"), "Red Harbor needs oil.");
     await userEvent.type(within(dialog).getByLabelText("Contracts And Debts"), "Deliver ten jars in twelve days.");
     await userEvent.type(within(dialog).getByLabelText("Route Hazards"), "Tariff patrols and bridge bandits.");
-    await userEvent.type(within(dialog).getByLabelText("Reputation And Contacts"), "Trusted by Kesh brokers.");
+    expect(within(dialog).queryByLabelText("Reputation And Contacts")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Profit And Loss"), "One lost crate erases profit.");
     await userEvent.type(within(dialog).getByLabelText("Opening Message"), "The creditor stamps the contract.");
     await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
@@ -12328,7 +12314,6 @@ describe("frontend helpers", () => {
       markets_and_stops: "Red Harbor needs oil.",
       contracts_and_debts: "Deliver ten jars in twelve days.",
       route_hazards: "Tariff patrols and bridge bandits.",
-      reputation_and_contacts: "Trusted by Kesh brokers.",
       profit_and_loss: "One lost crate erases profit.",
       opening_message: "The creditor stamps the contract."
     });
@@ -12498,7 +12483,28 @@ describe("frontend helpers", () => {
         ["premise", "Old premise"],
         ["player_character_name", "Mara"],
         ["player_role", "Keeper"]
-      ] as [string, string][]
+      ] as [string, string][],
+      character_starters: [
+        {
+          name: "Old Starter",
+          aliases: [],
+          role: "Should be replaced",
+          age: "",
+          known_state: "",
+          appearance: "",
+          visual_notes: "",
+          personality: "",
+          voice: "",
+          texting_style: "",
+          relationships: {},
+          goals: "",
+          motivations: "",
+          boundaries: "",
+          status: "",
+          met: true,
+          locked_fields: []
+        }
+      ]
     };
     const newDraft = {
       scenario_type: "full_roleplay",
@@ -12540,7 +12546,11 @@ describe("frontend helpers", () => {
       ),
       "new idea",
     );
-    await userEvent.click(screen.getByRole("button", { name: "Generate" }));
+    const draftGenerateButton = screen
+      .getAllByRole("button", { name: "Generate" })
+      .find((button) => !button.closest(".scenario-starter-generation"));
+    expect(draftGenerateButton).toBeDefined();
+    await userEvent.click(draftGenerateButton as HTMLElement);
 
     await waitFor(() => expect(sources).toHaveLength(1));
     act(() => {
@@ -12559,6 +12569,8 @@ describe("frontend helpers", () => {
     });
 
     await waitFor(() => expect(screen.getByLabelText("Title")).toHaveValue("New Draft"));
+    expect(screen.queryByLabelText("Draft starter Old Starter role")).not.toBeInTheDocument();
+    expect(screen.getByText("No character starters")).toBeInTheDocument();
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /save draft/i }));
 
@@ -12827,6 +12839,308 @@ describe("frontend helpers", () => {
     await waitFor(() => expect(screen.getByLabelText("Premise")).toHaveValue("Fresh premise"));
   });
 
+  it("generates and saves editable scenario draft character starters", async () => {
+    const sources = installEventSourceDouble();
+    const draft: ScenarioDraft = {
+      scenario_type: "full_roleplay",
+      scenario_types: ["full_roleplay", "investigation_mystery"],
+      action_choices_enabled: true,
+      regeneration_seed: "fog seed",
+      source_metadata: [],
+      sections: [
+        ["title", "Fog Gate"],
+        ["premise", "Old premise"]
+      ],
+      character_starters: [
+        {
+          name: "Mara Voss",
+          aliases: ["Mara"],
+          role: "Scout",
+          age: "",
+          known_state: "",
+          appearance: "",
+          visual_notes: "",
+          personality: "",
+          voice: "",
+          texting_style: "",
+          relationships: { Ren: "ally" },
+          goals: "",
+          motivations: "",
+          boundaries: "",
+          status: "",
+          met: true,
+          locked_fields: []
+        }
+      ]
+    };
+    const generatedDraft: ScenarioDraft = {
+      ...draft,
+      character_starters: [
+        ...(draft.character_starters ?? []),
+        {
+          name: "Ivo Hale",
+          aliases: [],
+          role: "Archivist",
+          age: "",
+          known_state: "",
+          appearance: "",
+          visual_notes: "",
+          personality: "",
+          voice: "",
+          texting_style: "",
+          relationships: { Mara: "client" },
+          goals: "",
+          motivations: "",
+          boundaries: "",
+          status: "",
+          met: false,
+          locked_fields: []
+        }
+      ]
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => {
+        if (path === "/api/scenarios/draft/character-starters/generate") {
+          return { id: "job-starters", type: "scenario_character_starters", status: "queued", result: null, error: null };
+        }
+        if (path === "/api/scenarios/draft/save") return runtimeModel({ active_save_id: "save-1" });
+        return {};
+      }
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel({ scenario_draft: draft })} initialMode="draft" onClose={vi.fn()} onRuntimeChanged={vi.fn()} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    const countInput = screen.getByLabelText("Number of Characters to generate") as HTMLInputElement;
+    expect(countInput.value).toBe("");
+    expect(screen.getByLabelText("Custom character description")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Upload Mara Voss reference image file")).not.toBeInTheDocument();
+    await userEvent.type(countInput, "1");
+    const starterGeneration = countInput.closest(".scenario-starter-generation");
+    expect(starterGeneration).not.toBeNull();
+    await userEvent.click(within(starterGeneration as HTMLElement).getByRole("button", { name: "Generate" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/scenarios/draft/character-starters/generate", expect.anything()));
+    const generateCall = fetchMock.mock.calls.find(([path]) => path === "/api/scenarios/draft/character-starters/generate");
+    expect(JSON.parse(String(generateCall?.[1].body))).toMatchObject({
+      scenario_type: "full_roleplay",
+      scenario_types: ["full_roleplay", "investigation_mystery"],
+      action_choices_enabled: true,
+      sections: {
+        title: "Fog Gate",
+        premise: "Old premise"
+      },
+      character_starters: [
+        expect.objectContaining({
+          name: "Mara Voss",
+          aliases: ["Mara"],
+          role: "Scout",
+          relationships: { Ren: "ally" },
+          met: true
+        })
+      ],
+      count: 1,
+      custom_description: ""
+    });
+
+    fireEvent.change(screen.getByLabelText("Premise"), {
+      target: { value: "Edited while starter generation runs" }
+    });
+    await waitFor(() => expect(sources).toHaveLength(1));
+    act(() => {
+      sources[0].dispatch("done", {
+        id: "job-starters",
+        type: "scenario_character_starters",
+        status: "succeeded",
+        result: runtimeModel({ scenario_draft: generatedDraft }),
+        error: null
+      });
+    });
+
+    await waitFor(() => expect(screen.getByLabelText("Draft starter Ivo Hale role")).toHaveValue("Archivist"));
+    expect(screen.getByLabelText("Premise")).toHaveValue("Edited while starter generation runs");
+    fireEvent.change(screen.getByLabelText("Draft starter Ivo Hale role"), {
+      target: { value: "Reluctant archivist" }
+    });
+    await userEvent.click(screen.getByRole("button", { name: /save draft/i }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/scenarios/draft/save", expect.anything()));
+    const saveCall = fetchMock.mock.calls.find(([path]) => path === "/api/scenarios/draft/save");
+    expect(JSON.parse(String(saveCall?.[1].body))).toMatchObject({
+      scenario_type: "full_roleplay",
+      scenario_types: ["full_roleplay", "investigation_mystery"],
+      sections: {
+        title: "Fog Gate",
+        premise: "Edited while starter generation runs"
+      },
+      character_starters: [
+        expect.objectContaining({
+          name: "Mara Voss",
+          role: "Scout"
+        }),
+        expect.objectContaining({
+          name: "Ivo Hale",
+          role: "Reluctant archivist",
+          relationships: { Mara: "client" },
+          met: false
+        })
+      ]
+    });
+  });
+
+  it("keeps draft starter and section generation watchers independent", async () => {
+    const sources = installEventSourceDouble();
+    const draft: ScenarioDraft = {
+      scenario_type: "full_roleplay",
+      regeneration_seed: "fog seed",
+      source_metadata: [],
+      sections: [
+        ["title", "Fog Gate"],
+        ["premise", "Old premise"]
+      ],
+      character_starters: []
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => {
+        if (path === "/api/scenarios/draft/character-starters/generate") {
+          return { id: "job-starters", type: "scenario_character_starters", status: "queued", result: null, error: null };
+        }
+        if (path === "/api/scenarios/draft/section") {
+          return { id: "job-section", type: "scenario_section", status: "queued", result: null, error: null };
+        }
+        return {};
+      }
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel({ scenario_draft: draft })} initialMode="draft" onClose={vi.fn()} onRuntimeChanged={vi.fn()} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    const countInput = screen.getByLabelText("Number of Characters to generate") as HTMLInputElement;
+    await userEvent.type(countInput, "1");
+    const starterGeneration = countInput.closest(".scenario-starter-generation");
+    expect(starterGeneration).not.toBeNull();
+    await userEvent.click(within(starterGeneration as HTMLElement).getByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    const premiseRow = screen.getByLabelText("Premise").closest("label");
+    expect(premiseRow).not.toBeNull();
+    await userEvent.click(within(premiseRow as HTMLElement).getByRole("button", { name: /regenerate/i }));
+    await waitFor(() => expect(sources).toHaveLength(2));
+    expect(sources[0].closed).toBe(false);
+    expect(sources[1].closed).toBe(false);
+
+    act(() => {
+      sources[0].dispatch("done", {
+        id: "job-starters",
+        type: "scenario_character_starters",
+        status: "succeeded",
+        result: runtimeModel({
+          scenario_draft: {
+            ...draft,
+            character_starters: [
+              {
+                name: "Ivo Hale",
+                aliases: [],
+                role: "Archivist",
+                age: "",
+                known_state: "",
+                appearance: "",
+                visual_notes: "",
+                personality: "",
+                voice: "",
+                texting_style: "",
+                relationships: {},
+                goals: "",
+                motivations: "",
+                boundaries: "",
+                status: "",
+                met: true,
+                locked_fields: []
+              }
+            ]
+          }
+        }),
+        error: null
+      });
+      sources[1].dispatch("done", {
+        id: "job-section",
+        type: "scenario_section",
+        status: "succeeded",
+        result: {
+          scenario_draft: {
+            sections: [
+              ["title", "Fog Gate"],
+              ["premise", "Fresh premise"]
+            ]
+          }
+        },
+        error: null
+      });
+    });
+
+    await waitFor(() => expect(screen.getByLabelText("Draft starter Ivo Hale role")).toHaveValue("Archivist"));
+    expect(screen.getByLabelText("Premise")).toHaveValue("Fresh premise");
+  });
+
+  it("surfaces draft starter generation runtime errors", async () => {
+    const sources = installEventSourceDouble();
+    const draft: ScenarioDraft = {
+      scenario_type: "full_roleplay",
+      regeneration_seed: "fog seed",
+      source_metadata: [],
+      sections: [
+        ["title", "Fog Gate"],
+        ["premise", "Old premise"]
+      ],
+      character_starters: []
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => path === "/api/scenarios/draft/character-starters/generate"
+        ? { id: "job-starters", type: "scenario_character_starters", status: "queued", result: null, error: null }
+        : {}
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel({ scenario_draft: draft })} initialMode="draft" onClose={vi.fn()} onRuntimeChanged={vi.fn()} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    const countInput = screen.getByLabelText("Number of Characters to generate") as HTMLInputElement;
+    await userEvent.type(countInput, "1");
+    const starterGeneration = countInput.closest(".scenario-starter-generation");
+    expect(starterGeneration).not.toBeNull();
+    await userEvent.click(within(starterGeneration as HTMLElement).getByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    act(() => {
+      sources[0].dispatch("done", {
+        id: "job-starters",
+        type: "scenario_character_starters",
+        status: "succeeded",
+        result: runtimeModel({ error: "No context update model preference configured" }),
+        error: null
+      });
+    });
+
+    expect(await screen.findByText("No context update model preference configured")).toBeInTheDocument();
+  });
+
   it("surfaces scenario section regeneration failures", async () => {
     const sources = installEventSourceDouble();
     const draft: ScenarioDraft = {
@@ -12978,7 +13292,7 @@ describe("frontend helpers", () => {
         ["player_role", "Harbor warden"],
         ["tone_genre", "Nautical noir"],
         ["current_scene", "Mara is negotiating under the quay."],
-        ["characters", "Mara keeps her clipped voice and debt to Ren."],
+        ["scene_notes", "Mara keeps her clipped voice and debt to Ren."],
         ["opening_message", "The bell tolls once."]
       ] as [string, string][]
     };
@@ -12997,7 +13311,7 @@ describe("frontend helpers", () => {
 
     expect(screen.getByText("Continuity")).toBeInTheDocument();
     expect(screen.getByLabelText("Current Scene")).toHaveValue("Mara is negotiating under the quay.");
-    expect(screen.getByLabelText("Characters")).toHaveValue("Mara keeps her clipped voice and debt to Ren.");
+    expect(screen.getByLabelText("Scene Notes")).toHaveValue("Mara keeps her clipped voice and debt to Ren.");
     await userEvent.clear(screen.getByLabelText("Current Scene"));
     await userEvent.type(screen.getByLabelText("Current Scene"), "Mara stands before the opened bell.");
     await userEvent.click(screen.getByRole("button", { name: /save draft/i }));
@@ -13007,7 +13321,7 @@ describe("frontend helpers", () => {
     expect(JSON.parse(String(saveCall?.[1].body))).toMatchObject({
       sections: {
         current_scene: "Mara stands before the opened bell.",
-        characters: "Mara keeps her clipped voice and debt to Ren."
+        scene_notes: "Mara keeps her clipped voice and debt to Ren."
       },
       source_metadata: { origin: "save_continuation" }
     });
@@ -17479,9 +17793,9 @@ describe("frontend helpers", () => {
     expect(screen.getByText("Context Budget Adaptive Fraction")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("tab", { name: "Models" }));
-    expect(screen.getByText("Fallback Behavior")).toBeInTheDocument();
-    expect(screen.getByText("Structured Output Fallback Enabled")).toBeInTheDocument();
-    expect(screen.getByText("Structured Output Fallback Enabled").closest("label")).toHaveAttribute("title", expect.stringContaining("structured maintenance"));
+    expect(screen.getByText("Roleplay Model Sets")).toBeInTheDocument();
+    expect(screen.queryByText("Fallback Behavior")).not.toBeInTheDocument();
+    expect(screen.queryByText("Structured Output Fallback Enabled")).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("tab", { name: "Local" }));
     expect(screen.getByRole("tab", { name: "Local" })).toHaveAttribute("aria-selected", "true");
@@ -18935,8 +19249,10 @@ describe("frontend helpers", () => {
     }));
 
     expect(screen.getByText("Routing Lanes")).toBeInTheDocument();
+    const advancedSection = screen.getByRole("button", { name: /advanced model routing/i }).closest("section");
+    expect(advancedSection).not.toBeNull();
     for (const group of ["Narration", "Cast & Direction", "Context & World", "Authoring & Media"]) {
-      expect(screen.getByRole("heading", { name: group })).toBeInTheDocument();
+      expect(within(advancedSection as HTMLElement).getByRole("heading", { name: group })).toBeInTheDocument();
     }
     for (const label of [
       "Narrator",
@@ -18961,7 +19277,7 @@ describe("frontend helpers", () => {
       "Video Generation",
       "Image Animation"
     ]) {
-      expect(screen.getByText(label)).toBeInTheDocument();
+      expect(within(advancedSection as HTMLElement).getByText(label)).toBeInTheDocument();
     }
     expect(screen.queryByText("Background Text")).not.toBeInTheDocument();
     expect(screen.queryByText("Context Work")).not.toBeInTheDocument();
@@ -19011,6 +19327,257 @@ describe("frontend helpers", () => {
       path === "/api/settings/model-routing-profiles/fast" &&
       init?.method === "DELETE"
     ))).toBe(true);
+  });
+
+  it("renders simple model selectors between model profiles and roleplay model sets", async () => {
+    const chatOptions = [modelOption("chat-a", "Chat A", ["chat"])];
+    const structuredOptions = [modelOption("structured-a", "Structured A", ["structured_output", "tool_calling"])];
+    const imageOptions = [modelOption("image-a", "Image A", ["image_generation"])];
+    const editOptions = [modelOption("edit-a", "Edit A", ["image_to_image"])];
+    const videoOptions = [modelOption("video-a", "Video A", ["text_to_video", "image_plus_text_to_video"])];
+
+    await renderModelSettings(modelSettingsPayload({
+      model_routing_profiles: modelRoutingProfilesSettings(),
+      task_model_selectors: [
+        modelSelector("chat", chatOptions),
+        modelSelector("chat_fallback", chatOptions),
+        modelSelector("response_planning", structuredOptions),
+        modelSelector("structured_output_fallback", structuredOptions),
+        modelSelector("tool_call_fallback", structuredOptions),
+        modelSelector("image_generation", imageOptions),
+        modelSelector("image_fallback", imageOptions),
+        modelSelector("image_to_image_generation", editOptions),
+        modelSelector("image_edit_fallback", editOptions),
+        modelSelector("video_generation", videoOptions),
+        modelSelector("image_animation", videoOptions),
+        modelSelector("video_fallback", videoOptions)
+      ]
+    }));
+
+    const bodyText = document.body.textContent ?? "";
+    expect(bodyText.indexOf("Model Profiles")).toBeLessThan(bodyText.indexOf("Simple Model Selectors"));
+    expect(bodyText.indexOf("Simple Model Selectors")).toBeLessThan(bodyText.indexOf("Roleplay Model Sets"));
+
+    const section = screen.getByRole("heading", { name: "Simple Model Selectors" }).closest("section");
+    expect(section).not.toBeNull();
+    for (const label of ["Structured Output / Tool Calls", "Prose", "Image Generation", "Image Edit", "Video Generation"]) {
+      expect(within(section as HTMLElement).getByText(label)).toBeInTheDocument();
+      expect(within(section as HTMLElement).getByLabelText(`${label} main model`)).toBeInTheDocument();
+      expect(within(section as HTMLElement).getByLabelText(`${label} fallback model`)).toBeInTheDocument();
+    }
+  });
+
+  it("applies the simple prose selector to text tasks and fallback preferences", async () => {
+    const chatOptions = [
+      modelOption("text-a", "Text A", ["chat"]),
+      modelOption("text-b", "Text B", ["chat"]),
+      modelOption("text-fallback", "Text Fallback", ["chat"])
+    ];
+    const fetchMock = await renderModelSettings(modelSettingsPayload({
+      task_model_selectors: [
+        modelSelector("chat", chatOptions, "text-a"),
+        modelSelector("scenario_generation", chatOptions, "text-a"),
+        modelSelector("summarization", chatOptions, "text-a"),
+        modelSelector("image_prompt", chatOptions, "text-a"),
+        modelSelector("narrator_fallback", chatOptions, "text-a"),
+        modelSelector("chat_fallback", chatOptions, "text-a")
+      ],
+      roleplay_model_groups: [
+        {
+          roleplay_type: "full_roleplay",
+          label: "Generic Roleplay",
+          selectors: [
+            modelSelector("chat_full_roleplay", chatOptions, "text-a"),
+            modelSelector("full_roleplay_summarization", chatOptions, "text-a"),
+            modelSelector("full_roleplay_image_prompt", chatOptions, "text-a"),
+            modelSelector("full_roleplay_narrator_fallback", chatOptions, "text-a"),
+            modelSelector("full_roleplay_chat_fallback", chatOptions, "text-a")
+          ]
+        }
+      ],
+      scenario_section_model_selectors: [
+        modelSelector("scenario_generation_section_opening_message", chatOptions, "text-a", { label: "Opening Message", section_id: "opening_message" })
+      ],
+      chat_fallback: { setting_key: "chat_fallback_enabled", enabled: false }
+    }));
+
+    const mainSelect = screen.getByLabelText("Prose main model");
+    const row = mainSelect.closest(".model-routing-row");
+    expect(row).not.toBeNull();
+    await userEvent.selectOptions(mainSelect, "fake\u0000text-b");
+    await userEvent.selectOptions(within(row as HTMLElement).getByLabelText("Prose fallback model"), "fake\u0000text-fallback");
+    await userEvent.click(within(row as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([path]) => path === "/api/settings/model-preference")).toHaveLength(12));
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/model-preference")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
+        { task: "chat", provider: "fake", model_id: "text-b" },
+        { task: "scenario_generation", provider: "fake", model_id: "text-b" },
+        { task: "summarization", provider: "fake", model_id: "text-b" },
+        { task: "image_prompt", provider: "fake", model_id: "text-b" },
+        { task: "chat_full_roleplay", provider: "fake", model_id: "text-b" },
+        { task: "full_roleplay_summarization", provider: "fake", model_id: "text-b" },
+        { task: "full_roleplay_image_prompt", provider: "fake", model_id: "text-b" },
+        { task: "scenario_generation_section_opening_message", provider: "fake", model_id: "text-b" },
+        { task: "narrator_fallback", provider: "fake", model_id: "text-fallback" },
+        { task: "chat_fallback", provider: "fake", model_id: "text-fallback" },
+        { task: "full_roleplay_narrator_fallback", provider: "fake", model_id: "text-fallback" },
+        { task: "full_roleplay_chat_fallback", provider: "fake", model_id: "text-fallback" }
+      ]);
+    const scopedCalls = fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .map(([, init]) => JSON.parse(String(init.body)));
+    expect(scopedCalls).toEqual([]);
+  });
+
+  it("applies the simple structured and tool-call selector to all structured tasks and fallback preferences", async () => {
+    const options = [
+      modelOption("structured-a", "Structured A", ["structured_output", "tool_calling"]),
+      modelOption("structured-b", "Structured B", ["structured_output", "tool_calling"]),
+      modelOption("structured-fallback", "Structured Fallback", ["structured_output", "tool_calling"])
+    ];
+    const fetchMock = await renderModelSettings(modelSettingsPayload({
+      task_model_selectors: [
+        modelSelector("response_planning", options, "structured-a"),
+        modelSelector("context_update", options, "structured-a"),
+        modelSelector("dating_route_profile", options, "structured-a"),
+        modelSelector("structured_output_fallback", options, "structured-a"),
+        modelSelector("tool_call_fallback", options, "structured-a")
+      ],
+      roleplay_model_groups: [
+        {
+          roleplay_type: "full_roleplay",
+          label: "Generic Roleplay",
+          selectors: [
+            modelSelector("full_roleplay_response_planning", options, "structured-a"),
+            modelSelector("full_roleplay_context_update", options, "structured-a"),
+            modelSelector("full_roleplay_structured_output_fallback", options, "structured-a"),
+            modelSelector("full_roleplay_tool_call_fallback", options, "structured-a")
+          ]
+        }
+      ],
+      structured_output_fallback: { setting_key: "structured_output_fallback_enabled", enabled: false },
+      tool_call_fallback: { setting_key: "tool_call_fallback_enabled", enabled: false }
+    }));
+
+    const mainSelect = screen.getByLabelText("Structured Output / Tool Calls main model");
+    const row = mainSelect.closest(".model-routing-row");
+    expect(row).not.toBeNull();
+    await userEvent.selectOptions(mainSelect, "fake\u0000structured-b");
+    await userEvent.selectOptions(within(row as HTMLElement).getByLabelText("Structured Output / Tool Calls fallback model"), "fake\u0000structured-fallback");
+    await userEvent.click(within(row as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([path]) => path === "/api/settings/model-preference")).toHaveLength(9));
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/model-preference")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
+        { task: "response_planning", provider: "fake", model_id: "structured-b" },
+        { task: "context_update", provider: "fake", model_id: "structured-b" },
+        { task: "dating_route_profile", provider: "fake", model_id: "structured-b" },
+        { task: "full_roleplay_response_planning", provider: "fake", model_id: "structured-b" },
+        { task: "full_roleplay_context_update", provider: "fake", model_id: "structured-b" },
+        { task: "structured_output_fallback", provider: "fake", model_id: "structured-fallback" },
+        { task: "tool_call_fallback", provider: "fake", model_id: "structured-fallback" },
+        { task: "full_roleplay_structured_output_fallback", provider: "fake", model_id: "structured-fallback" },
+        { task: "full_roleplay_tool_call_fallback", provider: "fake", model_id: "structured-fallback" }
+      ]);
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([]);
+  });
+
+  it("applies simple media selectors including image edit fallback and image animation", async () => {
+    const imageOptions = [
+      modelOption("image-a", "Image A", ["image_generation"]),
+      modelOption("image-b", "Image B", ["image_generation"]),
+      modelOption("image-fallback", "Image Fallback", ["image_generation"])
+    ];
+    const editOptions = [
+      modelOption("edit-a", "Edit A", ["image_to_image"]),
+      modelOption("edit-b", "Edit B", ["image_to_image"]),
+      modelOption("edit-fallback", "Edit Fallback", ["image_to_image"])
+    ];
+    const videoOptions = [
+      modelOption("video-a", "Video A", ["text_to_video", "image_plus_text_to_video"]),
+      modelOption("video-b", "Video B", ["text_to_video", "image_plus_text_to_video"]),
+      modelOption("video-fallback", "Video Fallback", ["text_to_video"])
+    ];
+    const fetchMock = await renderModelSettings(modelSettingsPayload({
+      task_model_selectors: [
+        modelSelector("image_generation", imageOptions, "image-a"),
+        modelSelector("image_fallback", imageOptions, "image-a"),
+        modelSelector("image_to_image_generation", editOptions, "edit-a"),
+        modelSelector("scene_image_edit_generation", editOptions, "edit-a"),
+        modelSelector("character_image_edit_generation", editOptions, "edit-a"),
+        modelSelector("text_message_image_edit_generation", editOptions, "edit-a"),
+        modelSelector("image_edit_fallback", editOptions, "edit-a"),
+        modelSelector("video_generation", videoOptions, "video-a"),
+        modelSelector("image_animation", videoOptions, "video-a"),
+        modelSelector("video_fallback", videoOptions, "video-a")
+      ],
+      roleplay_model_groups: [
+        {
+          roleplay_type: "full_roleplay",
+          label: "Generic Roleplay",
+          selectors: [
+            modelSelector("full_roleplay_image_generation", imageOptions, "image-a"),
+            modelSelector("full_roleplay_image_fallback", imageOptions, "image-a"),
+            modelSelector("full_roleplay_scene_image_edit_generation", editOptions, "edit-a"),
+            modelSelector("full_roleplay_image_edit_fallback", editOptions, "edit-a"),
+            modelSelector("full_roleplay_video_generation", videoOptions, "video-a"),
+            modelSelector("full_roleplay_image_animation", videoOptions, "video-a"),
+            modelSelector("full_roleplay_video_fallback", videoOptions, "video-a")
+          ]
+        }
+      ],
+      image_fallback: { setting_key: "image_fallback_enabled", enabled: false },
+      video_fallback: { setting_key: "video_fallback_enabled", enabled: false }
+    }));
+
+    const imageRow = screen.getByLabelText("Image Generation main model").closest(".model-routing-row");
+    expect(imageRow).not.toBeNull();
+    await userEvent.selectOptions(screen.getByLabelText("Image Generation main model"), "fake\u0000image-b");
+    await userEvent.selectOptions(within(imageRow as HTMLElement).getByLabelText("Image Generation fallback model"), "fake\u0000image-fallback");
+    await userEvent.click(within(imageRow as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    const editRow = screen.getByLabelText("Image Edit main model").closest(".model-routing-row");
+    expect(editRow).not.toBeNull();
+    await userEvent.selectOptions(screen.getByLabelText("Image Edit main model"), "fake\u0000edit-b");
+    await userEvent.selectOptions(within(editRow as HTMLElement).getByLabelText("Image Edit fallback model"), "fake\u0000edit-fallback");
+    await userEvent.click(within(editRow as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    const videoRow = screen.getByLabelText("Video Generation main model").closest(".model-routing-row");
+    expect(videoRow).not.toBeNull();
+    await userEvent.selectOptions(screen.getByLabelText("Video Generation main model"), "fake\u0000video-b");
+    await userEvent.selectOptions(within(videoRow as HTMLElement).getByLabelText("Video Generation fallback model"), "fake\u0000video-fallback");
+    await userEvent.click(within(videoRow as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([path]) => path === "/api/settings/model-preference")).toHaveLength(17));
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/model-preference")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
+        { task: "image_generation", provider: "fake", model_id: "image-b" },
+        { task: "full_roleplay_image_generation", provider: "fake", model_id: "image-b" },
+        { task: "image_fallback", provider: "fake", model_id: "image-fallback" },
+        { task: "full_roleplay_image_fallback", provider: "fake", model_id: "image-fallback" },
+        { task: "image_to_image_generation", provider: "fake", model_id: "edit-b" },
+        { task: "scene_image_edit_generation", provider: "fake", model_id: "edit-b" },
+        { task: "character_image_edit_generation", provider: "fake", model_id: "edit-b" },
+        { task: "text_message_image_edit_generation", provider: "fake", model_id: "edit-b" },
+        { task: "full_roleplay_scene_image_edit_generation", provider: "fake", model_id: "edit-b" },
+        { task: "image_edit_fallback", provider: "fake", model_id: "edit-fallback" },
+        { task: "full_roleplay_image_edit_fallback", provider: "fake", model_id: "edit-fallback" },
+        { task: "video_generation", provider: "fake", model_id: "video-b" },
+        { task: "image_animation", provider: "fake", model_id: "video-b" },
+        { task: "full_roleplay_video_generation", provider: "fake", model_id: "video-b" },
+        { task: "full_roleplay_image_animation", provider: "fake", model_id: "video-b" },
+        { task: "video_fallback", provider: "fake", model_id: "video-fallback" },
+        { task: "full_roleplay_video_fallback", provider: "fake", model_id: "video-fallback" }
+      ]);
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([]);
   });
 
   it("applies the narrator lane to shared and roleplay narrator selectors", async () => {
@@ -19681,10 +20248,12 @@ describe("frontend helpers", () => {
     }));
 
     const routingSelect = screen.getByLabelText("Narrator model");
+    const narratorRow = routingSelect.closest(".model-routing-row");
+    expect(narratorRow).not.toBeNull();
     expect(within(routingSelect).getByRole("option", {
       name: "Chat A - fake/chat-a · $0.15 in / $0.60 out per 1M · cache $0.01 read / $0.02 write per 1M"
     })).toBeInTheDocument();
-    expect(screen.getByText("Input $0.15 / output $0.60 per 1M tokens · Cache read $0.01 / write $0.02 per 1M tokens")).toBeInTheDocument();
+    expect(within(narratorRow as HTMLElement).getByText("Input $0.15 / output $0.60 per 1M tokens · Cache read $0.01 / write $0.02 per 1M tokens")).toBeInTheDocument();
 
     await expandRoutingLane("Narrator");
     const selector = screen.getByText("Chat").closest(".model-selector");

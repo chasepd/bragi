@@ -3916,7 +3916,6 @@ def test_submit_player_turn_keeps_dating_route_anchor_after_setup_ages_out(
         player_role="Transfer student",
         content={
             "player_character_name": "Lio Takahashi",
-            "romance_options": "Mika Arai is a romance option.",
             "current_scene": "Lio and Mika talk after the festival.",
         },
     )
@@ -7536,7 +7535,7 @@ def test_submit_player_turn_records_streaming_retry_failure_without_fallback(
     assert job["result"]["streaming_retry_used"] is True
     assert job["result"]["primary_error_category"] == "content_blocked"
     assert job["result"]["fallback_used"] is False
-    assert job["result"]["fallback_skipped_reason"] == "disabled"
+    assert job["result"]["fallback_skipped_reason"] == "no_fallback_model"
     assert job["result"]["classification"] == "suspected_blocked_output"
     assert job["error"] is not None
     assert "primary retry blocked" in job["error"]
@@ -13580,7 +13579,7 @@ def test_submit_player_turn_fails_blank_narrator_completion_without_persisting_i
     assert job["result"]["original_provider"] == "openrouter"
     assert job["result"]["original_model"] == "anthropic/claude-3.5-sonnet"
     assert job["result"]["fallback_used"] is False
-    assert job["result"]["fallback_skipped_reason"] == "disabled"
+    assert job["result"]["fallback_skipped_reason"] == "no_fallback_model"
     assert job["result"]["final_provider"] == "openrouter"
     assert job["result"]["final_model"] == "anthropic/claude-3.5-sonnet"
     assert job["result"]["classification"] == "suspected_blocked_output"
@@ -14294,7 +14293,7 @@ def test_submit_player_turn_uses_fallback_for_content_safety_header(
     assert job["result"]["classification"] == "suspected_blocked_output"
 
 
-def test_submit_player_turn_skips_fallback_marker_when_disabled(
+def test_submit_player_turn_uses_fallback_marker_when_toggle_false(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -14315,6 +14314,12 @@ def test_submit_player_turn_skips_fallback_marker_when_disabled(
         provider="venice",
         model_id="venice/fallback-chat",
     )
+    repositories.save_provider_model(
+        provider="venice",
+        model_id="venice/fallback-chat",
+        display_name="Venice Fallback Chat",
+        capabilities=["chat", "fallback_marker"],
+    )
     repositories.set_app_setting("chat_fallback_enabled", False)
     primary = StaticChatProvider("openrouter", " \n\t ")
     fallback = StaticChatProvider(
@@ -14327,35 +14332,31 @@ def test_submit_player_turn_skips_fallback_marker_when_disabled(
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
 
-    with pytest.raises(Exception) as exc_info:
-        asyncio.run(
-            service.submit_player_turn(
-                save_id=save.id,
-                body="I climb toward the beacon lens.",
-                speaker_name="Mara",
-            )
+    result = asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I climb toward the beacon lens.",
+            speaker_name="Mara",
         )
+    )
 
     assert len(primary.chat_requests) == 1
-    assert fallback.chat_requests == []
-    assert any(word in str(exc_info.value).casefold() for word in ("blank", "empty"))
-    persisted_messages = repositories.list_messages(save.id)
-    assert len(persisted_messages) == 1
-    assert persisted_messages[0].role == "player"
-    assert [
-        message for message in persisted_messages if message.role == "narrator"
-    ] == []
+    assert len(fallback.chat_requests) == 1
+    assert result.narrator_message.body == (
+        "The fallback narrator answers in natural prose."
+    )
+    assert result.narrator_message.provider == "venice"
+    assert result.narrator_message.model == "venice/fallback-chat"
 
     jobs = _chat_completion_jobs(repositories, save.id)
     assert len(jobs) == 1
     job = jobs[0]
-    assert job["status"] == "failed"
+    assert job["status"] == "succeeded"
     assert job["result"]["original_provider"] == "openrouter"
     assert job["result"]["original_model"] == "anthropic/claude-3.5-sonnet"
-    assert job["result"]["fallback_used"] is False
-    assert job["result"]["fallback_skipped_reason"] == "disabled"
-    assert job["result"]["final_provider"] == "openrouter"
-    assert job["result"]["final_model"] == "anthropic/claude-3.5-sonnet"
+    assert job["result"]["fallback_used"] is True
+    assert job["result"]["fallback_provider"] == "venice"
+    assert job["result"]["fallback_model"] == "venice/fallback-chat"
     assert job["result"]["classification"] == "suspected_blocked_output"
 
 

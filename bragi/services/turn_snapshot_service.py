@@ -28,6 +28,7 @@ from bragi.safety import (
 from bragi.services.scenario_content_rating import (
     metadata_with_scenario_content_ratings,
 )
+from bragi.services.scenario_service import strip_deprecated_scenario_character_sections
 from bragi.services.sexual_content_safety import (
     is_fade_to_black_message,
 )
@@ -622,41 +623,52 @@ class TurnSnapshotService:
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         message_ids = frozenset(active_message_ids)
         snapshots = self._exported_snapshots(save_id=save_id, message_ids=message_ids)
-        object_hashes = {snapshot.root_manifest_hash for snapshot in snapshots}
+        objects_by_hash: dict[str, dict[str, object]] = {}
+        snapshot_rows: list[dict[str, object]] = []
         for snapshot in snapshots:
             manifest = self._snapshot_manifest(snapshot)
-            for table_rows in _manifest_tables(manifest).values():
-                for entry in table_rows:
-                    object_hash = entry.get("object_hash")
-                    if isinstance(object_hash, str):
-                        object_hashes.add(object_hash)
-        objects = [
-            _snapshot_object_to_export(row)
-            for row in self.repositories.connection.execute(
-                f"""
-                SELECT object_hash, kind, encoding, payload, uncompressed_size,
-                       created_at
-                FROM save_snapshot_objects
-                WHERE object_hash IN ({_placeholders(len(object_hashes))})
-                ORDER BY rowid
-                """,
-                tuple(object_hashes),
-            ).fetchall()
-        ] if object_hashes else []
-        snapshot_rows: list[dict[str, object]] = [
-            {
-                "id": snapshot.id,
-                "save_id": snapshot.save_id,
-                "message_id": snapshot.message_id,
-                "parent_snapshot_id": snapshot.parent_snapshot_id,
-                "root_manifest_hash": snapshot.root_manifest_hash,
-                "context_revision": snapshot.context_revision,
-                "reason": snapshot.reason,
-                "created_at": snapshot.created_at,
-            }
-            for snapshot in snapshots
-        ]
-        return snapshot_rows, objects
+            rows_by_table = _sanitize_snapshot_rows_for_safety(
+                self._rows_from_manifest(manifest)
+            )
+            tables: dict[str, list[dict[str, str]]] = {}
+            for table_name, rows in rows_by_table.items():
+                entries: list[dict[str, str]] = []
+                for row in rows:
+                    object_hash = _add_snapshot_object_export(
+                        objects_by_hash,
+                        kind=f"row:{table_name}",
+                        value=row,
+                        created_at=snapshot.created_at,
+                    )
+                    entries.append(
+                        {
+                            "id": str(row.get("id", "")),
+                            "object_hash": object_hash,
+                        }
+                    )
+                tables[table_name] = entries
+            root_manifest_hash = _add_snapshot_object_export(
+                objects_by_hash,
+                kind="snapshot_manifest",
+                value={
+                    **manifest,
+                    "tables": tables,
+                },
+                created_at=snapshot.created_at,
+            )
+            snapshot_rows.append(
+                {
+                    "id": snapshot.id,
+                    "save_id": snapshot.save_id,
+                    "message_id": snapshot.message_id,
+                    "parent_snapshot_id": snapshot.parent_snapshot_id,
+                    "root_manifest_hash": root_manifest_hash,
+                    "context_revision": snapshot.context_revision,
+                    "reason": snapshot.reason,
+                    "created_at": snapshot.created_at,
+                }
+            )
+        return snapshot_rows, list(objects_by_hash.values())
 
     def import_snapshot_rows(
         self,
@@ -1774,6 +1786,10 @@ def _sanitize_snapshot_rows_for_safety(
         _sanitize_snapshot_message_row(row)
         for row in rows.get("messages", ())
     )
+    rows["save_scenario_updates"] = tuple(
+        _sanitize_snapshot_scenario_update_row(row)
+        for row in rows.get("save_scenario_updates", ())
+    )
     if quarantine_content_ratings:
         for table_name in (
             "messages",
@@ -1872,8 +1888,37 @@ def _snapshot_scenario_row_with_unclassified_rating(
         source if isinstance(source, Mapping) else None,
         aggregate_rating="unclassified",
     )
+    starters = parsed.get("character_starters")
+    if isinstance(starters, list):
+        for starter in starters:
+            if not isinstance(starter, dict):
+                continue
+            reference = starter.get("reference_image")
+            if isinstance(reference, dict):
+                reference["content_rating"] = "unclassified"
     copied["content_json"] = _compact_json(parsed)
     return copied
+
+
+def _sanitize_snapshot_scenario_update_row(
+    row: dict[str, object],
+) -> dict[str, object]:
+    content_json = row.get("content_json")
+    if not isinstance(content_json, str):
+        return row
+    try:
+        content = json.loads(content_json)
+    except json.JSONDecodeError:
+        return row
+    if not isinstance(content, dict):
+        return row
+    cleaned = dict(row)
+    cleaned["content_json"] = json.dumps(
+        strip_deprecated_scenario_character_sections(content),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return cleaned
 
 
 def _snapshot_row_references_transition(
@@ -2261,15 +2306,29 @@ def _delete_copied_paths(paths: list[Path], *, media_dir: Path) -> None:
             continue
 
 
-def _snapshot_object_to_export(row: sqlite3.Row) -> dict[str, object]:
-    return {
-        "object_hash": row["object_hash"],
-        "kind": row["kind"],
-        "encoding": row["encoding"],
-        "payload_base64": base64.b64encode(bytes(row["payload"])).decode("ascii"),
-        "uncompressed_size": row["uncompressed_size"],
-        "created_at": row["created_at"],
-    }
+def _add_snapshot_object_export(
+    objects_by_hash: dict[str, dict[str, object]],
+    *,
+    kind: str,
+    value: object,
+    created_at: str | None,
+) -> str:
+    payload = _canonical_json_bytes(value)
+    object_hash = _snapshot_object_hash(kind=kind, payload=payload)
+    objects_by_hash.setdefault(
+        object_hash,
+        {
+            "object_hash": object_hash,
+            "kind": kind,
+            "encoding": SNAPSHOT_ENCODING,
+            "payload_base64": base64.b64encode(
+                zlib.compress(payload),
+            ).decode("ascii"),
+            "uncompressed_size": len(payload),
+            "created_at": created_at,
+        },
+    )
+    return object_hash
 
 
 def _decode_exported_object(row: Mapping[str, object]) -> object:

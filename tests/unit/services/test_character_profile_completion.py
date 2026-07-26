@@ -27,7 +27,6 @@ from bragi.services.character_profile_completion import (
     ScenarioStarterReferenceImage,
     StructuredProviderCharacterProfileCompleter,
     ToolCallingProviderCharacterProfileCompleter,
-    complete_character_starters,
     content_with_character_starters,
     normalize_scenario_character_starters,
     scenario_character_starter_to_json,
@@ -108,60 +107,27 @@ def test_retired_character_interaction_type_does_not_infer_character_starter() -
     assert starters == ()
 
 
-def test_full_roleplay_starters_skip_player_and_alias_duplicates() -> None:
-    starters = scenario_character_starters_for_content(
+def test_deprecated_prose_fields_do_not_infer_character_starters() -> None:
+    content = {
+        "player_character_name": "Mara Voss",
+        "characters": "Captain Ilyra, Vey the outrider, and Brother Senn.",
+        "romance_options": "Mika Arai - student council president.",
+        "crew_and_command": "Commander Reyes - cautious mission commander.",
+        "major_npcs": "Duchess Salen - regent who needs Mara's vote.",
+    }
+
+    assert scenario_character_starters_for_content(
         scenario_type="full_roleplay",
-        content={
-            "player_character_name": "Mara Voss",
-            "characters": (
-                "Mara Voss, Captain Ilyra, Vey the outrider, "
-                "Vey the scout, and Brother Senn."
-            ),
-        },
-    )
-
-    assert [starter.name for starter in starters] == [
-        "Captain Ilyra",
-        "Vey the outrider",
-        "Brother Senn",
-    ]
-    vey = next(starter for starter in starters if starter.name == "Vey the outrider")
-    assert vey.aliases == ("Vey",)
-    assert vey.role == "outrider"
-
-
-def test_generated_starters_skip_duplicate_first_names() -> None:
-    starters = scenario_character_starters_for_content(
+        content=content,
+    ) == ()
+    assert scenario_character_starters_for_content(
         scenario_type="dating_sim",
-        content={
-            "player_character_name": "James Mitchell",
-            "romance_options": (
-                "Emily Carter - violinist with a guarded smile.\n"
-                "Emily Brooks - chef who knows the host.\n"
-                "Lily Chen - photographer watching the door."
-            ),
-        },
-    )
-
-    assert [starter.name for starter in starters] == ["Emily Carter", "Lily Chen"]
-
-
-def test_generated_starters_do_not_treat_titles_as_duplicate_first_names() -> None:
-    starters = scenario_character_starters_for_content(
-        scenario_type="first_contact_exploration",
-        content={
-            "player_character_name": "Dr. Mara Voss",
-            "crew_and_command": (
-                "Commander Reyes - cautious mission commander; "
-                "Dr. Nia Sol - xenobiologist tracking contamination risk"
-            ),
-        },
-    )
-
-    assert [starter.name for starter in starters] == [
-        "Commander Reyes",
-        "Dr. Nia Sol",
-    ]
+        content=content,
+    ) == ()
+    assert scenario_character_starters_for_content(
+        scenario_type="political_intrigue",
+        content=content,
+    ) == ()
 
 
 def test_explicit_character_starters_preserve_duplicate_first_names() -> None:
@@ -181,185 +147,15 @@ def test_explicit_character_starters_preserve_duplicate_first_names() -> None:
     ]
 
 
-def test_political_intrigue_starters_extract_major_npcs() -> None:
-    starters = scenario_character_starters_for_content(
-        scenario_type="political_intrigue",
-        content={
-            "player_character_name": "Mara Voss",
-            "major_npcs": (
-                "Mara Voss - the player should not become an NPC; "
-                "Duchess Salen - regent who needs Mara's vote; "
-                "Guildmaster Orro - charming broker who owes Mara one favor; "
-                "Duchess Salen - duplicate line should be ignored."
-            ),
-        },
-    )
-
-    assert [starter.name for starter in starters] == [
-        "Duchess Salen",
-        "Guildmaster Orro",
-    ]
-    assert starters[0].role == "regent who needs Mara's vote"
-    assert starters[1].known_state == (
-        "Guildmaster Orro - charming broker who owes Mara one favor"
-    )
-
-
-def test_dating_sim_starters_extract_romance_options_from_natural_prose() -> None:
-    starters = scenario_character_starters_for_content(
-        scenario_type="dating_sim",
-        content={
-            "player_character_name": "Ren Takahashi",
-            "romance_options": (
-                "Mika Arai - female class president; precise, ambitious, and "
-                "secretly lonely.\n"
-                "Sora Minase - female swimmer; bright, competitive, and terrified "
-                "of leaving home.\n"
-                "Ren Takahashi - the player character should not become an NPC.\n"
-                "Mika Arai - duplicate line should be ignored."
-            ),
-        },
-    )
-
-    assert [starter.name for starter in starters] == ["Mika Arai", "Sora Minase"]
-    mika = starters[0]
-    assert mika.role == (
-        "female class president; precise, ambitious, and secretly lonely"
-    )
-    assert mika.known_state == (
-        "Mika Arai - female class president; precise, ambitious, and secretly lonely"
-    )
-    assert mika.relationships == {
-        "Ren Takahashi": "romance option for Ren Takahashi"
-    }
-    assert mika.status == "available romance option at scenario start"
-    assert mika.texting_style == (
-        "Distinct casual texting style for a romance route; use their role, "
-        "personality, punctuation, emoji comfort, and response rhythm from the "
-        "romance option notes."
-    )
-
-
-def test_dating_sim_starters_extract_labeled_option_blocks() -> None:
-    starters = scenario_character_starters_for_content(
-        scenario_type="dating_sim",
-        content={
-            "player_character_name": "Avery Quill",
-            "romance_options": (
-                "Here are four options for the player to choose from:\n\n"
-                'Option One: Sable "Sab" Venn\n'
-                "Sable Venn is a sky-market guide who pulls Avery into "
-                "the floating festival.\n\n"
-                "Option Two: Nira Sol\n"
-                "Nira Sol is a signal cartographer who makes Avery's "
-                "quiet archive life feel electric.\n\n"
-                "Option Three: Ione Rook\n"
-                "Ione Rook is a moon-library keeper whose steadiness "
-                "matches the life Avery imagined.\n\n"
-                'Option Four: Lark "Kestrel" Voss\n'
-                "Lark Voss goes by Kestrel in the flight guild, and she "
-                "challenges Avery's assumptions about commitment."
-            ),
-        },
-    )
-
-    assert [starter.name for starter in starters] == [
-        "Sable Venn",
-        "Nira Sol",
-        "Ione Rook",
-        "Lark Voss",
-    ]
-    assert "Option One" not in {starter.name for starter in starters}
-    assert starters[0].aliases == ("Sab",)
-    assert starters[3].aliases == ("Kestrel",)
-    assert "sky-market guide" in starters[0].known_state
-    assert "goes by Kestrel" in starters[3].known_state
-    assert starters[0].relationships == {
-        "Avery Quill": "romance option for Avery Quill"
-    }
-
-
-def test_dating_sim_starters_extract_names_from_prose_paragraphs() -> None:
-    starters = scenario_character_starters_for_content(
-        scenario_type="dating_sim",
-        content={
-            "player_character_name": "Avery Quill",
-            "romance_options": (
-                "Sable Venn is a sky-market guide who pulls Avery into "
-                "the floating festival.\n"
-                "Nira Sol is a signal cartographer who shares Avery's "
-                "quiet archive life."
-            ),
-        },
-    )
-
-    assert [starter.name for starter in starters] == [
-        "Sable Venn",
-        "Nira Sol",
-    ]
-    assert all(len(starter.name) < 80 for starter in starters)
-
-
-def test_dating_sim_starters_extract_names_from_em_dash_bio_paragraphs() -> None:
-    starters = scenario_character_starters_for_content(
-        scenario_type="dating_sim",
-        content={
-            "player_character_name": "Avery Quill",
-            "romance_options": (
-                "Tarin Vale\u2014a 28-year-old observatory mechanic "
-                "volunteering at a star-chart workshop, she/her. Tarin has "
-                "short dark hair, silver gloves, and a habit of marking "
-                "constellations on her sleeves. Her hook: after watching Avery "
-                "repair a portable planetarium, she asks them to align a "
-                "stubborn lens array.\n\n"
-                "Lio Maren\u2014a 29-year-old mapmaker designing an archive "
-                "exhibit, she/her. She wears her copper hair in a long braid "
-                "woven with signal ribbons. Her hook: she notices Avery guide "
-                "a lost visitor through a rotating gallery with calm "
-                "encouragement."
-            ),
-        },
-    )
-
-    assert [starter.name for starter in starters] == [
-        "Tarin Vale",
-        "Lio Maren",
-    ]
-    assert all(len(starter.name) < 80 for starter in starters)
-    assert starters[0].role.startswith(
-        "a 28-year-old observatory mechanic volunteering at a star-chart workshop"
-    )
-    assert "Her hook: after watching Avery repair" in starters[0].known_state
-    assert starters[0].relationships == {
-        "Avery Quill": "romance option for Avery Quill"
-    }
-    assert starters[0].status == "available romance option at scenario start"
-
-
-def test_dating_sim_starters_reject_bio_prefix_before_hook_as_name() -> None:
-    starters = scenario_character_starters_for_content(
-        scenario_type="dating_sim",
-        content={
-            "player_character_name": "Avery Quill",
-            "romance_options": (
-                "A clever observatory mechanic with silver gloves. Her hook: "
-                "she asks Avery to repair a star-chart projector after the workshop."
-            ),
-        },
-    )
-
-    assert starters == ()
-
-
-def test_dating_sim_starters_can_be_generated_from_unstructured_romance_prose() -> None:
+def test_structured_starter_generation_honors_count_and_context() -> None:
     provider = RecordingStructuredProfileProvider(
         {
             "characters": [
-                    {
-                        "name": "Emily",
-                        "role": "Elementary school teacher with a nurturing heart.",
-                        "age": "28",
-                        "known_state": "Emily lights up when James mentions design.",
+                {
+                    "name": "Emily Carter",
+                    "role": "Elementary school teacher with a nurturing heart.",
+                    "age": "28",
+                    "known_state": "Emily lights up when James mentions design.",
                     "appearance": "Warm brown eyes and freckles across her nose.",
                     "visual_notes": "Soft smile and relaxed cardigans.",
                     "personality": "Warm, attentive, and quietly creative.",
@@ -368,11 +164,11 @@ def test_dating_sim_starters_can_be_generated_from_unstructured_romance_prose() 
                     "motivations": "Share warmth without losing her independence.",
                     "boundaries": "Will not rush intimacy before trust is earned.",
                 },
-                    {
-                        "name": "Lily",
-                        "role": "Librarian with razor-sharp wit.",
-                        "age": "29",
-                        "known_state": "Lily is at speed dating on a dare.",
+                {
+                    "name": "Lily Chen",
+                    "role": "Librarian with razor-sharp wit.",
+                    "age": "29",
+                    "known_state": "Lily is at speed dating on a dare.",
                     "appearance": "Dark hair, glasses, sleeve tattoos, cardigan.",
                     "visual_notes": "Vintage cardigan against bold tattoos.",
                     "personality": "Cynical, dry, and secretly hopeful.",
@@ -382,34 +178,6 @@ def test_dating_sim_starters_can_be_generated_from_unstructured_romance_prose() 
                     "boundaries": (
                         "Will not tolerate condescension about her guardedness."
                     ),
-                },
-                    {
-                        "name": "Olivia",
-                        "role": "Marketing director who wants direct honesty.",
-                        "age": "31",
-                        "known_state": "Olivia challenges James to say something real.",
-                    "appearance": "Tall, sharp cheekbones, blond bob.",
-                    "visual_notes": "Confident posture and precise gestures.",
-                    "personality": "Direct, competitive, and protective.",
-                    "voice": "Clear, confident, and warm when sincere.",
-                    "goals": "Meet someone honest enough to challenge her.",
-                    "motivations": "Escape the performance of always closing the deal.",
-                    "boundaries": (
-                        "Will not soften herself for someone who fears candor."
-                    ),
-                },
-                    {
-                        "name": "Chloe",
-                        "role": "Freelance photographer chasing spontaneous sparks.",
-                        "age": "27",
-                        "known_state": "Chloe notices James watching the room.",
-                    "appearance": "Copper hair and tiny silver earrings.",
-                    "visual_notes": "Camera bag slung over one shoulder.",
-                    "personality": "Quick, curious, and impulsively kind.",
-                    "voice": "Fast, enthusiastic, and playful.",
-                    "goals": "Find a spark that feels unscripted.",
-                    "motivations": "Follow curiosity toward real connection.",
-                    "boundaries": "Will not be treated as a disposable adventure.",
                 },
             ]
         }
@@ -421,91 +189,136 @@ def test_dating_sim_starters_can_be_generated_from_unstructured_romance_prose() 
     )
 
     starters = asyncio.run(
-        complete_character_starters(
-            completer=completer,
-            scenario_type="dating_sim",
-            content={
-                "title": "The Speed of Love",
-                "player_character_name": "James Mitchell",
-                "romance_options": (
-                    "Emily is a 28-year-old elementary school teacher with warm "
-                    "brown eyes and freckles. The hook: she asks about James's "
-                    "graphic design work.\n\n"
-                    "Lily, 29, is a librarian with a razor-sharp wit. The hook: "
-                    "she is here on a dare from her book club.\n\n"
-                    "Olivia, 31, is a marketing director who closes deals for a "
-                    "living. The hook: she challenges James to say something "
-                    "real.\n\n"
-                    "Chloe, 27, is a freelance photographer with a camera bag "
-                    "over one shoulder. The hook: she notices James watching "
-                    "the room."
+        completer.generate_starters(
+            CharacterStarterGenerationRequest(
+                scenario_type="dating_sim",
+                scenario_types=("dating_sim", "heist_infiltration"),
+                scenario_context=(
+                    "Title: The Speed of Love\n"
+                    "Premise: A speed dating night starts with a power outage."
                 ),
-            },
+                content={
+                    "title": "The Speed of Love",
+                    "player_character_name": "James Mitchell",
+                    "premise": "A speed dating night starts with a power outage.",
+                },
+                existing_starters=(ScenarioCharacterStarter(name="Mika Arai"),),
+                count=2,
+                name_candidate_context=(
+                    "Ordinary contemporary name candidates for new character "
+                    "starters:\nFeminine: Emily, Lily\nMasculine: Noah\nNeutral: "
+                    "Avery"
+                ),
+            )
         )
     )
 
-    assert [starter.name for starter in starters] == [
-        "Emily",
-        "Lily",
-        "Olivia",
-        "Chloe",
-    ]
-    assert provider.requests[0].schema_name == "dating_sim_character_starters"
+    assert [starter.name for starter in starters] == ["Emily Carter", "Lily Chen"]
+    request = provider.requests[0]
+    assert request.schema_name == "scenario_character_starters"
+    assert "Create exactly 2 new character starters" in request.messages[0].body
+    request_body = request.messages[1].body
+    assert "Scenario types: dating_sim, heist_infiltration" in request_body
+    assert "James Mitchell" in request_body
+    assert "Mika Arai" in request_body
+    assert "Ordinary contemporary name candidates" in request_body
+    assert "A speed dating night starts with a power outage." in request_body
     assert "James Mitchell" not in {starter.name for starter in starters}
-    assert starters[1].relationships == {
-        "James Mitchell": "romance option for James Mitchell"
-    }
-    assert starters[2].status == "available romance option at scenario start"
-    assert starters[3].appearance == "Copper hair and tiny silver earrings."
-    assert [starter.age for starter in starters] == ["28", "29", "31", "27"]
+    assert [starter.age for starter in starters] == ["28", "29"]
     assert len(provider.requests) == 1
 
 
-def test_dating_sim_starters_can_be_generated_from_tool_calls() -> None:
-    provider = RecordingToolCallProfileProvider(
-        [
-            (
-                ProviderToolCall(
-                    id="tool-emily",
-                    name="create_dating_sim_character_starter",
-                    arguments_json=json.dumps(
-                        {
-                            "name": "Emily",
-                            "role": "Elementary school teacher.",
-                            "age": "",
-                            "known_state": "Emily asks James about his designs.",
-                            "appearance": "Warm brown eyes and freckles.",
-                            "visual_notes": "Soft cardigans and quick smiles.",
-                            "personality": "Warm and attentive.",
-                            "voice": "Soft, lilting, and curious.",
-                            "goals": "Find a kind design-minded partner.",
-                            "motivations": "Share warmth with someone attentive.",
-                            "boundaries": "Will not rush past trust.",
-                        }
+def test_structured_starter_generation_honors_custom_description() -> None:
+    provider = RecordingStructuredProfileProvider(
+        {
+            "characters": [
+                {
+                    "name": "Avery Quinn",
+                    "role": "Emergency lighting technician.",
+                    "known_state": "Avery restores light during the blackout.",
+                    "appearance": "Tool belt, cropped hair, and a bright vest.",
+                    "visual_notes": "Portable work lamp and grease-smudged hands.",
+                    "personality": "Practical, warm, and quick to act.",
+                    "voice": 'Plainspoken. Example: "Hold this while I reset it."',
+                    "texting_style": (
+                        "Brief logistics with dry humor. Sample text: Found it."
                     ),
-                ),
-                ProviderToolCall(
-                    id="tool-lily",
-                    name="create_dating_sim_character_starter",
-                    arguments_json=json.dumps(
-                        {
-                            "name": "Lily",
-                            "role": "Librarian with dry wit.",
-                            "age": "29",
-                            "known_state": "Lily is here on a book-club dare.",
-                            "appearance": "Dark hair, glasses, and sleeve tattoos.",
-                            "visual_notes": "Vintage cardigan and tattoo sleeves.",
-                            "personality": "Cynical but secretly hopeful.",
-                            "voice": "Low, dry, and measured.",
-                            "goals": "Find someone who keeps up with her wit.",
-                            "motivations": "See whether hope is worth the risk.",
-                            "boundaries": "Will not tolerate condescension.",
-                        }
-                    ),
+                    "goals": "Keep everyone safe until the lights return.",
+                    "motivations": "Prove competence under pressure.",
+                    "boundaries": "Will not ignore a safety hazard for romance.",
+                }
+            ]
+        }
+    )
+    completer = StructuredProviderCharacterProfileCompleter(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-structured",
+    )
+
+    starters = asyncio.run(
+        completer.generate_starters(
+            CharacterStarterGenerationRequest(
+                scenario_type="dating_sim",
+                scenario_context="Title: Blackout Bell",
+                content={
+                    "player_character_name": "James Mitchell",
+                },
+                custom_description=(
+                    "An emergency lighting technician who meets the player "
+                    "during a blackout."
                 ),
             )
+        )
+    )
+
+    request_body = provider.requests[0].messages[1].body
+    assert (
+        "Create exactly one character starter"
+        in provider.requests[0].messages[0].body
+    )
+    assert "Custom character description" in request_body
+    assert "emergency lighting technician" in request_body
+    assert [starter.name for starter in starters] == ["Avery Quinn"]
+    assert len(provider.requests) == 1
+
+
+def test_structured_starter_generation_retries_duplicate_names() -> None:
+    provider = RecordingStructuredProfileProvider(
+        [
+            {"characters": [{"name": "James Mitchell", "role": "Player copy."}]},
+            {"characters": [{"name": "Avery Quinn", "role": "Gallery docent."}]},
         ]
     )
+    completer = StructuredProviderCharacterProfileCompleter(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-structured",
+    )
+
+    starters = asyncio.run(
+        completer.generate_starters(
+            CharacterStarterGenerationRequest(
+                scenario_type="dating_sim",
+                scenario_context="Title: Gallery Night",
+                content={
+                    "player_character_name": "James Mitchell",
+                },
+                existing_starters=(ScenarioCharacterStarter(name="Mika Arai"),),
+                count=1,
+            )
+        )
+    )
+
+    assert [starter.name for starter in starters] == ["Avery Quinn"]
+    assert len(provider.requests) == 2
+    assert "duplicates the player or existing starter" in (
+        provider.requests[1].messages[-1].body
+    )
+
+
+def test_tool_starter_generation_is_disabled() -> None:
+    provider = RecordingToolCallProfileProvider([])
     completer = ToolCallingProviderCharacterProfileCompleter(
         provider=provider,
         provider_name="fake",
@@ -513,27 +326,20 @@ def test_dating_sim_starters_can_be_generated_from_tool_calls() -> None:
     )
 
     starters = asyncio.run(
-        complete_character_starters(
-            completer=completer,
-            scenario_type="dating_sim",
-            content={
-                "player_character_name": "James Mitchell",
-                "romance_options": (
-                    "Emily is a teacher. Lily, 29, is a librarian."
-                ),
-            },
+        completer.generate_starters(
+            CharacterStarterGenerationRequest(
+                scenario_type="dating_sim",
+                scenario_context="Title: Gallery Night",
+                content={
+                    "player_character_name": "James Mitchell",
+                },
+                count=1,
+            )
         )
     )
 
-    assert [starter.name for starter in starters] == ["Emily", "Lily"]
-    assert provider.requests[0].tools[0].name == (
-        "create_dating_sim_character_starter"
-    )
-    assert starters[0].relationships == {
-        "James Mitchell": "romance option for James Mitchell"
-    }
-    assert starters[1].status == "available romance option at scenario start"
-    assert len(provider.requests) == 1
+    assert starters == ()
+    assert provider.requests == []
 
 
 def test_structured_dating_starter_generation_retries_denied_texting_style(
@@ -594,8 +400,8 @@ def test_structured_dating_starter_generation_retries_denied_texting_style(
                 scenario_context="Emily is a teacher waiting near the gallery.",
                 content={
                     "player_character_name": "James Mitchell",
-                    "romance_options": "Emily is a teacher waiting near the gallery.",
                 },
+                count=1,
                 save_id=save.id,
             )
         )
@@ -607,16 +413,12 @@ def test_structured_dating_starter_generation_retries_denied_texting_style(
     assert starters[0].texting_style == (
         "Warm check-ins. Sample text: Tell me when you arrive."
     )
-    assert starters[0].relationships == {
-        "James Mitchell": "romance option for James Mitchell"
-    }
 
 
 def test_content_with_character_starters_prefers_existing_explicit_payload() -> None:
     content = content_with_character_starters(
         scenario_type="full_roleplay",
         content={
-            "characters": "Captain Ilyra",
             CHARACTER_STARTERS_CONTENT_KEY: [
                 {
                     "name": "Custom Ilyra",
@@ -1095,7 +897,8 @@ def test_structured_profile_completer_routes_generation_and_enhancement_tasks(
             CharacterStarterGenerationRequest(
                 scenario_type="dating_sim",
                 scenario_context="Emily waits by the gallery.",
-                content={"romance_options": "Emily is waiting."},
+                content={"player_character_name": "James Mitchell"},
+                count=1,
                 save_id="save-1",
             )
         )
@@ -1117,7 +920,7 @@ def test_structured_profile_completer_routes_generation_and_enhancement_tasks(
 
     assert routed_tasks == [
         ("character_profile_completion", "context_update", "save-1"),
-        ("dating_sim_character_starters", "context_update", "save-1"),
+        ("scenario_character_starters", "dating_sim_context_update", "save-1"),
         ("character_field_enhancement", "character_enhancement", "save-1"),
     ]
 
@@ -1162,17 +965,20 @@ def test_tool_profile_completer_routes_generation_and_enhancement_tasks(
                 )
             )
         )
-    with pytest.raises(AssertionError, match="unexpected tool-call request"):
+    assert (
         asyncio.run(
             completer.generate_starters(
                 CharacterStarterGenerationRequest(
                     scenario_type="dating_sim",
                     scenario_context="Emily waits by the gallery.",
-                    content={"romance_options": "Emily is waiting."},
+                    content={"player_character_name": "James Mitchell"},
+                    count=1,
                     save_id="save-1",
                 )
             )
         )
+        == ()
+    )
     with pytest.raises(AssertionError, match="unexpected tool-call request"):
         asyncio.run(
             completer.enhance_field(
@@ -1190,7 +996,6 @@ def test_tool_profile_completer_routes_generation_and_enhancement_tasks(
         )
 
     assert routed_tasks == [
-        ("context_update", "save-1"),
         ("context_update", "save-1"),
         ("character_enhancement", "save-1"),
     ]

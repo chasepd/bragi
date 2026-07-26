@@ -1183,7 +1183,6 @@ def test_settings_model_exposes_optional_scenario_section_overrides(
         "lore",
         "locations",
         "factions",
-        "characters",
         "tone_genre",
         "current_scene",
         "magic_system",
@@ -1197,7 +1196,6 @@ def test_settings_model_exposes_optional_scenario_section_overrides(
         "factions_and_institutions",
         "mission_stakes",
         "mission_profile",
-        "crew_and_command",
         "ship_or_base_status",
         "exploration_target",
         "unknown_intelligence",
@@ -1207,7 +1205,6 @@ def test_settings_model_exposes_optional_scenario_section_overrides(
         "hazards_and_escalation",
         "expedition_goal",
         "route_options",
-        "party_roster",
         "resource_inventory",
         "environmental_conditions",
         "hazards_and_events",
@@ -1226,7 +1223,6 @@ def test_settings_model_exposes_optional_scenario_section_overrides(
         "npc_memory_rules",
         "current_loop_state",
         "case_facts",
-        "suspects",
         "clues",
         "timeline",
         "red_herrings",
@@ -1234,7 +1230,6 @@ def test_settings_model_exposes_optional_scenario_section_overrides(
         "case_status",
         "target_location",
         "objectives_and_stakes",
-        "crew_and_contacts",
         "intel_and_access",
         "security_model",
         "alert_and_heat",
@@ -1244,7 +1239,6 @@ def test_settings_model_exposes_optional_scenario_section_overrides(
         "aftermath",
         "political_arena",
         "political_factions",
-        "major_npcs",
         "central_conflict",
         "secrets_and_leverage",
         "reputation_and_standing",
@@ -1254,7 +1248,6 @@ def test_settings_model_exposes_optional_scenario_section_overrides(
         "political_pressure",
         "public_private_knowledge",
         "settlement_profile",
-        "population_and_residents",
         "resources_and_indicators",
         "projects_and_facilities",
         "threats_and_opportunities",
@@ -1263,12 +1256,10 @@ def test_settings_model_exposes_optional_scenario_section_overrides(
         "target_profile",
         "leads_and_clues",
         "hunt_locations",
-        "rivals_and_factions",
         "preparation_state",
         "hunt_status",
         "journey_profile",
         "route_and_stops",
-        "traveling_party",
         "transport_and_supplies",
         "recurring_pressures",
         "relationship_threads",
@@ -1278,10 +1269,8 @@ def test_settings_model_exposes_optional_scenario_section_overrides(
         "markets_and_stops",
         "contracts_and_debts",
         "route_hazards",
-        "reputation_and_contacts",
         "profit_and_loss",
         "player_character_profile",
-        "romance_options",
     ]
 
     inherited_title = selectors["title"]
@@ -2513,10 +2502,10 @@ def test_settings_model_exposes_summarization_and_image_controls(
     assert _value(automatic_image_generation, "setting_key") == (
         "automatic_image_generation_enabled"
     )
-    assert _value(automatic_image_generation, "enabled", "value") is True
+    assert _value(automatic_image_generation, "enabled", "value") is False
     image_style_preset = _value(model, "image_style_preset")
     assert _value(image_style_preset, "setting_key") == "image_style_preset"
-    assert _value(image_style_preset, "selected") == "none"
+    assert _value(image_style_preset, "selected") == "realistic"
     assert _list(_value(image_style_preset, "options")) == list(
         EXPECTED_IMAGE_STYLE_PRESETS
     )
@@ -2698,7 +2687,7 @@ def test_settings_model_exposes_persisted_summarization_and_image_controls(
     assert _value(image_frequency, "value") == 0
 
 
-def test_settings_model_defaults_unknown_image_style_preset_to_none(
+def test_settings_model_defaults_unknown_image_style_preset_to_realistic(
     repositories: PersistenceRepositories,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -2723,7 +2712,7 @@ def test_settings_model_defaults_unknown_image_style_preset_to_none(
     )
 
     image_style_preset = _value(model, "image_style_preset")
-    assert _value(image_style_preset, "selected") == "none"
+    assert _value(image_style_preset, "selected") == "realistic"
 
 
 def test_settings_model_reads_image_style_preset_for_active_save(
@@ -2807,6 +2796,27 @@ def test_settings_model_exposes_generation_setting_controls(
     image_dimensions = _value(model, "image_dimension_preset")
     assert _value(image_dimensions, "setting_key") == "image_dimension_preset"
     assert _value(image_dimensions, "selected") == "landscape_1024x768"
+    assert _value(image_dimensions, "supported") is True
+    assert _list(_value(image_dimensions, "options")) == list(
+        EXPECTED_IMAGE_DIMENSION_PRESETS
+    )
+
+
+def test_settings_model_defaults_image_dimension_preset_to_square(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    _seed_settings_data(repositories)
+
+    model = settings.build_settings_model(
+        repositories=repositories,
+        providers=("openrouter", "venice"),
+    )
+
+    image_dimensions = _value(model, "image_dimension_preset")
+    assert _value(image_dimensions, "setting_key") == "image_dimension_preset"
+    assert _value(image_dimensions, "selected") == "square_1024x1024"
     assert _value(image_dimensions, "supported") is True
     assert _list(_value(image_dimensions, "options")) == list(
         EXPECTED_IMAGE_DIMENSION_PRESETS
@@ -3125,7 +3135,7 @@ def test_settings_model_omits_diagnostics_entries_for_failures(
     assert _SENTINEL_SECRET not in repr(model)
 
 
-def test_settings_model_omits_configuration_diagnostics_but_helper_returns_them(
+def test_settings_model_omits_deprecated_fallback_disabled_diagnostics(
     repositories: PersistenceRepositories,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -3146,11 +3156,8 @@ def test_settings_model_omits_configuration_diagnostics_but_helper_returns_them(
     assert _value(model, "diagnostics", default=None) is None
     assert "Structured output fallback model is configured" not in repr(model)
     diagnostics = _list(settings.configuration_diagnostics(repositories))
-    assert any(
+    assert not any(
         _value(entry, "kind", "type") == "configuration"
-        and "Structured output fallback model is configured" in _value(entry, "error")
-        and "structured_output_fallback" in _value(entry, "error")
-        and "openrouter/openrouter/context-search" in _value(entry, "error")
         and "fallback is disabled" in _value(entry, "error")
         for entry in diagnostics
     )

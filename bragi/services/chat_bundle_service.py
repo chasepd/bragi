@@ -58,6 +58,7 @@ from bragi.services.scenario_content_rating import (
 from bragi.services.scenario_service import (
     RETIRED_SCENARIO_REASON,
     scenario_record_is_retired,
+    strip_deprecated_scenario_character_sections,
 )
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 from bragi.world_time_model import (
@@ -190,8 +191,16 @@ class ChatBundleService:
             ).fetchone(),
             f"Unknown scenario id: {save['scenario_id']}",
         )
+        scenario_payload = _row_dict(scenario)
+        scenario_payload["content_json"] = json.dumps(
+            strip_deprecated_scenario_character_sections(
+                _json_object(scenario_payload, "content_json"),
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         data: dict[str, object] = {
-            "scenario": _row_dict(scenario),
+            "scenario": scenario_payload,
             "save": _row_dict(save),
             "messages": self._rows(
                 """
@@ -980,6 +989,9 @@ class ChatBundleService:
                 content=_json_object(scenario_data, "content_json"),
             )
         )
+        scenario_content = strip_deprecated_scenario_character_sections(
+            scenario_content,
+        )
         scenario_content = _quarantine_imported_scenario_content(scenario_content)
 
         scenario = self.repositories.create_scenario(
@@ -1292,7 +1304,9 @@ class ChatBundleService:
                 premise=_text(row, "premise"),
                 player_role=_text(row, "player_role"),
                 content=_quarantine_imported_scenario_content(
-                    _json_object(row, "content_json")
+                    strip_deprecated_scenario_character_sections(
+                        _json_object(row, "content_json"),
+                    )
                 ),
                 reason=_text(row, "reason"),
                 provider=_text(row, "provider"),
@@ -3046,8 +3060,20 @@ def _filter_save_scenario_updates(
         source_message_ids = _json_string_list(row, "source_message_ids_json")
         if any(source_id not in active_source_refs for source_id in source_message_ids):
             continue
-        filtered.append(row)
+        filtered.append(_strip_deprecated_scenario_update_content(row))
     return filtered
+
+
+def _strip_deprecated_scenario_update_content(
+    row: dict[str, object],
+) -> dict[str, object]:
+    cleaned = dict(row)
+    cleaned["content_json"] = _dump_json_compact(
+        strip_deprecated_scenario_character_sections(
+            _json_object(cleaned, "content_json"),
+        ),
+    )
+    return cleaned
 
 
 def _filter_source_id_list_rows(

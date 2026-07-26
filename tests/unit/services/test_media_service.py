@@ -117,6 +117,12 @@ def _mark_message_as_fade_transition(
     return message
 
 
+def _assert_realistic_prompt(prompt: str, base_prompt: str) -> None:
+    assert prompt.startswith(f"{base_prompt}\n\n")
+    assert "Style preset: Realistic." in prompt
+    assert "photoreal image style" in prompt
+
+
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     return (
         struct.pack(">I", len(data))
@@ -481,7 +487,7 @@ def test_generate_for_message_drafts_prompt_and_persists_asset_and_job(
     assert request.model_id == "fake-image"
     assert request.source_save_id == save.id
     assert request.source_message_id == messages[-1].id
-    assert request.prompt == "cinematic drafted image prompt"
+    _assert_realistic_prompt(request.prompt, "cinematic drafted image prompt")
 
     media_assets = repositories.list_media_assets(save.id)
     assert [item.id for item in media_assets] == [asset.id]
@@ -507,7 +513,7 @@ def test_generate_for_message_drafts_prompt_and_persists_asset_and_job(
     assert jobs[0]["payload"]["model"] == "fake-image"
     assert jobs[0]["result"]["media_asset_id"] == media_asset.id
     assert jobs[0]["result"]["path"] == media_asset.path
-    assert jobs[0]["result"]["prompt_chars"] == len("cinematic drafted image prompt")
+    assert jobs[0]["result"]["prompt_chars"] == len(request.prompt)
 
 
 def test_upload_character_text_player_photo_describes_and_persists_upload(
@@ -1290,8 +1296,9 @@ def test_generate_for_message_uses_image_prompt_preference_for_prompt_drafting(
     assert len(image_provider.image_requests) == 1
     assert image_provider.image_requests[0].provider == "fake"
     assert image_provider.image_requests[0].model_id == "fake-image"
-    assert image_provider.image_requests[0].prompt == (
-        "image-prompt-model drafted prompt"
+    _assert_realistic_prompt(
+        image_provider.image_requests[0].prompt,
+        "image-prompt-model drafted prompt",
     )
 
 
@@ -1423,10 +1430,11 @@ def test_generate_for_message_recovers_from_empty_shared_image_prompt_with_share
     assert len(image_provider.image_requests) == 1
     assert image_provider.image_requests[0].provider == "fake"
     assert image_provider.image_requests[0].model_id == "fake-image"
-    assert image_provider.image_requests[0].prompt == (
-        "shared chat drafted image prompt"
+    _assert_realistic_prompt(
+        image_provider.image_requests[0].prompt,
+        "shared chat drafted image prompt",
     )
-    assert asset.prompt == "shared chat drafted image prompt"
+    assert asset.prompt == image_provider.image_requests[0].prompt
 
 
 def test_generate_for_message_uses_chat_preference_for_prompt_drafting_fallback(
@@ -1503,10 +1511,11 @@ def test_generate_for_message_recovers_from_empty_scenario_image_prompt(
     assert shared_prompt_provider.chat_requests[0].provider == "shared-prompt"
     assert shared_prompt_provider.chat_requests[0].model_id == "shared/prompt-drafter"
     assert len(image_provider.image_requests) == 1
-    assert image_provider.image_requests[0].prompt == (
-        "shared image prompt after empty scenario prompt"
+    _assert_realistic_prompt(
+        image_provider.image_requests[0].prompt,
+        "shared image prompt after empty scenario prompt",
     )
-    assert asset.prompt == "shared image prompt after empty scenario prompt"
+    assert asset.prompt == image_provider.image_requests[0].prompt
 
 
 def test_generate_for_message_omits_unselected_full_scenario_sections(
@@ -2436,7 +2445,10 @@ def test_generate_for_message_prompt_uses_selected_message_without_future_contex
     chat_context = _chat_request_context(provider.chat_requests[0])
     assert len(provider.image_requests) == 1
     assert provider.image_requests[0].source_message_id == selected_message.id
-    assert provider.image_requests[0].prompt == "cinematic drafted image prompt"
+    _assert_realistic_prompt(
+        provider.image_requests[0].prompt,
+        "cinematic drafted image prompt",
+    )
     assert "Narrator: A bell rings under the span." in chat_context
     assert "Future scene beat" not in chat_context
 
@@ -2941,7 +2953,7 @@ def test_generate_for_message_rejects_provider_image_path_outside_media_dir(
     result = jobs[0]["result"]
     assert result["classification"] == "primary_image_not_stored"
     assert result["fallback_used"] is False
-    assert result["fallback_skipped_reason"] == "disabled"
+    assert result["fallback_skipped_reason"] == "no_fallback_model"
     assert result["primary_error_message"] == (
         "Resolved image path escapes media directory"
     )
@@ -3025,7 +3037,7 @@ def test_generate_for_message_fails_when_provider_references_missing_output_path
     result = jobs[0]["result"]
     assert result["classification"] == "primary_image_not_stored"
     assert result["fallback_used"] is False
-    assert result["fallback_skipped_reason"] == "disabled"
+    assert result["fallback_skipped_reason"] == "no_fallback_model"
     assert result["primary_error_message"] == (
         "Image provider returned a missing image file"
     )
@@ -3161,7 +3173,10 @@ def test_automatic_generation_runs_only_when_narrator_count_reaches_frequency(
     assert "The oath-brands glow under the bridge stones." in _chat_request_context(
         provider.chat_requests[0]
     )
-    assert provider.image_requests[0].prompt == "cinematic drafted image prompt"
+    _assert_realistic_prompt(
+        provider.image_requests[0].prompt,
+        "cinematic drafted image prompt",
+    )
     assert repositories.list_media_assets(save.id)[0].source_message_id == (
         latest_narrator.id
     )
@@ -3224,6 +3239,7 @@ def test_automatic_generation_uses_deferred_source_message_ordinal(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=3,
     )
 
@@ -3244,7 +3260,7 @@ def test_automatic_generation_uses_deferred_source_message_ordinal(
     assert "Fourth narrator beat exists before the delayed job runs." not in (
         chat_context
     )
-    assert request.prompt == "cinematic drafted image prompt"
+    _assert_realistic_prompt(request.prompt, "cinematic drafted image prompt")
     assert repositories.list_media_assets(save.id)[0].source_message_id == (
         third_narrator.id
     )
@@ -3276,6 +3292,7 @@ def test_generate_prepared_automatic_uses_context_captured_during_prepare(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=2,
     )
 
@@ -3378,6 +3395,7 @@ def test_generate_prepared_automatic_rejects_unavailable_image_model(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=2,
     )
     prepared = service.prepare_automatic_if_due(
@@ -3420,6 +3438,7 @@ def test_automatic_generation_skips_text_message_beats(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=3,
     )
 
@@ -3468,6 +3487,7 @@ def test_automatic_generation_can_create_video_without_image_duplicate_blocking(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=2,
     )
 
@@ -3517,6 +3537,7 @@ def test_automatic_video_generation_labels_openrouter_request(
         repositories=repositories,
         providers={"openrouter": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=2,
     )
 
@@ -3556,6 +3577,7 @@ def test_automatic_generation_rejects_unavailable_video_model(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=2,
     )
 
@@ -4008,7 +4030,7 @@ def test_animate_image_failed_job_records_provider_validation_details(
     assert "At least one reference is required" in result["final_error_message"]
 
 
-def test_automatic_generation_disabled_makes_no_requests_or_records(
+def test_automatic_generation_is_disabled_by_default(
     repositories: PersistenceRepositories,
     tmp_path: Path,
 ) -> None:
@@ -4018,7 +4040,6 @@ def test_automatic_generation_disabled_makes_no_requests_or_records(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
-        automatic_enabled=False,
         auto_frequency=1,
     )
 
@@ -4069,6 +4090,7 @@ def test_automatic_generation_frequency_zero_is_disabled(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=0,
     )
 
@@ -4111,7 +4133,7 @@ def test_provider_failure_marks_job_failed_without_creating_asset_or_file(
     result = jobs[0]["result"]
     assert result["classification"] == "primary_image_generation_failed"
     assert result["fallback_used"] is False
-    assert result["fallback_skipped_reason"] == "disabled"
+    assert result["fallback_skipped_reason"] == "no_fallback_model"
     assert result["primary_error_category"] == (
         ProviderErrorCategory.IMAGE_GENERATION_FAILED.value
     )
@@ -4283,7 +4305,7 @@ def test_child_image_generation_does_not_fallback_to_provider_without_safe_mode(
     assert fallback_provider.image_requests == []
 
 
-def test_generate_fails_blocked_venice_headers_when_image_fallback_disabled(
+def test_generate_uses_image_fallback_when_toggle_false(
     repositories: PersistenceRepositories,
     tmp_path: Path,
 ) -> None:
@@ -4334,26 +4356,29 @@ def test_generate_fails_blocked_venice_headers_when_image_fallback_disabled(
         auto_frequency=3,
     )
 
-    with pytest.raises(ValueError, match="Image provider returned no image data"):
-        asyncio.run(
-            service.generate_for_message(
-                save_id=save.id,
-                source_message_id=messages[-1].id,
-            )
+    asset = asyncio.run(
+        service.generate_for_message(
+            save_id=save.id,
+            source_message_id=messages[-1].id,
         )
+    )
 
     assert len(primary_provider.image_requests) == 1
     assert primary_provider.image_requests[0].safe_mode is True
-    assert fallback_provider.image_requests == []
-    assert repositories.list_media_assets(save.id) == []
+    assert len(fallback_provider.image_requests) == 1
+    assert asset.provider == "fallback"
+    assert asset.model == "fallback/image"
     jobs = _image_generation_jobs(repositories, save.id)
     assert len(jobs) == 1
-    assert jobs[0]["status"] == "failed"
+    assert jobs[0]["status"] == "succeeded"
     assert jobs[0]["payload"]["venice_safe_mode"] is True
     result = jobs[0]["result"]
     assert result["classification"] == "suspected_blocked_image_output"
-    assert result["fallback_used"] is False
-    assert result["fallback_skipped_reason"] == "disabled"
+    assert result["fallback_used"] is True
+    assert result["fallback_provider"] == "fallback"
+    assert result["fallback_model"] == "fallback/image"
+    assert result["final_provider"] == "fallback"
+    assert result["final_model"] == "fallback/image"
     assert result["primary_venice_safe_mode"] is True
     assert result["primary_provider_headers"] == {
         "x-request-id": "primary-req",
@@ -4783,6 +4808,72 @@ def test_generate_video_retries_video_fallback_for_blocked_error(
     assert result["final_model"] == "openrouter/video"
 
 
+def test_generate_video_uses_fallback_when_toggle_false(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    repositories.set_model_preference(
+        task="video_generation",
+        provider="primary",
+        model_id="primary/safe-video",
+    )
+    _configure_video_fallback(
+        repositories,
+        enabled=False,
+        capabilities=["text_to_video", "fallback_marker"],
+    )
+    prompt_provider = RecordingImageProvider(
+        drafted_prompt="fallback-safe drafted video prompt",
+    )
+    primary_provider = SequenceVideoProvider(
+        provider_name="primary",
+        outcomes=[
+            ProviderError(
+                ProviderErrorCategory.CONTENT_BLOCKED,
+                "video output was blocked",
+            )
+        ],
+    )
+    fallback_provider = SequenceVideoProvider(
+        provider_name="fallback",
+        outcomes=[
+            VideoResponse(
+                provider="fallback",
+                model_id="fallback/video",
+                mime_type="video/mp4",
+                video_bytes=_VALID_MP4_BYTES,
+            )
+        ],
+    )
+    service = MediaService(
+        repositories=repositories,
+        providers={
+            "fake": prompt_provider,
+            "primary": primary_provider,
+            "fallback": fallback_provider,
+        },
+        media_dir=tmp_path / "media",
+        auto_frequency=3,
+    )
+
+    asset = asyncio.run(
+        service.generate_video_for_message(
+            save_id=save.id,
+            source_message_id=messages[-1].id,
+        )
+    )
+
+    assert len(primary_provider.video_requests) == 1
+    assert len(fallback_provider.video_requests) == 1
+    assert asset.provider == "fallback"
+    assert asset.model == "fallback/video"
+    result = _video_generation_jobs(repositories, save.id)[0]["result"]
+    assert result["fallback_used"] is True
+    assert result["fallback_provider"] == "fallback"
+    assert result["fallback_model"] == "fallback/video"
+
+
 def test_generate_video_retries_video_fallback_for_blocked_metadata(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -4970,7 +5061,6 @@ def test_generate_video_fails_with_diagnostics_when_primary_returns_no_video_dat
         provider="primary",
         model_id="primary/safe-video",
     )
-    _configure_video_fallback(repositories, enabled=False, capabilities=[])
     prompt_provider = RecordingImageProvider(
         drafted_prompt="fallback-safe drafted video prompt",
     )
@@ -5022,7 +5112,7 @@ def test_generate_video_fails_with_diagnostics_when_primary_returns_no_video_dat
     assert jobs[0]["status"] == "failed"
     assert result["classification"] == "suspected_blocked_video_output"
     assert result["fallback_used"] is False
-    assert result["fallback_skipped_reason"] == "disabled"
+    assert result["fallback_skipped_reason"] == "no_fallback_model"
     assert result["primary_attempt_count"] == 3
     assert result["primary_max_attempts"] == 3
     assert result["primary_retry_attempts"] == [
@@ -5174,7 +5264,7 @@ def test_generate_video_rejects_oversized_provider_video_file(
     assert _video_generation_jobs(repositories, save.id)[0]["result"] is None
 
 
-def test_generate_for_message_skips_image_fallback_when_toggle_disabled(
+def test_generate_for_message_uses_image_fallback_when_toggle_false(
     repositories: PersistenceRepositories,
     tmp_path: Path,
 ) -> None:
@@ -5206,27 +5296,27 @@ def test_generate_for_message_skips_image_fallback_when_toggle_disabled(
         auto_frequency=3,
     )
 
-    with pytest.raises(Exception, match="image output was blocked"):
-        asyncio.run(
-            service.generate_for_message(
-                save_id=save.id,
-                source_message_id=messages[-1].id,
-            )
+    asset = asyncio.run(
+        service.generate_for_message(
+            save_id=save.id,
+            source_message_id=messages[-1].id,
         )
+    )
 
     assert len(primary_provider.image_requests) == 1
-    assert fallback_provider.image_requests == []
-    assert repositories.list_media_assets(save.id) == []
+    assert len(fallback_provider.image_requests) == 1
+    assert asset.provider == "fallback"
+    assert asset.model == "fallback/image"
     jobs = _image_generation_jobs(repositories, save.id)
     result = jobs[0]["result"]
-    assert jobs[0]["status"] == "failed"
+    assert jobs[0]["status"] == "succeeded"
     assert result["classification"] == "suspected_blocked_image_output"
-    assert result["fallback_used"] is False
-    assert result["fallback_skipped_reason"] == "disabled"
+    assert result["fallback_used"] is True
     assert result["primary_error_category"] == (
         ProviderErrorCategory.CONTENT_BLOCKED.value
     )
-    assert result["final_error_category"] == ProviderErrorCategory.CONTENT_BLOCKED.value
+    assert result["final_provider"] == "fallback"
+    assert result["final_model"] == "fallback/image"
 
 
 def test_animate_image_skips_video_fallback_without_matching_video_flow(
@@ -7868,6 +7958,7 @@ def test_automatic_scene_generation_uses_present_character_reference(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=media_dir,
+        automatic_enabled=True,
         auto_frequency=2,
     )
     reference = asyncio.run(
@@ -7926,6 +8017,7 @@ def _media_service(
     }
     if auto_frequency is not _UNSET:
         kwargs["auto_frequency"] = auto_frequency
+    kwargs["automatic_enabled"] = True
     return MediaService(**kwargs)
 
 

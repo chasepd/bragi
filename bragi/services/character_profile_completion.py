@@ -77,30 +77,8 @@ CHARACTER_FIELD_ENHANCEMENT_FIELDS = (
     "visual_notes",
     "voice",
 )
-DEFAULT_DATING_SIM_TEXTING_STYLE = (
-    "Distinct casual texting style for a romance route; use their role, "
-    "personality, punctuation, emoji comfort, and response rhythm from the "
-    "romance option notes."
-)
 MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS = 2
 MAX_CHARACTER_FIELD_ENHANCEMENT_ATTEMPTS = 3
-ROMANCE_OPTION_LABEL_RE = re.compile(
-    r"^(?:romance\s+option|option|route|love\s+interest)\s+"
-    r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*[:.)-]\s*",
-    re.IGNORECASE,
-)
-ROMANCE_OPTION_HEADING_SEPARATOR_RE = re.compile(
-    r"\s+(?:--|-)\s+|\s*[\u2013\u2014]\s*|:\s+"
-)
-ROMANCE_OPTION_PROSE_MARKERS = (
-    " goes by ",
-    " is ",
-    " was ",
-    " has ",
-    " works ",
-    " lives ",
-    " stands ",
-)
 RELATIONSHIP_ENTRY_TARGET_KEYS = (
     "name",
     "character",
@@ -205,6 +183,11 @@ class CharacterStarterGenerationRequest:
     scenario_type: str
     scenario_context: str
     content: Mapping[str, object]
+    scenario_types: tuple[str, ...] = ()
+    existing_starters: tuple[ScenarioCharacterStarter, ...] = ()
+    count: int | None = None
+    custom_description: str = ""
+    name_candidate_context: str = ""
     save_id: str | None = None
 
 
@@ -303,20 +286,19 @@ class StructuredProviderCharacterProfileCompleter:
         self,
         request: CharacterStarterGenerationRequest,
     ) -> tuple[ScenarioCharacterStarter, ...]:
-        if request.scenario_type != "dating_sim":
-            return ()
         structured_request = StructuredOutputRequest(
             provider=self.provider_name,
             model_id=self.model_id,
-            schema_name="dating_sim_character_starters",
-            schema=_dating_sim_starter_generation_schema(),
-            messages=_dating_sim_starter_generation_messages(request),
+            schema_name="scenario_character_starters",
+            schema=_character_starter_generation_schema(),
+            messages=_character_starter_generation_messages(request),
             temperature=0.35,
         )
+        task = _starter_generation_task(request.scenario_type)
         structured_request = request_with_openrouter_routing(
             self.repositories,
             structured_request,
-            task="context_update",
+            task=task,
             save_id=request.save_id,
         )
         messages = list(structured_request.messages)
@@ -332,36 +314,33 @@ class StructuredProviderCharacterProfileCompleter:
                     repositories=self.repositories,
                     providers=self.providers,
                     request=current_request,
-                    task="context_update",
+                    task=task,
                     save_id=request.save_id,
                 )
             else:
                 response = await self.provider.generate_structured_output(
                     current_request
                 )
-            starters = _dating_sim_generated_starters(
-                _profile_completion_from_data(response.data),
-                request=request,
-            )
-            violations = _generated_profile_phrase_violations(
-                starters,
-                base_starters=(),
-                phrase_denylist=phrase_denylist,
-            )
-            if not violations:
+            try:
+                starters = _validated_generated_starters_from_data(
+                    response.data,
+                    request=request,
+                    phrase_denylist=phrase_denylist,
+                )
                 return starters
-            last_error = _phrase_denylist_provider_error(violations)
+            except ProviderError as exc:
+                last_error = exc
             messages.append(
                 ChatMessage(
                     role="user",
-                    body=_profile_phrase_retry_feedback(violations),
+                    body=_starter_generation_retry_feedback(last_error),
                 )
             )
         if last_error is not None:
             raise last_error
         raise ProviderError(
             ProviderErrorCategory.PROVIDER_ERROR,
-            "Dating sim starter generation failed without a provider response.",
+            "Character starter generation failed without a provider response.",
         )
 
     async def enhance_field(
@@ -566,62 +545,7 @@ class ToolCallingProviderCharacterProfileCompleter:
         self,
         request: CharacterStarterGenerationRequest,
     ) -> tuple[ScenarioCharacterStarter, ...]:
-        if request.scenario_type != "dating_sim":
-            return ()
-        tool_request = ToolCallRequest(
-            provider=self.provider_name,
-            model_id=self.model_id,
-            messages=_dating_sim_starter_generation_tool_messages(request),
-            tools=_dating_sim_starter_generation_tool_definitions(),
-            temperature=0.35,
-        )
-        if self.repositories is not None:
-            tool_request = request_with_openrouter_routing(
-                self.repositories,
-                tool_request,
-                task="context_update",
-                save_id=request.save_id,
-            )
-        try:
-            return await self._generate_starters_with_provider(
-                provider=self.provider,
-                request=tool_request,
-                generation_request=request,
-                save_id=request.save_id,
-            )
-        except ProviderError as exc:
-            if self.repositories is None or self.providers is None:
-                raise
-            fallback_request = tool_call_fallback_request(
-                repositories=self.repositories,
-                providers=self.providers,
-                request=tool_request,
-                save_id=request.save_id,
-            )
-            if fallback_request is None:
-                reason = tool_call_fallback_skip_reason(
-                    repositories=self.repositories,
-                    providers=self.providers,
-                    save_id=request.save_id,
-                )
-                raise ProviderError(
-                    exc.category,
-                    f"{exc}; fallback skipped: {reason}",
-                    status_code=exc.status_code,
-                    diagnostics=exc.diagnostics,
-                    retry_attempt_count=exc.retry_attempt_count,
-                    max_retry_attempts=exc.max_retry_attempts,
-                    retry_attempts=exc.retry_attempts,
-                ) from exc
-            fallback_provider = self.providers[fallback_request.provider]
-            if not isinstance(fallback_provider, ToolCallProvider):
-                raise
-            return await self._generate_starters_with_provider(
-                provider=fallback_provider,
-                request=fallback_request,
-                generation_request=request,
-                save_id=request.save_id,
-            )
+        return ()
 
     async def enhance_field(
         self,
@@ -746,59 +670,6 @@ class ToolCallingProviderCharacterProfileCompleter:
             ),
         )
 
-    async def _generate_starters_with_provider(
-        self,
-        *,
-        provider: ToolCallProvider,
-        request: ToolCallRequest,
-        generation_request: CharacterStarterGenerationRequest,
-        save_id: str | None,
-    ) -> tuple[ScenarioCharacterStarter, ...]:
-        messages = list(request.messages)
-        tool_schema = request.tools[0].parameters
-        phrase_denylist = _profile_phrase_denylist(
-            self.repositories,
-            save_id=save_id,
-        )
-        starters_by_key: dict[str, ScenarioCharacterStarter] = {}
-        last_errors: list[str] = []
-        for _turn in range(MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS + 1):
-            response = await provider.generate_tool_calls(
-                replace(request, messages=tuple(messages))
-            )
-            errors: list[str] = []
-            tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
-            for call in response.tool_calls:
-                accepted, result, starter = _validate_starter_generation_tool_call(
-                    call,
-                    tool_schema=tool_schema,
-                    phrase_denylist=phrase_denylist,
-                )
-                tool_results.append((call, result))
-                if accepted and starter is not None:
-                    starters_by_key[_character_key(starter.name)] = starter
-                    continue
-                errors.append(result["error"])
-            if not errors:
-                return _dating_sim_generated_starters(
-                    tuple(starters_by_key.values()),
-                    request=generation_request,
-                )
-            last_errors = errors
-            append_tool_feedback_messages(
-                messages,
-                assistant_body=response.body,
-                tool_calls=response.tool_calls,
-                tool_results=tool_results,
-            )
-        raise ProviderError(
-            category=ProviderErrorCategory.PROVIDER_ERROR,
-            message=(
-                "Dating sim starter generation tool-call validation failed: "
-                + "; ".join(last_errors)
-            ),
-        )
-
     async def _enhance_field_with_provider(
         self,
         *,
@@ -888,25 +759,14 @@ async def complete_character_starters(
     completer: object | None,
     scenario_type: str,
     content: Mapping[str, object],
+    scenario_types: Iterable[object] | None = None,
     save_id: str | None = None,
 ) -> tuple[ScenarioCharacterStarter, ...]:
+    del scenario_types
     starters = scenario_character_starters_for_content(
         scenario_type=scenario_type,
         content=content,
     )
-    if (
-        scenario_type == "dating_sim"
-        and completer is not None
-        and not _has_explicit_character_starters(content)
-    ):
-        generated_starters = await _generated_character_starters_for_content(
-            completer=completer,
-            scenario_type=scenario_type,
-            content=content,
-            save_id=save_id,
-        )
-        if generated_starters:
-            starters = generated_starters
     if not starters or completer is None:
         return starters
     if not _starters_need_profile_completion(starters):
@@ -976,13 +836,7 @@ def scenario_character_starters_for_content(
         starters = normalize_scenario_character_starters(existing, strict=False)
         if starters:
             return starters
-    if scenario_type == "dating_sim":
-        return _dating_sim_starters(content)
-    if scenario_type == "first_contact_exploration":
-        return _first_contact_starters(content)
-    if scenario_type == "political_intrigue":
-        return _political_intrigue_starters(content)
-    return _full_roleplay_starters(content)
+    return ()
 
 
 def normalize_scenario_character_starters(
@@ -1067,86 +921,13 @@ def scenario_context_text(
     scenario_type: str,
     content: Mapping[str, object],
 ) -> str:
-    labels = (
-        "title",
-        "premise",
-        "player_character_name",
-        "player_character_profile",
-        "player_role",
-        "worldbuilding",
-        "lore",
-        "locations",
-        "factions",
-        "characters",
-        "magic_system",
-        "realms_and_places",
-        "factions_and_orders",
-        "myths_and_creatures",
-        "quest_stakes",
-        "technology_level",
-        "setting_scope",
-        "species_and_intelligences",
-        "factions_and_institutions",
-        "mission_stakes",
-        "tone_genre",
-        "choice_style",
-        "current_scene",
-        "character_name",
-        "character_description",
-        "character_physical_description",
-        "character_personality",
-        "character_voice",
-        "relationship_seed",
-        "romance_options",
-        "opening_message",
-    )
     lines = [f"Scenario type: {scenario_type}"]
-    for key in labels:
-        value = content.get(key)
+    for key, value in content.items():
+        if key in {CHARACTER_STARTERS_CONTENT_KEY, "_source"}:
+            continue
         if isinstance(value, str) and value.strip():
             lines.append(f"{key}: {value.strip()}")
     return "\n".join(lines)
-
-
-async def _generated_character_starters_for_content(
-    *,
-    completer: object,
-    scenario_type: str,
-    content: Mapping[str, object],
-    save_id: str | None,
-) -> tuple[ScenarioCharacterStarter, ...]:
-    generate = getattr(completer, "generate_starters", None)
-    if not callable(generate):
-        return ()
-    request = CharacterStarterGenerationRequest(
-        scenario_type=scenario_type,
-        scenario_context=scenario_context_text(
-            scenario_type=scenario_type,
-            content=content,
-        ),
-        content=content,
-        save_id=save_id,
-    )
-    try:
-        generated = cast(
-            tuple[ScenarioCharacterStarter, ...],
-            await generate(request),
-        )
-    except Exception as exc:
-        log_error_event(
-            "character_starter_generation.failed",
-            scenario_type=scenario_type,
-            **exception_log_fields(exc),
-        )
-        return ()
-    normalized = tuple(generated)
-    if normalized:
-        log_event(
-            "character_starter_generation.succeeded",
-            scenario_type=scenario_type,
-            starter_count=len(normalized),
-        )
-    return normalized
 
 
 def starter_identity_locked_fields(
@@ -1303,401 +1084,6 @@ def _string_tuple(value: object, path: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(items))
 
 
-def _full_roleplay_starters(
-    content: Mapping[str, object],
-) -> tuple[ScenarioCharacterStarter, ...]:
-    characters_text = _content_text(content, "characters")
-    if not characters_text:
-        return ()
-    player_name = _character_key(_content_text(content, "player_character_name"))
-    player_dedupe_keys = _character_generated_dedupe_keys(player_name)
-    starters: list[ScenarioCharacterStarter] = []
-    seen: set[str] = set()
-    for fragment in _character_fragments(characters_text):
-        starter = _starter_from_fragment(fragment)
-        if starter is None:
-            continue
-        keys = _starter_seen_keys(starter)
-        dedupe_keys = _starter_generated_dedupe_keys(starter)
-        if (
-            not keys
-            or player_name in keys
-            or dedupe_keys & player_dedupe_keys
-            or dedupe_keys & seen
-        ):
-            continue
-        starters.append(starter)
-        seen.update(dedupe_keys)
-    return tuple(starters)
-
-
-def _first_contact_starters(
-    content: Mapping[str, object],
-) -> tuple[ScenarioCharacterStarter, ...]:
-    crew_text = _content_text(content, "crew_and_command")
-    if not crew_text:
-        return ()
-    player_name = _character_key(_content_text(content, "player_character_name"))
-    player_dedupe_keys = _character_generated_dedupe_keys(player_name)
-    starters: list[ScenarioCharacterStarter] = []
-    seen: set[str] = set()
-    for fragment in _character_fragments(crew_text):
-        starter = _starter_from_fragment(fragment)
-        if starter is None:
-            continue
-        keys = _starter_seen_keys(starter)
-        dedupe_keys = _starter_generated_dedupe_keys(starter)
-        if (
-            not keys
-            or player_name in keys
-            or dedupe_keys & player_dedupe_keys
-            or dedupe_keys & seen
-        ):
-            continue
-        starters.append(starter)
-        seen.update(dedupe_keys)
-    return tuple(starters)
-
-
-def _political_intrigue_starters(
-    content: Mapping[str, object],
-) -> tuple[ScenarioCharacterStarter, ...]:
-    npc_text = _content_text(content, "major_npcs")
-    if not npc_text:
-        return ()
-    player_name = _character_key(_content_text(content, "player_character_name"))
-    player_dedupe_keys = _character_generated_dedupe_keys(player_name)
-    starters: list[ScenarioCharacterStarter] = []
-    seen: set[str] = set()
-    for fragment in _character_fragments(npc_text):
-        starter = _starter_from_fragment(fragment)
-        if starter is None:
-            continue
-        keys = _starter_seen_keys(starter)
-        dedupe_keys = _starter_generated_dedupe_keys(starter)
-        if (
-            not keys
-            or player_name in keys
-            or dedupe_keys & player_dedupe_keys
-            or dedupe_keys & seen
-        ):
-            continue
-        starters.append(starter)
-        seen.update(dedupe_keys)
-    return tuple(starters)
-
-
-def _dating_sim_starters(
-    content: Mapping[str, object],
-) -> tuple[ScenarioCharacterStarter, ...]:
-    options_text = _content_text(content, "romance_options")
-    if not options_text:
-        return ()
-    player_name = _content_text(content, "player_character_name")
-    player_key = _character_key(player_name)
-    player_dedupe_keys = _character_generated_dedupe_keys(player_name)
-    relationship_target = player_name or "player"
-    starters: list[ScenarioCharacterStarter] = []
-    seen: set[str] = set()
-    for fragment in _romance_option_fragments(options_text):
-        starter = _starter_from_romance_option_fragment(fragment)
-        if starter is None:
-            continue
-        keys = _starter_seen_keys(starter)
-        dedupe_keys = _starter_generated_dedupe_keys(starter)
-        if (
-            not keys
-            or player_key in keys
-            or dedupe_keys & player_dedupe_keys
-            or dedupe_keys & seen
-        ):
-            continue
-        starters.append(
-            replace(
-                starter,
-                known_state=fragment,
-                texting_style=(
-                    starter.texting_style or DEFAULT_DATING_SIM_TEXTING_STYLE
-                ),
-                relationships={
-                    relationship_target: f"romance option for {relationship_target}"
-                },
-                status="available romance option at scenario start",
-                met=True,
-            )
-        )
-        seen.update(dedupe_keys)
-    return tuple(starters)
-
-
-def _dating_sim_generated_starters(
-    starters: tuple[ScenarioCharacterStarter, ...],
-    *,
-    request: CharacterStarterGenerationRequest,
-) -> tuple[ScenarioCharacterStarter, ...]:
-    player_name = _content_text(request.content, "player_character_name")
-    player_key = _character_key(player_name)
-    player_dedupe_keys = _character_generated_dedupe_keys(player_name)
-    relationship_target = player_name or "player"
-    normalized: list[ScenarioCharacterStarter] = []
-    seen: set[str] = set()
-    for starter in starters:
-        keys = _starter_seen_keys(starter)
-        dedupe_keys = _starter_generated_dedupe_keys(starter)
-        if (
-            not keys
-            or player_key in keys
-            or dedupe_keys & player_dedupe_keys
-            or dedupe_keys & seen
-        ):
-            continue
-        if _is_placeholder_romance_option_name(starter.name):
-            continue
-        normalized.append(
-            replace(
-                starter,
-                relationships={
-                    relationship_target: f"romance option for {relationship_target}"
-                },
-                status="available romance option at scenario start",
-                texting_style=(
-                    starter.texting_style or DEFAULT_DATING_SIM_TEXTING_STYLE
-                ),
-                met=True,
-            )
-        )
-        seen.update(dedupe_keys)
-    return tuple(normalized)
-
-
-def _romance_option_fragments(options_text: str) -> tuple[str, ...]:
-    lines = [
-        _clean_character_fragment(line)
-        for line in options_text.splitlines()
-    ]
-    nonblank_lines = [line for line in lines if line]
-    if any(_is_romance_option_label(line) for line in nonblank_lines):
-        return _labeled_romance_option_fragments(nonblank_lines)
-    return tuple(nonblank_lines)
-
-
-def _labeled_romance_option_fragments(lines: list[str]) -> tuple[str, ...]:
-    fragments: list[str] = []
-    current: list[str] = []
-    for line in lines:
-        if _is_romance_option_label(line):
-            if current:
-                fragments.append("\n".join(current))
-            current = [_strip_romance_option_label(line)]
-            continue
-        if current:
-            current.append(line)
-    if current:
-        fragments.append("\n".join(current))
-    return tuple(fragment for fragment in fragments if fragment.strip())
-
-
-def _starter_from_romance_option_fragment(
-    fragment: str,
-) -> ScenarioCharacterStarter | None:
-    lines = [line.strip() for line in fragment.splitlines() if line.strip()]
-    if not lines:
-        return None
-    first_line = _strip_romance_option_label(lines[0])
-    rest = "\n".join(lines[1:]).strip()
-    starter = _starter_from_romance_option_heading(first_line, rest)
-    if starter is not None:
-        return replace(starter, known_state=fragment)
-    starter = _starter_from_fragment(first_line)
-    if (
-        starter is None
-        or _is_placeholder_romance_option_name(starter.name)
-        or not _looks_like_standalone_romance_option_name(starter.name)
-    ):
-        return None
-    return replace(starter, known_state=fragment)
-
-
-def _starter_from_romance_option_heading(
-    first_line: str,
-    rest: str,
-) -> ScenarioCharacterStarter | None:
-    name_text, detail = _romance_option_heading_parts(first_line)
-    if not detail and rest and _looks_like_standalone_romance_option_name(name_text):
-        return _romance_option_starter(name_text, role="")
-
-    prose_name = _romance_option_prose_name(name_text)
-    if prose_name:
-        return _romance_option_starter(prose_name, role=detail)
-    if detail:
-        return _romance_option_starter(name_text, role=detail.rstrip("."))
-    return None
-
-
-def _romance_option_heading_parts(first_line: str) -> tuple[str, str]:
-    for match in ROMANCE_OPTION_HEADING_SEPARATOR_RE.finditer(first_line):
-        candidate = first_line[: match.start()].strip()
-        detail = first_line[match.end() :].strip()
-        if detail and _looks_like_standalone_romance_option_name(candidate):
-            return candidate, detail
-    return first_line, ""
-
-
-def _romance_option_starter(
-    name_text: str,
-    *,
-    role: str,
-) -> ScenarioCharacterStarter | None:
-    name, aliases = _romance_option_name_and_aliases(name_text)
-    if (
-        not name
-        or _is_placeholder_romance_option_name(name)
-        or not _looks_like_standalone_romance_option_name(name_text)
-    ):
-        return None
-    return ScenarioCharacterStarter(
-        name=name,
-        aliases=aliases,
-        role=role.strip(),
-        known_state=name,
-        met=True,
-        status="present at scenario start",
-    )
-
-
-def _romance_option_name_and_aliases(name_text: str) -> tuple[str, tuple[str, ...]]:
-    aliases = tuple(
-        dict.fromkeys(
-            alias.strip()
-            for alias in re.findall(r'"([^"]+)"', name_text)
-            if alias.strip()
-        )
-    )
-    normalized_name = re.sub(r'\s*"[^"]+"\s*', " ", name_text)
-    normalized_name = re.sub(r"\s+", " ", normalized_name).strip()
-    name = _clean_character_name(normalized_name or name_text)
-    return name, aliases
-
-
-def _romance_option_prose_name(first_line: str) -> str:
-    lowered = first_line.casefold()
-    marker_index = len(first_line)
-    for marker in ROMANCE_OPTION_PROSE_MARKERS:
-        index = lowered.find(marker)
-        if 0 < index < marker_index:
-            marker_index = index
-    if marker_index == len(first_line):
-        return ""
-    candidate = first_line[:marker_index].strip()
-    if not _looks_like_standalone_romance_option_name(candidate):
-        return ""
-    return candidate
-
-
-def _looks_like_standalone_romance_option_name(value: str) -> bool:
-    name, _aliases = _romance_option_name_and_aliases(value)
-    if not _looks_like_character_name(name):
-        return False
-    if len(name) > 80:
-        return False
-    words = name.split()
-    if len(words) > 6:
-        return False
-    if words[0].casefold() in {"a", "an", "the", "this", "that"} and (
-        len(words) == 1 or not words[1][0].isupper()
-    ):
-        return False
-    return not re.search(r"[.!?;,]", name)
-
-
-def _is_romance_option_label(value: str) -> bool:
-    return ROMANCE_OPTION_LABEL_RE.match(value) is not None
-
-
-def _strip_romance_option_label(value: str) -> str:
-    return ROMANCE_OPTION_LABEL_RE.sub("", value, count=1).strip()
-
-
-def _is_placeholder_romance_option_name(value: str) -> bool:
-    return bool(
-        re.fullmatch(
-            r"(?:Romance\s+Option|Option|Route|Love\s+Interest)\s+"
-            r"(?:\d+|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten)",
-            value.strip(),
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def _character_fragments(characters_text: str) -> tuple[str, ...]:
-    lines = [
-        _clean_character_fragment(line)
-        for line in characters_text.replace(";", "\n").splitlines()
-    ]
-    fragments: list[str] = []
-    for line in lines:
-        if not line:
-            continue
-        parts = line.split(",") if "," in line else [line]
-        fragments.extend(_clean_character_fragment(part) for part in parts)
-    return tuple(fragment for fragment in fragments if fragment)
-
-
-def _starter_from_fragment(fragment: str) -> ScenarioCharacterStarter | None:
-    name_text = fragment
-    detail = ""
-    for separator in (" - ", " -- ", ": "):
-        if separator in fragment:
-            name_text, detail = fragment.split(separator, 1)
-            break
-    name = _clean_character_name(name_text)
-    if not name or not _looks_like_character_name(name):
-        return None
-    aliases: tuple[str, ...] = ()
-    role = detail.strip()
-    match = re.match(r"^(?P<name>[A-Z][\w' -]{1,80}) the (?P<role>[^.]+)$", name)
-    if match:
-        aliases = (match.group("name").strip(),)
-        role = role or match.group("role").strip()
-    elif not role:
-        role = _leading_title_role(name)
-    return ScenarioCharacterStarter(
-        name=name,
-        aliases=aliases,
-        role=role,
-        known_state=fragment,
-        met=True,
-        status="present at scenario start",
-    )
-
-
-def _clean_character_fragment(value: str) -> str:
-    fragment = value.strip().strip("-*0123456789. \t\r\n")
-    return re.sub(r"^(?:and|or)\s+", "", fragment, flags=re.IGNORECASE)
-
-
-def _clean_character_name(value: str) -> str:
-    return value.strip().strip("\"'`()[]{}")
-
-
-def _looks_like_character_name(value: str) -> bool:
-    first_word = value.split(maxsplit=1)[0]
-    return bool(first_word and first_word[0].isupper())
-
-
-def _leading_title_role(name: str) -> str:
-    title_match = re.match(
-        r"^(Captain|Commander|Doctor|Dr|Professor|Prof|Brother|Sister|Father|"
-        r"Mother|Lord|Lady|Sir|Dame|King|Queen|Prince|Princess|Archivist|"
-        r"Inspector|Warden|General|Admiral|Sergeant|Lieutenant)\b",
-        name,
-    )
-    if title_match is None:
-        return ""
-    role = title_match.group(1)
-    return {"Dr": "Doctor", "Prof": "Professor"}.get(role, role)
-
-
 def _content_text(content: Mapping[str, object], key: str) -> str:
     value = content.get(key)
     return value.strip() if isinstance(value, str) else ""
@@ -1745,21 +1131,21 @@ def _profile_completion_schema(
     }
 
 
-def _dating_sim_starter_generation_schema() -> dict[str, object]:
+def _character_starter_generation_schema() -> dict[str, object]:
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "characters": {
                 "type": "array",
-                "items": _dating_sim_starter_generation_item_schema(),
+                "items": _character_starter_generation_item_schema(),
             }
         },
         "required": ["characters"],
     }
 
 
-def _dating_sim_starter_generation_item_schema() -> dict[str, object]:
+def _character_starter_generation_item_schema() -> dict[str, object]:
     string_array = {"type": "array", "items": {"type": "string"}}
     return {
         "type": "object",
@@ -1882,35 +1268,68 @@ def _profile_completion_messages(
     )
 
 
-def _dating_sim_starter_generation_messages(
+def _character_starter_generation_messages(
     request: CharacterStarterGenerationRequest,
 ) -> tuple[ChatMessage, ...]:
+    target_count = _starter_generation_target_count(request)
+    custom_instruction = (
+        "Create exactly one character starter matching this custom description: "
+        f"{request.custom_description.strip()}"
+        if request.custom_description.strip()
+        else f"Create exactly {target_count} new character starters."
+    )
     return (
         ChatMessage(
             role="system",
             body=(
-                "Create Bragi scenario character starters for dating sim romance "
-                "options. Use the enforced response schema. Return one character "
-                "for each actual romance option in the scenario context. Do not "
-                "return the player character. Do not treat prose labels, route "
-                "numbers, option headings, archetypes, or biography fragments as "
-                "character names. Read the whole prose context; do not assume a "
-                "specific line, bullet, paragraph, or separator format. Fill "
-                "concise role, age, known_state, appearance, visual_notes, "
-                "personality, voice, texting_style, goals, motivations, and "
-                "boundaries fields from the scenario. For voice include cadence, "
+                "Create Bragi scenario character starters. Use the enforced "
+                "response schema. "
+                f"{custom_instruction} Do not return the player character. Do "
+                "not return any existing starter or alias. Do not repeat names "
+                "or first names in the generated starters. Fill concise role, "
+                "age, known_state, appearance, visual_notes, personality, "
+                "voice, texting_style, goals, motivations, and boundaries fields "
+                "from the draft context and request. For voice include cadence, "
                 "diction, and 1-2 short quoted examples of what the character "
                 "would actually say. For texting_style include phone-message "
                 "habits and 1-2 short sample texts. Fill age only when directly "
-                "stated or clearly evidenced. Bragi will fill relationship and "
-                "status fields deterministically."
+                "stated or clearly evidenced. Use ordinary name candidates only "
+                "when they fit the scenario."
             ),
         ),
         ChatMessage(
             role="user",
-            body=request.scenario_context,
+            body=_starter_generation_context_text(request),
         ),
     )
+
+
+def _starter_generation_context_text(
+    request: CharacterStarterGenerationRequest,
+) -> str:
+    scenario_types = tuple(
+        scenario_type.strip()
+        for scenario_type in (request.scenario_types or (request.scenario_type,))
+        if scenario_type.strip()
+    )
+    player_name = _content_text(request.content, "player_character_name")
+    parts = [
+        request.scenario_context,
+        f"Scenario types: {', '.join(scenario_types)}",
+        f"Player character name: {player_name or '[none specified]'}",
+        _starter_prompt_text(request.existing_starters),
+    ]
+    if request.name_candidate_context:
+        parts.append(request.name_candidate_context)
+        parts.append(
+            "Use the candidate names only when they fit the requested new "
+            "character starters."
+        )
+    if request.custom_description.strip():
+        parts.append(
+            f"Custom character description: {request.custom_description.strip()}"
+        )
+    return "\n\n".join(part for part in parts if part.strip())
 
 
 def _field_enhancement_messages(
@@ -2020,23 +1439,6 @@ def _profile_completion_tool_messages(
     )
 
 
-def _dating_sim_starter_generation_tool_messages(
-    request: CharacterStarterGenerationRequest,
-) -> tuple[ToolCallMessage, ...]:
-    messages = _dating_sim_starter_generation_messages(request)
-    return tuple(
-        ToolCallMessage(
-            role=message.role,
-            body=message.body.replace(
-                "Use the enforced response schema.",
-                "Use the create_dating_sim_character_starter tool instead of prose.",
-            ),
-            speaker_name=message.speaker_name,
-        )
-        for message in messages
-    )
-
-
 def _field_enhancement_tool_messages(
     request: CharacterFieldEnhancementRequest,
 ) -> tuple[ToolCallMessage, ...]:
@@ -2064,18 +1466,6 @@ def _profile_completion_tool_definitions(
                 "Fill blank profile fields for one listed scenario character starter."
             ),
             parameters=_profile_completion_item_schema(starters),
-        ),
-    )
-
-
-def _dating_sim_starter_generation_tool_definitions() -> tuple[ToolDefinition, ...]:
-    return (
-        ToolDefinition(
-            name="create_dating_sim_character_starter",
-            description=(
-                "Create one Bragi character starter for a dating sim romance option."
-            ),
-            parameters=_dating_sim_starter_generation_item_schema(),
         ),
     )
 
@@ -2141,6 +1531,132 @@ def _profile_completion_from_data(
         data.get("characters", []),
         strict=False,
     )
+
+
+def _validated_generated_starters_from_data(
+    data: dict[str, object],
+    *,
+    request: CharacterStarterGenerationRequest,
+    phrase_denylist: tuple[str, ...],
+) -> tuple[ScenarioCharacterStarter, ...]:
+    raw_characters = data.get("characters", [])
+    if not isinstance(raw_characters, list):
+        raise ProviderError(
+            ProviderErrorCategory.PROVIDER_ERROR,
+            "Character starter generation returned invalid character data: "
+            "characters must be an array.",
+        )
+    starters: list[ScenarioCharacterStarter] = []
+    errors: list[str] = []
+    for index, item in enumerate(raw_characters):
+        try:
+            starters.append(_starter_from_mapping(item, path=f"characters[{index}]"))
+        except (TypeError, ValueError) as exc:
+            errors.append(str(exc))
+    target_count = _starter_generation_target_count(request)
+    if len(starters) != target_count:
+        errors.append(
+            "Character starter generation returned "
+            f"{len(starters)} characters; expected exactly {target_count}."
+        )
+    errors.extend(_generated_starter_name_errors(tuple(starters), request=request))
+    violations = _generated_profile_phrase_violations(
+        tuple(starters),
+        base_starters=(),
+        phrase_denylist=phrase_denylist,
+    )
+    if violations:
+        errors.append(summarize_phrase_policy_violations(violations))
+    if errors:
+        raise ProviderError(
+            ProviderErrorCategory.PROVIDER_ERROR,
+            "Character starter generation returned invalid character data: "
+            + "; ".join(errors),
+        )
+    return tuple(starters)
+
+
+def _generated_starter_name_errors(
+    starters: tuple[ScenarioCharacterStarter, ...],
+    *,
+    request: CharacterStarterGenerationRequest,
+) -> list[str]:
+    errors: list[str] = []
+    player_names = (_content_text(request.content, "player_character_name"),)
+    unavailable_keys = _starter_generation_unavailable_name_keys(
+        player_names=player_names,
+        existing_starters=request.existing_starters,
+    )
+    seen_keys: set[str] = set()
+    seen_first_names: set[str] = set()
+    for starter in starters:
+        keys = _starter_seen_keys(starter)
+        dedupe_keys = _starter_generated_dedupe_keys(starter)
+        first_name_key = _character_first_name_key(starter.name)
+        if not keys:
+            errors.append("Generated starter name must not be blank.")
+            continue
+        if keys & unavailable_keys or dedupe_keys & unavailable_keys:
+            errors.append(
+                f"Generated starter name duplicates the player or existing starter: "
+                f"{starter.name}."
+            )
+        if keys & seen_keys or dedupe_keys & seen_keys:
+            errors.append(f"Generated starter name is duplicated: {starter.name}.")
+        if first_name_key and first_name_key in seen_first_names:
+            errors.append(
+                f"Generated starter first name is duplicated: {starter.name}."
+            )
+        seen_keys.update(dedupe_keys)
+        if first_name_key:
+            seen_first_names.add(first_name_key)
+    return errors
+
+
+def _starter_generation_unavailable_name_keys(
+    *,
+    player_names: Iterable[str],
+    existing_starters: tuple[ScenarioCharacterStarter, ...],
+) -> set[str]:
+    keys: set[str] = set()
+    for name in player_names:
+        keys.update(_character_generated_dedupe_keys(name))
+    for starter in existing_starters:
+        keys.update(_starter_generated_dedupe_keys(starter))
+    return {key for key in keys if key}
+
+
+def _starter_generation_target_count(
+    request: CharacterStarterGenerationRequest,
+) -> int:
+    if request.custom_description.strip():
+        return 1
+    if request.count is None or isinstance(request.count, bool):
+        raise ProviderError(
+            ProviderErrorCategory.PROVIDER_ERROR,
+            "Character starter generation count is required.",
+        )
+    if request.count < 1 or request.count > 12:
+        raise ProviderError(
+            ProviderErrorCategory.PROVIDER_ERROR,
+            "Character starter generation count must be between 1 and 12.",
+        )
+    return request.count
+
+
+def _starter_generation_retry_feedback(error: ProviderError) -> str:
+    feedback = error.message.strip() or str(error)
+    return (
+        "Previous structured response was invalid: "
+        f"{feedback}. Return corrected character starters matching the requested "
+        "count with unique names that do not repeat the player or existing "
+        "starters."
+    )
+
+
+def _starter_generation_task(scenario_type: str) -> str:
+    normalized = scenario_type.strip() or "scenario"
+    return f"{normalized}_context_update"
 
 
 def _field_enhancement_from_data(
@@ -2579,45 +2095,6 @@ def _validate_profile_completion_tool_call(
     return True, accepted_tool_result(), starter
 
 
-def _validate_starter_generation_tool_call(
-    call: ProviderToolCall,
-    *,
-    tool_schema: dict[str, object],
-    phrase_denylist: tuple[str, ...],
-) -> tuple[bool, dict[str, str], ScenarioCharacterStarter | None]:
-    if call.name != "create_dating_sim_character_starter":
-        return False, invalid_tool_result(f"Unknown tool name: {call.name}"), None
-    arguments, parse_error = parse_tool_arguments_json(call.arguments_json)
-    if parse_error is not None or arguments is None:
-        return (
-            False,
-            invalid_tool_result(parse_error or "Tool arguments must be a JSON object"),
-            None,
-        )
-    shape_error = validate_tool_arguments_shape(arguments, schema=tool_schema)
-    if shape_error is not None:
-        return False, invalid_tool_result(shape_error), None
-    try:
-        starter = _starter_from_mapping(
-            arguments,
-            path="create_dating_sim_character_starter",
-        )
-    except (TypeError, ValueError) as exc:
-        return False, invalid_tool_result(str(exc)), None
-    violations = _generated_profile_phrase_violations(
-        (starter,),
-        base_starters=(),
-        phrase_denylist=phrase_denylist,
-    )
-    if violations:
-        return (
-            False,
-            invalid_tool_result(summarize_phrase_policy_violations(violations)),
-            None,
-        )
-    return True, accepted_tool_result(), starter
-
-
 def _validate_field_enhancement_tool_call(
     call: ProviderToolCall,
     *,
@@ -2740,17 +2217,6 @@ def _merge_starter(
 def _starter_field_is_blank(starter: ScenarioCharacterStarter, field_name: str) -> bool:
     value: object = getattr(starter, field_name)
     return value == "" or value == () or value == [] or value == {}
-
-
-def _has_explicit_character_starters(content: Mapping[str, object]) -> bool:
-    if CHARACTER_STARTERS_CONTENT_KEY not in content:
-        return False
-    return bool(
-        normalize_scenario_character_starters(
-            content.get(CHARACTER_STARTERS_CONTENT_KEY),
-            strict=False,
-        )
-    )
 
 
 def _starters_need_profile_completion(
