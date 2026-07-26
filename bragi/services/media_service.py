@@ -105,10 +105,8 @@ _MAX_PERSISTED_IMAGE_BYTES = 25 * 1024 * 1024
 _MAX_UPLOADED_IMAGE_DECODED_BYTES = 128 * 1024 * 1024
 _MAX_PERSISTED_VIDEO_BYTES = 100 * 1024 * 1024
 _SUSPICIOUS_FAST_RETRY_MAX_DURATION_MS = 750
-_IMAGE_FALLBACK_ENABLED_SETTING = "image_fallback_enabled"
 _IMAGE_FALLBACK_TASK = "image_fallback"
 _IMAGE_EDIT_FALLBACK_TASK = IMAGE_EDIT_FALLBACK_PURPOSE
-_VIDEO_FALLBACK_ENABLED_SETTING = "video_fallback_enabled"
 _VIDEO_FALLBACK_TASK = "video_fallback"
 _VENICE_IMAGE_SAFE_MODE_SETTING = "venice_image_safe_mode"
 _VENICE_PROVIDER_NAME = "venice"
@@ -3480,11 +3478,6 @@ class MediaService:
         request: VideoRequest,
         required_capability: ProviderCapability,
     ) -> VideoRequest | None:
-        fallback_enabled = self.repositories.get_app_setting(
-            _VIDEO_FALLBACK_ENABLED_SETTING
-        )
-        if not bool(fallback_enabled):
-            return None
         preference = roleplay_model_preference(
             repositories=self.repositories,
             save_id=save_id,
@@ -3537,11 +3530,6 @@ class MediaService:
         save_id: str,
         request: ImageRequest,
     ) -> _ImageFallbackRequest | None:
-        fallback_enabled = self.repositories.get_app_setting(
-            _IMAGE_FALLBACK_ENABLED_SETTING
-        )
-        if not bool(fallback_enabled):
-            return None
         required_capability = (
             ProviderCapability.IMAGE_TO_IMAGE
             if _image_request_has_source_media(request)
@@ -5708,11 +5696,6 @@ def _image_fallback_skip_reason(
     save_id: str,
     required_capability: ProviderCapability = ProviderCapability.IMAGE_GENERATION,
 ) -> str:
-    fallback_enabled = repositories.get_app_setting(
-        _IMAGE_FALLBACK_ENABLED_SETTING
-    )
-    if not bool(fallback_enabled):
-        return "disabled"
     first_configured_skip_reason: str | None = None
     for task in _image_fallback_candidate_tasks(required_capability):
         preference = roleplay_model_preference(
@@ -5757,11 +5740,6 @@ def _video_fallback_skip_reason(
     save_id: str,
     required_capability: ProviderCapability,
 ) -> str:
-    fallback_enabled = repositories.get_app_setting(
-        _VIDEO_FALLBACK_ENABLED_SETTING
-    )
-    if not bool(fallback_enabled):
-        return "disabled"
     preference = roleplay_model_preference(
         repositories=repositories,
         save_id=save_id,

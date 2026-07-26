@@ -426,8 +426,6 @@ def _fallback_chat_request(
     save_id: str | None,
     task: str,
 ) -> ChatRequest | None:
-    if not bool(repositories.get_app_setting(CHAT_FALLBACK_ENABLED_SETTING)):
-        return None
     preference = _fallback_preference(
         repositories=repositories,
         save_id=save_id,
@@ -467,8 +465,6 @@ def _chat_fallback_skip_reason(
     providers: dict[str, ProviderClient],
     save_id: str | None,
 ) -> str:
-    if not bool(repositories.get_app_setting(CHAT_FALLBACK_ENABLED_SETTING)):
-        return "disabled"
     preference = _fallback_preference(
         repositories=repositories,
         save_id=save_id,
@@ -499,12 +495,6 @@ def _fallback_structured_output_request(
     save_id: str | None,
     task: str,
 ) -> StructuredOutputRequest | None:
-    if not bool(
-        repositories.get_app_setting(
-            STRUCTURED_OUTPUT_FALLBACK_ENABLED_SETTING
-        )
-    ):
-        return None
     preference = _fallback_preference(
         repositories=repositories,
         save_id=save_id,
@@ -547,8 +537,6 @@ def tool_call_fallback_request(
     request: ToolCallRequest,
     save_id: str | None,
 ) -> ToolCallRequest | None:
-    if not bool(repositories.get_app_setting(TOOL_CALL_FALLBACK_ENABLED_SETTING)):
-        return None
     preference = _fallback_preference(
         repositories=repositories,
         save_id=save_id,
@@ -590,8 +578,6 @@ def tool_call_fallback_skip_reason(
     providers: dict[str, ProviderClient],
     save_id: str | None,
 ) -> str:
-    if not bool(repositories.get_app_setting(TOOL_CALL_FALLBACK_ENABLED_SETTING)):
-        return "disabled"
     preference = _fallback_preference(
         repositories=repositories,
         save_id=save_id,
@@ -631,12 +617,6 @@ def _structured_output_fallback_skip_reason(
     providers: dict[str, ProviderClient],
     save_id: str | None,
 ) -> str:
-    if not bool(
-        repositories.get_app_setting(
-            STRUCTURED_OUTPUT_FALLBACK_ENABLED_SETTING
-        )
-    ):
-        return "disabled"
     preference = _fallback_preference(
         repositories=repositories,
         save_id=save_id,

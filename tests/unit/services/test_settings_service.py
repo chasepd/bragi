@@ -1267,7 +1267,7 @@ def test_settings_service_persists_chat_fallback_preference(
         "dating_sim_structured_output_fallback",
     ],
 )
-def test_settings_service_auto_enables_structured_output_fallback_when_model_is_set(
+def test_settings_service_preserves_structured_output_fallback_toggle_when_model_is_set(
     tmp_path: Path,
     task: str,
 ) -> None:
@@ -1302,7 +1302,7 @@ def test_settings_service_auto_enables_structured_output_fallback_when_model_is_
                 "structured_output_fallback_enabled",
                 default=False,
             )
-            is True
+            is False
         )
 
 
@@ -1345,7 +1345,7 @@ def test_settings_service_rejects_retired_model_tasks(
         "dating_sim_tool_call_fallback",
     ],
 )
-def test_settings_service_auto_enables_tool_call_fallback_when_model_is_set(
+def test_settings_service_preserves_tool_call_fallback_toggle_when_model_is_set(
     tmp_path: Path,
     task: str,
 ) -> None:
@@ -1380,7 +1380,7 @@ def test_settings_service_auto_enables_tool_call_fallback_when_model_is_set(
                 "tool_call_fallback_enabled",
                 default=False,
             )
-            is True
+            is False
         )
 
 

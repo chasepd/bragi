@@ -17479,9 +17479,9 @@ describe("frontend helpers", () => {
     expect(screen.getByText("Context Budget Adaptive Fraction")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("tab", { name: "Models" }));
-    expect(screen.getByText("Fallback Behavior")).toBeInTheDocument();
-    expect(screen.getByText("Structured Output Fallback Enabled")).toBeInTheDocument();
-    expect(screen.getByText("Structured Output Fallback Enabled").closest("label")).toHaveAttribute("title", expect.stringContaining("structured maintenance"));
+    expect(screen.getByText("Roleplay Model Sets")).toBeInTheDocument();
+    expect(screen.queryByText("Fallback Behavior")).not.toBeInTheDocument();
+    expect(screen.queryByText("Structured Output Fallback Enabled")).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("tab", { name: "Local" }));
     expect(screen.getByRole("tab", { name: "Local" })).toHaveAttribute("aria-selected", "true");
@@ -18979,7 +18979,7 @@ describe("frontend helpers", () => {
     }
   });
 
-  it("applies the simple prose selector to text tasks and enables chat fallback", async () => {
+  it("applies the simple prose selector to text tasks and fallback preferences", async () => {
     const chatOptions = [
       modelOption("text-a", "Text A", ["chat"]),
       modelOption("text-b", "Text B", ["chat"]),
@@ -19040,10 +19040,10 @@ describe("frontend helpers", () => {
     const scopedCalls = fetchMock.mock.calls
       .filter(([path]) => path === "/api/settings/scoped")
       .map(([, init]) => JSON.parse(String(init.body)));
-    expect(scopedCalls).toEqual([{ key: "chat_fallback_enabled", value: true }]);
+    expect(scopedCalls).toEqual([]);
   });
 
-  it("applies the simple structured and tool-call selector to all structured tasks and fallback flags", async () => {
+  it("applies the simple structured and tool-call selector to all structured tasks and fallback preferences", async () => {
     const options = [
       modelOption("structured-a", "Structured A", ["structured_output", "tool_calling"]),
       modelOption("structured-b", "Structured B", ["structured_output", "tool_calling"]),
@@ -19096,10 +19096,7 @@ describe("frontend helpers", () => {
       ]);
     expect(fetchMock.mock.calls
       .filter(([path]) => path === "/api/settings/scoped")
-      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
-        { key: "structured_output_fallback_enabled", value: true },
-        { key: "tool_call_fallback_enabled", value: true }
-      ]);
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([]);
   });
 
   it("applies simple media selectors including image edit fallback and image animation", async () => {
@@ -19192,11 +19189,7 @@ describe("frontend helpers", () => {
       ]);
     expect(fetchMock.mock.calls
       .filter(([path]) => path === "/api/settings/scoped")
-      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
-        { key: "image_fallback_enabled", value: true },
-        { key: "image_fallback_enabled", value: true },
-        { key: "video_fallback_enabled", value: true }
-      ]);
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([]);
   });
 
   it("applies the narrator lane to shared and roleplay narrator selectors", async () => {

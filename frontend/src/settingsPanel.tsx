@@ -169,8 +169,7 @@ type SimpleModelSelectorMeta = readonly [
   readonly string[],
   readonly ModelCapabilityFamily[],
   readonly string[],
-  readonly ModelCapabilityFamily[],
-  readonly string[]
+  readonly ModelCapabilityFamily[]
 ];
 type SimpleModelSelectorGroup = {
   label: string;
@@ -178,7 +177,6 @@ type SimpleModelSelectorGroup = {
   mainOptions: ModelOption[];
   fallbackSelectors: TaskModelSelector[];
   fallbackOptions: ModelOption[];
-  fallbackSettingKeys: readonly string[];
 };
 
 const SETTINGS_SECTION_STALE_MS = 60_000;
@@ -195,40 +193,35 @@ const SIMPLE_MODEL_SELECTOR_GROUPS: readonly SimpleModelSelectorMeta[] = [
     structuredToolModelPurposes(),
     ["structured_output", "tool_calling"],
     ["structured_output_fallback", "tool_call_fallback"],
-    ["structured_output", "tool_calling"],
-    ["structured_output_fallback_enabled", "tool_call_fallback_enabled"]
+    ["structured_output", "tool_calling"]
   ],
   [
     "Prose",
     routingLanePurposes("narrator", "scenario_writer", "summarization", "image_prompt"),
     ["chat"],
     ["narrator_fallback", "chat_fallback"],
-    ["chat"],
-    ["chat_fallback_enabled"]
+    ["chat"]
   ],
   [
     "Image Generation",
     routingLanePurposes("image_generation"),
     ["image_generation"],
     ["image_fallback"],
-    ["image_generation"],
-    ["image_fallback_enabled"]
+    ["image_generation"]
   ],
   [
     "Image Edit",
     routingLanePurposes("image_edit"),
     ["image_to_image"],
     ["image_edit_fallback"],
-    ["image_to_image"],
-    ["image_fallback_enabled"]
+    ["image_to_image"]
   ],
   [
     "Video Generation",
     routingLanePurposes("video_generation", "image_animation"),
     ["text_to_video", "image_to_video"],
     ["video_fallback"],
-    ["text_to_video"],
-    ["video_fallback_enabled"]
+    ["text_to_video"]
   ]
 ];
 
@@ -950,7 +943,6 @@ function ModelSettings({ settings, updateLocal, disabled }: { settings?: Setting
       <ModelRoutingProfileControls settings={settings} />
       <SimpleModelSelectorSettings settings={settings} disabled={disabled} />
       <RoleplaySharedModelSettings settings={settings} updateLocal={updateLocal} disabled={disabled} />
-      <FallbackBehaviorSettings settings={settings} updateLocal={updateLocal} disabled={disabled} />
       {groups.length || fallbacks.length || otherSelectors.length ? (
         <AdvancedSettingsSection
           title="Advanced model routing"
@@ -998,11 +990,7 @@ function SimpleModelSelectorRow({ group, disabled }: { group: SimpleModelSelecto
   const savePreferences = useMutation({
     mutationFn: async ({ main, fallback }: { main: string; fallback: string }) => {
       await saveSimpleModelPreferences(group.mainSelectors, main);
-      if (await saveSimpleModelPreferences(group.fallbackSelectors, fallback)) {
-        for (const key of group.fallbackSettingKeys) {
-          await postJson("/api/settings/scoped", { key, value: true });
-        }
-      }
+      await saveSimpleModelPreferences(group.fallbackSelectors, fallback);
     },
     onSuccess: () => {
       setError("");
@@ -1085,25 +1073,6 @@ function simpleModelOptionSelect(
         </option>
       ))}
     </select>
-  );
-}
-
-function FallbackBehaviorSettings({ settings, updateLocal, disabled }: { settings: SettingsModel; updateLocal: (key: string, value: unknown) => void; disabled: boolean }) {
-  const controls = [
-    settings.chat_fallback,
-    settings.structured_output_fallback,
-    settings.tool_call_fallback,
-    settings.image_fallback,
-    settings.video_fallback
-  ].filter((control): control is ToggleControl => Boolean(control));
-  if (!controls.length) return null;
-  return (
-    <section className="settings-subsection">
-      <h3>Fallback Behavior</h3>
-      {controls.map((control) => (
-        <ToggleSetting key={control.setting_key} control={control} disabled={disabled} updateLocal={updateLocal} />
-      ))}
-    </section>
   );
 }
 
@@ -1429,7 +1398,7 @@ function modelRoutingLanes(settings: SettingsModel, metas: readonly ModelRouting
 
 function simpleModelSelectorGroups(settings: SettingsModel): SimpleModelSelectorGroup[] {
   const selectors = allModelSelectors(settings);
-  return SIMPLE_MODEL_SELECTOR_GROUPS.flatMap(([label, mainPurposes, mainCapabilities, fallbackPurposes, fallbackCapabilities, fallbackSettingKeys]) => {
+  return SIMPLE_MODEL_SELECTOR_GROUPS.flatMap(([label, mainPurposes, mainCapabilities, fallbackPurposes, fallbackCapabilities]) => {
     const mainSelectors = selectorsForPurposes(selectors, mainPurposes);
     const fallbackSelectors = selectorsForPurposes(selectors, fallbackPurposes);
     if (!mainSelectors.length && !fallbackSelectors.length) return [];
@@ -1438,8 +1407,7 @@ function simpleModelSelectorGroups(settings: SettingsModel): SimpleModelSelector
       mainSelectors,
       mainOptions: commonModelOptions(mainSelectors, mainCapabilities),
       fallbackSelectors,
-      fallbackOptions: commonModelOptions(fallbackSelectors, fallbackCapabilities),
-      fallbackSettingKeys
+      fallbackOptions: commonModelOptions(fallbackSelectors, fallbackCapabilities)
     }];
   });
 }

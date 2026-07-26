@@ -525,8 +525,6 @@ def _seed_fake_models_if_requested(
         display_name="Fake Edit",
         capabilities=["image_to_image"],
     )
-    if repositories.get_app_setting("structured_output_fallback_enabled") is None:
-        repositories.set_app_setting("structured_output_fallback_enabled", True)
     settings = bragi_runtime_bindings().build_settings_model(
         repositories=repositories,
         providers=tuple(providers.keys()),

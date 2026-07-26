@@ -3092,7 +3092,7 @@ def test_settings_model_omits_diagnostics_entries_for_failures(
     assert _SENTINEL_SECRET not in repr(model)
 
 
-def test_settings_model_omits_configuration_diagnostics_but_helper_returns_them(
+def test_settings_model_omits_deprecated_fallback_disabled_diagnostics(
     repositories: PersistenceRepositories,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -3113,11 +3113,8 @@ def test_settings_model_omits_configuration_diagnostics_but_helper_returns_them(
     assert _value(model, "diagnostics", default=None) is None
     assert "Structured output fallback model is configured" not in repr(model)
     diagnostics = _list(settings.configuration_diagnostics(repositories))
-    assert any(
+    assert not any(
         _value(entry, "kind", "type") == "configuration"
-        and "Structured output fallback model is configured" in _value(entry, "error")
-        and "structured_output_fallback" in _value(entry, "error")
-        and "openrouter/openrouter/context-search" in _value(entry, "error")
         and "fallback is disabled" in _value(entry, "error")
         for entry in diagnostics
     )
