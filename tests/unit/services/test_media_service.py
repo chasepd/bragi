@@ -57,6 +57,12 @@ _VALID_PNG_BYTES = bytes.fromhex(
 _VALID_MP4_BYTES = b"\x00\x00\x00\x18ftypmp42bragi-test-video"
 
 
+def _assert_realistic_prompt(prompt: str, base_prompt: str) -> None:
+    assert prompt.startswith(f"{base_prompt}\n\n")
+    assert "Style preset: Realistic." in prompt
+    assert "photoreal image style" in prompt
+
+
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     return (
         struct.pack(">I", len(data))
@@ -389,7 +395,7 @@ def test_generate_for_message_drafts_prompt_and_persists_asset_and_job(
     assert request.model_id == "fake-image"
     assert request.source_save_id == save.id
     assert request.source_message_id == messages[-1].id
-    assert request.prompt == "cinematic drafted image prompt"
+    _assert_realistic_prompt(request.prompt, "cinematic drafted image prompt")
 
     media_assets = repositories.list_media_assets(save.id)
     assert [item.id for item in media_assets] == [asset.id]
@@ -415,7 +421,7 @@ def test_generate_for_message_drafts_prompt_and_persists_asset_and_job(
     assert jobs[0]["payload"]["model"] == "fake-image"
     assert jobs[0]["result"]["media_asset_id"] == media_asset.id
     assert jobs[0]["result"]["path"] == media_asset.path
-    assert jobs[0]["result"]["prompt_chars"] == len("cinematic drafted image prompt")
+    assert jobs[0]["result"]["prompt_chars"] == len(request.prompt)
 
 
 def test_upload_character_text_player_photo_describes_and_persists_upload(
@@ -1189,8 +1195,9 @@ def test_generate_for_message_uses_image_prompt_preference_for_prompt_drafting(
     assert len(image_provider.image_requests) == 1
     assert image_provider.image_requests[0].provider == "fake"
     assert image_provider.image_requests[0].model_id == "fake-image"
-    assert image_provider.image_requests[0].prompt == (
-        "image-prompt-model drafted prompt"
+    _assert_realistic_prompt(
+        image_provider.image_requests[0].prompt,
+        "image-prompt-model drafted prompt",
     )
 
 
@@ -1322,10 +1329,11 @@ def test_generate_for_message_recovers_from_empty_shared_image_prompt_with_share
     assert len(image_provider.image_requests) == 1
     assert image_provider.image_requests[0].provider == "fake"
     assert image_provider.image_requests[0].model_id == "fake-image"
-    assert image_provider.image_requests[0].prompt == (
-        "shared chat drafted image prompt"
+    _assert_realistic_prompt(
+        image_provider.image_requests[0].prompt,
+        "shared chat drafted image prompt",
     )
-    assert asset.prompt == "shared chat drafted image prompt"
+    assert asset.prompt == image_provider.image_requests[0].prompt
 
 
 def test_generate_for_message_uses_chat_preference_for_prompt_drafting_fallback(
@@ -1402,10 +1410,11 @@ def test_generate_for_message_recovers_from_empty_scenario_image_prompt(
     assert shared_prompt_provider.chat_requests[0].provider == "shared-prompt"
     assert shared_prompt_provider.chat_requests[0].model_id == "shared/prompt-drafter"
     assert len(image_provider.image_requests) == 1
-    assert image_provider.image_requests[0].prompt == (
-        "shared image prompt after empty scenario prompt"
+    _assert_realistic_prompt(
+        image_provider.image_requests[0].prompt,
+        "shared image prompt after empty scenario prompt",
     )
-    assert asset.prompt == "shared image prompt after empty scenario prompt"
+    assert asset.prompt == image_provider.image_requests[0].prompt
 
 
 def test_generate_for_message_omits_unselected_full_scenario_sections(
@@ -2331,7 +2340,10 @@ def test_generate_for_message_prompt_uses_selected_message_without_future_contex
     chat_context = _chat_request_context(provider.chat_requests[0])
     assert len(provider.image_requests) == 1
     assert provider.image_requests[0].source_message_id == selected_message.id
-    assert provider.image_requests[0].prompt == "cinematic drafted image prompt"
+    _assert_realistic_prompt(
+        provider.image_requests[0].prompt,
+        "cinematic drafted image prompt",
+    )
     assert "Narrator: A bell rings under the span." in chat_context
     assert "Future scene beat" not in chat_context
 
@@ -3056,7 +3068,10 @@ def test_automatic_generation_runs_only_when_narrator_count_reaches_frequency(
     assert "The oath-brands glow under the bridge stones." in _chat_request_context(
         provider.chat_requests[0]
     )
-    assert provider.image_requests[0].prompt == "cinematic drafted image prompt"
+    _assert_realistic_prompt(
+        provider.image_requests[0].prompt,
+        "cinematic drafted image prompt",
+    )
     assert repositories.list_media_assets(save.id)[0].source_message_id == (
         latest_narrator.id
     )
@@ -3119,6 +3134,7 @@ def test_automatic_generation_uses_deferred_source_message_ordinal(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=3,
     )
 
@@ -3139,7 +3155,7 @@ def test_automatic_generation_uses_deferred_source_message_ordinal(
     assert "Fourth narrator beat exists before the delayed job runs." not in (
         chat_context
     )
-    assert request.prompt == "cinematic drafted image prompt"
+    _assert_realistic_prompt(request.prompt, "cinematic drafted image prompt")
     assert repositories.list_media_assets(save.id)[0].source_message_id == (
         third_narrator.id
     )
@@ -3171,6 +3187,7 @@ def test_generate_prepared_automatic_uses_context_captured_during_prepare(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=2,
     )
 
@@ -3273,6 +3290,7 @@ def test_generate_prepared_automatic_rejects_unavailable_image_model(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=2,
     )
     prepared = service.prepare_automatic_if_due(
@@ -3315,6 +3333,7 @@ def test_automatic_generation_skips_text_message_beats(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=3,
     )
 
@@ -3363,6 +3382,7 @@ def test_automatic_generation_can_create_video_without_image_duplicate_blocking(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=2,
     )
 
@@ -3412,6 +3432,7 @@ def test_automatic_video_generation_labels_openrouter_request(
         repositories=repositories,
         providers={"openrouter": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=2,
     )
 
@@ -3451,6 +3472,7 @@ def test_automatic_generation_rejects_unavailable_video_model(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=2,
     )
 
@@ -3849,7 +3871,7 @@ def test_animate_image_failed_job_records_provider_validation_details(
     assert "At least one reference is required" in result["final_error_message"]
 
 
-def test_automatic_generation_disabled_makes_no_requests_or_records(
+def test_automatic_generation_is_disabled_by_default(
     repositories: PersistenceRepositories,
     tmp_path: Path,
 ) -> None:
@@ -3859,7 +3881,6 @@ def test_automatic_generation_disabled_makes_no_requests_or_records(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
-        automatic_enabled=False,
         auto_frequency=1,
     )
 
@@ -3910,6 +3931,7 @@ def test_automatic_generation_frequency_zero_is_disabled(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=tmp_path / "media",
+        automatic_enabled=True,
         auto_frequency=0,
     )
 
@@ -7769,6 +7791,7 @@ def test_automatic_scene_generation_uses_present_character_reference(
         repositories=repositories,
         providers={"fake": provider},
         media_dir=media_dir,
+        automatic_enabled=True,
         auto_frequency=2,
     )
     reference = asyncio.run(
@@ -7826,6 +7849,7 @@ def _media_service(
     }
     if auto_frequency is not _UNSET:
         kwargs["auto_frequency"] = auto_frequency
+    kwargs["automatic_enabled"] = True
     return MediaService(**kwargs)
 
 

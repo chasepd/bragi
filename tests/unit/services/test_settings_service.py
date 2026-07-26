@@ -1648,14 +1648,14 @@ def test_settings_service_sanitizes_image_style_preset_preference(
         service = _settings_service(repositories)
         repositories.set_app_setting(IMAGE_STYLE_PRESET_SETTING, "comic_book")
 
-        assert service.get_local_setting(IMAGE_STYLE_PRESET_SETTING) == "none"
+        assert service.get_local_setting(IMAGE_STYLE_PRESET_SETTING) == "realistic"
 
         assert (
             service.get_local_setting(
                 IMAGE_STYLE_PRESET_SETTING,
                 save_id=first_save.id,
             )
-            == "none"
+            == "realistic"
         )
         service.set_local_setting(
             IMAGE_STYLE_PRESET_SETTING,
@@ -1692,13 +1692,13 @@ def test_settings_service_sanitizes_image_style_preset_preference(
                 IMAGE_STYLE_PRESET_SETTING,
                 save_id=first_save.id,
             )
-            == "none"
+            == "realistic"
         )
         assert (
             repositories.get_app_setting(
                 save_image_style_preset_setting_key(first_save.id)
             )
-            == "none"
+            == "realistic"
         )
 
 

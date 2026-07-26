@@ -32,7 +32,7 @@ MAX_CHAT_MAX_OUTPUT_TOKENS = 4096
 STEP_CHAT_MAX_OUTPUT_TOKENS = 64
 
 IMAGE_DIMENSION_PRESET_SETTING = "image_dimension_preset"
-DEFAULT_IMAGE_DIMENSION_PRESET = "provider_default"
+DEFAULT_IMAGE_DIMENSION_PRESET = "square_1024x1024"
 
 OPENROUTER_CHAT_REASONING_OVERRIDES_SETTING = "openrouter_chat_reasoning_overrides"
 OPENROUTER_PROVIDER_NAME = "openrouter"
@@ -72,7 +72,7 @@ class ImageDimensionPreset:
 
 _IMAGE_DIMENSION_PRESETS = (
     ImageDimensionPreset(
-        id=DEFAULT_IMAGE_DIMENSION_PRESET,
+        id="provider_default",
         label="Provider default",
         dimensions=None,
     ),

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from bragi.persistence.repositories import PersistenceRepositories
 
 IMAGE_STYLE_PRESET_SETTING = "image_style_preset"
-DEFAULT_IMAGE_STYLE_PRESET = "none"
+DEFAULT_IMAGE_STYLE_PRESET = "realistic"
 _SAVE_IMAGE_STYLE_PRESET_PREFIX = f"{IMAGE_STYLE_PRESET_SETTING}:save:"
 
 

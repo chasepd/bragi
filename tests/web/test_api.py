@@ -5604,14 +5604,14 @@ def test_settings_expose_and_persist_save_scoped_image_style_preset(
     payload = settings.json()
     assert payload["image_style_preset"] == {
         "setting_key": "image_style_preset",
-        "selected": "none",
+        "selected": "realistic",
         "options": EXPECTED_IMAGE_STYLE_PRESETS,
     }
     assert saved.status_code == 200
     assert first_updated.status_code == 200
     assert second_updated.status_code == 200
     assert first_updated.json()["image_style_preset"]["selected"] == "pixel_art"
-    assert second_updated.json()["image_style_preset"]["selected"] == "none"
+    assert second_updated.json()["image_style_preset"]["selected"] == "realistic"
 
 
 def test_settings_expose_and_persist_save_scoped_context_automation_toggles(

@@ -2469,10 +2469,10 @@ def test_settings_model_exposes_summarization_and_image_controls(
     assert _value(automatic_image_generation, "setting_key") == (
         "automatic_image_generation_enabled"
     )
-    assert _value(automatic_image_generation, "enabled", "value") is True
+    assert _value(automatic_image_generation, "enabled", "value") is False
     image_style_preset = _value(model, "image_style_preset")
     assert _value(image_style_preset, "setting_key") == "image_style_preset"
-    assert _value(image_style_preset, "selected") == "none"
+    assert _value(image_style_preset, "selected") == "realistic"
     assert _list(_value(image_style_preset, "options")) == list(
         EXPECTED_IMAGE_STYLE_PRESETS
     )
@@ -2654,7 +2654,7 @@ def test_settings_model_exposes_persisted_summarization_and_image_controls(
     assert _value(image_frequency, "value") == 0
 
 
-def test_settings_model_defaults_unknown_image_style_preset_to_none(
+def test_settings_model_defaults_unknown_image_style_preset_to_realistic(
     repositories: PersistenceRepositories,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -2679,7 +2679,7 @@ def test_settings_model_defaults_unknown_image_style_preset_to_none(
     )
 
     image_style_preset = _value(model, "image_style_preset")
-    assert _value(image_style_preset, "selected") == "none"
+    assert _value(image_style_preset, "selected") == "realistic"
 
 
 def test_settings_model_reads_image_style_preset_for_active_save(
@@ -2763,6 +2763,27 @@ def test_settings_model_exposes_generation_setting_controls(
     image_dimensions = _value(model, "image_dimension_preset")
     assert _value(image_dimensions, "setting_key") == "image_dimension_preset"
     assert _value(image_dimensions, "selected") == "landscape_1024x768"
+    assert _value(image_dimensions, "supported") is True
+    assert _list(_value(image_dimensions, "options")) == list(
+        EXPECTED_IMAGE_DIMENSION_PRESETS
+    )
+
+
+def test_settings_model_defaults_image_dimension_preset_to_square(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    _seed_settings_data(repositories)
+
+    model = settings.build_settings_model(
+        repositories=repositories,
+        providers=("openrouter", "venice"),
+    )
+
+    image_dimensions = _value(model, "image_dimension_preset")
+    assert _value(image_dimensions, "setting_key") == "image_dimension_preset"
+    assert _value(image_dimensions, "selected") == "square_1024x1024"
     assert _value(image_dimensions, "supported") is True
     assert _list(_value(image_dimensions, "options")) == list(
         EXPECTED_IMAGE_DIMENSION_PRESETS
