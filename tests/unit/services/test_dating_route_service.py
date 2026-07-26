@@ -20,7 +20,7 @@ def repositories(tmp_path: Path) -> Iterator[PersistenceRepositories]:
         yield PersistenceRepositories(connection)
 
 
-def test_seed_routes_for_dating_sim_romance_options(
+def test_seed_routes_for_dating_sim_existing_romance_characters(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, _player_id, npc_id = _dating_save_with_romance_option(repositories)
@@ -398,7 +398,6 @@ def _dating_save_with_romance_option(
         player_role="Transfer student",
         content={
             "player_character_name": "Ren Takahashi",
-            "romance_options": "Mika Arai is the class president.",
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Summer Save")

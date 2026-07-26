@@ -3309,13 +3309,13 @@ h1 {
   align-items: end;
 }
 
-.scenario-starter-wide {
-  grid-column: span 2;
+.scenario-starter-generation {
+  display: grid;
+  grid-template-columns: 1fr auto;
 }
 
-.scenario-starter-met {
-  min-height: 100%;
-  align-content: center;
+.scenario-starter-wide {
+  grid-column: span 2;
 }
 
 .scenario-starter-reference {

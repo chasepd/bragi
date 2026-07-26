@@ -23,6 +23,7 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.system_prompt import DEFAULT_PROSE_SAFETY_SECTION
+from bragi.services.character_profile_completion import ScenarioCharacterStarter
 from bragi.services.model_preferences import scenario_generation_section_model_task
 from bragi.services.scenario_service import (
     ScenarioDraft,
@@ -47,7 +48,6 @@ DATING_SIM_SECTION_IDS = (
     "player_character_name",
     "player_character_profile",
     "player_role",
-    "romance_options",
     "tone_genre",
     "opening_message",
 )
@@ -86,7 +86,6 @@ FIRST_CONTACT_EXPLORATION_SECTION_IDS = (
     "player_character_name",
     "player_role",
     "mission_profile",
-    "crew_and_command",
     "ship_or_base_status",
     "exploration_target",
     "unknown_intelligence",
@@ -105,7 +104,6 @@ SURVIVAL_EXPEDITION_SECTION_IDS = (
     "player_role",
     "expedition_goal",
     "route_options",
-    "party_roster",
     "resource_inventory",
     "environmental_conditions",
     "hazards_and_events",
@@ -142,7 +140,6 @@ INVESTIGATION_MYSTERY_SECTION_IDS = (
     "player_character_name",
     "player_role",
     "case_facts",
-    "suspects",
     "clues",
     "timeline",
     "red_herrings",
@@ -159,7 +156,6 @@ HEIST_INFILTRATION_SECTION_IDS = (
     "player_role",
     "target_location",
     "objectives_and_stakes",
-    "crew_and_contacts",
     "intel_and_access",
     "security_model",
     "alert_and_heat",
@@ -178,7 +174,6 @@ POLITICAL_INTRIGUE_SECTION_IDS = (
     "player_role",
     "political_arena",
     "political_factions",
-    "major_npcs",
     "central_conflict",
     "secrets_and_leverage",
     "reputation_and_standing",
@@ -197,7 +192,6 @@ SETTLEMENT_BUILDER_SECTION_IDS = (
     "player_character_name",
     "player_role",
     "settlement_profile",
-    "population_and_residents",
     "resources_and_indicators",
     "projects_and_facilities",
     "threats_and_opportunities",
@@ -215,7 +209,6 @@ MONSTER_HUNT_BOUNTY_SECTION_IDS = (
     "target_profile",
     "leads_and_clues",
     "hunt_locations",
-    "rivals_and_factions",
     "preparation_state",
     "hunt_status",
     "tone_genre",
@@ -229,7 +222,6 @@ ROAD_TRIP_PILGRIMAGE_SECTION_IDS = (
     "player_role",
     "journey_profile",
     "route_and_stops",
-    "traveling_party",
     "transport_and_supplies",
     "recurring_pressures",
     "relationship_threads",
@@ -248,7 +240,6 @@ MERCHANT_TRADE_ROUTE_SECTION_IDS = (
     "markets_and_stops",
     "contracts_and_debts",
     "route_hazards",
-    "reputation_and_contacts",
     "profit_and_loss",
     "tone_genre",
     "opening_message",
@@ -308,38 +299,6 @@ class BlockingScenarioProvider(RecordingScenarioProvider):
             ProviderErrorCategory.CONTENT_BLOCKED,
             "scenario section blocked",
         )
-
-
-class SequentialScenarioProvider:
-    provider_name = "openrouter"
-
-    def __init__(self, responses: list[str]) -> None:
-        self.responses = responses
-        self.chat_requests: list[ChatRequest] = []
-
-    async def validate_config(self) -> ProviderConfigStatus:
-        return ProviderConfigStatus(
-            provider=self.provider_name,
-            configured=True,
-            authenticated=True,
-        )
-
-    async def list_models(self) -> list[ProviderModel]:
-        return []
-
-    async def chat(self, request: ChatRequest) -> ChatResponse:
-        self.chat_requests.append(request)
-        if not self.responses:
-            raise AssertionError("unexpected extra scenario section request")
-        return ChatResponse(
-            body=self.responses.pop(0),
-            provider=request.provider,
-            model_id=request.model_id,
-            token_usage={"total": 17},
-        )
-
-    async def generate_image(self, request: ImageRequest) -> ImageResponse:
-        raise AssertionError("scenario draft generation must not request images")
 
 
 @pytest.fixture
@@ -568,7 +527,7 @@ def test_generate_draft_rejects_retired_character_interaction(
     assert provider.chat_requests == []
 
 
-def test_generate_dating_sim_draft_uses_player_and_romance_option_sections(
+def test_generate_dating_sim_draft_uses_player_sections_without_character_starters(
     repositories: PersistenceRepositories,
 ) -> None:
     provider = RecordingScenarioProvider(
@@ -592,16 +551,10 @@ def test_generate_dating_sim_draft_uses_player_and_romance_option_sections(
     assert sections == _dating_sim_sections()
     assert tuple(sections) == DATING_SIM_SECTION_IDS
     assert len(provider.chat_requests) == len(DATING_SIM_SECTION_IDS)
-    romance_request = provider.chat_requests[
-        DATING_SIM_SECTION_IDS.index("romance_options")
-    ]
-    romance_prompt = _request_text(romance_request)
-    assert "default to exactly 4" in romance_prompt
-    assert "opposite gender" in romance_prompt
-    assert "Do not include JSON" in _request_text(romance_request)
+    assert draft.character_starters == ()
 
 
-def test_generate_non_fantasy_draft_includes_ordinary_name_candidates(
+def test_generate_non_fantasy_draft_does_not_include_starter_name_candidates(
     repositories: PersistenceRepositories,
 ) -> None:
     provider = RecordingScenarioProvider(
@@ -621,15 +574,11 @@ def test_generate_non_fantasy_draft_includes_ordinary_name_candidates(
         )
     )
 
-    romance_request = provider.chat_requests[
-        DATING_SIM_SECTION_IDS.index("romance_options")
-    ]
-    romance_prompt = _request_text(romance_request)
-    assert "Ordinary contemporary name candidates" in romance_prompt
-    assert "Feminine:" in romance_prompt
-    assert "Masculine:" in romance_prompt
-    assert "Neutral:" in romance_prompt
-    assert "Do not repeat first names" in romance_prompt
+    request_text = "\n".join(
+        _request_text(request) for request in provider.chat_requests
+    )
+    assert "Ordinary contemporary name candidates" in request_text
+    assert "character starters" not in request_text
 
 
 def test_generate_fantasy_draft_does_not_include_ordinary_name_candidates(
@@ -656,55 +605,6 @@ def test_generate_fantasy_draft_does_not_include_ordinary_name_candidates(
         _request_text(request) for request in provider.chat_requests
     )
     assert "Ordinary contemporary name candidates" not in request_text
-
-
-def test_generate_non_fantasy_cast_section_retries_obvious_duplicate_first_names(
-    repositories: PersistenceRepositories,
-) -> None:
-    provider = SequentialScenarioProvider(
-        [
-            "The Speed of Love",
-            "A speed dating night starts with four strangers at one table.",
-            "James Mitchell",
-            "A quiet graphic designer trying to be brave.",
-            "A guest whose design work makes him notice small details.",
-            (
-                "Emily Carter - a violinist with a guarded smile.\n"
-                "Emily Brooks - a chef who knows the host.\n"
-                "Lily Chen - a photographer watching the door.\n"
-                "Chloe Rivera - a bookstore owner looking for a real answer."
-            ),
-            (
-                "Emily Carter - a violinist with a guarded smile.\n"
-                "Lily Brooks - a chef who knows the host.\n"
-                "Olivia Chen - a photographer watching the door.\n"
-                "Chloe Rivera - a bookstore owner looking for a real answer."
-            ),
-            "Warm contemporary romance with nervous humor.",
-            "The host rings the bell and the first conversation begins.",
-        ]
-    )
-    service = ScenarioService(
-        repositories=repositories,
-        provider=provider,
-        provider_name="openrouter",
-        model_id="scenario-drafter",
-    )
-
-    draft = asyncio.run(
-        service.generate_draft(
-            scenario_type=ScenarioType.DATING_SIM,
-            seed="A contemporary speed dating night.",
-        )
-    )
-
-    assert len(provider.chat_requests) == len(DATING_SIM_SECTION_IDS) + 1
-    retry_request = provider.chat_requests[
-        DATING_SIM_SECTION_IDS.index("romance_options") + 1
-    ]
-    assert "repeated first names: Emily" in _request_text(retry_request)
-    assert "Emily Brooks" not in draft.sections["romance_options"]
-    assert "Lily Brooks" in draft.sections["romance_options"]
 
 
 def test_generate_fantasy_roleplay_draft_uses_genre_sections(
@@ -785,7 +685,6 @@ def test_generate_hybrid_draft_merges_unique_genre_sections(
         "factions_and_institutions",
         "mission_stakes",
         "player_character_profile",
-        "romance_options",
         "tone_genre",
         "opening_message",
     )
@@ -793,12 +692,6 @@ def test_generate_hybrid_draft_merges_unique_genre_sections(
         **_science_fiction_roleplay_sections(),
         "player_character_profile": (
             "Ren is a courier caught between orbital politics and romance routes."
-        ),
-        "romance_options": (
-            "Mika Arai - station diplomat; precise and lonely.\n"
-            "Sora Minase - shuttle racer; bright and restless.\n"
-            "Yuna Kisaragi - xenobiologist; gentle and storm-drawn.\n"
-            "Nozomi Vale - childhood friend; funny and guarded."
         ),
     }
     expected_sections = {
@@ -833,12 +726,12 @@ def test_generate_hybrid_draft_merges_unique_genre_sections(
     assert tuple(sections) == expected_section_order
     assert sections == expected_sections
     assert len(provider.chat_requests) == len(sections)
-    romance_request = provider.chat_requests[
-        tuple(sections).index("romance_options")
+    profile_request = provider.chat_requests[
+        tuple(sections).index("player_character_profile")
     ]
-    romance_prompt = _request_text(romance_request)
-    assert "science fiction / dating sim hybrid scenario" in romance_prompt
-    assert "default to exactly 4" in romance_prompt
+    profile_prompt = _request_text(profile_request)
+    assert "science fiction / dating sim hybrid scenario" in profile_prompt
+    assert "romantic availability" in profile_prompt
 
 
 def test_generate_first_contact_exploration_draft_uses_discovery_sections(
@@ -1463,6 +1356,40 @@ def test_save_draft_persists_scenario_content_json_and_returns_id(
     }
 
 
+def test_save_draft_persists_explicit_character_starters(
+    repositories: PersistenceRepositories,
+) -> None:
+    service = ScenarioService(
+        repositories=repositories,
+        provider=RecordingScenarioProvider(_dating_sim_sections()),
+        provider_name="openrouter",
+        model_id="scenario-drafter",
+    )
+    draft = ScenarioDraft(
+        type=ScenarioType.DATING_SIM,
+        sections=_dating_sim_sections(),
+        character_starters=(
+            ScenarioCharacterStarter(
+                name="Mika Arai",
+                role="Student council president",
+                known_state="Mika runs the festival schedule.",
+                met=False,
+            ),
+        ),
+    )
+
+    scenario_id = service.save_draft(draft)
+
+    scenario = repositories.get_scenario(scenario_id)
+    assert scenario is not None
+    content = json.loads(scenario.content_json)
+    [starter] = content["character_starters"]
+    assert starter["name"] == "Mika Arai"
+    assert starter["role"] == "Student council president"
+    assert starter["known_state"] == "Mika runs the festival schedule."
+    assert starter["met"] is False
+
+
 def test_save_hybrid_draft_persists_primary_type_and_genre_metadata(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -1477,12 +1404,6 @@ def test_save_hybrid_draft_persists_primary_type_and_genre_metadata(
         **{
             "player_character_profile": (
                 "Ren is a transfer courier balancing mission duty and romance."
-            ),
-            "romance_options": (
-                "Mika Arai - station diplomat; precise and lonely.\n"
-                "Sora Minase - shuttle racer; bright and restless.\n"
-                "Yuna Kisaragi - xenobiologist; gentle and storm-drawn.\n"
-                "Nozomi Vale - childhood friend; funny and guarded."
             ),
         },
     }
@@ -1513,7 +1434,7 @@ def test_save_hybrid_draft_persists_primary_type_and_genre_metadata(
         "dating_sim",
     ]
     assert content["technology_level"] == sections["technology_level"]
-    assert content["romance_options"] == sections["romance_options"]
+    assert content["player_character_profile"] == sections["player_character_profile"]
 
 
 def test_save_draft_folds_legacy_starting_scene_into_opening_message(
@@ -1565,9 +1486,6 @@ def test_save_draft_accepts_legacy_full_roleplay_world_sections(
     assert scenario is not None
     assert json.loads(scenario.content_json)["worldbuilding"] == (
         "Signal towers bind the border marches together."
-    )
-    assert json.loads(scenario.content_json)["characters"] == (
-        "Captain Ilyra, Brother Senn, Vey the outrider."
     )
 
 
@@ -1887,7 +1805,6 @@ def _detailed_full_roleplay_sections() -> dict[str, str]:
         "lore": "The first beacon was lit from a fallen star.",
         "locations": "Gatehouse, cinder chapel, broken east stair.",
         "factions": "Wardens, ash cult, refugee caravan.",
-        "characters": "Captain Ilyra, Brother Senn, Vey the outrider.",
     }
 
 
@@ -1901,16 +1818,6 @@ def _dating_sim_sections() -> dict[str, str]:
             "club and which future will define his last summer."
         ),
         "player_role": "The central player character and romantic lead.",
-        "romance_options": (
-            "Mika Arai - female class president; precise, ambitious, and secretly "
-            "lonely.\n"
-            "Sora Minase - female swimmer; bright, competitive, and terrified of "
-            "leaving home.\n"
-            "Yuna Kisaragi - female art-club dreamer; gentle, strange, and "
-            "drawn to storms.\n"
-            "Nozomi Vale - female childhood friend; funny, guarded, and tired of "
-            "being overlooked."
-        ),
         "tone_genre": (
             "Warm romantic drama with comedy, longing, and school-life stakes."
         ),
@@ -1982,11 +1889,6 @@ def _first_contact_exploration_sections() -> dict[str, str]:
         "mission_profile": (
             "Survey the subglacial ocean and make non-hostile contact if possible."
         ),
-        "crew_and_command": (
-            "Commander Reyes - cautious mission commander; "
-            "Dr. Nia Sol - xenobiologist tracking contamination risk; "
-            "Tavi Qadir - engineer keeping the habitat warm."
-        ),
         "ship_or_base_status": (
             "Habitat Kestrel has 42 hours of stable heat and one damaged drill."
         ),
@@ -2030,7 +1932,6 @@ def _survival_expedition_sections() -> dict[str, str]:
         "player_role": "The expedition lead responsible for everyone surviving.",
         "expedition_goal": "Reach Northwatch before fever spreads through camp.",
         "route_options": "The cliff road is fast and exposed; the forest is slower.",
-        "party_roster": "Mara guides two scouts, a medic, and a mule handler.",
         "resource_inventory": (
             "Food for nine days, water for five, medicine for three patients."
         ),
@@ -2051,10 +1952,6 @@ def _investigation_mystery_sections() -> dict[str, str]:
         "player_role": "The investigator assigned to reopen the impossible case.",
         "case_facts": (
             "Curator Elian Vale vanished from the sealed east gallery during a gala."
-        ),
-        "suspects": (
-            "Sera Holt has restoration access and a false alibi. "
-            "Director Iven Rusk needs the insurance payout."
         ),
         "clues": (
             "Broken display dust found outside the gallery door; undiscovered. "
@@ -2093,10 +1990,6 @@ def _heist_infiltration_sections() -> dict[str, str]:
         "objectives_and_stakes": (
             "Primary objective: recover the treaty. Optional objective: copy "
             "the blackmail ledger. Failure starts a border war."
-        ),
-        "crew_and_contacts": (
-            "Mara leads Tavi the lockrunner, Ilyra the lookout, and Venn the "
-            "inside clerk."
         ),
         "intel_and_access": (
             "Known: guard shift changes at bell three and the lift code is split "
@@ -2143,11 +2036,6 @@ def _political_intrigue_sections() -> dict[str, str]:
         ),
         "political_factions": (
             "Guilds, Old Families, and dock unions compete for harbor control."
-        ),
-        "major_npcs": (
-            "Duchess Salen - regent who needs Mara's vote; "
-            "Guildmaster Orro - broker who owes Mara one favor; "
-            "Captain Vey - union leader testing every promise."
         ),
         "central_conflict": (
             "A midnight no-confidence vote can replace the regent and redirect "
@@ -2252,10 +2140,6 @@ def _settlement_builder_sections() -> dict[str, str]:
             "Hearthstone Landing is a timber-and-stone river town founded after "
             "the old bridge collapsed."
         ),
-        "population_and_residents": (
-            "Forty families, five orphaned apprentices, a weary miller, and two "
-            "outside masons."
-        ),
         "resources_and_indicators": (
             "Food: low. Lumber: useful. Morale: fragile. Defenses: unfinished."
         ),
@@ -2291,9 +2175,6 @@ def _monster_hunt_bounty_sections() -> dict[str, str]:
             "survivor heard bells."
         ),
         "hunt_locations": "Mill Creek, the old orchard, and the collapsed toll road.",
-        "rivals_and_factions": (
-            "A rival guild wants the bounty and the mayor wants quiet."
-        ),
         "preparation_state": "Silver wire, oil snares, two borrowed hounds, one debt.",
         "hunt_status": "Unresolved; target wounded but adapting.",
         "tone_genre": "Tense investigative wilderness hunt.",
@@ -2312,9 +2193,6 @@ def _road_trip_pilgrimage_sections() -> dict[str, str]:
         ),
         "route_and_stops": (
             "Salt road to Lantern Ford, then Crow Market, then the hill shrine."
-        ),
-        "traveling_party": (
-            "Nell, Brother Tom, Sera the driver, and two quarrelling cousins."
         ),
         "transport_and_supplies": (
             "One wagon, two mules, six days of oats, little coin."
@@ -2345,9 +2223,6 @@ def _merchant_trade_route_sections() -> dict[str, str]:
             "Deliver ten jars to Red Harbor in twelve days or double the debt."
         ),
         "route_hazards": "Tariff patrols, bridge bandits, summer storms, and rivals.",
-        "reputation_and_contacts": (
-            "Trusted by Kesh brokers; watched by Red Harbor taxmen."
-        ),
         "profit_and_loss": "Current margin is thin; one lost crate erases profit.",
         "tone_genre": "Economy-lite caravan drama with hard bargains.",
         "opening_message": "The creditor stamps the contract before the ink dries.",

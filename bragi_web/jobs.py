@@ -915,6 +915,8 @@ def _provider_task_for_job_type(job_type: str) -> str | None:
         return "video_generation"
     if job_type in {"scenario_draft", "scenario_section"}:
         return "scenario_generation"
+    if job_type == "scenario_character_starters":
+        return "context_update"
     if job_type in {"context_cleanup", "guided_context_cleanup"}:
         return "context_cleanup"
     if job_type == "summary_backfill":

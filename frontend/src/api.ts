@@ -312,6 +312,7 @@ export type ScenarioDraft = {
   regeneration_seed: string;
   source_metadata: [string, unknown][];
   action_choices_enabled?: boolean;
+  character_starters?: ScenarioCharacterStarter[];
 };
 export type ScenarioWizard = {
   flows: ScenarioWizardFlow[];

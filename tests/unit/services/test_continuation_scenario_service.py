@@ -199,7 +199,6 @@ def test_generate_draft_rejects_retired_character_interaction_hybrid(
         player_role="Player",
         content={
             "_scenario_genres": ["dating_sim", "character_interaction"],
-            "romance_options": [],
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Recovery save")

@@ -570,7 +570,7 @@ def test_extract_and_apply_turn_updates_political_intrigue_social_consequence(
         player_role="Envoy holding the swing vote",
         content={
             "political_factions": "Guilds, Old Families, and reformers.",
-            "major_npcs": "Guildmaster Orro owes Mara one favor.",
+            "factions": "Guildmaster Orro owes Mara one favor.",
             "political_pressure": "The midnight vote proceeds unless delayed.",
         },
     )

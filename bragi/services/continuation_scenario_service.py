@@ -47,7 +47,6 @@ CONTINUATION_SECTION_IDS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "tone_genre",
     "current_scene",
     "opening_message",
@@ -79,7 +78,6 @@ SURVIVAL_EXPEDITION_CONTINUATION_SECTION_IDS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -89,7 +87,6 @@ TIME_LOOP_CONTINUATION_SECTION_IDS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -97,7 +94,6 @@ INVESTIGATION_MYSTERY_CONTINUATION_SECTION_IDS = (
     *INVESTIGATION_MYSTERY_SECTIONS,
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -105,7 +101,6 @@ HEIST_INFILTRATION_CONTINUATION_SECTION_IDS = (
     *HEIST_INFILTRATION_SECTIONS,
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -115,7 +110,6 @@ POLITICAL_INTRIGUE_CONTINUATION_SECTION_IDS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -125,7 +119,6 @@ SETTLEMENT_BUILDER_CONTINUATION_SECTION_IDS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -133,7 +126,6 @@ MONSTER_HUNT_BOUNTY_CONTINUATION_SECTION_IDS = (
     *MONSTER_HUNT_BOUNTY_SECTIONS,
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -143,7 +135,6 @@ ROAD_TRIP_PILGRIMAGE_CONTINUATION_SECTION_IDS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -153,7 +144,6 @@ MERCHANT_TRADE_ROUTE_CONTINUATION_SECTION_IDS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 

@@ -11802,7 +11802,6 @@ describe("frontend helpers", () => {
       player_role: "Keeper",
       player_character_name: "Mara",
       player_character_profile: "",
-      romance_options: "",
       magic_system: "",
       realms_and_places: "",
       factions_and_orders: "",
@@ -11814,7 +11813,6 @@ describe("frontend helpers", () => {
       factions_and_institutions: "",
       mission_stakes: "",
       mission_profile: "",
-      crew_and_command: "",
       ship_or_base_status: "",
       exploration_target: "",
       unknown_intelligence: "",
@@ -11824,7 +11822,6 @@ describe("frontend helpers", () => {
       hazards_and_escalation: "",
       expedition_goal: "",
       route_options: "",
-      party_roster: "",
       resource_inventory: "",
       environmental_conditions: "",
       hazards_and_events: "",
@@ -11843,7 +11840,6 @@ describe("frontend helpers", () => {
       npc_memory_rules: "",
       current_loop_state: "",
       case_facts: "",
-      suspects: "",
       clues: "",
       timeline: "",
       red_herrings: "",
@@ -11851,7 +11847,6 @@ describe("frontend helpers", () => {
       case_status: "",
       target_location: "",
       objectives_and_stakes: "",
-      crew_and_contacts: "",
       intel_and_access: "",
       security_model: "",
       alert_and_heat: "",
@@ -11861,7 +11856,6 @@ describe("frontend helpers", () => {
       aftermath: "",
       political_arena: "",
       political_factions: "",
-      major_npcs: "",
       central_conflict: "",
       secrets_and_leverage: "",
       reputation_and_standing: "",
@@ -11871,7 +11865,6 @@ describe("frontend helpers", () => {
       political_pressure: "",
       public_private_knowledge: "",
       settlement_profile: "",
-      population_and_residents: "",
       resources_and_indicators: "",
       projects_and_facilities: "",
       threats_and_opportunities: "",
@@ -11880,12 +11873,10 @@ describe("frontend helpers", () => {
       target_profile: "",
       leads_and_clues: "",
       hunt_locations: "",
-      rivals_and_factions: "",
       preparation_state: "",
       hunt_status: "",
       journey_profile: "",
       route_and_stops: "",
-      traveling_party: "",
       transport_and_supplies: "",
       recurring_pressures: "",
       relationship_threads: "",
@@ -11895,7 +11886,6 @@ describe("frontend helpers", () => {
       markets_and_stops: "",
       contracts_and_debts: "",
       route_hazards: "",
-      reputation_and_contacts: "",
       profit_and_loss: "",
       tone_genre: "",
       choice_style: "",
@@ -11940,7 +11930,8 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Premise"), "A diplomatic station turns courtship into first contact.");
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Envoy-pilot");
     await userEvent.type(within(dialog).getByLabelText("Technology Level"), "Near-future orbital habitat and alien translators.");
-    await userEvent.type(within(dialog).getByLabelText("Romance Options"), "A xenolinguist, station marshal, and visiting envoy.");
+    await userEvent.type(within(dialog).getByLabelText("Player Character Profile"), "Mara is a translator trained for tense receptions.");
+    expect(within(dialog).queryByLabelText("Romance Options")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Opening Message"), "The airlock opens on the first reception.");
     await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
 
@@ -11953,7 +11944,7 @@ describe("frontend helpers", () => {
       premise: "A diplomatic station turns courtship into first contact.",
       player_role: "Envoy-pilot",
       technology_level: "Near-future orbital habitat and alien translators.",
-      romance_options: "A xenolinguist, station marshal, and visiting envoy.",
+      player_character_profile: "Mara is a translator trained for tense receptions.",
       opening_message: "The airlock opens on the first reception."
     });
     expect(onRuntimeChanged).toHaveBeenCalledWith(expect.objectContaining({
@@ -11990,7 +11981,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Premise"), "A curator vanishes during a gala.");
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Lead investigator");
     await userEvent.type(within(dialog).getByLabelText("Case Facts"), "The east gallery was sealed.");
-    await userEvent.type(within(dialog).getByLabelText("Suspects"), "Sera Holt has a false alibi.");
+    expect(within(dialog).queryByLabelText("Suspects")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Clues"), "The watch log skips eight minutes.");
     await userEvent.type(within(dialog).getByLabelText("Timeline"), "Public alarm at 9:21; hidden lift movement at 9:12.");
     await userEvent.type(within(dialog).getByLabelText("Red Herrings"), "The bloody glove is from a mannequin.");
@@ -12007,7 +11998,6 @@ describe("frontend helpers", () => {
       premise: "A curator vanishes during a gala.",
       player_role: "Lead investigator",
       case_facts: "The east gallery was sealed.",
-      suspects: "Sera Holt has a false alibi.",
       clues: "The watch log skips eight minutes.",
       timeline: "Public alarm at 9:21; hidden lift movement at 9:12.",
       red_herrings: "The bloody glove is from a mannequin.",
@@ -12050,7 +12040,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Crew planner");
     await userEvent.type(within(dialog).getByLabelText("Target Location"), "Skybank vault above the storm moorings.");
     await userEvent.type(within(dialog).getByLabelText("Objectives And Stakes"), "Recover the treaty and avoid war.");
-    await userEvent.type(within(dialog).getByLabelText("Crew And Contacts"), "Tavi runs locks; Venn is the inside clerk.");
+    expect(within(dialog).queryByLabelText("Crew And Contacts")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Intel And Access"), "Guard shift changes at bell three.");
     await userEvent.type(within(dialog).getByLabelText("Security Model"), "Clockwork cameras and a silent alarm.");
     await userEvent.type(within(dialog).getByLabelText("Alert And Heat"), "Suspicion low; alarm inactive.");
@@ -12070,7 +12060,6 @@ describe("frontend helpers", () => {
       player_role: "Crew planner",
       target_location: "Skybank vault above the storm moorings.",
       objectives_and_stakes: "Recover the treaty and avoid war.",
-      crew_and_contacts: "Tavi runs locks; Venn is the inside clerk.",
       intel_and_access: "Guard shift changes at bell three.",
       security_model: "Clockwork cameras and a silent alarm.",
       alert_and_heat: "Suspicion low; alarm inactive.",
@@ -12115,7 +12104,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Swing-vote envoy");
     await userEvent.type(within(dialog).getByLabelText("Political Arena"), "Harbor council chamber and public galleries.");
     await userEvent.type(within(dialog).getByLabelText("Political Factions"), "Guilds, Old Families, and dock unions.");
-    await userEvent.type(within(dialog).getByLabelText("Major Npcs"), "Duchess Salen needs Mara's vote; Orro owes a favor.");
+    expect(within(dialog).queryByLabelText("Major Npcs")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Central Conflict"), "A midnight vote can replace the regent.");
     await userEvent.type(within(dialog).getByLabelText("Secrets And Leverage"), "Only Mara knows Orro moved missing silver.");
     await userEvent.type(within(dialog).getByLabelText("Reputation And Standing"), "Mara is trusted by reformers.");
@@ -12136,7 +12125,6 @@ describe("frontend helpers", () => {
       player_role: "Swing-vote envoy",
       political_arena: "Harbor council chamber and public galleries.",
       political_factions: "Guilds, Old Families, and dock unions.",
-      major_npcs: "Duchess Salen needs Mara's vote; Orro owes a favor.",
       central_conflict: "A midnight vote can replace the regent.",
       secrets_and_leverage: "Only Mara knows Orro moved missing silver.",
       reputation_and_standing: "Mara is trusted by reformers.",
@@ -12181,7 +12169,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Premise"), "A survey crew finds patterned signals under the ice.");
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Mission linguist");
     await userEvent.type(within(dialog).getByLabelText("Mission Profile"), "Survey the hidden ocean.");
-    await userEvent.type(within(dialog).getByLabelText("Crew And Command"), "Commander Reyes leads the mission.");
+    expect(within(dialog).queryByLabelText("Crew And Command")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Ship Or Base Status"), "Habitat heat is stable for 42 hours.");
     await userEvent.type(within(dialog).getByLabelText("Exploration Target"), "A black-water cavern beneath the ice.");
     await userEvent.type(within(dialog).getByLabelText("Unknown Intelligence"), "An unseen singer answers sonar.");
@@ -12200,7 +12188,6 @@ describe("frontend helpers", () => {
       premise: "A survey crew finds patterned signals under the ice.",
       player_role: "Mission linguist",
       mission_profile: "Survey the hidden ocean.",
-      crew_and_command: "Commander Reyes leads the mission.",
       ship_or_base_status: "Habitat heat is stable for 42 hours.",
       exploration_target: "A black-water cavern beneath the ice.",
       unknown_intelligence: "An unseen singer answers sonar.",
@@ -12245,7 +12232,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Player Role"), "Expedition lead");
     await userEvent.type(within(dialog).getByLabelText("Expedition Goal"), "Reach Northwatch before the fever spreads.");
     await userEvent.type(within(dialog).getByLabelText("Route Options"), "Cliff road is faster; forest route has fuel.");
-    await userEvent.type(within(dialog).getByLabelText("Party Roster"), "Mara guides two scouts and a medic.");
+    expect(within(dialog).queryByLabelText("Party Roster")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Resource Inventory"), "Food for nine days; medicine for three patients.");
     await userEvent.type(within(dialog).getByLabelText("Environmental Conditions"), "Late winter whiteout with ice-glazed slopes.");
     await userEvent.type(within(dialog).getByLabelText("Hazards And Events"), "Avalanches, frostbite, and wolf sign.");
@@ -12264,7 +12251,6 @@ describe("frontend helpers", () => {
       player_role: "Expedition lead",
       expedition_goal: "Reach Northwatch before the fever spreads.",
       route_options: "Cliff road is faster; forest route has fuel.",
-      party_roster: "Mara guides two scouts and a medic.",
       resource_inventory: "Food for nine days; medicine for three patients.",
       environmental_conditions: "Late winter whiteout with ice-glazed slopes.",
       hazards_and_events: "Avalanches, frostbite, and wolf sign.",
@@ -12311,7 +12297,7 @@ describe("frontend helpers", () => {
     await userEvent.type(within(dialog).getByLabelText("Markets And Stops"), "Red Harbor needs oil.");
     await userEvent.type(within(dialog).getByLabelText("Contracts And Debts"), "Deliver ten jars in twelve days.");
     await userEvent.type(within(dialog).getByLabelText("Route Hazards"), "Tariff patrols and bridge bandits.");
-    await userEvent.type(within(dialog).getByLabelText("Reputation And Contacts"), "Trusted by Kesh brokers.");
+    expect(within(dialog).queryByLabelText("Reputation And Contacts")).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Profit And Loss"), "One lost crate erases profit.");
     await userEvent.type(within(dialog).getByLabelText("Opening Message"), "The creditor stamps the contract.");
     await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
@@ -12328,7 +12314,6 @@ describe("frontend helpers", () => {
       markets_and_stops: "Red Harbor needs oil.",
       contracts_and_debts: "Deliver ten jars in twelve days.",
       route_hazards: "Tariff patrols and bridge bandits.",
-      reputation_and_contacts: "Trusted by Kesh brokers.",
       profit_and_loss: "One lost crate erases profit.",
       opening_message: "The creditor stamps the contract."
     });
@@ -12498,7 +12483,28 @@ describe("frontend helpers", () => {
         ["premise", "Old premise"],
         ["player_character_name", "Mara"],
         ["player_role", "Keeper"]
-      ] as [string, string][]
+      ] as [string, string][],
+      character_starters: [
+        {
+          name: "Old Starter",
+          aliases: [],
+          role: "Should be replaced",
+          age: "",
+          known_state: "",
+          appearance: "",
+          visual_notes: "",
+          personality: "",
+          voice: "",
+          texting_style: "",
+          relationships: {},
+          goals: "",
+          motivations: "",
+          boundaries: "",
+          status: "",
+          met: true,
+          locked_fields: []
+        }
+      ]
     };
     const newDraft = {
       scenario_type: "full_roleplay",
@@ -12540,7 +12546,11 @@ describe("frontend helpers", () => {
       ),
       "new idea",
     );
-    await userEvent.click(screen.getByRole("button", { name: "Generate" }));
+    const draftGenerateButton = screen
+      .getAllByRole("button", { name: "Generate" })
+      .find((button) => !button.closest(".scenario-starter-generation"));
+    expect(draftGenerateButton).toBeDefined();
+    await userEvent.click(draftGenerateButton as HTMLElement);
 
     await waitFor(() => expect(sources).toHaveLength(1));
     act(() => {
@@ -12559,6 +12569,8 @@ describe("frontend helpers", () => {
     });
 
     await waitFor(() => expect(screen.getByLabelText("Title")).toHaveValue("New Draft"));
+    expect(screen.queryByLabelText("Draft starter Old Starter role")).not.toBeInTheDocument();
+    expect(screen.getByText("No character starters")).toBeInTheDocument();
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /save draft/i }));
 
@@ -12827,6 +12839,308 @@ describe("frontend helpers", () => {
     await waitFor(() => expect(screen.getByLabelText("Premise")).toHaveValue("Fresh premise"));
   });
 
+  it("generates and saves editable scenario draft character starters", async () => {
+    const sources = installEventSourceDouble();
+    const draft: ScenarioDraft = {
+      scenario_type: "full_roleplay",
+      scenario_types: ["full_roleplay", "investigation_mystery"],
+      action_choices_enabled: true,
+      regeneration_seed: "fog seed",
+      source_metadata: [],
+      sections: [
+        ["title", "Fog Gate"],
+        ["premise", "Old premise"]
+      ],
+      character_starters: [
+        {
+          name: "Mara Voss",
+          aliases: ["Mara"],
+          role: "Scout",
+          age: "",
+          known_state: "",
+          appearance: "",
+          visual_notes: "",
+          personality: "",
+          voice: "",
+          texting_style: "",
+          relationships: { Ren: "ally" },
+          goals: "",
+          motivations: "",
+          boundaries: "",
+          status: "",
+          met: true,
+          locked_fields: []
+        }
+      ]
+    };
+    const generatedDraft: ScenarioDraft = {
+      ...draft,
+      character_starters: [
+        ...(draft.character_starters ?? []),
+        {
+          name: "Ivo Hale",
+          aliases: [],
+          role: "Archivist",
+          age: "",
+          known_state: "",
+          appearance: "",
+          visual_notes: "",
+          personality: "",
+          voice: "",
+          texting_style: "",
+          relationships: { Mara: "client" },
+          goals: "",
+          motivations: "",
+          boundaries: "",
+          status: "",
+          met: false,
+          locked_fields: []
+        }
+      ]
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => {
+        if (path === "/api/scenarios/draft/character-starters/generate") {
+          return { id: "job-starters", type: "scenario_character_starters", status: "queued", result: null, error: null };
+        }
+        if (path === "/api/scenarios/draft/save") return runtimeModel({ active_save_id: "save-1" });
+        return {};
+      }
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel({ scenario_draft: draft })} initialMode="draft" onClose={vi.fn()} onRuntimeChanged={vi.fn()} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    const countInput = screen.getByLabelText("Number of Characters to generate") as HTMLInputElement;
+    expect(countInput.value).toBe("");
+    expect(screen.getByLabelText("Custom character description")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Upload Mara Voss reference image file")).not.toBeInTheDocument();
+    await userEvent.type(countInput, "1");
+    const starterGeneration = countInput.closest(".scenario-starter-generation");
+    expect(starterGeneration).not.toBeNull();
+    await userEvent.click(within(starterGeneration as HTMLElement).getByRole("button", { name: "Generate" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/scenarios/draft/character-starters/generate", expect.anything()));
+    const generateCall = fetchMock.mock.calls.find(([path]) => path === "/api/scenarios/draft/character-starters/generate");
+    expect(JSON.parse(String(generateCall?.[1].body))).toMatchObject({
+      scenario_type: "full_roleplay",
+      scenario_types: ["full_roleplay", "investigation_mystery"],
+      action_choices_enabled: true,
+      sections: {
+        title: "Fog Gate",
+        premise: "Old premise"
+      },
+      character_starters: [
+        expect.objectContaining({
+          name: "Mara Voss",
+          aliases: ["Mara"],
+          role: "Scout",
+          relationships: { Ren: "ally" },
+          met: true
+        })
+      ],
+      count: 1,
+      custom_description: ""
+    });
+
+    fireEvent.change(screen.getByLabelText("Premise"), {
+      target: { value: "Edited while starter generation runs" }
+    });
+    await waitFor(() => expect(sources).toHaveLength(1));
+    act(() => {
+      sources[0].dispatch("done", {
+        id: "job-starters",
+        type: "scenario_character_starters",
+        status: "succeeded",
+        result: runtimeModel({ scenario_draft: generatedDraft }),
+        error: null
+      });
+    });
+
+    await waitFor(() => expect(screen.getByLabelText("Draft starter Ivo Hale role")).toHaveValue("Archivist"));
+    expect(screen.getByLabelText("Premise")).toHaveValue("Edited while starter generation runs");
+    fireEvent.change(screen.getByLabelText("Draft starter Ivo Hale role"), {
+      target: { value: "Reluctant archivist" }
+    });
+    await userEvent.click(screen.getByRole("button", { name: /save draft/i }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/scenarios/draft/save", expect.anything()));
+    const saveCall = fetchMock.mock.calls.find(([path]) => path === "/api/scenarios/draft/save");
+    expect(JSON.parse(String(saveCall?.[1].body))).toMatchObject({
+      scenario_type: "full_roleplay",
+      scenario_types: ["full_roleplay", "investigation_mystery"],
+      sections: {
+        title: "Fog Gate",
+        premise: "Edited while starter generation runs"
+      },
+      character_starters: [
+        expect.objectContaining({
+          name: "Mara Voss",
+          role: "Scout"
+        }),
+        expect.objectContaining({
+          name: "Ivo Hale",
+          role: "Reluctant archivist",
+          relationships: { Mara: "client" },
+          met: false
+        })
+      ]
+    });
+  });
+
+  it("keeps draft starter and section generation watchers independent", async () => {
+    const sources = installEventSourceDouble();
+    const draft: ScenarioDraft = {
+      scenario_type: "full_roleplay",
+      regeneration_seed: "fog seed",
+      source_metadata: [],
+      sections: [
+        ["title", "Fog Gate"],
+        ["premise", "Old premise"]
+      ],
+      character_starters: []
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => {
+        if (path === "/api/scenarios/draft/character-starters/generate") {
+          return { id: "job-starters", type: "scenario_character_starters", status: "queued", result: null, error: null };
+        }
+        if (path === "/api/scenarios/draft/section") {
+          return { id: "job-section", type: "scenario_section", status: "queued", result: null, error: null };
+        }
+        return {};
+      }
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel({ scenario_draft: draft })} initialMode="draft" onClose={vi.fn()} onRuntimeChanged={vi.fn()} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    const countInput = screen.getByLabelText("Number of Characters to generate") as HTMLInputElement;
+    await userEvent.type(countInput, "1");
+    const starterGeneration = countInput.closest(".scenario-starter-generation");
+    expect(starterGeneration).not.toBeNull();
+    await userEvent.click(within(starterGeneration as HTMLElement).getByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    const premiseRow = screen.getByLabelText("Premise").closest("label");
+    expect(premiseRow).not.toBeNull();
+    await userEvent.click(within(premiseRow as HTMLElement).getByRole("button", { name: /regenerate/i }));
+    await waitFor(() => expect(sources).toHaveLength(2));
+    expect(sources[0].closed).toBe(false);
+    expect(sources[1].closed).toBe(false);
+
+    act(() => {
+      sources[0].dispatch("done", {
+        id: "job-starters",
+        type: "scenario_character_starters",
+        status: "succeeded",
+        result: runtimeModel({
+          scenario_draft: {
+            ...draft,
+            character_starters: [
+              {
+                name: "Ivo Hale",
+                aliases: [],
+                role: "Archivist",
+                age: "",
+                known_state: "",
+                appearance: "",
+                visual_notes: "",
+                personality: "",
+                voice: "",
+                texting_style: "",
+                relationships: {},
+                goals: "",
+                motivations: "",
+                boundaries: "",
+                status: "",
+                met: true,
+                locked_fields: []
+              }
+            ]
+          }
+        }),
+        error: null
+      });
+      sources[1].dispatch("done", {
+        id: "job-section",
+        type: "scenario_section",
+        status: "succeeded",
+        result: {
+          scenario_draft: {
+            sections: [
+              ["title", "Fog Gate"],
+              ["premise", "Fresh premise"]
+            ]
+          }
+        },
+        error: null
+      });
+    });
+
+    await waitFor(() => expect(screen.getByLabelText("Draft starter Ivo Hale role")).toHaveValue("Archivist"));
+    expect(screen.getByLabelText("Premise")).toHaveValue("Fresh premise");
+  });
+
+  it("surfaces draft starter generation runtime errors", async () => {
+    const sources = installEventSourceDouble();
+    const draft: ScenarioDraft = {
+      scenario_type: "full_roleplay",
+      regeneration_seed: "fog seed",
+      source_metadata: [],
+      sections: [
+        ["title", "Fog Gate"],
+        ["premise", "Old premise"]
+      ],
+      character_starters: []
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => path === "/api/scenarios/draft/character-starters/generate"
+        ? { id: "job-starters", type: "scenario_character_starters", status: "queued", result: null, error: null }
+        : {}
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel({ scenario_draft: draft })} initialMode="draft" onClose={vi.fn()} onRuntimeChanged={vi.fn()} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    const countInput = screen.getByLabelText("Number of Characters to generate") as HTMLInputElement;
+    await userEvent.type(countInput, "1");
+    const starterGeneration = countInput.closest(".scenario-starter-generation");
+    expect(starterGeneration).not.toBeNull();
+    await userEvent.click(within(starterGeneration as HTMLElement).getByRole("button", { name: "Generate" }));
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    act(() => {
+      sources[0].dispatch("done", {
+        id: "job-starters",
+        type: "scenario_character_starters",
+        status: "succeeded",
+        result: runtimeModel({ error: "No context update model preference configured" }),
+        error: null
+      });
+    });
+
+    expect(await screen.findByText("No context update model preference configured")).toBeInTheDocument();
+  });
+
   it("surfaces scenario section regeneration failures", async () => {
     const sources = installEventSourceDouble();
     const draft: ScenarioDraft = {
@@ -12978,7 +13292,7 @@ describe("frontend helpers", () => {
         ["player_role", "Harbor warden"],
         ["tone_genre", "Nautical noir"],
         ["current_scene", "Mara is negotiating under the quay."],
-        ["characters", "Mara keeps her clipped voice and debt to Ren."],
+        ["scene_notes", "Mara keeps her clipped voice and debt to Ren."],
         ["opening_message", "The bell tolls once."]
       ] as [string, string][]
     };
@@ -12997,7 +13311,7 @@ describe("frontend helpers", () => {
 
     expect(screen.getByText("Continuity")).toBeInTheDocument();
     expect(screen.getByLabelText("Current Scene")).toHaveValue("Mara is negotiating under the quay.");
-    expect(screen.getByLabelText("Characters")).toHaveValue("Mara keeps her clipped voice and debt to Ren.");
+    expect(screen.getByLabelText("Scene Notes")).toHaveValue("Mara keeps her clipped voice and debt to Ren.");
     await userEvent.clear(screen.getByLabelText("Current Scene"));
     await userEvent.type(screen.getByLabelText("Current Scene"), "Mara stands before the opened bell.");
     await userEvent.click(screen.getByRole("button", { name: /save draft/i }));
@@ -13007,7 +13321,7 @@ describe("frontend helpers", () => {
     expect(JSON.parse(String(saveCall?.[1].body))).toMatchObject({
       sections: {
         current_scene: "Mara stands before the opened bell.",
-        characters: "Mara keeps her clipped voice and debt to Ren."
+        scene_notes: "Mara keeps her clipped voice and debt to Ren."
       },
       source_metadata: { origin: "save_continuation" }
     });

@@ -3799,7 +3799,6 @@ def test_submit_player_turn_keeps_dating_route_anchor_after_setup_ages_out(
         player_role="Transfer student",
         content={
             "player_character_name": "Lio Takahashi",
-            "romance_options": "Mika Arai is a romance option.",
             "current_scene": "Lio and Mika talk after the festival.",
         },
     )

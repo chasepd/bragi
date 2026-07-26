@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import zipfile
@@ -927,6 +928,86 @@ def test_dirty_head_capture_tracks_message_body_edits_without_context_change(
     service.restore_save_to_snapshot(save_id=save.id, snapshot_id=edited.id)
 
     assert repositories.list_messages(save.id)[0].body == "I polish the lens."
+
+
+def test_restore_snapshot_strips_deprecated_scenario_update_sections(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    legacy_content: dict[str, object] = {
+        "opening_message": "The red lens wakes.",
+        "factions": "Beacon wardens",
+        "rivals_and_factions": "Ash riders scout the ridge.",
+        "reputation_and_contacts": "The old patrol owes Mara a warning.",
+        "major_npcs": "Captain Rell guards the cracked stair.",
+    }
+    update = repositories.add_save_scenario_update(
+        save_id=save.id,
+        title="Ashfall Keep: Red Lens",
+        premise="A red warning has reached the isolated border keep.",
+        player_role="Signal warden",
+        content=legacy_content,
+        reason="Legacy snapshot fixture.",
+        provider="fake-chat-provider",
+        model="fake-chat-model",
+    )
+    service = TurnSnapshotService(repositories)
+    snapshot = service.capture_baseline_snapshot(save.id)
+    manifest = service._snapshot_manifest(snapshot)  # noqa: SLF001 - legacy fixture
+    tables = manifest["tables"]
+    assert isinstance(tables, dict)
+    update_entries = tables["save_scenario_updates"]
+    assert isinstance(update_entries, list)
+    [update_entry] = update_entries
+    assert isinstance(update_entry, dict)
+    row = repositories.connection.execute(
+        "SELECT * FROM save_scenario_updates WHERE id = ?",
+        (update.id,),
+    ).fetchone()
+    legacy_row = dict(row)
+    legacy_row["content_json"] = json.dumps(legacy_content, sort_keys=True)
+    update_entry["object_hash"] = service._store_object(  # noqa: SLF001 - fixture
+        kind="row:save_scenario_updates",
+        value=legacy_row,
+    )
+    legacy_manifest_hash = service._store_object(  # noqa: SLF001 - fixture
+        kind="snapshot_manifest",
+        value=manifest,
+    )
+    repositories.connection.execute(
+        "UPDATE save_turn_snapshots SET root_manifest_hash = ? WHERE id = ?",
+        (legacy_manifest_hash, snapshot.id),
+    )
+    repositories.connection.execute(
+        "UPDATE save_scenario_updates SET content_json = ? WHERE id = ?",
+        (json.dumps({"factions": "Current wardens"}, sort_keys=True), update.id),
+    )
+    repositories.commit()
+    _snapshot_rows, snapshot_objects = service.export_snapshot_rows(
+        save_id=save.id,
+        active_message_ids=(),
+    )
+    exported_payloads = "\n".join(
+        zlib.decompress(base64.b64decode(str(row["payload_base64"]))).decode("utf-8")
+        for row in snapshot_objects
+    )
+    assert "rivals_and_factions" not in exported_payloads
+    assert "reputation_and_contacts" not in exported_payloads
+    assert "major_npcs" not in exported_payloads
+    assert "Ash riders scout the ridge." in exported_payloads
+
+    service.restore_save_to_snapshot(save_id=save.id, snapshot_id=snapshot.id)
+
+    [restored] = repositories.list_save_scenario_updates(save.id)
+    restored_content = json.loads(restored.content_json)
+    assert restored_content["factions"] == (
+        "Beacon wardens\n\n"
+        "Ash riders scout the ridge.\n\n"
+        "The old patrol owes Mara a warning."
+    )
+    assert "rivals_and_factions" not in restored_content
+    assert "reputation_and_contacts" not in restored_content
+    assert "major_npcs" not in restored_content
 
 
 def test_export_import_preserves_snapshot_backed_fork(

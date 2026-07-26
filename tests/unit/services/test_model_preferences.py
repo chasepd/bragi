@@ -170,10 +170,6 @@ def test_scenario_generation_section_model_task_maps_supported_sections() -> Non
         == "scenario_generation_section_player_character_profile"
     )
     assert (
-        scenario_generation_section_model_task("romance_options")
-        == "scenario_generation_section_romance_options"
-    )
-    assert (
         scenario_generation_section_model_task("choice_style")
         == "scenario_generation_section_choice_style"
     )
@@ -199,6 +195,8 @@ def test_scenario_generation_section_model_task_maps_supported_sections() -> Non
     )
     with pytest.raises(ValueError):
         scenario_generation_section_model_task("unknown_section")
+    with pytest.raises(ValueError):
+        scenario_generation_section_model_task("romance_options")
 
 
 def test_roleplay_model_preference_defaults_to_shared_base_tasks(

@@ -110,7 +110,6 @@ def test_wizard_model_exposes_editable_sections_for_each_flow(
         "player_character_name",
         "player_role",
         "mission_profile",
-        "crew_and_command",
         "ship_or_base_status",
         "exploration_target",
         "unknown_intelligence",
@@ -128,7 +127,6 @@ def test_wizard_model_exposes_editable_sections_for_each_flow(
         "player_role",
         "expedition_goal",
         "route_options",
-        "party_roster",
         "resource_inventory",
         "environmental_conditions",
         "hazards_and_events",
@@ -163,7 +161,6 @@ def test_wizard_model_exposes_editable_sections_for_each_flow(
         "player_character_name",
         "player_role",
         "case_facts",
-        "suspects",
         "clues",
         "timeline",
         "red_herrings",
@@ -179,7 +176,6 @@ def test_wizard_model_exposes_editable_sections_for_each_flow(
         "player_role",
         "target_location",
         "objectives_and_stakes",
-        "crew_and_contacts",
         "intel_and_access",
         "security_model",
         "alert_and_heat",
@@ -197,7 +193,6 @@ def test_wizard_model_exposes_editable_sections_for_each_flow(
         "player_role",
         "political_arena",
         "political_factions",
-        "major_npcs",
         "central_conflict",
         "secrets_and_leverage",
         "reputation_and_standing",
@@ -215,7 +210,6 @@ def test_wizard_model_exposes_editable_sections_for_each_flow(
         "player_character_name",
         "player_role",
         "settlement_profile",
-        "population_and_residents",
         "resources_and_indicators",
         "projects_and_facilities",
         "threats_and_opportunities",
@@ -232,7 +226,6 @@ def test_wizard_model_exposes_editable_sections_for_each_flow(
         "target_profile",
         "leads_and_clues",
         "hunt_locations",
-        "rivals_and_factions",
         "preparation_state",
         "hunt_status",
         "tone_genre",
@@ -245,7 +238,6 @@ def test_wizard_model_exposes_editable_sections_for_each_flow(
         "player_role",
         "journey_profile",
         "route_and_stops",
-        "traveling_party",
         "transport_and_supplies",
         "recurring_pressures",
         "relationship_threads",
@@ -263,7 +255,6 @@ def test_wizard_model_exposes_editable_sections_for_each_flow(
         "markets_and_stops",
         "contracts_and_debts",
         "route_hazards",
-        "reputation_and_contacts",
         "profit_and_loss",
         "tone_genre",
         "opening_message",
@@ -274,7 +265,6 @@ def test_wizard_model_exposes_editable_sections_for_each_flow(
         "player_character_name",
         "player_character_profile",
         "player_role",
-        "romance_options",
         "tone_genre",
         "opening_message",
     ]
@@ -341,11 +331,7 @@ def test_wizard_model_exposes_guided_seed_and_review_metadata_without_gtk(
     assert "hazards" in first_contact_seed
     assert _review_groups(first_contact) == {
         "Core": ["title", "premise", "player_character_name", "player_role"],
-        "Mission": [
-            "mission_profile",
-            "crew_and_command",
-            "ship_or_base_status",
-        ],
+        "Mission": ["mission_profile", "ship_or_base_status"],
         "Discovery": [
             "exploration_target",
             "knowledge_state",
@@ -365,7 +351,7 @@ def test_wizard_model_exposes_guided_seed_and_review_metadata_without_gtk(
     assert _review_groups(survival) == {
         "Core": ["title", "premise", "player_character_name", "player_role"],
         "Expedition": ["expedition_goal", "route_options", "travel_progress"],
-        "Party & Supplies": ["party_roster", "resource_inventory"],
+        "Supplies": ["resource_inventory"],
         "Conditions": [
             "environmental_conditions",
             "hazards_and_events",
@@ -402,11 +388,11 @@ def test_wizard_model_exposes_guided_seed_and_review_metadata_without_gtk(
     mystery_seed = _seed_prompt(mystery).casefold()
     assert "mystery" in mystery_seed
     assert "clues" in mystery_seed
-    assert "suspects" in mystery_seed
+    assert "timeline" in mystery_seed
     assert "hidden truth" in mystery_seed
     assert _review_groups(mystery) == {
         "Core": ["title", "premise", "player_character_name", "player_role"],
-        "Case": ["case_facts", "suspects", "case_status"],
+        "Case": ["case_facts", "case_status"],
         "Evidence": ["clues", "timeline", "red_herrings", "hidden_truth"],
         "Opening": ["tone_genre", "opening_message"],
     }
@@ -422,7 +408,7 @@ def test_wizard_model_exposes_guided_seed_and_review_metadata_without_gtk(
             "target_location",
             "objectives_and_stakes",
         ],
-        "Crew & Intel": ["crew_and_contacts", "intel_and_access"],
+        "Intel": ["intel_and_access"],
         "Security": ["security_model", "alert_and_heat"],
         "Tools & Complications": ["loadout_and_tools", "complications"],
         "Exit & Consequences": ["extraction_routes", "aftermath"],
@@ -437,9 +423,8 @@ def test_wizard_model_exposes_guided_seed_and_review_metadata_without_gtk(
     assert _review_groups(intrigue) == {
         "Core": ["title", "premise", "player_character_name", "player_role"],
         "Arena": ["political_arena", "central_conflict"],
-        "Factions & NPCs": [
+        "Factions": [
             "political_factions",
-            "major_npcs",
             "alliances_and_rivalries",
         ],
         "Leverage": [
@@ -462,7 +447,7 @@ def test_wizard_model_exposes_guided_seed_and_review_metadata_without_gtk(
     assert "resources" in settlement_seed
     assert _review_groups(settlement) == {
         "Core": ["title", "premise", "player_character_name", "player_role"],
-        "Community": ["settlement_profile", "population_and_residents"],
+        "Community": ["settlement_profile"],
         "Operations": ["resources_and_indicators", "projects_and_facilities"],
         "Pressure": ["threats_and_opportunities", "calendar_and_deadlines"],
         "Opening": ["tone_genre", "opening_message"],
@@ -477,7 +462,7 @@ def test_wizard_model_exposes_guided_seed_and_review_metadata_without_gtk(
         "Core": ["title", "premise", "player_character_name", "player_role"],
         "Hunt": ["hunt_profile", "target_profile", "hunt_status"],
         "Investigation": ["leads_and_clues", "hunt_locations"],
-        "Pressure": ["rivals_and_factions", "preparation_state"],
+        "Pressure": ["preparation_state"],
         "Opening": ["tone_genre", "opening_message"],
     }
 
@@ -489,7 +474,7 @@ def test_wizard_model_exposes_guided_seed_and_review_metadata_without_gtk(
     assert _review_groups(journey) == {
         "Core": ["title", "premise", "player_character_name", "player_role"],
         "Journey": ["journey_profile", "route_and_stops", "journey_progress"],
-        "Party": ["traveling_party", "relationship_threads"],
+        "Relationship Threads": ["relationship_threads"],
         "Road Pressure": ["transport_and_supplies", "recurring_pressures"],
         "Opening": ["tone_genre", "opening_message"],
     }
@@ -505,7 +490,6 @@ def test_wizard_model_exposes_guided_seed_and_review_metadata_without_gtk(
         "Cargo & Contracts": ["cargo_inventory", "contracts_and_debts"],
         "Risk & Standing": [
             "route_hazards",
-            "reputation_and_contacts",
             "profit_and_loss",
         ],
         "Opening": ["tone_genre", "opening_message"],
@@ -514,8 +498,7 @@ def test_wizard_model_exposes_guided_seed_and_review_metadata_without_gtk(
     dating_sim = flows["dating_sim"]
     dating_seed = _seed_prompt(dating_sim).casefold()
     assert "player character" in dating_seed
-    assert "romance option" in dating_seed
-    assert "four" in dating_seed
+    assert "dating sim premise" in dating_seed
     assert _review_groups(dating_sim) == {
         "Core": [
             "title",
@@ -524,7 +507,6 @@ def test_wizard_model_exposes_guided_seed_and_review_metadata_without_gtk(
             "player_character_profile",
             "player_role",
         ],
-        "Romance Options": ["romance_options"],
         "Opening": ["tone_genre", "opening_message"],
     }
 
