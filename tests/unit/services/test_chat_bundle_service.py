@@ -151,6 +151,59 @@ def test_export_save_writes_manifest_data_and_referenced_media(
         )
 
 
+def test_export_save_uses_consistent_read_snapshot(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    database_path = _repository_database_path(repositories)
+    repositories.connection.execute("PRAGMA journal_mode=WAL")
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    writer_connection = sqlite3.connect(database_path, timeout=5)
+    writer = PersistenceRepositories(writer_connection)
+    inserted_concurrent_thread = False
+
+    def insert_concurrent_thread() -> None:
+        nonlocal inserted_concurrent_thread
+        if inserted_concurrent_thread:
+            return
+        inserted_concurrent_thread = True
+        writer.add_active_thread(
+            thread_id="thread-concurrent-write",
+            save_id=save.id,
+            title="Concurrent warning",
+            description="This thread was committed after export started.",
+            priority=50,
+        )
+
+    def trace_export_query(statement: str) -> None:
+        if "FROM active_threads" in statement:
+            insert_concurrent_thread()
+
+    bundle_path = tmp_path / "exports" / "night-watch-snapshot.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    repositories.connection.set_trace_callback(trace_export_query)
+    try:
+        service.export_save(save.id, bundle_path)
+    finally:
+        repositories.connection.set_trace_callback(None)
+        writer_connection.close()
+
+    assert inserted_concurrent_thread
+    with zipfile.ZipFile(bundle_path) as bundle:
+        data = json.loads(bundle.read("data.json"))
+    assert isinstance(data, dict)
+    active_threads = data["active_threads"]
+    assert isinstance(active_threads, list)
+    assert all(
+        not isinstance(row, dict) or row.get("id") != "thread-concurrent-write"
+        for row in active_threads
+    )
+
+    persisted_thread = repositories.get_active_thread("thread-concurrent-write")
+    assert persisted_thread is not None
+
+
 def test_export_import_preserves_message_safety_transition(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -1983,7 +2036,7 @@ def test_preview_import_reads_manifest_without_loading_oversized_data_json(
     )
     manifest_payload = json.dumps(manifest).encode("utf-8")
     data_payload = b"{invalid oversized data" + (b"x" * len(manifest_payload))
-    monkeypatch.setattr(module, "_MAX_BUNDLE_JSON_BYTES", len(manifest_payload))
+    monkeypatch.setattr(module, "_MAX_BUNDLE_DATA_JSON_BYTES", len(manifest_payload))
     broken_bundle_path = tmp_path / "night-watch-oversized-data-preview.bragi-chat"
     _write_bundle_member_bytes(
         broken_bundle_path,
@@ -4204,13 +4257,10 @@ def test_export_save_rejects_media_race_without_writing_bundle(
     service = _chat_bundle_service(repositories, media_dir)
     service.export_save(save.id, bundle_path)
     original_bundle_bytes = bundle_path.read_bytes()
-    original_media_asset_rows = cast(
-        Callable[[str], list[dict[str, object]]],
-        service._media_asset_rows,
-    )
+    original_annotate_media_files = module._annotate_export_media_asset_files
 
-    def media_asset_rows_with_race(save_id: str) -> list[dict[str, object]]:
-        rows = original_media_asset_rows(save_id)
+    def annotate_media_files_with_race(rows: Any, media_dir_arg: Path) -> None:
+        original_annotate_media_files(rows, media_dir_arg)
         media_path = media_dir / MEDIA_PATH
         if race_action == "delete":
             media_path.unlink()
@@ -4220,9 +4270,12 @@ def test_export_save_rejects_media_race_without_writing_bundle(
             media_path.write_bytes(changed_media_bytes)
         else:
             raise AssertionError(f"Unhandled race action: {race_action}")
-        return rows
 
-    monkeypatch.setattr(service, "_media_asset_rows", media_asset_rows_with_race)
+    monkeypatch.setattr(
+        module,
+        "_annotate_export_media_asset_files",
+        annotate_media_files_with_race,
+    )
 
     with pytest.raises(module.ChatBundleError, match=message):
         service.export_save(save.id, bundle_path)
@@ -4932,7 +4985,9 @@ def test_import_save_rejects_declared_media_byte_count_over_limit_without_new_sa
 def test_chat_bundle_default_limits_support_large_save_exports() -> None:
     module = _chat_bundle_module()
 
-    assert module._MAX_BUNDLE_JSON_BYTES == 2 * 1024 * 1024 * 1024
+    assert module._MAX_BUNDLE_MANIFEST_JSON_BYTES == 1024 * 1024
+    assert module._MAX_BUNDLE_DATA_JSON_BYTES == 128 * 1024 * 1024
+    assert module._MAX_BUNDLE_JSON_TOTAL_BYTES == 129 * 1024 * 1024
     assert module._MAX_BUNDLE_MEDIA_FILE_BYTES == 2 * 1024 * 1024 * 1024
     assert module._MAX_BUNDLE_MEDIA_TOTAL_BYTES == 2 * 1024 * 1024 * 1024
 
@@ -4996,11 +5051,15 @@ def test_import_save_rejects_oversized_json_member_without_new_save(
     manifest_payload = json.dumps(manifest).encode("utf-8")
     data_payload = json.dumps(data).encode("utf-8")
     if member_name == "manifest.json":
-        monkeypatch.setattr(module, "_MAX_BUNDLE_JSON_BYTES", 2)
+        monkeypatch.setattr(module, "_MAX_BUNDLE_MANIFEST_JSON_BYTES", 2)
         manifest_payload = b"{invalid oversized manifest"
         data_payload = b"{}"
     elif member_name == "data.json":
-        monkeypatch.setattr(module, "_MAX_BUNDLE_JSON_BYTES", len(manifest_payload))
+        monkeypatch.setattr(
+            module,
+            "_MAX_BUNDLE_DATA_JSON_BYTES",
+            len(manifest_payload),
+        )
         data_payload = b"{invalid oversized data" + (b"x" * len(manifest_payload))
     else:
         raise AssertionError(f"Unhandled JSON member: {member_name}")
@@ -5015,6 +5074,96 @@ def test_import_save_rejects_oversized_json_member_without_new_save(
     save_ids = [save.id for save in repositories.list_saves()]
 
     with pytest.raises(module.ChatBundleError, match=f"{member_name} is too large"):
+        service.import_save(broken_bundle_path)
+
+    assert [save.id for save in repositories.list_saves()] == save_ids
+
+
+def test_import_save_streams_json_members_without_unbounded_zipfile_read(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service, _manifest, _data, _bundle_media_path = _export_bundle_payloads(
+        repositories,
+        tmp_path,
+    )
+    bundle_path = tmp_path / "night-watch.bragi-chat"
+    save_ids = [save.id for save in repositories.list_saves()]
+
+    def reject_unbounded_read(
+        _bundle: zipfile.ZipFile,
+        _name: object,
+        _pwd: object = None,
+    ) -> bytes:
+        raise AssertionError("ZipFile.read must not be used for bundle import")
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", reject_unbounded_read)
+
+    imported = service.import_save(bundle_path)
+
+    assert _imported_save_id(imported) not in save_ids
+
+
+def test_import_save_rejects_unsafe_json_compression_ratio_without_new_save(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    module = _chat_bundle_module()
+    service, manifest, data, bundle_media_path = _export_bundle_payloads(
+        repositories,
+        tmp_path,
+    )
+    messages = data["messages"]
+    assert isinstance(messages, list)
+    first_message = messages[0]
+    assert isinstance(first_message, dict)
+    first_message["body"] = "x" * (1024 * 1024)
+    broken_bundle_path = tmp_path / "night-watch-compressed-json.bragi-chat"
+    _write_bundle_with_member(
+        broken_bundle_path,
+        manifest=manifest,
+        data=data,
+        bundle_name=bundle_media_path,
+        payload=MEDIA_BYTES,
+    )
+    save_ids = [save.id for save in repositories.list_saves()]
+
+    with pytest.raises(module.ChatBundleError, match="suspiciously compressed"):
+        service.import_save(broken_bundle_path)
+
+    assert [save.id for save in repositories.list_saves()] == save_ids
+
+
+def test_import_save_rejects_total_decompressed_payload_over_limit_without_new_save(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    module = _chat_bundle_module()
+    service, manifest, data, bundle_media_path = _export_bundle_payloads(
+        repositories,
+        tmp_path,
+    )
+    manifest_payload = json.dumps(manifest).encode("utf-8")
+    data_payload = json.dumps(data).encode("utf-8")
+    monkeypatch.setattr(
+        module,
+        "_MAX_BUNDLE_TOTAL_DECOMPRESSED_BYTES",
+        len(manifest_payload) + len(data_payload) + len(MEDIA_BYTES) - 1,
+        raising=False,
+    )
+    broken_bundle_path = tmp_path / "night-watch-total-too-large.bragi-chat"
+    _write_bundle_member_bytes(
+        broken_bundle_path,
+        manifest_payload=manifest_payload,
+        data_payload=data_payload,
+        bundle_name=bundle_media_path,
+        payload=MEDIA_BYTES,
+    )
+    save_ids = [save.id for save in repositories.list_saves()]
+
+    with pytest.raises(module.ChatBundleError, match="Chat bundle is too large"):
         service.import_save(broken_bundle_path)
 
     assert [save.id for save in repositories.list_saves()] == save_ids
@@ -5725,6 +5874,15 @@ def _chat_bundle_module() -> Any:
         return importlib.import_module("bragi.services.chat_bundle_service")
     except ModuleNotFoundError as exc:
         pytest.fail(f"Missing bragi.services.chat_bundle_service: {exc}")
+
+
+def _repository_database_path(repositories: PersistenceRepositories) -> Path:
+    row = repositories.connection.execute("PRAGMA database_list").fetchone()
+    assert row is not None
+    database_path = row["file"]
+    assert isinstance(database_path, str)
+    assert database_path
+    return Path(database_path)
 
 
 def _imported_save_id(imported: object) -> str:
