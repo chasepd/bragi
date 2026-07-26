@@ -6580,13 +6580,11 @@ class ChatService:
     ) -> bool:
         expected_ids = tuple(source_message_ids)
         return any(
-            _retry_source_message_ids(job.payload) == expected_ids
-            for job in self.repositories.list_recent_jobs(
-                save_id=save_id,
-                types=("state_extraction",),
-                statuses=("succeeded",),
-                seconds=0,
-                limit=50,
+            job.type == "state_extraction"
+            and job.save_id == save_id
+            and _retry_source_message_ids(job.payload) == expected_ids
+            for job in self.repositories.list_jobs_by_status(
+                ("succeeded",),
             )
         )
 
