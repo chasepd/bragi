@@ -73,7 +73,17 @@ MANIFEST_NAME = "manifest.json"
 DATA_NAME = "data.json"
 _MAX_BUNDLE_MEDIA_FILE_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_BUNDLE_MEDIA_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
-_MAX_BUNDLE_JSON_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_BUNDLE_MANIFEST_JSON_BYTES = 1024 * 1024
+_MAX_BUNDLE_DATA_JSON_BYTES = 128 * 1024 * 1024
+_MAX_BUNDLE_JSON_TOTAL_BYTES = (
+    _MAX_BUNDLE_MANIFEST_JSON_BYTES + _MAX_BUNDLE_DATA_JSON_BYTES
+)
+_MAX_BUNDLE_TOTAL_DECOMPRESSED_BYTES = (
+    _MAX_BUNDLE_JSON_TOTAL_BYTES + _MAX_BUNDLE_MEDIA_TOTAL_BYTES
+)
+_MIN_BUNDLE_COMPRESSION_RATIO_CHECK_BYTES = 1024 * 1024
+_MAX_BUNDLE_COMPRESSION_RATIO = 250.0
+_BUNDLE_JSON_COPY_CHUNK_BYTES = 1024 * 1024
 _BUNDLE_MEDIA_COPY_CHUNK_BYTES = 1024 * 1024
 _CONTEXT_SOURCE_METADATA_MESSAGE_ID_FIELDS = (
     "source_message_id",
@@ -103,6 +113,13 @@ class ChatBundleManifest:
 @dataclass(frozen=True)
 class _BundleMediaMember:
     bundle_name: str
+    sha256: str
+    byte_count: int
+
+
+@dataclass(frozen=True)
+class _ExportMediaFile:
+    path: Path
     sha256: str
     byte_count: int
 
@@ -163,6 +180,100 @@ class ChatBundleService:
         *,
         include_message_revisions: bool = False,
     ) -> ChatBundleManifest:
+        self.repositories.begin_transaction()
+        try:
+            (
+                data,
+                save,
+                scenario,
+                message_count,
+                snapshot_media_asset_rows,
+            ) = self._capture_export_save_data(
+                save_id,
+                include_message_revisions=include_message_revisions,
+            )
+            self.repositories.commit_transaction()
+        except Exception:
+            self.repositories.rollback_transaction()
+            raise
+
+        _annotate_character_reference_image_asset_ids(data)
+        _repair_export_media_asset_source_references(data)
+        media_assets = cast(list[dict[str, object]], data["media_assets"])
+        snapshot_media_assets = _snapshot_only_media_asset_rows(
+            snapshot_media_asset_rows,
+            active_media_asset_ids={_text(row, "id") for row in media_assets},
+        )
+        data["snapshot_media_assets"] = snapshot_media_assets
+        _annotate_export_media_asset_files(
+            [*media_assets, *snapshot_media_assets],
+            self.media_dir,
+        )
+        media_files = _collect_media_files(
+            [*media_assets, *snapshot_media_assets],
+            self.media_dir,
+        )
+        exported_at = datetime.now(UTC).isoformat()
+        manifest_payload: dict[str, object] = {
+            "format": BUNDLE_FORMAT,
+            "bundle_format": BUNDLE_FORMAT,
+            "bundle_version": BUNDLE_VERSION,
+            "title": save["title"],
+            "save_title": save["title"],
+            "scenario_title": scenario["title"],
+            "message_count": message_count,
+            "media_count": len(media_assets),
+            "created_by": {
+                "application": "Bragi",
+                "version": __version__,
+            },
+            "bragi_schema_version": CURRENT_SCHEMA_VERSION,
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "exported_at": exported_at,
+            "save": {
+                "id": save["id"],
+                "title": save["title"],
+                "created_at": save["created_at"],
+                "updated_at": save["updated_at"],
+            },
+            "scenario": {
+                "id": scenario["id"],
+                "title": scenario["title"],
+            },
+            "counts": {
+                "messages": message_count,
+                "media_assets": len(media_assets),
+            },
+        }
+        manifest = _manifest_from_payload(manifest_payload)
+
+        _write_bundle_atomically(
+            bundle_path=bundle_path,
+            manifest_payload=manifest_payload,
+            data=data,
+            media_files=media_files,
+        )
+        log_event(
+            "chat_bundle.exported",
+            save_id=save_id,
+            bundle_path=str(bundle_path),
+            message_count=manifest.message_count,
+            media_count=manifest.media_count,
+        )
+        return manifest
+
+    def _capture_export_save_data(
+        self,
+        save_id: str,
+        *,
+        include_message_revisions: bool,
+    ) -> tuple[
+        dict[str, object],
+        dict[str, object],
+        dict[str, object],
+        int,
+        tuple[dict[str, object], ...],
+    ]:
         details = self.repositories.load_save_details(save_id)
         if details is None:
             raise ValueError(f"Unknown save id: {save_id}")
@@ -839,67 +950,13 @@ class ChatBundleService:
         )
         data["turn_snapshots"] = snapshot_rows
         data["snapshot_objects"] = snapshot_objects
-        _annotate_character_reference_image_asset_ids(data)
-        _repair_export_media_asset_source_references(data)
-        media_assets = cast(list[dict[str, object]], data["media_assets"])
-        snapshot_media_assets = _snapshot_only_media_asset_rows(
+        return (
+            data,
+            cast(dict[str, object], data["save"]),
+            cast(dict[str, object], data["scenario"]),
+            len(messages),
             snapshot_service.media_asset_rows_from_snapshot_objects(snapshot_objects),
-            active_media_asset_ids={_text(row, "id") for row in media_assets},
-            media_dir=self.media_dir,
         )
-        data["snapshot_media_assets"] = snapshot_media_assets
-        media_files = _collect_media_files(
-            [*media_assets, *snapshot_media_assets],
-            self.media_dir,
-        )
-        exported_at = datetime.now(UTC).isoformat()
-        manifest_payload: dict[str, object] = {
-            "format": BUNDLE_FORMAT,
-            "bundle_format": BUNDLE_FORMAT,
-            "bundle_version": BUNDLE_VERSION,
-            "title": save["title"],
-            "save_title": save["title"],
-            "scenario_title": scenario["title"],
-            "message_count": len(messages),
-            "media_count": len(media_assets),
-            "created_by": {
-                "application": "Bragi",
-                "version": __version__,
-            },
-            "bragi_schema_version": CURRENT_SCHEMA_VERSION,
-            "schema_version": CURRENT_SCHEMA_VERSION,
-            "exported_at": exported_at,
-            "save": {
-                "id": save["id"],
-                "title": save["title"],
-                "created_at": save["created_at"],
-                "updated_at": save["updated_at"],
-            },
-            "scenario": {
-                "id": scenario["id"],
-                "title": scenario["title"],
-            },
-            "counts": {
-                "messages": len(messages),
-                "media_assets": len(media_assets),
-            },
-        }
-        manifest = _manifest_from_payload(manifest_payload)
-
-        _write_bundle_atomically(
-            bundle_path=bundle_path,
-            manifest_payload=manifest_payload,
-            data=data,
-            media_files=media_files,
-        )
-        log_event(
-            "chat_bundle.exported",
-            save_id=save_id,
-            bundle_path=str(bundle_path),
-            message_count=manifest.message_count,
-            media_count=manifest.media_count,
-        )
-        return manifest
 
     def preview_import(self, bundle_path: Path) -> ChatBundlePreview:
         manifest = self._read_manifest(bundle_path)
@@ -2588,15 +2645,24 @@ class ChatBundleService:
     ) -> tuple[dict[str, object], dict[str, object]]:
         try:
             with zipfile.ZipFile(bundle_path) as bundle:
+                _validate_no_duplicate_bundle_members(bundle)
                 manifest = _json_object_from_bytes(
-                    _read_limited_member(bundle, MANIFEST_NAME),
+                    _read_limited_member(
+                        bundle,
+                        MANIFEST_NAME,
+                        max_bytes=_MAX_BUNDLE_MANIFEST_JSON_BYTES,
+                    ),
                     MANIFEST_NAME,
                 )
                 _validate_manifest_payload(manifest)
                 if not read_data:
                     return manifest, {}
                 data = _json_object_from_bytes(
-                    _read_limited_member(bundle, DATA_NAME),
+                    _read_limited_member(
+                        bundle,
+                        DATA_NAME,
+                        max_bytes=_MAX_BUNDLE_DATA_JSON_BYTES,
+                    ),
                     DATA_NAME,
                 )
                 _validate_bundle_data(manifest, data)
@@ -2612,7 +2678,7 @@ class ChatBundleService:
         ]
 
     def _media_asset_rows(self, save_id: str) -> list[dict[str, object]]:
-        rows = self._rows(
+        return self._rows(
             """
             SELECT id, save_id, source_message_id, type, path, thumbnail_path,
                    prompt, provider, model, status, mime_type, metadata_json,
@@ -2623,16 +2689,12 @@ class ChatBundleService:
             """,
             (save_id,),
         )
-        for row in rows:
-            _annotate_media_asset_files(row, self.media_dir)
-        return rows
 
 
 def _snapshot_only_media_asset_rows(
     rows: Iterable[dict[str, object]],
     *,
     active_media_asset_ids: set[str],
-    media_dir: Path,
 ) -> list[dict[str, object]]:
     snapshot_rows: list[dict[str, object]] = []
     seen = set(active_media_asset_ids)
@@ -2642,7 +2704,6 @@ def _snapshot_only_media_asset_rows(
             continue
         seen.add(asset_id)
         copied = dict(row)
-        _annotate_media_asset_files(copied, media_dir)
         snapshot_rows.append(copied)
     return snapshot_rows
 
@@ -2698,6 +2759,14 @@ def _annotate_media_asset_files(row: dict[str, object], media_dir: Path) -> None
             "byte_count": byte_count,
         }
     row["files"] = files
+
+
+def _annotate_export_media_asset_files(
+    rows: Iterable[dict[str, object]],
+    media_dir: Path,
+) -> None:
+    for row in rows:
+        _annotate_media_asset_files(row, media_dir)
 
 
 def _annotate_character_reference_image_asset_ids(data: dict[str, object]) -> None:
@@ -2784,8 +2853,8 @@ def _advisory_character_reference_links(
 def _collect_media_files(
     media_assets: object,
     media_dir: Path,
-) -> dict[str, Path]:
-    files: dict[str, Path] = {}
+) -> dict[str, _ExportMediaFile]:
+    files: dict[str, _ExportMediaFile] = {}
     total_byte_count = 0
     for row in _list_of_objects(media_assets, "media_assets"):
         asset_id = _text(row, "id")
@@ -2824,7 +2893,11 @@ def _collect_media_files(
             total_byte_count += actual_byte_count
             if total_byte_count > _MAX_BUNDLE_MEDIA_TOTAL_BYTES:
                 raise ChatBundleError("Chat bundle media is too large to export")
-            files[bundle_path] = local_path
+            files[bundle_path] = _ExportMediaFile(
+                path=local_path,
+                sha256=expected_sha,
+                byte_count=expected_byte_count,
+            )
     return files
 
 
@@ -3423,7 +3496,7 @@ def _write_bundle_atomically(
     bundle_path: Path,
     manifest_payload: dict[str, object],
     data: dict[str, object],
-    media_files: dict[str, Path],
+    media_files: dict[str, _ExportMediaFile],
 ) -> None:
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -3442,8 +3515,8 @@ def _write_bundle_atomically(
         ) as bundle:
             bundle.writestr(MANIFEST_NAME, _dump_json_pretty(manifest_payload))
             bundle.writestr(DATA_NAME, _dump_json_pretty(data))
-            for bundle_name, local_path in media_files.items():
-                bundle.write(local_path, bundle_name)
+            for bundle_name, media_file in media_files.items():
+                _write_verified_media_member(bundle, bundle_name, media_file)
         temporary_path.chmod(0o600)
         os.replace(temporary_path, bundle_path)
         bundle_path.chmod(0o600)
@@ -3455,6 +3528,27 @@ def _write_bundle_atomically(
             except OSError:
                 pass
         raise
+
+
+def _write_verified_media_member(
+    bundle: zipfile.ZipFile,
+    bundle_name: str,
+    media_file: _ExportMediaFile,
+) -> None:
+    digest = hashlib.sha256()
+    written = 0
+    with media_file.path.open("rb") as source:
+        with bundle.open(bundle_name, "w") as target:
+            while chunk := source.read(_BUNDLE_MEDIA_COPY_CHUNK_BYTES):
+                written += len(chunk)
+                if written > media_file.byte_count:
+                    raise ChatBundleError(
+                        f"Media file changed during export: {media_file.path}"
+                    )
+                digest.update(chunk)
+                target.write(chunk)
+    if written != media_file.byte_count or digest.hexdigest() != media_file.sha256:
+        raise ChatBundleError(f"Media file changed during export: {media_file.path}")
 
 
 def _load_media_members(
@@ -3584,11 +3678,55 @@ def _copy_bundle_media_member(
         raise
 
 
-def _read_limited_member(bundle: zipfile.ZipFile, name: str) -> bytes:
+def _read_limited_member(
+    bundle: zipfile.ZipFile,
+    name: str,
+    *,
+    max_bytes: int,
+) -> bytes:
     info = bundle.getinfo(name)
-    if info.file_size > _MAX_BUNDLE_JSON_BYTES:
+    if info.file_size > max_bytes:
         raise ChatBundleError(f"Chat bundle {name} is too large")
-    return bundle.read(info)
+    _validate_bundle_member_compression_ratio(info)
+    payload = bytearray()
+    with bundle.open(info) as source:
+        while chunk := source.read(_BUNDLE_JSON_COPY_CHUNK_BYTES):
+            payload.extend(chunk)
+            if len(payload) > max_bytes:
+                raise ChatBundleError(f"Chat bundle {name} is too large")
+    return bytes(payload)
+
+
+def _validate_no_duplicate_bundle_members(bundle: zipfile.ZipFile) -> None:
+    seen: set[str] = set()
+    for info in bundle.infolist():
+        if info.filename in seen:
+            raise ChatBundleError(f"Duplicate chat bundle member: {info.filename}")
+        seen.add(info.filename)
+
+
+def _validate_bundle_member_compression_ratio(info: zipfile.ZipInfo) -> None:
+    if info.file_size < _MIN_BUNDLE_COMPRESSION_RATIO_CHECK_BYTES:
+        return
+    if info.compress_size <= 0:
+        raise ChatBundleError(
+            f"Chat bundle member is suspiciously compressed: {info.filename}"
+        )
+    ratio = info.file_size / info.compress_size
+    if ratio > _MAX_BUNDLE_COMPRESSION_RATIO:
+        raise ChatBundleError(
+            f"Chat bundle member is suspiciously compressed: {info.filename}"
+        )
+
+
+def _validate_total_decompressed_size(total_byte_count: int) -> None:
+    if total_byte_count > _MAX_BUNDLE_TOTAL_DECOMPRESSED_BYTES:
+        raise ChatBundleError("Chat bundle is too large")
+
+
+def _validate_total_json_size(total_byte_count: int) -> None:
+    if total_byte_count > _MAX_BUNDLE_JSON_TOTAL_BYTES:
+        raise ChatBundleError("Chat bundle JSON is too large")
 
 
 def _validate_bundle_members(
@@ -3596,6 +3734,11 @@ def _validate_bundle_members(
     data: dict[str, object],
 ) -> None:
     expected = {MANIFEST_NAME, DATA_NAME}
+    total_decompressed_byte_count = (
+        bundle.getinfo(MANIFEST_NAME).file_size + bundle.getinfo(DATA_NAME).file_size
+    )
+    _validate_total_json_size(total_decompressed_byte_count)
+    _validate_total_decompressed_size(total_decompressed_byte_count)
     total_byte_count = 0
     for row in _bundle_media_asset_rows(data):
         asset_id = _text(row, "id")
@@ -3636,6 +3779,9 @@ def _validate_bundle_members(
                 raise ChatBundleError(
                     f"Media byte count mismatch for {bundle_name}"
                 )
+            _validate_bundle_member_compression_ratio(info)
+            total_decompressed_byte_count += info.file_size
+            _validate_total_decompressed_size(total_decompressed_byte_count)
             expected.add(bundle_name)
 
     seen: set[str] = set()
