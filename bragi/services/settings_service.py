@@ -147,12 +147,6 @@ from bragi.services.provider_diagnostics import (
     record_provider_error,
     record_provider_response,
 )
-from bragi.services.provider_fallbacks import (
-    STRUCTURED_OUTPUT_FALLBACK_ENABLED_SETTING,
-    STRUCTURED_OUTPUT_FALLBACK_PREFERENCE_TASKS,
-    TOOL_CALL_FALLBACK_ENABLED_SETTING,
-    TOOL_CALL_FALLBACK_PREFERENCE_TASKS,
-)
 from bragi.services.scenario_evolution_policy import (
     DEFAULT_SCENARIO_EVOLUTION_TURN_INTERVAL,
     SCENARIO_EVOLUTION_TURN_INTERVAL_SETTING,
@@ -455,36 +449,6 @@ class SettingsService:
             provider=provider,
             model_id=model_id,
         )
-        if task in STRUCTURED_OUTPUT_FALLBACK_PREFERENCE_TASKS:
-            fallback_enabled = self.repositories.get_app_setting(
-                STRUCTURED_OUTPUT_FALLBACK_ENABLED_SETTING
-            )
-            if not bool(fallback_enabled):
-                self.repositories.set_app_setting(
-                    STRUCTURED_OUTPUT_FALLBACK_ENABLED_SETTING,
-                    True,
-                )
-                log_event(
-                    "settings.structured_output_fallback_auto_enabled",
-                    task=task,
-                    provider=provider,
-                    model=model_id,
-                )
-        if task in TOOL_CALL_FALLBACK_PREFERENCE_TASKS:
-            fallback_enabled = self.repositories.get_app_setting(
-                TOOL_CALL_FALLBACK_ENABLED_SETTING
-            )
-            if not bool(fallback_enabled):
-                self.repositories.set_app_setting(
-                    TOOL_CALL_FALLBACK_ENABLED_SETTING,
-                    True,
-                )
-                log_event(
-                    "settings.tool_call_fallback_auto_enabled",
-                    task=task,
-                    provider=provider,
-                    model=model_id,
-                )
         thinking_preferences = sanitize_model_thinking_preferences(
             self.repositories.get_app_setting(MODEL_THINKING_PREFERENCES_SETTING)
         )

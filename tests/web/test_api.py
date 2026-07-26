@@ -5369,7 +5369,7 @@ def test_settings_model_refresh_rejects_unknown_provider(tmp_path: Path) -> None
     assert response.json()["detail"] == "Unknown provider"
 
 
-def test_fake_provider_seed_enables_structured_output_fallback(
+def test_fake_provider_seed_configures_structured_output_fallback_without_toggle(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -5383,7 +5383,7 @@ def test_fake_provider_seed_enables_structured_output_fallback(
     payload = settings.json()
     assert payload["structured_output_fallback"] == {
         "setting_key": "structured_output_fallback_enabled",
-        "enabled": True,
+        "enabled": False,
     }
     assert "Structured output fallback model is configured" not in settings.text
 
@@ -8932,7 +8932,7 @@ def test_settings_do_not_embed_diagnostics_payloads(tmp_path: Path) -> None:
     assert "web_events" not in payload
 
 
-def test_diagnostics_endpoint_includes_configuration_warnings(
+def test_diagnostics_endpoint_omits_deprecated_fallback_disabled_warning(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "bragi.sqlite3"
@@ -8953,7 +8953,7 @@ def test_diagnostics_endpoint_includes_configuration_warnings(
         response = client.get("/api/diagnostics?category=signals")
 
     assert response.status_code == 200
-    assert any(
+    assert not any(
         signal["kind"] == "configuration"
         and "Structured output fallback model is configured" in signal["error"]
         and "structured_output_fallback" in signal["error"]

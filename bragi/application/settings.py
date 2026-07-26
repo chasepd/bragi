@@ -169,12 +169,6 @@ from bragi.services.post_turn_inference import (
     POST_TURN_INFERENCE_MODE_SETTING,
     post_turn_inference_mode,
 )
-from bragi.services.provider_fallbacks import (
-    STRUCTURED_OUTPUT_FALLBACK_ENABLED_SETTING,
-    STRUCTURED_OUTPUT_FALLBACK_PREFERENCE_TASKS,
-    TOOL_CALL_FALLBACK_ENABLED_SETTING,
-    TOOL_CALL_FALLBACK_PREFERENCE_TASKS,
-)
 from bragi.services.settings_policy import scoped_setting_policy
 from bragi.services.text_script_policy import (
     SCRIPT_GUARD_MODE_OPTIONS,
@@ -2067,69 +2061,6 @@ def _selected_available(
 
 
 def configuration_diagnostics(
-    repositories: PersistenceRepositories,
+    _repositories: PersistenceRepositories,
 ) -> tuple[DiagnosticEntry, ...]:
-    entries: list[DiagnosticEntry] = []
-    entries.extend(
-        _structured_output_fallback_configuration_diagnostics(repositories)
-    )
-    entries.extend(_tool_call_fallback_configuration_diagnostics(repositories))
-    return tuple(entries)
-
-
-def _structured_output_fallback_configuration_diagnostics(
-    repositories: PersistenceRepositories,
-) -> tuple[DiagnosticEntry, ...]:
-    if _bool_setting(
-        repositories.get_app_setting(
-            STRUCTURED_OUTPUT_FALLBACK_ENABLED_SETTING
-        )
-    ):
-        return ()
-    entries: list[DiagnosticEntry] = []
-    for task in STRUCTURED_OUTPUT_FALLBACK_PREFERENCE_TASKS:
-        preference = _normalized_preference(
-            repositories.get_model_preference(task)
-        )
-        if preference is None:
-            continue
-        entries.append(
-            DiagnosticEntry(
-                kind="configuration",
-                error=(
-                    "Structured output fallback model is configured for "
-                    f"{task} ({preference.provider}/{preference.model_id}), "
-                    "but fallback is disabled."
-                ),
-            )
-        )
-    return tuple(entries)
-
-
-def _tool_call_fallback_configuration_diagnostics(
-    repositories: PersistenceRepositories,
-) -> tuple[DiagnosticEntry, ...]:
-    if _bool_setting(
-        repositories.get_app_setting(
-            TOOL_CALL_FALLBACK_ENABLED_SETTING
-        )
-    ):
-        return ()
-    entries: list[DiagnosticEntry] = []
-    for task in TOOL_CALL_FALLBACK_PREFERENCE_TASKS:
-        preference = _normalized_preference(
-            repositories.get_model_preference(task)
-        )
-        if preference is None:
-            continue
-        entries.append(
-            DiagnosticEntry(
-                kind="configuration",
-                error=(
-                    "Tool call fallback model is configured for "
-                    f"{task} ({preference.provider}/{preference.model_id}), "
-                    "but fallback is disabled."
-                ),
-            )
-        )
-    return tuple(entries)
+    return ()

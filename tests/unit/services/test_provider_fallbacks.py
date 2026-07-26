@@ -412,10 +412,11 @@ def test_chat_with_fallback_applies_openrouter_reasoning_overrides(
     assert fallback.chat_requests[0].reasoning.exclude is True
 
 
-def test_structured_output_fallback_disabled_error_reports_skip_reason(
+def test_structured_output_fallback_uses_configured_provider_when_toggle_false(
     repositories: PersistenceRepositories,
 ) -> None:
     _save_primary_structured_model(repositories)
+    repositories.set_app_setting("structured_output_fallback_enabled", False)
     repositories.set_model_preference(
         task="structured_output_fallback",
         provider="fallback",
@@ -436,23 +437,20 @@ def test_structured_output_fallback_disabled_error_reports_skip_reason(
     )
     fallback = RecordingStructuredProvider(provider_name="fallback")
 
-    with pytest.raises(ProviderError) as captured:
-        asyncio.run(
-            structured_output_with_fallback(
-                repositories=repositories,
-                providers={"primary": primary, "fallback": fallback},
-                request=_structured_request(),
-                task="context_search",
-                save_id="save-1",
-            )
+    response = asyncio.run(
+        structured_output_with_fallback(
+            repositories=repositories,
+            providers={"primary": primary, "fallback": fallback},
+            request=_structured_request(),
+            task="context_search",
+            save_id="save-1",
         )
+    )
 
     assert len(primary.structured_output_requests) == 1
-    assert fallback.structured_output_requests == []
-    assert "fallback_skipped_reason=disabled" in str(captured.value)
-    fields = exception_log_fields(captured.value)
-    assert fields["fallback_attempted"] is False
-    assert fields["fallback_skipped_reason"] == "disabled"
+    assert len(fallback.structured_output_requests) == 1
+    assert response.provider == "fallback"
+    assert response.model_id == "fallback-structured"
 
 
 def test_structured_output_with_fallback_rejects_unavailable_primary_model(
@@ -703,9 +701,10 @@ def test_structured_output_fallback_failure_reports_attempted_fallback(
     assert fields["fallback_model_id"] == "fallback-structured"
 
 
-def test_tool_call_fallback_disabled_reports_skip_reason(
+def test_tool_call_fallback_uses_configured_provider_when_toggle_false(
     repositories: PersistenceRepositories,
 ) -> None:
+    repositories.set_app_setting("tool_call_fallback_enabled", False)
     repositories.set_model_preference(
         task="tool_call_fallback",
         provider="fallback",
@@ -721,23 +720,16 @@ def test_tool_call_fallback_disabled_reports_skip_reason(
         "fallback": RecordingToolProvider(provider_name="fallback"),
     }
 
-    assert (
-        tool_call_fallback_request(
-            repositories=repositories,
-            providers=providers,
-            request=_tool_call_request(),
-            save_id="save-1",
-        )
-        is None
+    request = tool_call_fallback_request(
+        repositories=repositories,
+        providers=providers,
+        request=_tool_call_request(),
+        save_id="save-1",
     )
-    assert (
-        tool_call_fallback_skip_reason(
-            repositories=repositories,
-            providers=providers,
-            save_id="save-1",
-        )
-        == "disabled"
-    )
+
+    assert request is not None
+    assert request.provider == "fallback"
+    assert request.model_id == "fallback-tools"
 
 
 @pytest.mark.parametrize(
@@ -925,7 +917,6 @@ def test_tool_call_fallback_reports_unavailable_recommended_model(
 def _configure_working_structured_fallback(
     repositories: PersistenceRepositories,
 ) -> None:
-    repositories.set_app_setting("structured_output_fallback_enabled", True)
     repositories.set_model_preference(
         task="structured_output_fallback",
         provider="fallback",
@@ -951,7 +942,6 @@ def _save_primary_structured_model(repositories: PersistenceRepositories) -> Non
 def _configure_working_chat_fallback(
     repositories: PersistenceRepositories,
 ) -> None:
-    repositories.set_app_setting("chat_fallback_enabled", True)
     repositories.set_model_preference(
         task="chat_fallback",
         provider="fallback",
