@@ -1380,6 +1380,47 @@ def test_venice_structured_output_retries_empty_success_content(
     assert isinstance(attempts[1]["duration_ms"], int)
 
 
+def test_venice_structured_output_enforces_async_transport_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def blocked_to_thread(*_args: object, **_kwargs: object) -> object:
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("bragi.providers.venice.asyncio.to_thread", blocked_to_thread)
+    monkeypatch.setattr("bragi.providers.retry.asyncio.sleep", no_sleep)
+    secrets = InMemorySecretStore()
+    secrets.set_api_key("venice", "venice-secret")
+    client = VeniceClient(secret_store=secrets, timeout=0.01)
+
+    async def generate() -> None:
+        await client.generate_structured_output(
+            StructuredOutputRequest(
+                provider="venice",
+                model_id="llama-3.2-3b",
+                messages=(ChatMessage(role="user", body="Mara opens the door."),),
+                schema_name="state_memory_update",
+                schema={
+                    "type": "object",
+                    "properties": {"state_changes": {"type": "array"}},
+                    "required": ["state_changes"],
+                    "additionalProperties": False,
+                },
+            )
+        )
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(asyncio.wait_for(generate(), timeout=0.5))
+
+    assert exc_info.value.category == ProviderErrorCategory.NETWORK_ERROR
+    assert "timed out" in exc_info.value.message
+    assert exc_info.value.retry_attempt_count == 3
+    assert exc_info.value.max_retry_attempts == 3
+
+
 def test_venice_chat_content_preserves_provider_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

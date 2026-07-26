@@ -342,6 +342,35 @@ def test_completed_job_count_is_bounded_to_newest_records() -> None:
     asyncio.run(run_test())
 
 
+def test_job_event_wait_does_not_use_default_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def blocked_to_thread(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("job event waits must not use the default executor")
+
+    async def run_test() -> None:
+        release = asyncio.Event()
+        registry = JobRegistry()
+        monkeypatch.setattr("bragi_web.jobs.asyncio.to_thread", blocked_to_thread)
+
+        async def worker(_handle: JobHandle) -> dict[str, bool]:
+            await release.wait()
+            return {"ok": True}
+
+        record = await registry.create("wait_probe", worker)
+        waiter = asyncio.create_task(registry.wait_for_event(record.id, 0))
+        await asyncio.sleep(0)
+        await registry.add_event(record.id, "progress", {"ok": True})
+
+        assert await asyncio.wait_for(waiter, timeout=1.0) == 0
+
+        release.set()
+        assert record.task is not None
+        await asyncio.wait_for(record.task, timeout=1.0)
+
+    asyncio.run(run_test())
+
+
 def test_per_job_event_history_is_bounded_with_absolute_offset() -> None:
     async def run_test() -> None:
         registry = JobRegistry(JobRegistryLimits(max_events_per_job=2))

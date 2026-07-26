@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from bragi_web.runtime import RuntimeAccessLock
+from bragi_web.runtime import RuntimeAccessLock, SaveEventHub
 
 
 def test_runtime_access_lock_excludes_sync_access_during_async_access() -> None:
@@ -35,6 +35,7 @@ def test_runtime_access_lock_excludes_sync_access_during_async_access() -> None:
         sync_thread.join(timeout=1.0)
 
         assert sync_entered.is_set()
+        lock.close()
 
     asyncio.run(run_test())
 
@@ -65,6 +66,82 @@ def test_runtime_access_lock_does_not_block_event_loop_when_contended() -> None:
         thread.join(timeout=1.0)
 
         assert not thread.is_alive()
+        lock.close()
+
+    asyncio.run(run_test())
+
+
+def test_runtime_access_lock_async_access_uses_private_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def blocked_to_thread(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("runtime lock waits must not use the default executor")
+
+    async def run_test() -> None:
+        lock = RuntimeAccessLock()
+        monkeypatch.setattr("bragi_web.runtime.asyncio.to_thread", blocked_to_thread)
+        try:
+            async with lock.async_access():
+                pass
+        finally:
+            lock.close()
+
+    asyncio.run(run_test())
+
+
+def test_runtime_access_lock_close_does_not_disable_sync_access() -> None:
+    lock = RuntimeAccessLock()
+    lock.close()
+
+    with lock:
+        pass
+
+
+def test_runtime_access_lock_close_does_not_strand_queued_async_access() -> None:
+    async def enter_async_lock(lock: RuntimeAccessLock) -> None:
+        async with lock.async_access():
+            pass
+
+    async def run_test() -> None:
+        lock = RuntimeAccessLock()
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def hold_first() -> None:
+            async with lock.async_access():
+                first_entered.set()
+                await release_first.wait()
+
+        first = asyncio.create_task(hold_first())
+        await asyncio.wait_for(first_entered.wait(), timeout=1.0)
+
+        second = asyncio.create_task(enter_async_lock(lock))
+        await asyncio.sleep(0)
+        lock.close()
+
+        release_first.set()
+        await asyncio.wait_for(first, timeout=1.0)
+        await asyncio.wait_for(second, timeout=1.0)
+        lock.close()
+
+    asyncio.run(run_test())
+
+
+def test_save_event_hub_wait_for_event_does_not_use_default_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def blocked_to_thread(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("save event waits must not use the default executor")
+
+    async def run_test() -> None:
+        hub = SaveEventHub()
+        monkeypatch.setattr("bragi_web.runtime.asyncio.to_thread", blocked_to_thread)
+
+        waiter = asyncio.create_task(hub.wait_for_event("save-1", 0))
+        await asyncio.sleep(0)
+        hub.publish("save-1", "runtime_changed", {})
+
+        assert await asyncio.wait_for(waiter, timeout=1.0) == 0
 
     asyncio.run(run_test())
 

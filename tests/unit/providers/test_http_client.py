@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
+import threading
 from email.message import Message
 from urllib.error import HTTPError
 
@@ -14,6 +16,7 @@ from bragi.providers.http_client import (
     ensure_success,
     request_bytes,
     request_json,
+    request_sse_json,
 )
 
 
@@ -41,6 +44,68 @@ def test_iter_sse_data_ignores_comments_and_collects_multiline_data() -> None:
         "line one\nline two",
         "[DONE]",
     ]
+
+
+def test_request_sse_json_enforces_total_timeout_without_stream_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingStreamResponse:
+        status = 200
+
+        def __init__(self) -> None:
+            self.headers: Message[str, str] = Message()
+            self.closed = False
+            self.close_requested = threading.Event()
+
+        def __enter__(self) -> BlockingStreamResponse:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self.close()
+
+        def __iter__(self) -> BlockingStreamResponse:
+            return self
+
+        def __next__(self) -> bytes:
+            self.close_requested.wait(timeout=2.0)
+            if self.closed:
+                raise StopIteration
+            return b""
+
+        def readline(self) -> bytes:
+            self.close_requested.wait(timeout=2.0)
+            return b""
+
+        def close(self) -> None:
+            self.closed = True
+            self.close_requested.set()
+
+    response = BlockingStreamResponse()
+
+    class FakeOpener:
+        def open(self, *_args: object, **_kwargs: object) -> object:
+            return response
+
+    async def collect_stream() -> None:
+        async for _event in request_sse_json(
+            method="POST",
+            url="https://provider.example/v1/chat/completions",
+            headers={},
+            payload={"stream": True},
+            timeout=0.01,
+            provider="venice",
+            task="chat_completion",
+        ):
+            raise AssertionError("stream should not emit an event")
+
+    monkeypatch.setattr("bragi.providers.http_client._NO_REDIRECT_OPENER", FakeOpener())
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(asyncio.wait_for(collect_stream(), timeout=0.5))
+
+    assert exc_info.value.category == ProviderErrorCategory.NETWORK_ERROR
+    assert "timed out" in exc_info.value.message
+    assert response.closed is True
 
 
 def test_ensure_success_raises_provider_error_with_payload_message() -> None:
