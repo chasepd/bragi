@@ -228,6 +228,7 @@ from bragi.services.sexual_content_safety import (
 )
 from bragi.services.state_pruning_service import StatePruningService
 from bragi.services.state_service import (
+    AppliedExtraction,
     StateExtractor,
     StateService,
     StructuredProviderStateExtractor,
@@ -305,6 +306,20 @@ POST_TURN_PROVIDER_TASKS = {
 }
 POST_TURN_CONTEXT_UPDATE_BUDGET_SECONDS = 60.0
 POST_TURN_BACKGROUND_CATCHUP_TIMEOUT_SECONDS = 15.0
+STATE_EXTRACTION_RETRY_JOB_TYPE = "state_extraction_retry"
+STATE_EXTRACTION_RETRY_MAX_ATTEMPTS = CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS
+STATE_EXTRACTION_RETRY_DRAIN_LIMIT = CONTEXT_UPDATE_RETRY_DRAIN_LIMIT
+POST_TURN_DEPENDENCY_SATISFYING_STATUSES = frozenset(
+    {
+        "applied",
+        "complete",
+        "narrowed",
+        "queued",
+        "skipped",
+        "succeeded",
+    }
+)
+POST_TURN_UNFINISHED_STATUSES = frozenset({"pending", "running"})
 _SCENE_SNAPSHOT_NOT_PROVIDED = object()
 
 
@@ -4033,7 +4048,7 @@ class ChatService:
             )
 
         pending = set(POST_TURN_JOB_ORDER)
-        completed: set[str] = set()
+        satisfied: set[str] = set()
         running: dict[asyncio.Task[str], str] = {}
 
         def start_ready_steps() -> None:
@@ -4041,10 +4056,60 @@ class ChatService:
                 if name not in pending:
                     continue
                 dependencies = POST_TURN_JOB_DEPENDENCIES[name]
-                if any(dependency not in completed for dependency in dependencies):
+                if any(dependency not in satisfied for dependency in dependencies):
                     continue
                 pending.remove(name)
                 running[asyncio.create_task(run_named_step(name))] = name
+
+        def block_pending_dependents() -> None:
+            running_names = set(running.values())
+            changed = True
+            while changed:
+                changed = False
+                for name in POST_TURN_JOB_ORDER:
+                    if name not in pending:
+                        continue
+                    blocking_dependency = next(
+                        (
+                            dependency
+                            for dependency in POST_TURN_JOB_DEPENDENCIES[name]
+                            if dependency not in satisfied
+                            and dependency not in pending
+                            and dependency not in running_names
+                            and statuses.get(dependency)
+                            not in POST_TURN_UNFINISHED_STATUSES
+                        ),
+                        None,
+                    )
+                    if blocking_dependency is None:
+                        continue
+                    step_started = perf_counter()
+                    pending.remove(name)
+                    result: dict[str, object] = {
+                        "blocked_by": blocking_dependency,
+                        "blocked_dependency_status": statuses[blocking_dependency],
+                        "source_message_ids": [
+                            player_message_id,
+                            narrator_message_id,
+                        ],
+                    }
+                    step_results[name] = result
+                    publish(name, "blocked_dependency")
+                    record_step(
+                        name,
+                        "blocked_dependency",
+                        step_started,
+                        metadata=result,
+                    )
+                    log_event(
+                        "chat.post_turn_job_blocked_dependency",
+                        save_id=save_id,
+                        coordinator_job_id=coordinator.id,
+                        job_name=name,
+                        blocked_by=blocking_dependency,
+                        blocked_dependency_status=statuses[blocking_dependency],
+                    )
+                    changed = True
 
         start_ready_steps()
         try:
@@ -4055,10 +4120,12 @@ class ChatService:
                 )
                 for task in done:
                     name = running.pop(task)
-                    await task
+                    status = await task
                     if name == "context":
                         run_context_barrier()
-                    completed.add(name)
+                    if status in POST_TURN_DEPENDENCY_SATISFYING_STATUSES:
+                        satisfied.add(name)
+                block_pending_dependents()
                 start_ready_steps()
         except BaseException:
             for task in running:
@@ -4095,6 +4162,9 @@ class ChatService:
             "context_update_retry_count": self._queued_context_update_retry_count(
                 save_id=save_id
             ),
+            "state_extraction_retry_count": self._queued_state_extraction_retry_count(
+                save_id=save_id
+            ),
         }
         maintenance_failed_jobs = [
             name
@@ -4129,6 +4199,188 @@ class ChatService:
                 save_id=save_id,
                 **exception_log_fields(exc),
             )
+
+    async def run_state_extraction_retries(self, *, save_id: str | None = None) -> int:
+        retry_jobs = [
+            job
+            for job in self.repositories.list_jobs_by_status(("queued",))
+            if job.type == STATE_EXTRACTION_RETRY_JOB_TYPE
+            and (save_id is None or job.save_id == save_id)
+        ]
+        pressure = self._recent_provider_pressure(save_id=save_id)
+        completed = 0
+        started = 0
+        for retry_job in retry_jobs:
+            if pressure is not None:
+                self._defer_state_extraction_retry_job(retry_job, pressure=pressure)
+                continue
+            if started >= STATE_EXTRACTION_RETRY_DRAIN_LIMIT:
+                log_event(
+                    "chat.state_extraction_retry_drain_limited",
+                    save_id=save_id,
+                    retry_limit=STATE_EXTRACTION_RETRY_DRAIN_LIMIT,
+                    remaining_retry_count=len(retry_jobs) - started,
+                )
+                break
+            running = self.jobs.start(retry_job.id)
+            started += 1
+            payload = running.payload
+            retry_attempt = _retry_attempt(payload)
+            max_retry_attempts = _retry_max_attempts(payload)
+            retry_save_id = running.save_id
+            if retry_save_id is None:
+                self.jobs.fail(running.id, error="State retry job is missing save_id")
+                continue
+            source_message_ids = _retry_source_message_ids(payload)
+            if not source_message_ids:
+                self.jobs.fail(
+                    running.id,
+                    error="State retry job is missing source_message_ids",
+                )
+                continue
+            if self._successful_state_extraction_exists(
+                save_id=retry_save_id,
+                source_message_ids=source_message_ids,
+            ):
+                context_retry_job = self._ensure_context_update_retry_job(
+                    save_id=retry_save_id,
+                    source_message_ids=source_message_ids,
+                    reason="state_extraction_retry_succeeded",
+                )
+                self.jobs.succeed(
+                    running.id,
+                    result={
+                        "source_message_ids": list(source_message_ids),
+                        "already_applied": True,
+                        "context_retry_job_id": context_retry_job.id,
+                    },
+                )
+                completed += 1
+                continue
+            extractor_info = self._state_extractor_for_retry(
+                retry_save_id,
+                payload=payload,
+            )
+            if extractor_info is None:
+                self.jobs.fail(
+                    running.id,
+                    error="No configured state extraction service for retry",
+                )
+                continue
+            extractor, provider_name, model_id = extractor_info
+            inference_mode = _state_retry_inference_mode(payload)
+            verified_coverage = verified_post_turn_coverage_from_mapping(
+                payload.get("verified_plan_coverage")
+            )
+            if not verified_coverage.source_message_ids:
+                verified_coverage = VerifiedPostTurnCoverage(
+                    source_message_ids=source_message_ids,
+                )
+            include_memories = _state_retry_include_memories(payload)
+            try:
+                applied = await self._extract_and_apply_state_for_turn(
+                    extractor=extractor,
+                    save_id=retry_save_id,
+                    player_message_id=source_message_ids[0],
+                    narrator_message_id=source_message_ids[-1],
+                    include_memories=include_memories,
+                    inference_mode=inference_mode,
+                    verified_coverage=verified_coverage,
+                )
+            except asyncio.CancelledError:
+                self.jobs.cancel(
+                    running.id,
+                    error="State extraction retry drain cancelled",
+                    result={
+                        "source_message_ids": list(source_message_ids),
+                        "retry_attempt": retry_attempt,
+                        "max_retry_attempts": max_retry_attempts,
+                    },
+                )
+                log_event(
+                    "job.cancelled",
+                    job_id=running.id,
+                    job_type=running.type,
+                    save_id=retry_save_id,
+                    retry_attempt=retry_attempt,
+                    max_retry_attempts=max_retry_attempts,
+                )
+                raise
+            except Exception as exc:
+                retry_result: dict[str, object] = {
+                    "source_message_ids": list(source_message_ids),
+                    "retry_attempt": retry_attempt,
+                    "max_retry_attempts": max_retry_attempts,
+                }
+                retry_pressure = provider_pressure_from_exception(exc)
+                if retry_pressure is not None:
+                    retry_result["provider_pressure"] = retry_pressure.to_result()
+                    if retry_attempt >= max_retry_attempts:
+                        retry_result["retry_budget_exhausted"] = True
+                        log_event(
+                            "chat.state_extraction_retry_budget_exhausted",
+                            save_id=retry_save_id,
+                            retry_job_id=running.id,
+                            retry_attempt=retry_attempt,
+                            **retry_pressure.to_result(),
+                        )
+                    else:
+                        next_retry = self.jobs.create_queued(
+                            save_id=retry_save_id,
+                            type=STATE_EXTRACTION_RETRY_JOB_TYPE,
+                            payload=_state_extraction_retry_payload(
+                                source_message_ids=source_message_ids,
+                                reason="post_turn_state_failed",
+                                retry_attempt=retry_attempt + 1,
+                                max_retry_attempts=max_retry_attempts,
+                                include_memories=include_memories,
+                                inference_mode=inference_mode,
+                                verified_coverage=verified_coverage,
+                                existing_payload=payload,
+                                provider=provider_name,
+                                model=model_id,
+                                pressure=retry_pressure,
+                            ),
+                        )
+                        retry_result["next_retry_job_id"] = next_retry.id
+                        retry_result["next_retry_attempt"] = retry_attempt + 1
+                    pressure = retry_pressure
+                self.jobs.fail(
+                    running.id,
+                    error=_safe_error_text(exc),
+                    result=retry_result,
+                )
+                log_error_event(
+                    "chat.state_extraction_retry_failed",
+                    save_id=retry_save_id,
+                    retry_job_id=running.id,
+                    retry_attempt=retry_attempt,
+                    max_retry_attempts=max_retry_attempts,
+                    **exception_log_fields(exc),
+                )
+                continue
+            context_retry_job = self._ensure_context_update_retry_job(
+                save_id=retry_save_id,
+                source_message_ids=source_message_ids,
+                reason="state_extraction_retry_succeeded",
+            )
+            success_result: dict[str, object] = {
+                "source_message_ids": list(source_message_ids),
+                "state_change_count": len(applied.state_changes),
+                "memory_count": len(applied.memories),
+                "context_retry_job_id": context_retry_job.id,
+            }
+            if applied.suppressed_memory_count:
+                success_result["suppressed_memory_count"] = (
+                    applied.suppressed_memory_count
+                )
+            if applied.suppressed_state_change_count:
+                success_result["suppressed_state_change_count"] = (
+                    applied.suppressed_state_change_count
+                )
+            self.jobs.succeed(running.id, result=success_result)
+            completed += 1
+        return completed
 
     async def run_context_update_retries(self, *, save_id: str | None = None) -> int:
         retry_jobs = [
@@ -4369,6 +4621,110 @@ class ChatService:
                 limit=50,
             )
         )
+
+    def _state_extractor_for_model(
+        self,
+        *,
+        provider: ProviderClient,
+        provider_name: str,
+        model_id: str,
+    ) -> StateExtractor | None:
+        supports_tool_calling = isinstance(
+            provider,
+            ToolCallProvider,
+        ) and _model_supports_tool_calling(
+            repositories=self.repositories,
+            provider=provider_name,
+            model_id=model_id,
+        )
+        supports_structured_output = isinstance(
+            provider,
+            StructuredOutputProvider,
+        ) and _model_supports_structured_output(
+            repositories=self.repositories,
+            provider=provider_name,
+            model_id=model_id,
+        )
+        if supports_tool_calling:
+            return ToolCallingProviderStateExtractor(
+                provider=cast(ToolCallProvider, provider),
+                provider_name=provider_name,
+                model_id=model_id,
+                repositories=self.repositories,
+                providers=self.providers,
+                prompt_inspection_store=self.prompt_inspection_store,
+            )
+        if supports_structured_output:
+            return StructuredProviderStateExtractor(
+                provider=cast(StructuredOutputProvider, provider),
+                provider_name=provider_name,
+                model_id=model_id,
+                repositories=self.repositories,
+                providers=self.providers,
+            )
+        return None
+
+    async def _extract_and_apply_state_for_turn(
+        self,
+        *,
+        extractor: StateExtractor,
+        save_id: str,
+        player_message_id: str,
+        narrator_message_id: str,
+        include_memories: bool,
+        inference_mode: str,
+        verified_coverage: VerifiedPostTurnCoverage,
+    ) -> AppliedExtraction:
+        suppressed_memory_fingerprints = (
+            verified_coverage.memory_fingerprints
+            if inference_mode == POST_TURN_INFERENCE_MODE_HYBRID
+            else frozenset()
+        )
+        suppressed_state_keys = (
+            verified_coverage.state_keys
+            if inference_mode == POST_TURN_INFERENCE_MODE_HYBRID
+            else frozenset()
+        )
+        return await StateService(
+            repositories=self.repositories,
+            extractor=extractor,
+        ).extract_and_apply_turn(
+            save_id=save_id,
+            source_message_ids=(player_message_id, narrator_message_id),
+            include_memories=include_memories,
+            suppressed_memory_fingerprints=suppressed_memory_fingerprints,
+            suppressed_state_keys=suppressed_state_keys,
+        )
+
+    def _state_extractor_for_retry(
+        self,
+        save_id: str,
+        *,
+        payload: dict[str, object],
+    ) -> tuple[StateExtractor, str, str] | None:
+        provider_name = payload.get("provider")
+        model_id = payload.get("model")
+        if not isinstance(provider_name, str) or not isinstance(model_id, str):
+            preference = roleplay_model_preference(
+                repositories=self.repositories,
+                save_id=save_id,
+                purpose="state_memory",
+            )
+            if preference is None:
+                return None
+            provider_name = preference.provider
+            model_id = preference.model_id
+        provider = self.providers.get(provider_name)
+        if provider is None:
+            return None
+        extractor = self._state_extractor_for_model(
+            provider=provider,
+            provider_name=provider_name,
+            model_id=model_id,
+        )
+        if extractor is None:
+            return None
+        return extractor, provider_name, model_id
 
     def _context_update_service_for_retry(
         self,
@@ -5523,25 +5879,16 @@ class ChatService:
         if preference is None:
             return "skipped"
         provider = self.providers.get(preference.provider)
-        supports_tool_calling = (
-            provider is not None
-            and isinstance(provider, ToolCallProvider)
-            and _model_supports_tool_calling(
-                repositories=self.repositories,
-                provider=preference.provider,
+        extractor = (
+            self._state_extractor_for_model(
+                provider=provider,
+                provider_name=preference.provider,
                 model_id=preference.model_id,
             )
+            if provider is not None
+            else None
         )
-        supports_structured_output = (
-            provider is not None
-            and isinstance(provider, StructuredOutputProvider)
-            and _model_supports_structured_output(
-                repositories=self.repositories,
-                provider=preference.provider,
-                model_id=preference.model_id,
-            )
-        )
-        if not supports_tool_calling and not supports_structured_output:
+        if extractor is None:
             log_error_event(
                 "chat.state_extraction_skipped",
                 save_id=save_id,
@@ -5553,76 +5900,57 @@ class ChatService:
                 ),
             )
             return "skipped"
-        extractor: StateExtractor
-        if supports_tool_calling:
-            extractor = ToolCallingProviderStateExtractor(
-                provider=cast(ToolCallProvider, provider),
-                provider_name=preference.provider,
-                model_id=preference.model_id,
-                repositories=self.repositories,
-                providers=self.providers,
-                prompt_inspection_store=self.prompt_inspection_store,
-            )
-        else:
-            extractor = StructuredProviderStateExtractor(
-                provider=cast(StructuredOutputProvider, provider),
-                provider_name=preference.provider,
-                model_id=preference.model_id,
-                repositories=self.repositories,
-                providers=self.providers,
-            )
+        include_memories = True
         try:
             include_memories = not self._agentic_memory_curation_available(
                 save_id=save_id,
             )
-            suppressed_memory_fingerprints = (
-                verified_coverage.memory_fingerprints
-                if inference_mode == POST_TURN_INFERENCE_MODE_HYBRID
-                else frozenset()
-            )
-            suppressed_state_keys = (
-                verified_coverage.state_keys
-                if inference_mode == POST_TURN_INFERENCE_MODE_HYBRID
-                else frozenset()
-            )
-            applied = await StateService(
-                repositories=self.repositories,
+            applied = await self._extract_and_apply_state_for_turn(
                 extractor=extractor,
-            ).extract_and_apply_turn(
+                save_id=save_id,
+                player_message_id=player_message_id,
+                narrator_message_id=narrator_message_id,
+                include_memories=include_memories,
+                inference_mode=inference_mode,
+                verified_coverage=verified_coverage,
+            )
+            return _state_extraction_step_result(
+                applied,
+                inference_mode=inference_mode,
+                verified_coverage=verified_coverage,
+            )
+        except Exception as exc:
+            pressure = provider_pressure_from_exception(exc)
+            retry_job = self._ensure_state_extraction_retry_job(
                 save_id=save_id,
                 source_message_ids=(player_message_id, narrator_message_id),
                 include_memories=include_memories,
-                suppressed_memory_fingerprints=suppressed_memory_fingerprints,
-                suppressed_state_keys=suppressed_state_keys,
+                inference_mode=inference_mode,
+                verified_coverage=verified_coverage,
+                reason="post_turn_state_failed",
+                provider=preference.provider,
+                model=preference.model_id,
+                pressure=pressure,
             )
-            result: dict[str, object] = {
-                "state_change_count": len(applied.state_changes),
-                "memory_count": len(applied.memories),
-                "verified_plan_coverage": verified_coverage.to_json(),
-            }
-            if applied.suppressed_memory_count:
-                result["suppressed_memory_count"] = applied.suppressed_memory_count
-            if applied.suppressed_state_change_count:
-                result["suppressed_state_change_count"] = (
-                    applied.suppressed_state_change_count
-                )
-            if (
-                applied.suppressed_memory_count
-                or applied.suppressed_state_change_count
-            ):
-                return _PostTurnStepResult(status="narrowed", result=result)
-            if inference_mode == POST_TURN_INFERENCE_MODE_HYBRID:
-                return _PostTurnStepResult(status="succeeded", result=result)
-            return "succeeded"
-        except Exception as exc:
             log_error_event(
                 "chat.state_extraction_failed",
                 save_id=save_id,
+                retry_job_id=retry_job.id,
                 provider=preference.provider,
                 model=preference.model_id,
                 **exception_log_fields(exc),
             )
-            return "failed"
+            result: dict[str, object] = {
+                "state_extraction_failed": True,
+                "retry_job_id": retry_job.id,
+                "source_message_ids": [player_message_id, narrator_message_id],
+                "retry_attempt": _retry_attempt(retry_job.payload),
+                "max_retry_attempts": _retry_max_attempts(retry_job.payload),
+                "verified_plan_coverage": verified_coverage.to_json(),
+            }
+            if pressure is not None:
+                result["provider_pressure"] = pressure.to_result()
+            return _PostTurnStepResult(status="failed", result=result)
 
     def _agentic_memory_curation_available(self, *, save_id: str) -> bool:
         if not agentic_context_pipeline_enabled(self.repositories, save_id=save_id):
@@ -6006,6 +6334,129 @@ class ChatService:
                 result=dict(result),
             )
         return None
+
+    def _ensure_state_extraction_retry_job(
+        self,
+        *,
+        save_id: str,
+        source_message_ids: tuple[str, ...],
+        include_memories: bool,
+        inference_mode: str,
+        verified_coverage: VerifiedPostTurnCoverage,
+        reason: str,
+        provider: str | None = None,
+        model: str | None = None,
+        pressure: ProviderPressure | None = None,
+    ) -> JobRecord:
+        existing = self._queued_state_extraction_retry_job(
+            save_id=save_id,
+            source_message_ids=source_message_ids,
+        )
+        payload = _state_extraction_retry_payload(
+            source_message_ids=source_message_ids,
+            reason=reason,
+            retry_attempt=(
+                _retry_attempt(existing.payload) if existing is not None else 1
+            ),
+            max_retry_attempts=(
+                _retry_max_attempts(existing.payload)
+                if existing is not None
+                else STATE_EXTRACTION_RETRY_MAX_ATTEMPTS
+            ),
+            include_memories=include_memories,
+            inference_mode=inference_mode,
+            verified_coverage=verified_coverage,
+            existing_payload=existing.payload if existing is not None else None,
+            provider=provider,
+            model=model,
+            pressure=pressure,
+        )
+        if existing is not None:
+            return self.repositories.update_queued_job_payload(
+                existing.id,
+                payload=payload,
+            )
+        return self.jobs.create_queued(
+            save_id=save_id,
+            type=STATE_EXTRACTION_RETRY_JOB_TYPE,
+            payload=payload,
+        )
+
+    def _defer_state_extraction_retry_job(
+        self,
+        retry_job: JobRecord,
+        *,
+        pressure: ProviderPressure,
+    ) -> JobRecord:
+        deferred_count = _non_negative_int(
+            retry_job.payload.get("deferred_count")
+        ) + 1
+        payload = {
+            **retry_job.payload,
+            "retry_attempt": _retry_attempt(retry_job.payload),
+            "max_retry_attempts": _retry_max_attempts(retry_job.payload),
+            "deferred_count": deferred_count,
+            "last_deferred_reason": "provider_pressure",
+            "last_pressure_category": pressure.error_category,
+        }
+        if pressure.http_status is not None:
+            payload["last_pressure_http_status"] = pressure.http_status
+        if pressure.source_job_id is not None:
+            payload["last_pressure_job_id"] = pressure.source_job_id
+        updated = self.repositories.update_queued_job_payload(
+            retry_job.id,
+            payload=payload,
+        )
+        log_event(
+            "chat.state_extraction_retry_deferred_provider_pressure",
+            save_id=retry_job.save_id,
+            retry_job_id=retry_job.id,
+            deferred_count=deferred_count,
+            **pressure.to_result(),
+        )
+        return updated
+
+    def _queued_state_extraction_retry_job(
+        self,
+        *,
+        save_id: str,
+        source_message_ids: tuple[str, ...],
+    ) -> JobRecord | None:
+        expected_ids = tuple(source_message_ids)
+        for job in self.repositories.list_jobs_by_status(("queued",)):
+            if (
+                job.type != STATE_EXTRACTION_RETRY_JOB_TYPE
+                or job.save_id != save_id
+            ):
+                continue
+            if _retry_source_message_ids(job.payload) == expected_ids:
+                return job
+        return None
+
+    def _successful_state_extraction_exists(
+        self,
+        *,
+        save_id: str,
+        source_message_ids: tuple[str, ...],
+    ) -> bool:
+        expected_ids = tuple(source_message_ids)
+        return any(
+            _retry_source_message_ids(job.payload) == expected_ids
+            for job in self.repositories.list_recent_jobs(
+                save_id=save_id,
+                types=("state_extraction",),
+                statuses=("succeeded",),
+                seconds=0,
+                limit=50,
+            )
+        )
+
+    def _queued_state_extraction_retry_count(self, *, save_id: str) -> int:
+        return sum(
+            1
+            for job in self.repositories.list_jobs_by_status(("queued",))
+            if job.type == STATE_EXTRACTION_RETRY_JOB_TYPE and job.save_id == save_id
+        )
 
     def _ensure_context_update_retry_job(
         self,
@@ -6464,6 +6915,28 @@ def _post_turn_telemetry_status(status: str) -> str:
     if status == "queued":
         return "succeeded"
     return status
+
+
+def _state_extraction_step_result(
+    applied: AppliedExtraction,
+    *,
+    inference_mode: str,
+    verified_coverage: VerifiedPostTurnCoverage,
+) -> str | _PostTurnStepResult:
+    result: dict[str, object] = {
+        "state_change_count": len(applied.state_changes),
+        "memory_count": len(applied.memories),
+        "verified_plan_coverage": verified_coverage.to_json(),
+    }
+    if applied.suppressed_memory_count:
+        result["suppressed_memory_count"] = applied.suppressed_memory_count
+    if applied.suppressed_state_change_count:
+        result["suppressed_state_change_count"] = applied.suppressed_state_change_count
+    if applied.suppressed_memory_count or applied.suppressed_state_change_count:
+        return _PostTurnStepResult(status="narrowed", result=result)
+    if inference_mode == POST_TURN_INFERENCE_MODE_HYBRID:
+        return _PostTurnStepResult(status="succeeded", result=result)
+    return "succeeded"
 
 
 def _narrator_messages(
@@ -9345,6 +9818,52 @@ def _retry_source_message_ids(payload: dict[str, object]) -> tuple[str, ...]:
     return tuple(item for item in raw_ids if isinstance(item, str) and item)
 
 
+def _state_extraction_retry_payload(
+    *,
+    source_message_ids: tuple[str, ...],
+    reason: str,
+    retry_attempt: int,
+    max_retry_attempts: int,
+    include_memories: bool,
+    inference_mode: str,
+    verified_coverage: VerifiedPostTurnCoverage,
+    existing_payload: dict[str, object] | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    pressure: ProviderPressure | None = None,
+) -> dict[str, object]:
+    payload = dict(existing_payload or {})
+    payload.update(
+        {
+            "source_message_ids": list(source_message_ids),
+            "reason": reason,
+            "retry_attempt": max(1, retry_attempt),
+            "max_retry_attempts": max(1, max_retry_attempts),
+            "include_memories": include_memories,
+            "effective_post_turn_inference_mode": inference_mode,
+            "verified_plan_coverage": verified_coverage.to_json(),
+        }
+    )
+    if provider is not None:
+        payload["provider"] = provider
+    elif "provider" not in payload:
+        payload["provider"] = None
+    if model is not None:
+        payload["model"] = model
+    elif "model" not in payload:
+        payload["model"] = None
+    if pressure is not None:
+        payload["last_deferred_reason"] = (
+            "provider_pressure" if reason == "provider_pressure_deferred" else reason
+        )
+        payload["last_pressure_category"] = pressure.error_category
+        if pressure.http_status is not None:
+            payload["last_pressure_http_status"] = pressure.http_status
+        if pressure.source_job_id is not None:
+            payload["last_pressure_job_id"] = pressure.source_job_id
+    return payload
+
+
 def _context_update_retry_payload(
     *,
     source_message_ids: tuple[str, ...],
@@ -9383,6 +9902,22 @@ def _context_update_retry_payload(
         if pressure.source_job_id is not None:
             payload["last_pressure_job_id"] = pressure.source_job_id
     return payload
+
+
+def _state_retry_include_memories(payload: dict[str, object]) -> bool:
+    value = payload.get("include_memories")
+    return value if isinstance(value, bool) else True
+
+
+def _state_retry_inference_mode(payload: dict[str, object]) -> str:
+    value = payload.get("effective_post_turn_inference_mode")
+    if isinstance(value, str) and value in {
+        POST_TURN_INFERENCE_MODE_HYBRID,
+        POST_TURN_INFERENCE_MODE_LEGACY,
+        POST_TURN_INFERENCE_MODE_PLAN_OWNED,
+    }:
+        return value
+    return POST_TURN_INFERENCE_MODE_LEGACY
 
 
 def _retry_attempt(payload: dict[str, object]) -> int:

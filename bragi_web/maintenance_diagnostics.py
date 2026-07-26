@@ -17,6 +17,8 @@ _DIAGNOSTIC_JOB_TYPES = (
     "guided_context_cleanup",
     "memory_consolidation",
     "post_turn_jobs",
+    "state_extraction_retry",
+    "state_extraction_retry_drain",
     "state_pruning",
     "summary_backfill",
     "world_context_retention",

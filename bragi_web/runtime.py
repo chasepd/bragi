@@ -473,6 +473,7 @@ def create_state() -> WebAppState:
             repositories=cast(Any, repositories),
         ).recover_stale_jobs(
             preserve_queued_types=(
+                "state_extraction_retry",
                 "context_update_retry",
                 CHARACTER_TEXT_WORLD_UPDATE_RETRY_JOB_TYPE,
             ),

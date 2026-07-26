@@ -18,6 +18,7 @@ from bragi_web.serialization import to_jsonable
 
 WORLD_SUGGESTION_REVIEW_TASK = "world_suggestion_review"
 STATE_PRUNING_TASK = "state_pruning"
+STATE_EXTRACTION_RETRY_DRAIN_TASK = "state_extraction_retry_drain"
 CONTEXT_UPDATE_RETRY_DRAIN_TASK = "context_update_retry_drain"
 CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_TASK = (
     "character_text_world_update_retry_drain"
@@ -34,6 +35,7 @@ WEB_MAINTENANCE_CHARACTER_REGISTRY_MAINTENANCE_JOB = (
     "web_maintenance_character_registry_maintenance"
 )
 _RETRY_DRAIN_JOB_TYPES = {
+    STATE_EXTRACTION_RETRY_DRAIN_TASK: "state_extraction_retry",
     CONTEXT_UPDATE_RETRY_DRAIN_TASK: "context_update_retry",
     CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_TASK: (
         "character_text_world_update_retry"
@@ -42,6 +44,7 @@ _RETRY_DRAIN_JOB_TYPES = {
 
 WORLD_SUGGESTION_REVIEW_INTERVAL_SECONDS = 60
 STATE_PRUNING_INTERVAL_SECONDS = 60
+STATE_EXTRACTION_RETRY_DRAIN_INTERVAL_SECONDS = 60
 CONTEXT_UPDATE_RETRY_DRAIN_INTERVAL_SECONDS = 60
 CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_INTERVAL_SECONDS = 60
 WORLD_CONTEXT_RETENTION_INTERVAL_SECONDS = 15 * 60
@@ -141,6 +144,10 @@ class WebMaintenanceScheduler:
             for save_ids in target_save_ids_by_task.values()
             for save_id in save_ids
         }
+        state_retry_active_at_start = {
+            save_id: _has_active_state_extraction_retry(repositories, save_id)
+            for save_id in target_save_ids
+        }
         context_retry_active_at_start = {
             save_id: _has_active_context_update_retry(repositories, save_id)
             for save_id in target_save_ids
@@ -155,6 +162,11 @@ class WebMaintenanceScheduler:
                         save_id=save_id,
                         skip_reason="active_same_save_job",
                     )
+                    continue
+                if (
+                    state_retry_active_at_start.get(save_id, False)
+                    and definition.task_type in _STATE_RETRY_BLOCKED_TASKS
+                ):
                     continue
                 if (
                     context_retry_active_at_start.get(save_id, False)
@@ -662,6 +674,22 @@ def _context_update_retry_drain_due(repositories: Any, save_id: str) -> bool:
     )
 
 
+def _state_extraction_retry_drain_due(repositories: Any, save_id: str) -> bool:
+    has_matching_job = getattr(repositories, "has_matching_job", None)
+    if callable(has_matching_job):
+        return bool(
+            has_matching_job(
+                statuses=("queued",),
+                types=("state_extraction_retry",),
+                save_id=save_id,
+            )
+        )
+    return any(
+        job.type == "state_extraction_retry" and job.save_id == save_id
+        for job in repositories.list_jobs_by_status(("queued",))
+    )
+
+
 def _character_text_world_update_retry_drain_due(
     repositories: Any,
     save_id: str,
@@ -693,7 +721,10 @@ def _memory_consolidation_due(repositories: Any, save_id: str) -> bool:
         MEMORY_CONSOLIDATION_THRESHOLD,
     )
 
-    if _has_active_context_update_retry(repositories, save_id):
+    if _has_active_state_extraction_retry(
+        repositories,
+        save_id,
+    ) or _has_active_context_update_retry(repositories, save_id):
         return False
     if not _model_preference_configured(
         repositories,
@@ -708,7 +739,10 @@ def _memory_consolidation_due(repositories: Any, save_id: str) -> bool:
 
 
 def _character_registry_maintenance_due(repositories: Any, save_id: str) -> bool:
-    if _has_active_context_update_retry(repositories, save_id):
+    if _has_active_state_extraction_retry(
+        repositories,
+        save_id,
+    ) or _has_active_context_update_retry(repositories, save_id):
         return False
     if not _model_preference_configured(
         repositories,
@@ -751,6 +785,22 @@ def _has_active_context_update_retry(repositories: Any, save_id: str) -> bool:
         )
     return any(
         job.type == "context_update_retry" and job.save_id == save_id
+        for job in repositories.list_jobs_by_status(("queued", "running"))
+    )
+
+
+def _has_active_state_extraction_retry(repositories: Any, save_id: str) -> bool:
+    has_matching_job = getattr(repositories, "has_matching_job", None)
+    if callable(has_matching_job):
+        return bool(
+            has_matching_job(
+                statuses=("queued", "running"),
+                types=("state_extraction_retry",),
+                save_id=save_id,
+            )
+        )
+    return any(
+        job.type == "state_extraction_retry" and job.save_id == save_id
         for job in repositories.list_jobs_by_status(("queued", "running"))
     )
 
@@ -884,6 +934,14 @@ _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
         cache_policy_checks=True,
     ),
     _MaintenanceTaskDefinition(
+        task_type=STATE_EXTRACTION_RETRY_DRAIN_TASK,
+        interval_seconds=STATE_EXTRACTION_RETRY_DRAIN_INTERVAL_SECONDS,
+        progress_label="Retrying state extraction",
+        runtime_method="run_state_extraction_retries",
+        event_reason="state_extraction_retry",
+        should_schedule=_state_extraction_retry_drain_due,
+    ),
+    _MaintenanceTaskDefinition(
         task_type=CONTEXT_UPDATE_RETRY_DRAIN_TASK,
         interval_seconds=CONTEXT_UPDATE_RETRY_DRAIN_INTERVAL_SECONDS,
         progress_label="Retrying context updates",
@@ -929,6 +987,14 @@ _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
         job_type=WEB_MAINTENANCE_CHARACTER_REGISTRY_MAINTENANCE_JOB,
         cache_policy_checks=True,
     ),
+)
+
+_STATE_RETRY_BLOCKED_TASKS = frozenset(
+    {
+        CONTEXT_UPDATE_RETRY_DRAIN_TASK,
+        MEMORY_CONSOLIDATION_TASK,
+        CHARACTER_REGISTRY_MAINTENANCE_TASK,
+    }
 )
 
 _CONTEXT_RETRY_BLOCKED_TASKS = frozenset(

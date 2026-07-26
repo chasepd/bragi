@@ -20,6 +20,7 @@ from bragi_web.scheduler import (
     CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_TASK,
     CONTEXT_UPDATE_RETRY_DRAIN_TASK,
     MEMORY_CONSOLIDATION_TASK,
+    STATE_EXTRACTION_RETRY_DRAIN_TASK,
     STATE_PRUNING_TASK,
     WEB_MAINTENANCE_CHARACTER_REGISTRY_MAINTENANCE_JOB,
     WORLD_CONTEXT_RETENTION_TASK,
@@ -556,6 +557,118 @@ def test_scheduler_drains_context_update_retry_for_active_save(
     assert retry_job.id in {
         job.id for job in repositories.list_jobs_by_status(("queued",))
     }
+
+
+def test_scheduler_drains_state_extraction_retry_for_active_save(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_id = _save(repositories, title="Night Watch")
+    retry_job = repositories.create_job(
+        save_id=save_id,
+        type="state_extraction_retry",
+        status="queued",
+        payload={"source_message_ids": ["player-1", "narrator-1"]},
+    )
+    runtime = _ReviewRuntime(active_save_id=save_id)
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.state_retry_calls == [save_id]
+    assert runtime.context_retry_calls == []
+    task = repositories.get_scheduled_task(
+        task_type=STATE_EXTRACTION_RETRY_DRAIN_TASK,
+        save_id=save_id,
+    )
+    assert task is not None
+    assert task.failure_count == 0
+    assert retry_job.id in {
+        job.id for job in repositories.list_jobs_by_status(("queued",))
+    }
+
+
+def test_scheduler_drains_state_extraction_retry_for_inactive_save(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    active_save_id = _save(repositories, title="Active Save")
+    inactive_save_id = _save(repositories, title="Inactive Save")
+    retry_job = repositories.create_job(
+        save_id=inactive_save_id,
+        type="state_extraction_retry",
+        status="queued",
+        payload={"source_message_ids": ["player-1", "narrator-1"]},
+    )
+    runtime = _ReviewRuntime(active_save_id=active_save_id)
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.state_retry_calls == [inactive_save_id]
+    assert runtime.context_retry_calls == []
+    task = repositories.get_scheduled_task(
+        task_type=STATE_EXTRACTION_RETRY_DRAIN_TASK,
+        save_id=inactive_save_id,
+    )
+    assert task is not None
+    assert task.failure_count == 0
+    assert retry_job.id in {
+        job.id for job in repositories.list_jobs_by_status(("queued",))
+    }
+
+
+def test_scheduler_prioritizes_state_retry_before_context_retry(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_id = _save(repositories, title="Night Watch")
+    repositories.create_job(
+        save_id=save_id,
+        type="state_extraction_retry",
+        status="queued",
+        payload={"source_message_ids": ["player-1", "narrator-1"]},
+    )
+    repositories.create_job(
+        save_id=save_id,
+        type="context_update_retry",
+        status="queued",
+        payload={"source_message_ids": ["player-1", "narrator-1"]},
+    )
+    runtime = _ReviewRuntime(active_save_id=save_id)
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.state_retry_calls == [save_id]
+    assert runtime.context_retry_calls == []
 
 
 def test_scheduler_drains_context_update_retry_for_inactive_save(
@@ -1160,6 +1273,7 @@ class _ReviewRuntime:
         self.active_save_id = active_save_id
         self.calls: list[str] = []
         self.state_pruning_calls: list[str] = []
+        self.state_retry_calls: list[str] = []
         self.context_retry_calls: list[str] = []
         self.character_text_world_update_retry_calls: list[str] = []
         self.memory_consolidation_calls: list[str] = []
@@ -1181,6 +1295,10 @@ class _ReviewRuntime:
 
     async def run_context_update_retries(self, *, active_save_id: str) -> object:
         self.context_retry_calls.append(active_save_id)
+        return {"active_save_id": active_save_id, "completed": 0, "error": None}
+
+    async def run_state_extraction_retries(self, *, active_save_id: str) -> object:
+        self.state_retry_calls.append(active_save_id)
         return {"active_save_id": active_save_id, "completed": 0, "error": None}
 
     async def run_character_text_world_update_retries(

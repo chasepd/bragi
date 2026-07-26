@@ -337,6 +337,8 @@ def test_retention_prunes_terminal_scheduler_jobs(
     save, _message_id = _persist_save(repositories)
     scheduler_job_types = (
         "world_suggestion_review",
+        "state_extraction_retry",
+        "state_extraction_retry_drain",
         "context_update_retry_drain",
         "web_maintenance_state_pruning",
         "web_maintenance_world_context_retention",
@@ -373,7 +375,7 @@ def test_retention_prunes_terminal_scheduler_jobs(
         assert _job_ids(repositories, save.id, job_type=job_type) == [
             f"{job_type}-2"
         ]
-    assert result.pruned_terminal_jobs == 12
+    assert result.pruned_terminal_jobs == 16
 
 
 def test_retention_counts_current_retention_job_toward_terminal_job_limit(

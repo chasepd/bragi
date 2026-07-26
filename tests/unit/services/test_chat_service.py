@@ -11282,16 +11282,16 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
     assert final_statuses == {
         "state": "succeeded",
         "context": "failed",
-        "time_reconciliation": "skipped",
-        "proactive_text": "skipped",
-        "director": "skipped",
+        "time_reconciliation": "blocked_dependency",
+        "proactive_text": "blocked_dependency",
+        "director": "blocked_dependency",
         "scenario": "skipped",
         "image": "failed",
     }
     assert progress_updates[-1].status_text == (
         "Post-turn: state succeeded, context failed, "
-        "time_reconciliation skipped, proactive_text skipped, director skipped, "
-        "scenario skipped, image failed"
+        "time_reconciliation blocked_dependency, proactive_text blocked_dependency, "
+        "director blocked_dependency, scenario skipped, image failed"
     )
     assert all(
         [job.name for job in progress.jobs]
@@ -11309,7 +11309,14 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
     seen_statuses = {
         job.status for progress in progress_updates for job in progress.jobs
     }
-    assert {"pending", "running", "succeeded", "failed", "skipped"} <= seen_statuses
+    assert {
+        "pending",
+        "running",
+        "succeeded",
+        "failed",
+        "skipped",
+        "blocked_dependency",
+    } <= seen_statuses
 
     jobs = _post_turn_jobs(repositories, save.id)
     assert len(jobs) == 1
@@ -11331,14 +11338,14 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
     assert [(job["name"], job["status"]) for job in result_jobs] == [
         ("state", "succeeded"),
         ("context", "failed"),
-        ("time_reconciliation", "skipped"),
-        ("proactive_text", "skipped"),
-        ("director", "skipped"),
+        ("time_reconciliation", "blocked_dependency"),
+        ("proactive_text", "blocked_dependency"),
+        ("director", "blocked_dependency"),
         ("scenario", "skipped"),
         ("image", "failed"),
     ]
-    assert result_jobs[2]["result"]["skipped_reason"] == "checker_unavailable"
-    assert result_jobs[3]["result"]["reason"] == "texts_disabled"
+    assert result_jobs[2]["result"]["blocked_by"] == "context"
+    assert result_jobs[3]["result"]["blocked_by"] == "time_reconciliation"
     steps = repositories.list_job_steps(jobs[0]["id"])
     step_by_name = {step.name: step for step in steps}
     assert {
@@ -11347,9 +11354,9 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
     } == {
         "state": ("succeeded", "state_memory"),
         "context": ("failed", "context_update"),
-        "time_reconciliation": ("skipped", "context_update"),
-        "proactive_text": ("skipped", "chat"),
-        "director": ("skipped", "director_pressure"),
+        "time_reconciliation": ("blocked_dependency", "context_update"),
+        "proactive_text": ("blocked_dependency", "chat"),
+        "director": ("blocked_dependency", "director_pressure"),
         "scenario": ("skipped", "scenario_evolution"),
         "image": ("failed", "image_generation"),
     }
@@ -11842,6 +11849,228 @@ def test_run_post_turn_jobs_queues_retry_when_continuity_update_fails(
         ]
 
 
+def test_run_post_turn_jobs_queues_state_retry_and_blocks_dependents(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I climb toward the beacon lens.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon lens hums awake.",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-state-memory",
+        display_name="Fake State Memory",
+        capabilities=["structured_output"],
+        context_window=8192,
+    )
+    repositories.set_model_preference(
+        task="state_memory",
+        provider="fake",
+        model_id="fake-state-memory",
+    )
+    events: list[str] = []
+    provider = RecordingStateMemoryProvider(
+        "fake",
+        events=events,
+        structured_error=RuntimeError("state extractor unavailable"),
+    )
+    context_update = RecordingContextUpdateService()
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=None,
+        context_update_service=context_update,
+    )
+
+    asyncio.run(
+        service.run_post_turn_jobs(
+            save_id=save.id,
+            player_message_id=player_message.id,
+            narrator_message_id=narrator_message.id,
+        )
+    )
+
+    assert events == ["state_memory_extraction"]
+    assert context_update.calls == []
+    coordinator = _post_turn_jobs(repositories, save.id)[0]
+    assert _post_turn_child_status(coordinator, "state") == "failed"
+    assert _post_turn_child_status(coordinator, "context") == "blocked_dependency"
+    assert (
+        _post_turn_child_status(coordinator, "time_reconciliation")
+        == "blocked_dependency"
+    )
+    blocked_context = _post_turn_child_result(coordinator, "context")
+    assert blocked_context == {
+        "blocked_by": "state",
+        "blocked_dependency_status": "failed",
+        "source_message_ids": [player_message.id, narrator_message.id],
+    }
+    state_retry_jobs = [
+        job
+        for job in repositories.list_jobs_by_status(("queued",))
+        if job.type == "state_extraction_retry"
+    ]
+    assert len(state_retry_jobs) == 1
+    assert state_retry_jobs[0].payload["source_message_ids"] == [
+        player_message.id,
+        narrator_message.id,
+    ]
+    assert state_retry_jobs[0].payload["reason"] == "post_turn_state_failed"
+    assert coordinator["result"]["maintenance_failed_jobs"] == ["state"]
+    assert not [
+        job
+        for job in repositories.list_jobs_by_status(("queued",))
+        if job.type == "context_update_retry"
+    ]
+
+
+def test_run_state_extraction_retries_applies_once_and_queues_context_retry(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I climb toward the beacon lens.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon lens hums awake.",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-state-memory",
+        display_name="Fake State Memory",
+        capabilities=["structured_output"],
+        context_window=8192,
+    )
+    repositories.set_model_preference(
+        task="state_memory",
+        provider="fake",
+        model_id="fake-state-memory",
+    )
+    repositories.create_job(
+        save_id=save.id,
+        type="state_extraction_retry",
+        status="queued",
+        payload={
+            "source_message_ids": [player_message.id, narrator_message.id],
+            "reason": "post_turn_state_failed",
+            "retry_attempt": 1,
+            "max_retry_attempts": 3,
+            "provider": "fake",
+            "model": "fake-state-memory",
+            "include_memories": True,
+        },
+    )
+    events: list[str] = []
+    provider = RecordingStateMemoryProvider(
+        "fake",
+        events=events,
+        structured_data={
+            "state_changes": [
+                {
+                    "operation": "upsert",
+                    "key": "scene.location",
+                    "value": {"name": "Beacon gallery"},
+                    "category": "scene",
+                    "confidence": 0.87,
+                    "evidence_quote": "The beacon lens hums awake.",
+                }
+            ],
+            "memories": [
+                {
+                    "body": "Mara promised Elian she would keep the beacon lit.",
+                    "tags": ["beacon", "promise"],
+                    "importance": 0.91,
+                    "evidence_quote": "The beacon lens hums awake.",
+                }
+            ],
+        },
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=None,
+    )
+
+    completed = asyncio.run(service.run_state_extraction_retries(save_id=save.id))
+
+    assert completed == 1
+    assert events == ["state_memory_extraction"]
+    assert [
+        (state.key, state.value)
+        for state in repositories.list_world_state(save.id)
+    ] == [("scene.location", {"name": "Beacon gallery"})]
+    assert [memory.body for memory in repositories.list_memories(save.id)] == [
+        "Mara promised Elian she would keep the beacon lit."
+    ]
+    context_retries = [
+        job
+        for job in repositories.list_jobs_by_status(("queued",))
+        if job.type == "context_update_retry"
+    ]
+    assert len(context_retries) == 1
+    assert context_retries[0].payload["reason"] == "state_extraction_retry_succeeded"
+    assert context_retries[0].payload["source_message_ids"] == [
+        player_message.id,
+        narrator_message.id,
+    ]
+    repositories.create_job(
+        save_id=save.id,
+        type="state_extraction_retry",
+        status="queued",
+        payload={
+            "source_message_ids": [player_message.id, narrator_message.id],
+            "reason": "post_turn_state_failed",
+            "retry_attempt": 1,
+            "max_retry_attempts": 3,
+            "provider": "fake",
+            "model": "fake-state-memory",
+            "include_memories": True,
+        },
+    )
+
+    completed_again = asyncio.run(service.run_state_extraction_retries(save_id=save.id))
+
+    assert completed_again == 1
+    assert events == ["state_memory_extraction"]
+    assert [memory.body for memory in repositories.list_memories(save.id)] == [
+        "Mara promised Elian she would keep the beacon lit."
+    ]
+    assert [
+        job
+        for job in repositories.list_jobs_by_status(("queued",))
+        if job.type == "context_update_retry"
+    ] == context_retries
+
+
 def test_run_post_turn_jobs_defers_low_priority_work_after_provider_pressure(
     repositories: PersistenceRepositories,
     monkeypatch: pytest.MonkeyPatch,
@@ -11948,38 +12177,29 @@ def test_run_post_turn_jobs_defers_low_priority_work_after_provider_pressure(
     assert world_time.called is False
     job = _post_turn_jobs(repositories, save.id)[0]
     assert _post_turn_child_status(job, "state") == "failed"
-    assert _post_turn_child_status(job, "context") == "deferred"
+    assert _post_turn_child_status(job, "context") == "blocked_dependency"
     assert (
         _post_turn_child_status(job, "time_reconciliation")
-        == "skipped_provider_pressure"
+        == "blocked_dependency"
     )
-    assert _post_turn_child_status(job, "director") == "skipped_provider_pressure"
+    assert _post_turn_child_status(job, "director") == "blocked_dependency"
     assert _post_turn_child_status(job, "scenario") == "skipped_provider_pressure"
-    assert _post_turn_child_result(job, "context")["provider_pressure"] == {
-        "reason": "provider_pressure",
-        "error_category": "rate_limited",
-        "http_status": 429,
-        "retry_attempt_count": 3,
-        "max_retry_attempts": 3,
+    assert _post_turn_child_result(job, "context") == {
+        "blocked_by": "state",
+        "blocked_dependency_status": "failed",
+        "source_message_ids": [player_message.id, narrator_message.id],
     }
-    assert _post_turn_child_result(job, "time_reconciliation")[
-        "provider_pressure"
-    ] == {
-        "reason": "provider_pressure",
-        "error_category": "rate_limited",
-        "http_status": 429,
-        "retry_attempt_count": 3,
-        "max_retry_attempts": 3,
+    assert _post_turn_child_result(job, "time_reconciliation") == {
+        "blocked_by": "context",
+        "blocked_dependency_status": "blocked_dependency",
+        "source_message_ids": [player_message.id, narrator_message.id],
     }
     retry_jobs = [
         job
         for job in repositories.list_jobs_by_status(("queued",))
         if job.type == "context_update_retry"
     ]
-    assert len(retry_jobs) == 1
-    assert retry_jobs[0].payload["reason"] == "provider_pressure_deferred"
-    assert retry_jobs[0].payload["retry_attempt"] == 1
-    assert retry_jobs[0].payload["max_retry_attempts"] == 3
+    assert retry_jobs == []
 
 
 def test_run_post_turn_jobs_finishes_sibling_already_started_before_pressure(
@@ -12071,7 +12291,7 @@ def test_run_post_turn_jobs_finishes_sibling_already_started_before_pressure(
     job = _post_turn_jobs(repositories, save.id)[0]
     assert _post_turn_child_status(job, "state") == "failed"
     assert _post_turn_child_status(job, "scenario") == "succeeded"
-    assert _post_turn_child_status(job, "context") == "deferred"
+    assert _post_turn_child_status(job, "context") == "blocked_dependency"
 
 
 def test_run_post_turn_jobs_gates_low_priority_work_after_context_pressure_result(

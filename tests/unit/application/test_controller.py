@@ -8893,6 +8893,121 @@ def test_context_update_retry_wait_does_not_block_initial_render_input_save(
     ]
 
 
+def test_state_extraction_retry_wait_does_not_block_initial_render_input_save(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, _ = _persist_runtime_save(repositories, include_messages=False)
+    _configure_chat_and_context_preferences(repositories)
+    retry_started = asyncio.Event()
+    release_retry = asyncio.Event()
+    input_saved = asyncio.Event()
+    post_input_barrier_released = asyncio.Event()
+
+    class BlockingStateRetryChatService:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        async def run_state_extraction_retries(
+            self,
+            *,
+            save_id: str | None = None,
+        ) -> int:
+            assert save_id == save_id_fixture
+            retry_started.set()
+            await release_retry.wait()
+            return 1
+
+        async def submit_player_turn(
+            self,
+            *,
+            save_id: str,
+            body: str,
+            speaker_name: str | None = None,
+            run_post_turn_jobs: bool = True,
+            cancellation_token: Any,
+            post_input_context: Callable[[], Any] | None = None,
+        ) -> object:
+            assert run_post_turn_jobs is False
+            assert save_id == save_id_fixture
+            cancellation_token.throw_if_cancelled()
+            player = repositories.append_message(
+                save_id=save_id,
+                role="player",
+                speaker_name=speaker_name,
+                body=body,
+            )
+            input_saved.set()
+            assert post_input_context is not None
+            async with post_input_context():
+                post_input_barrier_released.set()
+            narrator = repositories.append_message(
+                save_id=save_id,
+                role="narrator",
+                speaker_name="Narrator",
+                body=f"fake narrator: {body}",
+                provider="fake",
+                model="fake-chat",
+            )
+            return SimpleNamespace(player_message=player, narrator_message=narrator)
+
+    save_id_fixture = save_id
+
+    async def run_retry_and_submit() -> tuple[object, object]:
+        monkeypatch.setattr(runtime, "ChatService", BlockingStateRetryChatService)
+        controller = _runtime_controller(
+            runtime,
+            repositories,
+            tmp_path,
+            context_search_service=NoopContextSearch(),
+        )
+        controller.load_save(save_id)
+        retry_task = asyncio.create_task(
+            controller.run_state_extraction_retries(active_save_id=save_id)
+        )
+        await asyncio.wait_for(retry_started.wait(), timeout=1.0)
+
+        submit_task = asyncio.create_task(
+            controller.submit_player_message_for_initial_render(
+                body="I keep moving while state retries finish.",
+                speaker_name="Mara",
+            )
+        )
+        await asyncio.wait_for(input_saved.wait(), timeout=1.0)
+
+        assert [
+            (message.role, message.body)
+            for message in repositories.list_messages(save_id)
+        ] == [
+            ("player", "I keep moving while state retries finish."),
+        ]
+        assert not post_input_barrier_released.is_set()
+        assert not submit_task.done()
+
+        release_retry.set()
+        return (
+            await asyncio.wait_for(submit_task, timeout=1.0),
+            await asyncio.wait_for(retry_task, timeout=1.0),
+        )
+
+    turn, retry_model = asyncio.run(run_retry_and_submit())
+
+    assert _value(turn, "input_committed") is True
+    assert _error_text(_value(turn, "delta")) == ""
+    assert _status_text(retry_model) == (
+        "State extraction retries finished: 1 completed."
+    )
+    assert [
+        (message.role, message.body)
+        for message in repositories.list_messages(save_id)
+    ] == [
+        ("player", "I keep moving while state retries finish."),
+        ("narrator", "fake narrator: I keep moving while state retries finish."),
+    ]
+
+
 def test_cancelled_async_save_lock_waiter_does_not_leak_thread_lock(
     repositories: PersistenceRepositories,
     tmp_path: Path,
