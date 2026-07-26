@@ -2693,6 +2693,65 @@ def test_send_text_includes_character_texting_style_when_present(
     ) in prompt_text
 
 
+def test_send_text_includes_character_cooperation_conditions(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id = _create_save_with_characters(repositories, scenario_type="dating_sim")
+    npc = next(
+        character
+        for character in repositories.list_characters(save_id)
+        if not character.is_player_character
+    )
+    repositories.update_character(
+        replace(
+            npc,
+            attitude_toward_player="Hostile until Mira apologizes for the prank.",
+            cooperation_conditions=(
+                "Replies usefully only after Mira admits what happened."
+            ),
+        )
+    )
+    repositories.set_model_preference(
+        task="chat_dating_sim",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = RecordingTextProvider()
+    service = CharacterTextService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+    _grant_player_has_number(repositories, save_id, npc.id)
+
+    asyncio.run(
+        service.send_text(
+            save_id=save_id,
+            character_id=npc.id,
+            body="Can you just tell me where the key is?",
+        )
+    )
+
+    request = provider.chat_requests[-1]
+    current_scene_recap = "\n".join(request.current_scene_recap)
+    phone_context = "\n".join(request.phone_context)
+    assert (
+        "Character profile attitude toward player: Hostile until Mira apologizes "
+        "for the prank."
+    ) in current_scene_recap
+    assert (
+        "Character profile cooperation conditions: Replies usefully only after "
+        "Mira admits what happened."
+    ) in current_scene_recap
+    assert (
+        "Known character cooperation conditions: Replies usefully only after "
+        "Mira admits what happened."
+    ) in phone_context
+    assert (
+        "Known character attitude toward player: Hostile until Mira apologizes "
+        "for the prank."
+    ) in phone_context
+
+
 def test_send_text_applies_structured_text_world_updates(
     repositories: PersistenceRepositories,
 ) -> None:

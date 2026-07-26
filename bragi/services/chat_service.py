@@ -8839,6 +8839,12 @@ def _has_voice_profile_context(character: CharacterRecord) -> bool:
             character.known_state,
             character.status,
             character.relationships,
+            character.goals,
+            character.motivations,
+            character.current_intent,
+            character.boundaries,
+            character.attitude_toward_player,
+            character.cooperation_conditions,
         )
     )
 
@@ -8852,6 +8858,12 @@ def _character_voice_profile_text(character: CharacterRecord) -> str:
         ("personality", character.personality),
         ("known state", character.known_state),
         ("status", character.status),
+        ("goals", character.goals),
+        ("motivations", character.motivations),
+        ("current intent", character.current_intent),
+        ("boundaries", character.boundaries),
+        ("attitude toward player", character.attitude_toward_player),
+        ("cooperation conditions", character.cooperation_conditions),
     ):
         if value:
             parts.append(f"{label}: {value}")

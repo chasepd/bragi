@@ -162,7 +162,14 @@ def test_structured_starter_generation_honors_count_and_context() -> None:
                     "voice": "Soft, lilting, and curious.",
                     "goals": "Find a partner who values her creative life.",
                     "motivations": "Share warmth without losing her independence.",
+                    "current_intent": "Test whether the player respects her time.",
                     "boundaries": "Will not rush intimacy before trust is earned.",
+                    "attitude_toward_player": (
+                        "Openly kind but not automatically trusting."
+                    ),
+                    "cooperation_conditions": (
+                        "Cooperates when the player is direct and respectful."
+                    ),
                 },
                 {
                     "name": "Lily Chen",
@@ -175,8 +182,17 @@ def test_structured_starter_generation_honors_count_and_context() -> None:
                     "voice": "Low, dry, and measured.",
                     "goals": "Find someone who enjoys her wit without dismissing it.",
                     "motivations": "Test whether hope is worth the risk.",
+                    "current_intent": (
+                        "Push back before deciding whether the player is worth time."
+                    ),
                     "boundaries": (
                         "Will not tolerate condescension about her guardedness."
+                    ),
+                    "attitude_toward_player": (
+                        "Guarded, skeptical, and willing to be unfair at first."
+                    ),
+                    "cooperation_conditions": (
+                        "Helps only after the player treats her skepticism seriously."
                     ),
                 },
             ]
@@ -225,6 +241,30 @@ def test_structured_starter_generation_honors_count_and_context() -> None:
     assert "A speed dating night starts with a power outage." in request_body
     assert "James Mitchell" not in {starter.name for starter in starters}
     assert [starter.age for starter in starters] == ["28", "29"]
+    assert starters[1].attitude_toward_player == (
+        "Guarded, skeptical, and willing to be unfair at first."
+    )
+    assert starters[1].cooperation_conditions == (
+        "Helps only after the player treats her skepticism seriously."
+    )
+    character_schema = request.schema["properties"]["characters"]
+    assert isinstance(character_schema, dict)
+    item_schema = character_schema["items"]
+    assert isinstance(item_schema, dict)
+    item_properties = item_schema["properties"]
+    assert isinstance(item_properties, dict)
+    assert {
+        "goals",
+        "motivations",
+        "current_intent",
+        "boundaries",
+        "attitude_toward_player",
+        "cooperation_conditions",
+    } <= set(item_properties)
+    system_body = request.messages[0].body
+    assert "full spectrum" in system_body
+    assert "hostile" in system_body
+    assert "unreasonable" in system_body
     assert len(provider.requests) == 1
 
 
@@ -444,7 +484,10 @@ def test_content_with_character_starters_prefers_existing_explicit_payload() -> 
             "relationships": {},
             "goals": "",
             "motivations": "",
+            "current_intent": "",
             "boundaries": "",
+            "attitude_toward_player": "",
+            "cooperation_conditions": "",
             "status": "",
             "met": False,
             "locked_fields": [],
@@ -513,12 +556,27 @@ def test_structured_profile_completion_fills_blanks_without_overwriting() -> Non
                     "relationships": {"Mara Voss": "guarded ally"},
                     "goals": "Keep the lower beacon burning through the storm.",
                     "motivations": "Protect the village below the cliff path.",
+                    "current_intent": "Demand proof before unlocking the failsafe.",
                     "boundaries": (
                         "Will not abandon the tower while the lens is unstable."
                     ),
+                    "attitude_toward_player": (
+                        "Wary and unfairly suspicious after the last breach."
+                    ),
+                    "cooperation_conditions": (
+                        "Shares the failsafe only after Mara shows the warrant."
+                    ),
                     "status": "waiting near the beacon",
                     "met": True,
-                    "locked_fields": ["role", "goals", "motivations", "boundaries"],
+                    "locked_fields": [
+                        "role",
+                        "goals",
+                        "motivations",
+                        "current_intent",
+                        "boundaries",
+                        "attitude_toward_player",
+                        "cooperation_conditions",
+                    ],
                 }
             ]
         }
@@ -557,10 +615,25 @@ def test_structured_profile_completion_fills_blanks_without_overwriting() -> Non
             relationships={"Mara Voss": "guarded ally"},
             goals="Keep the watch orderly.",
             motivations="Protect the village below the cliff path.",
+            current_intent="Demand proof before unlocking the failsafe.",
             boundaries="Will not abandon the tower while the lens is unstable.",
+            attitude_toward_player=(
+                "Wary and unfairly suspicious after the last breach."
+            ),
+            cooperation_conditions=(
+                "Shares the failsafe only after Mara shows the warrant."
+            ),
             status="waiting near the beacon",
             met=False,
-            locked_fields=("boundaries", "goals", "motivations", "role"),
+            locked_fields=(
+                "attitude_toward_player",
+                "boundaries",
+                "cooperation_conditions",
+                "current_intent",
+                "goals",
+                "motivations",
+                "role",
+            ),
         ),
     )
     schema = provider.requests[0].schema
@@ -572,7 +645,16 @@ def test_structured_profile_completion_fills_blanks_without_overwriting() -> Non
     assert isinstance(item_schema, dict)
     item_properties = item_schema["properties"]
     assert isinstance(item_properties, dict)
-    assert {"goals", "motivations", "boundaries"} <= set(item_properties)
+    assert {
+        "goals",
+        "motivations",
+        "current_intent",
+        "boundaries",
+        "attitude_toward_player",
+        "cooperation_conditions",
+    } <= set(item_properties)
+    assert "full spectrum" in provider.requests[0].messages[0].body
+    assert "hostile" in provider.requests[0].messages[0].body
 
 
 def test_structured_profile_completion_retries_denied_generated_voice(
@@ -791,7 +873,14 @@ def test_character_starter_json_round_trips_agency_fields() -> None:
                 name="Captain Ilyra",
                 goals="Hold the beacon until dawn.",
                 motivations="Keep the lower village safe.",
+                current_intent="Demand proof before opening the failsafe.",
                 boundaries="Will not leave the tower during a lens breach.",
+                attitude_toward_player=(
+                    "Suspicious of Mara until she proves authority."
+                ),
+                cooperation_conditions=(
+                    "Helps only after Mara shows the brass warrant."
+                ),
             ),
         ),
     )
@@ -806,7 +895,14 @@ def test_character_starter_json_round_trips_agency_fields() -> None:
             name="Captain Ilyra",
             goals="Hold the beacon until dawn.",
             motivations="Keep the lower village safe.",
+            current_intent="Demand proof before opening the failsafe.",
             boundaries="Will not leave the tower during a lens breach.",
+            attitude_toward_player=(
+                "Suspicious of Mara until she proves authority."
+            ),
+            cooperation_conditions=(
+                "Helps only after Mara shows the brass warrant."
+            ),
         ),
     )
 

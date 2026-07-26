@@ -61,7 +61,10 @@ CHARACTER_STARTER_IDENTITY_LOCK_FIELDS = (
 CHARACTER_STARTER_AGENCY_LOCK_FIELDS = (
     "goals",
     "motivations",
+    "current_intent",
     "boundaries",
+    "attitude_toward_player",
+    "cooperation_conditions",
 )
 CHARACTER_PROFILE_COMPLETION_FIELDS = tuple(
     field for field in CHARACTER_STARTER_IDENTITY_LOCK_FIELDS if field != "age"
@@ -884,7 +887,10 @@ def scenario_character_starter_to_json(
         "relationships": dict(starter.relationships),
         "goals": starter.goals,
         "motivations": starter.motivations,
+        "current_intent": starter.current_intent,
         "boundaries": starter.boundaries,
+        "attitude_toward_player": starter.attitude_toward_player,
+        "cooperation_conditions": starter.cooperation_conditions,
         "status": starter.status,
         "met": starter.met,
         "locked_fields": list(starter.locked_fields),
@@ -1111,7 +1117,10 @@ def _profile_completion_schema(
             "relationships": {"type": "object"},
             "goals": {"type": "string"},
             "motivations": {"type": "string"},
+            "current_intent": {"type": "string"},
             "boundaries": {"type": "string"},
+            "attitude_toward_player": {"type": "string"},
+            "cooperation_conditions": {"type": "string"},
             "status": {"type": "string"},
             "met": {"type": "boolean"},
             "locked_fields": string_array,
@@ -1163,7 +1172,10 @@ def _character_starter_generation_item_schema() -> dict[str, object]:
             "texting_style": {"type": "string"},
             "goals": {"type": "string"},
             "motivations": {"type": "string"},
+            "current_intent": {"type": "string"},
             "boundaries": {"type": "string"},
+            "attitude_toward_player": {"type": "string"},
+            "cooperation_conditions": {"type": "string"},
         },
         "required": ["name"],
     }
@@ -1243,9 +1255,14 @@ def _profile_completion_messages(
                 "Complete sparse Bragi scenario character starters. Use the "
                 "enforced response schema. Return only listed characters. Preserve "
                 "nonblank supplied fields; fill blank identity/profile fields with "
-                "concise details from the scenario context. Also fill blank goals, "
-                "motivations, and boundaries with concise plausible agency details "
-                "that fit the scenario and current profile. Fill blank voice with "
+                "concise details from the scenario context. Also fill blank agency "
+                "fields with concise plausible details that fit the scenario and "
+                "current profile: goals, motivations, current intent, boundaries, "
+                "attitude toward the player, and cooperation conditions. Use the "
+                "full spectrum of NPC stances; some characters may be naturally "
+                "trusting and cooperative, while others may be guarded, hostile, "
+                "self-interested, unfair, or unreasonable when that fits their "
+                "role and context. Fill blank voice with "
                 "cadence, diction, and 1-2 short quoted concrete examples of what "
                 "the character would actually say. Fill blank texting_style "
                 "with concise phone-message habits such as length, punctuation, "
@@ -1288,8 +1305,13 @@ def _character_starter_generation_messages(
                 "not return any existing starter or alias. Do not repeat names "
                 "or first names in the generated starters. Fill concise role, "
                 "age, known_state, appearance, visual_notes, personality, "
-                "voice, texting_style, goals, motivations, and boundaries fields "
-                "from the draft context and request. For voice include cadence, "
+                "voice, texting_style, and all agency fields from the draft "
+                "context and request: goals, motivations, current intent, "
+                "boundaries, attitude toward the player, and cooperation "
+                "conditions. Use the full spectrum of NPC stances; some characters "
+                "may be naturally trusting and cooperative, while others may be "
+                "guarded, hostile, self-interested, unfair, or unreasonable when "
+                "that fits their role and context. For voice include cadence, "
                 "diction, and 1-2 short quoted examples of what the character "
                 "would actually say. For texting_style include phone-message "
                 "habits and 1-2 short sample texts. Fill age only when directly "
@@ -1504,7 +1526,11 @@ def _starter_prompt_text(starters: tuple[ScenarioCharacterStarter, ...]) -> str:
             f"appearance={starter.appearance}; personality={starter.personality}; "
             f"voice={starter.voice}; texting_style={starter.texting_style}; "
             f"goals={starter.goals}; "
-            f"motivations={starter.motivations}; boundaries={starter.boundaries}; "
+            f"motivations={starter.motivations}; "
+            f"current_intent={starter.current_intent}; "
+            f"boundaries={starter.boundaries}; "
+            f"attitude_toward_player={starter.attitude_toward_player}; "
+            f"cooperation_conditions={starter.cooperation_conditions}; "
             f"missing={', '.join(missing) or 'none'}"
         )
     return "\n".join(lines)
@@ -2197,10 +2223,14 @@ def _merge_starter(
         relationships=base.relationships or completed.relationships,
         goals=base.goals or completed.goals,
         motivations=base.motivations or completed.motivations,
-        current_intent=base.current_intent,
+        current_intent=base.current_intent or completed.current_intent,
         boundaries=base.boundaries or completed.boundaries,
-        attitude_toward_player=base.attitude_toward_player,
-        cooperation_conditions=base.cooperation_conditions,
+        attitude_toward_player=(
+            base.attitude_toward_player or completed.attitude_toward_player
+        ),
+        cooperation_conditions=(
+            base.cooperation_conditions or completed.cooperation_conditions
+        ),
         status=base.status or completed.status,
         met=base.met,
         locked_fields=tuple(
