@@ -367,6 +367,7 @@ def test_migration_rejects_orphaned_pending_review_suggestions(tmp_path: Path) -
         )
         connection.execute("DELETE FROM schema_migrations WHERE version = 65")
         connection.execute("DELETE FROM schema_migrations WHERE version = 66")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 67")
         connection.commit()
 
     migrate_database(database_path)
@@ -400,6 +401,7 @@ def test_migrate_database_upgrades_schema_61_world_time_columns(
         connection.execute("DELETE FROM schema_migrations WHERE version = 64")
         connection.execute("DELETE FROM schema_migrations WHERE version = 65")
         connection.execute("DELETE FROM schema_migrations WHERE version = 66")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 67")
         connection.execute(
             "ALTER TABLE scene_snapshots DROP COLUMN world_time_day_index"
         )
@@ -727,10 +729,8 @@ def test_migrate_database_removes_retired_character_import_routing_state(
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)
     with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            "DELETE FROM schema_migrations WHERE version = ?",
-            (CURRENT_SCHEMA_VERSION,),
-        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 66")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 67")
         connection.executemany(
             """
             INSERT INTO model_preferences(id, task, provider, model_id)
@@ -844,6 +844,159 @@ def test_migrate_database_removes_retired_character_import_routing_state(
     assert set(persisted_overrides["thinking"]) == retained_tasks
     assert jobs == {"chat-job"}
     assert steps == {"chat-step"}
+
+
+def test_migrate_database_strips_deprecated_scenario_character_sections(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ledger Road",
+            premise="A caravan must turn debt into profit.",
+            player_role="Caravan factor",
+            content={
+                "title": "Ledger Road",
+                "premise": "A caravan must turn debt into profit.",
+                "player_role": "Caravan factor",
+                "factions": "Kesh brokers",
+                "characters": "Mara Voss and Ren the bell debtor.",
+                "romance_options": "Mika Arai watches the station doors.",
+                "rivals_and_factions": "A rival guild wants the contract.",
+                "reputation_and_contacts": "Trusted by Red Harbor taxmen.",
+                "character_starters": [
+                    {
+                        "name": "Mika Arai",
+                        "role": "Station diplomat",
+                        "known_state": "Mika knows the locked departure board.",
+                    }
+                ],
+            },
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Ledger Road Save",
+        )
+        scenario_update = repositories.add_save_scenario_update(
+            save_id=save.id,
+            title="Ledger Road: Bridge Debt",
+            premise="The caravan owes a bridge toll.",
+            player_role="Caravan factor",
+            content={
+                "title": "Ledger Road: Bridge Debt",
+                "premise": "The caravan owes a bridge toll.",
+                "player_role": "Caravan factor",
+                "factions": "Bridge assessors",
+                "major_npcs": "Orlen keeps the toll ledger.",
+                "rivals_and_factions": "Kesh brokers contest the bridge debt.",
+                "reputation_and_contacts": "Known to the Red Harbor tax office.",
+            },
+            reason="Legacy update fixture.",
+            provider="fake-provider",
+            model="fake-model",
+        )
+        null_only_scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Null Ledger",
+            premise="A ledger contains blank legacy fields.",
+            player_role="Auditor",
+            content={"title": "Null Ledger"},
+        )
+        connection.execute(
+            "UPDATE scenarios SET content_json = ? WHERE id = ?",
+            (
+                json.dumps(
+                    {
+                        "title": "Null Ledger",
+                        "characters": None,
+                        "reputation_and_contacts": None,
+                    }
+                ),
+                null_only_scenario.id,
+            ),
+        )
+        null_only_update = repositories.add_save_scenario_update(
+            save_id=save.id,
+            title="Null Ledger Update",
+            premise="The blank fields remain blank.",
+            player_role="Auditor",
+            content={"title": "Null Ledger Update"},
+            reason="Legacy null fixture.",
+            provider="fake-provider",
+            model="fake-model",
+        )
+        connection.execute(
+            "UPDATE save_scenario_updates SET content_json = ? WHERE id = ?",
+            (
+                json.dumps(
+                    {
+                        "title": "Null Ledger Update",
+                        "major_npcs": None,
+                        "rivals_and_factions": None,
+                    }
+                ),
+                null_only_update.id,
+            ),
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 67")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT content_json FROM scenarios WHERE id = ?",
+            (scenario.id,),
+        ).fetchone()
+        assert row is not None
+        content = json.loads(row[0])
+        assert content["factions"] == (
+            "Kesh brokers\n\n"
+            "A rival guild wants the contract.\n\n"
+            "Trusted by Red Harbor taxmen."
+        )
+        assert content["character_starters"] == [
+            {
+                "name": "Mika Arai",
+                "role": "Station diplomat",
+                "known_state": "Mika knows the locked departure board.",
+            }
+        ]
+        assert "characters" not in content
+        assert "romance_options" not in content
+        assert "rivals_and_factions" not in content
+        assert "reputation_and_contacts" not in content
+        row = connection.execute(
+            "SELECT content_json FROM save_scenario_updates WHERE id = ?",
+            (scenario_update.id,),
+        ).fetchone()
+        assert row is not None
+        update_content = json.loads(row[0])
+        assert update_content["factions"] == (
+            "Bridge assessors\n\n"
+            "Kesh brokers contest the bridge debt.\n\n"
+            "Known to the Red Harbor tax office."
+        )
+        assert "major_npcs" not in update_content
+        assert "rivals_and_factions" not in update_content
+        assert "reputation_and_contacts" not in update_content
+        row = connection.execute(
+            "SELECT content_json FROM scenarios WHERE id = ?",
+            (null_only_scenario.id,),
+        ).fetchone()
+        assert row is not None
+        null_only_content = json.loads(row[0])
+        assert null_only_content == {"title": "Null Ledger"}
+        row = connection.execute(
+            "SELECT content_json FROM save_scenario_updates WHERE id = ?",
+            (null_only_update.id,),
+        ).fetchone()
+        assert row is not None
+        null_only_update_content = json.loads(row[0])
+        assert null_only_update_content == {"title": "Null Ledger Update"}
 
 
 def test_migrate_database_recovers_empty_schema_migrations_table(

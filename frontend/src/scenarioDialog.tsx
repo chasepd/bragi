@@ -1,14 +1,13 @@
-import React, { useEffect, useState } from "react";
+import React, { useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Image, Loader2, Plus, RefreshCw, Upload, Wand2, X } from "lucide-react";
-import { api, postJson } from "./api";
+import { Check, Loader2, Plus, RefreshCw, Wand2, X } from "lucide-react";
+import { postJson } from "./api";
 import type { Job, RuntimeModel, ScenarioDraft, ScenarioWizardFlow } from "./api";
 import {
   defaultFlows,
   defaultSecondaryScenarioType,
   canUseChildRestrictedControls,
   DialogForm,
-  EmptyState,
   initialMediaDraftLabel,
   InlineNotice,
   labelize,
@@ -16,18 +15,23 @@ import {
   MANUAL_BASE_SECTION_IDS,
   MANUAL_SCENARIO_TEXTAREA_FIELDS,
   normalizedScenarioTypes,
-  PanelHeader,
   progressLabel,
   runtimeQueryKey,
   runtimeResultError,
+  STARTER_INPUT_FIELDS,
+  STARTER_TEXTAREA_FIELDS,
   scenarioCreationFlow,
+  scenarioEditorStarters,
   scenarioSectionEditorGroups,
   scenarioSectionResultText,
+  scenarioStarterPayload,
   SegmentedTabs,
   isRuntimeModel,
   useDialogJobWatcher
 } from "./workbenchCore";
-import type { CurrentUser, RunJob, ScenarioDraftPrefill, ScenarioForm, ScenarioFormTextField, SegmentOption } from "./workbenchCore";
+import type { CurrentUser, RunJob, ScenarioDraftPrefill, ScenarioEditorStarter, ScenarioForm, ScenarioFormTextField, SegmentOption } from "./workbenchCore";
+
+type DraftCharacterStarter = ScenarioEditorStarter;
 
 export function ScenarioDialog({
   model,
@@ -67,7 +71,6 @@ export function ScenarioDialog({
     player_role: "",
     player_character_name: "",
     player_character_profile: "",
-    romance_options: "",
     magic_system: "",
     realms_and_places: "",
     factions_and_orders: "",
@@ -79,7 +82,6 @@ export function ScenarioDialog({
     factions_and_institutions: "",
     mission_stakes: "",
     mission_profile: "",
-    crew_and_command: "",
     ship_or_base_status: "",
     exploration_target: "",
     unknown_intelligence: "",
@@ -89,7 +91,6 @@ export function ScenarioDialog({
     hazards_and_escalation: "",
     expedition_goal: "",
     route_options: "",
-    party_roster: "",
     resource_inventory: "",
     environmental_conditions: "",
     hazards_and_events: "",
@@ -108,7 +109,6 @@ export function ScenarioDialog({
     npc_memory_rules: "",
     current_loop_state: "",
     case_facts: "",
-    suspects: "",
     clues: "",
     timeline: "",
     red_herrings: "",
@@ -116,7 +116,6 @@ export function ScenarioDialog({
     case_status: "",
     target_location: "",
     objectives_and_stakes: "",
-    crew_and_contacts: "",
     intel_and_access: "",
     security_model: "",
     alert_and_heat: "",
@@ -126,7 +125,6 @@ export function ScenarioDialog({
     aftermath: "",
     political_arena: "",
     political_factions: "",
-    major_npcs: "",
     central_conflict: "",
     secrets_and_leverage: "",
     reputation_and_standing: "",
@@ -136,7 +134,6 @@ export function ScenarioDialog({
     political_pressure: "",
     public_private_knowledge: "",
     settlement_profile: "",
-    population_and_residents: "",
     resources_and_indicators: "",
     projects_and_facilities: "",
     threats_and_opportunities: "",
@@ -145,12 +142,10 @@ export function ScenarioDialog({
     target_profile: "",
     leads_and_clues: "",
     hunt_locations: "",
-    rivals_and_factions: "",
     preparation_state: "",
     hunt_status: "",
     journey_profile: "",
     route_and_stops: "",
-    traveling_party: "",
     transport_and_supplies: "",
     recurring_pressures: "",
     relationship_threads: "",
@@ -160,7 +155,6 @@ export function ScenarioDialog({
     markets_and_stops: "",
     contracts_and_debts: "",
     route_hazards: "",
-    reputation_and_contacts: "",
     profit_and_loss: "",
     tone_genre: "",
     choice_style: "",
@@ -420,7 +414,6 @@ function emptyScenarioFormFields(): ScenarioForm {
     player_role: "",
     player_character_name: "",
     player_character_profile: "",
-    romance_options: "",
     magic_system: "",
     realms_and_places: "",
     factions_and_orders: "",
@@ -432,7 +425,6 @@ function emptyScenarioFormFields(): ScenarioForm {
     factions_and_institutions: "",
     mission_stakes: "",
     mission_profile: "",
-    crew_and_command: "",
     ship_or_base_status: "",
     exploration_target: "",
     unknown_intelligence: "",
@@ -442,7 +434,6 @@ function emptyScenarioFormFields(): ScenarioForm {
     hazards_and_escalation: "",
     expedition_goal: "",
     route_options: "",
-    party_roster: "",
     resource_inventory: "",
     environmental_conditions: "",
     hazards_and_events: "",
@@ -461,7 +452,6 @@ function emptyScenarioFormFields(): ScenarioForm {
     npc_memory_rules: "",
     current_loop_state: "",
     case_facts: "",
-    suspects: "",
     clues: "",
     timeline: "",
     red_herrings: "",
@@ -469,7 +459,6 @@ function emptyScenarioFormFields(): ScenarioForm {
     case_status: "",
     target_location: "",
     objectives_and_stakes: "",
-    crew_and_contacts: "",
     intel_and_access: "",
     security_model: "",
     alert_and_heat: "",
@@ -479,7 +468,6 @@ function emptyScenarioFormFields(): ScenarioForm {
     aftermath: "",
     political_arena: "",
     political_factions: "",
-    major_npcs: "",
     central_conflict: "",
     secrets_and_leverage: "",
     reputation_and_standing: "",
@@ -489,7 +477,6 @@ function emptyScenarioFormFields(): ScenarioForm {
     political_pressure: "",
     public_private_knowledge: "",
     settlement_profile: "",
-    population_and_residents: "",
     resources_and_indicators: "",
     projects_and_facilities: "",
     threats_and_opportunities: "",
@@ -498,12 +485,10 @@ function emptyScenarioFormFields(): ScenarioForm {
     target_profile: "",
     leads_and_clues: "",
     hunt_locations: "",
-    rivals_and_factions: "",
     preparation_state: "",
     hunt_status: "",
     journey_profile: "",
     route_and_stops: "",
-    traveling_party: "",
     transport_and_supplies: "",
     recurring_pressures: "",
     relationship_threads: "",
@@ -513,7 +498,6 @@ function emptyScenarioFormFields(): ScenarioForm {
     markets_and_stops: "",
     contracts_and_debts: "",
     route_hazards: "",
-    reputation_and_contacts: "",
     profit_and_loss: "",
     tone_genre: "",
     choice_style: "",
@@ -541,8 +525,15 @@ function ScenarioDraftEditor({
   setDraft: (draft: ScenarioDraft) => void;
 }) {
   const client = useQueryClient();
-  const watchDialogJob = useDialogJobWatcher();
+  const watchSectionJob = useDialogJobWatcher();
+  const watchStarterJob = useDialogJobWatcher();
   const [sections, setSections] = useState<Record<string, string>>(() => Object.fromEntries(draft.sections));
+  const [starters, setStarters] = useState<DraftCharacterStarter[]>(() => scenarioEditorStarters(draft.character_starters));
+  const sectionsRef = useRef(sections);
+  const startersRef = useRef(starters);
+  const [starterCount, setStarterCount] = useState("");
+  const [customDescription, setCustomDescription] = useState("");
+  const [generatingStarters, setGeneratingStarters] = useState(false);
   const [openingImage, setOpeningImage] = useState(false);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -558,10 +549,98 @@ function ScenarioDraftEditor({
     : baseGroups;
   const initialMediaLabel = initialMediaDraftLabel(draft.scenario_type);
   const initialMediaAllowed = canUseChildRestrictedControls(currentUser);
+  const updateDraftState = (nextSections: Record<string, string>, nextStarters: DraftCharacterStarter[]) => {
+    sectionsRef.current = nextSections;
+    startersRef.current = nextStarters;
+    const starterPayload = scenarioStarterPayload(nextStarters);
+    setDraft({
+      ...draft,
+      sections: Object.entries(nextSections),
+      ...("value" in starterPayload ? { character_starters: starterPayload.value } : {})
+    });
+  };
   const updateSection = (sectionId: string, value: string) => {
-    const next = { ...sections, [sectionId]: value };
+    const next = { ...sectionsRef.current, [sectionId]: value };
     setSections(next);
-    setDraft({ ...draft, sections: Object.entries(next) });
+    updateDraftState(next, startersRef.current);
+  };
+  const updateStarters = (nextStarters: DraftCharacterStarter[]) => {
+    setStarters(nextStarters);
+    updateDraftState(sectionsRef.current, nextStarters);
+  };
+  const appendGeneratedStarters = (returnedStarters: DraftCharacterStarter[], requestStarterCount: number) => {
+    const generated = returnedStarters.slice(requestStarterCount);
+    if (!generated.length) return;
+    setStarters((current) => {
+      const seen = new Set(current.map((starter) => starter.name.trim().toLocaleLowerCase()).filter(Boolean));
+      const merged = [
+        ...current,
+        ...generated.filter((starter) => {
+          const key = starter.name.trim().toLocaleLowerCase();
+          if (!key || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+      ];
+      startersRef.current = merged;
+      updateDraftState(sectionsRef.current, merged);
+      return merged;
+    });
+  };
+  const generateStarters = async (mode: "count" | "custom") => {
+    const starterPayload = scenarioStarterPayload(starters);
+    if ("error" in starterPayload) {
+      setError(starterPayload.error);
+      return;
+    }
+    let count: number | undefined;
+    const description = customDescription.trim();
+    if (mode === "count") {
+      const parsed = Number(starterCount);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 12) {
+        setError("Number of characters must be between 1 and 12");
+        return;
+      }
+      count = parsed;
+    } else if (!description) {
+      setError("Custom character description is required");
+      return;
+    }
+    setGeneratingStarters(true);
+    setError("");
+    try {
+      const created = await postJson<Job>("/api/scenarios/draft/character-starters/generate", {
+        scenario_type: draft.scenario_type,
+        scenario_types: normalizedScenarioTypes(draft.scenario_type, draft.scenario_types),
+        sections,
+        character_starters: starterPayload.value,
+        count,
+        custom_description: mode === "custom" ? description : "",
+        action_choices_enabled: Boolean(draft.action_choices_enabled)
+      });
+      watchStarterJob(created.id, (done) => {
+        if (!["succeeded", "failed", "cancelled"].includes(done.status)) return;
+        setGeneratingStarters(false);
+        if (done.status === "succeeded") {
+          const errorMessage = runtimeResultError(done.result);
+          if (isRuntimeModel(done.result) && done.result.scenario_draft) {
+            const nextDraft = done.result.scenario_draft;
+            appendGeneratedStarters(
+              scenarioEditorStarters(nextDraft.character_starters),
+              starterPayload.value.length
+            );
+            client.setQueryData(runtimeQueryKey(done.result.active_save_id ?? null), done.result);
+          } else {
+            setError(errorMessage || "Generated character starters were not returned");
+          }
+        } else {
+          setError(done.error || "Starter generation failed.");
+        }
+      });
+    } catch (failure) {
+      setGeneratingStarters(false);
+      setError(failure instanceof Error ? failure.message : "Could not start starter generation");
+    }
   };
   return (
     <div className="draft-editor">
@@ -592,7 +671,7 @@ function ScenarioDraftEditor({
                         sections,
                         action_choices_enabled: Boolean(draft.action_choices_enabled)
                       });
-                      watchDialogJob(created.id, (done) => {
+                      watchSectionJob(created.id, (done) => {
                         if (done.status === "succeeded") {
                           const regenerated = scenarioSectionResultText(done.result, sectionId);
                           const errorMessage = runtimeResultError(done.result);
@@ -619,6 +698,17 @@ function ScenarioDraftEditor({
           </div>
         </details>
       ))}
+      <DraftCharacterStarterPanel
+        starters={starters}
+        starterCount={starterCount}
+        customDescription={customDescription}
+        generating={generatingStarters}
+        setStarterCount={setStarterCount}
+        setCustomDescription={setCustomDescription}
+        setStarters={updateStarters}
+        onGenerateCount={() => void generateStarters("count")}
+        onGenerateCustom={() => void generateStarters("custom")}
+      />
       {error ? <InlineNotice>{error}</InlineNotice> : null}
       {initialMediaAllowed ? (
         <label className="toggle-row compact-toggle">
@@ -632,6 +722,11 @@ function ScenarioDraftEditor({
           className="primary-command compact"
           disabled={saving}
           onClick={async () => {
+            const starterPayload = scenarioStarterPayload(starters);
+            if ("error" in starterPayload) {
+              setError(starterPayload.error);
+              return;
+            }
             setSaving(true);
             setError("");
             try {
@@ -639,6 +734,7 @@ function ScenarioDraftEditor({
                 scenario_type: draft.scenario_type,
                 scenario_types: normalizedScenarioTypes(draft.scenario_type, draft.scenario_types),
                 sections,
+                character_starters: starterPayload.value,
                 save_title: sections.title ?? "",
                 source_metadata: Object.fromEntries(draft.source_metadata ?? []),
                 action_choices_enabled: Boolean(draft.action_choices_enabled)
@@ -661,6 +757,153 @@ function ScenarioDraftEditor({
         </button>
       </div>
     </div>
+  );
+}
+
+function DraftCharacterStarterPanel({
+  starters,
+  starterCount,
+  customDescription,
+  generating,
+  setStarterCount,
+  setCustomDescription,
+  setStarters,
+  onGenerateCount,
+  onGenerateCustom
+}: {
+  starters: DraftCharacterStarter[];
+  starterCount: string;
+  customDescription: string;
+  generating: boolean;
+  setStarterCount: (value: string) => void;
+  setCustomDescription: (value: string) => void;
+  setStarters: (starters: DraftCharacterStarter[]) => void;
+  onGenerateCount: () => void;
+  onGenerateCustom: () => void;
+}) {
+  const updateStarter = (id: string, patch: Partial<DraftCharacterStarter>) => {
+    setStarters(starters.map((starter) => starter.id === id ? { ...starter, ...patch } : starter));
+  };
+  const addStarter = () => setStarters([...starters, {
+    id: `draft-starter:new:${starters.length}:${Date.now()}`,
+    starter_id: "",
+    name: "",
+    aliases_text: "",
+    role: "",
+    age: "",
+    known_state: "",
+    appearance: "",
+    visual_notes: "",
+    personality: "",
+    voice: "",
+    texting_style: "",
+    goals: "",
+    motivations: "",
+    boundaries: "",
+    relationships_json: "{}",
+    status: "",
+    met: true,
+    locked_fields_text: ""
+  } as DraftCharacterStarter]);
+  const removeStarter = (id: string) => setStarters(starters.filter((starter) => starter.id !== id));
+
+  return (
+    <details className="model-group scenario-section-group" open>
+      <summary>
+        <div>
+          <strong>Character starters</strong>
+          <span>{starters.length} characters</span>
+        </div>
+      </summary>
+      <div className="scenario-starter-list">
+        <div className="scenario-starter-generation">
+          <label className="field-label">
+            <span>Number of Characters to generate</span>
+            <input
+              type="number"
+              min={1}
+              max={12}
+              value={starterCount}
+              onChange={(event) => setStarterCount(event.target.value)}
+            />
+          </label>
+          <button type="button" className="secondary-command" disabled={generating} onClick={onGenerateCount}>
+            {generating ? <Loader2 className="spin" size={15} /> : <Wand2 size={15} />} Generate
+          </button>
+          <label className="field-label scenario-starter-wide">
+            <span>Custom character description</span>
+            <textarea value={customDescription} onChange={(event) => setCustomDescription(event.target.value)} />
+          </label>
+          <button type="button" className="secondary-command" disabled={generating} onClick={onGenerateCustom}>
+            {generating ? <Loader2 className="spin" size={15} /> : <Plus size={15} />} Generate character
+          </button>
+        </div>
+        {starters.map((starter, index) => (
+          <div className="scenario-starter-row" key={starter.id}>
+            <div className="scenario-starter-grid">
+              <label className="field-label">
+                <span>Name</span>
+                <input
+                  aria-label={`Draft starter ${index + 1} name`}
+                  value={starter.name}
+                  onChange={(event) => updateStarter(starter.id, { name: event.target.value })}
+                />
+              </label>
+              {STARTER_INPUT_FIELDS.map(([field, label, suffix]) => (
+                <label className="field-label" key={field}>
+                  <span>{label}</span>
+                  <input
+                    aria-label={`Draft starter ${starter.name || index + 1} ${suffix}`}
+                    value={starter[field]}
+                    onChange={(event) => updateStarter(
+                      starter.id,
+                      { [field]: event.target.value } as Partial<DraftCharacterStarter>
+                    )}
+                  />
+                </label>
+              ))}
+              <label className="toggle-row compact-toggle scenario-starter-met">
+                <input
+                  type="checkbox"
+                  checked={starter.met}
+                  onChange={(event) => updateStarter(starter.id, { met: event.target.checked })}
+                />
+                <span>Met</span>
+              </label>
+              {STARTER_TEXTAREA_FIELDS.map(([field, label, suffix]) => (
+                <label className="field-label scenario-starter-wide" key={field}>
+                  <span>{label}</span>
+                  <textarea
+                    className={field === "relationships_json" ? "json-editor compact-json-editor" : undefined}
+                    aria-label={`Draft starter ${starter.name || index + 1} ${suffix}`}
+                    value={starter[field]}
+                    onChange={(event) => updateStarter(
+                      starter.id,
+                      { [field]: event.target.value } as Partial<DraftCharacterStarter>
+                    )}
+                  />
+                </label>
+              ))}
+            </div>
+            <div className="scenario-starter-tools">
+              <button
+                type="button"
+                className="destructive-action"
+                title="Remove"
+                aria-label={`Remove ${starter.name || "starter"}`}
+                onClick={() => removeStarter(starter.id)}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </div>
+        ))}
+        {!starters.length ? <p className="empty">No character starters</p> : null}
+        <button type="button" className="secondary-command scenario-add-starter" onClick={addStarter}>
+          <Plus size={15} /> Add starter
+        </button>
+      </div>
+    </details>
   );
 }
 

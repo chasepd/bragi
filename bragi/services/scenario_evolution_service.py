@@ -58,14 +58,12 @@ FULL_ROLEPLAY_EVOLVABLE_SECTIONS = frozenset(
         "lore",
         "locations",
         "factions",
-        "characters",
     )
 )
 DATING_SIM_EVOLVABLE_SECTIONS = frozenset(
     (
         "current_scene",
         "player_character_profile",
-        "romance_options",
     )
 )
 FANTASY_ROLEPLAY_EVOLVABLE_SECTIONS = frozenset(
@@ -92,7 +90,6 @@ FIRST_CONTACT_EXPLORATION_EVOLVABLE_SECTIONS = frozenset(
     (
         "current_scene",
         "mission_profile",
-        "crew_and_command",
         "ship_or_base_status",
         "exploration_target",
         "unknown_intelligence",
@@ -107,7 +104,6 @@ SURVIVAL_EXPEDITION_EVOLVABLE_SECTIONS = frozenset(
         "current_scene",
         "expedition_goal",
         "route_options",
-        "party_roster",
         "resource_inventory",
         "environmental_conditions",
         "hazards_and_events",
@@ -137,9 +133,7 @@ INVESTIGATION_MYSTERY_EVOLVABLE_SECTIONS = frozenset(
         "current_scene",
         "locations",
         "factions",
-        "characters",
         "case_facts",
-        "suspects",
         "clues",
         "timeline",
         "red_herrings",
@@ -152,7 +146,6 @@ HEIST_INFILTRATION_EVOLVABLE_SECTIONS = frozenset(
         "current_scene",
         "target_location",
         "objectives_and_stakes",
-        "crew_and_contacts",
         "intel_and_access",
         "security_model",
         "alert_and_heat",
@@ -167,10 +160,8 @@ POLITICAL_INTRIGUE_EVOLVABLE_SECTIONS = frozenset(
         "current_scene",
         "locations",
         "factions",
-        "characters",
         "political_arena",
         "political_factions",
-        "major_npcs",
         "central_conflict",
         "secrets_and_leverage",
         "reputation_and_standing",
@@ -1035,7 +1026,7 @@ def _scenario_evolution_instruction(scenario_type: str) -> str:
     if scenario_type == "political_intrigue":
         return (
             base + " For political intrigue roleplays, update only durable "
-            "changes to the political arena, faction positions, major NPC "
+            "changes to the political arena, faction positions, notable "
             "loyalties or grudges, central conflict, secrets or leverage, "
             "reputation or standing, obligations, favors, alliances, rivalries, "
             "event calendar, timed pressure, public/private knowledge boundaries, "
@@ -1044,7 +1035,7 @@ def _scenario_evolution_instruction(scenario_type: str) -> str:
             "terms, and timed pressure changes."
         )
     return (
-        base + " For generic roleplays, update locations, factions, characters, lore, "
+        base + " For generic roleplays, update locations, factions, lore, "
         "worldbuilding, or starting/current scene setup when play has clearly "
         "moved beyond the original setup. Prefer world-data records for concrete "
         "facts; use scenario section updates as short high-level rollups only."

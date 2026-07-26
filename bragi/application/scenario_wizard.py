@@ -156,7 +156,7 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                 label="First Contact / Exploration",
                 seed_prompt=(
                     "Describe the first contact or exploration mission, unknown "
-                    "world or anomaly, crew and ship/base status, alien or "
+                    "world or anomaly, ship/base status, alien or "
                     "ambiguous intelligence, translation progress, discoveries, "
                     "hazards, tone, and visible opening narration."
                 ),
@@ -175,7 +175,6 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                         label="Mission",
                         section_ids=(
                             "mission_profile",
-                            "crew_and_command",
                             "ship_or_base_status",
                         ),
                     ),
@@ -209,7 +208,7 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                 label="Survival Expedition",
                 seed_prompt=(
                     "Describe the survival expedition premise, player role, "
-                    "goal, route options, party, supplies, environmental "
+                    "goal, route options, supplies, environmental "
                     "conditions, hazards, camp status, travel progress, tone, "
                     "and visible opening narration."
                 ),
@@ -233,11 +232,8 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                         ),
                     ),
                     ScenarioReviewGroup(
-                        label="Party & Supplies",
-                        section_ids=(
-                            "party_roster",
-                            "resource_inventory",
-                        ),
+                        label="Supplies",
+                        section_ids=("resource_inventory",),
                     ),
                     ScenarioReviewGroup(
                         label="Conditions",
@@ -321,7 +317,7 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                 flow_id=ScenarioType.INVESTIGATION_MYSTERY.value,
                 label="Investigation Mystery",
                 seed_prompt=(
-                    "Describe the mystery premise, case facts, suspects, clues, "
+                    "Describe the mystery premise, case facts, clues, "
                     "timeline, red herrings, hidden truth, case status, tone, "
                     "and visible opening narration."
                 ),
@@ -340,7 +336,6 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                         label="Case",
                         section_ids=(
                             "case_facts",
-                            "suspects",
                             "case_status",
                         ),
                     ),
@@ -367,7 +362,7 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                 label="Heist / Infiltration",
                 seed_prompt=(
                     "Describe the heist or infiltration target, objectives, "
-                    "crew, contacts, intel, access, security model, alert or "
+                    "intel, access, security model, alert or "
                     "heat state, loadout, complications, extraction, aftermath, "
                     "tone, and visible opening narration."
                 ),
@@ -390,11 +385,8 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                         ),
                     ),
                     ScenarioReviewGroup(
-                        label="Crew & Intel",
-                        section_ids=(
-                            "crew_and_contacts",
-                            "intel_and_access",
-                        ),
+                        label="Intel",
+                        section_ids=("intel_and_access",),
                     ),
                     ScenarioReviewGroup(
                         label="Security",
@@ -430,7 +422,7 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                 flow_id=ScenarioType.POLITICAL_INTRIGUE.value,
                 label="Political Intrigue",
                 seed_prompt=(
-                    "Describe the political arena, factions, major NPCs, "
+                    "Describe the political arena, factions, "
                     "central conflict, secrets, reputation or standing, favors "
                     "and obligations, alliances, timed political pressure, "
                     "public versus private knowledge, tone, and visible "
@@ -455,10 +447,9 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                         ),
                     ),
                     ScenarioReviewGroup(
-                        label="Factions & NPCs",
+                        label="Factions",
                         section_ids=(
                             "political_factions",
-                            "major_npcs",
                             "alliances_and_rivalries",
                         ),
                     ),
@@ -491,7 +482,7 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                 flow_id=ScenarioType.SETTLEMENT_BUILDER.value,
                 label="Settlement Builder",
                 seed_prompt=(
-                    "Describe the settlement premise, residents, resources, "
+                    "Describe the settlement premise, resources, "
                     "projects, facilities, threats, opportunities, calendar "
                     "pressure, tone, and visible opening narration."
                 ),
@@ -508,10 +499,7 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                     ),
                     ScenarioReviewGroup(
                         label="Community",
-                        section_ids=(
-                            "settlement_profile",
-                            "population_and_residents",
-                        ),
+                        section_ids=("settlement_profile",),
                     ),
                     ScenarioReviewGroup(
                         label="Operations",
@@ -541,7 +529,7 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                 label="Monster Hunt / Bounty",
                 seed_prompt=(
                     "Describe the hunt or bounty premise, target, clues, "
-                    "locations, rivals, preparation state, current hunt status, "
+                    "locations, preparation state, current hunt status, "
                     "tone, and visible opening narration."
                 ),
                 editable_section_ids=MONSTER_HUNT_BOUNTY_SECTIONS,
@@ -572,10 +560,7 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                     ),
                     ScenarioReviewGroup(
                         label="Pressure",
-                        section_ids=(
-                            "rivals_and_factions",
-                            "preparation_state",
-                        ),
+                        section_ids=("preparation_state",),
                     ),
                     ScenarioReviewGroup(
                         label="Opening",
@@ -590,8 +575,8 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                 flow_id=ScenarioType.ROAD_TRIP_PILGRIMAGE.value,
                 label="Road Trip / Pilgrimage",
                 seed_prompt=(
-                    "Describe the journey premise, route, stops, traveling "
-                    "party, transport, supplies, recurring pressures, "
+                    "Describe the journey premise, route, stops, "
+                    "transport, supplies, recurring pressures, "
                     "relationships, progress, tone, and visible opening "
                     "narration."
                 ),
@@ -615,11 +600,8 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                         ),
                     ),
                     ScenarioReviewGroup(
-                        label="Party",
-                        section_ids=(
-                            "traveling_party",
-                            "relationship_threads",
-                        ),
+                        label="Relationship Threads",
+                        section_ids=("relationship_threads",),
                     ),
                     ScenarioReviewGroup(
                         label="Road Pressure",
@@ -642,7 +624,7 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                 label="Merchant / Trade Route",
                 seed_prompt=(
                     "Describe the trade premise, route, cargo, markets, "
-                    "contracts, debts, route hazards, reputation, contacts, "
+                    "contracts, debts, route hazards, "
                     "profit and loss pressure, tone, and visible opening "
                     "narration."
                 ),
@@ -675,7 +657,6 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                         label="Risk & Standing",
                         section_ids=(
                             "route_hazards",
-                            "reputation_and_contacts",
                             "profit_and_loss",
                         ),
                     ),
@@ -692,10 +673,8 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                 flow_id=ScenarioType.DATING_SIM.value,
                 label="Dating Sim",
                 seed_prompt=(
-                    "Describe the player character, dating sim premise, romance "
-                    "option preferences, tone, and visible opening narration. "
-                    "Unless you specify otherwise, Bragi will target four "
-                    "opposite-gender romance options."
+                    "Describe the player character, dating sim premise, tone, "
+                    "and visible opening narration."
                 ),
                 editable_section_ids=DATING_SIM_SECTIONS,
                 review_groups=(
@@ -708,10 +687,6 @@ def build_scenario_wizard_model() -> ScenarioWizardModel:
                             "player_character_profile",
                             "player_role",
                         ),
-                    ),
-                    ScenarioReviewGroup(
-                        label="Romance Options",
-                        section_ids=("romance_options",),
                     ),
                     ScenarioReviewGroup(
                         label="Opening",

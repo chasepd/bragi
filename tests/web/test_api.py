@@ -10246,6 +10246,7 @@ def test_save_scenario_draft_awaits_async_runtime(tmp_path: Path) -> None:
             scenario_type: str,
             scenario_types: list[str] | None,
             sections: dict[str, str],
+            character_starters: list[dict[str, object]],
             action_choices_enabled: bool,
             save_title: str,
             source_metadata: dict[str, object] | None,
@@ -10256,6 +10257,7 @@ def test_save_scenario_draft_awaits_async_runtime(tmp_path: Path) -> None:
                     "scenario_type": scenario_type,
                     "scenario_types": scenario_types,
                     "sections": sections,
+                    "character_starters": character_starters,
                     "action_choices_enabled": action_choices_enabled,
                     "save_title": save_title,
                     "source_metadata": source_metadata,
@@ -10287,6 +10289,12 @@ def test_save_scenario_draft_awaits_async_runtime(tmp_path: Path) -> None:
                 "scenario_type": "full_roleplay",
                 "scenario_types": ["full_roleplay", "dating_sim"],
                 "sections": {"title": "Lantern Keep"},
+                "character_starters": [
+                    {
+                        "name": "Mara Voss",
+                        "concept": "Stormwarden scout",
+                    }
+                ],
                 "action_choices_enabled": True,
                 "save_title": "Lantern Keep",
                 "source_metadata": {"origin": "generated"},
@@ -10300,11 +10308,351 @@ def test_save_scenario_draft_awaits_async_runtime(tmp_path: Path) -> None:
             "scenario_type": "full_roleplay",
             "scenario_types": ["full_roleplay", "dating_sim"],
             "sections": {"title": "Lantern Keep"},
+            "character_starters": [
+                {
+                    "name": "Mara Voss",
+                    "concept": "Stormwarden scout",
+                }
+            ],
             "action_choices_enabled": True,
             "save_title": "Lantern Keep",
             "source_metadata": {"origin": "generated"},
         }
     ]
+
+
+def test_scenario_draft_character_starters_generation_uses_runtime_job(
+    tmp_path: Path,
+) -> None:
+    class StarterGenerationRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[dict[str, object]] = []
+
+        async def generate_scenario_draft_character_starters(
+            self,
+            *,
+            scenario_type: str,
+            scenario_types: list[str] | None,
+            sections: dict[str, str],
+            character_starters: list[dict[str, object]],
+            count: int | None,
+            custom_description: str,
+            action_choices_enabled: bool,
+        ) -> dict[str, object]:
+            await asyncio.sleep(0)
+            self.calls.append(
+                {
+                    "scenario_type": scenario_type,
+                    "scenario_types": scenario_types,
+                    "sections": sections,
+                    "character_starters": character_starters,
+                    "count": count,
+                    "custom_description": custom_description,
+                    "action_choices_enabled": action_choices_enabled,
+                }
+            )
+            return {
+                "active_save_id": None,
+                "active_save_title": None,
+                "chronicle": {"messages": []},
+                "composer_enabled": True,
+                "custom_instructions": "",
+                "error": None,
+                "failed_save": False,
+                "failure_text": None,
+                "media": None,
+                "model_indicator": "fake / chat",
+                "saves": [],
+                "scenario_draft": {
+                    "scenario_type": "full_roleplay",
+                    "scenario_types": ["full_roleplay", "investigation_mystery"],
+                    "action_choices_enabled": True,
+                    "sections": [["title", "Lantern Keep"]],
+                    "character_starters": [
+                        {
+                            "name": "Mara Voss",
+                            "concept": "Stormwarden scout",
+                        },
+                        {
+                            "name": "Ivo Hale",
+                            "concept": "Archivist with a secret",
+                        },
+                    ],
+                    "regeneration_seed": "",
+                    "source_metadata": [],
+                },
+                "status": "Character starters generated",
+            }
+
+    runtime = StarterGenerationRuntime()
+
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, runtime)))
+    ) as client:
+        response = client.post(
+            "/api/scenarios/draft/character-starters/generate",
+            json={
+                "scenario_type": "full_roleplay",
+                "scenario_types": ["full_roleplay", "investigation_mystery"],
+                "sections": {
+                    "title": "Lantern Keep",
+                    "opening_message": "The beacon wakes.",
+                },
+                "character_starters": [
+                    {
+                        "name": "Mara Voss",
+                        "concept": "Stormwarden scout",
+                    }
+                ],
+                "count": 1,
+                "action_choices_enabled": True,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["type"] == "scenario_character_starters"
+        job = _wait_for_terminal_job(client, response.json()["id"])
+
+    assert job["status"] == "succeeded"
+    assert job["result"]["status"] == "Character starters generated"
+    assert job["result"]["scenario_draft"]["character_starters"] == [
+        {
+            "name": "Mara Voss",
+            "concept": "Stormwarden scout",
+        },
+        {
+            "name": "Ivo Hale",
+            "concept": "Archivist with a secret",
+        },
+    ]
+    assert runtime.calls == [
+        {
+            "scenario_type": "full_roleplay",
+            "scenario_types": ["full_roleplay", "investigation_mystery"],
+            "sections": {
+                "title": "Lantern Keep",
+                "opening_message": "The beacon wakes.",
+            },
+            "character_starters": [
+                {
+                    "name": "Mara Voss",
+                    "concept": "Stormwarden scout",
+                }
+            ],
+            "count": 1,
+            "custom_description": "",
+            "action_choices_enabled": True,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("request_overrides", "detail"),
+    [
+        (
+            {},
+            "Number of characters or custom character description is required",
+        ),
+        (
+            {"count": 0},
+            "Number of characters must be between 1 and 12",
+        ),
+        (
+            {"count": 13},
+            "Number of characters must be between 1 and 12",
+        ),
+        (
+            {"character_starters": [{"role": "Stormwarden scout"}], "count": 1},
+            "character_starters[0].name is required",
+        ),
+    ],
+)
+def test_scenario_draft_character_starters_generation_rejects_invalid_before_job(
+    tmp_path: Path,
+    request_overrides: dict[str, object],
+    detail: str,
+) -> None:
+    class StarterGenerationRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def generate_scenario_draft_character_starters(
+            self,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            self.calls += 1
+            return _chat_model("Character starters generated.")
+
+    runtime = StarterGenerationRuntime()
+    payload = {
+        "scenario_type": "full_roleplay",
+        "sections": {"title": "Lantern Keep"},
+        **request_overrides,
+    }
+
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, runtime)))
+    ) as client:
+        response = client.post(
+            "/api/scenarios/draft/character-starters/generate",
+            json=payload,
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": detail}
+    assert runtime.calls == 0
+
+
+@pytest.mark.parametrize("count", [True, "1", 1.0])
+def test_scenario_draft_character_starters_generation_rejects_non_integer_count(
+    tmp_path: Path,
+    count: object,
+) -> None:
+    class StarterGenerationRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def generate_scenario_draft_character_starters(
+            self,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            self.calls += 1
+            return _chat_model("Character starters generated.")
+
+    runtime = StarterGenerationRuntime()
+
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, runtime)))
+    ) as client:
+        response = client.post(
+            "/api/scenarios/draft/character-starters/generate",
+            json={
+                "scenario_type": "full_roleplay",
+                "sections": {"title": "Lantern Keep"},
+                "count": count,
+            },
+        )
+
+    assert response.status_code == 422
+    assert runtime.calls == 0
+
+
+def test_scenario_draft_character_starters_generation_rejects_extra_fields(
+    tmp_path: Path,
+) -> None:
+    class StarterGenerationRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def generate_scenario_draft_character_starters(
+            self,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            self.calls += 1
+            return _chat_model("Character starters generated.")
+
+    runtime = StarterGenerationRuntime()
+
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, runtime)))
+    ) as client:
+        response = client.post(
+            "/api/scenarios/draft/character-starters/generate",
+            json={
+                "scenario_type": "full_roleplay",
+                "sections": {"title": "Lantern Keep"},
+                "count": 1,
+                "ignored": "x" * 70_000,
+            },
+        )
+
+    assert response.status_code == 422
+    assert runtime.calls == 0
+
+
+def test_scenario_draft_character_starters_generation_rejects_oversized_payload(
+    tmp_path: Path,
+) -> None:
+    class StarterGenerationRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def generate_scenario_draft_character_starters(
+            self,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            self.calls += 1
+            return _chat_model("Character starters generated.")
+
+    runtime = StarterGenerationRuntime()
+
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, runtime)))
+    ) as client:
+        response = client.post(
+            "/api/scenarios/draft/character-starters/generate",
+            json={
+                "scenario_type": "full_roleplay",
+                "sections": {"title": "Lantern Keep"},
+                "character_starters": [
+                    {"name": f"Starter {index}"}
+                    for index in range(25)
+                ],
+                "count": 1,
+            },
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "detail": "Character starter generation request is too large"
+    }
+    assert runtime.calls == 0
+
+
+def test_scenario_draft_character_starters_generation_rejects_oversized_json(
+    tmp_path: Path,
+) -> None:
+    class StarterGenerationRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def generate_scenario_draft_character_starters(
+            self,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            self.calls += 1
+            return _chat_model("Character starters generated.")
+
+    runtime = StarterGenerationRuntime()
+
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, runtime)))
+    ) as client:
+        response = client.post(
+            "/api/scenarios/draft/character-starters/generate",
+            json={
+                "scenario_type": "full_roleplay",
+                "sections": {"title": "Lantern Keep"},
+                "character_starters": [
+                    {
+                        "name": "Mara Voss",
+                        "padding": [0] * 35_000,
+                    }
+                ],
+                "count": 1,
+            },
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "detail": "Character starter generation request is too large"
+    }
+    assert runtime.calls == 0
 
 
 def test_continuation_scenario_draft_uses_runtime_job(tmp_path: Path) -> None:
@@ -10418,6 +10766,7 @@ def test_scenario_routes_forward_child_actor(
             scenario_type: str,
             scenario_types: list[str] | None,
             sections: dict[str, str],
+            character_starters: list[dict[str, object]],
             action_choices_enabled: bool,
             save_title: str,
             source_metadata: dict[str, object] | None,
@@ -10427,12 +10776,37 @@ def test_scenario_routes_forward_child_actor(
                 scenario_type,
                 scenario_types,
                 sections,
+                character_starters,
                 action_choices_enabled,
                 save_title,
                 source_metadata,
             )
             self.actor_user_ids.append(("save", current_user_id))
             return _chat_model("Draft saved.")
+
+        async def generate_scenario_draft_character_starters(
+            self,
+            *,
+            scenario_type: str,
+            sections: dict[str, str],
+            character_starters: list[dict[str, object]],
+            count: int | None,
+            custom_description: str,
+            scenario_types: list[str] | None = None,
+            action_choices_enabled: bool = False,
+            current_user_id: str | None = None,
+        ) -> dict[str, object]:
+            del (
+                scenario_type,
+                scenario_types,
+                sections,
+                character_starters,
+                count,
+                custom_description,
+                action_choices_enabled,
+            )
+            self.actor_user_ids.append(("starters", current_user_id))
+            return _chat_model("Character starters generated.")
 
         def start_saved_scenario(
             self,
@@ -10515,6 +10889,15 @@ def test_scenario_routes_forward_child_actor(
                 save_id=job_save_id,
             )
             assert job["status"] == "succeeded"
+        starter_generation = client.post(
+            "/api/scenarios/draft/character-starters/generate",
+            json={
+                "scenario_type": "full_roleplay",
+                "sections": {"title": "Lantern Keep"},
+                "character_starters": [],
+                "count": 1,
+            },
+        )
         saved = client.post(
             "/api/scenarios/draft/save",
             json={
@@ -10536,6 +10919,10 @@ def test_scenario_routes_forward_child_actor(
                 "opening_message": "The beacon wakes.",
             },
         )
+        assert starter_generation.status_code == 403
+        assert starter_generation.json() == {
+            "detail": "Character starter generation is not allowed"
+        }
         assert saved.status_code == 200
         assert started.status_code == 200
         assert manual.status_code == 200
@@ -10790,6 +11177,14 @@ def test_venice_character_routes_are_absent(tmp_path: Path) -> None:
                 "seed": "Retired",
                 "section_id": "title",
                 "sections": {},
+            },
+        ),
+        (
+            "/api/scenarios/draft/character-starters/generate",
+            {
+                "scenario_type": "character_interaction",
+                "sections": {"title": "Retired"},
+                "count": 1,
             },
         ),
         (
@@ -14639,7 +15034,6 @@ def _create_dating_auth_save(
         player_role="Transfer student",
         content={
             "player_character_name": "Ren Takahashi",
-            "romance_options": "Mika Arai is the class president.",
         },
     )
     save = repositories.create_save(

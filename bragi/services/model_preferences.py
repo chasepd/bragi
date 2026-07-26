@@ -145,7 +145,6 @@ SCENARIO_GENERATION_SECTION_GROUPS = (
             "lore",
             "locations",
             "factions",
-            "characters",
             "tone_genre",
             "current_scene",
         ),
@@ -174,7 +173,6 @@ SCENARIO_GENERATION_SECTION_GROUPS = (
         "First Contact / Exploration",
         (
             "mission_profile",
-            "crew_and_command",
             "ship_or_base_status",
             "exploration_target",
             "unknown_intelligence",
@@ -189,7 +187,6 @@ SCENARIO_GENERATION_SECTION_GROUPS = (
         (
             "expedition_goal",
             "route_options",
-            "party_roster",
             "resource_inventory",
             "environmental_conditions",
             "hazards_and_events",
@@ -218,7 +215,6 @@ SCENARIO_GENERATION_SECTION_GROUPS = (
         "Investigation Mystery",
         (
             "case_facts",
-            "suspects",
             "clues",
             "timeline",
             "red_herrings",
@@ -231,7 +227,6 @@ SCENARIO_GENERATION_SECTION_GROUPS = (
         (
             "target_location",
             "objectives_and_stakes",
-            "crew_and_contacts",
             "intel_and_access",
             "security_model",
             "alert_and_heat",
@@ -246,7 +241,6 @@ SCENARIO_GENERATION_SECTION_GROUPS = (
         (
             "political_arena",
             "political_factions",
-            "major_npcs",
             "central_conflict",
             "secrets_and_leverage",
             "reputation_and_standing",
@@ -261,7 +255,6 @@ SCENARIO_GENERATION_SECTION_GROUPS = (
         "Settlement Builder",
         (
             "settlement_profile",
-            "population_and_residents",
             "resources_and_indicators",
             "projects_and_facilities",
             "threats_and_opportunities",
@@ -275,7 +268,6 @@ SCENARIO_GENERATION_SECTION_GROUPS = (
             "target_profile",
             "leads_and_clues",
             "hunt_locations",
-            "rivals_and_factions",
             "preparation_state",
             "hunt_status",
         ),
@@ -285,7 +277,6 @@ SCENARIO_GENERATION_SECTION_GROUPS = (
         (
             "journey_profile",
             "route_and_stops",
-            "traveling_party",
             "transport_and_supplies",
             "recurring_pressures",
             "relationship_threads",
@@ -300,7 +291,6 @@ SCENARIO_GENERATION_SECTION_GROUPS = (
             "markets_and_stops",
             "contracts_and_debts",
             "route_hazards",
-            "reputation_and_contacts",
             "profit_and_loss",
         ),
     ),
@@ -308,7 +298,6 @@ SCENARIO_GENERATION_SECTION_GROUPS = (
         "Dating Sim",
         (
             "player_character_profile",
-            "romance_options",
         ),
     ),
 )

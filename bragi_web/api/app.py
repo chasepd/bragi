@@ -45,7 +45,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from starlette.background import BackgroundTask
 
 from bragi_common.media_mime import safe_served_media_mime_type
@@ -180,6 +180,9 @@ _AUTH_THROTTLED_DETAIL = "Too many authentication attempts; try again later"
 _AUTH_USERNAME_MAX_LENGTH = 128
 _AUTH_PASSWORD_MAX_LENGTH = 1024
 _BOOTSTRAP_SETUP_TOKEN_MAX_LENGTH = 256
+_DRAFT_STARTER_GENERATION_MAX_SECTION_COUNT = 64
+_DRAFT_STARTER_GENERATION_MAX_EXISTING_STARTERS = 24
+_DRAFT_STARTER_GENERATION_MAX_JSON_CHARS = 60_000
 _PUBLIC_API_PATHS = frozenset(
     {
         "/api/health",
@@ -328,9 +331,22 @@ class SaveScenarioDraftRequest(BaseModel):
     scenario_type: str = "full_roleplay"
     scenario_types: list[str] | None = None
     sections: dict[str, str] = Field(default_factory=dict)
+    character_starters: list[dict[str, Any]] = Field(default_factory=list)
     action_choices_enabled: bool = False
     save_title: str = ""
     source_metadata: dict[str, object] | None = None
+
+
+class ScenarioDraftCharacterStarterGenerationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scenario_type: str = "full_roleplay"
+    scenario_types: list[str] | None = None
+    sections: dict[str, str] = Field(default_factory=dict)
+    character_starters: list[dict[str, Any]] = Field(default_factory=list)
+    count: StrictInt | None = None
+    custom_description: str = ""
+    action_choices_enabled: bool = False
 
 
 class RegenerateScenarioSectionRequest(BaseModel):
@@ -2832,6 +2848,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "scenario_types",
             ):
                 kwargs["scenario_types"] = payload.scenario_types
+            if _call_accepts_keyword(
+                state.runtime.save_scenario_draft,
+                "character_starters",
+            ):
+                kwargs["character_starters"] = payload.character_starters
             result = state.runtime.save_scenario_draft(
                 scenario_type=payload.scenario_type,
                 sections=payload.sections,
@@ -2851,6 +2872,60 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         )
         _publish_save_event(state, None, "saves_changed", {"reason": "save_created"})
         return payload_dict
+
+    @app.post("/api/scenarios/draft/character-starters/generate")
+    async def generate_scenario_draft_character_starters(
+        payload: ScenarioDraftCharacterStarterGenerationRequest,
+        state: StateDep,
+    ) -> dict[str, Any]:
+        _raise_if_retired_scenario_request(
+            payload.scenario_type,
+            payload.scenario_types,
+        )
+        async with state.lock.async_access():
+            current_user = _save_access_user(state)
+            if current_user is not None and current_user.role == "child":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Character starter generation is not allowed",
+                )
+            current_user_id = current_user.id if current_user is not None else None
+        _raise_if_starter_generation_payload_too_large(payload)
+        _raise_if_starter_generation_request_invalid(payload)
+
+        async def worker(handle: JobHandle) -> Any:
+            await handle.event("progress", {"label": "Generating character starters"})
+            kwargs: dict[str, Any] = {}
+            if _call_accepts_keyword(
+                state.runtime.generate_scenario_draft_character_starters,
+                "scenario_types",
+            ):
+                kwargs["scenario_types"] = payload.scenario_types
+            if _call_accepts_keyword(
+                state.runtime.generate_scenario_draft_character_starters,
+                "current_user_id",
+            ):
+                kwargs["current_user_id"] = current_user_id
+            if _call_accepts_keyword(
+                state.runtime.generate_scenario_draft_character_starters,
+                "action_choices_enabled",
+            ):
+                kwargs["action_choices_enabled"] = payload.action_choices_enabled
+            return await state.runtime.generate_scenario_draft_character_starters(
+                scenario_type=payload.scenario_type,
+                sections=payload.sections,
+                character_starters=payload.character_starters,
+                count=payload.count,
+                custom_description=payload.custom_description,
+                **kwargs,
+            )
+
+        return await _create_job_summary(
+            state,
+            "scenario_character_starters",
+            worker,
+            lock_runtime=False,
+        )
 
     @app.post("/api/scenarios/draft/section")
     async def regenerate_scenario_section(
@@ -5800,6 +5875,72 @@ def _content_safety_policy_for_request(
 def _owner_user_id_for_request(state: WebAppState) -> str | None:
     user = _save_access_user(state)
     return user.id if user is not None else None
+
+
+def _raise_if_starter_generation_payload_too_large(
+    payload: ScenarioDraftCharacterStarterGenerationRequest,
+) -> None:
+    if len(payload.sections) > _DRAFT_STARTER_GENERATION_MAX_SECTION_COUNT:
+        raise HTTPException(
+            status_code=413,
+            detail="Character starter generation request is too large",
+        )
+    if (
+        len(payload.character_starters)
+        > _DRAFT_STARTER_GENERATION_MAX_EXISTING_STARTERS
+    ):
+        raise HTTPException(
+            status_code=413,
+            detail="Character starter generation request is too large",
+        )
+    if len(payload.model_dump_json()) > _DRAFT_STARTER_GENERATION_MAX_JSON_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail="Character starter generation request is too large",
+        )
+
+
+def _raise_if_starter_generation_request_invalid(
+    payload: ScenarioDraftCharacterStarterGenerationRequest,
+) -> None:
+    from bragi.services.character_profile_completion import (
+        normalize_scenario_character_starters,
+    )
+    from bragi.services.scenario_service import (
+        normalize_scenario_draft_sections,
+        normalized_scenario_types_and_flag,
+    )
+
+    try:
+        draft_type, _draft_genres, _action_choices_enabled = (
+            normalized_scenario_types_and_flag(
+                payload.scenario_type,
+                scenario_types=payload.scenario_types,
+                action_choices_enabled=payload.action_choices_enabled,
+            )
+        )
+        normalize_scenario_draft_sections(draft_type, payload.sections)
+        normalize_scenario_character_starters(
+            list(payload.character_starters),
+            strict=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if payload.count is not None and (
+        isinstance(payload.count, bool) or payload.count < 1 or payload.count > 12
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Number of characters must be between 1 and 12",
+        )
+    if payload.custom_description.strip():
+        return
+    if payload.count is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Number of characters or custom character description is required",
+        )
 
 
 def _request_owns_bundle_preview(

@@ -221,7 +221,6 @@ def _dating_save_with_romance_option(
         player_role="Transfer student",
         content={
             "player_character_name": "Ren Takahashi",
-            "romance_options": "Mika Arai is the class president.",
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Summer Save")

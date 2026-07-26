@@ -23,6 +23,7 @@ from bragi.services.action_choice_flags import (
     normalize_legacy_action_choice_scenario,
 )
 from bragi.services.character_profile_completion import (
+    ScenarioCharacterStarter,
     content_with_character_starters,
 )
 from bragi.services.content_rating import effective_content_safety_policy
@@ -62,6 +63,25 @@ RETIRED_SCENARIO_REASON = (
     "The character_interaction scenario type is no longer supported"
 )
 _OPENING_SECTION_IDS = ("tone_genre", "choice_style", "opening_message")
+DEPRECATED_CHARACTER_LIST_SECTION_IDS = frozenset(
+    {
+        "characters",
+        "romance_options",
+        "suspects",
+        "crew_and_command",
+        "party_roster",
+        "crew_and_contacts",
+        "major_npcs",
+        "population_and_residents",
+        "rivals_and_factions",
+        "traveling_party",
+        "reputation_and_contacts",
+    }
+)
+_DEPRECATED_FACTION_APPEND_SECTION_IDS = (
+    "rivals_and_factions",
+    "reputation_and_contacts",
+)
 
 
 FULL_ROLEPLAY_SECTIONS = (
@@ -83,7 +103,6 @@ FULL_ROLEPLAY_ALLOWED_SECTIONS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "tone_genre",
     "opening_message",
     "current_scene",
@@ -155,7 +174,6 @@ FIRST_CONTACT_EXPLORATION_SECTIONS = (
     "player_character_name",
     "player_role",
     "mission_profile",
-    "crew_and_command",
     "ship_or_base_status",
     "exploration_target",
     "unknown_intelligence",
@@ -180,7 +198,6 @@ SURVIVAL_EXPEDITION_SECTIONS = (
     "player_role",
     "expedition_goal",
     "route_options",
-    "party_roster",
     "resource_inventory",
     "environmental_conditions",
     "hazards_and_events",
@@ -197,7 +214,6 @@ SURVIVAL_EXPEDITION_ALLOWED_SECTIONS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -229,7 +245,6 @@ TIME_LOOP_ALLOWED_SECTIONS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -239,7 +254,6 @@ INVESTIGATION_MYSTERY_SECTIONS = (
     "player_character_name",
     "player_role",
     "case_facts",
-    "suspects",
     "clues",
     "timeline",
     "red_herrings",
@@ -254,7 +268,6 @@ INVESTIGATION_MYSTERY_ALLOWED_SECTIONS = (
     "choice_style",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -265,7 +278,6 @@ HEIST_INFILTRATION_SECTIONS = (
     "player_role",
     "target_location",
     "objectives_and_stakes",
-    "crew_and_contacts",
     "intel_and_access",
     "security_model",
     "alert_and_heat",
@@ -282,7 +294,6 @@ HEIST_INFILTRATION_ALLOWED_SECTIONS = (
     "choice_style",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -293,7 +304,6 @@ POLITICAL_INTRIGUE_SECTIONS = (
     "player_role",
     "political_arena",
     "political_factions",
-    "major_npcs",
     "central_conflict",
     "secrets_and_leverage",
     "reputation_and_standing",
@@ -313,7 +323,6 @@ POLITICAL_INTRIGUE_ALLOWED_SECTIONS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -323,7 +332,6 @@ SETTLEMENT_BUILDER_SECTIONS = (
     "player_character_name",
     "player_role",
     "settlement_profile",
-    "population_and_residents",
     "resources_and_indicators",
     "projects_and_facilities",
     "threats_and_opportunities",
@@ -339,7 +347,6 @@ SETTLEMENT_BUILDER_ALLOWED_SECTIONS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -352,7 +359,6 @@ MONSTER_HUNT_BOUNTY_SECTIONS = (
     "target_profile",
     "leads_and_clues",
     "hunt_locations",
-    "rivals_and_factions",
     "preparation_state",
     "hunt_status",
     "tone_genre",
@@ -364,7 +370,6 @@ MONSTER_HUNT_BOUNTY_ALLOWED_SECTIONS = (
     "choice_style",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -375,7 +380,6 @@ ROAD_TRIP_PILGRIMAGE_SECTIONS = (
     "player_role",
     "journey_profile",
     "route_and_stops",
-    "traveling_party",
     "transport_and_supplies",
     "recurring_pressures",
     "relationship_threads",
@@ -391,7 +395,6 @@ ROAD_TRIP_PILGRIMAGE_ALLOWED_SECTIONS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -405,7 +408,6 @@ MERCHANT_TRADE_ROUTE_SECTIONS = (
     "markets_and_stops",
     "contracts_and_debts",
     "route_hazards",
-    "reputation_and_contacts",
     "profit_and_loss",
     "tone_genre",
     "opening_message",
@@ -418,7 +420,6 @@ MERCHANT_TRADE_ROUTE_ALLOWED_SECTIONS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -428,7 +429,6 @@ DATING_SIM_SECTIONS = (
     "player_character_name",
     "player_character_profile",
     "player_role",
-    "romance_options",
     "tone_genre",
     "opening_message",
 )
@@ -440,7 +440,6 @@ DATING_SIM_ALLOWED_SECTIONS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -460,7 +459,6 @@ CHOOSE_YOUR_OWN_ADVENTURE_ALLOWED_SECTIONS = (
     "lore",
     "locations",
     "factions",
-    "characters",
     "current_scene",
 )
 
@@ -494,10 +492,6 @@ _SECTION_GUIDANCE = {
     ),
     "factions": (
         "Summarize important established groups only; do not invent extra politics."
-    ),
-    "characters": (
-        "Summarize important established non-player characters only; do not invent "
-        "a cast list."
     ),
     "tone_genre": "Define the genre, mood, pacing, and content style.",
     "choice_style": (
@@ -550,11 +544,6 @@ _SECTION_GUIDANCE = {
         "command limits, and what would count as a responsible success or "
         "failure."
     ),
-    "crew_and_command": (
-        "Describe the starting crew, command structure, expertise, morale, "
-        "conflicts, injuries, trust in the player or mission plan, and any "
-        "standing orders that shape decisions."
-    ),
     "ship_or_base_status": (
         "Describe the ship, station, habitat, shuttle, or field base status. "
         "Include systems, supplies, equipment damage, rescue windows, and "
@@ -595,11 +584,6 @@ _SECTION_GUIDANCE = {
         "jurisdiction, and facts available at the start. Do not reveal hidden "
         "truth or the culprit's secret plan here."
     ),
-    "suspects": (
-        "Write natural prose with a small suspect, witness, faction, or person "
-        "of interest set. Include motives, alibis, secrets, relationships, and "
-        "what each person currently knows."
-    ),
     "clues": (
         "Track starter clues in natural prose. Include source location, "
         "discovery status, reliability, and connections to suspects, events, "
@@ -633,11 +617,6 @@ _SECTION_GUIDANCE = {
         "Describe the primary objective, optional objectives, non-negotiable "
         "constraints, deadlines, and what success, partial success, or failure "
         "would change."
-    ),
-    "crew_and_contacts": (
-        "Describe the crew, contacts, inside sources, rivals, handlers, or "
-        "marks in natural prose. Include roles, leverage, trust, friction, and "
-        "what each person can contribute or jeopardize."
     ),
     "intel_and_access": (
         "Describe known intel, unknowns, access credentials, covers, schedules, "
@@ -683,11 +662,6 @@ _SECTION_GUIDANCE = {
         "positions, hidden goals where useful for continuity, resources, "
         "pressure points, rivalries, and alliances."
     ),
-    "major_npcs": (
-        "Describe the key political NPCs in natural prose. Include roles, "
-        "loyalties, grudges, obligations, secrets, relationships to the "
-        "player, and what each NPC currently wants."
-    ),
     "central_conflict": (
         "Describe the central political conflict, decision, succession fight, "
         "vote, negotiation, scandal, coup risk, or policy struggle that makes "
@@ -730,10 +704,6 @@ _SECTION_GUIDANCE = {
         "Describe the settlement identity, location, theme, founding problem, "
         "leadership situation, and long-term objective in natural prose."
     ),
-    "population_and_residents": (
-        "Describe population groups, notable residents, leaders, specialists, "
-        "dependents, outside contacts, tensions, and what each group needs."
-    ),
     "resources_and_indicators": (
         "Track important resources and high-level indicators in prose: food, "
         "supplies, money, tools, defenses, medicine, fuel, trade goods, "
@@ -769,10 +739,6 @@ _SECTION_GUIDANCE = {
         "Describe locations tied to sightings, lairs, witnesses, victims, danger "
         "level, environmental conditions, and likely encounters."
     ),
-    "rivals_and_factions": (
-        "Describe rival hunters, patrons, authorities, victims, factions, allies, "
-        "and bystanders with their agendas, leverage, and risks."
-    ),
     "preparation_state": (
         "Track preparation in prose: gear, research, traps, allies, debts, "
         "special requirements, missing tools, and costs of being unprepared."
@@ -788,10 +754,6 @@ _SECTION_GUIDANCE = {
     "route_and_stops": (
         "Describe the route, expected stops, detours, borders, travel constraints, "
         "opportunities, dangers, contacts, and unresolved threads at stops."
-    ),
-    "traveling_party": (
-        "Describe the traveling party with names, roles, relationships, personal "
-        "goals, tensions, secrets, promises, and vulnerabilities."
     ),
     "transport_and_supplies": (
         "Track transport and travel resources in prose: vehicle condition, mounts, "
@@ -829,10 +791,6 @@ _SECTION_GUIDANCE = {
         "Describe route hazards such as weather, pirates, inspections, tariffs, "
         "bandits, blockades, shortages, rivals, and timed risks."
     ),
-    "reputation_and_contacts": (
-        "Describe reputation by market or faction and relationships with brokers, "
-        "clients, authorities, crew, competitors, patrons, and creditors."
-    ),
     "profit_and_loss": (
         "Describe profit, loss, margins, debt pressure, risk exposure, known price "
         "changes, and economic consequences transparently in prose."
@@ -844,11 +802,6 @@ _SECTION_GUIDANCE = {
     "route_options": (
         "Describe the viable routes, detours, retreat paths, landmarks, travel "
         "constraints, and tradeoffs the party can understand at the start."
-    ),
-    "party_roster": (
-        "Describe the expedition party in natural prose, including names, roles, "
-        "survival strengths or vulnerabilities, morale, injuries, and notable "
-        "interpersonal pressure."
     ),
     "resource_inventory": (
         "Track important supplies and equipment in prose: food, water, shelter, "
@@ -958,14 +911,6 @@ _SECTION_GUIDANCE = {
         "Describe the character's current emotional baseline toward the player "
         "and the relationship tension, trust, affection, or distance at the start."
     ),
-    "romance_options": (
-        "Write natural prose only, with one romance option per line or short "
-        "paragraph. Include each option's name, gender/pronouns, role or "
-        "archetype, appearance, personality, voice, and initial relationship "
-        "hook. Unless the user request specifies a different count or gender "
-        "mix, default to exactly 4 distinct romance options of the opposite "
-        "gender of the player character."
-    ),
     "current_scene": "Summarize the durable current scene after play has moved on.",
 }
 
@@ -978,6 +923,7 @@ class ScenarioDraft:
     metadata: Mapping[str, object] | None = None
     regeneration_seed: str = ""
     action_choices_enabled: bool = False
+    character_starters: tuple[ScenarioCharacterStarter, ...] = ()
 
     def __post_init__(self) -> None:
         normalized_type = ScenarioType(self.type)
@@ -996,6 +942,11 @@ class ScenarioDraft:
             self,
             "metadata",
             MappingProxyType(dict(self.metadata or {})),
+        )
+        object.__setattr__(
+            self,
+            "character_starters",
+            tuple(self.character_starters),
         )
 
     @property
@@ -1205,6 +1156,7 @@ class ScenarioService:
             metadata=_draft_metadata_with_generation_prompt(metadata, seed),
             regeneration_seed=seed,
             action_choices_enabled=action_choices_enabled,
+            character_starters=(),
         )
 
     async def regenerate_section(
@@ -1464,6 +1416,7 @@ class ScenarioService:
             metadata=draft.metadata,
             regeneration_seed=draft.regeneration_seed,
             action_choices_enabled=draft.action_choices_enabled,
+            character_starters=draft.character_starters,
         )
 
     def save_draft(self, draft: ScenarioDraft) -> str:
@@ -1498,6 +1451,7 @@ class ScenarioService:
             content=content_with_character_starters(
                 scenario_type=draft.type.value,
                 content=content,
+                starters=draft.character_starters,
             ),
         )
         log_event(
@@ -2058,6 +2012,7 @@ def normalize_scenario_draft_sections(
         action_choices_enabled=False,
     )
     normalized = {key: value.strip() for key, value in sections.items()}
+    normalized = strip_deprecated_scenario_character_sections_from_text(normalized)
     if legacy_action_choices_enabled:
         normalized["choice_style"] = normalized.get("choice_style", "")
     if _uses_opening_message_legacy_setup(normalized_type):
@@ -2089,6 +2044,7 @@ def normalize_scenario_definition(
             content=content,
         )
     )
+    normalized = strip_deprecated_scenario_character_sections(normalized)
     normalized_premise = premise.strip()
     if _uses_opening_message_legacy_setup(normalized_type):
         starting_scene = _object_text(normalized.pop("starting_scene", None))
@@ -2110,6 +2066,36 @@ def normalize_scenario_definition(
         else:
             normalized.pop("premise", None)
     return normalized_premise, normalized
+
+
+def strip_deprecated_scenario_character_sections(
+    content: Mapping[str, object],
+) -> dict[str, object]:
+    normalized = dict(content)
+    deprecated_values: dict[str, object] = {}
+    faction_fragments = [_object_text(normalized.get("factions"))]
+    for key in DEPRECATED_CHARACTER_LIST_SECTION_IDS:
+        if key in normalized:
+            deprecated_values[key] = normalized.pop(key)
+    for key in _DEPRECATED_FACTION_APPEND_SECTION_IDS:
+        text = _object_text(deprecated_values.get(key))
+        if text:
+            faction_fragments.append(text)
+    nonblank_factions = [fragment for fragment in faction_fragments if fragment]
+    if nonblank_factions:
+        normalized["factions"] = "\n\n".join(nonblank_factions)
+    return normalized
+
+
+def strip_deprecated_scenario_character_sections_from_text(
+    content: Mapping[str, str],
+) -> dict[str, str]:
+    stripped = strip_deprecated_scenario_character_sections(content)
+    return {
+        key: value
+        for key, value in stripped.items()
+        if isinstance(value, str)
+    }
 
 
 def _normalized_scenario_type_and_flag(

@@ -139,7 +139,6 @@ def test_compact_scenario_instructions_includes_survival_expedition_setup() -> N
         content={
             "expedition_goal": "Reach Northwatch before the medicine spoils.",
             "route_options": "Cliff road, glacier basin, or old mine tunnel.",
-            "party_roster": "Mara, two porters, and an injured scout.",
             "resource_inventory": "Food: 9 days. Water: 6 skins.",
             "environmental_conditions": "Late winter whiteouts and brittle ice.",
             "hazards_and_events": "Avalanches, frostbite, and lost trail markers.",
@@ -152,7 +151,6 @@ def test_compact_scenario_instructions_includes_survival_expedition_setup() -> N
 
     assert "Expedition goal: Reach Northwatch" in instructions
     assert "Route options: Cliff road" in instructions
-    assert "Party roster: Mara" in instructions
     assert "Resource inventory: Food: 9 days" in instructions
     assert "Environmental conditions: Late winter" in instructions
     assert "Hazards/events: Avalanches" in instructions
@@ -196,7 +194,6 @@ def test_compact_scenario_instructions_includes_political_intrigue_setup() -> No
         content={
             "political_arena": "The harbor council and its public galleries.",
             "political_factions": "Guilds, Old Families, and reform pamphleteers.",
-            "major_npcs": "Duchess Salen and Guildmaster Orro.",
             "central_conflict": "A midnight no-confidence vote can replace the regent.",
             "secrets_and_leverage": "Only Mara knows Orro moved missing silver.",
             "reputation_and_standing": "Mara is trusted by reformers.",
@@ -214,7 +211,6 @@ def test_compact_scenario_instructions_includes_political_intrigue_setup() -> No
 
     assert "Political arena: The harbor council" in instructions
     assert "Political factions: Guilds" in instructions
-    assert "Major NPCs: Duchess Salen" in instructions
     assert "Central conflict: A midnight no-confidence vote" in instructions
     assert "Secrets/leverage: Only Mara knows Orro moved" in instructions
     assert "Reputation/standing: Mara is trusted" in instructions

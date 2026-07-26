@@ -536,11 +536,6 @@ def _dating_sim_identity_lines(
                 "player_character_profile",
                 "Player profile",
             ),
-            _scenario_content_line(
-                scenario,
-                "romance_options",
-                "Romance options",
-            ),
         )
         if line
     )
@@ -638,7 +633,6 @@ def _first_contact_identity_lines(
         line
         for line in (
             *lean_lines,
-            _scenario_content_line(scenario, "crew_and_command", "Crew/command"),
             _scenario_content_line(
                 scenario,
                 "exploration_target",
@@ -709,7 +703,6 @@ def _heist_infiltration_identity_lines(
         for line in (
             _scenario_content_line(scenario, "target_location", "Target location"),
             *lean_lines,
-            _scenario_content_line(scenario, "crew_and_contacts", "Crew/contacts"),
             _scenario_content_line(scenario, "intel_and_access", "Intel/access"),
             _scenario_content_line(scenario, "loadout_and_tools", "Loadout/tools"),
             _scenario_content_line(scenario, "complications", "Complications"),
@@ -761,7 +754,6 @@ def _political_intrigue_identity_lines(
                 "political_factions",
                 "Political factions",
             ),
-            _scenario_content_line(scenario, "major_npcs", "Major NPCs"),
             _scenario_content_line(
                 scenario,
                 "secrets_and_leverage",
@@ -813,11 +805,6 @@ def _settlement_builder_identity_lines(
                 "settlement_profile",
                 "Settlement profile",
             ),
-            _scenario_content_line(
-                scenario,
-                "population_and_residents",
-                "Population/residents",
-            ),
             *lean_lines,
         )
         if line
@@ -845,11 +832,6 @@ def _monster_hunt_bounty_identity_lines(
             _scenario_content_line(scenario, "hunt_profile", "Hunt profile"),
             *lean_lines,
             _scenario_content_line(scenario, "hunt_locations", "Hunt locations"),
-            _scenario_content_line(
-                scenario,
-                "rivals_and_factions",
-                "Rivals/factions",
-            ),
         )
         if line
     )
@@ -887,7 +869,6 @@ def _road_trip_pilgrimage_identity_lines(
         for line in (
             _scenario_content_line(scenario, "journey_profile", "Journey profile"),
             _scenario_content_line(scenario, "route_and_stops", "Route/stops"),
-            _scenario_content_line(scenario, "traveling_party", "Traveling party"),
             *lean_lines,
         )
         if line
@@ -904,11 +885,6 @@ def _merchant_trade_route_identity_lines(
     lean_lines = (
         _scenario_content_line(scenario, "cargo_inventory", "Cargo inventory"),
         _scenario_content_line(scenario, "contracts_and_debts", "Contracts/debts"),
-        _scenario_content_line(
-            scenario,
-            "reputation_and_contacts",
-            "Reputation/contacts",
-        ),
         _scenario_content_line(scenario, "profit_and_loss", "Profit/loss"),
     )
     if not include_setup:
@@ -953,7 +929,6 @@ def _survival_expedition_identity_lines(
         for line in (
             *lean_lines,
             _scenario_content_line(scenario, "route_options", "Route options"),
-            _scenario_content_line(scenario, "party_roster", "Party roster"),
             _scenario_content_line(
                 scenario,
                 "hazards_and_events",
