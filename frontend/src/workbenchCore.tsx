@@ -310,6 +310,7 @@ function runtimeChangedRefreshTargets(reason: string | null, panel: PanelName): 
 
 function saveEventRefreshTargets(event: SaveEvent, panel: PanelName): WorkbenchRefreshTarget[] {
   if (event.type === "runtime_changed") return runtimeChangedRefreshTargets(saveEventReason(event), panel);
+  if (event.type === "world_data_changed") return runtimeChangedRefreshTargets(saveEventReason(event), panel);
   if (event.type === "job_changed") return ["jobs-active", "chat-status"];
   if (event.type === "character_texts_changed") return ["character-texts", "character-text-thread", "chat-status"];
   if (event.type === "scenarios_changed") return ["scenarios"];
