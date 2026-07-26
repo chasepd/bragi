@@ -11,6 +11,7 @@ import {
   Check,
   ChevronDown,
   ChevronLeft,
+  ChevronUp,
   Clock,
   Download,
   Edit3,
@@ -2801,6 +2802,7 @@ function Workbench({
   const [lookAroundOpen, setLookAroundOpen] = useState(false);
   const [lookAroundInitialQuery, setLookAroundInitialQuery] = useState("");
   const [lookAroundAnswer, setLookAroundAnswer] = useState<LookAroundAnswer | null>(null);
+  const [topbarExpanded, setTopbarExpanded] = useState(true);
   const [draftInitialMode, setDraftInitialMode] = useState<"manual" | "draft">("manual");
   const [draftPrefill, setDraftPrefill] = useState<ScenarioDraftPrefill | null>(null);
   const [mobileSheet, setMobileSheet] = useState<MobileSheetName | null>(null);
@@ -3446,63 +3448,83 @@ function Workbench({
       ) : null}
       <main className="chronicle-pane">
         <div className="topbar">
-          <div>
-            <p className="eyebrow">{model?.model_indicator ?? "No model selected"}</p>
-            <h1>{model?.active_save_title ?? "Bragi Workbench"}</h1>
-            <div className="topbar-meta">
-              <span>{model?.scenario_title ?? "No scenario loaded"}</span>
-              {model?.scene_title ? <span>{model.scene_title}</span> : null}
+          {topbarExpanded ? (
+            <div>
+              <p className="eyebrow">{model?.model_indicator ?? "No model selected"}</p>
+              <h1>{model?.active_save_title ?? "Bragi Workbench"}</h1>
+              <div className="topbar-meta">
+                <span>{model?.scenario_title ?? "No scenario loaded"}</span>
+                {model?.scene_title ? <span>{model.scene_title}</span> : null}
+              </div>
+              <WorldTimeControl
+                worldTime={model?.world_time ?? null}
+                activeSaveId={activeSaveSupported ? activeSaveId : null}
+                onRuntimeChanged={applyRuntimeModel}
+              />
             </div>
-            <WorldTimeControl
-              worldTime={model?.world_time ?? null}
-              activeSaveId={activeSaveSupported ? activeSaveId : null}
-              onRuntimeChanged={applyRuntimeModel}
-            />
-          </div>
+          ) : null}
           <div className="topbar-actions">
-            {runtimeLoadError || model?.error ? (
-              <p className="topbar-error" role="alert">{runtimeLoadError || model?.error}</p>
+            {topbarExpanded ? (
+              <>
+                {runtimeLoadError || model?.error ? (
+                  <p className="topbar-error" role="alert">{runtimeLoadError || model?.error}</p>
+                ) : null}
+                <button
+                  type="button"
+                  className="icon-button"
+                  title="Look around"
+                  aria-label="Look around"
+                  disabled={lookAroundDisabled}
+                  onClick={() => openLookAround("")}
+                >
+                  <Search size={16} aria-hidden="true" />
+                </button>
+                {model?.character_texts_enabled ? (
+                  <button
+                    type="button"
+                    className="icon-button phone-button"
+                    title={unreadCharacterTextCount ? `Open phone, ${unreadCharacterTextCount} unread` : "Open phone"}
+                    aria-label={unreadCharacterTextCount ? `Open phone, ${unreadCharacterTextCount} unread` : "Open phone"}
+                    disabled={!activeSaveId || !activeSaveSupported}
+                    onClick={() => setPhoneOpen(true)}
+                  >
+                    <Smartphone size={16} aria-hidden="true" />
+                    {unreadCharacterTextCount ? (
+                      <span className="phone-unread-badge">{unreadCharacterTextCount}</span>
+                    ) : null}
+                  </button>
+                ) : null}
+                {currentUser && onLogout ? (
+                  <div className="session-chip">
+                    <span>{currentUser.username}</span>
+                    <small>{currentUser.role}</small>
+                    <button
+                      type="button"
+                      className="icon-button"
+                      title="Log out"
+                      aria-label="Log out"
+                      onClick={onLogout}
+                    >
+                      <LogOut size={16} aria-hidden="true" />
+                    </button>
+                  </div>
+                ) : null}
+              </>
             ) : null}
             <button
               type="button"
               className="icon-button"
-              title="Look around"
-              aria-label="Look around"
-              disabled={lookAroundDisabled}
-              onClick={() => openLookAround("")}
+              title={topbarExpanded ? "Collapse top bar" : "Expand top bar"}
+              aria-label={topbarExpanded ? "Collapse top bar" : "Expand top bar"}
+              aria-expanded={topbarExpanded}
+              onClick={() => setTopbarExpanded((expanded) => !expanded)}
             >
-              <Search size={16} aria-hidden="true" />
+              {topbarExpanded ? (
+                <ChevronUp size={16} aria-hidden="true" />
+              ) : (
+                <ChevronDown size={16} aria-hidden="true" />
+              )}
             </button>
-            {model?.character_texts_enabled ? (
-              <button
-                type="button"
-                className="icon-button phone-button"
-                title={unreadCharacterTextCount ? `Open phone, ${unreadCharacterTextCount} unread` : "Open phone"}
-                aria-label={unreadCharacterTextCount ? `Open phone, ${unreadCharacterTextCount} unread` : "Open phone"}
-                disabled={!activeSaveId || !activeSaveSupported}
-                onClick={() => setPhoneOpen(true)}
-              >
-                <Smartphone size={16} aria-hidden="true" />
-                {unreadCharacterTextCount ? (
-                  <span className="phone-unread-badge">{unreadCharacterTextCount}</span>
-                ) : null}
-              </button>
-            ) : null}
-            {currentUser && onLogout ? (
-              <div className="session-chip">
-                <span>{currentUser.username}</span>
-                <small>{currentUser.role}</small>
-                <button
-                  type="button"
-                  className="icon-button"
-                  title="Log out"
-                  aria-label="Log out"
-                  onClick={onLogout}
-                >
-                  <LogOut size={16} aria-hidden="true" />
-                </button>
-              </div>
-            ) : null}
           </div>
         </div>
         {!activeSaveSupported ? (

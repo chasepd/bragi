@@ -6877,6 +6877,56 @@ describe("frontend helpers", () => {
     expect(Boolean(tray.compareDocumentPosition(composer as Element) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
   });
 
+  it("collapses and restores the top bar controls", async () => {
+    installEventSourceDouble();
+    vi.stubGlobal("fetch", workbenchFetch([], runtimeModel({
+      world_time: {
+        snapshot_id: "scene-1",
+        day_index: 5,
+        day_label: "friday",
+        phase: "evening",
+        clock_minutes: 1275,
+        period_label: "festival week",
+        source_message_id: null,
+        confidence: null,
+        display: "Friday festival week evening at 21:15"
+      }
+    })));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench
+          currentUser={{ id: "user-1", username: "Mira", role: "user", status: "active" }}
+          onLogout={vi.fn()}
+        />
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByRole("heading", { name: "Lantern Keep" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Look around" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Log out" })).toBeInTheDocument();
+    expect(screen.getByText("Friday festival week evening at 21:15")).toBeInTheDocument();
+
+    const collapseButton = screen.getByRole("button", { name: "Collapse top bar" });
+    expect(collapseButton).toHaveAttribute("aria-expanded", "true");
+    await userEvent.click(collapseButton);
+
+    expect(screen.queryByRole("heading", { name: "Lantern Keep" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Look around" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Log out" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Friday festival week evening at 21:15")).not.toBeInTheDocument();
+    const expandButton = screen.getByRole("button", { name: "Expand top bar" });
+    expect(expandButton).toHaveAttribute("aria-expanded", "false");
+
+    await userEvent.click(expandButton);
+
+    expect(await screen.findByRole("heading", { name: "Lantern Keep" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Look around" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Log out" })).toBeInTheDocument();
+    expect(screen.getByText("Friday festival week evening at 21:15")).toBeInTheDocument();
+  });
+
   it("shows in-world time and lets the player correct it", async () => {
     installEventSourceDouble();
     let currentModel = runtimeModel({
