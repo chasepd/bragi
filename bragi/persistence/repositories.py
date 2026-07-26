@@ -103,6 +103,7 @@ JOB_STEP_STATUSES = frozenset(
         "cancelled",
         "skipped",
         "deferred",
+        "blocked_dependency",
         "skipped_provider_pressure",
     }
 )
@@ -7326,7 +7327,8 @@ class PersistenceRepositories:
                   'context_precompute', 'context_search', 'context_update',
                   'context_update_retry', 'context_update_retry_drain',
                   'guided_context_cleanup', 'memory_consolidation',
-                  'scenario_evolution', 'state_pruning',
+                  'scenario_evolution', 'state_extraction_retry',
+                  'state_extraction_retry_drain', 'state_pruning',
                   'web_maintenance_character_registry_maintenance',
                   'web_maintenance_memory_consolidation',
                   'web_maintenance_state_pruning',

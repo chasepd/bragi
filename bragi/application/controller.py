@@ -547,8 +547,8 @@ class BragiRuntime:
         self._pending_chat_cancellations: set[str] = set()
         self._save_operation_locks: dict[str, threading.Lock] = {}
         self._save_operation_locks_guard = threading.Lock()
-        self._context_retry_drain_counts: dict[str, int] = {}
-        self._context_retry_drain_guard = threading.Lock()
+        self._maintenance_retry_drain_counts: dict[str, int] = {}
+        self._maintenance_retry_drain_guard = threading.Lock()
         self._context_trimmed_narrator_message_ids: set[str] = set()
 
     def cancel_active_chat_turn(self, save_id: str | None = None) -> bool:
@@ -3645,7 +3645,7 @@ class BragiRuntime:
         if save_id is None:
             return self.build_model(error="No active save selected")
         try:
-            self._begin_context_retry_drain(save_id)
+            self._begin_maintenance_retry_drain(save_id)
             try:
                 async with self._save_operation_lock(save_id):
                     completed = await ChatService(
@@ -3659,7 +3659,7 @@ class BragiRuntime:
                         ),
                     ).run_context_update_retries(save_id=save_id)
             finally:
-                self._end_context_retry_drain(save_id)
+                self._end_maintenance_retry_drain(save_id)
         except Exception as exc:
             log_error_event(
                 "runtime.context_update_retries_failed",
@@ -3672,6 +3672,49 @@ class BragiRuntime:
             )
         return self.build_model(
             status=f"Context update retries finished: {completed} completed.",
+            active_save_id=save_id,
+        )
+
+    async def run_state_extraction_retries(
+        self,
+        *,
+        active_save_id: str | None | object = ...,
+    ) -> RuntimeModel:
+        save_id = (
+            self.active_save_id
+            if active_save_id is ...
+            else cast(str | None, active_save_id)
+        )
+        if save_id is None:
+            return self.build_model(error="No active save selected")
+        try:
+            self._begin_maintenance_retry_drain(save_id)
+            try:
+                async with self._save_operation_lock(save_id):
+                    completed = await ChatService(
+                        repositories=self.repositories,
+                        providers=self.providers,
+                        context_search_service=self.context_search_service,
+                        summary_service=self._summary_service(),
+                        media_service=self._media_service(),
+                        prompt_inspection_store=(
+                            self._prompt_inspection_store_if_enabled()
+                        ),
+                    ).run_state_extraction_retries(save_id=save_id)
+            finally:
+                self._end_maintenance_retry_drain(save_id)
+        except Exception as exc:
+            log_error_event(
+                "runtime.state_extraction_retries_failed",
+                save_id=save_id,
+                **exception_log_fields(exc),
+            )
+            return self.build_model(
+                error=_user_visible_error(exc),
+                active_save_id=save_id,
+            )
+        return self.build_model(
+            status=f"State extraction retries finished: {completed} completed.",
             active_save_id=save_id,
         )
 
@@ -5449,26 +5492,26 @@ class BragiRuntime:
     ) -> bool:
         return (
             post_input_catchup is not None
-            or self._context_retry_drain_active(save_id)
+            or self._maintenance_retry_drain_active(save_id)
         )
 
-    def _begin_context_retry_drain(self, save_id: str) -> None:
-        with self._context_retry_drain_guard:
-            self._context_retry_drain_counts[save_id] = (
-                self._context_retry_drain_counts.get(save_id, 0) + 1
+    def _begin_maintenance_retry_drain(self, save_id: str) -> None:
+        with self._maintenance_retry_drain_guard:
+            self._maintenance_retry_drain_counts[save_id] = (
+                self._maintenance_retry_drain_counts.get(save_id, 0) + 1
             )
 
-    def _end_context_retry_drain(self, save_id: str) -> None:
-        with self._context_retry_drain_guard:
-            count = self._context_retry_drain_counts.get(save_id, 0)
+    def _end_maintenance_retry_drain(self, save_id: str) -> None:
+        with self._maintenance_retry_drain_guard:
+            count = self._maintenance_retry_drain_counts.get(save_id, 0)
             if count <= 1:
-                self._context_retry_drain_counts.pop(save_id, None)
+                self._maintenance_retry_drain_counts.pop(save_id, None)
                 return
-            self._context_retry_drain_counts[save_id] = count - 1
+            self._maintenance_retry_drain_counts[save_id] = count - 1
 
-    def _context_retry_drain_active(self, save_id: str) -> bool:
-        with self._context_retry_drain_guard:
-            return self._context_retry_drain_counts.get(save_id, 0) > 0
+    def _maintenance_retry_drain_active(self, save_id: str) -> bool:
+        with self._maintenance_retry_drain_guard:
+            return self._maintenance_retry_drain_counts.get(save_id, 0) > 0
 
     async def _acquire_thread_save_operation_lock(
         self,

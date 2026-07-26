@@ -16,6 +16,7 @@ CONTINUITY_JOB_TYPES = frozenset(
     {
         "context_search",
         "state_extraction",
+        "state_extraction_retry",
         "context_update",
         "context_update_retry",
         "character_text_world_update",

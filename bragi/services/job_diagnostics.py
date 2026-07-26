@@ -33,6 +33,8 @@ _JOB_TYPE_ORIGINS = {
     "chat_completion": "chat_turn",
     "scenario_draft": "scenario_wizard",
     "scenario_generation": "scenario_wizard",
+    "state_extraction_retry": "scheduled_maintenance",
+    "state_extraction_retry_drain": "scheduled_maintenance",
     "state_pruning": "scheduled_maintenance",
     "context_cleanup": "scheduled_maintenance",
     "guided_context_cleanup": "scheduled_maintenance",

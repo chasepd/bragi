@@ -921,6 +921,8 @@ def _provider_task_for_job_type(job_type: str) -> str | None:
         return "context_cleanup"
     if job_type == "summary_backfill":
         return "summarization"
+    if job_type == "state_extraction_retry_drain":
+        return "state_memory"
     if job_type in {
         "context_update_retry_drain",
         "character_text_world_update_retry_drain",

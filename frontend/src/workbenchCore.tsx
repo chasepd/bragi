@@ -278,6 +278,7 @@ function runtimeChangedRefreshTargets(reason: string | null, panel: PanelName): 
     "world_data_applied",
     "world_suggestion_review",
     "state_pruning",
+    "state_extraction_retry",
     "context_update_retry",
     "character_text_world_update_retry",
     "world_context_retention",
