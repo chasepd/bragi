@@ -461,6 +461,58 @@ def test_dating_sim_starters_can_be_generated_from_unstructured_romance_prose() 
     assert len(provider.requests) == 1
 
 
+def test_structured_dating_starter_generation_gets_name_candidates() -> None:
+    provider = RecordingStructuredProfileProvider(
+        {
+            "characters": [
+                {
+                    "name": "Avery",
+                    "role": "Photographer chasing unscripted sparks.",
+                    "known_state": "Avery asks James about the gallery light.",
+                    "appearance": "Copper hair and tiny silver earrings.",
+                    "visual_notes": "Camera strap and quick, curious glances.",
+                    "personality": "Quick, curious, and impulsively kind.",
+                    "voice": 'Bright and candid. Example: "Show me what you see."',
+                    "texting_style": (
+                        "Short excited bursts. Sample text: Send the photo?"
+                    ),
+                    "goals": "Find a connection that feels unscripted.",
+                    "motivations": "Follow curiosity toward real trust.",
+                    "boundaries": "Will not be treated as a disposable adventure.",
+                }
+            ]
+        }
+    )
+    completer = StructuredProviderCharacterProfileCompleter(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-structured",
+    )
+
+    starters = asyncio.run(
+        complete_character_starters(
+            completer=completer,
+            scenario_type="dating_sim",
+            content={
+                "player_character_name": "James Mitchell",
+                "romance_options": (
+                    "A photographer with a camera bag asks about James's "
+                    "favorite gallery light."
+                ),
+            },
+        )
+    )
+
+    request_body = provider.requests[0].messages[1].body
+    assert "Ordinary contemporary name candidates" in request_body
+    assert "Feminine:" in request_body
+    assert "Masculine:" in request_body
+    assert "Neutral:" in request_body
+    assert "Preserve explicit scenario names" in request_body
+    assert [starter.name for starter in starters] == ["Avery"]
+    assert len(provider.requests) == 1
+
+
 def test_dating_sim_starters_can_be_generated_from_tool_calls() -> None:
     provider = RecordingToolCallProfileProvider(
         [
@@ -533,6 +585,71 @@ def test_dating_sim_starters_can_be_generated_from_tool_calls() -> None:
         "James Mitchell": "romance option for James Mitchell"
     }
     assert starters[1].status == "available romance option at scenario start"
+    assert len(provider.requests) == 1
+
+
+def test_tool_dating_starter_generation_gets_name_candidates() -> None:
+    provider = RecordingToolCallProfileProvider(
+        [
+            (
+                ProviderToolCall(
+                    id="tool-avery",
+                    name="create_dating_sim_character_starter",
+                    arguments_json=json.dumps(
+                        {
+                            "name": "Avery",
+                            "role": "Photographer chasing unscripted sparks.",
+                            "known_state": (
+                                "Avery asks James about the gallery light."
+                            ),
+                            "appearance": "Copper hair and tiny silver earrings.",
+                            "visual_notes": (
+                                "Camera strap and quick, curious glances."
+                            ),
+                            "personality": (
+                                "Quick, curious, and impulsively kind."
+                            ),
+                            "voice": (
+                                'Bright and candid. Example: "Show me what you see."'
+                            ),
+                            "texting_style": (
+                                "Short excited bursts. Sample text: Send the photo?"
+                            ),
+                            "goals": "Find a connection that feels unscripted.",
+                            "motivations": "Follow curiosity toward real trust.",
+                            "boundaries": (
+                                "Will not be treated as a disposable adventure."
+                            ),
+                        }
+                    ),
+                ),
+            )
+        ]
+    )
+    completer = ToolCallingProviderCharacterProfileCompleter(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-tools",
+    )
+
+    starters = asyncio.run(
+        complete_character_starters(
+            completer=completer,
+            scenario_type="dating_sim",
+            content={
+                "player_character_name": "James Mitchell",
+                "romance_options": (
+                    "A photographer with a camera bag asks about James's "
+                    "favorite gallery light."
+                ),
+            },
+        )
+    )
+
+    request_body = provider.requests[0].messages[1].body
+    assert "Ordinary contemporary name candidates" in request_body
+    assert "Preserve explicit scenario names" in request_body
+    assert [starter.name for starter in starters] == ["Avery"]
     assert len(provider.requests) == 1
 
 

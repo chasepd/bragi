@@ -48,6 +48,13 @@ _CAST_DEDUPE_SECTION_IDS = frozenset(
         "traveling_party",
     }
 )
+_CHARACTER_STARTER_SECTION_IDS = MappingProxyType(
+    {
+        "dating_sim": "romance_options",
+        "first_contact_exploration": "crew_and_command",
+        "political_intrigue": "major_npcs",
+    }
+)
 _PROSE_NAME_MARKERS = (
     " is ",
     " was ",
@@ -139,6 +146,24 @@ def ordinary_name_candidate_context(
     return "\n".join(lines)
 
 
+def ordinary_character_name_candidate_context(
+    *,
+    scenario_type: Any,
+    content: Mapping[str, object],
+    per_bucket: int = 12,
+) -> str:
+    section_id = _character_starter_section_id(scenario_type)
+    if not section_id:
+        return ""
+    return ordinary_name_candidate_context(
+        scenario_type=scenario_type,
+        section_id=section_id,
+        seed=_source_generation_prompt(content),
+        sections=_string_content_sections(content),
+        per_bucket=per_bucket,
+    )
+
+
 def ordinary_name_candidates(
     *,
     scenario_type: Any,
@@ -215,6 +240,30 @@ def repeated_first_names(text: str) -> tuple[str, ...]:
             repeated_keys.add(key)
         seen.add(key)
     return tuple(repeated)
+
+
+def _character_starter_section_id(scenario_type: Any) -> str:
+    for value in _scenario_type_values(scenario_type):
+        section_id = _CHARACTER_STARTER_SECTION_IDS.get(value)
+        if section_id:
+            return section_id
+    return "characters"
+
+
+def _string_content_sections(content: Mapping[str, object]) -> dict[str, str]:
+    return {
+        key: value.strip()
+        for key, value in content.items()
+        if isinstance(value, str) and value.strip()
+    }
+
+
+def _source_generation_prompt(content: Mapping[str, object]) -> str:
+    source = content.get("_source")
+    if not isinstance(source, Mapping):
+        return ""
+    prompt = source.get("generation_prompt")
+    return prompt.strip() if isinstance(prompt, str) else ""
 
 
 @cache
