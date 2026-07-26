@@ -8,9 +8,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from bragi.persistence.models import MediaAssetRecord
+from bragi.persistence.models import MediaAssetRecord, MessageRecord
 from bragi.persistence.repositories import PersistenceRepositories
-from bragi.services.content_rating import content_exceeds_rating
+from bragi.services.media_content_rating import media_asset_exceeds_rating
 from bragi.services.model_preferences import roleplay_model_preference
 
 _IMAGE_TO_VIDEO_CAPABILITIES = frozenset(
@@ -23,8 +23,6 @@ _IMAGE_TO_VIDEO_CAPABILITIES = frozenset(
 )
 _CHARACTER_NAME_MEDIA_KINDS = frozenset({"character_image", "character_reference"})
 _CHARACTER_REFERENCE_RELATION = "reference_image"
-
-
 @dataclass(frozen=True)
 class MediaSourceModel:
     id: str
@@ -79,7 +77,7 @@ def build_media_model(
     allowed_rating: str | None = None,
 ) -> MediaModel:
     source_messages = {
-        message.id: message.body
+        message.id: message
         for message in repositories.list_messages(save_id)
     }
     image_animation_available = _image_animation_available(
@@ -100,11 +98,14 @@ def build_media_model(
     media_assets = [
         asset
         for asset in all_media_assets
-        if not _media_asset_exceeds_rating(
-            asset,
-            allowed_rating=allowed_rating,
-            source_messages=source_messages,
-            media_assets_by_id=all_media_assets_by_id,
+        if (
+            allowed_rating is None
+            or not media_asset_exceeds_rating(
+                asset,
+                allowed_rating=allowed_rating,
+                media_assets_by_id=all_media_assets_by_id,
+                source_messages=source_messages,
+            )
         )
     ]
     media_asset_by_id = {asset.id: asset for asset in media_assets}
@@ -156,44 +157,10 @@ def build_media_model(
     )
 
 
-def _media_asset_exceeds_rating(
-    asset: MediaAssetRecord,
-    *,
-    allowed_rating: str | None,
-    source_messages: Mapping[str, str],
-    media_assets_by_id: Mapping[str, MediaAssetRecord],
-    visited_asset_ids: frozenset[str] = frozenset(),
-) -> bool:
-    if allowed_rating is None:
-        return False
-    if content_exceeds_rating(asset.prompt, allowed_rating=allowed_rating):
-        return True
-    if asset.source_message_id is not None:
-        source_message = source_messages.get(asset.source_message_id)
-        if source_message is not None and content_exceeds_rating(
-            source_message,
-            allowed_rating=allowed_rating,
-        ):
-            return True
-    source_asset_id = asset.source_media_asset_id
-    if source_asset_id is None or source_asset_id in visited_asset_ids:
-        return False
-    source_asset = media_assets_by_id.get(source_asset_id)
-    if source_asset is None:
-        return False
-    return _media_asset_exceeds_rating(
-        source_asset,
-        allowed_rating=allowed_rating,
-        source_messages=source_messages,
-        media_assets_by_id=media_assets_by_id,
-        visited_asset_ids=visited_asset_ids | {asset.id},
-    )
-
-
 def _to_image_model(
     asset: MediaAssetRecord,
     *,
-    source_messages: dict[str, str],
+    source_messages: Mapping[str, MessageRecord],
     image_animation_available: bool,
     source_asset: MediaAssetRecord | None,
     metadata: dict[str, Any],
@@ -202,10 +169,13 @@ def _to_image_model(
     is_character_reference: bool,
     can_set_character_reference: bool,
 ) -> MediaImageModel:
-    source_message = (
+    source_message_record = (
         source_messages.get(asset.source_message_id)
         if asset.source_message_id is not None
         else None
+    )
+    source_message = (
+        source_message_record.body if source_message_record is not None else None
     )
     prompt_preview = _prompt_preview(
         prompt=asset.prompt,
@@ -249,12 +219,15 @@ def _to_image_model(
 def _to_source_model(
     asset: MediaAssetRecord,
     *,
-    source_messages: dict[str, str],
+    source_messages: Mapping[str, MessageRecord],
 ) -> MediaSourceModel:
-    source_message = (
+    source_message_record = (
         source_messages.get(asset.source_message_id)
         if asset.source_message_id is not None
         else None
+    )
+    source_message = (
+        source_message_record.body if source_message_record is not None else None
     )
     return MediaSourceModel(
         id=asset.id,

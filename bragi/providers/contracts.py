@@ -261,6 +261,7 @@ class ImageRequest:
     source_media_path: Path | None = None
     source_media_asset_ids: tuple[str, ...] = ()
     source_media_paths: tuple[Path, ...] = ()
+    content_rating: str = "unrated"
     dimensions: tuple[int, int] | None = None
     safe_mode: bool | None = None
     force_safe_mode: bool = False
@@ -292,6 +293,7 @@ class VideoRequest:
     source_message_id: str
     source_media_asset_id: str | None = None
     source_media_path: Path | None = None
+    content_rating: str = "unrated"
     dimensions: tuple[int, int] | None = None
     safe_mode: bool | None = None
     force_safe_mode: bool = False

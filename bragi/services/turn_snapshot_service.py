@@ -25,6 +25,9 @@ from bragi.safety import (
     FADE_TO_BLACK_TRANSITION_KIND,
     normalize_message_safety,
 )
+from bragi.services.scenario_content_rating import (
+    metadata_with_scenario_content_ratings,
+)
 from bragi.services.sexual_content_safety import (
     is_fade_to_black_message,
 )
@@ -682,7 +685,8 @@ class TurnSnapshotService:
                 self._rows_from_exported_manifest(
                     objects_by_hash,
                     _text(row, "root_manifest_hash"),
-                )
+                ),
+                quarantine_content_ratings=True,
             )
             for row in snapshots
         }
@@ -1759,6 +1763,8 @@ def _sanitize_snapshot_message_row(
 
 def _sanitize_snapshot_rows_for_safety(
     rows_by_table: Mapping[str, Iterable[Mapping[str, object]]],
+    *,
+    quarantine_content_ratings: bool = False,
 ) -> dict[str, tuple[dict[str, object], ...]]:
     rows = {
         table_name: tuple(dict(row) for row in table_rows)
@@ -1768,6 +1774,26 @@ def _sanitize_snapshot_rows_for_safety(
         _sanitize_snapshot_message_row(row)
         for row in rows.get("messages", ())
     )
+    if quarantine_content_ratings:
+        for table_name in (
+            "messages",
+            "character_text_messages",
+            "message_action_choices",
+            "summaries",
+            "characters",
+        ):
+            rows[table_name] = tuple(
+                {**row, "content_rating": "unclassified"}
+                for row in rows.get(table_name, ())
+            )
+        rows["media_assets"] = tuple(
+            _snapshot_media_row_with_unclassified_rating(row)
+            for row in rows.get("media_assets", ())
+        )
+        rows["save_scenario_updates"] = tuple(
+            _snapshot_scenario_row_with_unclassified_rating(row)
+            for row in rows.get("save_scenario_updates", ())
+        )
     transition_ids = {
         str(row["id"])
         for row in rows["messages"]
@@ -1812,6 +1838,42 @@ def _sanitize_snapshot_rows_for_safety(
             sanitized_rows.append(row)
         rows[table_name] = tuple(sanitized_rows)
     return rows
+
+
+def _snapshot_media_row_with_unclassified_rating(
+    row: Mapping[str, object],
+) -> dict[str, object]:
+    copied = dict(row)
+    metadata = copied.get("metadata_json")
+    try:
+        parsed = json.loads(metadata) if isinstance(metadata, str) else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    parsed["content_rating"] = "unclassified"
+    copied["metadata_json"] = _compact_json(parsed)
+    return copied
+
+
+def _snapshot_scenario_row_with_unclassified_rating(
+    row: Mapping[str, object],
+) -> dict[str, object]:
+    copied = dict(row)
+    content = copied.get("content_json")
+    try:
+        parsed = json.loads(content) if isinstance(content, str) else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    source = parsed.get("_source")
+    parsed["_source"] = metadata_with_scenario_content_ratings(
+        source if isinstance(source, Mapping) else None,
+        aggregate_rating="unclassified",
+    )
+    copied["content_json"] = _compact_json(parsed)
+    return copied
 
 
 def _snapshot_row_references_transition(

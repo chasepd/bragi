@@ -18,6 +18,7 @@ from bragi.persistence.models import (
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     ChatMessage,
+    ChatRequest,
     ProviderClient,
     StructuredOutputProvider,
     StructuredOutputRequest,
@@ -26,6 +27,8 @@ from bragi.services.action_choice_flags import scenario_action_choices_enabled
 from bragi.services.character_action_planning_service import (
     CHARACTER_ACTION_PLANNING_TASK,
 )
+from bragi.services.content_rating import effective_content_safety_policy
+from bragi.services.content_safety_service import ContentSafetyService
 from bragi.services.model_capabilities import (
     MODEL_LACKS_CAPABILITY_REASON,
     MODEL_MISSING_REASON,
@@ -49,6 +52,7 @@ class PreparedActionChoiceGeneration:
     save_id: str
     narrator_message_id: str
     request: StructuredOutputRequest
+    current_user_id: str | None = None
 
 
 class ActionChoiceService:
@@ -57,9 +61,17 @@ class ActionChoiceService:
         *,
         repositories: PersistenceRepositories,
         providers: dict[str, ProviderClient],
+        content_safety_service: ContentSafetyService | None = None,
     ) -> None:
         self.repositories = repositories
         self.providers = providers
+        self.content_safety_service = (
+            content_safety_service
+            or ContentSafetyService(
+                repositories=repositories,
+                providers=providers,
+            )
+        )
 
     async def generate_for_message(
         self,
@@ -67,11 +79,13 @@ class ActionChoiceService:
         save_id: str,
         narrator_message_id: str,
         save_details: SaveDetailsRecord | None = None,
+        current_user_id: str | None = None,
     ) -> list[MessageActionChoiceRecord]:
         prepared = self.prepare_for_message(
             save_id=save_id,
             narrator_message_id=narrator_message_id,
             save_details=save_details,
+            current_user_id=current_user_id,
         )
         if prepared is None:
             return []
@@ -83,6 +97,7 @@ class ActionChoiceService:
         save_id: str,
         narrator_message_id: str,
         save_details: SaveDetailsRecord | None = None,
+        current_user_id: str | None = None,
     ) -> PreparedActionChoiceGeneration | None:
         details = save_details or self.repositories.load_save_details(save_id)
         if details is None:
@@ -153,6 +168,7 @@ class ActionChoiceService:
             save_id=save_id,
             narrator_message_id=narrator_message_id,
             request=request,
+            current_user_id=current_user_id,
         )
 
     async def generate_prepared(
@@ -182,12 +198,33 @@ class ActionChoiceService:
             },
         )
         choices = _choices_from_structured_data(response.data)
+        policy = effective_content_safety_policy(
+            self.repositories,
+            user_id=prepared.current_user_id,
+        )
+        reviewed_choices: list[str] = []
+        content_ratings: list[str] = []
+        for choice in choices:
+            safety = await self.content_safety_service.review_narration(
+                body=choice,
+                content_rating=policy.rating,
+                fade_to_black_enabled=False,
+                save_id=prepared.save_id,
+                source_request=ChatRequest(
+                    provider=response.provider,
+                    model_id=response.model_id,
+                    messages=(),
+                ),
+            )
+            reviewed_choices.append(safety.body)
+            content_ratings.append(safety.reviewed_content_rating)
         return self.repositories.replace_message_action_choices(
             save_id=prepared.save_id,
             message_id=prepared.narrator_message_id,
-            choices=choices,
+            choices=reviewed_choices,
             provider=response.provider,
             model=response.model_id,
+            content_ratings=content_ratings,
         )
 
 

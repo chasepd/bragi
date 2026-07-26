@@ -96,6 +96,7 @@ EXPECTED_TASKS = {
     "memory_curation",
     "response_planning",
     "response_verification",
+    "content_safety",
     "director_pressure",
     "action_choice_generation",
     "character_presence_assessment",
@@ -1121,6 +1122,35 @@ def test_settings_context_search_selector_accepts_tool_calling_models(
     assert "tool_calling" in _value(tool_option, "capabilities")
 
 
+def test_settings_content_safety_selector_requires_structured_output_models(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    _seed_settings_data(repositories)
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="openrouter/safety-tools",
+        display_name="Safety Tools",
+        capabilities=["tool_calling"],
+        context_window=128_000,
+    )
+
+    model = settings.build_settings_model(
+        repositories=repositories,
+        providers=("openrouter", "venice"),
+    )
+
+    selectors = {
+        _value(selector, "task"): selector
+        for selector in _list(_value(model, "task_model_selectors", "model_selectors"))
+    }
+    safety_model_ids = _option_model_ids(selectors["content_safety"])
+    assert "openrouter/context-search" in safety_model_ids
+    assert "openrouter/safety-tools" not in safety_model_ids
+    assert "openrouter/chat-fast" not in safety_model_ids
+
+
 def test_settings_model_exposes_optional_scenario_section_overrides(
     repositories: PersistenceRepositories,
     monkeypatch: MonkeyPatch,
@@ -1395,6 +1425,7 @@ def test_settings_model_defaults_to_one_shared_roleplay_model_group(
         "memory_curation",
         "response_planning",
         "response_verification",
+        "content_safety",
         "director_pressure",
         "action_choice_generation",
         "character_presence_assessment",
@@ -1587,6 +1618,7 @@ def test_settings_model_exposes_separate_roleplay_groups_when_shared_is_disabled
         "full_roleplay_memory_curation",
         "full_roleplay_response_planning",
         "full_roleplay_response_verification",
+        "full_roleplay_content_safety",
         "full_roleplay_director_pressure",
         "full_roleplay_action_choice_generation",
         "full_roleplay_character_presence_assessment",
@@ -1665,6 +1697,7 @@ def test_settings_model_exposes_separate_roleplay_groups_when_shared_is_disabled
         "dating_sim_memory_curation",
         "dating_sim_response_planning",
         "dating_sim_response_verification",
+        "dating_sim_content_safety",
         "dating_sim_director_pressure",
         "dating_sim_action_choice_generation",
         "dating_sim_character_presence_assessment",
@@ -3365,6 +3398,7 @@ def _expected_roleplay_selector_tasks(roleplay_type: str, chat_task: str) -> lis
         f"{roleplay_type}_memory_curation",
         f"{roleplay_type}_response_planning",
         f"{roleplay_type}_response_verification",
+        f"{roleplay_type}_content_safety",
         f"{roleplay_type}_director_pressure",
         f"{roleplay_type}_action_choice_generation",
         f"{roleplay_type}_character_presence_assessment",

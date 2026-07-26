@@ -31,6 +31,7 @@ from bragi.services.context_search_service import (
     RECENT_MESSAGE_CANDIDATE_LIMIT,
     ContextSearchService,
 )
+from bragi.services.sexual_content_safety import CONTENT_FILTER_TRANSITION
 from bragi.services.world_data_service import (
     WorldDataAuditRow,
     WorldDataCharacterRow,
@@ -2551,6 +2552,17 @@ def test_world_data_service_applies_edits_and_hides_archived_context_inputs(
         "player_role": "Beacon keeper",
         "opening_message": "The lens turns red.",
         "tone_genre": "siege mystery",
+        "_source": {
+            "content_rating": "unclassified",
+            "section_content_ratings": {
+                "title": "unclassified",
+                "premise": "unclassified",
+                "player_character_name": "unclassified",
+                "player_role": "unclassified",
+                "opening_message": "unclassified",
+                "tone_genre": "unclassified",
+            },
+        },
     }
     assert _error_text(result) == ""
 
@@ -2696,6 +2708,14 @@ def test_world_data_service_forks_shared_scenario_before_applying_save_edits(
     assert json.loads(edited_scenario.content_json)["_source"] == {
         "origin": "ai_draft",
         "generation_prompt": "A shared keep in an ash storm.",
+        "content_rating": "unclassified",
+        "section_content_ratings": {
+            "title": "unclassified",
+            "premise": "unclassified",
+            "player_character_name": "unclassified",
+            "player_role": "unclassified",
+            "opening_message": "unclassified",
+        },
     }
     assert result_scenario.generation_prompt == "A shared keep in an ash storm."
     assert untouched_scenario.title == "Shared Keep"
@@ -2703,6 +2723,122 @@ def test_world_data_service_forks_shared_scenario_before_applying_save_edits(
     assert json.loads(original_scenario.content_json)["starting_scene"] == (
         "The storm climbs the outer wall."
     )
+
+
+def test_world_data_service_redacts_scenario_definition_above_viewer_rating(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    world_data = _import_world_data_service_without_gtk(monkeypatch)
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Restricted Keep",
+        premise="Restricted premise.",
+        player_role="Signal warden",
+        content={
+            "opening_message": "Restricted opening.",
+            "_source": {"content_rating": "r"},
+        },
+    )
+
+    model = world_data.WorldDataService(
+        repositories,
+        allowed_content_rating="pg",
+    ).build_scenario_definition_model(scenario.id)
+
+    assert model.scenario is not None
+    assert model.scenario.title == CONTENT_FILTER_TRANSITION
+    assert model.scenario.premise == CONTENT_FILTER_TRANSITION
+    assert model.scenario.content_sections == ()
+
+
+def test_world_data_service_filters_derived_records_by_source_message_rating(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    world_data = _import_world_data_service_without_gtk(monkeypatch)
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Shared Keep",
+        premise="A shared keep.",
+        player_role="Warden",
+        content={"_source": {"content_rating": "g"}},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Watch")
+    safe_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="A lantern glows.",
+        content_rating="g",
+    )
+    restricted_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Restricted source material.",
+        content_rating="r",
+    )
+    for label, message in (
+        ("safe", safe_message),
+        ("restricted", restricted_message),
+    ):
+        repositories.upsert_world_state(
+            save_id=save.id,
+            key=f"scene.{label}",
+            value={"detail": label},
+            category="scene",
+            source_message_id=message.id,
+        )
+        repositories.add_memory(
+            save_id=save.id,
+            body=f"{label} memory",
+            tags=[label],
+            source_message_ids=[message.id],
+        )
+        repositories.add_summary(
+            save_id=save.id,
+            covers_message_start_id=message.id,
+            covers_message_end_id=message.id,
+            body=f"{label} summary",
+            provider="fake",
+            model="fake-summary",
+            content_rating="g" if label == "safe" else "r",
+        )
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="message",
+            source_id=message.id,
+            title=f"{label} context",
+            body=f"{label} context body",
+            metadata={"source_message_ids": [message.id]},
+        )
+        repositories.add_character(
+            save_id=save.id,
+            name=f"{label.title()} Character",
+            source_message_id=message.id,
+        )
+        repositories.add_active_thread(
+            save_id=save.id,
+            title=f"{label} thread",
+            source_message_id=message.id,
+        )
+    repositories.add_memory(
+        save_id=save.id,
+        body="legacy memory without rating provenance",
+        tags=["legacy"],
+    )
+
+    model = world_data.WorldDataService(
+        repositories,
+        active_save_id=save.id,
+        allowed_content_rating="pg",
+    ).build_model()
+
+    assert [row.key for row in model.world_state] == ["scene.safe"]
+    assert [row.body for row in model.memories] == ["safe memory"]
+    assert [row.body for row in model.summaries] == ["safe summary"]
+    assert [row.body for row in model.context_inputs] == ["safe context body"]
+    assert [row.name for row in model.characters] == ["Safe Character"]
+    assert [row.title for row in model.threads] == ["safe thread"]
 
 
 def test_world_data_service_applies_shared_scenario_definition_edit_in_place(
@@ -2791,6 +2927,15 @@ def test_world_data_service_applies_shared_scenario_definition_edit_in_place(
         "_source": {
             "origin": "ai_draft",
             "generation_prompt": "A shared storm keep prompt.",
+            "content_rating": "unclassified",
+            "section_content_ratings": {
+                "title": "unclassified",
+                "premise": "unclassified",
+                "player_character_name": "unclassified",
+                "player_role": "unclassified",
+                "opening_message": "unclassified",
+                "tone_genre": "unclassified",
+            },
         },
     }
     assert result_scenario.scenario_id == scenario.id
@@ -2967,6 +3112,17 @@ def test_world_data_service_scenario_definition_edit_preserves_overrides(
         "premise": "The shared base scenario now starts at the upper lens.",
         "player_character_name": "Nia Vale",
         "player_role": "Beacon keeper",
+        "_source": {
+            "content_rating": "unclassified",
+            "section_content_ratings": {
+                "opening_message": "unclassified",
+                "tone_genre": "unclassified",
+                "title": "unclassified",
+                "premise": "unclassified",
+                "player_character_name": "unclassified",
+                "player_role": "unclassified",
+            },
+        },
     }
     assert result_scenario.title == "Retuned Beacon"
     assert result_scenario.premise == (

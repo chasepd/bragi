@@ -13,6 +13,8 @@ from bragi.providers.contracts import (
     ProviderCapability,
     ProviderConfigStatus,
     ProviderModel,
+    StructuredOutputRequest,
+    StructuredOutputResponse,
 )
 from bragi.services.chat_service import ChatService
 from bragi.services.context_search_service import ContextSearchResult
@@ -38,7 +40,12 @@ class ContinuingFakeProvider:
                 provider=self.provider_name,
                 model_id="fake-chat",
                 display_name="Fake Chat",
-                capabilities=frozenset({ProviderCapability.CHAT}),
+                capabilities=frozenset(
+                    {
+                        ProviderCapability.CHAT,
+                        ProviderCapability.STRUCTURED_OUTPUT,
+                    }
+                ),
             )
         ]
 
@@ -49,6 +56,23 @@ class ContinuingFakeProvider:
             provider=request.provider,
             model_id=request.model_id,
             token_usage={"total": 8},
+        )
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        if request.schema_name != "content_safety_review":
+            raise AssertionError(f"unexpected structured schema: {request.schema_name}")
+        return StructuredOutputResponse(
+            data={
+                "action": "allow",
+                "category": "none",
+                "reason": "Integration fixture content is within the ceiling.",
+                "minimum_rating": "g",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
         )
 
     async def generate_image(self, request: ImageRequest) -> ImageResponse:

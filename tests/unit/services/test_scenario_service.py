@@ -20,6 +20,8 @@ from bragi.providers.contracts import (
     ImageResponse,
     ProviderConfigStatus,
     ProviderModel,
+    StructuredOutputRequest,
+    StructuredOutputResponse,
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.system_prompt import DEFAULT_PROSE_SAFETY_SECTION
@@ -272,6 +274,7 @@ class RecordingScenarioProvider:
         self.response_sections = response_sections
         self.section_ids = tuple(response_sections)
         self.chat_requests: list[ChatRequest] = []
+        self.structured_output_requests: list[StructuredOutputRequest] = []
 
     async def validate_config(self) -> ProviderConfigStatus:
         return ProviderConfigStatus(
@@ -299,6 +302,22 @@ class RecordingScenarioProvider:
 
     async def generate_image(self, request: ImageRequest) -> ImageResponse:
         raise AssertionError("scenario draft generation must not request images")
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_output_requests.append(request)
+        return StructuredOutputResponse(
+            data={
+                "action": "allow",
+                "category": "none",
+                "reason": "The section stays within the content ceiling.",
+                "minimum_rating": "g",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
 
 
 class BlockingScenarioProvider(RecordingScenarioProvider):
@@ -340,6 +359,46 @@ class SequentialScenarioProvider:
 
     async def generate_image(self, request: ImageRequest) -> ImageResponse:
         raise AssertionError("scenario draft generation must not request images")
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        return StructuredOutputResponse(
+            data={
+                "action": "allow",
+                "category": "none",
+                "reason": "The section stays within the content ceiling.",
+                "minimum_rating": "g",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+class ScenarioSafetyProvider(RecordingScenarioProvider):
+    provider_name = "safety"
+
+    def __init__(self, action: str) -> None:
+        super().__init__({})
+        self.action = action
+        self.structured_output_requests: list[StructuredOutputRequest] = []
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_output_requests.append(request)
+        return StructuredOutputResponse(
+            data={
+                "action": self.action,
+                "category": "violence",
+                "reason": "The draft exceeds the configured ceiling.",
+                "minimum_rating": "r",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
 
 
 @pytest.fixture
@@ -441,15 +500,28 @@ def test_child_scenario_generation_uses_account_policy_and_sanitizes_output(
     provider = RecordingScenarioProvider(
         {"opening_message": "The blast dismembered the guard in graphic detail."}
     )
+    safety_provider = ScenarioSafetyProvider("block")
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="safety",
+        model_id="safety-model",
+    )
+    repositories.save_provider_model(
+        provider="safety",
+        model_id="safety-model",
+        display_name="Safety Model",
+        capabilities=["structured_output"],
+    )
     service = ScenarioService(
         repositories=repositories,
         provider=provider,
         provider_name="openrouter",
         model_id="scenario-drafter",
+        providers={"openrouter": provider, "safety": safety_provider},
         current_user_id=child.id,
     )
 
-    value = asyncio.run(
+    result = asyncio.run(
         service.regenerate_section(
             scenario_type=ScenarioType.FULL_ROLEPLAY,
             seed="A beacon keeper survives a sudden storm.",
@@ -458,9 +530,51 @@ def test_child_scenario_generation_uses_account_policy_and_sanitizes_output(
         )
     )
 
-    assert value == CONTENT_FILTER_TRANSITION
+    assert result.body == CONTENT_FILTER_TRANSITION
+    assert result.minimum_rating == "g"
     assert provider.chat_requests[0].content_rating == "g"
     assert provider.chat_requests[0].fade_to_black_enabled is True
+    assert len(safety_provider.structured_output_requests) == 1
+
+
+def test_generated_draft_persists_section_rating_provenance(
+    repositories: PersistenceRepositories,
+) -> None:
+    provider = RecordingScenarioProvider(
+        _provider_response_sections(_full_roleplay_sections())
+    )
+    safety_provider = ScenarioSafetyProvider("allow")
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="safety",
+        model_id="safety-model",
+    )
+    repositories.save_provider_model(
+        provider="safety",
+        model_id="safety-model",
+        display_name="Safety Model",
+        capabilities=["structured_output"],
+    )
+    service = ScenarioService(
+        repositories=repositories,
+        provider=provider,
+        provider_name="openrouter",
+        model_id="scenario-drafter",
+        providers={"openrouter": provider, "safety": safety_provider},
+    )
+
+    draft = asyncio.run(
+        service.generate_draft(
+            scenario_type=ScenarioType.FULL_ROLEPLAY,
+            seed="A beacon keeper survives a sudden storm.",
+        )
+    )
+
+    assert draft.metadata is not None
+    assert draft.metadata["content_rating"] == "g"
+    assert draft.metadata["section_content_ratings"] == {
+        section_id: "g" for section_id in FULL_ROLEPLAY_SECTION_IDS
+    }
 
 
 def test_generate_draft_accepts_explicit_allowed_sections_and_metadata(
@@ -489,7 +603,12 @@ def test_generate_draft_accepts_explicit_allowed_sections_and_metadata(
     )
 
     assert _sections(draft) == sections
-    assert dict(draft.metadata or {}) == {"origin": "save_continuation"}
+    assert draft.metadata is not None
+    assert draft.metadata["origin"] == "save_continuation"
+    assert draft.metadata["content_rating"] == "g"
+    assert draft.metadata["section_content_ratings"] == {
+        section_id: "g" for section_id in sections
+    }
     assert [
         _requested_scenario_section(request.messages[-1].body)
         for request in provider.chat_requests
@@ -1266,6 +1385,11 @@ def test_generate_draft_uses_chat_fallback_for_blocked_sections(
     assert {request.model_id for request in fallback.chat_requests} == {
         "fallback-chat"
     }
+    assert primary.structured_output_requests == []
+    assert {
+        (request.provider, request.model_id)
+        for request in fallback.structured_output_requests
+    } == {("fallback", "fallback-chat")}
 
 
 def test_generate_draft_reports_generating_and_completed_progress(

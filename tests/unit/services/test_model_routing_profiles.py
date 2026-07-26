@@ -309,6 +309,47 @@ def test_apply_model_routing_profile_replaces_known_preferences_transactionally(
     assert model.last_loaded_profile_id == "profile-1"
 
 
+def test_apply_model_routing_profile_rejects_unusable_safety_agent(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="model/tool-only",
+        display_name="Tool Only",
+        capabilities=["tool_calling"],
+    )
+    repositories.set_app_setting(
+        MODEL_ROUTING_PROFILES_SETTING,
+        {
+            "profiles": [
+                {
+                    "id": "profile-safety",
+                    "name": "Unsafe routing",
+                    "roleplay_shared_models_enabled": False,
+                    "preferences": [
+                        {
+                            "task": "full_roleplay_content_safety",
+                            "provider": "openrouter",
+                            "model_id": "model/tool-only",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Saved Safety Agent model is unavailable",
+    ):
+        apply_model_routing_profile(repositories, "profile-safety")
+
+    assert (
+        repositories.get_model_preference("full_roleplay_content_safety")
+        is None
+    )
+
+
 def test_save_current_model_routing_profile_rejects_duplicate_names(
     repositories: PersistenceRepositories,
 ) -> None:

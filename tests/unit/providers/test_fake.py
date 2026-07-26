@@ -132,3 +132,26 @@ def test_fake_provider_structured_and_vision_methods_capture_requests() -> None:
         assert provider.image_description_requests == [vision_request]
 
     asyncio.run(run())
+
+
+def test_fake_provider_allows_content_safety_review_by_default() -> None:
+    async def run() -> None:
+        provider = FakeProviderClient()
+        response = await provider.generate_structured_output(
+            StructuredOutputRequest(
+                provider="fake",
+                model_id="fake-chat",
+                messages=(),
+                schema_name="content_safety_review",
+                schema={"type": "object"},
+            )
+        )
+
+        assert response.data == {
+            "action": "allow",
+            "category": "none",
+            "reason": "Fake provider content is suitable for general audiences.",
+            "minimum_rating": "g",
+        }
+
+    asyncio.run(run())

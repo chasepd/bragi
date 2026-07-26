@@ -568,6 +568,74 @@ def test_set_model_preference_clears_stale_model_thinking_preference(
     assert repositories.get_app_setting(MODEL_THINKING_PREFERENCES_SETTING) == {}
 
 
+def test_set_content_safety_model_preference_rejects_known_tool_only_model(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="openrouter/safety-tools",
+        display_name="Safety Tools",
+        capabilities=["tool_calling"],
+    )
+    service = _settings_service(repositories)
+
+    with pytest.raises(
+        ValueError,
+        match="Safety Agent model must support structured output",
+    ):
+        service.set_model_preference(
+            task="content_safety",
+            provider="openrouter",
+            model_id="openrouter/safety-tools",
+        )
+
+    assert repositories.get_model_preference("content_safety") is None
+
+
+def test_set_content_safety_model_preference_rejects_unknown_model(
+    repositories: PersistenceRepositories,
+) -> None:
+    service = _settings_service(repositories)
+
+    with pytest.raises(
+        ValueError,
+        match="Safety Agent model must support structured output",
+    ):
+        service.set_model_preference(
+            task="content_safety",
+            provider="openrouter",
+            model_id="openrouter/unknown-safety-model",
+        )
+
+    assert repositories.get_model_preference("content_safety") is None
+
+
+def test_set_split_content_safety_preference_rejects_known_tool_only_model(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="openrouter/safety-tools",
+        display_name="Safety Tools",
+        capabilities=["tool_calling"],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Safety Agent model must support structured output",
+    ):
+        _settings_service(repositories).set_model_preference(
+            task="full_roleplay_content_safety",
+            provider="openrouter",
+            model_id="openrouter/safety-tools",
+        )
+
+    assert (
+        repositories.get_model_preference("full_roleplay_content_safety")
+        is None
+    )
+
+
 def test_set_save_model_preference_stores_only_save_override(
     repositories: PersistenceRepositories,
 ) -> None:

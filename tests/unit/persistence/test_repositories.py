@@ -64,6 +64,7 @@ def test_message_safety_transition_round_trips_and_edits_clear_it(
         role="narrator",
         body="Rejected narrator draft.",
         safety_transition="fade_to_black",
+        content_rating="r",
     )
 
     fetched = repositories.get_message(save_id=save.id, message_id=message.id)
@@ -73,29 +74,34 @@ def test_message_safety_transition_round_trips_and_edits_clear_it(
         "the next scene begins."
     )
     assert fetched.safety_transition == "fade_to_black"
+    assert fetched.content_rating == "r"
 
     edited = repositories.update_message_body(
         save_id=save.id,
         message_id=message.id,
         body="The watch continues.",
+        content_rating="g",
     )
     assert edited.safety_transition == ""
+    assert edited.content_rating == "g"
 
+    raw_body = "He thrust into her before the scene changed."
     raw = repositories.append_message(
         save_id=save.id,
         role="narrator",
-        body="He thrust into her before the scene changed.",
+        body=raw_body,
     )
-    assert raw.body == message.body
-    assert raw.safety_transition == "fade_to_black"
+    assert raw.body == raw_body
+    assert raw.safety_transition == ""
 
+    edited_body = "Their hands slid beneath her clothes."
     edited_raw = repositories.update_message_body(
         save_id=save.id,
         message_id=raw.id,
-        body="Their hands slid beneath her clothes.",
+        body=edited_body,
     )
-    assert edited_raw.body == message.body
-    assert edited_raw.safety_transition == "fade_to_black"
+    assert edited_raw.body == edited_body
+    assert edited_raw.safety_transition == ""
 
 
 def test_repositories_update_save_title_trims_and_refreshes_list_order(

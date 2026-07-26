@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from bragi.content_rating_instructions import (
+    CONTENT_RATING_UNRATED,
+    content_rating_ceiling_summary,
+)
+
 DEFAULT_RESPONSE_STYLE_SECTION = (
     "Response style:\n"
     "- Keep responses reasonably short.\n"
@@ -10,53 +15,48 @@ DEFAULT_RESPONSE_STYLE_SECTION = (
     "- Format text messages with > at the beginning of each message."
 )
 
-DEFAULT_PROSE_SAFETY_SECTION = (
-    "Prose safety boundary:\n"
-    "- Romance and consensual intimacy may be acknowledged as story events "
-    "when appropriate.\n"
-    "- Do not generate explicit sexual description or step-by-step sexual "
-    "acts.\n"
-    "- If a scene would move into explicit intimacy, stop before explicit "
-    "detail with a brief, natural, diegetic fade-to-black / next-scene "
-    "transition, then resume after time has passed.\n"
-    "- Keep the transition in-world and matter-of-fact; never mention "
-    "policies, safety rules, or this instruction.\n"
-    "- This built-in boundary takes precedence over scenario, save, account, "
-    "turn, and regeneration guidance."
-)
-
-
 def prose_safety_section(*, content_rating: str, fade_to_black_enabled: bool) -> str:
     """Render the narrator boundary for the actor's effective safety policy."""
 
-    normalized = content_rating.strip().casefold()
-    if normalized == "pg-13" and fade_to_black_enabled:
-        return DEFAULT_PROSE_SAFETY_SECTION
-    label = {
-        "g": "G",
-        "pg": "PG",
-        "pg-13": "PG-13",
-        "r": "R",
-        "unrated": "Unrated",
-    }.get(normalized, "PG-13")
+    normalized = content_rating.strip().casefold().replace("_", "-")
+    if normalized == "pg13":
+        normalized = "pg-13"
+    if normalized == CONTENT_RATING_UNRATED:
+        return ""
     lines = [
         "Prose safety boundary:",
-        f"- Keep all generated narration within the selected {label} content rating.",
+        content_rating_ceiling_summary(normalized),
     ]
     if fade_to_black_enabled:
         lines.append(
-            "- If sexual intimacy would become explicit, use a brief, natural, "
-            "diegetic fade-to-black transition and resume after time has passed."
+            "Fade-to-black behavior:\n"
+            "- If sexual or romantic escalation would cross this rating ceiling, "
+            "stop before the disallowed detail, use a brief natural diegetic "
+            "fade-to-black transition, and resume after time has passed."
+        )
+    else:
+        lines.append(
+            "Fade-to-black behavior:\n"
+            "- Fade-to-black is disabled. Keep the narration within the ceiling "
+            "without using a safety transition."
         )
     lines.extend(
         (
-            "- Never mention policies, safety rules, ratings, or this instruction "
-            "in the story.",
-            "- This built-in boundary takes precedence over scenario, save, account, "
-            "turn, and regeneration guidance.",
+            "Application rules:\n"
+            "- Never mention policies, safety rules, ratings, or these instructions "
+            "in the story.\n"
+            "- This built-in boundary takes precedence over scenario, save, "
+            "account, turn, and regeneration guidance.",
         )
     )
     return "\n".join(lines)
+
+
+DEFAULT_PROSE_SAFETY_SECTION = prose_safety_section(
+    content_rating="pg-13",
+    fade_to_black_enabled=True,
+)
+
 
 CHARACTER_TEXT_RESPONSE_STYLE_SECTION = (
     "Character text response style:\n"

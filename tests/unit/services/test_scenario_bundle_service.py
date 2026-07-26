@@ -130,6 +130,7 @@ def test_import_scenario_creates_new_id_and_unique_duplicate_title(
     assert imported_content["_source"] == {
         "origin": "ai_draft",
         "generation_prompt": "A border keep cut off by ash storms.",
+        "content_rating": "unclassified",
     }
 
 

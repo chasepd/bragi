@@ -9,6 +9,7 @@ from time import perf_counter
 from types import MappingProxyType
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
+from bragi.content_rating_instructions import maximum_content_rating
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     ChatMessage,
@@ -26,16 +27,19 @@ from bragi.services.character_profile_completion import (
     content_with_character_starters,
 )
 from bragi.services.content_rating import effective_content_safety_policy
+from bragi.services.content_safety_service import ContentSafetyService
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.model_preferences import (
     scenario_generation_section_model_preference,
 )
 from bragi.services.provider_fallbacks import chat_with_fallback
+from bragi.services.scenario_content_rating import (
+    metadata_with_scenario_content_ratings,
+)
 from bragi.services.scenario_name_sources import (
     ordinary_name_candidate_context,
     repeated_first_names_for_section,
 )
-from bragi.services.sexual_content_safety import sanitize_narrator_body
 
 
 class ScenarioType(StrEnum):
@@ -1049,6 +1053,12 @@ ScenarioGenerationProgressCallback = Callable[
 ]
 
 
+@dataclass(frozen=True)
+class ScenarioSectionGenerationResult:
+    body: str
+    minimum_rating: str
+
+
 class ScenarioService:
     def __init__(
         self,
@@ -1059,6 +1069,7 @@ class ScenarioService:
         model_id: str,
         providers: dict[str, ProviderClient] | None = None,
         current_user_id: str | None = None,
+        content_safety_service: ContentSafetyService | None = None,
     ) -> None:
         self.repositories = repositories
         self.provider = provider
@@ -1066,6 +1077,10 @@ class ScenarioService:
         self.model_id = model_id
         self.providers = providers or {provider_name: provider}
         self.current_user_id = current_user_id
+        self.content_safety_service = content_safety_service or ContentSafetyService(
+            repositories=repositories,
+            providers=self.providers,
+        )
         self.jobs = JobLifecycleService(repositories=repositories)
 
     async def generate_draft(
@@ -1115,6 +1130,7 @@ class ScenarioService:
             collect_provider_diagnostics=True,
         )
         sections: dict[str, str] = {}
+        section_content_ratings: dict[str, str] = {}
         log_event(
             "scenario_generation.started",
             scenario_type=normalized_type.value,
@@ -1138,7 +1154,7 @@ class ScenarioService:
                         total_count=len(resolved_section_ids),
                     ),
                 )
-                section_value = await self._generate_section(
+                section_result = await self._generate_section(
                     scenario_type=normalized_type,
                     scenario_types=normalized_genres,
                     action_choices_enabled=action_choices_enabled,
@@ -1146,7 +1162,9 @@ class ScenarioService:
                     section_id=section_id,
                     sections=sections,
                 )
+                section_value = section_result.body
                 sections[section_id] = section_value
+                section_content_ratings[section_id] = section_result.minimum_rating
                 log_event(
                     "scenario_generation.field_succeeded",
                     scenario_type=normalized_type.value,
@@ -1198,11 +1216,18 @@ class ScenarioService:
             scenario_types=tuple(genre.value for genre in normalized_genres),
             field_count=len(sections),
         )
+        draft_metadata = metadata_with_scenario_content_ratings(
+            _draft_metadata_with_generation_prompt(metadata, seed),
+            aggregate_rating=maximum_content_rating(
+                tuple(section_content_ratings.values())
+            ),
+            section_ratings=section_content_ratings,
+        )
         return ScenarioDraft(
             type=normalized_type,
             scenario_types=normalized_genres,
             sections=sections,
-            metadata=_draft_metadata_with_generation_prompt(metadata, seed),
+            metadata=draft_metadata,
             regeneration_seed=seed,
             action_choices_enabled=action_choices_enabled,
         )
@@ -1216,7 +1241,7 @@ class ScenarioService:
         section_id: str,
         sections: Mapping[str, str],
         action_choices_enabled: bool = False,
-    ) -> str:
+    ) -> ScenarioSectionGenerationResult:
         normalized_type, normalized_genres, action_choices_enabled = (
             normalized_scenario_types_and_flag(
                 scenario_type,
@@ -1245,7 +1270,7 @@ class ScenarioService:
             collect_provider_diagnostics=True,
         )
         try:
-            section_value = await self._generate_section(
+            section_result = await self._generate_section(
                 scenario_type=normalized_type,
                 scenario_types=normalized_genres,
                 action_choices_enabled=action_choices_enabled,
@@ -1267,7 +1292,7 @@ class ScenarioService:
             job.id,
             result={
                 "section_id": section_id,
-                "generated_chars": len(section_value),
+                "generated_chars": len(section_result.body),
             },
         )
         log_event(
@@ -1275,9 +1300,9 @@ class ScenarioService:
             scenario_type=normalized_type.value,
             scenario_types=tuple(genre.value for genre in normalized_genres),
             section_id=section_id,
-            generated_chars=len(section_value),
+            generated_chars=len(section_result.body),
         )
-        return section_value
+        return section_result
 
     async def _generate_section(
         self,
@@ -1288,7 +1313,7 @@ class ScenarioService:
         seed: str,
         section_id: str,
         sections: Mapping[str, str],
-    ) -> str:
+    ) -> ScenarioSectionGenerationResult:
         started_at = perf_counter()
         provider_name, model_id = self._effective_section_model(section_id)
         if provider_name not in self.providers:
@@ -1331,16 +1356,24 @@ class ScenarioService:
             section_id=section_id,
             started_at=started_at,
         )
-        section_value = sanitize_narrator_body(
-            _section_value_from_response(
-                response.body,
-                scenario_type=scenario_type,
-                scenario_types=scenario_types,
-                section_id=section_id,
+        section_value = _section_value_from_response(
+            response.body,
+            scenario_type=scenario_type,
+            scenario_types=scenario_types,
+            section_id=section_id,
+        )
+        safety = await self.content_safety_service.review_narration(
+            body=section_value,
+            source_request=replace(
+                request,
+                provider=response.provider,
+                model_id=response.model_id,
             ),
             content_rating=content_safety.rating,
             fade_to_black_enabled=content_safety.fade_to_black_enabled,
-        ).body
+            roleplay_type=scenario_type.value,
+        )
+        section_value = safety.body
         repeated_names = repeated_first_names_for_section(
             scenario_type=scenario_types or (scenario_type,),
             section_id=section_id,
@@ -1366,17 +1399,31 @@ class ScenarioService:
                 section_id=section_id,
                 started_at=started_at,
             )
-            return sanitize_narrator_body(
-                _section_value_from_response(
-                    retry_response.body,
-                    scenario_type=scenario_type,
-                    scenario_types=scenario_types,
-                    section_id=section_id,
+            retry_value = _section_value_from_response(
+                retry_response.body,
+                scenario_type=scenario_type,
+                scenario_types=scenario_types,
+                section_id=section_id,
+            )
+            retry_safety = await self.content_safety_service.review_narration(
+                body=retry_value,
+                source_request=replace(
+                    retry_request,
+                    provider=retry_response.provider,
+                    model_id=retry_response.model_id,
                 ),
                 content_rating=content_safety.rating,
                 fade_to_black_enabled=content_safety.fade_to_black_enabled,
-            ).body
-        return section_value
+                roleplay_type=scenario_type.value,
+            )
+            return ScenarioSectionGenerationResult(
+                body=retry_safety.body,
+                minimum_rating=retry_safety.reviewed_content_rating,
+            )
+        return ScenarioSectionGenerationResult(
+            body=section_value,
+            minimum_rating=safety.reviewed_content_rating,
+        )
 
     async def _chat_for_section(
         self,

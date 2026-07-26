@@ -124,7 +124,7 @@ class CharacterBundleService:
                        source_message_id, locked_fields_json,
                        protected_from_maintenance, contact_name,
                        first_seen_message_id, last_updated_message_id,
-                       created_at, updated_at
+                       content_rating, created_at, updated_at
                 FROM characters
                 WHERE id = ? AND archived_at IS NULL
                 """,
@@ -355,6 +355,7 @@ class CharacterBundleService:
             ),
             first_seen_message_id=None,
             last_updated_message_id=None,
+            content_rating="unclassified",
         )
         imported_media_count = 0
         skipped_media_count = 0
@@ -871,6 +872,7 @@ def _character_payload(
         "contact_name": row["contact_name"],
         "first_seen_message_id": None,
         "last_updated_message_id": None,
+        "content_rating": row["content_rating"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-import unicodedata
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -39,130 +37,6 @@ DEFAULT_ADULT_CONTENT_RATING = CONTENT_RATING_PG_13
 DEFAULT_CHILD_CONTENT_RATING = CONTENT_RATING_PG
 DEFAULT_FADE_TO_BLACK_ENABLED = True
 
-_RATING_RANK = {
-    CONTENT_RATING_G: 0,
-    CONTENT_RATING_PG: 1,
-    CONTENT_RATING_PG_13: 2,
-    CONTENT_RATING_R: 3,
-    CONTENT_RATING_UNRATED: 4,
-}
-_NON_WORD_RE = re.compile(r"[^\w]+", re.UNICODE)
-_WHITESPACE_RE = re.compile(r"\s+")
-_SPACED_LETTERS_RE = re.compile(r"(?<!\w)(?:[a-z]\s+){2,}[a-z](?!\w)")
-_PG_PATTERNS = (
-    re.compile(r"\bkiss(?:es|ed|ing)?\b"),
-    re.compile(r"\bflirt(?:s|ed|ing|ation)?\b"),
-    re.compile(r"\bmake(?:s|ing)?\s+out\b"),
-    re.compile(r"\bromantic\s+(?:embrace|moment|relationship)\b"),
-    re.compile(
-        r"\b(?:fight|fights|fought|fighting|battle|battles|weapon|weapons|"
-        r"sword|swords|gun|guns|rifle|rifles|pistol|pistols|knife|knives|"
-        r"dagger|daggers|danger|death|dead)\b"
-    ),
-)
-_PG_13_PATTERNS = (
-    re.compile(r"\b(?:undress(?:es|ed|ing)?|disrob(?:e|es|ed|ing))\b"),
-    re.compile(r"\b(?:lingerie|sexual intimacy|sex scene|slept together)\b"),
-    re.compile(
-        r"\b(?:hands?|fingers?)\s+(?:slipped|slid|moved)\s+"
-        r"(?:under|beneath|inside)\b"
-    ),
-    re.compile(
-        r"\b(?:touched|caressed|stroked)\s+(?:his|her|their|the)?\s*"
-        r"(?:breasts?|groin|crotch|inner thighs?)\b"
-    ),
-    re.compile(
-        r"\b(?:blood|bloody|stab|stabs|stabbed|stabbing|shoot|shoots|shot|"
-        r"kill|kills|killed|killing|wound|wounds|wounded|assault|drunk|drugs?)\b"
-    ),
-    re.compile(r"\b(?:damn|hell)\b"),
-)
-_R_PATTERNS = (
-    re.compile(
-        r"\b(?:had|has|have|having|began|begin|begins|beginning|started|starts|"
-        r"starting|engaged|engages|engaging)\s+(?:in\s+)?"
-        r"(?:\w+\s+){0,3}sex\b"
-    ),
-    re.compile(r"\b(?:sex|sexual)\s+acts?\b"),
-    re.compile(r"\b(?:sexual\s+)?intercourse\b"),
-    re.compile(r"\bcopulat(?:e|es|ed|ing|ion)\b"),
-    re.compile(r"\b(?:explicit|graphic|hardcore)\s+(?:sex|sexual content|nudity)\b"),
-    re.compile(r"\bsexually\s+explicit\b"),
-    re.compile(r"\b(?:penetrat(?:e|ed|es|ing|ion)|ejaculat(?:e|ed|es|ing|ion))\b"),
-    re.compile(r"\b(?:masturbat(?:e|ed|es|ing|ion)|orgasm(?:s)?|climax(?:es|ed|ing)?)\b"),
-    re.compile(r"\b(?:oral sex|anal sex|blow ?job|fellatio|cunnilingus)\b"),
-    re.compile(
-        r"\bcame\s+(?:(?:inside|on)\s+|(?:all\s+)?over\s+)"
-        r"(?:him|her|them)\b"
-    ),
-    re.compile(
-        r"\bforc(?:e|es|ed|ing)\s+"
-        r"(?:himself|herself|themself|themselves)\s+"
-        r"(?:inside|into)\s+(?:him|her|them)\b"
-    ),
-    re.compile(r"\b(?:nude|nudity|naked|porn|pornographic)\b"),
-    re.compile(
-        r"\b(?:topless|bottomless|braless|erotic|fetish|cleavage|"
-        r"nipples?|areolas?|breasts?|boobs?|genitals?|penis|cock|dick|"
-        r"vagina|vulva|pussy|"
-        r"testicles?|buttocks?)\b"
-    ),
-    re.compile(
-        r"\b(?:bare|exposed|uncovered)\s+"
-        r"(?:breasts?|genitals?|penis|vagina|vulva|testicles?)\b"
-    ),
-    re.compile(
-        r"\b(?:rape|rapes|raped|raping|rapist|sexual assault|sexual violence|"
-        r"molest(?:s|ed|ing|ation)?|incest)\b"
-    ),
-    re.compile(r"\bthrust(?:s|ed|ing)?\s+(?:into|inside)\b"),
-    re.compile(
-        r"\b(?:dismember(?:s|ed|ing|ment)?|disembowel(?:s|ed|ing|ment)?|"
-        r"decapitat(?:e|es|ed|ing|ion)|"
-        r"eviscerat(?:e|es|ed|ing|ion)|mutilat(?:e|es|ed|ing|ion)|guts?|"
-        r"entrails|graphic gore|graphic violence|severed (?:head|limb|body))\b"
-    ),
-    re.compile(
-        r"\b(?:chop(?:s|ped|ping)?|hack(?:s|ed|ing)?|cut(?:s|ting)?)\s+off\s+"
-        r"(?:\w+\s+){0,3}(?:heads?|limbs?)\b"
-    ),
-    re.compile(
-        r"\b(?:crush(?:es|ed|ing)?|smash(?:es|ed|ing)?|cav(?:e|es|ed|ing))\s+"
-        r"(?:\w+\s+){0,3}(?:skulls?|heads?)\b"
-    ),
-    re.compile(
-        r"\b(?:brains?|blood|organs?|intestines?|viscera)\s+"
-        r"(?:spill(?:s|ed|ing)?|splatter(?:s|ed|ing)?|spray(?:s|ed|ing)?|"
-        r"spurt(?:s|ed|ing)?)\b"
-    ),
-    re.compile(
-        r"\b(?:rip(?:s|ped|ping)?|tear(?:s|ing)?|tore|pull(?:s|ed|ing)?)\s+out\s+"
-        r"(?:\w+\s+){0,3}(?:hearts?|organs?|intestines?)\b"
-    ),
-    re.compile(
-        r"\b(?:rip(?:s|ped|ping)?|tear(?:s|ing)?|tore|hack(?:s|ed|ing)?|"
-        r"saw(?:s|ed|ing)?)\s+(?:\w+\s+){0,3}"
-        r"(?:arms?|legs?|hands?|feet|limbs?)\s+(?:off|apart)\b"
-    ),
-    re.compile(
-        r"\b(?:blow(?:s|ing)?|blew|blast(?:s|ed|ing)?)\s+"
-        r"(?:\w+\s+){0,3}(?:heads?|skulls?)\s+(?:off|apart)\b"
-    ),
-    re.compile(
-        r"\bgoug(?:e|es|ed|ing)\s+out\s+(?:\w+\s+){0,3}eyes?\b"
-    ),
-    re.compile(
-        r"\b(?:slit(?:s|ting)?|cut(?:s|ting)?)\s+(?:\w+\s+){0,3}throats?\b"
-    ),
-    re.compile(r"\b(?:behead(?:s|ed|ing)?|flay(?:s|ed|ing)?)\b"),
-    re.compile(
-        r"\b(?:torture|tortures|tortured|torturing|murder|murders|murdered|"
-        r"murdering|suicide|suicidal|self harm|self-harm|strangl(?:e|es|ed|ing))\b"
-    ),
-    re.compile(r"\b(?:cocaine|heroin|meth|methamphetamine|fentanyl)\b"),
-    re.compile(r"\b(?:fuck|fucks|fucked|fucking|motherfucker|cunt)\b"),
-)
-
 
 @dataclass(frozen=True)
 class ContentSafetyPolicy:
@@ -186,28 +60,6 @@ def sanitize_content_rating(
     if normalized in CONTENT_RATING_OPTIONS:
         return normalized
     return default
-
-
-def classify_content_rating(value: str) -> str:
-    """Return the minimum supported rating for deterministic text patterns."""
-
-    normalized = _normalize_for_matching(value)
-    if any(pattern.search(normalized) for pattern in _R_PATTERNS):
-        return CONTENT_RATING_R
-    if any(pattern.search(normalized) for pattern in _PG_13_PATTERNS):
-        return CONTENT_RATING_PG_13
-    if any(pattern.search(normalized) for pattern in _PG_PATTERNS):
-        return CONTENT_RATING_PG
-    return CONTENT_RATING_G
-
-
-def content_exceeds_rating(value: str, *, allowed_rating: str) -> bool:
-    """Return whether deterministic content requires a higher rating."""
-
-    allowed = sanitize_content_rating(allowed_rating)
-    if allowed == CONTENT_RATING_UNRATED:
-        return False
-    return _RATING_RANK[classify_content_rating(value)] > _RATING_RANK[allowed]
 
 
 def effective_content_safety_policy(
@@ -245,6 +97,8 @@ def effective_content_safety_policy(
     fade_enabled = (
         stored_fade if isinstance(stored_fade, bool) else DEFAULT_FADE_TO_BLACK_ENABLED
     )
+    if rating == CONTENT_RATING_UNRATED:
+        fade_enabled = False
     return ContentSafetyPolicy(
         rating=rating,
         fade_to_black_enabled=True if is_child else fade_enabled,
@@ -282,12 +136,3 @@ def set_user_content_rating(
         value=normalized,
     )
     return normalized
-
-
-def _normalize_for_matching(value: str) -> str:
-    normalized = unicodedata.normalize("NFKC", value).casefold()
-    normalized = _WHITESPACE_RE.sub(" ", _NON_WORD_RE.sub(" ", normalized)).strip()
-    return _SPACED_LETTERS_RE.sub(
-        lambda match: match.group(0).replace(" ", ""),
-        normalized,
-    )

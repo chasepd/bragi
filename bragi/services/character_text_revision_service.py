@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from difflib import unified_diff
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from bragi.persistence.models import (
     CharacterTextMessageRecord,
@@ -13,6 +13,7 @@ from bragi.persistence.models import (
     ContextUpdateAuditRecord,
 )
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.providers.contracts import ProviderClient
 from bragi.services.character_text_service import (
     CharacterTextAttachmentMediaRunner,
     CharacterTextMessage,
@@ -21,6 +22,8 @@ from bragi.services.character_text_service import (
     refresh_character_text_thread_memory,
 )
 from bragi.services.character_text_world_update_service import character_text_source_ref
+from bragi.services.content_rating import effective_content_safety_policy
+from bragi.services.content_safety_service import ContentSafetyService
 
 if TYPE_CHECKING:
     from bragi.services.character_text_world_update_service import (
@@ -113,6 +116,36 @@ class CharacterTextRevisionService:
             save_id=save_id,
             text_message_id=text_message_id,
             body=body,
+            allowed_senders=frozenset({"character"}),
+            sender_error="Only character text messages can be corrected",
+        )
+
+    async def correct_character_text_with_safety(
+        self,
+        *,
+        save_id: str,
+        text_message_id: str,
+        body: str,
+        current_user_id: str | None,
+    ) -> CharacterTextEditResult:
+        policy = effective_content_safety_policy(
+            self.repositories,
+            user_id=current_user_id,
+        )
+        safety = await ContentSafetyService(
+            repositories=self.repositories,
+            providers=cast(dict[str, ProviderClient], self.providers),
+        ).review_narration(
+            body=body,
+            content_rating=policy.rating,
+            fade_to_black_enabled=policy.fade_to_black_enabled,
+            save_id=save_id,
+        )
+        return self._edit_text_body(
+            save_id=save_id,
+            text_message_id=text_message_id,
+            body=safety.body,
+            content_rating=safety.reviewed_content_rating,
             allowed_senders=frozenset({"character"}),
             sender_error="Only character text messages can be corrected",
         )
@@ -280,6 +313,7 @@ class CharacterTextRevisionService:
         save_id: str,
         text_message_id: str,
         body: str,
+        content_rating: str | None = None,
         allowed_senders: frozenset[str],
         sender_error: str,
     ) -> CharacterTextEditResult:
@@ -300,6 +334,7 @@ class CharacterTextRevisionService:
                 save_id=save_id,
                 message_id=selected.id,
                 body=replacement,
+                content_rating=content_rating,
             )
             self._cleanup_text_sources(
                 save_id=save_id,

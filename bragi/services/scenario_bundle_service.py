@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +27,9 @@ from bragi.services.media_service import (
     _persist_thumbnail,
     _safe_path_segment,
     _uploaded_image_mime_type,
+)
+from bragi.services.scenario_content_rating import (
+    metadata_with_scenario_content_ratings,
 )
 from bragi.services.scenario_service import (
     RETIRED_SCENARIO_REASON,
@@ -219,6 +223,7 @@ class ScenarioBundleService:
             premise=_text(scenario, "premise"),
             content=scenario_content,
         )
+        content = _quarantine_imported_scenario_content(content)
         materialized_paths: list[str] = []
         try:
             content = _materialize_bundle_media_members(
@@ -492,9 +497,30 @@ def _materialize_bundle_media_members(
                 or "Uploaded character reference image"
             )
             reference["source"] = "uploaded"
+            reference["content_rating"] = "unclassified"
             reference["created_at"] = datetime.now(UTC).isoformat()
             reference["bundle_path"] = None
     return content
+
+
+def _quarantine_imported_scenario_content(
+    content: Mapping[str, object],
+) -> dict[str, object]:
+    quarantined = dict(content)
+    source = quarantined.get("_source")
+    quarantined["_source"] = metadata_with_scenario_content_ratings(
+        source if isinstance(source, Mapping) else None,
+        aggregate_rating="unclassified",
+    )
+    starters = quarantined.get("character_starters")
+    if isinstance(starters, list):
+        for starter in starters:
+            if not isinstance(starter, dict):
+                continue
+            reference = starter.get("reference_image")
+            if isinstance(reference, dict):
+                reference["content_rating"] = "unclassified"
+    return quarantined
 
 
 def _validate_materialized_media_budget(

@@ -391,6 +391,12 @@ def seed_continuation_characters(
     metadata: Mapping[str, object],
     source_message_id: str | None,
 ) -> int:
+    content_rating = metadata.get("content_rating")
+    normalized_content_rating = (
+        content_rating.strip()
+        if isinstance(content_rating, str) and content_rating.strip()
+        else "unclassified"
+    )
     raw_items = metadata.get("character_continuity")
     if not isinstance(raw_items, list):
         return 0
@@ -437,6 +443,7 @@ def seed_continuation_characters(
             private_notes=_text(item.get("private_notes")),
             source_message_id=source_message_id,
             protected_from_maintenance=True,
+            content_rating=normalized_content_rating,
         )
         existing_keys.add(key)
         existing_keys.update(alias_keys)

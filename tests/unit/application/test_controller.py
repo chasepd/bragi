@@ -47,7 +47,10 @@ from bragi.services.chat_history_settings import (
 from bragi.services.context_search_service import ContextSearchResult
 from bragi.services.continuation_scenario_service import CONTINUATION_SECTION_IDS
 from bragi.services.model_preferences import scenario_generation_section_model_task
-from bragi.services.sexual_content_safety import CONTENT_FILTER_TRANSITION
+from bragi.services.sexual_content_safety import (
+    CONTENT_FILTER_TRANSITION,
+    FADE_TO_BLACK_TRANSITION,
+)
 
 _MISSING = object()
 
@@ -114,6 +117,89 @@ class RuntimeFakeProvider:
             provider=request.provider,
             model_id=request.model_id,
             image_bytes=b"runtime fake scene image",
+        )
+
+class RuntimeContentSafetyProvider(RuntimeFakeProvider):
+    def __init__(self, action: str = "block") -> None:
+        super().__init__()
+        self.action = action
+        self.structured_requests: list[StructuredOutputRequest] = []
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_requests.append(request)
+        return StructuredOutputResponse(
+            data={
+                "action": self.action,
+                "category": (
+                    "sexual_content"
+                    if self.action == "fade_to_black"
+                    else "violence"
+                ),
+                "reason": "The draft crosses the selected ceiling.",
+                "minimum_rating": "r",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+class RuntimeAllowingSafetyProvider(RuntimeContentSafetyProvider):
+    provider_name = "safety"
+
+    def __init__(self) -> None:
+        super().__init__(action="allow")
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_requests.append(request)
+        return StructuredOutputResponse(
+            data={
+                "action": "allow",
+                "category": "none",
+                "reason": "The draft stays within the content ceiling.",
+                "minimum_rating": "g",
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+class RuntimeSelectiveStarterSafetyProvider(RuntimeContentSafetyProvider):
+    def __init__(self, *, fail_on_starter: bool = False) -> None:
+        super().__init__(action="allow")
+        self.fail_on_starter = fail_on_starter
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_requests.append(request)
+        body = request.messages[-1].body
+        if "forbidden generated starter detail" in body:
+            if self.fail_on_starter:
+                raise RuntimeError("safety agent unavailable")
+            data = {
+                "action": "block",
+                "category": "violence",
+                "reason": "The generated character crosses the selected ceiling.",
+                "minimum_rating": "r",
+            }
+        else:
+            data = {
+                "action": "allow",
+                "category": "none",
+                "reason": "The draft stays within the content ceiling.",
+                "minimum_rating": "g",
+            }
+        return StructuredOutputResponse(
+            data=data,
+            provider=request.provider,
+            model_id=request.model_id,
         )
 
 
@@ -705,6 +791,7 @@ def test_start_saved_action_choice_scenario_returns_opening_action_choices(
     )
     scenario_content: dict[str, object] = dict(_reviewed_cyoa_sections())
     scenario_content["action_choices_enabled"] = True
+    scenario_content = _rated_scenario_content(scenario_content)
     scenario = repositories.create_scenario(
         type="full_roleplay",
         title="Library of Falling Doors",
@@ -867,6 +954,168 @@ def test_manual_action_choice_generation_failure_is_nonfatal(
     assert repositories.latest_message_action_choices(save_id) == []
 
 
+def test_manual_scenario_classifies_every_persisted_text_section(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    provider = RuntimeContentSafetyProvider(action="block")
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="fake",
+        model_id="fake-safety",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-safety",
+        display_name="Fake Safety",
+        capabilities=["structured_output"],
+    )
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        providers={"fake": provider},
+    )
+
+    model = controller.create_manual_scenario(
+        runtime.ManualScenarioInput(
+            scenario_type="full_roleplay",
+            title="Restricted title",
+            premise="Restricted premise",
+            player_character_name="Restricted player",
+            player_role="Restricted role",
+            tone_genre="Restricted tone",
+            opening_message="Restricted opening",
+        )
+    )
+
+    save_id = _value(model, "active_save_id")
+    assert save_id is not None
+    save = repositories.get_save(save_id)
+    assert save is not None
+    scenario = repositories.get_scenario(save.scenario_id)
+    assert scenario is not None
+    content = json.loads(scenario.content_json)
+    assert scenario.title == CONTENT_FILTER_TRANSITION
+    assert scenario.premise == CONTENT_FILTER_TRANSITION
+    assert scenario.player_role == CONTENT_FILTER_TRANSITION
+    for section_id in (
+        "title",
+        "premise",
+        "player_character_name",
+        "player_role",
+        "tone_genre",
+        "opening_message",
+    ):
+        assert content[section_id] == CONTENT_FILTER_TRANSITION
+        assert content["_source"]["section_content_ratings"][section_id] == "g"
+    assert content["_source"]["content_rating"] == "g"
+
+
+def test_manual_scenario_fails_closed_when_generated_character_starter_review_fails(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    completion_provider = RuntimeStructuredCleanupProvider(
+        [
+            {
+                "characters": [
+                    {
+                        "name": "Captain Ilyra",
+                        "voice": "forbidden generated starter detail",
+                        "relationships": {
+                            "Mara Voss": "forbidden generated starter detail"
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    safety_provider = RuntimeSelectiveStarterSafetyProvider(
+        fail_on_starter=True
+    )
+    repositories.set_model_preference(
+        task="context_update",
+        provider="fake",
+        model_id="fake-structured",
+    )
+    _save_fake_provider_model(
+        repositories,
+        model_id="fake-structured",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="safety",
+        model_id="fake-safety",
+    )
+    repositories.save_provider_model(
+        provider="safety",
+        model_id="fake-safety",
+        display_name="Fake Safety",
+        capabilities=["structured_output"],
+    )
+    child = repositories.create_user(
+        username="Child",
+        role="child",
+        password_hash="hash",
+    )
+    repositories.set_scoped_setting(
+        scope="user",
+        scope_id=child.id,
+        key="content_filter_rating",
+        value="g",
+    )
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        providers={
+            "fake": completion_provider,
+            "safety": safety_provider,
+        },
+    )
+
+    model = controller.create_manual_scenario(
+        runtime.ManualScenarioInput(
+            scenario_type="full_roleplay",
+            title="Lantern Keep",
+            premise="A beacon guards a storm coast.",
+            player_character_name="Mara Voss",
+            player_role="Signal warden",
+            characters="Captain Ilyra, the exiled commander.",
+            opening_message="The beacon wakes.",
+        ),
+        current_user_id=child.id,
+    )
+
+    save_id = _value(model, "active_save_id")
+    assert save_id is not None
+    save = repositories.get_save(save_id)
+    assert save is not None
+    scenario = repositories.get_scenario(save.scenario_id)
+    assert scenario is not None
+    content = json.loads(scenario.content_json)
+    assert "forbidden generated starter detail" not in json.dumps(content)
+    assert content["character_starters"][0]["name"] == CONTENT_FILTER_TRANSITION
+    assert content["character_starters"][0]["voice"] == (
+        CONTENT_FILTER_TRANSITION
+    )
+    assert content["character_starters"][0]["relationships"] == {}
+    assert content["_source"]["section_content_ratings"][
+        "character_starters"
+    ] == "g"
+    assert any(
+        "forbidden generated starter detail" in request.messages[-1].body
+        for request in safety_provider.structured_requests
+    )
+    assert _error_text(model) == ""
+
+
 def test_runtime_delete_media_asset_archives_asset_and_refreshes_model(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -1017,6 +1266,7 @@ def test_runtime_animate_media_asset_creates_video_with_source_provenance(
         model="fake-image",
         status="succeeded",
         mime_type="image/png",
+        metadata={"content_rating": "g"},
     )
     repositories.save_provider_model(
         provider="fake",
@@ -1076,6 +1326,7 @@ def test_runtime_animate_media_asset_reports_unavailable_provider(
         model="fake-image",
         status="succeeded",
         mime_type="image/png",
+        metadata={"content_rating": "g"},
     )
     repositories.save_provider_model(
         provider="fake",
@@ -1128,6 +1379,7 @@ def test_runtime_animate_media_asset_allows_missing_catalog_row_for_selected_mod
         model="fake-image",
         status="succeeded",
         mime_type="image/png",
+        metadata={"content_rating": "g"},
     )
     repositories.set_model_preference(
         task="image_animation",
@@ -2440,6 +2692,10 @@ def test_generate_scenario_draft_uses_scenario_preference_or_chat_fallback_witho
     assert dict(_value(draft, "source_metadata")) == {
         "origin": "ai_draft",
         "generation_prompt": "A harbor that keeps old promises.",
+        "content_rating": "g",
+        "section_content_ratings": {
+            section_id: "g" for section_id in provider.scenario_sections
+        },
     }
     assert _status_text(model) == "Scenario draft generated"
 
@@ -2838,7 +3094,16 @@ def test_save_scenario_draft_persists_reviewed_sections_creates_active_save_and_
     assert scenario.title == "Reviewed Glass Harbor"
     assert scenario.premise == "A revised drowned harbor mystery."
     assert scenario.player_role == "Reef investigator"
-    assert json.loads(scenario.content_json) == reviewed_sections
+    content = json.loads(scenario.content_json)
+    assert {
+        key: value for key, value in content.items() if key != "_source"
+    } == reviewed_sections
+    assert content["_source"] == {
+        "content_rating": "g",
+        "section_content_ratings": {
+            section_id: "g" for section_id in reviewed_sections
+        },
+    }
 
     messages = repositories.list_messages(save.id)
     message_rows = [
@@ -2904,7 +3169,23 @@ def test_start_saved_scenario_filters_opening_for_child_account(
     monkeypatch: MonkeyPatch,
 ) -> None:
     runtime = _import_runtime_without_gtk(monkeypatch)
-    controller = _runtime_controller(runtime, repositories, tmp_path)
+    provider = RuntimeContentSafetyProvider()
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="fake",
+        model_id="fake-safety",
+    )
+    _save_fake_provider_model(
+        repositories,
+        model_id="fake-safety",
+        capabilities=["structured_output"],
+    )
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        provider=provider,
+    )
     child = repositories.create_user(
         username="Ilyra",
         role="child",
@@ -2923,6 +3204,10 @@ def test_start_saved_scenario_filters_opening_for_child_account(
         player_role="Signal warden",
         content={
             "opening_message": "Blood covered the floor after the attack.",
+            "_source": {
+                "content_rating": "g",
+                "section_content_ratings": {"opening_message": "g"},
+            },
         },
     )
 
@@ -2934,6 +3219,7 @@ def test_start_saved_scenario_filters_opening_for_child_account(
     save_id = _value(model, "active_save_id")
     assert save_id is not None
     assert repositories.list_messages(save_id)[0].body == CONTENT_FILTER_TRANSITION
+    assert provider.structured_requests
 
 
 def test_start_saved_scenario_filters_graphic_gore_for_default_child_rating(
@@ -2942,7 +3228,23 @@ def test_start_saved_scenario_filters_graphic_gore_for_default_child_rating(
     monkeypatch: MonkeyPatch,
 ) -> None:
     runtime = _import_runtime_without_gtk(monkeypatch)
-    controller = _runtime_controller(runtime, repositories, tmp_path)
+    provider = RuntimeContentSafetyProvider()
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="fake",
+        model_id="fake-safety",
+    )
+    _save_fake_provider_model(
+        repositories,
+        model_id="fake-safety",
+        capabilities=["structured_output"],
+    )
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        provider=provider,
+    )
     child = repositories.create_user(
         username="Ilyra",
         role="child",
@@ -2957,6 +3259,10 @@ def test_start_saved_scenario_filters_graphic_gore_for_default_child_rating(
             "opening_message": (
                 "He disemboweled the guard, spilling his organs across the floor."
             ),
+            "_source": {
+                "content_rating": "g",
+                "section_content_ratings": {"opening_message": "g"},
+            },
         },
     )
 
@@ -2968,6 +3274,7 @@ def test_start_saved_scenario_filters_graphic_gore_for_default_child_rating(
     save_id = _value(model, "active_save_id")
     assert save_id is not None
     assert repositories.list_messages(save_id)[0].body == CONTENT_FILTER_TRANSITION
+    assert provider.structured_requests
 
 
 def test_save_scenario_draft_persists_generation_prompt_metadata(
@@ -3002,6 +3309,10 @@ def test_save_scenario_draft_persists_generation_prompt_metadata(
     assert content["_source"] == {
         "origin": "ai_draft",
         "generation_prompt": "A drowned harbor with a bell mystery.",
+        "content_rating": "g",
+        "section_content_ratings": {
+            section_id: "g" for section_id in reviewed_sections
+        },
     }
 
 
@@ -3496,6 +3807,106 @@ def test_save_scenario_draft_seeds_reviewed_full_roleplay_starting_npcs(
     )
     assert vey.aliases == ["Vey"]
     assert all(character.save_id == active_save_id for character in characters)
+
+
+def test_save_scenario_draft_reviews_generated_character_starter_content(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    completion_provider = RuntimeStructuredCleanupProvider(
+        [
+            {
+                "characters": [
+                    {
+                        "name": "Captain Ilyra",
+                        "voice": "forbidden generated starter detail",
+                        "relationships": {
+                            "Mara Voss": "forbidden generated starter detail"
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    safety_provider = RuntimeSelectiveStarterSafetyProvider()
+    repositories.set_model_preference(
+        task="context_update",
+        provider="fake",
+        model_id="fake-structured",
+    )
+    _save_fake_provider_model(
+        repositories,
+        model_id="fake-structured",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="safety",
+        model_id="fake-safety",
+    )
+    repositories.save_provider_model(
+        provider="safety",
+        model_id="fake-safety",
+        display_name="Fake Safety",
+        capabilities=["structured_output"],
+    )
+    child = repositories.create_user(
+        username="Child",
+        role="child",
+        password_hash="hash",
+    )
+    repositories.set_scoped_setting(
+        scope="user",
+        scope_id=child.id,
+        key="content_filter_rating",
+        value="g",
+    )
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        providers={
+            "fake": completion_provider,
+            "safety": safety_provider,
+        },
+    )
+    sections = {
+        **_reviewed_full_roleplay_sections(),
+        "characters": "Captain Ilyra, the exiled commander.",
+    }
+
+    model = asyncio.run(
+        controller.save_scenario_draft(
+            scenario_type="full_roleplay",
+            sections=sections,
+            save_title="Reviewed Save",
+            current_user_id=child.id,
+        )
+    )
+
+    save_id = _value(model, "active_save_id")
+    assert save_id is not None
+    save = repositories.get_save(save_id)
+    assert save is not None
+    scenario = repositories.get_scenario(save.scenario_id)
+    assert scenario is not None
+    content = json.loads(scenario.content_json)
+    assert "forbidden generated starter detail" not in json.dumps(content)
+    assert content["character_starters"][0]["name"] == CONTENT_FILTER_TRANSITION
+    assert content["character_starters"][0]["voice"] == (
+        CONTENT_FILTER_TRANSITION
+    )
+    assert content["character_starters"][0]["relationships"] == {}
+    assert content["_source"]["section_content_ratings"][
+        "character_starters"
+    ] == "g"
+    assert content["_source"]["content_rating"] == "g"
+    assert any(
+        "forbidden generated starter detail" in request.messages[-1].body
+        for request in safety_provider.structured_requests
+    )
 
 
 def test_save_scenario_draft_persists_reviewed_investigation_mystery_sections(
@@ -5195,14 +5606,14 @@ def test_runtime_lists_saved_scenarios_without_gtk_or_provider_calls(
         title="Glass Harbor",
         premise="A drowned harbor rings its bell at low tide.",
         player_role="Harbor warden",
-        content={
+        content=_rated_scenario_content({
             "opening_message": "The harbor bell rings under the mud.",
             "action_choices_enabled": True,
             "_source": {
                 "origin": "ai_draft",
                 "generation_prompt": "A drowned harbor at low tide.",
             },
-        },
+        }),
     )
     provider = RuntimeFakeProvider()
     controller = _runtime_controller(runtime, repositories, tmp_path, provider=provider)
@@ -5221,6 +5632,49 @@ def test_runtime_lists_saved_scenarios_without_gtk_or_provider_calls(
     assert provider.chat_requests == []
 
 
+def test_runtime_hides_scenarios_above_the_request_actor_rating(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    child = repositories.create_user(
+        username="Ilyra",
+        role="child",
+        password_hash="hash",
+    )
+    repositories.create_scenario(
+        type="full_roleplay",
+        title="Quiet Harbor",
+        premise="A gentle harbor mystery.",
+        player_role="Keeper",
+        content={
+            "opening_message": "The bell rings.",
+            "_source": {"content_rating": "g"},
+        },
+    )
+    repositories.create_scenario(
+        type="full_roleplay",
+        title="Restricted Harbor",
+        premise="An adult harbor story.",
+        player_role="Keeper",
+        content={
+            "opening_message": "Restricted opening.",
+            "_source": {"content_rating": "r"},
+        },
+    )
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        provider=RuntimeFakeProvider(),
+    )
+
+    scenarios = controller.list_saved_scenarios(current_user_id=child.id)
+
+    assert [scenario.title for scenario in scenarios] == ["Quiet Harbor"]
+
+
 def test_runtime_lists_saved_scenarios_with_legacy_type(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -5232,14 +5686,18 @@ def test_runtime_lists_saved_scenarios_with_legacy_type(
         title="Old Harbor",
         premise="An older scenario template from a previous version.",
         player_role="Keeper",
-        content={"opening_message": "The old harbor bell rings."},
+        content=_rated_scenario_content(
+            {"opening_message": "The old harbor bell rings."}
+        ),
     )
     repositories.create_scenario(
         type="full_roleplay",
         title="Glass Harbor",
         premise="A drowned harbor rings its bell at low tide.",
         player_role="Harbor warden",
-        content={"opening_message": "The harbor bell rings under the mud."},
+        content=_rated_scenario_content(
+            {"opening_message": "The harbor bell rings under the mud."}
+        ),
     )
     controller = _runtime_controller(
         runtime,
@@ -5267,7 +5725,9 @@ def test_start_saved_scenario_reuses_existing_scenario_and_opening_without_provi
         title="Glass Harbor",
         premise="A drowned harbor rings its bell at low tide.",
         player_role="Harbor warden",
-        content={"opening_message": "The harbor bell rings under the mud."},
+        content=_rated_scenario_content(
+            {"opening_message": "The harbor bell rings under the mud."}
+        ),
     )
     original_save = repositories.create_save(
         scenario_id=scenario.id,
@@ -5307,7 +5767,7 @@ def test_start_saved_scenario_seeds_registry_from_character_starters(
         title="Glass Harbor",
         premise="A drowned harbor rings its bell at low tide.",
         player_role="Harbor warden",
-        content={
+        content=_rated_scenario_content({
             "opening_message": "The harbor bell rings under the mud.",
             "characters": "Legacy NPC",
             "character_starters": [
@@ -5325,7 +5785,7 @@ def test_start_saved_scenario_seeds_registry_from_character_starters(
                     "met": False,
                 }
             ],
-        },
+        }),
     )
     provider = RuntimeFakeProvider()
     controller = _runtime_controller(runtime, repositories, tmp_path, provider=provider)
@@ -5380,7 +5840,7 @@ def test_start_saved_scenario_seeds_character_starter_reference_image(
         title="Glass Harbor",
         premise="A drowned harbor rings its bell at low tide.",
         player_role="Harbor warden",
-        content={
+        content=_rated_scenario_content({
             "opening_message": "The harbor bell rings under the mud.",
             "character_starters": [
                 {
@@ -5397,7 +5857,7 @@ def test_start_saved_scenario_seeds_character_starter_reference_image(
                     },
                 }
             ],
-        },
+        }),
     )
     controller = _runtime_controller(runtime, repositories, tmp_path)
 
@@ -5488,7 +5948,7 @@ def test_start_saved_management_scenario_seeds_template_state(
         title=sections["title"],
         premise=sections["premise"],
         player_role=sections["player_role"],
-        content=cast(dict[str, object], dict(sections)),
+        content=_rated_scenario_content(cast(dict[str, object], dict(sections))),
     )
     provider = RuntimeFakeProvider()
     controller = _runtime_controller(runtime, repositories, tmp_path, provider=provider)
@@ -5517,7 +5977,9 @@ def test_start_saved_scenario_can_skip_process_global_selection(
         title="Glass Harbor",
         premise="A drowned harbor rings its bell at low tide.",
         player_role="Harbor warden",
-        content={"opening_message": "The harbor bell rings under the mud."},
+        content=_rated_scenario_content(
+            {"opening_message": "The harbor bell rings under the mud."}
+        ),
     )
     controller = _runtime_controller(runtime, repositories, tmp_path)
 
@@ -6496,6 +6958,7 @@ def test_edit_message_without_resubmit_player_reconciles_world_data(
         ids["narrator_3"],
     ]
     assert active_messages[2].body == "I keep the sealed door shut and listen."
+    assert active_messages[2].content_rating == "g"
     assert active_messages[3].body == "The corridor floods with ash."
     revisions = repositories.list_message_revisions(
         save_id=save_id,
@@ -6739,6 +7202,60 @@ def test_edit_narrator_message_keeps_revision_when_reconciliation_is_unavailable
     )
     assert revisions[0].reconciliation_status == "skipped"
     assert _status_text(model) == "Narrator message edited"
+
+
+def test_edit_narrator_message_uses_content_safety_agent_before_revision(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, ids = _persist_revision_save(repositories)
+    provider = RuntimeContentSafetyProvider("fade_to_black")
+    repositories.set_model_preference(
+        task="content_safety",
+        provider="fake",
+        model_id="fake-safety",
+    )
+    _save_fake_provider_model(
+        repositories,
+        model_id="fake-safety",
+        capabilities=["structured_output"],
+    )
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        provider=provider,
+        context_search_service=NoopContextSearch(),
+    )
+    controller.load_save(save_id)
+    rejected = "A draft that the safety agent sends off-screen."
+
+    asyncio.run(
+        controller.edit_narrator_message(
+            message_id=ids["narrator_2"],
+            body=rejected,
+        )
+    )
+
+    message = repositories.get_message(
+        save_id=save_id,
+        message_id=ids["narrator_2"],
+    )
+    assert message is not None
+    assert message.body == FADE_TO_BLACK_TRANSITION
+    assert message.safety_transition == "fade_to_black"
+    assert message.content_rating == "g"
+    [revision] = repositories.list_message_revisions(
+        save_id=save_id,
+        message_id=ids["narrator_2"],
+    )
+    assert revision.new_body == FADE_TO_BLACK_TRANSITION
+    assert rejected not in revision.diff_unified
+    assert [request.schema_name for request in provider.structured_requests] == [
+        "content_safety_review"
+    ]
 
 
 def test_delete_messages_from_here_soft_deletes_suffix_without_provider_preferences(
@@ -9999,9 +10516,26 @@ def _runtime_controller(
         if hasattr(runtime, "RuntimeController")
         else runtime.BragiRuntime
     )
+    resolved_providers = dict(
+        providers or {"fake": provider or RuntimeFakeProvider()}
+    )
+    if repositories.get_model_preference("content_safety") is None:
+        safety_provider = "safety"
+        resolved_providers[safety_provider] = RuntimeAllowingSafetyProvider()
+        repositories.set_model_preference(
+            task="content_safety",
+            provider=safety_provider,
+            model_id="fake-safety",
+        )
+        repositories.save_provider_model(
+            provider=safety_provider,
+            model_id="fake-safety",
+            display_name="Fake Safety",
+            capabilities=["structured_output"],
+        )
     return runtime_class(
         repositories=repositories,
-        providers=providers or {"fake": provider or RuntimeFakeProvider()},
+        providers=resolved_providers,
         media_dir=tmp_path / "media",
         context_search_service=context_search_service,
     )
@@ -10094,6 +10628,24 @@ def _reviewed_full_roleplay_sections() -> dict[str, str]:
         "tone_genre": "Reviewed nautical noir.",
         "opening_message": "Reviewed opening bell.",
     }
+
+
+def _rated_scenario_content(
+    content: dict[str, object],
+    *,
+    rating: str = "g",
+) -> dict[str, object]:
+    rated = dict(content)
+    existing_source = rated.get("_source")
+    source = dict(existing_source) if isinstance(existing_source, dict) else {}
+    source["content_rating"] = rating
+    source["section_content_ratings"] = {
+        key: rating
+        for key, value in rated.items()
+        if key != "_source" and isinstance(value, str)
+    }
+    rated["_source"] = source
+    return rated
 
 
 def _reviewed_first_contact_exploration_sections() -> dict[str, str]:
@@ -10497,10 +11049,10 @@ def _persist_runtime_save(
         title="Ashfall Keep",
         premise="A border keep is cut off by ash storms.",
         player_role=player_role,
-        content={
+        content=_rated_scenario_content({
             "player_character_name": player_character_name,
             "opening_message": "The beacon gutters in the tower.",
-        },
+        }),
     )
     save = repositories.create_save(scenario_id=scenario.id, title=title)
     if not include_messages:
@@ -10511,6 +11063,7 @@ def _persist_runtime_save(
         role="player",
         speaker_name="Mara",
         body=player_body,
+        content_rating="g",
     )
     narrator = repositories.append_message(
         save_id=save.id,
@@ -10520,6 +11073,7 @@ def _persist_runtime_save(
         provider="fake",
         model="fake-chat",
         token_estimate=21,
+        content_rating="g",
     )
     return save.id, narrator.id
 

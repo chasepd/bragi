@@ -70,13 +70,7 @@ from bragi.persistence.models import (
     WorldStateRecord,
 )
 from bragi.redaction import redact_text
-from bragi.safety import (
-    CONTENT_FILTER_TRANSITION,
-    CONTENT_FILTER_TRANSITION_KIND,
-    FADE_TO_BLACK_TRANSITION,
-    FADE_TO_BLACK_TRANSITION_KIND,
-    normalize_message_safety,
-)
+from bragi.safety import normalize_message_safety
 from bragi.world_time_model import (
     canonical_world_time_from_legacy,
     canonical_world_time_from_values,
@@ -203,7 +197,7 @@ _CHARACTER_TEXT_THREAD_PARTICIPANT_COLUMNS = (
 )
 _CHARACTER_TEXT_MESSAGE_COLUMNS = (
     "id, save_id, thread_id, character_id, sender, body, sender_character_id, "
-    "provider, model, token_estimate, delivery_status, delivery_error, "
+    "provider, model, token_estimate, content_rating, delivery_status, delivery_error, "
     "delivery_job_id, delivery_attempt, in_world_sent_at, delivered_at, read_at, "
     "reply_to_message_id, created_at, updated_at, deleted_at"
 )
@@ -2104,23 +2098,9 @@ class PersistenceRepositories:
         created_at: str | None = None,
         updated_at: str | None = None,
         safety_transition: str = "",
-        content_rating: str = "pg-13",
-        fade_to_black_enabled: bool = True,
+        content_rating: str = "unclassified",
         touch_save_updated_at: bool = True,
     ) -> MessageRecord:
-        if role == "narrator":
-            from bragi.services.sexual_content_safety import sanitize_narrator_body
-
-            safety = sanitize_narrator_body(
-                body,
-                content_rating=content_rating,
-                fade_to_black_enabled=fade_to_black_enabled,
-            )
-            body = safety.body
-            if safety.body == FADE_TO_BLACK_TRANSITION:
-                safety_transition = FADE_TO_BLACK_TRANSITION_KIND
-            elif safety.body == CONTENT_FILTER_TRANSITION:
-                safety_transition = CONTENT_FILTER_TRANSITION_KIND
         body, safety_transition = normalize_message_safety(
             body=body,
             role=role,
@@ -2137,18 +2117,20 @@ class PersistenceRepositories:
             token_estimate=token_estimate,
             deleted_at=None,
             safety_transition=safety_transition,
+            content_rating=content_rating,
         )
         self.connection.execute(
             """
             INSERT INTO messages(
                 id, save_id, role, speaker_name, body, provider, model,
-                token_estimate, created_at, updated_at, safety_transition
+                token_estimate, created_at, updated_at, safety_transition,
+                content_rating
             )
             VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?,
                 COALESCE(?, CURRENT_TIMESTAMP),
                 COALESCE(?, strftime('%Y-%m-%d %H:%M:%f', 'now')),
-                ?
+                ?, ?
             )
             """,
             (
@@ -2163,6 +2145,7 @@ class PersistenceRepositories:
                 created_at,
                 updated_at,
                 record.safety_transition,
+                record.content_rating,
             ),
         )
         if touch_save_updated_at:
@@ -2183,7 +2166,7 @@ class PersistenceRepositories:
             """
             SELECT id, save_id, role, body, speaker_name, provider, model,
                    token_estimate, deleted_at, created_at, updated_at,
-                   safety_transition
+                   safety_transition, content_rating
             FROM messages
             WHERE id = ?
             """,
@@ -2203,7 +2186,7 @@ class PersistenceRepositories:
             f"""
             SELECT id, save_id, role, body, speaker_name, provider, model,
                    token_estimate, deleted_at, created_at, updated_at,
-                   safety_transition
+                   safety_transition, content_rating
             FROM messages
             WHERE save_id = ? AND id = ? {deleted_filter}
             """,
@@ -2222,7 +2205,7 @@ class PersistenceRepositories:
             f"""
             SELECT id, save_id, role, body, speaker_name, provider, model,
                    token_estimate, deleted_at, created_at, updated_at,
-                   safety_transition
+                   safety_transition, content_rating
             FROM messages
             WHERE save_id = ? {deleted_filter}
             ORDER BY rowid
@@ -2324,7 +2307,7 @@ class PersistenceRepositories:
             f"""
             SELECT id, save_id, role, body, speaker_name, provider, model,
                    token_estimate, deleted_at, created_at, updated_at,
-                   safety_transition
+                   safety_transition, content_rating
             FROM messages
             WHERE save_id = ?
               {rowid_filter}
@@ -2369,7 +2352,7 @@ class PersistenceRepositories:
             f"""
             SELECT id, save_id, role, body, speaker_name, provider, model,
                    token_estimate, deleted_at, created_at, updated_at,
-                   safety_transition
+                   safety_transition, content_rating
             FROM messages
             WHERE save_id = ? {deleted_filter} {before_filter}
             ORDER BY rowid DESC
@@ -2413,7 +2396,7 @@ class PersistenceRepositories:
             f"""
             SELECT id, save_id, role, body, speaker_name, provider, model,
                    token_estimate, deleted_at, created_at, updated_at,
-                   safety_transition
+                   safety_transition, content_rating
             FROM messages
             WHERE save_id = ? AND deleted_at IS NULL {before_filter}
               {filter_clause}
@@ -2479,8 +2462,8 @@ class PersistenceRepositories:
         save_id: str,
         message_id: str,
         body: str,
-        content_rating: str = "pg-13",
-        fade_to_black_enabled: bool = True,
+        content_rating: str = "unclassified",
+        safety_transition: str = "",
     ) -> MessageRecord:
         existing = self._fetch_one(
             "SELECT role FROM messages "
@@ -2489,36 +2472,28 @@ class PersistenceRepositories:
         )
         if existing is None:
             raise ValueError(f"Unknown active message id: {message_id}")
-        safety_transition = ""
-        if str(existing["role"]) == "narrator":
-            from bragi.services.sexual_content_safety import sanitize_narrator_body
-
-            safety = sanitize_narrator_body(
-                body,
-                content_rating=content_rating,
-                fade_to_black_enabled=fade_to_black_enabled,
-            )
-            body = safety.body
-            if safety.body == FADE_TO_BLACK_TRANSITION:
-                safety_transition = FADE_TO_BLACK_TRANSITION_KIND
-            elif safety.body == CONTENT_FILTER_TRANSITION:
-                safety_transition = CONTENT_FILTER_TRANSITION_KIND
+        body, safety_transition = normalize_message_safety(
+            body=body,
+            role=str(existing["role"]),
+            safety_transition=safety_transition,
+        )
         self.connection.execute(
             """
             UPDATE messages
             SET body = ?, token_estimate = NULL, safety_transition = ?,
+                content_rating = ?,
                 updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
                     || ':' || lower(hex(randomblob(4)))
             WHERE save_id = ? AND id = ? AND deleted_at IS NULL
             """,
-            (body, safety_transition, save_id, message_id),
+            (body, safety_transition, content_rating, save_id, message_id),
         )
         self.commit()
         row = self._fetch_one(
             """
             SELECT id, save_id, role, body, speaker_name, provider, model,
                    token_estimate, deleted_at, created_at, updated_at,
-                   safety_transition
+                   safety_transition, content_rating
             FROM messages
             WHERE save_id = ? AND id = ? AND deleted_at IS NULL
             """,
@@ -2746,7 +2721,7 @@ class PersistenceRepositories:
             """
             SELECT id, save_id, role, body, speaker_name, provider, model,
                    token_estimate, deleted_at, created_at, updated_at,
-                   safety_transition
+                   safety_transition, content_rating
             FROM messages
             WHERE save_id = ?
               AND deleted_at IS NULL
@@ -3999,12 +3974,20 @@ class PersistenceRepositories:
         character_id: str | None = None,
         first_seen_message_id: str | None = None,
         last_updated_message_id: str | None = None,
+        content_rating: str = "unclassified",
     ) -> CharacterRecord:
         self._validate_location_reference(
             save_id=save_id,
             location_id=location_id,
             field_name="location_id",
         )
+        if content_rating == "unclassified" and source_message_id is not None:
+            source_message = self.get_message(
+                save_id=save_id,
+                message_id=source_message_id,
+            )
+            if source_message is not None:
+                content_rating = source_message.content_rating
         resolved_history = history.strip() if history.strip() else known_state
         record = CharacterRecord(
             id=character_id or _new_id(),
@@ -4039,6 +4022,7 @@ class PersistenceRepositories:
             contact_name=contact_name,
             first_seen_message_id=first_seen_message_id or source_message_id,
             last_updated_message_id=last_updated_message_id or source_message_id,
+            content_rating=content_rating,
         )
         if record.is_player_character:
             record = replace(record, protected_from_maintenance=True)
@@ -4054,11 +4038,11 @@ class PersistenceRepositories:
                 location_id, private_notes, source_message_id,
                 locked_fields_json, protected_from_maintenance,
                 is_player_character, texting_style, contact_name,
-                first_seen_message_id, last_updated_message_id
+                first_seen_message_id, last_updated_message_id, content_rating
             )
             VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             _character_params(record),
@@ -4092,6 +4076,7 @@ class PersistenceRepositories:
                 texting_style = ?, contact_name = ?,
                 first_seen_message_id = ?,
                 last_updated_message_id = ?,
+                content_rating = ?,
                 updated_at = CURRENT_TIMESTAMP, archived_at = NULL
             WHERE id = ? AND save_id = ?
             """,
@@ -4126,6 +4111,7 @@ class PersistenceRepositories:
                 character.contact_name,
                 character.first_seen_message_id or character.source_message_id,
                 character.last_updated_message_id or character.source_message_id,
+                character.content_rating,
                 character.id,
                 character.save_id,
             ),
@@ -4150,7 +4136,7 @@ class PersistenceRepositories:
                    location_id, private_notes, source_message_id,
                    locked_fields_json, protected_from_maintenance,
                    is_player_character, texting_style, contact_name,
-                   first_seen_message_id, last_updated_message_id
+                   first_seen_message_id, last_updated_message_id, content_rating
             FROM characters
             WHERE id = ? AND archived_at IS NULL
             """,
@@ -4170,7 +4156,7 @@ class PersistenceRepositories:
                    location_id, private_notes, source_message_id,
                    locked_fields_json, protected_from_maintenance,
                    is_player_character, texting_style, contact_name,
-                   first_seen_message_id, last_updated_message_id
+                   first_seen_message_id, last_updated_message_id, content_rating
             FROM characters
             WHERE save_id = ? AND archived_at IS NULL
             ORDER BY name, created_at, rowid
@@ -4732,6 +4718,7 @@ class PersistenceRepositories:
         delivered_at: str | None = None,
         read_at: str | None = None,
         reply_to_message_id: str | None = None,
+        content_rating: str = "unclassified",
     ) -> CharacterTextMessageRecord:
         thread = self.get_character_text_thread(thread_id=thread_id, save_id=save_id)
         if thread is None:
@@ -4772,11 +4759,12 @@ class PersistenceRepositories:
             INSERT INTO character_text_messages(
                 id, save_id, thread_id, character_id, sender, body,
                 sender_character_id, provider, model, token_estimate,
+                content_rating,
                 delivery_status, delivery_error, delivery_job_id,
                 delivery_attempt, in_world_sent_at, delivered_at, read_at,
                 reply_to_message_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record_id,
@@ -4789,6 +4777,7 @@ class PersistenceRepositories:
                 provider,
                 model,
                 token_estimate,
+                content_rating,
                 delivery_status,
                 redact_text(delivery_error),
                 delivery_job_id,
@@ -5021,14 +5010,16 @@ class PersistenceRepositories:
         save_id: str,
         message_id: str,
         body: str,
+        content_rating: str | None = None,
     ) -> CharacterTextMessageRecord:
         self.connection.execute(
             """
             UPDATE character_text_messages
-            SET body = ?, updated_at = CURRENT_TIMESTAMP
+            SET body = ?, content_rating = COALESCE(?, content_rating),
+                updated_at = CURRENT_TIMESTAMP
             WHERE save_id = ? AND id = ? AND deleted_at IS NULL
             """,
-            (body.strip(), save_id, message_id),
+            (body.strip(), content_rating, save_id, message_id),
         )
         self.commit()
         updated = self.get_character_text_message(
@@ -5049,6 +5040,7 @@ class PersistenceRepositories:
         model: str | None,
         token_estimate: int | None,
         in_world_sent_at: str | None = None,
+        content_rating: str = "unclassified",
     ) -> CharacterTextMessageRecord:
         existing = self.get_character_text_message(
             save_id=save_id,
@@ -5063,6 +5055,7 @@ class PersistenceRepositories:
                 provider = ?,
                 model = ?,
                 token_estimate = ?,
+                content_rating = ?,
                 delivery_status = 'sent',
                 delivery_error = NULL,
                 in_world_sent_at = COALESCE(?, in_world_sent_at),
@@ -5075,6 +5068,7 @@ class PersistenceRepositories:
                 provider,
                 model,
                 token_estimate,
+                content_rating,
                 _blank_to_none(in_world_sent_at),
                 save_id,
                 message_id,
@@ -6920,6 +6914,7 @@ class PersistenceRepositories:
         choices: list[str] | tuple[str, ...],
         provider: str = "",
         model: str = "",
+        content_ratings: list[str] | tuple[str, ...] | None = None,
     ) -> list[MessageActionChoiceRecord]:
         normalized_choices = tuple(
             choice.strip() for choice in choices if choice.strip()
@@ -6933,15 +6928,21 @@ class PersistenceRepositories:
                 """,
                 (save_id, message_id),
             )
+            normalized_ratings = tuple(content_ratings or ())
             for ordinal, body in enumerate(normalized_choices, start=1):
+                content_rating = (
+                    normalized_ratings[ordinal - 1]
+                    if ordinal <= len(normalized_ratings)
+                    else "unclassified"
+                )
                 self.connection.execute(
                     """
                     INSERT INTO message_action_choices(
                         id, save_id, message_id, ordinal, body, provider, model,
-                        updated_at
+                        content_rating, updated_at
                     )
                     VALUES (
-                        ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?,
                         strftime('%Y-%m-%d %H:%M:%f', 'now')
                     )
                     """,
@@ -6953,6 +6954,7 @@ class PersistenceRepositories:
                         body,
                         provider,
                         model,
+                        content_rating,
                     ),
                 )
             self.commit_transaction()
@@ -6975,7 +6977,7 @@ class PersistenceRepositories:
         rows = self._fetch_all(
             f"""
             SELECT c.id, c.save_id, c.message_id, c.ordinal, c.body, c.provider,
-                   c.model, c.created_at, c.updated_at
+                   c.model, c.content_rating, c.created_at, c.updated_at
             FROM message_action_choices c
             JOIN messages m ON m.id = c.message_id
             WHERE {' AND '.join(f'c.{item}' for item in filters)}
@@ -7852,6 +7854,7 @@ class PersistenceRepositories:
         body: str,
         provider: str,
         model: str,
+        content_rating: str = "unclassified",
         summary_id: str | None = None,
     ) -> SummaryRecord:
         record = SummaryRecord(
@@ -7862,14 +7865,15 @@ class PersistenceRepositories:
             body=body,
             provider=provider,
             model=model,
+            content_rating=content_rating,
         )
         self.connection.execute(
             """
             INSERT INTO summaries(
                 id, save_id, covers_message_start_id, covers_message_end_id,
-                body, provider, model
+                body, provider, model, content_rating
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -7879,6 +7883,7 @@ class PersistenceRepositories:
                 record.body,
                 record.provider,
                 record.model,
+                record.content_rating,
             ),
         )
         self.commit()
@@ -7889,20 +7894,23 @@ class PersistenceRepositories:
         *,
         summary_id: str,
         body: str,
+        content_rating: str | None = None,
     ) -> SummaryRecord:
         self.connection.execute(
             """
             UPDATE summaries
-            SET body = ?, archived_at = NULL
+            SET body = ?,
+                content_rating = COALESCE(?, content_rating),
+                archived_at = NULL
             WHERE id = ?
             """,
-            (body, summary_id),
+            (body, content_rating, summary_id),
         )
         self.commit()
         row = self._fetch_one(
             """
             SELECT id, save_id, covers_message_start_id, covers_message_end_id,
-                   body, provider, model
+                   body, provider, model, content_rating
             FROM summaries
             WHERE id = ?
             """,
@@ -7940,7 +7948,7 @@ class PersistenceRepositories:
         rows = self._fetch_all(
             """
             SELECT id, save_id, covers_message_start_id, covers_message_end_id,
-                   body, provider, model
+                   body, provider, model, content_rating
             FROM summaries
             WHERE save_id = ? AND archived_at IS NULL
             ORDER BY created_at, rowid
@@ -10610,6 +10618,7 @@ def _character_params(record: CharacterRecord) -> tuple[object, ...]:
         record.contact_name,
         record.first_seen_message_id or record.source_message_id,
         record.last_updated_message_id or record.source_message_id,
+        record.content_rating,
     )
 
 
@@ -10649,6 +10658,7 @@ def _character_from_row(row: sqlite3.Row) -> CharacterRecord:
         contact_name=row["contact_name"],
         first_seen_message_id=first_seen_message_id,
         last_updated_message_id=last_updated_message_id,
+        content_rating=row["content_rating"],
     )
 
 
@@ -10695,6 +10705,7 @@ def _character_text_message_from_row(row: sqlite3.Row) -> CharacterTextMessageRe
         sender_character_id=row["sender_character_id"],
         provider=row["provider"],
         model=row["model"],
+        content_rating=row["content_rating"],
         token_estimate=_optional_int(row["token_estimate"]),
         delivery_status=row["delivery_status"],
         delivery_error=row["delivery_error"],
@@ -11182,6 +11193,7 @@ def _message_action_choice_from_row(row: sqlite3.Row) -> MessageActionChoiceReco
         body=row["body"],
         provider=row["provider"],
         model=row["model"],
+        content_rating=row["content_rating"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

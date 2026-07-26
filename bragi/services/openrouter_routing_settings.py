@@ -82,6 +82,7 @@ _STRUCTURED_TOOL_TASKS = frozenset(
         "memory_curation",
         "response_planning",
         "response_verification",
+        "content_safety",
         "director_pressure",
         "action_choice_generation",
         "character_presence_assessment",

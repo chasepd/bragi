@@ -18,6 +18,7 @@ from bragi.persistence.models import (
     WorldStateRecord,
 )
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.safety import CONTENT_FILTER_TRANSITION
 from bragi.services.character_registry_service import (
     CharacterKnowledgeAction,
     CharacterRegistryEdits,
@@ -114,6 +115,30 @@ def test_build_model_ignores_retired_save_level_character_reference(
     )
 
     assert [row.reference_image for row in model.characters] == [None, None]
+
+
+def test_build_model_replaces_character_above_viewer_rating(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    character = repositories.add_character(
+        save_id=save.id,
+        name="The Ash Warden",
+        appearance="A lingering graphic injury.",
+        relationships={"player": "A prolonged frightening threat."},
+        content_rating="r",
+    )
+
+    model = CharacterRegistryService(
+        repositories,
+        allowed_content_rating="pg",
+    ).build_model(active_save_id=save.id)
+
+    row = next(item for item in model.characters if item.character_id == character.id)
+    assert row.name == CONTENT_FILTER_TRANSITION
+    assert row.appearance == CONTENT_FILTER_TRANSITION
+    assert row.relationships_json == "{}"
+    assert row.content_rating == "r"
 
 
 def test_build_model_exposes_characters_presence_locations_and_known_links(

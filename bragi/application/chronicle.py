@@ -78,6 +78,7 @@ class ChronicleMessageModel:
     edited_at: str | None = None
     debug_prompt: str | None = None
     debug_provider_payload: str | None = None
+    content_rating: str = "unclassified"
 
     @property
     def role_label(self) -> str:
@@ -158,6 +159,7 @@ def build_chronicle_model(
                 if debug_prompts_enabled
                 else None
             ),
+            content_rating=message.content_rating,
         )
         for message in messages
     )

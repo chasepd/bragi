@@ -87,6 +87,7 @@ EXPECTED_COLUMNS = {
         "role",
         "speaker_name",
         "body",
+        "content_rating",
         "safety_transition",
         "updated_at",
         "deleted_at",
@@ -110,6 +111,7 @@ EXPECTED_COLUMNS = {
         "last_updated_message_id",
         "contact_name",
         "texting_style",
+        "content_rating",
     },
     "scene_snapshots": {
         "id",
@@ -225,6 +227,7 @@ EXPECTED_COLUMNS = {
         "character_id",
         "sender",
         "body",
+        "content_rating",
         "delivery_status",
         "delivery_job_id",
         "reply_to_message_id",
@@ -365,8 +368,7 @@ def test_migration_rejects_orphaned_pending_review_suggestions(tmp_path: Path) -
             field_path="goals",
             proposed_value="Leave.",
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version = 65")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 66")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 65")
         connection.commit()
 
     migrate_database(database_path)
@@ -395,11 +397,7 @@ def test_migrate_database_upgrades_schema_61_world_time_columns(
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)
     with sqlite3.connect(database_path) as connection:
-        connection.execute("DELETE FROM schema_migrations WHERE version = 62")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 63")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 64")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 65")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 66")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 62")
         connection.execute(
             "ALTER TABLE scene_snapshots DROP COLUMN world_time_day_index"
         )
@@ -727,10 +725,7 @@ def test_migrate_database_removes_retired_character_import_routing_state(
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)
     with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            "DELETE FROM schema_migrations WHERE version = ?",
-            (CURRENT_SCHEMA_VERSION,),
-        )
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 66")
         connection.executemany(
             """
             INSERT INTO model_preferences(id, task, provider, model_id)

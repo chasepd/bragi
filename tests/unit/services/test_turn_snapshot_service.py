@@ -190,8 +190,6 @@ def test_snapshot_restore_preserves_unrated_narration_without_resanitizing(
         role="narrator",
         speaker_name="Narrator",
         body=adult_body,
-        content_rating="unrated",
-        fade_to_black_enabled=False,
     )
     snapshot = service.capture_message_snapshot(
         save_id=save.id,

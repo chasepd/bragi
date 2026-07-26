@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import perf_counter
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
@@ -21,6 +21,8 @@ from bragi.providers.contracts import (
 )
 from bragi.redaction import redact_text
 from bragi.safety import FADE_TO_BLACK_TRANSITION
+from bragi.services.content_rating import effective_content_safety_policy
+from bragi.services.content_safety_service import ContentSafetyService
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.model_preferences import roleplay_model_preference
 from bragi.services.provider_fallbacks import chat_with_fallback
@@ -49,6 +51,7 @@ class GeneratedSummary:
     model: str
     request_count: int
     repaired: bool
+    content_rating: str = "unclassified"
 
 
 class SummaryService:
@@ -60,12 +63,20 @@ class SummaryService:
         enabled: bool = True,
         threshold: float = 0.75,
         retain_recent_messages: int = 2,
+        content_safety_service: ContentSafetyService | None = None,
     ) -> None:
         self.repositories = repositories
         self.providers = providers
         self.enabled = enabled
         self.threshold = threshold
         self.retain_recent_messages = retain_recent_messages
+        self.content_safety_service = (
+            content_safety_service
+            or ContentSafetyService(
+                repositories=repositories,
+                providers=providers,
+            )
+        )
         self.jobs = JobLifecycleService(repositories=repositories)
 
     def estimate_context_budget(
@@ -109,6 +120,7 @@ class SummaryService:
         context_window: int | None = None,
         model_context_window: int | None = None,
         pending_message: PendingMessageEstimate | None = None,
+        current_user_id: str | None = None,
     ) -> SummaryRecord | None:
         enabled = _automatic_summarization_enabled(
             self.repositories,
@@ -206,6 +218,26 @@ class SummaryService:
                 prior_summaries=tuple(summaries),
                 started_at=started_at,
             )
+            policy = effective_content_safety_policy(
+                self.repositories,
+                user_id=current_user_id,
+            )
+            safety = await self.content_safety_service.review_narration(
+                body=generated.body,
+                content_rating=policy.rating,
+                fade_to_black_enabled=False,
+                save_id=save_id,
+                source_request=ChatRequest(
+                    provider=generated.provider,
+                    model_id=generated.model,
+                    messages=(),
+                ),
+            )
+            generated = replace(
+                generated,
+                body=safety.body,
+                content_rating=safety.reviewed_content_rating,
+            )
         except Exception as exc:
             self.jobs.fail(
                 job.id,
@@ -238,6 +270,7 @@ class SummaryService:
                 body=generated.body,
                 provider=generated.provider,
                 model=generated.model,
+                content_rating=generated.content_rating,
             )
             for old_summary in summaries:
                 self.repositories.archive_summary(old_summary.id)

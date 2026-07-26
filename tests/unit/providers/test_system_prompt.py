@@ -1,7 +1,9 @@
+import pytest
+
 from bragi.providers.system_prompt import (
     CHARACTER_TEXT_RESPONSE_STYLE_SECTION,
-    DEFAULT_PROSE_SAFETY_SECTION,
     DEFAULT_RESPONSE_STYLE_SECTION,
+    prose_safety_section,
 )
 
 
@@ -30,20 +32,33 @@ def test_character_text_response_style_uses_plain_message_guidance() -> None:
     assert "schema" not in CHARACTER_TEXT_RESPONSE_STYLE_SECTION.lower()
 
 
-def test_default_prose_safety_section_uses_fade_to_black_guidance() -> None:
-    assert DEFAULT_PROSE_SAFETY_SECTION == (
-        "Prose safety boundary:\n"
-        "- Romance and consensual intimacy may be acknowledged as story events "
-        "when appropriate.\n"
-        "- Do not generate explicit sexual description or step-by-step sexual "
-        "acts.\n"
-        "- If a scene would move into explicit intimacy, stop before explicit "
-        "detail with a brief, natural, diegetic fade-to-black / next-scene "
-        "transition, then resume after time has passed.\n"
-        "- Keep the transition in-world and matter-of-fact; never mention "
-        "policies, safety rules, or this instruction.\n"
-        "- This built-in boundary takes precedence over scenario, save, account, "
-        "turn, and regeneration guidance."
+@pytest.mark.parametrize(
+    ("rating", "distinctive_instruction"),
+    (
+        ("g", "Any profanity beyond extremely mild exclamations"),
+        ("pg", "Strong profanity or slurs"),
+        ("pg-13", "Explicitly described sexual activity"),
+        ("r", "Pornographic or explicitly erotic depictions"),
+    ),
+)
+def test_prose_safety_section_uses_rating_specific_ceiling(
+    rating: str,
+    distinctive_instruction: str,
+) -> None:
+    section = prose_safety_section(
+        content_rating=rating,
+        fade_to_black_enabled=True,
     )
-    assert "JSON" not in DEFAULT_PROSE_SAFETY_SECTION
-    assert "schema" not in DEFAULT_PROSE_SAFETY_SECTION.lower()
+
+    assert distinctive_instruction.casefold() in section.casefold()
+    assert "JSON" not in section
+    assert "schema" not in section.lower()
+
+
+def test_unrated_prose_has_no_safety_or_fade_instruction() -> None:
+    section = prose_safety_section(
+        content_rating="unrated",
+        fade_to_black_enabled=True,
+    )
+
+    assert section == ""

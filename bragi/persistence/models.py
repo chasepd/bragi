@@ -208,6 +208,7 @@ class MessageRecord:
     created_at: str | None = None
     updated_at: str | None = None
     safety_transition: str = ""
+    content_rating: str = "unclassified"
 
 
 @dataclass(frozen=True)
@@ -225,6 +226,7 @@ class MessageActionChoiceRecord:
     body: str
     provider: str
     model: str
+    content_rating: str = "unclassified"
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -386,6 +388,7 @@ class CharacterRecord:
     first_seen_message_id: str | None = None
     last_updated_message_id: str | None = None
     history: str = ""
+    content_rating: str = "unclassified"
 
     def __post_init__(self) -> None:
         history = self.known_state or self.history
@@ -517,6 +520,7 @@ class CharacterTextMessageRecord:
     created_at: str | None = None
     updated_at: str | None = None
     deleted_at: str | None = None
+    content_rating: str = "unclassified"
 
 
 @dataclass(frozen=True)
@@ -696,6 +700,7 @@ class SummaryRecord:
     body: str
     provider: str
     model: str
+    content_rating: str = "unclassified"
 
 
 @dataclass(frozen=True)
