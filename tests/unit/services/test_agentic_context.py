@@ -9,7 +9,10 @@ import pytest
 
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import ContextObservationRecord, SaveRecord
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.providers.contracts import (
     ChatMessage,
     ChatRequest,
@@ -207,6 +210,53 @@ def test_observation_extractor_returns_evidence_backed_candidates(
     )
 
 
+def test_observation_extractor_normalizes_legacy_observation_types(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    messages = tuple(repositories.list_messages(save.id))
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        "observation_type": "scene_fact",
+                        "claim": "The beacon lens is nearby.",
+                        "evidence_quote": "climb toward the beacon lens",
+                        "source_message_ids": [messages[0].id],
+                        "scope": "scene",
+                        "confidence": 0.8,
+                        "tags": [],
+                    }
+                ]
+            }
+        }
+    )
+    extractor = StructuredProviderObservationExtractor(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="observer",
+    )
+
+    observations = asyncio.run(extractor.extract(save_id=save.id, messages=messages))
+
+    assert observations[0].observation_type == "scene_detail"
+    observation_type_schema = provider.structured_output_requests[0].schema[
+        "properties"
+    ]["observations"]["items"]["properties"]["observation_type"]
+    assert observation_type_schema["enum"] == [
+        "player_preference",
+        "character_fact",
+        "relationship",
+        "world_fact",
+        "scene_detail",
+        "open_thread",
+        "promise",
+        "inventory",
+        "other",
+    ]
+
+
 def test_observation_service_drops_ungrounded_evidence_quotes(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -380,6 +430,67 @@ def test_context_curation_service_applies_memory_and_context_decisions(
     updated_observation = repositories.get_context_observation(memory_observation.id)
     assert updated_observation is not None
     assert updated_observation.status == "accepted"
+
+
+def test_context_curation_binds_scene_scratch_to_scene_and_turn_ttl(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    _player, narrator = repositories.list_messages(save.id)
+    location = repositories.add_location(save_id=save.id, name="Beacon Gallery")
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=location.id,
+        source_message_id=narrator.id,
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="scene_detail",
+        claim="The lens flashes red.",
+        evidence_quote="lens flashes red",
+        source_message_ids=[narrator.id],
+        scope="scene",
+        confidence=0.82,
+        tags=["beacon"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "scene_scratch",
+                        "reason": "Temporary scene state.",
+                        "confidence": 0.81,
+                        "memory_body": "",
+                        "context_title": "Flashing lens",
+                        "context_body": "The lens flashes red.",
+                        "tags": ["beacon"],
+                    }
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 1
+    scratch = repositories.list_context_sources(
+        save.id,
+        source_type="observation",
+    )[0]
+    assert scratch.scene_snapshot_id == scene.id
+    assert scratch.scene_generation == scene.scene_generation
+    assert scratch.created_turn_number == 1
+    assert scratch.expires_after_turn_number == 13
 
 
 def test_context_curation_rejects_unexpected_generated_script(
@@ -620,6 +731,67 @@ def test_context_curation_discards_observations_with_missing_source_message(
     assert updated.status == "discarded"
 
 
+def test_context_curation_queues_unsupported_curated_claim_for_confirmation(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, _narrator = repositories.list_messages(save.id)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara wants grounded narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+        tags=["tone"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "Purported preference.",
+                        "confidence": 0.88,
+                        "memory_body": (
+                            "Mara wants every scene moved to a ruby library."
+                        ),
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                        "grounding_status": "unsupported",
+                        "supporting_evidence_quote": "Keep it grounded",
+                        "supporting_source_message_ids": [player.id],
+                    }
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 0
+    assert result.confirmation_count == 1
+    assert repositories.list_memories(save.id) == []
+    suggestions = repositories.list_context_update_suggestions(save.id)
+    assert len(suggestions) == 1
+    assert suggestions[0].entity_type == "memory"
+    updated = repositories.get_context_observation(observation.id)
+    assert updated is not None
+    assert updated.status == "needs_confirmation"
+    assert updated.metadata["grounding_rejected"]
+
+
 def test_context_curation_queues_durable_memory_when_confirmation_enabled(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -679,6 +851,10 @@ def test_context_curation_queues_durable_memory_when_confirmation_enabled(
         "source_message_id": player.id,
         "source_message_ids": [player.id],
         "source_observation_id": observation.id,
+        "source_observation_ids": [observation.id],
+        "claim_fingerprint": canonical_claim_fingerprint(
+            "Mara likes concise, grounded narration."
+        ),
     }
     updated_observation = repositories.get_context_observation(observation.id)
     assert updated_observation is not None
@@ -689,14 +865,20 @@ def test_context_curation_suppresses_duplicate_durable_memory_records(
     repositories: PersistenceRepositories,
 ) -> None:
     save = _seed_save(repositories)
-    player, narrator = repositories.list_messages(save.id)
+    player, _narrator = repositories.list_messages(save.id)
+    repeated_preference = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="Please keep the narration concise and grounded.",
+    )
     observations = (
         repositories.add_context_observation(
             save_id=save.id,
             observation_type="player_preference",
             claim="Mara likes concise narration.",
             evidence_quote="Keep it grounded",
-            source_message_ids=[player.id, narrator.id],
+            source_message_ids=[player.id],
             scope="durable",
             confidence=0.9,
             tags=["tone"],
@@ -704,12 +886,12 @@ def test_context_curation_suppresses_duplicate_durable_memory_records(
         repositories.add_context_observation(
             save_id=save.id,
             observation_type="player_preference",
-            claim="Mara likes concise narration.",
-            evidence_quote="Keep it grounded",
-            source_message_ids=[narrator.id, player.id],
+            claim="Mara likes concise narration!",
+            evidence_quote="keep the narration concise and grounded",
+            source_message_ids=[repeated_preference.id],
             scope="durable",
-            confidence=0.9,
-            tags=["tone"],
+            confidence=0.95,
+            tags=["style"],
         ),
     )
     provider = RecordingStructuredProvider(
@@ -720,13 +902,16 @@ def test_context_curation_suppresses_duplicate_durable_memory_records(
                         "observation_id": observation.id,
                         "action": "durable_memory",
                         "reason": "Stable narrator preference.",
-                        "confidence": 0.88,
-                        "memory_body": "Mara likes concise, grounded narration.",
+                        "confidence": 0.88 + (index * 0.05),
+                        "memory_body": (
+                            "Mara likes concise, grounded narration"
+                            + ("!" if index else ".")
+                        ),
                         "context_title": "",
                         "context_body": "",
-                        "tags": ["tone"],
+                        "tags": [("tone" if index == 0 else "style")],
                     }
-                    for observation in observations
+                    for index, observation in enumerate(observations)
                 ]
             }
         }
@@ -743,9 +928,18 @@ def test_context_curation_suppresses_duplicate_durable_memory_records(
     result = asyncio.run(service.curate_pending(save.id))
 
     assert result.accepted_count == 1
-    assert [memory.body for memory in repositories.list_memories(save.id)] == [
+    memories = repositories.list_memories(save.id)
+    assert [memory.body for memory in memories] == [
         "Mara likes concise, grounded narration."
     ]
+    assert memories[0].source_message_ids == [player.id, repeated_preference.id]
+    assert memories[0].source_observation_ids == [
+        observations[0].id,
+        observations[1].id,
+    ]
+    assert memories[0].tags == ["tone", "style"]
+    assert memories[0].importance == pytest.approx(0.93)
+    assert memories[0].claim_fingerprint
     updated_observations = [
         repositories.get_context_observation(observation.id)
         for observation in observations

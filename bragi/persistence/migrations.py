@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import unicodedata
 from contextvars import ContextVar
+from hashlib import sha256
 from pathlib import Path
 
 from bragi.model_tasks import is_retired_model_task
 from bragi.private_files import ensure_private_file
 
-CURRENT_SCHEMA_VERSION = 70
+CURRENT_SCHEMA_VERSION = 71
 
 _PRESERVE_SCHEMA_SCRIPT_TRANSACTION: ContextVar[bool] = ContextVar(
     "_PRESERVE_SCHEMA_SCRIPT_TRANSACTION",
@@ -152,6 +154,10 @@ CREATE TABLE IF NOT EXISTS context_sources (
     body TEXT NOT NULL DEFAULT '',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     token_estimate INTEGER,
+    scene_snapshot_id TEXT REFERENCES scene_snapshots(id),
+    scene_generation INTEGER,
+    created_turn_number INTEGER,
+    expires_after_turn_number INTEGER,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     archived_at TEXT,
@@ -207,6 +213,7 @@ CREATE TABLE IF NOT EXISTS scene_snapshots (
     locked_fields_json TEXT NOT NULL DEFAULT '[]',
     first_seen_message_id TEXT REFERENCES messages(id),
     last_updated_message_id TEXT REFERENCES messages(id),
+    scene_generation INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(save_id, current_location_id) REFERENCES locations(save_id, id)
@@ -374,6 +381,8 @@ CREATE TABLE IF NOT EXISTS memories (
     importance INTEGER NOT NULL DEFAULT 1,
     source_message_id TEXT REFERENCES messages(id),
     source_message_ids_json TEXT NOT NULL DEFAULT '[]',
+    claim_fingerprint TEXT NOT NULL DEFAULT '',
+    source_observation_ids_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     archived_at TEXT
@@ -618,23 +627,30 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 69:
+            if current == 70:
+                _migrate_schema_70_to_71(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 69:
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 68:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 67:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 66:
                 _migrate_schema_66_to_67(connection)
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 65:
                 _migrate_schema_65_to_66(connection)
@@ -642,6 +658,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 64:
                 _migrate_schema_64_to_65(connection)
@@ -650,6 +667,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 63:
                 _migrate_schema_63_to_64(connection)
@@ -659,6 +677,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 62:
                 _migrate_schema_62_to_63(connection)
@@ -669,6 +688,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 61:
                 _migrate_schema_61_to_62(connection)
@@ -680,6 +700,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             else:
                 raise RuntimeError(
@@ -1623,6 +1644,61 @@ def _migrate_schema_69_to_70(connection: sqlite3.Connection) -> None:
         "TEXT NOT NULL DEFAULT 'unclassified'",
     )
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (70)")
+
+
+def _migrate_schema_70_to_71(connection: sqlite3.Connection) -> None:
+    _add_column_if_missing(
+        connection,
+        "scene_snapshots",
+        "scene_generation",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+    for column_name, definition in (
+        ("scene_snapshot_id", "TEXT REFERENCES scene_snapshots(id)"),
+        ("scene_generation", "INTEGER"),
+        ("created_turn_number", "INTEGER"),
+        ("expires_after_turn_number", "INTEGER"),
+    ):
+        _add_column_if_missing(connection, "context_sources", column_name, definition)
+    _add_column_if_missing(
+        connection,
+        "memories",
+        "claim_fingerprint",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column_if_missing(
+        connection,
+        "memories",
+        "source_observation_ids_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    if _table_exists(connection, "memories"):
+        rows = connection.execute(
+            "SELECT id, body FROM memories WHERE claim_fingerprint = ''"
+        ).fetchall()
+        for memory_id, body in rows:
+            connection.execute(
+                "UPDATE memories SET claim_fingerprint = ? WHERE id = ?",
+                (_migration_claim_fingerprint(body), memory_id),
+            )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_memories_save_claim_fingerprint_active
+            ON memories(save_id, claim_fingerprint)
+            WHERE archived_at IS NULL AND claim_fingerprint != ''
+            """
+        )
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (71)")
+
+
+def _migration_claim_fingerprint(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value)).casefold()
+    canonical = "".join(
+        character if character.isalnum() else " "
+        for character in text
+    )
+    canonical = " ".join(canonical.split())
+    return sha256(canonical.encode("utf-8")).hexdigest() if canonical else ""
 
 
 def _remove_retired_model_preferences(connection: sqlite3.Connection) -> None:

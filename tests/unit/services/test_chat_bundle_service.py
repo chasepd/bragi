@@ -1797,6 +1797,72 @@ def test_import_save_remaps_observation_context_source_metadata_id(
     assert imported_source.metadata["observation_id"] == imported_observation.id
 
 
+def test_import_save_preserves_memory_and_scene_scratch_provenance(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    [memory] = repositories.list_memories(save.id)
+    repositories.update_memory(
+        memory_id=memory.id,
+        body=memory.body,
+        tags=memory.tags,
+        importance=memory.importance,
+        source_message_ids=memory.source_message_ids,
+        source_observation_ids=[OBSERVATION_ID],
+        claim_fingerprint="mara-knows-eastern-signal-code",
+    )
+    location = repositories.add_location(
+        save_id=save.id,
+        name="Beacon gallery",
+        source_message_id=NARRATOR_MESSAGE_ID,
+    )
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=location.id,
+        situation="The lens is still warm.",
+        source_message_id=NARRATOR_MESSAGE_ID,
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="observation",
+        source_id=OBSERVATION_ID,
+        title="Warm lens",
+        body="The beacon lens remains warm.",
+        metadata={
+            "observation_id": OBSERVATION_ID,
+            "curation_action": "scene_scratch",
+        },
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=1,
+        expires_after_turn_number=13,
+    )
+    bundle_path = tmp_path / "exports" / "night-watch-scratch.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+    imported_save_id = _imported_save_id(imported)
+
+    [imported_observation] = repositories.list_context_observations(imported_save_id)
+    [imported_memory] = repositories.list_memories(imported_save_id)
+    [imported_scratch] = repositories.list_context_sources(
+        imported_save_id,
+        source_type="observation",
+    )
+    imported_scene = repositories.get_scene_snapshot(imported_save_id)
+    assert imported_scene is not None
+    assert imported_memory.claim_fingerprint == "mara-knows-eastern-signal-code"
+    assert imported_memory.source_observation_ids == [imported_observation.id]
+    assert imported_scratch.source_id == imported_observation.id
+    assert imported_scratch.scene_snapshot_id == imported_scene.id
+    assert imported_scratch.scene_generation == scene.scene_generation
+    assert imported_scratch.created_turn_number == 1
+    assert imported_scratch.expires_after_turn_number == 13
+
+
 def test_import_save_ignores_historical_job_diagnostics(
     repositories: PersistenceRepositories,
     tmp_path: Path,

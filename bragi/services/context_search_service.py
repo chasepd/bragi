@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import unicodedata
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -54,6 +55,7 @@ from bragi.services.knowledge_boundary import (
     message_visible_to_present_characters,
     scoped_owner_name,
 )
+from bragi.services.mention_matching import character_name_is_mentioned
 from bragi.services.model_capabilities import (
     MODEL_LACKS_CAPABILITY_REASON,
     MODEL_MISSING_REASON,
@@ -290,6 +292,10 @@ class ContextSearchService:
                 self.repositories,
                 save_id=save_id,
                 latest_player_message="",
+                scene_snapshot=snapshot.scene_snapshot,
+                characters=list(snapshot.characters),
+                character_knowledge_edges=list(snapshot.character_knowledge_edges),
+                entity_links=list(snapshot.entity_links),
             )
             candidates = _next_turn_context_candidates(
                 scenario=snapshot.details.scenario,
@@ -461,10 +467,21 @@ class ContextSearchService:
                 )
                 if narration_snapshot is None:
                     raise ValueError(f"Unknown save id: {save_id}")
-                retrieved_sources = _indexed_context_source_retrieval(
+                retrieved_sources = await _retrieve_indexed_context_sources(
                     self.repositories,
+                    provider=provider,
+                    provider_name=preference.provider,
+                    model_id=preference.model_id,
                     save_id=save_id,
                     latest_player_message=player_message,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    characters=list(narration_snapshot.characters),
+                    character_knowledge_edges=list(
+                        narration_snapshot.character_knowledge_edges
+                    ),
+                    entity_links=list(narration_snapshot.entity_links),
+                    recent_messages=messages,
+                    message_visibility=list(narration_snapshot.message_visibility),
                 )
                 candidate_set = _context_candidate_set(
                     scenario=scenario,
@@ -505,10 +522,21 @@ class ContextSearchService:
                     ),
                 )
                 narration_snapshot = snapshot
-                retrieved_sources = _indexed_context_source_retrieval(
+                retrieved_sources = await _retrieve_indexed_context_sources(
                     self.repositories,
+                    provider=provider,
+                    provider_name=preference.provider,
+                    model_id=preference.model_id,
                     save_id=save_id,
                     latest_player_message=player_message,
+                    scene_snapshot=snapshot.scene_snapshot,
+                    characters=list(snapshot.characters),
+                    character_knowledge_edges=list(
+                        snapshot.character_knowledge_edges
+                    ),
+                    entity_links=list(snapshot.entity_links),
+                    recent_messages=messages,
+                    message_visibility=list(snapshot.message_visibility),
                 )
                 candidate_set = _context_candidate_set(
                     scenario=scenario,
@@ -883,18 +911,91 @@ def _indexed_context_source_retrieval(
     *,
     save_id: str,
     latest_player_message: str,
+    scene_snapshot: SceneSnapshotRecord | None,
+    characters: list[CharacterRecord],
+    character_knowledge_edges: list[CharacterKnowledgeEdgeRecord],
+    entity_links: list[EntityLinkRecord],
+    additional_query_terms: tuple[str, ...] = (),
 ) -> _IndexedContextSourceRetrieval:
     started_at = perf_counter()
-    query_terms = sorted(_meaningful_terms(latest_player_message))
+    query_terms = sorted(
+        _meaningful_terms(
+            " ".join((latest_player_message, *additional_query_terms))
+        )
+    )
+    turn_scope = character_scope_for_turn(
+        scene_snapshot=scene_snapshot,
+        characters=characters,
+        latest_player_message=latest_player_message,
+    )
+    scoped_targets = allowed_character_scoped_targets(
+        scene_snapshot=scene_snapshot,
+        characters=characters,
+        character_knowledge_edges=character_knowledge_edges,
+        entity_links=entity_links,
+        latest_player_message=latest_player_message,
+    )
+    allowed_owner_names = {
+        scoped_owner_name(owner)
+        for owner in scoped_targets.allowed.values()
+    }
+    current_turn_number = repositories.count_active_messages_by_role(
+        save_id,
+        roles=("narrator",),
+    )["narrator"]
+    reference_character_ids = set(turn_scope.reference_character_ids)
+    current_scene_snapshot_id = (
+        scene_snapshot.id if scene_snapshot is not None else None
+    )
+    current_scene_generation = (
+        scene_snapshot.scene_generation if scene_snapshot is not None else None
+    )
+    repositories.archive_stale_scene_scratch(
+        save_id=save_id,
+        current_scene_snapshot_id=current_scene_snapshot_id,
+        current_scene_generation=current_scene_generation,
+        current_turn_number=current_turn_number,
+    )
     protected = repositories.list_protected_context_sources(
         save_id,
         limit=PROTECTED_CONTEXT_SOURCE_LIMIT,
+        allowed_owner_names=allowed_owner_names,
+        reference_character_ids=reference_character_ids,
+        current_scene_snapshot_id=current_scene_snapshot_id,
+        current_scene_generation=current_scene_generation,
+        current_turn_number=current_turn_number,
+        blocked_source_keys=scoped_targets.blocked,
     )
-    hits = repositories.search_context_sources(
+    exact_hits = repositories.search_context_sources(
+        save_id,
+        query_terms=query_terms,
+        source_types=INDEXED_CONTEXT_SOURCE_TYPES,
+        limit=min(24, INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT),
+        allowed_owner_names=allowed_owner_names,
+        reference_character_ids=reference_character_ids,
+        current_scene_snapshot_id=current_scene_snapshot_id,
+        current_scene_generation=current_scene_generation,
+        current_turn_number=current_turn_number,
+        blocked_source_keys=scoped_targets.blocked,
+        match_all=True,
+    )
+    broad_hits = repositories.search_context_sources(
         save_id,
         query_terms=query_terms,
         source_types=INDEXED_CONTEXT_SOURCE_TYPES,
         limit=INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT,
+        allowed_owner_names=allowed_owner_names,
+        reference_character_ids=reference_character_ids,
+        current_scene_snapshot_id=current_scene_snapshot_id,
+        current_scene_generation=current_scene_generation,
+        current_turn_number=current_turn_number,
+        blocked_source_keys=scoped_targets.blocked,
+    )
+    hits = tuple(
+        {
+            hit.record.id: hit
+            for hit in (*exact_hits, *broad_hits)
+        }.values()
     )
     records: list[ContextSourceRecord] = []
     seen_ids: set[str] = set()
@@ -908,6 +1009,20 @@ def _indexed_context_source_retrieval(
             continue
         seen_ids.add(hit.record.id)
         records.append(hit.record)
+    for record in repositories.list_curated_observation_source_markers(save_id):
+        if (
+            record.id in seen_ids
+            or record.metadata.get("curation_action")
+            not in {"save_context", "scene_scratch"}
+        ):
+            continue
+        seen_ids.add(record.id)
+        records.append(
+            replace(
+                record,
+                metadata={**record.metadata, "suppression_only": True},
+            )
+        )
     return _IndexedContextSourceRetrieval(
         records=tuple(records),
         diagnostics={
@@ -918,6 +1033,188 @@ def _indexed_context_source_retrieval(
             "indexed_retrieval_duration_ms": _elapsed_ms(started_at),
             "first_pass_source_type_counts": _context_source_type_counts(records),
         },
+    )
+
+
+async def _retrieve_indexed_context_sources(
+    repositories: PersistenceRepositories,
+    *,
+    provider: ProviderClient,
+    provider_name: str,
+    model_id: str,
+    save_id: str,
+    latest_player_message: str,
+    scene_snapshot: SceneSnapshotRecord | None,
+    characters: list[CharacterRecord],
+    character_knowledge_edges: list[CharacterKnowledgeEdgeRecord],
+    entity_links: list[EntityLinkRecord],
+    recent_messages: list[MessageRecord],
+    message_visibility: list[MessageVisibilityRecord],
+) -> _IndexedContextSourceRetrieval:
+    initial = _indexed_context_source_retrieval(
+        repositories,
+        save_id=save_id,
+        latest_player_message=latest_player_message,
+        scene_snapshot=scene_snapshot,
+        characters=characters,
+        character_knowledge_edges=character_knowledge_edges,
+        entity_links=entity_links,
+    )
+    initial_hit_count = initial.diagnostics.get("indexed_retrieval_hit_count")
+    if (
+        not latest_player_message.strip()
+        or (
+            isinstance(initial_hit_count, int | float)
+            and initial_hit_count > 0
+        )
+        or not isinstance(provider, StructuredOutputProvider)
+    ):
+        return initial
+    expanded_terms = await _structured_retrieval_expansion(
+        provider=provider,
+        provider_name=provider_name,
+        model_id=model_id,
+        latest_player_message=latest_player_message,
+        scene_snapshot=scene_snapshot,
+        characters=characters,
+        recent_messages=recent_messages,
+        message_visibility=message_visibility,
+    )
+    if not expanded_terms:
+        return initial
+    expanded = _indexed_context_source_retrieval(
+        repositories,
+        save_id=save_id,
+        latest_player_message=latest_player_message,
+        scene_snapshot=scene_snapshot,
+        characters=characters,
+        character_knowledge_edges=character_knowledge_edges,
+        entity_links=entity_links,
+        additional_query_terms=expanded_terms,
+    )
+    return replace(
+        expanded,
+        diagnostics={
+            **expanded.diagnostics,
+            "retrieval_expansion_used": True,
+            "retrieval_expansion_term_count": len(expanded_terms),
+        },
+    )
+
+
+async def _structured_retrieval_expansion(
+    *,
+    provider: StructuredOutputProvider,
+    provider_name: str,
+    model_id: str,
+    latest_player_message: str,
+    scene_snapshot: SceneSnapshotRecord | None,
+    characters: list[CharacterRecord],
+    recent_messages: list[MessageRecord],
+    message_visibility: list[MessageVisibilityRecord],
+) -> tuple[str, ...]:
+    present_ids = frozenset(
+        scene_snapshot.present_character_ids if scene_snapshot is not None else ()
+    )
+    visible_recent = [
+        message
+        for message in recent_messages
+        if message_visible_to_present_characters(
+            message_id=message.id,
+            present_character_ids=present_ids,
+            message_visibility=message_visibility,
+        )
+    ][-6:]
+    eligible_characters = [
+        character
+        for character in characters
+        if character.id in present_ids
+        or character_name_is_mentioned(
+            name=character.name,
+            aliases=character.aliases,
+            text=" ".join(message.body for message in visible_recent),
+        )
+    ]
+    entity_ids = [character.id for character in eligible_characters]
+    schema: dict[str, object] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "terms": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {"type": "string"},
+            },
+            "phrases": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {"type": "string"},
+            },
+            "entity_ids": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {"type": "string", "enum": entity_ids},
+            },
+        },
+        "required": ["terms", "phrases", "entity_ids"],
+    }
+    entity_text = "\n".join(
+        f"- {character.id}: {character.name}; aliases={', '.join(character.aliases)}"
+        for character in eligible_characters
+    ) or "none"
+    recent_text = "\n".join(
+        f"- {message.speaker_name or message.role}: {message.body}"
+        for message in visible_recent
+    )
+    request = StructuredOutputRequest(
+        provider=provider_name,
+        model_id=model_id,
+        schema_name="context_retrieval_expansion",
+        schema=schema,
+        messages=(
+            ChatMessage(
+                role="system",
+                body=(
+                    "Expand the player's continuity query with short synonymous "
+                    "terms, phrases, and visible entity references. Use only the "
+                    "provided entity IDs and enforced schema."
+                ),
+            ),
+            ChatMessage(
+                role="user",
+                body=(
+                    f"Player query:\n{latest_player_message}\n\n"
+                    f"Visible entities:\n{entity_text}\n\n"
+                    f"Visible recent context:\n{recent_text}"
+                ),
+            ),
+        ),
+        temperature=0.0,
+    )
+    try:
+        response = await provider.generate_structured_output(request)
+    except (ProviderError, ValueError, KeyError, TypeError):
+        return ()
+    data = response.data
+    terms = _string_values(data.get("terms"), limit=12)
+    phrases = _string_values(data.get("phrases"), limit=6)
+    selected_ids = set(_string_values(data.get("entity_ids"), limit=8))
+    entity_terms = tuple(
+        value
+        for character in eligible_characters
+        if character.id in selected_ids
+        for value in (character.name, *character.aliases)
+    )
+    return tuple(dict.fromkeys((*terms, *phrases, *entity_terms)))
+
+
+def _string_values(value: object, *, limit: int) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        text
+        for item in value[:limit]
+        if (text := str(item).strip())
     )
 
 
@@ -2705,6 +3002,8 @@ def _indexed_context_candidates(
 ) -> tuple[_ContextCandidate, ...]:
     candidates: list[_ContextCandidate] = []
     for record in records:
+        if record.metadata.get("suppression_only") is True:
+            continue
         source_type = _indexed_candidate_source_type(
             record,
             accepted_observation_ids=accepted_observation_ids,
@@ -2916,10 +3215,31 @@ def _narrow_context_candidates(
             item[0],
         ),
     )
-    selected = sorted(
-        ranked[:MAX_CONTEXT_CANDIDATE_POOL],
-        key=lambda item: item[0],
-    )
+    selected_indexes: set[int] = set()
+    selected_type_counts: Counter[str] = Counter()
+    for source_type in dict.fromkeys(
+        candidate.source_type for candidate in candidates
+    ):
+        reserved = [
+            item for item in ranked if item[1].source_type == source_type
+        ][:4]
+        for index, candidate in reserved:
+            selected_indexes.add(index)
+            selected_type_counts[candidate.source_type] += 1
+    for index, candidate in ranked:
+        if len(selected_indexes) >= MAX_CONTEXT_CANDIDATE_POOL:
+            break
+        if index in selected_indexes:
+            continue
+        if selected_type_counts[candidate.source_type] >= 24:
+            continue
+        selected_indexes.add(index)
+        selected_type_counts[candidate.source_type] += 1
+    selected = [
+        (index, candidate)
+        for index, candidate in enumerate(candidates)
+        if index in selected_indexes
+    ]
     return tuple(candidate for _index, candidate in selected)
 
 
@@ -2958,10 +3278,23 @@ def _candidate_rank(
 
 
 def _meaningful_terms(text: str) -> set[str]:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    terms: list[str] = []
+    current: list[str] = []
+    for character in normalized:
+        if character.isalnum() or (character in {"'", "’"} and current):
+            current.append("'" if character == "’" else character)
+            continue
+        if current:
+            terms.append("".join(current).strip("'"))
+            current = []
+    if current:
+        terms.append("".join(current).strip("'"))
     return {
         term
-        for term in re.findall(r"[a-z0-9']{3,}", text.casefold())
-        if term
+        for term in terms
+        if len(term) >= 2
+        and term
         not in {
             "and",
             "for",

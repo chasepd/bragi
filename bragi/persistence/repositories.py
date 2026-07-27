@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import sqlite3
+import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -2977,6 +2977,10 @@ class PersistenceRepositories:
         metadata: dict[str, object] | None = None,
         token_estimate: int | None = None,
         context_source_id: str | None = None,
+        scene_snapshot_id: str | None = None,
+        scene_generation: int | None = None,
+        created_turn_number: int | None = None,
+        expires_after_turn_number: int | None = None,
     ) -> ContextSourceRecord:
         existing = self._fetch_one(
             """
@@ -2995,19 +2999,28 @@ class PersistenceRepositories:
             body=body,
             metadata=dict(metadata or {}),
             token_estimate=token_estimate,
+            scene_snapshot_id=scene_snapshot_id,
+            scene_generation=scene_generation,
+            created_turn_number=created_turn_number,
+            expires_after_turn_number=expires_after_turn_number,
         )
         self.connection.execute(
             """
             INSERT INTO context_sources(
                 id, save_id, source_type, source_id, title, body, metadata_json,
-                token_estimate
+                token_estimate, scene_snapshot_id, scene_generation,
+                created_turn_number, expires_after_turn_number
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(save_id, source_type, source_id) DO UPDATE SET
                 title = excluded.title,
                 body = excluded.body,
                 metadata_json = excluded.metadata_json,
                 token_estimate = excluded.token_estimate,
+                scene_snapshot_id = excluded.scene_snapshot_id,
+                scene_generation = excluded.scene_generation,
+                created_turn_number = excluded.created_turn_number,
+                expires_after_turn_number = excluded.expires_after_turn_number,
                 updated_at = CURRENT_TIMESTAMP,
                 archived_at = NULL
             """,
@@ -3020,6 +3033,10 @@ class PersistenceRepositories:
                 record.body,
                 _dump_json(record.metadata),
                 record.token_estimate,
+                record.scene_snapshot_id,
+                record.scene_generation,
+                record.created_turn_number,
+                record.expires_after_turn_number,
             ),
         )
         self.commit()
@@ -3029,7 +3046,8 @@ class PersistenceRepositories:
         row = self._fetch_one(
             """
             SELECT id, save_id, source_type, source_id, title, body, metadata_json,
-                   token_estimate
+                   token_estimate, scene_snapshot_id, scene_generation,
+                   created_turn_number, expires_after_turn_number
             FROM context_sources
             WHERE id = ? AND archived_at IS NULL
             """,
@@ -3050,12 +3068,38 @@ class PersistenceRepositories:
         rows = self._fetch_all(
             f"""
             SELECT id, save_id, source_type, source_id, title, body, metadata_json,
-                   token_estimate
+                   token_estimate, scene_snapshot_id, scene_generation,
+                   created_turn_number, expires_after_turn_number
             FROM context_sources
             WHERE save_id = ? AND archived_at IS NULL {type_filter}
             ORDER BY source_type, title, created_at, rowid
             """,
             params,
+        )
+        return [_context_source_from_row(row) for row in rows]
+
+    def list_curated_observation_source_markers(
+        self,
+        save_id: str,
+    ) -> list[ContextSourceRecord]:
+        rows = self._fetch_all(
+            """
+            SELECT id, save_id, source_type, source_id, title, body, metadata_json,
+                   token_estimate, scene_snapshot_id, scene_generation,
+                   created_turn_number, expires_after_turn_number
+            FROM context_sources
+            WHERE save_id = ?
+              AND source_type = 'observation'
+              AND json_extract(metadata_json, '$.curation_action')
+                  IN ('save_context', 'scene_scratch')
+              AND (
+                    archived_at IS NULL
+                    OR json_extract(metadata_json, '$.curation_action')
+                       = 'scene_scratch'
+                  )
+            ORDER BY created_at, rowid
+            """,
+            (save_id,),
         )
         return [_context_source_from_row(row) for row in rows]
 
@@ -3066,15 +3110,32 @@ class PersistenceRepositories:
         query_terms: set[str] | frozenset[str] | list[str] | tuple[str, ...],
         source_types: set[str] | frozenset[str] | list[str] | tuple[str, ...],
         limit: int,
+        allowed_owner_names: set[str] | frozenset[str] | None = None,
+        reference_character_ids: set[str] | frozenset[str] | None = None,
+        current_scene_snapshot_id: str | None = None,
+        current_scene_generation: int | None = None,
+        current_turn_number: int | None = None,
+        blocked_source_keys: set[tuple[str, str]] | frozenset[tuple[str, str]]
+        | None = None,
+        match_all: bool = False,
     ) -> list[ContextSourceSearchHit]:
         if limit <= 0:
             return []
-        match_query = _fts_query_from_terms(query_terms)
+        match_query = _fts_query_from_terms(query_terms, match_all=match_all)
         if not match_query:
             return []
         source_type_values = tuple(dict.fromkeys(str(item) for item in source_types))
         if not source_type_values:
             return []
+        eligibility_sql, eligibility_params = _context_source_eligibility_sql(
+            alias="context_sources",
+            allowed_owner_names=allowed_owner_names,
+            reference_character_ids=reference_character_ids,
+            current_scene_snapshot_id=current_scene_snapshot_id,
+            current_scene_generation=current_scene_generation,
+            current_turn_number=current_turn_number,
+            blocked_source_keys=blocked_source_keys,
+        )
         rows = self._fetch_all(
             f"""
             SELECT
@@ -3086,6 +3147,10 @@ class PersistenceRepositories:
                 context_sources.body,
                 context_sources.metadata_json,
                 context_sources.token_estimate,
+                context_sources.scene_snapshot_id,
+                context_sources.scene_generation,
+                context_sources.created_turn_number,
+                context_sources.expires_after_turn_number,
                 bm25(context_source_fts, 1.2, 1.0) AS bm25_rank
             FROM context_source_fts
             JOIN context_sources
@@ -3096,6 +3161,7 @@ class PersistenceRepositories:
               AND context_sources.source_type IN (
                   {_placeholders(len(source_type_values))}
               )
+              {eligibility_sql}
             ORDER BY bm25_rank, context_sources.created_at DESC,
                      context_sources.rowid DESC
             LIMIT ?
@@ -3104,6 +3170,7 @@ class PersistenceRepositories:
                 match_query,
                 save_id,
                 *source_type_values,
+                *eligibility_params,
                 limit,
             ),
         )
@@ -3120,13 +3187,30 @@ class PersistenceRepositories:
         save_id: str,
         *,
         limit: int,
+        allowed_owner_names: set[str] | frozenset[str] | None = None,
+        reference_character_ids: set[str] | frozenset[str] | None = None,
+        current_scene_snapshot_id: str | None = None,
+        current_scene_generation: int | None = None,
+        current_turn_number: int | None = None,
+        blocked_source_keys: set[tuple[str, str]] | frozenset[tuple[str, str]]
+        | None = None,
     ) -> list[ContextSourceRecord]:
         if limit <= 0:
             return []
+        eligibility_sql, eligibility_params = _context_source_eligibility_sql(
+            alias="context_sources",
+            allowed_owner_names=allowed_owner_names,
+            reference_character_ids=reference_character_ids,
+            current_scene_snapshot_id=current_scene_snapshot_id,
+            current_scene_generation=current_scene_generation,
+            current_turn_number=current_turn_number,
+            blocked_source_keys=blocked_source_keys,
+        )
         rows = self._fetch_all(
-            """
+            f"""
             SELECT id, save_id, source_type, source_id, title, body,
-                   metadata_json, token_estimate
+                   metadata_json, token_estimate, scene_snapshot_id,
+                   scene_generation, created_turn_number, expires_after_turn_number
             FROM context_sources
             WHERE save_id = ?
               AND archived_at IS NULL
@@ -3140,6 +3224,7 @@ class PersistenceRepositories:
                             IN ('save_context', 'scene_scratch')
                     )
                   )
+              {eligibility_sql}
             ORDER BY
                 CASE
                     WHEN source_type = 'open_obligation' THEN 0
@@ -3153,7 +3238,7 @@ class PersistenceRepositories:
                 rowid DESC
             LIMIT ?
             """,
-            (save_id, limit),
+            (save_id, *eligibility_params, limit),
         )
         return [_context_source_from_row(row) for row in rows]
 
@@ -3167,6 +3252,63 @@ class PersistenceRepositories:
             (context_source_id,),
         )
         self.commit()
+
+    def archive_stale_scene_scratch(
+        self,
+        *,
+        save_id: str,
+        current_scene_snapshot_id: str | None,
+        current_scene_generation: int | None,
+        current_turn_number: int,
+    ) -> frozenset[str]:
+        if current_scene_snapshot_id is None or current_scene_generation is None:
+            stale_clause = "1"
+            params: tuple[object, ...] = (save_id,)
+        else:
+            stale_clause = """
+                (
+                    scene_snapshot_id IS NULL
+                    OR scene_snapshot_id != ?
+                    OR scene_generation IS NULL
+                    OR scene_generation != ?
+                    OR (
+                        expires_after_turn_number IS NOT NULL
+                        AND expires_after_turn_number <= ?
+                    )
+                )
+            """
+            params = (
+                save_id,
+                current_scene_snapshot_id,
+                current_scene_generation,
+                current_turn_number,
+            )
+        rows = self._fetch_all(
+            f"""
+            SELECT id
+            FROM context_sources
+            WHERE save_id = ?
+              AND archived_at IS NULL
+              AND source_type = 'observation'
+              AND json_extract(metadata_json, '$.curation_action')
+                  = 'scene_scratch'
+              AND {stale_clause}
+            """,
+            params,
+        )
+        stale_ids = frozenset(str(row["id"]) for row in rows)
+        if not stale_ids:
+            return stale_ids
+        self.connection.execute(
+            f"""
+            UPDATE context_sources
+            SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE id IN ({_placeholders(len(stale_ids))})
+            """,
+            tuple(stale_ids),
+        )
+        self.commit()
+        return stale_ids
 
     def restore_context_sources(
         self,
@@ -3382,7 +3524,7 @@ class PersistenceRepositories:
                    weather, mood,
                    nearby_objects_json, hazards_json,
                    present_character_ids_json, source_message_id, locked_fields_json,
-                   first_seen_message_id, last_updated_message_id
+                   first_seen_message_id, last_updated_message_id, scene_generation
             FROM scene_snapshots
             WHERE save_id = ?
             """,
@@ -3451,7 +3593,7 @@ class PersistenceRepositories:
         )
         existing = self._fetch_one(
             """
-            SELECT id, first_seen_message_id,
+            SELECT id, first_seen_message_id, current_location_id, scene_generation,
                    in_world_time, time_of_day, day_of_week, world_day_index,
                    world_time_day_index, world_time_day_label,
                    world_time_phase, world_time_clock_minutes,
@@ -3474,6 +3616,11 @@ class PersistenceRepositories:
             if last_updated_message_id is not None
             else source_message_id
         )
+        scene_generation = 1
+        if existing is not None:
+            scene_generation = int(existing["scene_generation"])
+            if existing["current_location_id"] != current_location_id:
+                scene_generation += 1
         provided_legacy_values = {
             "in_world_time": in_world_time,
             "time_of_day": time_of_day,
@@ -3711,6 +3858,7 @@ class PersistenceRepositories:
             locked_fields=list(locked_fields or []),
             first_seen_message_id=first_seen,
             last_updated_message_id=last_updated,
+            scene_generation=scene_generation,
         )
         self.connection.execute(
             """
@@ -3723,11 +3871,11 @@ class PersistenceRepositories:
                 weather, mood,
                 nearby_objects_json, hazards_json,
                 present_character_ids_json, source_message_id, locked_fields_json,
-                first_seen_message_id, last_updated_message_id
+                first_seen_message_id, last_updated_message_id, scene_generation
             )
             VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             ON CONFLICT(save_id) DO UPDATE SET
                 current_location_id = excluded.current_location_id,
@@ -3756,6 +3904,7 @@ class PersistenceRepositories:
                     excluded.first_seen_message_id
                 ),
                 last_updated_message_id = excluded.last_updated_message_id,
+                scene_generation = excluded.scene_generation,
                 updated_at = CURRENT_TIMESTAMP
             """,
             (
@@ -3784,8 +3933,28 @@ class PersistenceRepositories:
                 _dump_json(record.locked_fields),
                 record.first_seen_message_id,
                 record.last_updated_message_id,
+                record.scene_generation,
             ),
         )
+        if (
+            existing is not None
+            and scene_generation != int(existing["scene_generation"])
+        ):
+            self.connection.execute(
+                """
+                UPDATE context_sources
+                SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE save_id = ?
+                  AND archived_at IS NULL
+                  AND json_extract(metadata_json, '$.curation_action')
+                      = 'scene_scratch'
+                  AND (
+                        scene_snapshot_id IS NOT ?
+                        OR scene_generation IS NOT ?
+                      )
+                """,
+                (save_id, record.id, record.scene_generation),
+            )
         self.commit()
         saved = self.get_scene_snapshot(save_id)
         if saved is None:
@@ -7429,6 +7598,44 @@ class PersistenceRepositories:
             raise ValueError(f"Unknown context update suggestion id: {suggestion_id}")
         return _context_update_suggestion_from_row(row)
 
+    def update_context_update_suggestion_content(
+        self,
+        suggestion_id: str,
+        *,
+        proposed_value: object,
+        confidence: float,
+        source_message_ids: list[str] | tuple[str, ...],
+    ) -> ContextUpdateSuggestionRecord:
+        self.connection.execute(
+            """
+            UPDATE context_update_suggestions
+            SET proposed_value_json = ?, confidence = ?,
+                source_message_ids_json = ?
+            WHERE id = ?
+            """,
+            (
+                _dump_json(proposed_value),
+                confidence,
+                _dump_json(_unique_strings(source_message_ids)),
+                suggestion_id,
+            ),
+        )
+        self.commit()
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, update_type, entity_type, entity_id, field_path,
+                   proposed_value_json, status, reason, confidence,
+                   source_message_ids_json, created_at, resolved_at,
+                   review_attempt_count, next_review_at, last_review_error
+            FROM context_update_suggestions
+            WHERE id = ?
+            """,
+            (suggestion_id,),
+        )
+        if row is None:
+            raise ValueError(f"Unknown context update suggestion id: {suggestion_id}")
+        return _context_update_suggestion_from_row(row)
+
     def update_context_update_suggestion_statuses(
         self,
         suggestion_ids: list[str] | tuple[str, ...],
@@ -7675,6 +7882,8 @@ class PersistenceRepositories:
         source_message_id: str | None = None,
         source_message_ids: list[str] | tuple[str, ...] | None = None,
         memory_id: str | None = None,
+        claim_fingerprint: str | None = None,
+        source_observation_ids: list[str] | tuple[str, ...] | None = None,
     ) -> MemoryRecord:
         resolved_source_message_ids = _memory_source_message_ids(
             source_message_id=source_message_id,
@@ -7688,14 +7897,21 @@ class PersistenceRepositories:
             importance=importance,
             source_message_id=source_message_id,
             source_message_ids=resolved_source_message_ids,
+            claim_fingerprint=(
+                claim_fingerprint
+                if claim_fingerprint is not None
+                else canonical_claim_fingerprint(body)
+            ),
+            source_observation_ids=_unique_strings(source_observation_ids or ()),
         )
         self.connection.execute(
             """
             INSERT INTO memories(
                 id, save_id, body, tags_json, importance, source_message_id,
-                source_message_ids_json
+                source_message_ids_json, claim_fingerprint,
+                source_observation_ids_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -7705,6 +7921,8 @@ class PersistenceRepositories:
                 record.importance,
                 record.source_message_id,
                 _dump_json(record.source_message_ids),
+                record.claim_fingerprint,
+                _dump_json(record.source_observation_ids),
             ),
         )
         self.commit()
@@ -7718,11 +7936,14 @@ class PersistenceRepositories:
         tags: list[str],
         importance: float,
         source_message_ids: list[str] | tuple[str, ...] | None = None,
+        source_observation_ids: list[str] | tuple[str, ...] | None = None,
+        claim_fingerprint: str | None = None,
         clear_source: bool = False,
     ) -> MemoryRecord:
         current = self._fetch_one(
             """
-            SELECT source_message_id, source_message_ids_json
+            SELECT source_message_id, source_message_ids_json,
+                   source_observation_ids_json, claim_fingerprint
             FROM memories
             WHERE id = ?
             """,
@@ -7743,11 +7964,26 @@ class PersistenceRepositories:
                 ),
             )
         )
+        resolved_observation_ids = (
+            []
+            if clear_source
+            else _unique_strings(
+                _load_list(current["source_observation_ids_json"])
+                if source_observation_ids is None
+                else source_observation_ids
+            )
+        )
+        resolved_fingerprint = (
+            claim_fingerprint
+            if claim_fingerprint is not None
+            else canonical_claim_fingerprint(body)
+        )
         self.connection.execute(
             """
             UPDATE memories
             SET body = ?, tags_json = ?, importance = ?, source_message_id = ?,
                 source_message_ids_json = ?,
+                claim_fingerprint = ?, source_observation_ids_json = ?,
                 updated_at = CURRENT_TIMESTAMP, archived_at = NULL
             WHERE id = ?
             """,
@@ -7757,6 +7993,8 @@ class PersistenceRepositories:
                 importance,
                 source_message_id,
                 _dump_json(resolved_source_message_ids),
+                resolved_fingerprint,
+                _dump_json(resolved_observation_ids),
                 memory_id,
             ),
         )
@@ -7764,7 +8002,8 @@ class PersistenceRepositories:
         row = self._fetch_one(
             """
             SELECT id, save_id, body, tags_json, importance, source_message_id,
-                   source_message_ids_json
+                   source_message_ids_json, claim_fingerprint,
+                   source_observation_ids_json
             FROM memories
             WHERE id = ?
             """,
@@ -7783,6 +8022,8 @@ class PersistenceRepositories:
                 source_message_id=row["source_message_id"],
                 source_message_ids=_load_list(row["source_message_ids_json"]),
             ),
+            claim_fingerprint=row["claim_fingerprint"],
+            source_observation_ids=_load_list(row["source_observation_ids_json"]),
         )
 
     def archive_memory(self, memory_id: str) -> None:
@@ -7813,7 +8054,8 @@ class PersistenceRepositories:
         rows = self._fetch_all(
             """
             SELECT id, save_id, body, tags_json, importance, source_message_id,
-                   source_message_ids_json
+                   source_message_ids_json, claim_fingerprint,
+                   source_observation_ids_json
             FROM memories
             WHERE save_id = ? AND archived_at IS NULL
             ORDER BY created_at, rowid
@@ -7831,6 +8073,10 @@ class PersistenceRepositories:
                 source_message_ids=_memory_source_message_ids(
                     source_message_id=row["source_message_id"],
                     source_message_ids=_load_list(row["source_message_ids_json"]),
+                ),
+                claim_fingerprint=row["claim_fingerprint"],
+                source_observation_ids=_load_list(
+                    row["source_observation_ids_json"]
                 ),
             )
             for row in rows
@@ -10103,6 +10349,16 @@ def _new_id() -> str:
     return uuid4().hex
 
 
+def canonical_claim_fingerprint(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value)).casefold()
+    canonical = "".join(
+        character if character.isalnum() else " "
+        for character in text
+    )
+    canonical = " ".join(canonical.split())
+    return sha256(canonical.encode("utf-8")).hexdigest() if canonical else ""
+
+
 def _transaction_savepoint_name(depth: int) -> str:
     return f"bragi_tx_{depth}"
 
@@ -10132,10 +10388,12 @@ def _placeholders(count: int) -> str:
 
 def _fts_query_from_terms(
     terms: set[str] | frozenset[str] | list[str] | tuple[str, ...],
+    *,
+    match_all: bool = False,
 ) -> str:
     normalized: list[str] = []
     for value in terms:
-        for term in re.findall(r"[A-Za-z0-9']{3,}", str(value).casefold()):
+        for term in _unicode_search_terms(str(value)):
             normalized.append(term)
             if term.endswith("'s") and len(term) > 3:
                 normalized.append(term[:-2])
@@ -10144,7 +10402,111 @@ def _fts_query_from_terms(
     for term in unique_terms:
         escaped = term.replace('"', '""')
         quoted_terms.append(f'"{escaped}"*')
-    return " OR ".join(quoted_terms)
+    return (" AND " if match_all else " OR ").join(quoted_terms)
+
+
+def _unicode_search_terms(value: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    terms: list[str] = []
+    current: list[str] = []
+    for character in normalized:
+        if character.isalnum() or (character in {"'", "’"} and current):
+            current.append("'" if character == "’" else character)
+            continue
+        if current:
+            term = "".join(current).strip("'")
+            if len(term) >= 2:
+                terms.append(term)
+            current = []
+    if current:
+        term = "".join(current).strip("'")
+        if len(term) >= 2:
+            terms.append(term)
+    return tuple(terms)
+
+
+def _context_source_eligibility_sql(
+    *,
+    alias: str,
+    allowed_owner_names: set[str] | frozenset[str] | None,
+    reference_character_ids: set[str] | frozenset[str] | None,
+    current_scene_snapshot_id: str | None,
+    current_scene_generation: int | None,
+    current_turn_number: int | None,
+    blocked_source_keys: set[tuple[str, str]] | frozenset[tuple[str, str]]
+    | None,
+) -> tuple[str, tuple[object, ...]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    if allowed_owner_names is not None or reference_character_ids is not None:
+        owners = tuple(sorted(allowed_owner_names or ()))
+        character_ids = tuple(sorted(reference_character_ids or ()))
+        audience_match = "0"
+        if reference_character_ids is None:
+            audience_match = "1"
+        elif character_ids:
+            audience_match = (
+                "EXISTS ("
+                f"SELECT 1 FROM json_each({alias}.metadata_json, "
+                "'$.audience_character_ids') audience "
+                f"WHERE CAST(audience.value AS TEXT) IN "
+                f"({_placeholders(len(character_ids))})"
+                ")"
+            )
+            params.extend(character_ids)
+        owner_match = "0"
+        if allowed_owner_names is None:
+            owner_match = "1"
+        elif owners:
+            owner_match = (
+                "EXISTS ("
+                f"SELECT 1 FROM json_each({alias}.metadata_json, '$.known_by') owner "
+                f"WHERE CAST(owner.value AS TEXT) IN "
+                f"({_placeholders(len(owners))})"
+                ")"
+            )
+            params.extend(owners)
+        audience_count = (
+            f"COALESCE(json_array_length(json_extract({alias}.metadata_json, "
+            "'$.audience_character_ids')), 0)"
+        )
+        known_count = (
+            f"COALESCE(json_array_length(json_extract({alias}.metadata_json, "
+            "'$.known_by')), 0)"
+        )
+        clauses.append(
+            f"(({audience_count} > 0 AND {audience_match}) OR "
+            f"({audience_count} = 0 AND "
+            f"({known_count} = 0 OR {owner_match})))"
+        )
+    if (
+        current_scene_snapshot_id is not None
+        and current_scene_generation is not None
+        and current_turn_number is not None
+    ):
+        clauses.append(
+            "("
+            f"COALESCE(json_extract({alias}.metadata_json, "
+            "'$.curation_action'), '') "
+            "!= 'scene_scratch' OR "
+            f"({alias}.scene_snapshot_id = ? AND {alias}.scene_generation = ? "
+            f"AND ({alias}.expires_after_turn_number IS NULL "
+            f"OR {alias}.expires_after_turn_number > ?))"
+            ")"
+        )
+        params.extend(
+            (
+                current_scene_snapshot_id,
+                current_scene_generation,
+                current_turn_number,
+            )
+        )
+    for source_type, source_id in sorted(blocked_source_keys or ()):
+        clauses.append(f"NOT ({alias}.source_type = ? AND {alias}.source_id = ?)")
+        params.extend((source_type, source_id))
+    if not clauses:
+        return "", ()
+    return "AND " + " AND ".join(f"({clause})" for clause in clauses), tuple(params)
 
 
 def _validate_job_status(status: str) -> None:
@@ -10527,6 +10889,10 @@ def _context_source_from_row(row: sqlite3.Row) -> ContextSourceRecord:
         body=row["body"],
         metadata=_load_object(row["metadata_json"]),
         token_estimate=row["token_estimate"],
+        scene_snapshot_id=row["scene_snapshot_id"],
+        scene_generation=_optional_int(row["scene_generation"]),
+        created_turn_number=_optional_int(row["created_turn_number"]),
+        expires_after_turn_number=_optional_int(row["expires_after_turn_number"]),
     )
 
 
@@ -10559,6 +10925,7 @@ def _scene_snapshot_from_row(row: sqlite3.Row) -> SceneSnapshotRecord:
         locked_fields=_load_list(row["locked_fields_json"]),
         first_seen_message_id=first_seen_message_id,
         last_updated_message_id=last_updated_message_id,
+        scene_generation=int(row["scene_generation"]),
     )
 
 

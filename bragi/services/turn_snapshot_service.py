@@ -211,6 +211,7 @@ _TABLE_REFERENCE_COLUMNS: dict[str, dict[str, str]] = {
     "locations": {"parent_location_id": "locations"},
     "characters": {"location_id": "locations"},
     "scene_snapshots": {"current_location_id": "locations"},
+    "context_sources": {"scene_snapshot_id": "scene_snapshots"},
     "media_assets": {"source_media_asset_id": "media_assets"},
     "save_loss_condition_changes": {"condition_id": "save_loss_conditions"},
     "save_loss_outcomes": {"condition_id": "save_loss_conditions"},
@@ -291,7 +292,13 @@ _JSON_COLUMNS_BY_TABLE: dict[str, frozenset[str]] = {
         {"before_json", "after_json", "source_message_ids_json"}
     ),
     "state_changes": frozenset({"before_json", "after_json"}),
-    "memories": frozenset({"tags_json", "source_message_ids_json"}),
+    "memories": frozenset(
+        {
+            "tags_json",
+            "source_message_ids_json",
+            "source_observation_ids_json",
+        }
+    ),
     "save_scenario_updates": frozenset({"content_json", "source_message_ids_json"}),
     "save_loss_condition_changes": frozenset({"before_json", "after_json"}),
     "save_loss_outcomes": frozenset({"evidence_json"}),

@@ -2995,6 +2995,59 @@ def test_repositories_persist_character_knowledge_graph_rows(
     )[0].archived_at is not None
 
 
+def test_character_knowledge_updates_are_scoped_by_owner_and_target(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    mara = repositories.add_character(
+        save_id=save_id,
+        name="Mara",
+        source_message_id=message_id,
+    )
+    lio = repositories.add_character(
+        save_id=save_id,
+        name="Lio",
+        source_message_id=message_id,
+    )
+    memory = repositories.add_memory(
+        save_id=save_id,
+        body="The western archive uses a moonstone key.",
+        tags=["archive"],
+        source_message_id=message_id,
+    )
+    mara_edge = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=mara.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="may_know",
+    )
+    lio_edge = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=lio.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="knows",
+    )
+
+    updated_mara = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=mara.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="does_not_know",
+    )
+    edges = {
+        edge.character_id: edge
+        for edge in repositories.list_character_knowledge_edges(save_id)
+    }
+
+    assert updated_mara.id == mara_edge.id
+    assert edges[mara.id].knowledge_state == "does_not_know"
+    assert edges[lio.id].id == lio_edge.id
+    assert edges[lio.id].knowledge_state == "knows"
+
+
 def test_repositories_replace_and_list_message_scene_presence(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3612,6 +3665,216 @@ def test_repositories_search_context_sources_with_fts(
     assert [hit.record.source_id for hit in hits] == ["memory-moonstone"]
     assert hits[0].record == target
     assert isinstance(hits[0].bm25_rank, float)
+
+
+def test_repositories_search_context_sources_with_unicode_terms(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    cyrillic = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-cyrillic",
+        title="Северный маяк",
+        body="Северный маяк открывается медным ключом.",
+    )
+    cjk = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-cjk",
+        title="月石羅針盤",
+        body="月石羅針盤は東の書庫を開く。",
+    )
+
+    cyrillic_hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"маяк"},
+        source_types={"memory"},
+        limit=8,
+    )
+    cjk_hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"月石羅針盤"},
+        source_types={"memory"},
+        limit=8,
+    )
+
+    assert [hit.record for hit in cyrillic_hits] == [cyrillic]
+    assert [hit.record for hit in cjk_hits] == [cjk]
+
+
+def test_repositories_apply_context_visibility_before_search_limit(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    for index in range(12):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=f"hidden-{index:02d}",
+            title=f"moonstone hidden {index:02d}",
+            body="The moonstone opens the hidden archive.",
+            metadata={"known_by": ["Lio"]},
+        )
+    accessible = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="accessible",
+        title="moonstone public",
+        body="The moonstone opens the public archive.",
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=1,
+        allowed_owner_names={"Mara"},
+    )
+
+    assert [hit.record for hit in hits] == [accessible]
+
+
+def test_repositories_apply_blocked_scoped_targets_before_search_limit(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    blocked: set[tuple[str, str]] = set()
+    for index in range(12):
+        source_id = f"hidden-{index:02d}"
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=source_id,
+            title=f"moonstone secret {index:02d}",
+            body="The moonstone opens the concealed archive.",
+        )
+        blocked.add(("memory", source_id))
+    accessible = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="accessible",
+        title="moonstone public",
+        body="The moonstone opens the public archive.",
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=1,
+        blocked_source_keys=blocked,
+    )
+
+    assert [hit.record for hit in hits] == [accessible]
+
+
+def test_repositories_expire_scene_scratch_on_generation_change(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    first_location = repositories.add_location(
+        save_id=save_id,
+        name="Beacon",
+        source_message_id=message_id,
+    )
+    second_location = repositories.add_location(
+        save_id=save_id,
+        name="Archive",
+        source_message_id=message_id,
+    )
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        current_location_id=first_location.id,
+        source_message_id=message_id,
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="observation",
+        source_id="scratch-observation",
+        title="Temporary lens state",
+        body="The lens is warm.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=1,
+        expires_after_turn_number=13,
+    )
+
+    same_scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        current_location_id=first_location.id,
+        source_message_id=message_id,
+    )
+    assert same_scene.scene_generation == scene.scene_generation
+    assert repositories.get_context_source(scratch.id) is not None
+
+    next_scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        current_location_id=second_location.id,
+        source_message_id=message_id,
+    )
+
+    assert next_scene.scene_generation == scene.scene_generation + 1
+    assert repositories.get_context_source(scratch.id) is None
+
+
+def test_repositories_archive_scene_scratch_after_turn_ttl(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        situation="The beacon lens is warm.",
+        source_message_id=message_id,
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="observation",
+        source_id="scratch-observation",
+        title="Temporary lens state",
+        body="The lens is warm.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=1,
+        expires_after_turn_number=13,
+    )
+
+    archived_ids = repositories.archive_stale_scene_scratch(
+        save_id=save_id,
+        current_scene_snapshot_id=scene.id,
+        current_scene_generation=scene.scene_generation,
+        current_turn_number=13,
+    )
+
+    assert archived_ids == frozenset({scratch.id})
+    assert repositories.get_context_source(scratch.id) is None
+    assert [
+        marker.id
+        for marker in repositories.list_curated_observation_source_markers(save_id)
+    ] == [scratch.id]
 
 
 def test_repositories_list_protected_context_sources(

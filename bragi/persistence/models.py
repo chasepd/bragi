@@ -274,6 +274,10 @@ class ContextSourceRecord:
     body: str
     metadata: dict[str, object]
     token_estimate: int | None
+    scene_snapshot_id: str | None = None
+    scene_generation: int | None = None
+    created_turn_number: int | None = None
+    expires_after_turn_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -309,6 +313,7 @@ class SceneSnapshotRecord:
     world_time_confidence: float | None = None
     first_seen_message_id: str | None = None
     last_updated_message_id: str | None = None
+    scene_generation: int = 1
 
 
 @dataclass(frozen=True)
@@ -671,6 +676,8 @@ class MemoryRecord:
     importance: float
     source_message_id: str | None
     source_message_ids: list[str] = field(default_factory=list)
+    claim_fingerprint: str = ""
+    source_observation_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

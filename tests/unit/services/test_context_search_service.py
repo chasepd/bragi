@@ -53,10 +53,18 @@ class RecordingStructuredContextProvider:
     def __init__(
         self,
         response_data: dict[str, object] | None = None,
+        *,
+        expansion_data: dict[str, object] | None = None,
     ) -> None:
         self.response_data = response_data or {"selections": []}
+        self.expansion_data = expansion_data or {
+            "terms": [],
+            "phrases": [],
+            "entity_ids": [],
+        }
         self.chat_requests: list[ChatRequest] = []
         self.structured_output_requests: list[StructuredOutputRequest] = []
+        self.expansion_requests: list[StructuredOutputRequest] = []
 
     async def validate_config(self) -> ProviderConfigStatus:
         return ProviderConfigStatus(
@@ -83,6 +91,14 @@ class RecordingStructuredContextProvider:
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "context_retrieval_expansion":
+            self.expansion_requests.append(request)
+            return StructuredOutputResponse(
+                data=self.expansion_data,
+                provider=request.provider,
+                model_id=request.model_id,
+                token_usage={"total": 3},
+            )
         self.structured_output_requests.append(request)
         return StructuredOutputResponse(
             data=self.response_data,
@@ -110,7 +126,8 @@ class MutatingStructuredContextProvider(RecordingStructuredContextProvider):
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         response = await super().generate_structured_output(request)
-        self.after_selection()
+        if request.schema_name != "context_retrieval_expansion":
+            self.after_selection()
         return response
 
 
@@ -394,6 +411,14 @@ class CountingPersistenceRepositories(PersistenceRepositories):
         query_terms: set[str] | frozenset[str] | list[str] | tuple[str, ...],
         source_types: set[str] | frozenset[str] | list[str] | tuple[str, ...],
         limit: int,
+        allowed_owner_names: set[str] | frozenset[str] | None = None,
+        reference_character_ids: set[str] | frozenset[str] | None = None,
+        current_scene_snapshot_id: str | None = None,
+        current_scene_generation: int | None = None,
+        current_turn_number: int | None = None,
+        blocked_source_keys: set[tuple[str, str]] | frozenset[tuple[str, str]]
+        | None = None,
+        match_all: bool = False,
     ) -> list[ContextSourceSearchHit]:
         self.list_counts["context_source_searches"] = (
             self.list_counts.get("context_source_searches", 0) + 1
@@ -403,6 +428,13 @@ class CountingPersistenceRepositories(PersistenceRepositories):
             query_terms=query_terms,
             source_types=source_types,
             limit=limit,
+            allowed_owner_names=allowed_owner_names,
+            reference_character_ids=reference_character_ids,
+            current_scene_snapshot_id=current_scene_snapshot_id,
+            current_scene_generation=current_scene_generation,
+            current_turn_number=current_turn_number,
+            blocked_source_keys=blocked_source_keys,
+            match_all=match_all,
         )
 
     def list_protected_context_sources(
@@ -410,11 +442,27 @@ class CountingPersistenceRepositories(PersistenceRepositories):
         save_id: str,
         *,
         limit: int,
+        allowed_owner_names: set[str] | frozenset[str] | None = None,
+        reference_character_ids: set[str] | frozenset[str] | None = None,
+        current_scene_snapshot_id: str | None = None,
+        current_scene_generation: int | None = None,
+        current_turn_number: int | None = None,
+        blocked_source_keys: set[tuple[str, str]] | frozenset[tuple[str, str]]
+        | None = None,
     ) -> list[ContextSourceRecord]:
         self.list_counts["protected_context_sources"] = (
             self.list_counts.get("protected_context_sources", 0) + 1
         )
-        return super().list_protected_context_sources(save_id, limit=limit)
+        return super().list_protected_context_sources(
+            save_id,
+            limit=limit,
+            allowed_owner_names=allowed_owner_names,
+            reference_character_ids=reference_character_ids,
+            current_scene_snapshot_id=current_scene_snapshot_id,
+            current_scene_generation=current_scene_generation,
+            current_turn_number=current_turn_number,
+            blocked_source_keys=blocked_source_keys,
+        )
 
 
 def test_context_selection_instruction_prioritizes_mystery_context() -> None:
@@ -799,17 +847,18 @@ def test_context_search_uses_curated_observation_sources_without_raw_duplicate(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(repositories)
-    narrator_message = next(
-        message
-        for message in repositories.list_messages(save.id)
-        if message.role == "narrator"
+    omen_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The ruby omen means the bridge oath is fragile.",
     )
     observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="open_thread",
-        claim="Raw ruby omen wording should not be offered.",
-        evidence_quote="A silver bell rings beneath the bridge.",
-        source_message_ids=[narrator_message.id],
+        claim="The ruby omen means the bridge oath is fragile.",
+        evidence_quote="ruby omen means the bridge oath is fragile",
+        source_message_ids=[omen_message.id],
         scope="save",
         status="pending",
         confidence=0.84,
@@ -867,7 +916,7 @@ def test_context_search_uses_curated_observation_sources_without_raw_duplicate(
         expected_text="Curated ruby omen",
     ) == observation.id
     assert "The ruby omen means the bridge oath is fragile." in prompt
-    assert "Raw ruby omen wording should not be offered." not in prompt
+    assert f"Evidence: {observation.evidence_quote}" not in prompt
     assert [item.source_id for item in result.selected_observations] == [
         observation.id
     ]
@@ -3560,6 +3609,76 @@ def test_context_search_uses_ranked_index_before_structured_selection(
     assert result_json["selected_memories"][0]["source_id"] == exact_memory.id
 
 
+def test_context_search_uses_structured_paraphrase_and_pronoun_expansion(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    source_message = next(
+        message
+        for message in repositories.list_messages(save.id)
+        if message.role == "narrator"
+    )
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The physician keeps antivenom in the western archive.",
+        tags=["medicine"],
+        importance=0.8,
+        source_message_id=source_message.id,
+    )
+    physician = repositories.add_character(
+        save_id=save.id,
+        name="Physician Tessa",
+        role="healer",
+        met=True,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Physician Tessa just left the western archive.",
+        present_character_ids=[physician.id],
+    )
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="Where did she store it?",
+    )
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": memory.id,
+                    "relevance_note": "The healer refers to the physician.",
+                }
+            ]
+        },
+        expansion_data={
+            "terms": ["physician", "antivenom"],
+            "phrases": [],
+            "entity_ids": [physician.id],
+        },
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert len(provider.expansion_requests) == 1
+    expansion_prompt = "\n".join(
+        message.body for message in provider.expansion_requests[0].messages
+    )
+    assert "Where did she store it?" in expansion_prompt
+    assert "Physician Tessa" in expansion_prompt
+    selection_prompt = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert memory.body in selection_prompt
+    assert [item.source_id for item in result.selected_memories] == [memory.id]
+
+
 def test_context_search_offers_indexed_character_voice_candidates(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -4408,7 +4527,7 @@ def test_context_search_cache_hit_does_not_scan_bulky_context_rows(
         expected_counts.get("protected_context_sources", 0) + 1
     )
     expected_counts["context_source_searches"] = (
-        expected_counts.get("context_source_searches", 0) + 1
+        expected_counts.get("context_source_searches", 0) + 2
     )
     assert counting.list_counts == expected_counts
 

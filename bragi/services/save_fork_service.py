@@ -284,17 +284,6 @@ class SaveForkService:
         prefix_ids: frozenset[str],
     ) -> None:
         self._copy_table(
-            "context_sources",
-            source_save_id,
-            fork_save_id,
-            message_id_map,
-            prefix_ids,
-            exclude_archived=True,
-            json_columns=("metadata_json",),
-            provenance_json_columns=("metadata_json",),
-            source_id_message_types=frozenset({"message"}),
-        )
-        self._copy_table(
             "locations",
             source_save_id,
             fork_save_id,
@@ -369,6 +358,18 @@ class SaveForkService:
             ),
         )
         self._copy_table(
+            "context_sources",
+            source_save_id,
+            fork_save_id,
+            message_id_map,
+            prefix_ids,
+            exclude_archived=True,
+            json_columns=("metadata_json",),
+            provenance_json_columns=("metadata_json",),
+            source_id_message_types=frozenset({"message"}),
+            reference_columns={"scene_snapshot_id": "scene_snapshots"},
+        )
+        self._copy_table(
             "message_scene_presence",
             source_save_id,
             fork_save_id,
@@ -436,7 +437,10 @@ class SaveForkService:
             message_id_map,
             prefix_ids,
             exclude_archived=True,
-            json_columns=("tags_json", "source_message_ids_json"),
+            json_columns=(
+                "tags_json",
+                "source_message_ids_json",
+            ),
             message_list_columns=("source_message_ids_json",),
         )
         self._copy_table(

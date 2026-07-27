@@ -388,8 +388,9 @@ class ChatBundleService:
             "memories": self._rows(
                 """
                 SELECT id, save_id, body, tags_json, importance,
-                       source_message_id, source_message_ids_json, created_at,
-                       updated_at, archived_at
+                       source_message_id, source_message_ids_json,
+                       claim_fingerprint, source_observation_ids_json,
+                       created_at, updated_at, archived_at
                 FROM memories
                 WHERE save_id = ? AND archived_at IS NULL
                 ORDER BY created_at, rowid
@@ -457,8 +458,9 @@ class ChatBundleService:
             "context_sources": self._rows(
                 """
                 SELECT id, save_id, source_type, source_id, title, body,
-                       metadata_json, token_estimate, created_at, updated_at,
-                       archived_at
+                       metadata_json, token_estimate, scene_snapshot_id,
+                       scene_generation, created_turn_number,
+                       expires_after_turn_number, created_at, updated_at, archived_at
                 FROM context_sources
                 WHERE save_id = ? AND archived_at IS NULL
                 ORDER BY source_type, source_id, rowid
@@ -489,7 +491,8 @@ class ChatBundleService:
                        nearby_objects_json, hazards_json,
                        present_character_ids_json, source_message_id,
                        locked_fields_json, first_seen_message_id,
-                       last_updated_message_id, created_at, updated_at
+                       last_updated_message_id, scene_generation,
+                       created_at, updated_at
                 FROM scene_snapshots
                 WHERE save_id = ?
                 ORDER BY rowid
@@ -1243,6 +1246,7 @@ class ChatBundleService:
                     message_order=message_order,
                     repair_tracker=repair_tracker,
                 ),
+                claim_fingerprint=_optional_text(row, "claim_fingerprint"),
             )
             memory_id_map[original_id] = memory.id
         imported_id_maps["memory"] = memory_id_map
@@ -1335,6 +1339,33 @@ class ChatBundleService:
             observation_id_map[original_id] = observation.id
         imported_id_maps["observation"] = observation_id_map
         imported_id_maps["context_observations"] = observation_id_map
+        imported_memories = {
+            memory.id: memory for memory in self.repositories.list_memories(save.id)
+        }
+        for row in _list_of_objects(data.get("memories"), "memories"):
+            memory_id = memory_id_map.get(_text(row, "id"))
+            imported_memory = imported_memories.get(memory_id or "")
+            if imported_memory is None:
+                continue
+            source_observation_ids = [
+                observation_id_map[original_id]
+                for original_id in _json_string_list(
+                    row,
+                    "source_observation_ids_json",
+                )
+                if original_id in observation_id_map
+            ]
+            if not source_observation_ids:
+                continue
+            self.repositories.update_memory(
+                memory_id=imported_memory.id,
+                body=imported_memory.body,
+                tags=imported_memory.tags,
+                importance=imported_memory.importance,
+                source_message_ids=imported_memory.source_message_ids,
+                source_observation_ids=source_observation_ids,
+                claim_fingerprint=imported_memory.claim_fingerprint,
+            )
 
         scenario_update_id_map: dict[str, str] = {}
         for row in _list_of_objects(
@@ -1860,36 +1891,6 @@ class ChatBundleService:
             character_text_message_id_map=character_text_message_id_map,
         )
 
-        context_sources: list[dict[str, object]] = []
-        for row in _list_of_objects(data.get("context_sources"), "context_sources"):
-            copied = _copy_row_for_save(
-                row,
-                save_id,
-                new_id=context_source_id_map[_text(row, "id")],
-            )
-            source_type = _text(copied, "source_type")
-            source_id = _text(copied, "source_id")
-            mapped_source_id = _mapped_context_source_id(
-                entity_id_maps,
-                source_type,
-                source_id,
-                repair_tracker=repair_tracker,
-            )
-            if mapped_source_id is None:
-                continue
-            copied["source_id"] = mapped_source_id
-            copied["metadata_json"] = _remapped_context_source_metadata_json(
-                copied,
-                message_id_map,
-                character_text_message_id_map,
-                observation_id_map=entity_id_maps.get("observation", {}),
-                scenario_id_map=entity_id_maps.get("scenario", {}),
-                entity_id_maps=entity_id_maps,
-                repair_tracker=repair_tracker,
-            )
-            context_sources.append(copied)
-        _insert_rows(connection, "context_sources", context_sources)
-
         locations: list[dict[str, object]] = []
         for row in _list_of_objects(data.get("locations"), "locations"):
             original_id = _text(row, "id")
@@ -1978,6 +1979,42 @@ class ChatBundleService:
             scene_snapshots.append(copied)
         _insert_rows(connection, "scene_snapshots", scene_snapshots)
         _backfill_imported_scene_world_time(connection, save_id)
+
+        context_sources: list[dict[str, object]] = []
+        for row in _list_of_objects(data.get("context_sources"), "context_sources"):
+            copied = _copy_row_for_save(
+                row,
+                save_id,
+                new_id=context_source_id_map[_text(row, "id")],
+            )
+            source_type = _text(copied, "source_type")
+            source_id = _text(copied, "source_id")
+            mapped_source_id = _mapped_context_source_id(
+                entity_id_maps,
+                source_type,
+                source_id,
+                repair_tracker=repair_tracker,
+            )
+            if mapped_source_id is None:
+                continue
+            copied["source_id"] = mapped_source_id
+            copied["scene_snapshot_id"] = _mapped_optional_value(
+                entity_id_maps.get("scene_snapshot", {}),
+                _optional_text(row, "scene_snapshot_id"),
+                field_name="context_sources.scene_snapshot_id",
+                repair_tracker=repair_tracker,
+            )
+            copied["metadata_json"] = _remapped_context_source_metadata_json(
+                copied,
+                message_id_map,
+                character_text_message_id_map,
+                observation_id_map=entity_id_maps.get("observation", {}),
+                scenario_id_map=entity_id_maps.get("scenario", {}),
+                entity_id_maps=entity_id_maps,
+                repair_tracker=repair_tracker,
+            )
+            context_sources.append(copied)
+        _insert_rows(connection, "context_sources", context_sources)
 
         characters: list[dict[str, object]] = []
         for row in _list_of_objects(data.get("characters"), "characters"):
