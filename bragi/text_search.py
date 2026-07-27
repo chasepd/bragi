@@ -16,6 +16,7 @@ MAX_IDENTIFIER_FILTER_UNCOMPRESSED_BYTES = 8 * (
     MAX_STRUCTURED_IDENTIFIER_INPUT_CHARS + 1
 )
 MAX_NORMALIZED_SEARCH_CHARS = 65_536
+MAX_UNICODE_WORD_TERM_CHARS = 512
 
 
 def _bounded_nfkc_casefold(
@@ -24,18 +25,14 @@ def _bounded_nfkc_casefold(
     max_input_chars: int,
     max_output_chars: int,
 ) -> str:
-    normalized_parts: list[str] = []
-    remaining = max_output_chars
-    for start in range(0, min(len(value), max_input_chars), 1024):
-        normalized = unicodedata.normalize(
-            "NFKC",
-            value[start : start + 1024],
-        ).casefold()
-        normalized_parts.append(normalized[:remaining])
-        remaining -= min(len(normalized), remaining)
-        if remaining <= 0:
-            break
-    return "".join(normalized_parts)
+    normalized = unicodedata.normalize(
+        "NFKC",
+        value[:max_input_chars],
+    ).casefold()
+    if len(normalized) <= max_output_chars:
+        return normalized
+    edge_chars = max(1, (max_output_chars - 1) // 2)
+    return f"{normalized[:edge_chars]} {normalized[-edge_chars:]}"
 
 
 def unicode_word_terms(value: str) -> tuple[str, ...]:
@@ -52,12 +49,12 @@ def unicode_word_terms(value: str) -> tuple[str, ...]:
             continue
         if current:
             term = "".join(current).strip("'")
-            if term:
+            if term and len(term) <= MAX_UNICODE_WORD_TERM_CHARS:
                 terms.append(term)
             current = []
     if current:
         term = "".join(current).strip("'")
-        if term:
+        if term and len(term) <= MAX_UNICODE_WORD_TERM_CHARS:
             terms.append(term)
     return tuple(terms)
 

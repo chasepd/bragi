@@ -35,3 +35,15 @@ def test_structured_identifier_filter_matches_middle_identifier() -> None:
 
     assert identifier_filter_matches(identifier_filter, '["code-128"]') == 1
     assert identifier_filter_matches(identifier_filter, '["missing-999"]') == 0
+
+
+def test_unicode_normalization_preserves_combining_sequence_at_old_chunk_edge() -> None:
+    value = (" " * 1023) + "A\u030A-7"
+
+    assert "å-7" in structured_identifiers(value)
+
+
+def test_unicode_normalization_preserves_tail_after_compatibility_expansion() -> None:
+    value = ("\ufdfa " * 4_000) + "TARGET-9999"
+
+    assert "target-9999" in structured_identifiers(value)

@@ -2423,12 +2423,15 @@ def _grounding_sentence_boundary(character: str) -> bool:
 def _grounding_adjacent_fragment_qualifies(value: str) -> bool:
     ordered_terms = _ordered_grounding_terms(value)
     raw_terms = _grounding_boundary_terms(value)
+    has_semantic_symbol = any(
+        unicodedata.category(character).startswith("S")
+        or character in {"?", "~"}
+        or "QUESTION" in unicodedata.name(character, "")
+        or "INTERROBANG" in unicodedata.name(character, "")
+        or "CROSS MARK" in unicodedata.name(character, "")
+        for character in value
+    )
     anaphoric_terms = {"it", "so", "that", "this"}
-    if not (
-        len(ordered_terms) <= 1
-        or bool(set(raw_terms) & anaphoric_terms)
-    ):
-        return False
     terms = set(ordered_terms)
     qualifier_terms = {
         "allegedly",
@@ -2436,13 +2439,17 @@ def _grounding_adjacent_fragment_qualifies(value: str) -> bool:
         "claim",
         "claimed",
         "claims",
+        "conjecture",
         "could",
         "doubt",
         "doubts",
+        "guess",
         "maybe",
         "may",
         "might",
+        "ostensibly",
         "perhaps",
+        "possibility",
         "possibly",
         "reported",
         "rumor",
@@ -2451,11 +2458,21 @@ def _grounding_adjacent_fragment_qualifies(value: str) -> bool:
         "unconfirmed",
         "uncertain",
         "unverified",
+        "unsure",
     }
+    is_short_fragment = len(ordered_terms) <= 2
+    is_anaphoric_fragment = bool(set(raw_terms) & anaphoric_terms)
     return bool(
-        terms & qualifier_terms
-        or _grounding_denial_conflicts("", value)
-        or _grounding_negation_conflicts("", value)
+        has_semantic_symbol
+        or is_anaphoric_fragment
+        or (
+            is_short_fragment
+            and (
+                terms & qualifier_terms
+                or _grounding_denial_conflicts("", value)
+                or _grounding_negation_conflicts("", value)
+            )
+        )
     )
 
 
@@ -2466,6 +2483,7 @@ def _compact_grounding_padding(value: str) -> str:
         name = unicodedata.name(character, "")
         semantic_punctuation = (
             character in {".", "!", "?", "~"}
+            or unicodedata.category(character).startswith("S")
             or "FULL STOP" in name
             or "QUESTION" in name
             or "EXCLAMATION" in name
@@ -3909,13 +3927,27 @@ def _curated_decision_is_grounded(
         if decision.action == "durable_memory"
         else (decision.context_body.strip() or observation.claim)
     )
-    proposed_fingerprint = canonical_claim_fingerprint(proposed)
-    return (
-        proposed_fingerprint == canonical_claim_fingerprint(observation.claim)
-        and any(
-            proposed_fingerprint == canonical_claim_fingerprint(source_text)
-            for source_text in supporting_texts
+    if canonical_claim_fingerprint(proposed) != canonical_claim_fingerprint(
+        observation.claim
+    ):
+        return False
+    supporting_contexts = tuple(
+        context
+        for source_text in supporting_texts
+        if (
+            context := _source_context_for_evidence_quote(
+                decision.supporting_evidence_quote,
+                source_text,
+            )
         )
+    )
+    return bool(supporting_contexts) and any(
+        not _grounding_negation_conflicts(proposed, context)
+        and not _grounding_denial_conflicts(proposed, context)
+        and not _grounding_modality_conflicts(proposed, context)
+        and _grounding_context_preserves_claim_boundary(proposed, context)
+        and _grounding_order_is_preserved(proposed, context)
+        for context in supporting_contexts
     )
 
 
@@ -4032,9 +4064,27 @@ def _grounding_context_preserves_claim_boundary(
 ) -> bool:
     if "~~" in context:
         return False
+    claim_semantic_symbols = {
+        character
+        for character in unicodedata.normalize("NFKC", claim)
+        if (
+            unicodedata.category(character).startswith("S")
+            or character in {"?", "~"}
+            or "QUESTION" in unicodedata.name(character, "")
+            or "INTERROBANG" in unicodedata.name(character, "")
+            or "NOT SIGN" in unicodedata.name(character, "")
+            or "NEGATION" in unicodedata.name(character, "")
+            or "CROSS MARK" in unicodedata.name(character, "")
+        )
+    }
     if any(
         (
-            "QUESTION" in unicodedata.name(character, "")
+            (
+                unicodedata.category(character).startswith("S")
+                or character in {"?", "~"}
+                or "QUESTION" in unicodedata.name(character, "")
+            )
+            and character not in claim_semantic_symbols
             or "INTERROBANG" in unicodedata.name(character, "")
             or "NOT SIGN" in unicodedata.name(character, "")
             or "NEGATION" in unicodedata.name(character, "")

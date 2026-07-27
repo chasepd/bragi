@@ -3124,6 +3124,69 @@ def test_repositories_consolidate_duplicates_without_losing_active_references(
     assert source.title == "Active duplicate source"
 
 
+def test_repositories_consolidate_duplicates_keeps_body_provenance_atomic(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, hidden_message_id = _persist_repository_save(repositories)
+    visible_message = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        body="The lamps are lit.",
+    )
+    keeper = repositories.add_memory(
+        save_id=save_id,
+        body="Mara likes tea.",
+        tags=["preference"],
+    )
+    duplicate_id = "legacy-memory-duplicate"
+    repositories.connection.execute(
+        "DROP INDEX idx_memories_save_claim_fingerprint_active"
+    )
+    repositories.connection.execute(
+        """
+        INSERT INTO memories(
+            id, save_id, body, tags_json, importance,
+            source_message_ids_json, claim_fingerprint,
+            source_observation_ids_json
+        )
+        VALUES (?, ?, 'mara likes tea', '[]', 0.5, '[]', ?, '[]')
+        """,
+        (
+            duplicate_id,
+            save_id,
+            canonical_claim_fingerprint("mara likes tea"),
+        ),
+    )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=keeper.id,
+        title="Hidden keeper",
+        body="The hidden vault code is AMBER-77.",
+        metadata={"source_message_ids": [hidden_message_id]},
+    )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=duplicate_id,
+        title="Harmless duplicate",
+        body="The lamps are lit.",
+        metadata={"source_message_ids": [visible_message.id]},
+    )
+    repositories.commit()
+
+    repositories.consolidate_active_memory_duplicates(save_id=save_id)
+
+    [source] = repositories.list_context_sources(
+        save_id,
+        source_type="memory",
+    )
+    assert source.source_id == keeper.id
+    assert source.body == "The hidden vault code is AMBER-77."
+    assert source.metadata["source_message_ids"] == [hidden_message_id]
+    assert visible_message.id not in source.metadata["source_message_ids"]
+
+
 def test_restore_memories_merges_active_fingerprint_collision(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -4595,6 +4658,128 @@ def test_repositories_indexes_exact_identifier_at_source_tail(
     )
 
     assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_restore_rebuilds_archived_exact_identifier_index(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-restored-code",
+        title="Restored vault identifier",
+        body="Only SECRET-42 opens the restored vault.",
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_sources
+        SET archived_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (target.id,),
+    )
+    repositories.connection.execute(
+        "DELETE FROM context_source_exact_identifiers WHERE context_source_id = ?",
+        (target.id,),
+    )
+    repositories.commit()
+
+    repositories.restore_context_sources({target.id})
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms={"secret", "42"},
+        source_types={"memory"},
+        limit=1,
+        exact_identifiers=("SECRET-42",),
+    )
+
+    assert [hit.record.id for hit in hits] == [target.id]
+
+
+def test_repositories_rejects_index_budget_before_persisting_source(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-existing",
+        title="Existing marker",
+        body="Existing marker code EXISTING-1.",
+    )
+    existing_index_rows = repositories.connection.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM context_source_search_terms WHERE save_id = ?)
+            + (
+                SELECT COUNT(*)
+                FROM context_source_exact_identifiers
+                WHERE save_id = ?
+            )
+        """,
+        (save_id, save_id),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_INDEX_ROWS_PER_REBUILD",
+        existing_index_rows,
+    )
+
+    with pytest.raises(ValueError, match="too large to rebuild"):
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id="memory-rejected",
+            title="Rejected marker",
+            body="Rejected marker code REJECTED-2.",
+        )
+
+    assert (
+        repositories.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM context_sources
+            WHERE save_id = ? AND source_id = 'memory-rejected'
+            """,
+            (save_id,),
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_repositories_rejects_source_text_budget_before_persisting_source(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_TEXT_BYTES_PER_REBUILD",
+        16,
+    )
+
+    with pytest.raises(ValueError, match="source text is too large"):
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id="memory-rejected",
+            title="Rejected marker",
+            body="This body exceeds the test budget.",
+        )
+
+    assert (
+        repositories.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM context_sources
+            WHERE save_id = ? AND source_id = 'memory-rejected'
+            """,
+            (save_id,),
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_repositories_bounds_index_rebuild_before_writing(

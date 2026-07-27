@@ -4655,7 +4655,7 @@ def _mapped_context_source_id(
     *,
     repair_tracker: _BundleImportRepairTracker | None = None,
 ) -> str | None:
-    if source_type == "message":
+    if source_type in {"message", "messages"}:
         mapped_items: list[str] = []
         for item in source_id.split(","):
             item = item.strip()

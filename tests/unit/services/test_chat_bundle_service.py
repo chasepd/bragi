@@ -1995,6 +1995,43 @@ def test_import_save_remaps_context_source_row_id_source(
     assert imported_source.source_id == imported_summary.id
 
 
+def test_import_save_remaps_plural_comma_joined_message_context_source(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="messages",
+        source_id=f"{PLAYER_MESSAGE_ID},{NARRATOR_MESSAGE_ID}",
+        title="Two-message context",
+        body="The warning develops across two messages.",
+        metadata={
+            "source_message_ids": [PLAYER_MESSAGE_ID, NARRATOR_MESSAGE_ID],
+        },
+        context_source_id="ctx-plural-message-source",
+    )
+    bundle_path = tmp_path / "exports" / "plural-message-source.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+    imported = service.import_save(bundle_path)
+
+    imported_save_id = _imported_save_id(imported)
+    imported_message_ids = {
+        message.id for message in repositories.list_messages(imported_save_id)
+    }
+    [imported_source] = repositories.list_context_sources(
+        imported_save_id,
+        source_type="messages",
+    )
+    remapped_source_ids = set(imported_source.source_id.split(","))
+    assert remapped_source_ids <= imported_message_ids
+    assert PLAYER_MESSAGE_ID not in remapped_source_ids
+    assert NARRATOR_MESSAGE_ID not in remapped_source_ids
+
+
 def test_import_save_repairs_world_state_context_source_ids(
     repositories: PersistenceRepositories,
     tmp_path: Path,

@@ -859,7 +859,9 @@ def test_persisted_observation_grounding_uses_unicode_sentence_boundaries(
         "Mara has the red key. Lio is unsure.",
         "Mara has the red key. I guess.",
         "Mara has the red key. So they say.",
-        "The lamps flare. Mara has the red key.",
+        "Mara has the red key. 🤔",
+        "Mara has the red key. 🤷",
+        "Mara has the red key. ❓",
     ],
 )
 def test_curated_free_text_must_preserve_the_complete_source_message(
@@ -890,6 +892,47 @@ def test_curated_free_text_must_preserve_the_complete_source_message(
     )
 
     assert not agentic_context_module._curated_decision_is_grounded(
+        decision,
+        observation=observation,
+        source_texts=(source_text,),
+    )
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        "The lamps flare. Mara has the red key.",
+        "Mara has the red key. Lio watches the doorway.",
+    ],
+)
+def test_curated_free_text_accepts_grounded_sentence_in_longer_message(
+    source_text: str,
+) -> None:
+    observation = ContextObservationRecord(
+        id="observation-imported",
+        save_id="save-imported",
+        observation_type="character_fact",
+        claim="Mara has the red key.",
+        evidence_quote="Mara has the red key",
+        source_message_ids=["message-imported"],
+        scope="durable",
+        status="pending",
+        confidence=0.99,
+        tags=["key"],
+        metadata={},
+    )
+    decision = CurationDecision(
+        observation_id=observation.id,
+        action="durable_memory",
+        reason="Stable fact.",
+        confidence=0.99,
+        memory_body=observation.claim,
+        grounding_status="entailed",
+        supporting_evidence_quote=observation.evidence_quote,
+        supporting_source_message_ids=("message-imported",),
+    )
+
+    assert agentic_context_module._curated_decision_is_grounded(
         decision,
         observation=observation,
         source_texts=(source_text,),

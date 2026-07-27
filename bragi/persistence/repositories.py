@@ -108,6 +108,9 @@ MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
 MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
 MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 250_000
+MAX_CONTEXT_INDEX_BYTES_PER_REBUILD = 32 * 1024 * 1024
+MAX_CONTEXT_SOURCE_TEXT_BYTES_PER_REBUILD = 32 * 1024 * 1024
+MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD = 32 * 1024 * 1024
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
@@ -3378,6 +3381,16 @@ class PersistenceRepositories:
             == record.expires_after_turn_number
         ):
             return _context_source_from_row(existing)
+        terms = _context_source_search_terms(record.title, record.body)
+        identifiers = _context_source_exact_identifiers(
+            record.title,
+            record.body,
+        )
+        self._validate_context_source_index_replacement(
+            record,
+            terms=terms,
+            identifiers=identifiers,
+        )
         self.connection.execute(
             """
             INSERT INTO context_sources(
@@ -3413,7 +3426,12 @@ class PersistenceRepositories:
                 record.expires_after_turn_number,
             ),
         )
-        self._replace_context_source_search_terms(record)
+        self._replace_context_source_search_terms(
+            record,
+            terms=terms,
+            identifiers=identifiers,
+            enforce_save_budget=False,
+        )
         self.commit()
         return self.get_context_source(record.id) or record
 
@@ -3423,7 +3441,24 @@ class PersistenceRepositories:
         *,
         terms: tuple[str, ...] | None = None,
         identifiers: tuple[str, ...] | None = None,
+        enforce_save_budget: bool = True,
     ) -> None:
+        resolved_terms = (
+            terms
+            if terms is not None
+            else _context_source_search_terms(record.title, record.body)
+        )
+        resolved_identifiers = (
+            identifiers
+            if identifiers is not None
+            else _context_source_exact_identifiers(record.title, record.body)
+        )
+        if enforce_save_budget:
+            self._validate_context_source_index_replacement(
+                record,
+                terms=resolved_terms,
+                identifiers=resolved_identifiers,
+            )
         self.connection.execute(
             "DELETE FROM context_source_search_terms WHERE context_source_id = ?",
             (record.id,),
@@ -3439,11 +3474,7 @@ class PersistenceRepositories:
             """,
             (
                 (record.id, record.save_id, term)
-                for term in (
-                    terms
-                    if terms is not None
-                    else _context_source_search_terms(record.title, record.body)
-                )
+                for term in resolved_terms
             ),
         )
         self.connection.execute(
@@ -3452,11 +3483,6 @@ class PersistenceRepositories:
             WHERE context_source_id = ?
             """,
             (record.id,),
-        )
-        resolved_identifiers = (
-            identifiers
-            if identifiers is not None
-            else _context_source_exact_identifiers(record.title, record.body)
         )
         self.connection.executemany(
             """
@@ -3473,10 +3499,115 @@ class PersistenceRepositories:
             ),
         )
 
+    def _validate_context_source_index_replacement(
+        self,
+        record: ContextSourceRecord,
+        *,
+        terms: tuple[str, ...],
+        identifiers: tuple[str, ...],
+    ) -> None:
+        source_text_bytes = 0
+        normalized_text_bytes = 0
+        existing_source_rows = self.connection.execute(
+            """
+            SELECT title, body
+            FROM context_sources
+            WHERE save_id = ?
+              AND archived_at IS NULL
+              AND id != ?
+            """,
+            (record.save_id, record.id),
+        )
+        for title, body in existing_source_rows:
+            source_bytes, normalized_bytes = _context_source_text_budget_usage(
+                str(title or ""),
+                str(body or ""),
+            )
+            source_text_bytes += source_bytes
+            normalized_text_bytes += normalized_bytes
+            _raise_if_context_source_text_budget_exceeded(
+                source_text_bytes=source_text_bytes,
+                normalized_text_bytes=normalized_text_bytes,
+            )
+        added_source_bytes, added_normalized_bytes = (
+            _context_source_text_budget_usage(record.title, record.body)
+        )
+        source_text_bytes += added_source_bytes
+        normalized_text_bytes += added_normalized_bytes
+        _raise_if_context_source_text_budget_exceeded(
+            source_text_bytes=source_text_bytes,
+            normalized_text_bytes=normalized_text_bytes,
+        )
+        existing_rows, existing_bytes = self.connection.execute(
+            """
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM context_source_search_terms terms
+                    JOIN context_sources source
+                      ON source.id = terms.context_source_id
+                    WHERE terms.save_id = ?
+                      AND source.archived_at IS NULL
+                      AND source.id != ?
+                ) + (
+                    SELECT COUNT(*)
+                    FROM context_source_exact_identifiers identifiers
+                    JOIN context_sources source
+                      ON source.id = identifiers.context_source_id
+                    WHERE identifiers.save_id = ?
+                      AND source.archived_at IS NULL
+                      AND source.id != ?
+                ),
+                (
+                    SELECT COALESCE(SUM(LENGTH(CAST(terms.term AS BLOB))), 0)
+                    FROM context_source_search_terms terms
+                    JOIN context_sources source
+                      ON source.id = terms.context_source_id
+                    WHERE terms.save_id = ?
+                      AND source.archived_at IS NULL
+                      AND source.id != ?
+                ) + (
+                    SELECT COALESCE(
+                        SUM(LENGTH(CAST(identifiers.identifier AS BLOB))),
+                        0
+                    )
+                    FROM context_source_exact_identifiers identifiers
+                    JOIN context_sources source
+                      ON source.id = identifiers.context_source_id
+                    WHERE identifiers.save_id = ?
+                      AND source.archived_at IS NULL
+                      AND source.id != ?
+                )
+            """,
+            (
+                record.save_id,
+                record.id,
+                record.save_id,
+                record.id,
+                record.save_id,
+                record.id,
+                record.save_id,
+                record.id,
+            ),
+        ).fetchone()
+        added_identifiers = identifiers or ("",)
+        indexed_rows = int(existing_rows) + len(terms) + len(added_identifiers)
+        indexed_bytes = int(existing_bytes) + sum(
+            len(value.encode("utf-8"))
+            for value in (*terms, *added_identifiers)
+        )
+        if indexed_rows > MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
+            raise ValueError("Context source index is too large to rebuild")
+        if indexed_bytes > MAX_CONTEXT_INDEX_BYTES_PER_REBUILD:
+            raise ValueError("Context source index text is too large to rebuild")
+
     def rebuild_context_source_search_terms(self, save_id: str) -> None:
         self.begin_transaction()
         try:
             indexed_rows = 0
+            indexed_bytes = 0
+            source_text_bytes = 0
+            normalized_text_bytes = 0
             rows = self.connection.execute(
                 """
                 SELECT id, save_id, source_type, source_id,
@@ -3498,13 +3629,34 @@ class PersistenceRepositories:
                     record.title,
                     record.body,
                 )
+                added_source_bytes, added_normalized_bytes = (
+                    _context_source_text_budget_usage(
+                        record.title,
+                        record.body,
+                    )
+                )
+                source_text_bytes += added_source_bytes
+                normalized_text_bytes += added_normalized_bytes
+                _raise_if_context_source_text_budget_exceeded(
+                    source_text_bytes=source_text_bytes,
+                    normalized_text_bytes=normalized_text_bytes,
+                )
                 indexed_rows += len(terms) + max(1, len(identifiers))
+                indexed_bytes += sum(
+                    len(value.encode("utf-8"))
+                    for value in (*terms, *(identifiers or ("",)))
+                )
                 if indexed_rows > MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
                     raise ValueError("Context source index is too large to rebuild")
+                if indexed_bytes > MAX_CONTEXT_INDEX_BYTES_PER_REBUILD:
+                    raise ValueError(
+                        "Context source index text is too large to rebuild"
+                    )
                 self._replace_context_source_search_terms(
                     record,
                     terms=terms,
                     identifiers=identifiers,
+                    enforce_save_budget=False,
                 )
             self.commit_transaction()
         except Exception:
@@ -4150,15 +4302,35 @@ class PersistenceRepositories:
     ) -> None:
         if not context_source_ids:
             return
-        self.connection.execute(
-            f"""
-            UPDATE context_sources
-            SET archived_at = NULL, updated_at = CURRENT_TIMESTAMP
-            WHERE id IN ({_placeholders(len(context_source_ids))})
-            """,
-            tuple(context_source_ids),
-        )
-        self.commit()
+        self.begin_transaction()
+        try:
+            rows = self._fetch_all(
+                f"""
+                SELECT id, save_id, source_type, source_id, title, body,
+                       metadata_json, token_estimate, scene_snapshot_id,
+                       scene_generation, created_turn_number,
+                       expires_after_turn_number
+                FROM context_sources
+                WHERE id IN ({_placeholders(len(context_source_ids))})
+                ORDER BY rowid
+                """,
+                tuple(sorted(context_source_ids)),
+            )
+            for row in rows:
+                record = _context_source_from_row(row)
+                self._replace_context_source_search_terms(record)
+                self.connection.execute(
+                    """
+                    UPDATE context_sources
+                    SET archived_at = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (record.id,),
+                )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
 
     def archive_context_sources_for_deleted_messages(
         self,
@@ -10814,7 +10986,9 @@ class PersistenceRepositories:
     ) -> None:
         rows = self._fetch_all(
             """
-            SELECT source_id, metadata_json, token_estimate
+            SELECT source_id, metadata_json, token_estimate, title, body,
+                   scene_snapshot_id, scene_generation,
+                   created_turn_number, expires_after_turn_number
             FROM context_sources
             WHERE save_id = ? AND source_type = 'memory'
               AND source_id IN (?, ?) AND archived_at IS NULL
@@ -10825,6 +10999,18 @@ class PersistenceRepositories:
         keeper = rows_by_source_id.get(keeper_id)
         duplicate = rows_by_source_id.get(duplicate_id)
         if keeper is None or duplicate is None:
+            return
+        if any(
+            keeper[field] != duplicate[field]
+            for field in (
+                "title",
+                "body",
+                "scene_snapshot_id",
+                "scene_generation",
+                "created_turn_number",
+                "expires_after_turn_number",
+            )
+        ):
             return
         metadata = merge_context_source_metadata(
             keeper["metadata_json"],
@@ -13465,14 +13651,64 @@ def validate_context_source_index_budget(
     rows: Iterable[Mapping[str, object]],
 ) -> None:
     indexed_rows = 0
+    indexed_bytes = 0
+    source_text_bytes = 0
+    normalized_text_bytes = 0
     for row in rows:
         title = str(row.get("title") or "")
         body = str(row.get("body") or "")
+        added_source_bytes, added_normalized_bytes = (
+            _context_source_text_budget_usage(title, body)
+        )
+        source_text_bytes += added_source_bytes
+        normalized_text_bytes += added_normalized_bytes
+        _raise_if_context_source_text_budget_exceeded(
+            source_text_bytes=source_text_bytes,
+            normalized_text_bytes=normalized_text_bytes,
+        )
         terms = _context_source_search_terms(title, body)
         identifiers = _context_source_exact_identifiers(title, body)
-        indexed_rows += len(terms) + max(1, len(identifiers))
+        indexed_identifiers = identifiers or ("",)
+        indexed_rows += len(terms) + len(indexed_identifiers)
+        indexed_bytes += sum(
+            len(value.encode("utf-8"))
+            for value in (*terms, *indexed_identifiers)
+        )
         if indexed_rows > MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
             raise ValueError("Context source index is too large to rebuild")
+        if indexed_bytes > MAX_CONTEXT_INDEX_BYTES_PER_REBUILD:
+            raise ValueError("Context source index text is too large to rebuild")
+
+
+def _context_source_text_budget_usage(
+    title: str,
+    body: str,
+) -> tuple[int, int]:
+    bounded_title = title[:MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
+    bounded_body = body[:MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
+    source_text_bytes = len(bounded_title.encode("utf-8")) + len(
+        bounded_body.encode("utf-8")
+    )
+    normalized_text_bytes = len(
+        unicodedata.normalize("NFKC", bounded_title).casefold().encode("utf-8")
+    ) + len(
+        unicodedata.normalize("NFKC", bounded_body).casefold().encode("utf-8")
+    )
+    return source_text_bytes, normalized_text_bytes
+
+
+def _raise_if_context_source_text_budget_exceeded(
+    *,
+    source_text_bytes: int,
+    normalized_text_bytes: int,
+) -> None:
+    if source_text_bytes > MAX_CONTEXT_SOURCE_TEXT_BYTES_PER_REBUILD:
+        raise ValueError("Context source text is too large to rebuild")
+    if (
+        normalized_text_bytes
+        > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
+    ):
+        raise ValueError("Normalized context source text is too large to rebuild")
 
 
 def _validate_context_source_provenance_metadata(

@@ -24,7 +24,6 @@ CURRENT_SCHEMA_VERSION = 72
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
-_MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 250_000
 _MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
 _MAX_MEMORY_PROVENANCE_IDS = 64
 
@@ -4346,8 +4345,6 @@ def _ensure_context_source_search_terms_schema(
         WHERE key = 'exact_identifiers_complete_v2'
         """
     ).fetchone()
-    if exact_identifier_index_complete is None:
-        connection.execute("DELETE FROM context_source_exact_identifiers")
     missing_rows = connection.execute(
         """
         SELECT source.id, source.save_id,
@@ -4363,15 +4360,11 @@ def _ensure_context_source_search_terms_schema(
         ORDER BY source.rowid
         """
     )
-    indexed_rows = 0
     for source_id, save_id, title, body in missing_rows:
         terms = _migration_context_source_search_terms(
             str(title or ""),
             str(body or ""),
         )
-        indexed_rows += len(terms)
-        if indexed_rows > _MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
-            raise RuntimeError("Context source index is too large to rebuild")
         connection.executemany(
             """
             INSERT OR IGNORE INTO context_source_search_terms(
@@ -4389,23 +4382,21 @@ def _ensure_context_source_search_terms_schema(
                substr(source.title, 1, 65536),
                substr(source.body, 1, 65536)
         FROM context_sources source
-        WHERE source.archived_at IS NULL
-          AND NOT EXISTS (
-              SELECT 1
-              FROM context_source_exact_identifiers identifier
-              WHERE identifier.context_source_id = source.id
-          )
+        WHERE ? = 1
+           OR NOT EXISTS (
+                SELECT 1
+                FROM context_source_exact_identifiers identifier
+                WHERE identifier.context_source_id = source.id
+           )
         ORDER BY source.rowid
-        """
+        """,
+        (int(exact_identifier_index_complete is None),),
     )
     for source_id, save_id, title, body in missing_identifier_rows:
         identifiers = _migration_context_source_exact_identifiers(
             str(title or ""),
             str(body or ""),
         )
-        indexed_rows += max(1, len(identifiers))
-        if indexed_rows > _MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
-            raise RuntimeError("Context source index is too large to rebuild")
         connection.executemany(
             """
             INSERT OR IGNORE INTO context_source_exact_identifiers(

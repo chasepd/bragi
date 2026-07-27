@@ -399,6 +399,14 @@ def test_migrate_database_rebuilds_incomplete_exact_identifier_index(
             """,
             (source.id, save.id),
         )
+        connection.execute(
+            """
+            UPDATE context_sources
+            SET archived_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (source.id,),
+        )
         connection.commit()
 
     migrate_database(database_path)
