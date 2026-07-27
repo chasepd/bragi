@@ -3830,6 +3830,66 @@ def test_repositories_apply_context_visibility_before_search_limit(
     assert [hit.record for hit in hits] == [accessible]
 
 
+def test_repositories_apply_message_visibility_before_search_limit(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    hidden_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="A hidden moonstone rumor circulates.",
+    )
+    visible_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The public moonstone archive opens.",
+    )
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_message.id,
+        character_id=character.id,
+        visibility="not_visible",
+    )
+    for index in range(90):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="observation",
+            source_id=f"hidden-observation-{index:02d}",
+            title=f"moonstone hidden {index:02d}",
+            body="The moonstone opens the hidden archive.",
+            metadata={"source_message_ids": [hidden_message.id]},
+        )
+    accessible = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="observation",
+        source_id="accessible-observation",
+        title="moonstone public",
+        body="The moonstone opens the public archive.",
+        metadata={"source_message_ids": [visible_message.id]},
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"observation"},
+        limit=1,
+        visibility_character_ids={character.id},
+    )
+
+    assert [hit.record for hit in hits] == [accessible]
+
+
 def test_repositories_apply_blocked_scoped_targets_before_search_limit(
     repositories: PersistenceRepositories,
 ) -> None:

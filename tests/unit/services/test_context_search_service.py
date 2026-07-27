@@ -185,9 +185,16 @@ class SequenceToolContextProvider(RecordingStructuredContextProvider):
         self,
         *,
         responses: list[tuple[ProviderToolCall, ...] | Exception],
+        expansion_data: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
         self.responses = responses
+        self.expansion_data = expansion_data or {
+            "terms": [],
+            "phrases": [],
+            "entity_ids": [],
+        }
+        self.tool_expansion_requests: list[ToolCallRequest] = []
         self.tool_call_requests: list[ToolCallRequest] = []
 
     async def list_models(self) -> list[ProviderModel]:
@@ -218,6 +225,21 @@ class SequenceToolContextProvider(RecordingStructuredContextProvider):
         self,
         request: ToolCallRequest,
     ) -> ToolCallResponse:
+        if [tool.name for tool in request.tools] == ["expand_context_retrieval"]:
+            self.tool_expansion_requests.append(request)
+            return ToolCallResponse(
+                tool_calls=(
+                    ProviderToolCall(
+                        id="call-expansion",
+                        name="expand_context_retrieval",
+                        arguments_json=json.dumps(self.expansion_data),
+                    ),
+                ),
+                body="",
+                provider=request.provider,
+                model_id=request.model_id,
+                token_usage={"total": 11},
+            )
         self.tool_call_requests.append(request)
         if not self.responses:
             raise AssertionError("unexpected tool-call request")
@@ -423,6 +445,7 @@ class CountingPersistenceRepositories(PersistenceRepositories):
         limit: int,
         allowed_owner_names: set[str] | frozenset[str] | None = None,
         reference_character_ids: set[str] | frozenset[str] | None = None,
+        visibility_character_ids: set[str] | frozenset[str] | None = None,
         current_scene_snapshot_id: str | None = None,
         current_scene_generation: int | None = None,
         current_turn_number: int | None = None,
@@ -441,6 +464,7 @@ class CountingPersistenceRepositories(PersistenceRepositories):
             limit=limit,
             allowed_owner_names=allowed_owner_names,
             reference_character_ids=reference_character_ids,
+            visibility_character_ids=visibility_character_ids,
             current_scene_snapshot_id=current_scene_snapshot_id,
             current_scene_generation=current_scene_generation,
             current_turn_number=current_turn_number,
@@ -456,6 +480,7 @@ class CountingPersistenceRepositories(PersistenceRepositories):
         limit: int,
         allowed_owner_names: set[str] | frozenset[str] | None = None,
         reference_character_ids: set[str] | frozenset[str] | None = None,
+        visibility_character_ids: set[str] | frozenset[str] | None = None,
         current_scene_snapshot_id: str | None = None,
         current_scene_generation: int | None = None,
         current_turn_number: int | None = None,
@@ -470,6 +495,7 @@ class CountingPersistenceRepositories(PersistenceRepositories):
             limit=limit,
             allowed_owner_names=allowed_owner_names,
             reference_character_ids=reference_character_ids,
+            visibility_character_ids=visibility_character_ids,
             current_scene_snapshot_id=current_scene_snapshot_id,
             current_scene_generation=current_scene_generation,
             current_turn_number=current_turn_number,
@@ -3804,7 +3830,7 @@ def test_context_search_uses_structured_paraphrase_and_pronoun_expansion(
     assert [item.source_id for item in result.selected_memories] == [memory.id]
 
 
-def test_context_search_uses_tool_paraphrase_and_pronoun_expansion(
+def test_context_search_uses_tool_paraphrase_despite_noisy_lexical_hit(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(
@@ -3819,13 +3845,13 @@ def test_context_search_uses_tool_paraphrase_and_pronoun_expansion(
     memory = repositories.add_memory(
         save_id=save.id,
         body="The physician keeps antivenom in the western archive.",
-        tags=["medicine"],
+        tags=["remedy"],
         source_message_id=source_message.id,
     )
     repositories.add_memory(
         save_id=save.id,
-        body="The general store closes before sunset.",
-        tags=["market"],
+        body="The medicine market closes before sunset.",
+        tags=["medicine", "market"],
         source_message_id=source_message.id,
     )
     physician = repositories.add_character(
@@ -3842,23 +3868,10 @@ def test_context_search_uses_tool_paraphrase_and_pronoun_expansion(
     repositories.update_message_body(
         save_id=save.id,
         message_id=player_message.id,
-        body="Where did she store it?",
+        body="Where is the medicine stored?",
     )
     provider = SequenceToolContextProvider(
         responses=[
-            (
-                ProviderToolCall(
-                    id="call-expansion",
-                    name="expand_context_retrieval",
-                    arguments_json=json.dumps(
-                        {
-                            "terms": ["physician", "antivenom"],
-                            "phrases": [],
-                            "entity_ids": [physician.id],
-                        }
-                    ),
-                ),
-            ),
             (
                 ProviderToolCall(
                     id="call-memory",
@@ -3871,7 +3884,12 @@ def test_context_search_uses_tool_paraphrase_and_pronoun_expansion(
                     ),
                 ),
             ),
-        ]
+        ],
+        expansion_data={
+            "terms": ["physician", "antivenom"],
+            "phrases": [],
+            "entity_ids": [physician.id],
+        },
     )
     service = ContextSearchService(
         repositories=repositories,
@@ -3882,12 +3900,12 @@ def test_context_search_uses_tool_paraphrase_and_pronoun_expansion(
         service.search(save_id=save.id, player_message_id=player_message.id)
     )
 
-    assert len(provider.tool_call_requests) == 2
-    assert [tool.name for tool in provider.tool_call_requests[0].tools] == [
+    assert len(provider.tool_expansion_requests) == 1
+    assert [tool.name for tool in provider.tool_expansion_requests[0].tools] == [
         "expand_context_retrieval"
     ]
     assert memory.body in "\n".join(
-        message.body for message in provider.tool_call_requests[1].messages
+        message.body for message in provider.tool_call_requests[0].messages
     )
     assert [item.source_id for item in result.selected_memories] == [memory.id]
 

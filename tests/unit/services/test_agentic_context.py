@@ -268,7 +268,7 @@ def test_observation_service_drops_ungrounded_evidence_quotes(
                 "observations": [
                     {
                         "observation_type": "player_preference",
-                        "claim": "Mara wants grounded narration.",
+                        "claim": "Keep it grounded.",
                         "evidence_quote": "Keep it grounded",
                         "source_message_ids": [messages[0].id],
                         "scope": "durable",
@@ -305,7 +305,92 @@ def test_observation_service_drops_ungrounded_evidence_quotes(
     )
 
     assert result.observed_count == 1
-    assert result.observations[0].claim == "Mara wants grounded narration."
+    assert result.observations[0].claim == "Keep it grounded."
+
+
+def test_observation_service_rejects_claim_unrelated_to_real_evidence(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    messages = tuple(repositories.list_messages(save.id))
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        "observation_type": "world_fact",
+                        "claim": "Bob is secretly the murderer.",
+                        "evidence_quote": (
+                            "The lens flashes red and shows riders in the ash."
+                        ),
+                        "source_message_ids": [messages[1].id],
+                        "scope": "durable",
+                        "confidence": 0.99,
+                        "tags": ["mystery"],
+                    }
+                ]
+            }
+        }
+    )
+    service = ObservationService(
+        repositories=repositories,
+        extractor=StructuredProviderObservationExtractor(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="observer",
+        ),
+    )
+
+    result = asyncio.run(
+        service.observe_turn(
+            save_id=save.id,
+            source_message_ids=tuple(message.id for message in messages),
+        )
+    )
+
+    assert result.observed_count == 0
+    assert repositories.list_context_observations(save.id) == []
+
+
+def test_observation_service_caps_and_deduplicates_provider_candidates(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    messages = tuple(repositories.list_messages(save.id))
+    candidate = {
+        "observation_type": "player_preference",
+        "claim": "Keep it grounded.",
+        "evidence_quote": "Keep it grounded",
+        "source_message_ids": [messages[0].id],
+        "scope": "durable",
+        "confidence": 0.91,
+        "tags": ["tone"],
+    }
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [dict(candidate) for _ in range(100)]
+            }
+        }
+    )
+    service = ObservationService(
+        repositories=repositories,
+        extractor=StructuredProviderObservationExtractor(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="observer",
+        ),
+    )
+
+    result = asyncio.run(
+        service.observe_turn(
+            save_id=save.id,
+            source_message_ids=tuple(message.id for message in messages),
+        )
+    )
+
+    assert result.observed_count == 1
+    assert len(repositories.list_context_observations(save.id)) == 1
 
 
 def test_observation_service_rejects_unexpected_generated_script(
@@ -880,6 +965,64 @@ def test_context_curation_rejects_high_overlap_negation_contradiction(
                         "tags": ["vault"],
                         "grounding_status": "entailed",
                         "supporting_evidence_quote": "Mara has no key to the vault",
+                        "supporting_source_message_ids": [source.id],
+                    }
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 0
+    assert result.confirmation_count == 1
+    assert repositories.list_memories(save.id) == []
+
+
+def test_context_curation_rejects_high_overlap_relation_reversal(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    source = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara gave Ilyra the vault key.",
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="relationship",
+        claim="Mara gave Ilyra the vault key.",
+        evidence_quote="Mara gave Ilyra the vault key",
+        source_message_ids=[source.id],
+        scope="durable",
+        confidence=0.95,
+        tags=["vault"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "Vault key transfer.",
+                        "confidence": 0.95,
+                        "memory_body": "Ilyra gave Mara the vault key.",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["vault"],
+                        "grounding_status": "entailed",
+                        "supporting_evidence_quote": (
+                            "Mara gave Ilyra the vault key"
+                        ),
                         "supporting_source_message_ids": [source.id],
                     }
                 ]

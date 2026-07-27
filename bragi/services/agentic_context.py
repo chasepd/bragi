@@ -408,31 +408,51 @@ class ObservationService:
                 safety_transition=message.safety_transition,
             )
         )
-        records = tuple(
-            self.repositories.add_context_observation(
-                save_id=save_id,
-                observation_type=observation.observation_type,
-                claim=observation.claim,
-                evidence_quote=observation.evidence_quote,
-                source_message_ids=observation.source_message_ids,
-                scope=observation.scope,
-                confidence=observation.confidence,
-                tags=observation.tags,
-                metadata={"observer": "structured_output"},
-            )
-            for observation in extracted
-            if observation.claim.strip()
-            and _observation_evidence_is_grounded(
-                observation,
-                messages_by_id=messages_by_id,
-            )
-            and not _observation_script_policy_violations(
-                observation,
-                messages_by_id=messages_by_id,
-                mode=mode,
-            )
-            and not blocked_source_ids.intersection(observation.source_message_ids)
+        eligible = tuple(
+            {
+                (
+                    observation.observation_type,
+                    canonical_claim_fingerprint(observation.claim),
+                    tuple(observation.source_message_ids),
+                ): observation
+                for observation in extracted[:64]
+                if observation.claim.strip()
+                and _observation_evidence_is_grounded(
+                    observation,
+                    messages_by_id=messages_by_id,
+                )
+                and not _observation_script_policy_violations(
+                    observation,
+                    messages_by_id=messages_by_id,
+                    mode=mode,
+                )
+                and not blocked_source_ids.intersection(
+                    observation.source_message_ids
+                )
+            }.values()
         )
+        records: tuple[ContextObservationRecord, ...] = ()
+        if eligible:
+            self.repositories.begin_transaction()
+            try:
+                records = tuple(
+                    self.repositories.add_context_observation(
+                        save_id=save_id,
+                        observation_type=observation.observation_type,
+                        claim=observation.claim,
+                        evidence_quote=observation.evidence_quote,
+                        source_message_ids=observation.source_message_ids,
+                        scope=observation.scope,
+                        confidence=observation.confidence,
+                        tags=observation.tags,
+                        metadata={"observer": "structured_output"},
+                    )
+                    for observation in eligible
+                )
+                self.repositories.commit_transaction()
+            except Exception:
+                self.repositories.rollback_transaction()
+                raise
         return ObservationResult(
             save_id=save_id,
             observed_count=len(records),
@@ -1346,6 +1366,7 @@ def _observation_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object
         "properties": {
             "observations": {
                 "type": "array",
+                "maxItems": 64,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -1354,10 +1375,12 @@ def _observation_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object
                             "type": "string",
                             "enum": list(OBSERVATION_TYPES),
                         },
-                        "claim": {"type": "string"},
-                        "evidence_quote": {"type": "string"},
+                        "claim": {"type": "string", "maxLength": 2000},
+                        "evidence_quote": {"type": "string", "maxLength": 1000},
                         "source_message_ids": {
                             "type": "array",
+                            "maxItems": 8,
+                            "uniqueItems": True,
                             "items": source_schema,
                         },
                         "scope": {
@@ -1365,7 +1388,12 @@ def _observation_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object
                             "enum": ["turn", "scene", "save", "durable"],
                         },
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "tags": {
+                            "type": "array",
+                            "maxItems": 16,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "maxLength": 64},
+                        },
                     },
                     "required": [
                         "observation_type",
@@ -1411,7 +1439,7 @@ def _observations_from_data(
     allowed_ids = {message.id for message in messages}
     message_bodies_by_id = {message.id: message.body for message in messages}
     observations: list[ExtractedObservation] = []
-    for raw in raw_items:
+    for raw in raw_items[:64]:
         if not isinstance(raw, dict):
             raise ValueError("Observation extraction item must be an object")
         source_ids = tuple(
@@ -1419,8 +1447,8 @@ def _observations_from_data(
             for source_id in _string_tuple(raw.get("source_message_ids"))
             if source_id in allowed_ids
         )
-        claim = _string(raw.get("claim"))
-        evidence_quote = _string(raw.get("evidence_quote"))
+        claim = _string(raw.get("claim"))[:2000]
+        evidence_quote = _string(raw.get("evidence_quote"))[:1000]
         if not claim or not evidence_quote or not source_ids:
             continue
         if not any(
@@ -1451,13 +1479,31 @@ def _observation_evidence_is_grounded(
 ) -> bool:
     if not _meaningful_evidence_span(observation.evidence_quote):
         return False
-    return any(
+    quote_is_sourced = any(
         source_body is not None
         and quote_matches_source(observation.evidence_quote, source_body)
         for source_body in (
             messages_by_id.get(source_id)
             for source_id in observation.source_message_ids
         )
+    )
+    if not quote_is_sourced:
+        return False
+    if _grounding_negation_conflicts(
+        observation.claim,
+        observation.evidence_quote,
+    ):
+        return False
+    if _grounding_anchor_conflicts(
+        observation.claim,
+        observation.evidence_quote,
+    ):
+        return False
+    claim_terms = _grounding_terms(observation.claim)
+    evidence_terms = _grounding_terms(observation.evidence_quote)
+    return bool(
+        claim_terms
+        and len(claim_terms & evidence_terms) / len(claim_terms) >= 0.8
     )
 
 
@@ -3074,14 +3120,10 @@ def _memory_with_fingerprint(
     save_id: str,
     fingerprint: str,
 ) -> MemoryRecord | None:
-    for memory in repositories.list_memories(save_id):
-        existing_fingerprint = (
-            memory.claim_fingerprint
-            or canonical_claim_fingerprint(memory.body)
-        )
-        if existing_fingerprint == fingerprint:
-            return memory
-    return None
+    return repositories.get_memory_by_claim_fingerprint(
+        save_id=save_id,
+        claim_fingerprint=fingerprint,
+    )
 
 
 def _pending_memory_suggestion_with_fingerprint(
@@ -3210,6 +3252,11 @@ def _curated_decision_is_grounded(
     )
     if _grounding_negation_conflicts(proposed, observation.claim):
         return False
+    if (
+        decision.action == "durable_memory"
+        and _grounding_anchor_conflicts(proposed, observation.claim)
+    ):
+        return False
     proposed_terms = _grounding_terms(proposed)
     grounding_terms = _grounding_terms(grounding_text)
     if not proposed_terms:
@@ -3248,6 +3295,37 @@ def _grounding_negation_conflicts(proposed: str, observation_claim: str) -> bool
     proposed_negated = bool(_grounding_terms(proposed) & negations)
     observation_negated = bool(_grounding_terms(observation_claim) & negations)
     return proposed_negated != observation_negated
+
+
+def _grounding_anchor_conflicts(proposed: str, observation_claim: str) -> bool:
+    proposed_terms = tuple(_ordered_grounding_terms(proposed))
+    observation_terms = tuple(_ordered_grounding_terms(observation_claim))
+    return bool(
+        proposed_terms
+        and observation_terms
+        and proposed_terms[0] != observation_terms[0]
+    )
+
+
+def _ordered_grounding_terms(value: str) -> list[str]:
+    ignored = {
+        "a",
+        "an",
+        "and",
+        "for",
+        "from",
+        "into",
+        "that",
+        "the",
+        "this",
+        "was",
+        "with",
+    }
+    return [
+        term if len(term) <= 6 else term[:5]
+        for term in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
+        if term not in ignored
+    ]
 
 
 def _curated_memory_proposed_value(

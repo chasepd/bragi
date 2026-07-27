@@ -3152,6 +3152,7 @@ class PersistenceRepositories:
         limit: int,
         allowed_owner_names: set[str] | frozenset[str] | None = None,
         reference_character_ids: set[str] | frozenset[str] | None = None,
+        visibility_character_ids: set[str] | frozenset[str] | None = None,
         current_scene_snapshot_id: str | None = None,
         current_scene_generation: int | None = None,
         current_turn_number: int | None = None,
@@ -3172,6 +3173,7 @@ class PersistenceRepositories:
             alias="context_sources",
             allowed_owner_names=allowed_owner_names,
             reference_character_ids=reference_character_ids,
+            visibility_character_ids=visibility_character_ids,
             current_scene_snapshot_id=current_scene_snapshot_id,
             current_scene_generation=current_scene_generation,
             current_turn_number=current_turn_number,
@@ -3347,6 +3349,7 @@ class PersistenceRepositories:
         limit: int,
         allowed_owner_names: set[str] | frozenset[str] | None = None,
         reference_character_ids: set[str] | frozenset[str] | None = None,
+        visibility_character_ids: set[str] | frozenset[str] | None = None,
         current_scene_snapshot_id: str | None = None,
         current_scene_generation: int | None = None,
         current_turn_number: int | None = None,
@@ -3359,6 +3362,7 @@ class PersistenceRepositories:
             alias="context_sources",
             allowed_owner_names=allowed_owner_names,
             reference_character_ids=reference_character_ids,
+            visibility_character_ids=visibility_character_ids,
             current_scene_snapshot_id=current_scene_snapshot_id,
             current_scene_generation=current_scene_generation,
             current_turn_number=current_turn_number,
@@ -8327,6 +8331,45 @@ class PersistenceRepositories:
             for row in rows
         ]
 
+    def get_memory_by_claim_fingerprint(
+        self,
+        *,
+        save_id: str,
+        claim_fingerprint: str,
+    ) -> MemoryRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, body, tags_json, importance, source_message_id,
+                   source_message_ids_json, claim_fingerprint,
+                   source_observation_ids_json
+            FROM memories
+            WHERE save_id = ?
+              AND claim_fingerprint = ?
+              AND archived_at IS NULL
+            ORDER BY created_at, rowid
+            LIMIT 1
+            """,
+            (save_id, claim_fingerprint),
+        )
+        if row is None:
+            return None
+        return MemoryRecord(
+            id=row["id"],
+            save_id=row["save_id"],
+            body=row["body"],
+            tags=_load_list(row["tags_json"]),
+            importance=row["importance"],
+            source_message_id=row["source_message_id"],
+            source_message_ids=_memory_source_message_ids(
+                source_message_id=row["source_message_id"],
+                source_message_ids=_load_list(row["source_message_ids_json"]),
+            ),
+            claim_fingerprint=row["claim_fingerprint"],
+            source_observation_ids=_load_list(
+                row["source_observation_ids_json"]
+            ),
+        )
+
     def count_active_memories(self, save_id: str) -> int:
         row = self._fetch_one(
             """
@@ -10675,6 +10718,7 @@ def _context_source_eligibility_sql(
     alias: str,
     allowed_owner_names: set[str] | frozenset[str] | None,
     reference_character_ids: set[str] | frozenset[str] | None,
+    visibility_character_ids: set[str] | frozenset[str] | None,
     current_scene_snapshot_id: str | None,
     current_scene_generation: int | None,
     current_turn_number: int | None,
@@ -10683,6 +10727,21 @@ def _context_source_eligibility_sql(
 ) -> tuple[str, tuple[object, ...]]:
     clauses: list[str] = []
     params: list[object] = []
+    visibility_ids = tuple(sorted(visibility_character_ids or ()))
+    if visibility_ids:
+        clauses.append(
+            "NOT EXISTS ("
+            f"SELECT 1 FROM json_each({alias}.metadata_json, "
+            "'$.source_message_ids') source_message "
+            "JOIN message_visibility visibility "
+            f"ON visibility.save_id = {alias}.save_id "
+            "AND visibility.message_id = CAST(source_message.value AS TEXT) "
+            "WHERE visibility.visibility = 'not_visible' "
+            f"AND visibility.character_id IN "
+            f"({_placeholders(len(visibility_ids))})"
+            ")"
+        )
+        params.extend(visibility_ids)
     if allowed_owner_names is not None or reference_character_ids is not None:
         owners = tuple(sorted(allowed_owner_names or ()))
         character_ids = tuple(sorted(reference_character_ids or ()))

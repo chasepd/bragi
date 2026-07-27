@@ -576,6 +576,12 @@ class ContextSearchService:
                 cache_status=cache_status,
                 **_candidate_count_fields(candidates),
             )
+            preselection_revision = (
+                self.repositories.context_candidate_revision_token(
+                    save_id,
+                    ignored_message_id=player_message_id,
+                )
+            )
             requirement_error = _model_requirement_error(
                 repositories=self.repositories,
                 provider=preference.provider,
@@ -736,6 +742,7 @@ class ContextSearchService:
                 focus_message=focus_message,
                 result=result,
                 fallback_snapshot=narration_snapshot,
+                preselection_revision=preselection_revision,
             )
             result = replace(
                 result,
@@ -829,12 +836,18 @@ def _rehydrate_selected_context(
     focus_message: MessageRecord | None,
     result: ContextSearchResult,
     fallback_snapshot: NarrationContextSnapshot | None,
+    preselection_revision: str,
 ) -> tuple[ContextSearchResult, NarrationContextSnapshot | None]:
     selected_items = _selected_context_items(result)
     if not selected_items:
         return result, fallback_snapshot
 
-    ContinuityIndexService(repositories).sync_save(save_id)
+    current_revision = repositories.context_candidate_revision_token(
+        save_id,
+        ignored_message_id=player_message_id,
+    )
+    if current_revision != preselection_revision:
+        ContinuityIndexService(repositories).sync_save(save_id)
     details = repositories.load_save_details(save_id)
     if details is None:
         raise ValueError(f"Unknown save id: {save_id}")
@@ -975,6 +988,7 @@ def _indexed_context_source_retrieval(
         limit=PROTECTED_CONTEXT_SOURCE_LIMIT,
         allowed_owner_names=allowed_owner_names,
         reference_character_ids=reference_character_ids,
+        visibility_character_ids=set(turn_scope.present_character_ids),
         current_scene_snapshot_id=current_scene_snapshot_id,
         current_scene_generation=current_scene_generation,
         current_turn_number=current_turn_number,
@@ -987,6 +1001,7 @@ def _indexed_context_source_retrieval(
         limit=min(24, INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT),
         allowed_owner_names=allowed_owner_names,
         reference_character_ids=reference_character_ids,
+        visibility_character_ids=set(turn_scope.present_character_ids),
         current_scene_snapshot_id=current_scene_snapshot_id,
         current_scene_generation=current_scene_generation,
         current_turn_number=current_turn_number,
@@ -1001,6 +1016,7 @@ def _indexed_context_source_retrieval(
         limit=INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT,
         allowed_owner_names=allowed_owner_names,
         reference_character_ids=reference_character_ids,
+        visibility_character_ids=set(turn_scope.present_character_ids),
         current_scene_snapshot_id=current_scene_snapshot_id,
         current_scene_generation=current_scene_generation,
         current_turn_number=current_turn_number,
@@ -1093,15 +1109,7 @@ async def _retrieve_indexed_context_sources(
             model_id=model_id,
         )
     )
-    initial_hit_count = initial.diagnostics.get("indexed_retrieval_hit_count")
-    tool_expansion_needed = (
-        not isinstance(initial_hit_count, int | float)
-        or initial_hit_count <= 0
-        or _query_contains_referential_pronoun(latest_player_message)
-    )
     if supports_tools:
-        if not tool_expansion_needed:
-            return initial
         expanded_terms = await _tool_retrieval_expansion(
             repositories=repositories,
             provider=cast(ToolCallProvider, provider),
@@ -1416,26 +1424,6 @@ def _string_values(value: object, *, limit: int) -> tuple[str, ...]:
     )
 
 
-def _query_contains_referential_pronoun(value: str) -> bool:
-    return bool(
-        _meaningful_terms(value)
-        & {
-            "he",
-            "her",
-            "him",
-            "his",
-            "it",
-            "its",
-            "she",
-            "that",
-            "their",
-            "them",
-            "they",
-            "this",
-        }
-    )
-
-
 def _context_source_type_counts(
     records: list[ContextSourceRecord] | tuple[ContextSourceRecord, ...],
 ) -> dict[str, int]:
@@ -1561,6 +1549,8 @@ def _context_candidate_set(
             world_state,
             scoped_targets=scoped_targets,
             exclude_open_thread_aggregates=bool(indexed_candidates),
+            present_character_ids=turn_scope.present_character_ids,
+            message_visibility=message_visibility or [],
         )
         if include_missing_raw_candidates
         else ()
@@ -3560,10 +3550,20 @@ def _state_candidates(
     *,
     scoped_targets: ScopedTargets,
     exclude_open_thread_aggregates: bool = False,
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
     candidates: list[_ContextCandidate] = []
     for record in records:
         if exclude_open_thread_aggregates and is_open_threads_aggregate_key(record.key):
+            continue
+        if record.source_message_id and not (
+            _source_messages_visible_to_present_characters(
+                (record.source_message_id,),
+                present_character_ids=present_character_ids,
+                message_visibility=message_visibility,
+            )
+        ):
             continue
         text = _scoped_candidate_text(
             source_type="world_state",

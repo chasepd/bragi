@@ -1125,13 +1125,13 @@ class RecordingAgenticPipelineProvider(RecordingChatProvider):
             data = {
                 "observations": [
                     {
-                        "observation_type": "player_preference",
-                        "claim": "Mara likes concise narration.",
+                        "observation_type": "scene_detail",
+                        "claim": "I climb toward the beacon lens.",
                         "evidence_quote": "I climb toward the beacon lens.",
                         "source_message_ids": source_ids,
-                        "scope": "durable",
+                        "scope": "scene",
                         "confidence": 0.9,
-                        "tags": ["tone"],
+                        "tags": ["beacon"],
                     }
                 ]
             }
@@ -1143,12 +1143,12 @@ class RecordingAgenticPipelineProvider(RecordingChatProvider):
                     {
                         "observation_id": observation_id,
                         "action": "durable_memory",
-                        "reason": "Stable narrator preference.",
+                        "reason": "The action may matter later.",
                         "confidence": 0.88,
                         "memory_body": self.curation_memory_body,
                         "context_title": "",
                         "context_body": "",
-                        "tags": ["tone"],
+                        "tags": ["beacon"],
                     }
                 ]
             }
@@ -15392,7 +15392,7 @@ def test_submit_player_turn_uses_degraded_recovered_context(
         )
     )
 
-    assert len(primary.tool_call_requests) == 1
+    assert len(primary.tool_call_requests) == 2
     assert len(fallback.tool_call_requests) == 1
     assert len(primary.chat_requests) == 1
     narrator_request = primary.chat_requests[0]
@@ -18962,7 +18962,7 @@ def test_submit_player_turn_uses_state_only_extraction_when_agentic_curation_ava
                 }
             ],
         },
-        curation_memory_body="Mara likes concise, grounded narration.",
+        curation_memory_body="I climb toward the beacon lens.",
     )
     service = ChatService(
         repositories=repositories,
@@ -18998,7 +18998,7 @@ def test_submit_player_turn_uses_state_only_extraction_when_agentic_curation_ava
         "name": "Beacon gallery"
     }
     assert [memory.body for memory in repositories.list_memories(save.id)] == [
-        "Mara likes concise, grounded narration."
+        "I climb toward the beacon lens."
     ]
     state_jobs = [
         job
@@ -19122,7 +19122,7 @@ def test_submit_player_turn_queues_agentic_durable_memory_when_confirmation_enab
         "fake",
         events=events,
         state_data={"state_changes": [], "memories": []},
-        curation_memory_body="Mara likes concise, grounded narration.",
+        curation_memory_body="I climb toward the beacon lens.",
     )
     service = ChatService(
         repositories=repositories,
@@ -19146,9 +19146,7 @@ def test_submit_player_turn_queues_agentic_durable_memory_when_confirmation_enab
     assert len(suggestions) == 1
     assert suggestions[0].entity_type == "memory"
     proposed_value = cast(dict[str, Any], suggestions[0].proposed_value)
-    assert proposed_value["body"] == (
-        "Mara likes concise, grounded narration."
-    )
+    assert proposed_value["body"] == "I climb toward the beacon lens."
 
 
 def test_submit_player_turn_runs_scenario_evolution_after_state_memory_extraction(

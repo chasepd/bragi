@@ -6250,6 +6250,82 @@ def test_focused_scene_maintainer_does_not_create_unknown_scene_entities(
     ]
 
 
+def test_focused_scene_transition_expires_scratch_at_same_location(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    location = repositories.add_location(save_id=save.id, name="Beacon Gallery")
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=location.id,
+        situation="The watch studies the cracked lens.",
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="observation",
+        source_id="same-location-scratch",
+        title="Temporary lens state",
+        body="The cracked lens is still warm.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=1,
+        expires_after_turn_number=13,
+    )
+    narrator_message = repositories.update_message_body(
+        save_id=save.id,
+        message_id=narrator_message.id,
+        body="The narration cuts to a new scene in the Beacon Gallery.",
+    )
+    provider = SequenceToolCallProvider(
+        responses=[
+            (),
+            (
+                ProviderToolCall(
+                    id="same-location-scene-transition",
+                    name="set_scene_location_presence",
+                    arguments_json=json.dumps(
+                        {
+                            "current_location_name": "Beacon Gallery",
+                            "scene_transition": True,
+                            "source_message_id": narrator_message.id,
+                            "evidence_quote": (
+                                "cuts to a new scene in the Beacon Gallery"
+                            ),
+                            "reason": "The narration establishes a new scene.",
+                            "confidence": 0.98,
+                        }
+                    ),
+                ),
+            ),
+            (),
+        ]
+    )
+    service = module.ContextUpdateService(
+        repositories=repositories,
+        extractor=RecordingContextUpdateExtractor(module.ContextUpdateExtraction()),
+        focused_scene_maintainer=module.ToolCallingFocusedSceneMaintainer(
+            provider=provider,
+            provider_name="fake",
+            model_id="fake-context-update",
+        ),
+    )
+
+    asyncio.run(
+        service.update_after_turn(
+            save_id=save.id,
+            source_message_ids=(player_message.id, narrator_message.id),
+        )
+    )
+
+    updated_scene = repositories.get_scene_snapshot(save.id)
+    assert updated_scene is not None
+    assert updated_scene.current_location_id == location.id
+    assert updated_scene.scene_generation == scene.scene_generation + 1
+    assert repositories.get_context_source(scratch.id) is None
+
+
 def test_focused_scene_maintainer_uses_snapshot_emotion_scope_for_invalid_presence(
     repositories: PersistenceRepositories,
 ) -> None:
