@@ -45,11 +45,16 @@ def budget_chat_request(
     )
     if context_window is None:
         _log_unenforced_budget(request.provider, request.model_id, task)
+        reserved_output_tokens = _reserved_output_tokens(
+            request.max_output_tokens,
+            _CHAT_OUTPUT_RESERVES.get(task, DEFAULT_CHAT_OUTPUT_RESERVE),
+        )
         return _chat_request_with_budget_diagnostics(
-            request,
+            replace(request, max_output_tokens=reserved_output_tokens),
             {
                 "task": task,
                 "model_context_window": None,
+                "reserved_output_tokens": reserved_output_tokens,
                 "enforced": False,
                 "reason": "no_model_context_window",
                 "still_over_budget": None,
@@ -103,7 +108,16 @@ def budget_structured_output_request(
     )
     if context_window is None:
         _log_unenforced_budget(request.provider, request.model_id, task)
-        return request
+        return replace(
+            request,
+            max_output_tokens=_reserved_output_tokens(
+                request.max_output_tokens,
+                _STRUCTURED_OUTPUT_RESERVES.get(
+                    task,
+                    DEFAULT_STRUCTURED_OUTPUT_RESERVE,
+                ),
+            ),
+        )
     return enforce_structured_output_request_budget(
         request,
         model_context_window=context_window,
@@ -187,7 +201,16 @@ def budget_tool_call_request(
             task=task,
             reason="no_repository_context",
         )
-        return request
+        return replace(
+            request,
+            max_output_tokens=_reserved_output_tokens(
+                request.max_output_tokens,
+                _STRUCTURED_OUTPUT_RESERVES.get(
+                    task,
+                    DEFAULT_TOOL_CALL_OUTPUT_RESERVE,
+                ),
+            ),
+        )
     context_window = model_context_window(
         repositories,
         provider=request.provider,
@@ -195,7 +218,16 @@ def budget_tool_call_request(
     )
     if context_window is None:
         _log_unenforced_budget(request.provider, request.model_id, task)
-        return request
+        return replace(
+            request,
+            max_output_tokens=_reserved_output_tokens(
+                request.max_output_tokens,
+                _STRUCTURED_OUTPUT_RESERVES.get(
+                    task,
+                    DEFAULT_TOOL_CALL_OUTPUT_RESERVE,
+                ),
+            ),
+        )
     return enforce_tool_call_request_budget(
         request,
         model_context_window=context_window,

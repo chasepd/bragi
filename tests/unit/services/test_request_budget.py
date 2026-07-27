@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from typing import cast
+from unittest.mock import Mock
+
 import pytest
 
+from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     ChatMessage,
     ChatPromptPurpose,
@@ -13,10 +17,60 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.services.request_budget import (
+    budget_chat_request,
+    budget_structured_output_request,
+    budget_tool_call_request,
     enforce_chat_request_budget,
     enforce_structured_output_request_budget,
     enforce_tool_call_request_budget,
 )
+
+
+def test_unknown_windows_still_apply_provider_output_caps() -> None:
+    repository_mock = Mock()
+    repository_mock.list_provider_models.return_value = []
+    repositories = cast(PersistenceRepositories, repository_mock)
+
+    chat = budget_chat_request(
+        repositories,
+        ChatRequest(
+            provider="fake",
+            model_id="unknown",
+            messages=(ChatMessage(role="user", body="Continue."),),
+        ),
+        task="character_text",
+    )
+    structured = budget_structured_output_request(
+        repositories,
+        StructuredOutputRequest(
+            provider="fake",
+            model_id="unknown",
+            messages=(ChatMessage(role="user", body="Select."),),
+            schema_name="selection",
+            schema={"type": "object", "additionalProperties": False},
+        ),
+        task="context_search",
+    )
+    tool = budget_tool_call_request(
+        repositories,
+        ToolCallRequest(
+            provider="fake",
+            model_id="unknown",
+            messages=(ToolCallMessage(role="user", body="Select."),),
+            tools=(
+                ToolDefinition(
+                    name="select",
+                    description="Select.",
+                    parameters={"type": "object", "additionalProperties": False},
+                ),
+            ),
+        ),
+        task="context_search",
+    )
+
+    assert chat.max_output_tokens == 256
+    assert structured.max_output_tokens == 128
+    assert tool.max_output_tokens == 128
 
 
 def test_chat_budget_rejects_irreducible_core_before_dispatch() -> None:

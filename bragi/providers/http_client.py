@@ -741,7 +741,8 @@ def _safe_message_diagnostics(payload: dict[str, Any]) -> dict[str, object]:
 def _append_source_ids(source_ids: list[str], text: str) -> None:
     if len(source_ids) >= _MAX_CAPTURED_SOURCE_IDS:
         return
-    for source_type, identifier in _SOURCE_ID_PATTERN.findall(text):
+    for match in _SOURCE_ID_PATTERN.finditer(text):
+        source_type, identifier = match.groups()
         if source_type not in _TRUSTED_SOURCE_ID_TYPES:
             continue
         source_id = f"{source_type}:{identifier}"
