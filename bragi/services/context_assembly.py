@@ -102,6 +102,8 @@ class ContextSource:
     text: str
     reason: str = ""
     always_include: bool = False
+    relevance_query: str = ""
+    trimmable: bool = False
 
 
 @dataclass(frozen=True)
@@ -326,23 +328,45 @@ def apply_context_budget(
     included_chars = 0
     total_chars = sum(len(source.text) for source in sources)
     for source in sources:
-        char_count = len(source.text)
+        delivered_source = source
+        char_count = len(delivered_source.text)
         include = (
-            source.always_include
+            delivered_source.always_include
             or limit is None
             or included_chars + char_count <= limit
         )
+        trimmed = False
+        if (
+            not include
+            and limit is not None
+            and delivered_source.trimmable
+        ):
+            delivered_source = _trim_context_source_to_budget(
+                delivered_source,
+                limit=max(0, limit - included_chars),
+            )
+            char_count = len(delivered_source.text)
+            include = bool(delivered_source.text)
+            trimmed = include
         if include:
-            included.append(source)
+            included.append(delivered_source)
             included_chars += char_count
         breakdown.append(
             ContextSourceBreakdown(
-                tier=source.tier,
-                source_type=source.source_type,
-                source_id=source.source_id,
+                tier=delivered_source.tier,
+                source_type=delivered_source.source_type,
+                source_id=delivered_source.source_id,
                 char_count=char_count,
                 included=include,
-                reason=(source.reason or "included") if include else "budget_skipped",
+                reason=(
+                    "budget_trimmed"
+                    if trimmed
+                    else (
+                        (delivered_source.reason or "included")
+                        if include
+                        else "budget_skipped"
+                    )
+                ),
             )
         )
     return (
@@ -354,6 +378,103 @@ def apply_context_budget(
             included_chars=included_chars,
             sources=tuple(breakdown),
         ),
+    )
+
+
+def _trim_context_source_to_budget(
+    source: ContextSource,
+    *,
+    limit: int,
+) -> ContextSource:
+    if limit <= 0:
+        return replace(source, text="")
+    text = source.text
+    if len(text) <= limit:
+        return source
+    marker = _context_source_marker(text)
+    if marker and limit <= len(marker) + 4:
+        return replace(source, text="")
+    body = text[len(marker) :].lstrip() if marker else text
+    available = limit - len(marker)
+    if marker:
+        available -= 1
+    if available < 8:
+        return replace(source, text="")
+    excerpt = _relevance_centered_excerpt(
+        body,
+        query=source.relevance_query,
+        limit=available,
+    )
+    trimmed_text = f"{marker} {excerpt}" if marker else excerpt
+    return replace(source, text=trimmed_text)
+
+
+def _context_source_marker(text: str) -> str:
+    stripped = text.lstrip()
+    if not stripped.startswith("[") or "]" not in stripped:
+        return ""
+    marker_end = stripped.index("]") + 1
+    return stripped[:marker_end]
+
+
+def _relevance_centered_excerpt(
+    text: str,
+    *,
+    query: str,
+    limit: int,
+) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    if limit <= 3:
+        return "." * limit
+    lowered = compact.casefold()
+    positions = [
+        position
+        for term in _context_relevance_terms(query)
+        if (position := lowered.find(term)) >= 0
+    ]
+    anchor = (
+        sum(positions) // len(positions)
+        if positions
+        else len(compact) // 2
+    )
+    leading_marker = "..."
+    trailing_marker = "..."
+    content_limit = limit - len(leading_marker) - len(trailing_marker)
+    if content_limit <= 0:
+        return compact[:limit]
+    start = max(0, min(anchor - (content_limit // 2), len(compact) - content_limit))
+    end = min(len(compact), start + content_limit)
+    if start > 0:
+        next_space = compact.find(" ", start)
+        if 0 <= next_space < end:
+            start = next_space + 1
+    if end < len(compact):
+        previous_space = compact.rfind(" ", start, end)
+        if previous_space > start:
+            end = previous_space
+    excerpt = compact[start:end].strip()
+    return (
+        (leading_marker if start > 0 else "")
+        + excerpt
+        + (trailing_marker if end < len(compact) else "")
+    )[:limit]
+
+
+def _context_relevance_terms(query: str) -> tuple[str, ...]:
+    return tuple(
+        term
+        for term in re.findall(r"[a-z0-9']{3,}", query.casefold())
+        if term
+        not in {
+            "and",
+            "for",
+            "the",
+            "that",
+            "this",
+            "with",
+        }
     )
 
 

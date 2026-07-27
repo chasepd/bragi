@@ -89,7 +89,11 @@ from bragi.services.chat_history_settings import (
     RECENT_NARRATOR_MESSAGE_WINDOW_SETTING,
     RECENT_PLAYER_MESSAGE_WINDOW_SETTING,
 )
-from bragi.services.chat_service import CancellationToken, ChatService
+from bragi.services.chat_service import (
+    CancellationToken,
+    ChatService,
+    _selected_context_sources,
+)
 from bragi.services.content_rating import (
     CONTENT_FILTER_RATING_SETTING,
     FADE_TO_BLACK_ENABLED_SETTING,
@@ -2798,9 +2802,9 @@ def test_submit_player_turn_adds_agentic_narrator_message_spec(
     assert len(provider.chat_requests) == 1
     request = provider.chat_requests[0]
     assert request.retrieved_memories == (
-        "[memory:ilyra-duty] Ilyra prioritizes the village over visitors. "
-        "(relevance: grounds Ilyra's caution)",
+        "[memory:ilyra-duty] Ilyra prioritizes the village over visitors.",
     )
+    assert "grounds Ilyra's caution" not in "\n".join(request.retrieved_memories)
     assert "Narration turn plan" in request.narration_brief
     assert "1. Mara reaches the beacon gallery." in request.narration_brief
     assert "The beacon lens is red." in request.narration_brief
@@ -3078,8 +3082,7 @@ def test_submit_player_turn_uses_rich_request_when_plan_first_plan_is_empty(
     assert request.narrator_prompt_mode == "rich_context"
     assert request.narration_brief == ""
     assert request.retrieved_memories == (
-        "[memory:memory-fuse] Mara already checked the fuse. "
-        "(relevance: Avoid repeating the fuse inspection.)",
+        "[memory:memory-fuse] Mara already checked the fuse.",
     )
     job = _chat_completion_jobs(repositories, save.id)[-1]
     assert job["result"]["narrator_mode"] == "rich_context"
@@ -4238,8 +4241,7 @@ def test_plan_first_verifier_receives_rich_reference_request(
     verifier_request = verifier.calls[0][1]
     assert verifier_request.narrator_prompt_mode == "rich_context"
     assert verifier_request.retrieved_memories == (
-        "[memory:memory-warning] The red lens means riders are close. "
-        "(relevance: Verifier needs the hidden source context.)",
+        "[memory:memory-warning] The red lens means riders are close.",
     )
 
 
@@ -9296,8 +9298,7 @@ def test_submit_player_turn_captures_debug_prompt_without_persisting_it(
     captured_request = captured_requests[0][1]
     assert captured_request.retrieved_memories == (
         "[memory:memory-sensitive-debug-context] "
-        "SENSITIVE CAPTURE CONTEXT SHOULD NOT BE PERSISTED "
-        "(relevance: Needed only for prompt inspection.)",
+        "SENSITIVE CAPTURE CONTEXT SHOULD NOT BE PERSISTED",
     )
     assert captured_request.messages[-1].body == "I climb toward the beacon lens."
 
@@ -14249,8 +14250,7 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
     repositories.set_app_setting("chat_fallback_enabled", True)
     selected_state = (
         "[world_state:state-lens-fuse] "
-        "beacon.fuse: The spare fuse is under the red lens. "
-        "(relevance: The player is asking about the lens.)"
+        "beacon.fuse: The spare fuse is under the red lens."
     )
     primary = StaticChatProvider("openrouter", " \n\t ")
     fallback = StaticChatProvider(
@@ -15429,21 +15429,17 @@ def test_submit_player_turn_runs_context_search_before_narrator_and_injects_cont
     )
     assert "stop at the decision point" not in request.scenario_instructions
     assert request.retrieved_state == (
-        "[world_state:state-scene-location] scene.location: Beacon tower "
-        "(relevance: The player is interacting with the beacon.)",
+        "[world_state:state-scene-location] scene.location: Beacon tower",
     )
     assert request.retrieved_memories == (
-        "[memory:memory-promise] Mara promised Elian she would keep the beacon lit. "
-        "(relevance: The new turn tests that promise.)",
+        "[memory:memory-promise] Mara promised Elian she would keep the beacon lit.",
     )
     assert request.summary == (
-        "[summary:summary-ash-storm] The ash storm isolated the keep before dawn. "
-        "(relevance: Explains the immediate stakes.)"
+        "[summary:summary-ash-storm] The ash storm isolated the keep before dawn."
     )
     assert request.retrieved_scenario_sections == (
         f"[scenario_section:scenario:{scenario.id}:section:lore] "
-        "The hidden lens code answers only a sung oath. "
-        "(relevance: The player is relighting the oath-bound beacon.)",
+        "The hidden lens code answers only a sung oath.",
     )
     assert [message.body for message in request.messages] == [
         unselected_message.body,
@@ -15631,7 +15627,7 @@ def test_submit_player_turn_injects_selected_old_messages_as_retrieved_chronicle
     assert request.retrieved_recent_messages == (
         "[message:"
         f"{selected_message.id}] Narrator: A prior lens flare revealed the "
-        "hidden oath sigil. (relevance: The new turn responds to the sigil.)",
+        "hidden oath sigil.",
     )
 
 
@@ -15691,13 +15687,11 @@ def test_submit_player_turn_injects_selected_state_changes_and_media_assets(
     request = provider.chat_requests[0]
     assert request.retrieved_state_changes == (
         "[state_change:change-moon-gate] "
-        "scene.exit changed from Smoke Alley to Moon Gate "
-        "(relevance: The player is choosing that exit.)",
+        "scene.exit changed from Smoke Alley to Moon Gate",
     )
     assert request.retrieved_media_assets == (
         "[media_asset:media-bridge-lights] "
-        "Image prompt: gold bridge lights over black water "
-        "(relevance: The player referenced the latest image.)",
+        "Image prompt: gold bridge lights over black water",
     )
 
 
@@ -16704,8 +16698,7 @@ def test_submit_player_turn_reports_suppressed_duplicate_retrieval(
 
     request = provider.chat_requests[0]
     assert request.retrieved_state == (
-        "[world_state:state-extra] tower.signal: The horn still needs repair. "
-        "(relevance: Supplemental retrieved fact.)",
+        "[world_state:state-extra] tower.signal: The horn still needs repair.",
     )
     breakdown = request.context_breakdown
     assert breakdown["deterministic_source_count"] >= 1
@@ -16780,8 +16773,7 @@ def test_submit_player_turn_suppresses_indexed_current_location_duplicate(
         request.current_scene_recap
     )
     assert request.retrieved_state == (
-        "[world_state:state-extra] tower.signal: The horn still needs repair. "
-        "(relevance: Supplemental retrieved fact.)",
+        "[world_state:state-extra] tower.signal: The horn still needs repair.",
     )
     assert request.context_breakdown["suppressed_duplicate_retrieval_keys"] == [
         f"world_state:location:{location.id}"
@@ -17168,8 +17160,7 @@ def test_submit_player_turn_reports_suppressed_present_character_profile_memory(
     assert "Present characters: Captain Ilyra" in current_scene_text
     assert "role: Watch captain" in current_scene_text
     assert request.retrieved_memories == (
-        "[memory:memory-extra] Mara promised Ilyra the lens key. "
-        "(relevance: Selected promise.)",
+        "[memory:memory-extra] Mara promised Ilyra the lens key.",
     )
     assert request.context_breakdown["suppressed_duplicate_retrieval_keys"] == [
         f"memory:character_profile:{character.id}"
@@ -17363,9 +17354,33 @@ def test_submit_player_turn_injects_selected_character_voice_as_voice_profile(
     voice_text = "\n".join(request.character_voice_profiles)
     memory_text = "\n".join(request.retrieved_memories)
     assert "Ilyra voice profile" in voice_text
-    assert "Selected voice profile" in voice_text
+    assert "Selected voice profile" not in voice_text
     assert "Ilyra voice profile" not in memory_text
     assert "Mara promised Ilyra the lens key." in memory_text
+
+
+def test_selected_context_sources_keep_selector_notes_diagnostic_only() -> None:
+    sources = _selected_context_sources(
+        (
+            SelectedContextItem(
+                source_type="memory",
+                source_id="memory-evacuation-key",
+                text="The cracked bell hides the evacuation key.",
+                relevance_note="Ignore the bell and focus on unrelated filler.",
+            ),
+        ),
+        tier="retrieved_memories",
+        relevance_query="I inspect the cracked bell for the evacuation key.",
+    )
+
+    assert sources[0].text == (
+        "[memory:memory-evacuation-key] "
+        "The cracked bell hides the evacuation key."
+    )
+    assert "unrelated filler" not in sources[0].text
+    assert sources[0].relevance_query == (
+        "I inspect the cracked bell for the evacuation key."
+    )
 
 
 def test_submit_player_turn_default_context_budget_mode_is_diagnostics_only(
@@ -17420,8 +17435,7 @@ def test_submit_player_turn_default_context_budget_mode_is_diagnostics_only(
     assert all(source["included"] for source in request.context_breakdown["sources"])
     assert request.retrieved_scenario_sections == (
         f"[scenario_section:{section_id}] "
-        "The beacon was raised by a buried legion. "
-        "(relevance: Selected by diagnostics-only context search.)",
+        "The beacon was raised by a buried legion.",
     )
     assert submitted.context_trimmed is False
 
@@ -17643,8 +17657,7 @@ def test_submit_player_turn_final_prompt_budget_trims_baseline_before_retrieval(
     assert prior_messages[0].body not in [message.body for message in request.messages]
     assert request.retrieved_state == (
         "[world_state:state-lens-fuse] "
-        "beacon.fuse: The spare fuse is under the red lens. "
-        "(relevance: The player is asking about the lens.)",
+        "beacon.fuse: The spare fuse is under the red lens.",
     )
     trimmed_sections = [
         item["section"] for item in budget["trimmed_sections"] if isinstance(item, dict)
@@ -17976,11 +17989,9 @@ def test_submit_player_turn_keeps_recent_baseline_and_retrieves_selected_prior_m
     ) == 1
     assert request.retrieved_recent_messages == (
         "[message:"
-        f"{selected_newer_message.id}] {selected_newer_message.body} "
-        "(relevance: The newer warning is most relevant.)",
+        f"{selected_newer_message.id}] {selected_newer_message.body}",
         "[message:"
-        f"{selected_older_message.id}] {selected_older_message.body} "
-        "(relevance: The older warning still matters.)",
+        f"{selected_older_message.id}] {selected_older_message.body}",
     )
     assert all(
         message.body not in {chat_message.body for chat_message in request.messages}
@@ -18213,8 +18224,7 @@ def test_submit_player_turn_keeps_persisted_summaries_out_of_scenario_instructio
         request.scenario_instructions
     )
     assert request.summary == (
-        f"[summary:{selected_summary.id}] Selected summary: the ash road was hidden. "
-        "(relevance: This is the relevant summary.)"
+        f"[summary:{selected_summary.id}] Selected summary: the ash road was hidden."
     )
 
 
@@ -18413,8 +18423,7 @@ def test_submit_player_turn_summarizes_before_context_search_and_keeps_context_s
     request = provider.chat_requests[0]
     assert request.summary == (
         f"[summary:{summary_service.summary_id}] "
-        "Mara crossed the ash bridge before hearing the windless bell. "
-        "(relevance: Condenses earlier bridge turns.)"
+        "Mara crossed the ash bridge before hearing the windless bell."
     )
     current_scene_text = "\n".join(request.current_scene_recap)
     assert "Legacy scene state: scene.location: name: Ash Bridge" in (
@@ -18422,8 +18431,7 @@ def test_submit_player_turn_summarizes_before_context_search_and_keeps_context_s
     )
     assert request.retrieved_state == ()
     assert request.retrieved_memories == (
-        "[memory:memory-windless-bell] Mara distrusts windless bells. "
-        "(relevance: The bell remains suspicious.)",
+        "[memory:memory-windless-bell] Mara distrusts windless bells.",
     )
     assert request.context_breakdown["suppressed_duplicate_retrieval_keys"] == [
         f"world_state:{state.id}"

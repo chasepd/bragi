@@ -390,6 +390,39 @@ def test_apply_context_budget_reports_metadata_and_skips_over_budget_sources() -
     assert adaptive.budget_limit_chars == 5
 
 
+def test_apply_context_budget_relevance_trims_selected_canonical_source() -> None:
+    source = ContextSource(
+        tier="retrieved_memories",
+        source_type="memory",
+        source_id="memory-1",
+        text=(
+            "[memory:memory-1] Opening context. "
+            + ("unrelated filler " * 30)
+            + "The cracked bell hides the evacuation key. "
+            + ("closing filler " * 20)
+        ),
+        reason="selected by context search",
+        relevance_query="cracked bell evacuation key",
+        trimmable=True,
+    )
+
+    selected, breakdown = apply_context_budget(
+        (source,),
+        settings=ContextBudgetSettings(
+            mode=CONTEXT_BUDGET_MODE_FIXED_CHARS,
+            fixed_total_chars=140,
+        ),
+    )
+
+    assert len(selected) == 1
+    assert len(selected[0].text) <= 140
+    assert selected[0].text.startswith("[memory:memory-1]")
+    assert "cracked bell hides the evacuation key" in selected[0].text
+    assert breakdown.included_chars == len(selected[0].text)
+    assert breakdown.sources[0].included is True
+    assert breakdown.sources[0].reason == "budget_trimmed"
+
+
 def test_narrator_context_always_includes_current_in_world_time_under_tight_budget(
     repositories: PersistenceRepositories,
 ) -> None:

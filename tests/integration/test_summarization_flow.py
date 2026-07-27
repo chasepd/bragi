@@ -101,9 +101,7 @@ class SummarizationContextNarratorProvider:
             "world_state:state-ash-bridge"
         ]
         assert request.retrieved_memories == (
-            "[memory:memory-bell] Mara distrusts bells that ring without wind. "
-            "| fact_type: memory | importance: 1 "
-            f"(relevance: {self.memory_note})",
+            "[memory:memory-bell] Mara distrusts bells that ring without wind.",
         )
         assert [message.body for message in request.messages] == [
             "I step onto the ash bridge.",
