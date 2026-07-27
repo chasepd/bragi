@@ -86,6 +86,7 @@ CHARACTER_FIELD_ENHANCEMENT_FIELDS = (
 )
 MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS = 2
 MAX_CHARACTER_FIELD_ENHANCEMENT_ATTEMPTS = 3
+CHARACTER_STARTER_OUTPUT_TOKENS_PER_CHARACTER = 1024
 RELATIONSHIP_ENTRY_TARGET_KEYS = (
     "name",
     "character",
@@ -297,13 +298,17 @@ class StructuredProviderCharacterProfileCompleter:
         self,
         request: CharacterStarterGenerationRequest,
     ) -> tuple[ScenarioCharacterStarter, ...]:
+        target_count = _starter_generation_target_count(request)
         structured_request = StructuredOutputRequest(
             provider=self.provider_name,
             model_id=self.model_id,
             schema_name="scenario_character_starters",
-            schema=_character_starter_generation_schema(),
+            schema=_character_starter_generation_schema(target_count),
             messages=_character_starter_generation_messages(request),
             temperature=0.35,
+            max_output_tokens=(
+                CHARACTER_STARTER_OUTPUT_TOKENS_PER_CHARACTER * target_count
+            ),
         )
         task = _starter_generation_task(request.scenario_type)
         structured_request = request_with_openrouter_routing(
@@ -320,35 +325,43 @@ class StructuredProviderCharacterProfileCompleter:
         )
         for _attempt in range(MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS + 1):
             current_request = replace(structured_request, messages=tuple(messages))
-            if self.repositories is not None and self.providers is not None:
-                response = await structured_output_with_fallback(
-                    repositories=self.repositories,
-                    providers=self.providers,
-                    request=current_request,
-                    task=task,
-                    save_id=request.save_id,
-                )
-            else:
-                response = await self.provider.generate_structured_output(
-                    budget_structured_output_request(
-                        self.repositories,
-                        current_request,
-                        task=task,
-                    )
-                )
+            attempt_error: ProviderError
             try:
-                starters = _validated_generated_starters_from_data(
-                    response.data,
-                    request=request,
-                    phrase_denylist=phrase_denylist,
-                )
-                return starters
+                if self.repositories is not None and self.providers is not None:
+                    response = await structured_output_with_fallback(
+                        repositories=self.repositories,
+                        providers=self.providers,
+                        request=current_request,
+                        task=task,
+                        save_id=request.save_id,
+                    )
+                else:
+                    response = await self.provider.generate_structured_output(
+                        budget_structured_output_request(
+                            self.repositories,
+                            current_request,
+                            task=task,
+                        )
+                    )
             except ProviderError as exc:
-                last_error = exc
+                if exc.category != ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID:
+                    raise
+                attempt_error = exc
+            else:
+                try:
+                    starters = _validated_generated_starters_from_data(
+                        response.data,
+                        request=request,
+                        phrase_denylist=phrase_denylist,
+                    )
+                    return starters
+                except ProviderError as exc:
+                    attempt_error = exc
+            last_error = attempt_error
             messages.append(
                 ChatMessage(
                     role="user",
-                    body=_starter_generation_retry_feedback(last_error),
+                    body=_starter_generation_retry_feedback(attempt_error),
                 )
             )
         if last_error is not None:
@@ -1162,7 +1175,9 @@ def _profile_completion_schema(
     }
 
 
-def _character_starter_generation_schema() -> dict[str, object]:
+def _character_starter_generation_schema(
+    target_count: int,
+) -> dict[str, object]:
     return {
         "type": "object",
         "additionalProperties": False,
@@ -1170,6 +1185,8 @@ def _character_starter_generation_schema() -> dict[str, object]:
             "characters": {
                 "type": "array",
                 "items": _character_starter_generation_item_schema(),
+                "minItems": target_count,
+                "maxItems": target_count,
             }
         },
         "required": ["characters"],
@@ -1178,28 +1195,29 @@ def _character_starter_generation_schema() -> dict[str, object]:
 
 def _character_starter_generation_item_schema() -> dict[str, object]:
     string_array = {"type": "array", "items": {"type": "string"}}
+    properties: dict[str, object] = {
+        "name": {"type": "string"},
+        "aliases": string_array,
+        "role": {"type": "string"},
+        "age": {"type": "string"},
+        "known_state": {"type": "string"},
+        "appearance": {"type": "string"},
+        "visual_notes": {"type": "string"},
+        "personality": {"type": "string"},
+        "voice": {"type": "string"},
+        "texting_style": {"type": "string"},
+        "goals": {"type": "string"},
+        "motivations": {"type": "string"},
+        "current_intent": {"type": "string"},
+        "boundaries": {"type": "string"},
+        "attitude_toward_player": {"type": "string"},
+        "cooperation_conditions": {"type": "string"},
+    }
     return {
         "type": "object",
         "additionalProperties": False,
-        "properties": {
-            "name": {"type": "string"},
-            "aliases": string_array,
-            "role": {"type": "string"},
-            "age": {"type": "string"},
-            "known_state": {"type": "string"},
-            "appearance": {"type": "string"},
-            "visual_notes": {"type": "string"},
-            "personality": {"type": "string"},
-            "voice": {"type": "string"},
-            "texting_style": {"type": "string"},
-            "goals": {"type": "string"},
-            "motivations": {"type": "string"},
-            "current_intent": {"type": "string"},
-            "boundaries": {"type": "string"},
-            "attitude_toward_player": {"type": "string"},
-            "cooperation_conditions": {"type": "string"},
-        },
-        "required": ["name"],
+        "properties": properties,
+        "required": list(properties),
     }
 
 
@@ -1325,7 +1343,9 @@ def _character_starter_generation_messages(
                 "response schema. "
                 f"{custom_instruction} Do not return the player character. Do "
                 "not return any existing starter or alias. Do not repeat names "
-                "or first names in the generated starters. Fill concise role, "
+                "or first names in the generated starters. Return every schema "
+                "field for every starter; use an empty string or empty aliases "
+                "array when the draft does not support a value. Fill concise role, "
                 "age, known_state, appearance, visual_notes, personality, "
                 "voice, texting_style, and all agency fields from the draft "
                 "context and request: goals, motivations, current intent, "

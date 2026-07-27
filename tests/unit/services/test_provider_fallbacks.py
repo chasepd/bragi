@@ -760,6 +760,40 @@ def test_structured_output_fallback_attempts_configured_provider(
     assert response.data == {"selected": ["memory-1"]}
 
 
+def test_structured_output_fallback_recovers_from_schema_violation(
+    repositories: PersistenceRepositories,
+) -> None:
+    _save_primary_structured_model(repositories)
+    _configure_working_structured_fallback(repositories)
+    primary = RecordingStructuredProvider(
+        provider_name="primary",
+        error=ProviderError(
+            ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID,
+            "Structured provider response violated its JSON Schema",
+        ),
+    )
+    fallback = RecordingStructuredProvider(
+        provider_name="fallback",
+        response_data={"selected": ["memory-1"]},
+    )
+
+    response = asyncio.run(
+        structured_output_with_fallback(
+            repositories=repositories,
+            providers={"primary": primary, "fallback": fallback},
+            request=_structured_request(),
+            task="context_search",
+            save_id="save-1",
+        )
+    )
+
+    assert len(primary.structured_output_requests) == 1
+    assert len(fallback.structured_output_requests) == 1
+    assert response.provider == "fallback"
+    assert response.model_id == "fallback-structured"
+    assert response.data == {"selected": ["memory-1"]}
+
+
 def test_structured_output_fallback_keeps_model_available_after_model_not_found(
     repositories: PersistenceRepositories,
 ) -> None:
