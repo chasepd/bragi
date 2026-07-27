@@ -81,6 +81,7 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
+from bragi.services.request_budget import budget_tool_call_request
 from bragi.services.tool_call_helpers import (
     CONTEXT_SEARCH_TOOL_RETRY_INSTRUCTION,
     accepted_tool_result,
@@ -1475,6 +1476,7 @@ async def _select_context_with_tool_calls(
     )
     try:
         result = await _select_context_with_tool_feedback(
+            repositories=repositories,
             provider=provider,
             request=request,
             candidates=candidates,
@@ -1613,12 +1615,22 @@ async def _recover_context_tool_selection(
     save_id: str | None,
     primary_error: Exception | None,
 ) -> _ContextSelectionOutcome:
-    fallback_request = tool_call_fallback_request(
-        repositories=repositories,
-        providers=providers,
-        request=request,
-        save_id=save_id,
-    )
+    try:
+        fallback_request = tool_call_fallback_request(
+            repositories=repositories,
+            providers=providers,
+            request=request,
+            save_id=save_id,
+            task="context_search",
+        )
+    except ProviderError as exc:
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=request.provider,
+            primary_model_id=request.model_id,
+            fallback_skipped_reason="fallback_request_over_budget",
+            exc=exc,
+        )
     if fallback_request is None:
         reason = tool_call_fallback_skip_reason(
             repositories=repositories,
@@ -1666,6 +1678,7 @@ async def _recover_context_tool_selection(
     )
     try:
         result = await _select_context_with_tool_feedback(
+            repositories=repositories,
             provider=fallback_provider,
             request=fallback_request,
             candidates=candidates,
@@ -1803,6 +1816,7 @@ def _mark_provider_model_unavailable_for_error(
 
 async def _select_context_with_tool_feedback(
     *,
+    repositories: PersistenceRepositories,
     provider: ToolCallProvider,
     request: ToolCallRequest,
     candidates: tuple[_ContextCandidate, ...],
@@ -1821,9 +1835,12 @@ async def _select_context_with_tool_feedback(
     last_errors: list[str] = []
 
     for _turn in range(MAX_CONTEXT_SEARCH_TOOL_FEEDBACK_TURNS + 1):
-        response = await provider.generate_tool_calls(
-            replace(request, messages=tuple(messages))
+        turn_request = budget_tool_call_request(
+            repositories,
+            replace(request, messages=tuple(messages)),
+            task="context_search",
         )
+        response = await provider.generate_tool_calls(turn_request)
         errors: list[str] = []
         tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
         for call in response.tool_calls:

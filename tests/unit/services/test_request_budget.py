@@ -7,11 +7,15 @@ from bragi.providers.contracts import (
     ChatPromptPurpose,
     ChatRequest,
     StructuredOutputRequest,
+    ToolCallMessage,
+    ToolCallRequest,
+    ToolDefinition,
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.services.request_budget import (
     enforce_chat_request_budget,
     enforce_structured_output_request_budget,
+    enforce_tool_call_request_budget,
 )
 
 
@@ -70,4 +74,44 @@ def test_structured_budget_reserves_output_and_schema_tokens() -> None:
     estimated_schema_tokens = diagnostics["estimated_schema_tokens"]
     assert isinstance(estimated_schema_tokens, int)
     assert estimated_schema_tokens > 100
+    assert diagnostics["still_over_budget"] is True
+
+
+def test_tool_call_budget_reserves_output_and_tool_schema_tokens() -> None:
+    request = ToolCallRequest(
+        provider="fake",
+        model_id="tools",
+        messages=(ToolCallMessage(role="user", body="Select matching context."),),
+        tools=(
+            ToolDefinition(
+                name="select_context",
+                description="Select matching context.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "source_id": {
+                            "type": "string",
+                            "enum": ["source-" + "x" * 800],
+                        }
+                    },
+                    "required": ["source_id"],
+                    "additionalProperties": False,
+                },
+            ),
+        ),
+        max_output_tokens=64,
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        enforce_tool_call_request_budget(
+            request,
+            model_context_window=200,
+            task="context_search",
+        )
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics["reserved_output_tokens"] == 64
+    estimated_tool_tokens = diagnostics["estimated_tool_tokens"]
+    assert isinstance(estimated_tool_tokens, int)
+    assert estimated_tool_tokens > 100
     assert diagnostics["still_over_budget"] is True

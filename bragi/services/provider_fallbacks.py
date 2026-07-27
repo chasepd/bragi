@@ -50,6 +50,7 @@ from bragi.services.provider_diagnostics import (
 from bragi.services.request_budget import (
     budget_chat_request,
     budget_structured_output_request,
+    budget_tool_call_request,
 )
 
 CHAT_FALLBACK_ENABLED_SETTING = "chat_fallback_enabled"
@@ -595,6 +596,7 @@ def tool_call_fallback_request(
     providers: dict[str, ProviderClient],
     request: ToolCallRequest,
     save_id: str | None,
+    task: str = TOOL_CALL_FALLBACK_TASK,
 ) -> ToolCallRequest | None:
     preference = _fallback_preference(
         repositories=repositories,
@@ -612,7 +614,7 @@ def tool_call_fallback_request(
         required=TOOL_CALLING_CAPABILITIES,
     ):
         return None
-    return request_with_openrouter_routing(
+    fallback = request_with_openrouter_routing(
         repositories,
         request_with_model_thinking_preference(
             repositories,
@@ -628,6 +630,11 @@ def tool_call_fallback_request(
         ),
         task=TOOL_CALL_FALLBACK_TASK,
         save_id=save_id,
+    )
+    return budget_tool_call_request(
+        repositories,
+        fallback,
+        task=task,
     )
 
 
