@@ -57,7 +57,10 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
-from bragi.services.request_budget import budget_tool_call_request
+from bragi.services.request_budget import (
+    budget_structured_output_request,
+    budget_tool_call_request,
+)
 from bragi.services.sexual_content_safety import is_fade_to_black_message
 from bragi.services.state_preservation import preserve_replaced_world_state_memory
 from bragi.services.text_script_policy import (
@@ -266,7 +269,11 @@ class StructuredProviderStateExtractor:
             )
         else:
             response = await self.provider.generate_structured_output(
-                structured_request
+                budget_structured_output_request(
+                    self.repositories,
+                    structured_request,
+                    task="state_memory",
+                )
             )
         extraction = _state_extraction_from_structured_data(
             response.data,

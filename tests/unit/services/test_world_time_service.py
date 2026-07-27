@@ -661,6 +661,7 @@ def test_world_time_service_applies_structured_time_update(
     assert snapshot.world_day_index == 0
     assert snapshot.last_updated_message_id == message_id
     assert provider.requests[0].schema_name == "world_time_advance"
+    assert provider.requests[0].max_output_tokens == 1024
     assert "world_day_index: 0" in provider.requests[0].messages[1].body
 
 

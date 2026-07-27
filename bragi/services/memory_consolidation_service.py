@@ -35,7 +35,10 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
-from bragi.services.request_budget import budget_tool_call_request
+from bragi.services.request_budget import (
+    budget_structured_output_request,
+    budget_tool_call_request,
+)
 from bragi.services.text_script_policy import (
     DEFAULT_SCRIPT_GUARD_MODE,
     ScriptPolicyViolation,
@@ -306,7 +309,11 @@ class MemoryConsolidationService:
             )
         else:
             response = await self.provider.generate_structured_output(
-                structured_request,
+                budget_structured_output_request(
+                    self.repositories,
+                    structured_request,
+                    task="context_update",
+                ),
             )
         return _clusters_from_structured_data(response.data)
 
