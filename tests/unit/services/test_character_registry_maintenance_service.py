@@ -55,7 +55,7 @@ class RecordingStructuredMaintenanceProvider:
                 model_id="fake-character-maintenance",
                 display_name="Fake Character Maintenance",
                 capabilities=frozenset({ProviderCapability.STRUCTURED_OUTPUT}),
-                context_window=8192,
+                context_window=32768,
             )
         ]
 
@@ -106,7 +106,7 @@ class RecordingToolMaintenanceProvider:
                 model_id="fake-character-maintenance",
                 display_name="Fake Character Maintenance",
                 capabilities=frozenset({ProviderCapability.TOOL_CALLING}),
-                context_window=8192,
+                context_window=32768,
             )
         ]
 
@@ -1283,7 +1283,7 @@ def _configure_character_maintenance_model(
         model_id="fake-character-maintenance",
         display_name="Fake Character Maintenance",
         capabilities=capabilities or ["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="character_registry_maintenance",

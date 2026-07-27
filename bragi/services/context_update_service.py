@@ -91,6 +91,7 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
+from bragi.services.request_budget import budget_tool_call_request
 from bragi.services.scene_snapshot_locks import scene_snapshot_field_is_locked
 from bragi.services.sexual_content_safety import is_fade_to_black_message
 from bragi.services.tool_call_helpers import (
@@ -1142,9 +1143,12 @@ class ToolCallingProviderContextUpdater:
         last_errors: list[str] = []
 
         for _turn in range(MAX_CONTEXT_UPDATE_TOOL_FEEDBACK_TURNS + 1):
-            response = await provider.generate_tool_calls(
-                replace(request, messages=tuple(messages))
+            turn_request = budget_tool_call_request(
+                self.repositories,
+                replace(request, messages=tuple(messages)),
+                task="context_update",
             )
+            response = await provider.generate_tool_calls(turn_request)
             errors: list[str] = []
             tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
             for call in response.tool_calls:
@@ -1204,9 +1208,12 @@ class ToolCallingProviderContextUpdater:
         last_errors: list[str] = []
 
         for _turn in range(MAX_CONTEXT_UPDATE_TOOL_FEEDBACK_TURNS + 1):
-            response = await provider.generate_tool_calls(
-                replace(request, messages=tuple(messages))
+            turn_request = budget_tool_call_request(
+                self.repositories,
+                replace(request, messages=tuple(messages)),
+                task="context_update",
             )
+            response = await provider.generate_tool_calls(turn_request)
             errors: list[str] = []
             tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
             for call in response.tool_calls:
@@ -1287,9 +1294,12 @@ class ToolCallingProviderContextUpdater:
         )
 
         for turn in range(MAX_CONTEXT_UPDATE_TOOL_FEEDBACK_TURNS + 1):
-            response = await provider.generate_tool_calls(
-                replace(request, messages=tuple(messages))
+            turn_request = budget_tool_call_request(
+                self.repositories,
+                replace(request, messages=tuple(messages)),
+                task="context_update",
             )
+            response = await provider.generate_tool_calls(turn_request)
             errors: list[str] = []
             tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
             raw_calls = [_tool_call_diagnostic(call) for call in response.tool_calls]
@@ -1618,9 +1628,12 @@ class ToolCallingFocusedSceneMaintainer:
         last_errors: list[str] = []
 
         for turn in range(MAX_CONTEXT_UPDATE_TOOL_FEEDBACK_TURNS + 1):
-            response = await self.provider.generate_tool_calls(
-                replace(tool_request, messages=tuple(messages))
+            turn_request = budget_tool_call_request(
+                self.repositories,
+                replace(tool_request, messages=tuple(messages)),
+                task="context_update",
             )
+            response = await self.provider.generate_tool_calls(turn_request)
             errors: list[str] = []
             tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
             raw_calls = [_tool_call_diagnostic(call) for call in response.tool_calls]

@@ -62,3 +62,24 @@ def test_validate_structured_output_accepts_nested_valid_data() -> None:
         schema=schema,
         schema_name="nested",
     )
+
+
+def test_validation_diagnostics_do_not_echo_provider_property_names() -> None:
+    provider_property = "private-provider-property"
+
+    with pytest.raises(StructuredOutputValidationError) as exc_info:
+        validate_structured_output(
+            {provider_property: {"value": 17}},
+            schema={
+                "type": "object",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            },
+            schema_name="safe_diagnostics",
+        )
+
+    assert provider_property not in repr(exc_info.value.diagnostics)

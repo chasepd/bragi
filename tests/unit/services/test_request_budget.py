@@ -41,6 +41,22 @@ def test_chat_budget_rejects_irreducible_core_before_dispatch() -> None:
     assert exc_info.value.diagnostics["still_over_budget"] is True
 
 
+def test_chat_budget_sets_provider_output_cap_from_reserve() -> None:
+    request = ChatRequest(
+        provider="fake",
+        model_id="chat",
+        messages=(ChatMessage(role="user", body="Continue."),),
+    )
+
+    budgeted = enforce_chat_request_budget(
+        request,
+        model_context_window=4096,
+        task="character_text",
+    )
+
+    assert budgeted.max_output_tokens == 256
+
+
 def test_structured_budget_reserves_output_and_schema_tokens() -> None:
     request = StructuredOutputRequest(
         provider="fake",
@@ -115,3 +131,36 @@ def test_tool_call_budget_reserves_output_and_tool_schema_tokens() -> None:
     assert isinstance(estimated_tool_tokens, int)
     assert estimated_tool_tokens > 100
     assert diagnostics["still_over_budget"] is True
+
+
+def test_structured_and_tool_budgets_set_provider_output_caps() -> None:
+    structured = enforce_structured_output_request_budget(
+        StructuredOutputRequest(
+            provider="fake",
+            model_id="structured",
+            messages=(ChatMessage(role="user", body="Select."),),
+            schema_name="selection",
+            schema={"type": "object", "additionalProperties": False},
+        ),
+        model_context_window=4096,
+        task="context_search",
+    )
+    tool = enforce_tool_call_request_budget(
+        ToolCallRequest(
+            provider="fake",
+            model_id="tools",
+            messages=(ToolCallMessage(role="user", body="Select."),),
+            tools=(
+                ToolDefinition(
+                    name="select",
+                    description="Select.",
+                    parameters={"type": "object", "additionalProperties": False},
+                ),
+            ),
+        ),
+        model_context_window=4096,
+        task="context_search",
+    )
+
+    assert structured.max_output_tokens == 128
+    assert tool.max_output_tokens == 128

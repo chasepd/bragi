@@ -37,6 +37,7 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
+from bragi.services.request_budget import budget_tool_call_request
 from bragi.services.tool_call_helpers import (
     accepted_tool_result,
     append_tool_feedback_messages,
@@ -639,9 +640,12 @@ class ToolCallingProviderCharacterProfileCompleter:
         completed_by_key: dict[str, ScenarioCharacterStarter] = {}
         last_errors: list[str] = []
         for _turn in range(MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS + 1):
-            response = await provider.generate_tool_calls(
-                replace(request, messages=tuple(messages))
+            turn_request = budget_tool_call_request(
+                self.repositories,
+                replace(request, messages=tuple(messages)),
+                task="scenario_generation",
             )
+            response = await provider.generate_tool_calls(turn_request)
             errors: list[str] = []
             tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
             for call in response.tool_calls:
@@ -689,9 +693,12 @@ class ToolCallingProviderCharacterProfileCompleter:
         validation_failure_count = 0
         max_turns = MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS + 1
         for turn_index in range(max_turns):
-            response = await provider.generate_tool_calls(
-                replace(request, messages=tuple(messages))
+            turn_request = budget_tool_call_request(
+                self.repositories,
+                replace(request, messages=tuple(messages)),
+                task="character_enhancement",
             )
+            response = await provider.generate_tool_calls(turn_request)
             errors: list[str] = []
             tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
             for call in response.tool_calls:

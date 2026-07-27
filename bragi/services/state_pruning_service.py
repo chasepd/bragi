@@ -49,6 +49,7 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
+from bragi.services.request_budget import budget_tool_call_request
 from bragi.services.tool_call_helpers import (
     accepted_tool_result,
     append_tool_feedback_messages,
@@ -584,6 +585,7 @@ async def _select_pruned_state_with_tool_fallback(
 ) -> tuple[PrunedWorldStateFact, ...]:
     try:
         return await _select_pruned_state_with_tool_feedback(
+            repositories=repositories,
             provider=provider,
             request=request,
             active_state=active_state,
@@ -628,6 +630,7 @@ async def _select_pruned_state_with_tool_fallback(
         )
         try:
             return await _select_pruned_state_with_tool_feedback(
+                repositories=repositories,
                 provider=fallback_provider,
                 request=fallback_request,
                 active_state=active_state,
@@ -642,6 +645,7 @@ async def _select_pruned_state_with_tool_fallback(
 
 async def _select_pruned_state_with_tool_feedback(
     *,
+    repositories: PersistenceRepositories,
     provider: ToolCallProvider,
     request: ToolCallRequest,
     active_state: tuple[WorldStateRecord, ...],
@@ -654,9 +658,12 @@ async def _select_pruned_state_with_tool_feedback(
     last_errors: list[str] = []
 
     for _turn in range(MAX_STATE_PRUNING_TOOL_FEEDBACK_TURNS + 1):
-        response = await provider.generate_tool_calls(
-            replace(request, messages=tuple(messages))
+        turn_request = budget_tool_call_request(
+            repositories,
+            replace(request, messages=tuple(messages)),
+            task="state_pruning",
         )
+        response = await provider.generate_tool_calls(turn_request)
         errors: list[str] = []
         tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
         for call in response.tool_calls:

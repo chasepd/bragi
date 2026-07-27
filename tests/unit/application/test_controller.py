@@ -84,7 +84,7 @@ class RuntimeFakeProvider:
                 model_id="fake-chat",
                 display_name="Fake Chat",
                 capabilities=frozenset({ProviderCapability.CHAT}),
-                context_window=8192,
+                context_window=32768,
             ),
             ProviderModel(
                 provider=self.provider_name,
@@ -10012,7 +10012,7 @@ def test_run_summary_backfill_compacts_save_and_can_apply_windows(
         model_id="fake-summary",
         display_name="Fake Summary",
         capabilities=[ProviderCapability.CHAT.value],
-        context_window=1024,
+        context_window=8192,
     )
     repositories.set_scoped_setting(
         scope="save",

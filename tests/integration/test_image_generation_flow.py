@@ -54,7 +54,7 @@ class FakeImageProvider:
                         ProviderCapability.STRUCTURED_OUTPUT,
                     }
                 ),
-                context_window=8192,
+                context_window=32768,
             ),
             ProviderModel(
                 provider=self.provider_name,

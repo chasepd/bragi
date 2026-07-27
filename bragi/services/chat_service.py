@@ -8780,12 +8780,15 @@ def _apply_final_prompt_budget(
         "estimated_tokens_after": estimated_tokens_before,
         "enforced": False,
         "trimmed": False,
-        "still_over_budget": False,
+        "still_over_budget": None,
         "trimmed_sections": [],
     }
     if model_context_window is None or model_context_window <= 0:
         diagnostics["reason"] = "no_model_context_window"
-        return _request_with_final_prompt_diagnostics(request, diagnostics)
+        return _request_with_final_prompt_diagnostics(
+            replace(request, max_output_tokens=reserved_output_tokens),
+            diagnostics,
+        )
 
     input_limit_tokens = max(0, model_context_window - reserved_output_tokens)
     diagnostics["input_limit_tokens"] = input_limit_tokens
@@ -8816,7 +8819,10 @@ def _apply_final_prompt_budget(
             ),
             diagnostics=diagnostics,
         )
-    return _request_with_final_prompt_diagnostics(request, diagnostics)
+    return _request_with_final_prompt_diagnostics(
+        replace(request, max_output_tokens=reserved_output_tokens),
+        diagnostics,
+    )
 
 
 def _trim_final_prompt_to_limit(

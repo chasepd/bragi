@@ -178,7 +178,7 @@ class RecordingChatProvider:
                 model_id=f"{self.provider_name}-chat",
                 display_name=f"{self.provider_name.title()} Chat",
                 capabilities=frozenset({ProviderCapability.CHAT}),
-                context_window=8192,
+                context_window=32768,
             )
         ]
 
@@ -229,7 +229,7 @@ class RecordingContextAndChatProvider(RecordingChatProvider):
                 model_id=f"{self.provider_name}-chat",
                 display_name=f"{self.provider_name.title()} Chat",
                 capabilities=frozenset({ProviderCapability.CHAT}),
-                context_window=8192,
+                context_window=32768,
             ),
         ]
 
@@ -279,7 +279,7 @@ class ToolContextAndChatProvider(RecordingChatProvider):
                 model_id=f"{self.provider_name}-chat",
                 display_name=f"{self.provider_name.title()} Chat",
                 capabilities=frozenset({ProviderCapability.CHAT}),
-                context_window=8192,
+                context_window=32768,
             ),
         ]
 
@@ -318,7 +318,7 @@ class DatingRouteProfileChatProvider(RecordingChatProvider):
                 model_id=f"{self.provider_name}-chat",
                 display_name=f"{self.provider_name.title()} Chat",
                 capabilities=frozenset({ProviderCapability.CHAT}),
-                context_window=8192,
+                context_window=32768,
             ),
             ProviderModel(
                 provider=self.provider_name,
@@ -386,14 +386,14 @@ class RecordingLookAroundProvider(RecordingChatProvider):
                 model_id=f"{self.provider_name}-chat",
                 display_name=f"{self.provider_name.title()} Chat",
                 capabilities=frozenset({ProviderCapability.CHAT}),
-                context_window=8192,
+                context_window=32768,
             ),
             ProviderModel(
                 provider=self.provider_name,
                 model_id=f"{self.provider_name}-structured",
                 display_name=f"{self.provider_name.title()} Structured",
                 capabilities=frozenset({ProviderCapability.STRUCTURED_OUTPUT}),
-                context_window=8192,
+                context_window=32768,
             ),
         ]
 
@@ -446,14 +446,14 @@ class RecordingNarratorPlanningProvider(RecordingChatProvider):
                 model_id=f"{self.provider_name}-chat",
                 display_name=f"{self.provider_name.title()} Chat",
                 capabilities=frozenset({ProviderCapability.CHAT}),
-                context_window=8192,
+                context_window=32768,
             ),
             ProviderModel(
                 provider=self.provider_name,
                 model_id=f"{self.provider_name}-planner",
                 display_name=f"{self.provider_name.title()} Planner",
                 capabilities=frozenset({ProviderCapability.STRUCTURED_OUTPUT}),
-                context_window=8192,
+                context_window=32768,
             ),
         ]
 
@@ -492,7 +492,7 @@ class RecordingCyoaChatProvider(RecordingChatProvider):
                         ProviderCapability.STRUCTURED_OUTPUT,
                     }
                 ),
-                context_window=8192,
+                context_window=32768,
             )
         ]
 
@@ -5414,7 +5414,7 @@ def test_hybrid_post_turn_mode_does_not_duplicate_verified_planned_memory(
             model_id=model_id,
             display_name=model_id,
             capabilities=["chat"] if task == "chat" else ["structured_output"],
-            context_window=8192,
+            context_window=32768,
         )
         repositories.set_model_preference(
             task=task,
@@ -5535,7 +5535,7 @@ def test_plan_owned_post_turn_mode_keeps_hybrid_fallback_for_partial_coverage(
             model_id=model_id,
             display_name=model_id,
             capabilities=["chat"] if task == "chat" else ["structured_output"],
-            context_window=8192,
+            context_window=32768,
         )
         repositories.set_model_preference(
             task=task,
@@ -5669,7 +5669,7 @@ def test_plan_owned_post_turn_mode_falls_back_when_commits_still_need_updates(
             model_id=model_id,
             display_name=model_id,
             capabilities=["chat"] if task == "chat" else ["structured_output"],
-            context_window=8192,
+            context_window=32768,
         )
         repositories.set_model_preference(
             task=task,
@@ -5792,7 +5792,7 @@ def test_plan_owned_post_turn_mode_skips_legacy_inference_for_verified_noop(
             model_id=model_id,
             display_name=model_id,
             capabilities=["chat"] if task == "chat" else ["structured_output"],
-            context_window=8192,
+            context_window=32768,
         )
         repositories.set_model_preference(
             task=task,
@@ -5935,7 +5935,7 @@ def test_plan_owned_post_turn_mode_falls_back_to_hybrid_for_weak_plan_coverage(
             model_id=model_id,
             display_name=model_id,
             capabilities=["chat"] if task == "chat" else ["structured_output"],
-            context_window=8192,
+            context_window=32768,
         )
         repositories.set_model_preference(
             task=task,
@@ -7591,7 +7591,7 @@ def test_submit_player_turn_uses_configured_fallback_after_streaming_retry_failu
         model_id="venice/fallback-chat",
         display_name="Venice Fallback Chat",
         capabilities=["chat", "fallback_marker"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_app_setting("chat_fallback_enabled", True)
     _configure_content_safety_model(repositories)
@@ -8158,7 +8158,7 @@ def test_chat_fallback_filters_unsupported_generation_settings(
     assert primary.chat_requests[0].max_output_tokens == 1800
     assert len(fallback.chat_requests) == 1
     assert fallback.chat_requests[0].temperature is None
-    assert fallback.chat_requests[0].max_output_tokens is None
+    assert fallback.chat_requests[0].max_output_tokens == 1200
 
 
 def test_submit_player_turn_includes_save_custom_instructions(
@@ -10159,7 +10159,7 @@ def test_submit_player_turn_debug_logging_records_stage_metadata_without_story_t
             model_id="anthropic/claude-3.5-sonnet",
             display_name="Claude 3.5 Sonnet",
             capabilities=["chat"],
-            context_window=8192,
+            context_window=32768,
         )
         repositories.set_model_preference(
             task="chat",
@@ -10493,7 +10493,7 @@ def test_run_post_turn_jobs_does_not_prune_state_after_extraction(
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -10670,7 +10670,7 @@ def test_run_post_turn_jobs_runs_context_update_after_state_memory_before_later_
             model_id=model_id,
             display_name=display_name,
             capabilities=["structured_output"],
-            context_window=8192,
+            context_window=32768,
         )
         repositories.set_model_preference(
             task=task,
@@ -10965,7 +10965,7 @@ def test_run_post_turn_jobs_prefers_tool_calling_for_context_update(
             model_id=model_id,
             display_name=display_name,
             capabilities=capabilities,
-            context_window=8192,
+            context_window=32768,
         )
         repositories.set_model_preference(
             task=task,
@@ -11041,7 +11041,7 @@ def test_run_post_turn_jobs_prefers_tool_calling_for_state_memory(
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output", "tool_calling"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -11105,7 +11105,7 @@ def test_run_post_turn_jobs_skips_context_update_without_structured_output_capab
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -11117,7 +11117,7 @@ def test_run_post_turn_jobs_skips_context_update_without_structured_output_capab
         model_id="fake-context-update",
         display_name="Fake Context Update",
         capabilities=["chat"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="context_update",
@@ -11177,7 +11177,7 @@ def test_run_post_turn_jobs_skips_context_update_with_missing_catalog_row(
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -11242,7 +11242,7 @@ def test_run_post_turn_jobs_leaves_character_maintenance_for_scheduler(
         model_id="fake-character-maintenance",
         display_name="Fake Character Maintenance",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="character_registry_maintenance",
@@ -12001,7 +12001,7 @@ def test_run_post_turn_jobs_queues_state_retry_and_blocks_dependents(
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -12092,7 +12092,7 @@ def test_run_post_turn_jobs_queues_state_retry_when_extractor_unavailable(
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["chat"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -12162,7 +12162,7 @@ def test_run_state_extraction_retries_applies_once_and_queues_context_retry(
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -14295,7 +14295,7 @@ def test_submit_player_turn_uses_fallback_for_blank_primary_response(
         model_id="venice/fallback-chat",
         display_name="Venice Fallback Chat",
         capabilities=["chat", "fallback_marker"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_app_setting("chat_fallback_enabled", True)
     primary = StaticChatProvider("openrouter", " \n\t ")
@@ -14375,7 +14375,7 @@ def test_plan_first_narrator_request_is_preserved_for_fallback_model(
         model_id="venice/fallback-chat",
         display_name="Venice Fallback Chat",
         capabilities=["chat", "fallback_marker"],
-        context_window=8192,
+        context_window=32768,
     )
     planner = ScriptedNarratorPlanner(
         NarratorMessageSpec(
@@ -14451,14 +14451,14 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
-        context_window=2600,
+        context_window=6500,
     )
     repositories.save_provider_model(
         provider="venice",
         model_id="venice/fallback-chat",
         display_name="Venice Fallback Chat",
         capabilities=["chat", "fallback_marker"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="chat",
@@ -14510,13 +14510,13 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
 
     assert primary.chat_requests[0].retrieved_state == ()
     primary_budget = primary.chat_requests[0].context_breakdown["final_prompt_budget"]
-    assert primary_budget["model_context_window"] == 2600
+    assert primary_budget["model_context_window"] == 6500
     assert primary_budget["trimmed"] is True
     assert fallback.chat_requests[0].retrieved_state == (selected_state,)
     fallback_budget = fallback.chat_requests[0].context_breakdown[
         "final_prompt_budget"
     ]
-    assert fallback_budget["model_context_window"] == 8192
+    assert fallback_budget["model_context_window"] == 32768
     assert fallback_budget["trimmed"] is False
 
 
@@ -14555,7 +14555,7 @@ def test_submit_player_turn_prefers_narrator_fallback_over_text_fallback(
             model_id=model_id,
             display_name="Fallback Chat",
             capabilities=["chat"],
-            context_window=8192,
+            context_window=32768,
         )
     repositories.set_app_setting("chat_fallback_enabled", True)
     primary = StaticChatProvider("openrouter", " \n\t ")
@@ -14617,7 +14617,7 @@ def test_submit_player_turn_uses_fallback_for_fast_provider_retries(
         model_id="venice/fallback-chat",
         display_name="Venice Fallback Chat",
         capabilities=["chat", "fallback_marker"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_app_setting("chat_fallback_enabled", True)
     primary = FailingChatProvider(
@@ -14723,7 +14723,7 @@ def test_submit_player_turn_skips_fallback_for_missing_base_capability(
         model_id="venice/fallback-chat",
         display_name=f"Venice Fallback Chat {case_id}",
         capabilities=capabilities,
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_app_setting("chat_fallback_enabled", True)
     primary = StaticChatProvider("openrouter", " \n\t ")
@@ -14796,7 +14796,7 @@ def test_submit_player_turn_skips_unavailable_fallback_model(
         model_id="venice/fallback-chat",
         display_name="Venice Fallback Chat",
         capabilities=["chat", "fallback_marker"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.mark_missing_provider_models_unavailable(
         provider="venice",
@@ -14859,7 +14859,7 @@ def test_submit_player_turn_records_failed_fallback_marker(
         model_id="venice/fallback-chat",
         display_name="Venice Fallback Chat",
         capabilities=["chat", "fallback_marker"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_app_setting("chat_fallback_enabled", True)
     primary = StaticChatProvider("openrouter", " \n\t ")
@@ -14928,7 +14928,7 @@ def test_submit_player_turn_uses_fallback_for_content_safety_header(
         model_id="venice/fallback-chat",
         display_name="Venice Fallback Chat",
         capabilities=["chat", "fallback_marker"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_app_setting("chat_fallback_enabled", True)
     primary = StaticChatProvider(
@@ -17839,7 +17839,7 @@ def test_submit_player_turn_final_prompt_budget_trims_baseline_before_retrieval(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
-        context_window=3000,
+        context_window=8000,
     )
     repositories.set_model_preference(
         task="chat",
@@ -17915,7 +17915,7 @@ def test_final_prompt_budget_trims_pending_suggestions_before_messages() -> None
             pending_context_suggestions=("Pending review: " + "storm " * 1800,),
             max_output_tokens=1,
         ),
-        model_context_window=1000,
+        model_context_window=8000,
     )
 
     budget = request.context_breakdown["final_prompt_budget"]
@@ -17940,7 +17940,7 @@ def test_final_prompt_budget_can_trim_phone_context() -> None:
             phone_context=("Phone thread: Mika " + "late message " * 1800,),
             max_output_tokens=1,
         ),
-        model_context_window=1000,
+        model_context_window=8000,
     )
 
     budget = request.context_breakdown["final_prompt_budget"]
@@ -17984,7 +17984,7 @@ def test_submit_player_turn_final_prompt_budget_trims_selected_retrieval(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
-        context_window=3000,
+        context_window=8000,
     )
     repositories.set_model_preference(
         task="chat",
@@ -18059,7 +18059,7 @@ def test_final_prompt_budget_preserves_summary_before_low_priority_retrieval() -
             ),
             max_output_tokens=1,
         ),
-        model_context_window=1500,
+        model_context_window=6000,
     )
 
     budget = request.context_breakdown["final_prompt_budget"]
@@ -18120,6 +18120,7 @@ def test_submit_player_turn_final_prompt_budget_diagnostics_only_without_model_w
     budget = request.context_breakdown["final_prompt_budget"]
     assert budget["enforced"] is False
     assert budget["reason"] == "no_model_context_window"
+    assert budget["still_over_budget"] is None
     assert budget["trimmed"] is False
     assert prior_message.body in [message.body for message in request.messages]
     assert submitted.context_trimmed is False
@@ -18578,7 +18579,7 @@ def test_submit_player_turn_summarizes_before_context_search_and_keeps_context_s
         model_id="fake-chat",
         display_name="Fake Chat",
         capabilities=["chat"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="chat",
@@ -18660,7 +18661,7 @@ def test_submit_player_turn_summarizes_before_context_search_and_keeps_context_s
     )
 
     assert events == ["summarization", "context_search", "narrator_chat"]
-    assert summary_service.calls == [(save.id, 8192)]
+    assert summary_service.calls == [(save.id, 32768)]
     assert context_search.calls == [(save.id, result.player_message.id)]
     request = provider.chat_requests[0]
     assert request.summary == (
@@ -18730,7 +18731,7 @@ def test_submit_player_turn_counts_pending_player_message_for_summary_pressure(
         model_id="fake-chat",
         display_name="Fake Chat",
         capabilities=["chat"],
-        context_window=3000,
+        context_window=12000,
     )
     repositories.set_model_preference(
         task="chat",
@@ -18759,7 +18760,7 @@ def test_submit_player_turn_counts_pending_player_message_for_summary_pressure(
         summary_service=SummaryService(
             repositories=repositories,
             providers={"fake-summary": summary_provider},
-            threshold=0.03,
+            threshold=0.01,
         ),
     )
 
@@ -18809,7 +18810,7 @@ def test_submit_player_turn_extracts_state_and_memory_with_structured_model(
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -18926,7 +18927,7 @@ def test_submit_player_turn_uses_state_only_extraction_when_agentic_curation_ava
             model_id=model_id,
             display_name=model_id,
             capabilities=["structured_output"],
-            context_window=8192,
+            context_window=32768,
         )
         repositories.set_model_preference(
             task=task,
@@ -19029,7 +19030,7 @@ def test_submit_player_turn_falls_back_to_state_memory_when_curation_unavailable
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -19104,7 +19105,7 @@ def test_submit_player_turn_queues_agentic_durable_memory_when_confirmation_enab
             model_id=model_id,
             display_name=model_id,
             capabilities=["structured_output"],
-            context_window=8192,
+            context_window=32768,
         )
         repositories.set_model_preference(
             task=task,
@@ -19166,7 +19167,7 @@ def test_submit_player_turn_runs_scenario_evolution_after_state_memory_extractio
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -19178,7 +19179,7 @@ def test_submit_player_turn_runs_scenario_evolution_after_state_memory_extractio
         model_id="fake-scenario-evolution",
         display_name="Fake Scenario Evolution",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="scenario_evolution",
@@ -19311,7 +19312,7 @@ def test_scenario_evolution_not_due_records_configured_interval_skip_job(
         model_id="fake-scenario-evolution",
         display_name="Fake Scenario Evolution",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="scenario_evolution",
@@ -19392,7 +19393,7 @@ def test_retired_character_interaction_state_extraction_has_no_special_guidance(
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -19461,7 +19462,7 @@ def test_first_contact_state_extraction_prompt_tracks_partial_knowledge(
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -19525,7 +19526,7 @@ def test_submit_player_turn_does_not_fail_when_state_memory_extraction_fails(
         model_id="fake-state-memory",
         display_name="Fake State Memory",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="state_memory",
@@ -19584,7 +19585,7 @@ def test_submit_player_turn_continues_when_summarization_fails(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="chat",
@@ -19642,7 +19643,7 @@ def test_submit_player_turn_continues_when_summarization_fails(
     )
 
     assert events == ["summarization", "context_search", "narrator_chat"]
-    assert summary_service.calls == [(save.id, 8192)]
+    assert summary_service.calls == [(save.id, 32768)]
     assert summary_service.pending_messages[0] == PendingMessageEstimate(
         body="I climb toward the beacon lens."
     )

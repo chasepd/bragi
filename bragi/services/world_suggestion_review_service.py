@@ -37,6 +37,7 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
+from bragi.services.request_budget import budget_tool_call_request
 from bragi.services.tool_call_helpers import (
     accepted_tool_result,
     append_tool_feedback_messages,
@@ -383,11 +384,13 @@ class WorldSuggestionReviewService:
     ) -> tuple[SuggestionReviewDecision, ...]:
         if self.providers is None:
             return await _review_groups_with_tool_feedback(
+                repositories=self.repositories,
                 provider=provider,
                 request=request,
             )
         try:
             return await _review_groups_with_tool_feedback(
+                repositories=self.repositories,
                 provider=provider,
                 request=request,
             )
@@ -437,6 +440,7 @@ class WorldSuggestionReviewService:
             )
             try:
                 return await _review_groups_with_tool_feedback(
+                    repositories=self.repositories,
                     provider=fallback_provider,
                     request=fallback_request,
                 )
@@ -812,6 +816,7 @@ def _decisions_from_data(data: dict[str, Any]) -> tuple[SuggestionReviewDecision
 
 async def _review_groups_with_tool_feedback(
     *,
+    repositories: PersistenceRepositories,
     provider: ToolCallProvider,
     request: ToolCallRequest,
 ) -> tuple[SuggestionReviewDecision, ...]:
@@ -822,9 +827,12 @@ async def _review_groups_with_tool_feedback(
     last_errors: list[str] = []
 
     for _turn in range(MAX_WORLD_SUGGESTION_REVIEW_TOOL_FEEDBACK_TURNS + 1):
-        response = await provider.generate_tool_calls(
-            replace(request, messages=tuple(messages))
+        turn_request = budget_tool_call_request(
+            repositories,
+            replace(request, messages=tuple(messages)),
+            task="world_suggestion_review",
         )
+        response = await provider.generate_tool_calls(turn_request)
         errors: list[str] = []
         tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
         for call in response.tool_calls:

@@ -42,6 +42,7 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
+from bragi.services.request_budget import budget_tool_call_request
 from bragi.services.sexual_content_safety import is_fade_to_black_message
 from bragi.services.tool_call_helpers import (
     accepted_tool_result,
@@ -342,6 +343,7 @@ class ToolCallingProviderScenarioEvolver:
         )
         if self.providers is None:
             return await _scenario_evolution_with_tool_feedback(
+                repositories=repositories,
                 provider=self.provider,
                 request=tool_request,
                 allowed_sections=allowed_sections,
@@ -741,6 +743,7 @@ async def _scenario_evolution_with_tool_fallback(
 ) -> ScenarioEvolution:
     try:
         return await _scenario_evolution_with_tool_feedback(
+            repositories=repositories,
             provider=provider,
             request=request,
             allowed_sections=allowed_sections,
@@ -766,6 +769,7 @@ async def _scenario_evolution_with_tool_fallback(
             raise provider_error_with_fallback_skipped_reason(exc, reason) from exc
         try:
             return await _scenario_evolution_with_tool_feedback(
+                repositories=repositories,
                 provider=fallback_provider,
                 request=fallback_request,
                 allowed_sections=allowed_sections,
@@ -781,6 +785,7 @@ async def _scenario_evolution_with_tool_fallback(
 
 async def _scenario_evolution_with_tool_feedback(
     *,
+    repositories: PersistenceRepositories,
     provider: ToolCallProvider,
     request: ToolCallRequest,
     allowed_sections: tuple[str, ...],
@@ -794,9 +799,12 @@ async def _scenario_evolution_with_tool_feedback(
     last_errors: list[str] = []
 
     for _turn in range(MAX_SCENARIO_EVOLUTION_TOOL_FEEDBACK_TURNS + 1):
-        response = await provider.generate_tool_calls(
-            replace(request, messages=tuple(messages))
+        turn_request = budget_tool_call_request(
+            repositories,
+            replace(request, messages=tuple(messages)),
+            task="scenario_evolution",
         )
+        response = await provider.generate_tool_calls(turn_request)
         errors: list[str] = []
         turn_results: list[
             tuple[

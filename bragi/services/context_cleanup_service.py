@@ -50,6 +50,7 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
+from bragi.services.request_budget import budget_tool_call_request
 from bragi.services.scene_snapshot_locks import scene_snapshot_field_is_locked
 from bragi.services.tool_call_helpers import (
     accepted_tool_result,
@@ -831,14 +832,18 @@ class ContextCleanupService:
         )
         if self.providers is None:
             return await _generate_cleanup_tool_items(
+                repositories=self.repositories,
                 provider=provider,
                 request=request,
+                task=task,
                 validator=validator,
             )
         try:
             return await _generate_cleanup_tool_items(
+                repositories=self.repositories,
                 provider=provider,
                 request=request,
+                task=task,
                 validator=validator,
             )
         except ProviderError as exc:
@@ -881,8 +886,10 @@ class ContextCleanupService:
             )
             try:
                 return await _generate_cleanup_tool_items(
+                    repositories=self.repositories,
                     provider=fallback_provider,
                     request=fallback_request,
+                    task=task,
                     validator=validator,
                 )
             except ProviderError as fallback_exc:
@@ -1916,8 +1923,10 @@ def _guided_action_tool_messages(
 
 async def _generate_cleanup_tool_items[T](
     *,
+    repositories: PersistenceRepositories,
     provider: ToolCallProvider,
     request: ToolCallRequest,
+    task: str,
     validator: Callable[
         [ProviderToolCall, dict[str, dict[str, object]]],
         tuple[bool, dict[str, str], T | None],
@@ -1930,9 +1939,12 @@ async def _generate_cleanup_tool_items[T](
     last_errors: list[str] = []
 
     for _turn in range(_MAX_CONTEXT_CLEANUP_TOOL_FEEDBACK_TURNS + 1):
-        response = await provider.generate_tool_calls(
-            replace(request, messages=tuple(messages))
+        turn_request = budget_tool_call_request(
+            repositories,
+            replace(request, messages=tuple(messages)),
+            task=task,
         )
+        response = await provider.generate_tool_calls(turn_request)
         errors: list[str] = []
         tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
         for call in response.tool_calls:
