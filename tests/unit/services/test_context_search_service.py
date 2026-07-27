@@ -1364,7 +1364,7 @@ def test_context_search_uses_deterministic_fallback_when_tool_provider_fails(
     assert job_result["fallback_skipped_reason"] == "no_fallback_model"
 
 
-def test_context_search_uses_deterministic_fallback_when_tool_fallback_fails(
+def test_context_search_keeps_missing_tool_fallback_model_available(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(
@@ -1385,9 +1385,9 @@ def test_context_search_uses_deterministic_fallback_when_tool_fallback_fails(
     fallback = FallbackToolContextProvider(
         responses=[
             ProviderError(
-                ProviderErrorCategory.PROVIDER_ERROR,
-                "fallback provider failed",
-                status_code=500,
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "fallback model missing",
+                status_code=404,
             )
         ]
     )
@@ -1405,6 +1405,11 @@ def test_context_search_uses_deterministic_fallback_when_tool_fallback_fails(
     assert [item.source_id for item in result.selected_state] == [state.id]
     assert result.retrieval_degraded is True
     assert result.retrieval_recovery == "deterministic_fallback"
+    assert [
+        model.available
+        for model in repositories.list_provider_models("fallback")
+        if model.model_id == "fallback-tools"
+    ] == [True]
     job_result = json.loads(
         _context_search_jobs(repositories, save.id)[-1]["result_json"]
     )
@@ -1413,8 +1418,8 @@ def test_context_search_uses_deterministic_fallback_when_tool_fallback_fails(
     assert job_result["fallback_provider"] == "fallback"
     assert job_result["fallback_model"] == "fallback-tools"
     assert job_result["fallback_used"] is False
-    assert job_result["error_category"] == ProviderErrorCategory.PROVIDER_ERROR.value
-    assert job_result["http_status"] == 500
+    assert job_result["error_category"] == ProviderErrorCategory.MODEL_NOT_FOUND.value
+    assert job_result["http_status"] == 404
 
 
 def test_context_search_retries_model_after_model_not_found(
