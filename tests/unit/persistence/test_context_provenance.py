@@ -52,3 +52,23 @@ def test_merge_context_source_metadata_keeps_duplicate_derivations_alternative(
         ["message-visible"],
     ]
     assert merged["source_provenance_mode"] == "any"
+
+
+def test_merge_context_source_metadata_preserves_large_conjunctive_derivation(
+) -> None:
+    first_group = [f"message-a-{index:02d}" for index in range(40)]
+    second_group = [f"message-b-{index:02d}" for index in range(40)]
+
+    merged = merge_context_source_metadata(
+        {
+            "source_provenance_groups": [first_group, second_group],
+            "source_provenance_mode": "all",
+        },
+        {
+            "source_provenance_groups": [["message-alternative"]],
+            "source_provenance_mode": "any",
+        },
+    )
+
+    assert merged["source_provenance_groups"] == [first_group, second_group]
+    assert merged["source_provenance_mode"] == "all"

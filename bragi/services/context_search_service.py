@@ -3486,6 +3486,7 @@ def _bounded_structured_identifiers(text: str) -> tuple[str, ...]:
             structured_identifiers(
                 _bounded_context_query_text(text),
                 max_input_chars=MAX_CONTEXT_QUERY_CHARS,
+                max_identifiers=MAX_CONTEXT_QUERY_CHARS // 2,
             )
         )
     )

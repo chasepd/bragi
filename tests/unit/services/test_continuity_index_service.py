@@ -534,6 +534,60 @@ def test_continuity_index_distinguishes_conjunctive_and_alternative_provenance(
     assert by_source[repeated.id].metadata["source_provenance_mode"] == "any"
 
 
+def test_continuity_index_reserves_provenance_group_for_scalar_source(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    messages = [
+        repositories.append_message(
+            save_id=save.id,
+            role="narrator",
+            body=f"Evidence {index}.",
+        ).id
+        for index in range(65)
+    ]
+    observation_ids = [
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="world_fact",
+            claim=f"Claim {index}.",
+            source_message_ids=[messages[index]],
+            status="accepted",
+        ).id
+        for index in range(64)
+    ]
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="Bounded provenance memory.",
+        tags=["fact"],
+        source_message_id=messages[64],
+        source_message_ids=[messages[64]],
+        source_observation_ids=observation_ids,
+    )
+
+    ContinuityIndexService(repositories).sync_save(save.id)
+
+    indexed = next(
+        source
+        for source in repositories.list_context_sources(
+            save.id,
+            source_type="memory",
+        )
+        if source.source_id == memory.id
+    )
+    groups = indexed.metadata["source_provenance_groups"]
+    assert isinstance(groups, list)
+    assert len(groups) == 64
+    assert any(messages[64] in group for group in groups)
+
+
 def test_continuity_index_world_state_cap_prefers_recent_ties(
     repositories: PersistenceRepositories,
 ) -> None:

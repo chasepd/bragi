@@ -36,6 +36,7 @@ def merge_context_source_metadata(
         metadata[field] = values
 
     groups = _provenance_groups(loaded)
+    provenance_mode = "any"
     if not _provenance_within_bounds(groups):
         provenance_overflow = True
     selected_provenance = loaded
@@ -43,7 +44,14 @@ def merge_context_source_metadata(
         selected_provenance = loaded[:1]
         first_metadata = selected_provenance[0] if selected_provenance else {}
         source_ids = _string_values(first_metadata.get("source_message_ids"))
-        groups = _provenance_groups(selected_provenance)
+        groups = _provenance_groups(
+            selected_provenance,
+            collapse_all=False,
+        )
+        first_mode = first_metadata.get("source_provenance_mode")
+        provenance_mode = (
+            first_mode if first_mode in {"all", "any"} else "any"
+        )
         if (
             len(source_ids) > MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS
             or not _provenance_within_bounds(groups)
@@ -58,7 +66,7 @@ def merge_context_source_metadata(
                 metadata.pop(field, None)
 
     metadata["source_provenance_groups"] = groups
-    metadata["source_provenance_mode"] = "any"
+    metadata["source_provenance_mode"] = provenance_mode
     if any(item.get("requires_audience") is True for item in loaded):
         metadata["requires_audience"] = True
     return metadata
@@ -103,6 +111,8 @@ def _string_values(value: object) -> list[str]:
 
 def _provenance_groups(
     metadata_items: Iterable[Mapping[str, object]],
+    *,
+    collapse_all: bool = True,
 ) -> list[list[str]]:
     groups: list[list[str]] = []
     for item in metadata_items:
@@ -130,7 +140,11 @@ def _provenance_groups(
         ]
         if ungrouped_ids:
             item_groups.append(ungrouped_ids)
-        if item.get("source_provenance_mode") == "all" and item_groups:
+        if (
+            collapse_all
+            and item.get("source_provenance_mode") == "all"
+            and item_groups
+        ):
             item_groups = [
                 list(
                     dict.fromkeys(

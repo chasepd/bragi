@@ -48,6 +48,9 @@ _MAX_SNAPSHOT_PROVENANCE_GROUPS = 64
 _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS = 64
 _MAX_SNAPSHOT_OBJECT_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
 _MAX_SNAPSHOT_TOTAL_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
+_MAX_IMPORTED_SNAPSHOT_COUNT = 4_096
+_MAX_SNAPSHOT_MANIFEST_ENTRIES = 100_000
+_MAX_SNAPSHOT_IMPORT_REFERENCE_WORK = 250_000
 SNAPSHOT_ENCODING = "zlib-json-v1"
 
 
@@ -734,15 +737,18 @@ class TurnSnapshotService:
         }
         if not snapshots:
             return 0
+        root_manifest_hashes = {
+            _text(row, "root_manifest_hash") for row in snapshots
+        }
         source_rows_by_manifest = {
-            _text(row, "root_manifest_hash"): _sanitize_snapshot_rows_for_safety(
+            root_manifest_hash: _sanitize_snapshot_rows_for_safety(
                 self._rows_from_exported_manifest(
                     objects_by_hash,
-                    _text(row, "root_manifest_hash"),
+                    root_manifest_hash,
                 ),
                 quarantine_content_ratings=True,
             )
-            for row in snapshots
+            for root_manifest_hash in root_manifest_hashes
         }
         remapper = _SnapshotRemapper(
             source_save_id=source_save_id,
@@ -758,6 +764,8 @@ class TurnSnapshotService:
         manifest_hash_map: dict[str, str] = {}
         for row in snapshots:
             old_manifest_hash = _text(row, "root_manifest_hash")
+            if old_manifest_hash in manifest_hash_map:
+                continue
             rows_by_table = source_rows_by_manifest[old_manifest_hash]
             manifest_object = _decode_exported_object(
                 objects_by_hash[old_manifest_hash]
@@ -1606,6 +1614,7 @@ class _SnapshotRemapper:
                 self._remap_context_source_metadata(
                     raw,
                     source_type=cast(str | None, row.get("source_type")),
+                    source_id=cast(str | None, row.get("source_id")),
                 )
             )
         if table_name == "media_assets" and column == "metadata_json":
@@ -1681,6 +1690,7 @@ class _SnapshotRemapper:
         raw: object,
         *,
         source_type: str | None,
+        source_id: str | None,
     ) -> object:
         if not isinstance(raw, dict):
             return raw
@@ -1742,7 +1752,11 @@ class _SnapshotRemapper:
         entity_ids = raw.get("entity_ids")
         if isinstance(entity_ids, list) and source_type is not None:
             remapped["entity_ids"] = [
-                self._mapped_context_source_id(source_type, item)
+                self._mapped_context_metadata_entity_id(
+                    source_type,
+                    source_id,
+                    item,
+                )
                 if isinstance(item, str)
                 else item
                 for item in entity_ids
@@ -1753,7 +1767,38 @@ class _SnapshotRemapper:
                 "character_text_threads",
                 thread_id,
             )
+        observation_id = raw.get("observation_id")
+        if isinstance(observation_id, str) and source_type == "observation":
+            remapped["observation_id"] = self._mapped_table_id(
+                "context_observations",
+                observation_id,
+            )
         return remapped
+
+    def _mapped_context_metadata_entity_id(
+        self,
+        source_type: str,
+        source_id: str | None,
+        value: object,
+    ) -> object:
+        if source_type == "memory" and isinstance(source_id, str):
+            if source_id.startswith(("character_profile:", "relationship:")):
+                return self._mapped_table_id("characters", value)
+        if (
+            source_type == "world_state"
+            and isinstance(source_id, str)
+            and source_id.startswith("location:")
+        ):
+            return self._mapped_table_id("locations", value)
+        direct_tables = {
+            "character_voice": "characters",
+            "open_obligation": "active_threads",
+            "character_text_thread": "character_text_threads",
+        }
+        table_name = direct_tables.get(source_type)
+        if table_name is not None:
+            return self._mapped_table_id(table_name, value)
+        return self._mapped_context_source_id(source_type, value)
 
     def _remap_known_metadata_ids(self, value: object) -> object:
         if isinstance(value, list):
@@ -1762,18 +1807,35 @@ class _SnapshotRemapper:
             remapped: dict[str, object] = {}
             id_fields = {
                 "character_id": "characters",
+                "sender_character_id": "characters",
                 "thread_id": "character_text_threads",
                 "text_message_id": "character_text_messages",
                 "source_message_id": "messages",
                 "media_asset_id": "media_assets",
+                "source_media_asset_id": "media_assets",
+                "source_character_reference_asset_id": "media_assets",
+                "source_character_reference_character_id": "characters",
+            }
+            id_list_fields = {
+                "source_media_asset_ids": "media_assets",
+                "source_character_reference_asset_ids": "media_assets",
+                "source_character_reference_character_ids": "characters",
             }
             for key, item in value.items():
                 table_name = id_fields.get(key)
-                remapped[key] = (
-                    self._mapped_table_id(table_name, item)
-                    if table_name is not None
-                    else self._remap_known_metadata_ids(item)
-                )
+                list_table_name = id_list_fields.get(key)
+                if key == "request_source_message_id":
+                    mapped_message_id = self._mapped_table_id("messages", item)
+                    remapped[key] = self._mapped_table_id(
+                        "character_text_messages",
+                        mapped_message_id,
+                    )
+                elif table_name is not None:
+                    remapped[key] = self._mapped_table_id(table_name, item)
+                elif list_table_name is not None:
+                    remapped[key] = self._remap_id_list(item, list_table_name)
+                else:
+                    remapped[key] = self._remap_known_metadata_ids(item)
             return remapped
         return value
 
@@ -2709,6 +2771,8 @@ def _validate_exported_snapshot_rows(
     object_rows: Iterable[Mapping[str, object]],
 ) -> None:
     snapshots = [dict(row) for row in snapshot_rows]
+    if len(snapshots) > _MAX_IMPORTED_SNAPSHOT_COUNT:
+        raise ValueError("Snapshot bundle contains too many snapshots")
     seen_snapshot_ids: set[str] = set()
     for row in snapshots:
         snapshot_id = _text(row, "id")
@@ -2731,8 +2795,11 @@ def _validate_exported_snapshot_rows(
             raise ValueError("Snapshot objects are too large")
         objects_by_hash[object_hash] = _decode_exported_snapshot_object(object_row)
 
-    for row in snapshots:
-        root_hash = _text(row, "root_manifest_hash")
+    total_manifest_entries = 0
+    root_hashes = {
+        _text(row, "root_manifest_hash") for row in snapshots
+    }
+    for root_hash in root_hashes:
         manifest = _required_exported_snapshot_object(
             objects_by_hash,
             root_hash,
@@ -2746,11 +2813,18 @@ def _validate_exported_snapshot_rows(
         raw_tables = manifest.get("tables")
         if not isinstance(raw_tables, Mapping):
             raise ValueError(f"Snapshot manifest is missing table entries: {root_hash}")
+        manifest_entry_count = 0
         for table_name, entries in raw_tables.items():
             if table_name not in _TABLES_BY_NAME:
                 raise ValueError(f"Unknown snapshot table in manifest: {table_name}")
             if not isinstance(entries, list):
                 raise ValueError(f"Snapshot table entries must be a list: {table_name}")
+            manifest_entry_count += len(entries)
+            if manifest_entry_count > _MAX_SNAPSHOT_MANIFEST_ENTRIES:
+                raise ValueError("Snapshot manifest contains too many entries")
+            total_manifest_entries += len(entries)
+            if total_manifest_entries > _MAX_SNAPSHOT_IMPORT_REFERENCE_WORK:
+                raise ValueError("Snapshot manifests contain too many row references")
             for entry in entries:
                 if not isinstance(entry, Mapping):
                     raise ValueError(f"Snapshot table entry is invalid: {table_name}")
@@ -3150,6 +3224,7 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
             provenance_overflow = True
         metadata[field] = merged_values
     groups = _snapshot_context_source_provenance_groups(loaded_metadata)
+    provenance_mode = "any"
     if (
         len(groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS
         or any(
@@ -3172,7 +3247,14 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
             if isinstance(raw_source_ids, list)
             else []
         )
-        groups = _snapshot_context_source_provenance_groups(provenance_metadata)
+        groups = _snapshot_context_source_provenance_groups(
+            provenance_metadata,
+            collapse_all=False,
+        )
+        first_mode = first_metadata.get("source_provenance_mode")
+        provenance_mode = (
+            first_mode if first_mode in {"all", "any"} else "any"
+        )
         if (
             len(source_ids) > _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS
             or len(groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS
@@ -3190,7 +3272,7 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
             else:
                 metadata.pop(field, None)
     metadata["source_provenance_groups"] = groups
-    metadata["source_provenance_mode"] = "any"
+    metadata["source_provenance_mode"] = provenance_mode
     if any(item.get("requires_audience") is True for item in loaded_metadata):
         metadata["requires_audience"] = True
     return _compact_json(metadata)
@@ -3198,6 +3280,8 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
 
 def _snapshot_context_source_provenance_groups(
     metadata_items: Iterable[Mapping[str, object]],
+    *,
+    collapse_all: bool = True,
 ) -> list[list[str]]:
     groups: list[list[str]] = []
     for item in metadata_items:
@@ -3240,7 +3324,11 @@ def _snapshot_context_source_provenance_groups(
         ]
         if ungrouped_item_ids:
             item_groups.append(ungrouped_item_ids)
-        if item.get("source_provenance_mode") == "all" and item_groups:
+        if (
+            collapse_all
+            and item.get("source_provenance_mode") == "all"
+            and item_groups
+        ):
             item_groups = [
                 list(
                     dict.fromkeys(

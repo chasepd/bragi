@@ -3916,10 +3916,12 @@ def _grounding_context_preserves_claim_boundary(
     claim: str,
     context: str,
 ) -> bool:
-    assertion_context = context.rstrip().rstrip("'\"”’)]}")
-    if (
-        assertion_context
-        and "QUESTION MARK" in unicodedata.name(assertion_context[-1], "")
+    if any(
+        (
+            "QUESTION" in unicodedata.name(character, "")
+            or "INTERROBANG" in unicodedata.name(character, "")
+        )
+        for character in context
     ):
         return False
     claim_terms = _grounding_boundary_terms(claim)

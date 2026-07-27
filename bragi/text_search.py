@@ -41,16 +41,30 @@ def structured_identifiers(
         "NFKC",
         value[:max_input_chars],
     ).casefold()
-    identifiers = (
-        identifier
-        for identifier in re.findall(
-            r"(?<!\w)[^\W_]+(?:[-_.][^\W_]+)+(?!\w)",
-            normalized,
-            flags=re.UNICODE,
+    identifiers = tuple(
+        dict.fromkeys(
+            identifier
+            for identifier in re.findall(
+                r"(?<!\w)[^\W_]+(?:[-_.][^\W_]+)+(?!\w)",
+                normalized,
+                flags=re.UNICODE,
+            )
+            if len(identifier) <= MAX_STRUCTURED_IDENTIFIER_CHARS
         )
-        if len(identifier) <= MAX_STRUCTURED_IDENTIFIER_CHARS
     )
-    return tuple(dict.fromkeys(identifiers))[:max_identifiers]
+    if len(identifiers) <= max_identifiers:
+        return identifiers
+    edge_count = max_identifiers // 2
+    if edge_count <= 0:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            (
+                *identifiers[:edge_count],
+                *identifiers[-edge_count:],
+            )
+        )
+    )[:max_identifiers]
 
 
 def cjk_lexical_anchors(value: str) -> tuple[str, ...]:

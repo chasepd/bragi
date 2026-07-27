@@ -108,6 +108,58 @@ def test_snapshot_object_decode_rejects_oversized_declared_object() -> None:
         )
 
 
+def test_snapshot_validation_bounds_snapshot_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(turn_snapshot_module, "_MAX_IMPORTED_SNAPSHOT_COUNT", 1)
+
+    with pytest.raises(ValueError, match="too many snapshots"):
+        turn_snapshot_module._validate_exported_snapshot_rows(
+            [
+                {"id": "snapshot-one", "root_manifest_hash": "manifest"},
+                {"id": "snapshot-two", "root_manifest_hash": "manifest"},
+            ],
+            [],
+        )
+
+
+def test_snapshot_validation_bounds_unique_manifest_reference_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        turn_snapshot_module,
+        "_MAX_SNAPSHOT_IMPORT_REFERENCE_WORK",
+        1,
+    )
+    objects: dict[str, dict[str, object]] = {}
+    row_hash = turn_snapshot_module._add_snapshot_object_export(
+        objects,
+        kind="row:messages",
+        value={"id": "message-one"},
+        created_at=None,
+    )
+    manifest_hash = turn_snapshot_module._add_snapshot_object_export(
+        objects,
+        kind="snapshot_manifest",
+        value={
+            "format": turn_snapshot_module.SNAPSHOT_FORMAT,
+            "tables": {
+                "messages": [
+                    {"id": "message-one", "object_hash": row_hash},
+                    {"id": "message-two", "object_hash": row_hash},
+                ]
+            },
+        },
+        created_at=None,
+    )
+
+    with pytest.raises(ValueError, match="too many row references"):
+        turn_snapshot_module._validate_exported_snapshot_rows(
+            [{"id": "snapshot-one", "root_manifest_hash": manifest_hash}],
+            objects.values(),
+        )
+
+
 def test_snapshot_trigger_key_remapping_is_schema_aware() -> None:
     remapper = turn_snapshot_module._SnapshotRemapper(
         source_save_id="save-old",
@@ -116,6 +168,7 @@ def test_snapshot_trigger_key_remapping_is_schema_aware() -> None:
         id_maps={
             "messages": {"message-old": "message-new"},
             "characters": {"character-old": "character-new"},
+            "locations": {"location-old": "location-new"},
             "memories": {"shared-id": "memory-new"},
         },
     )
@@ -160,6 +213,95 @@ def test_snapshot_json_remapping_preserves_ordinary_text_equal_to_ids() -> None:
     assert memory["tags_json"] == '["mara"]'
 
 
+def test_snapshot_json_remapping_updates_known_context_and_media_references() -> None:
+    remapper = turn_snapshot_module._SnapshotRemapper(
+        source_save_id="save-old",
+        target_save_id="save-new",
+        rows_by_table={},
+        id_maps={
+            "messages": {"message-old": "message-new"},
+            "characters": {"character-old": "character-new"},
+            "locations": {"location-old": "location-new"},
+            "context_observations": {"observation-old": "observation-new"},
+            "character_text_messages": {"text-old": "text-new"},
+            "media_assets": {
+                "media-old": "media-new",
+                "reference-old": "reference-new",
+            },
+        },
+    )
+
+    context_source = remapper.remap_row(
+        "context_sources",
+        {
+            "id": "context-old",
+            "save_id": "save-old",
+            "source_type": "observation",
+            "source_id": "observation-old",
+            "metadata_json": json.dumps({"observation_id": "observation-old"}),
+        },
+    )
+    media = remapper.remap_row(
+        "media_assets",
+        {
+            "id": "media-old",
+            "save_id": "save-old",
+            "metadata_json": json.dumps(
+                {
+                    "request_source_message_id": "text-old",
+                    "sender_character_id": "character-old",
+                    "source_media_asset_id": "reference-old",
+                    "source_media_asset_ids": ["reference-old"],
+                    "source_character_reference_asset_id": "reference-old",
+                    "source_character_reference_asset_ids": ["reference-old"],
+                    "source_character_reference_character_ids": ["character-old"],
+                }
+            ),
+        },
+    )
+    character_profile = remapper.remap_row(
+        "context_sources",
+        {
+            "id": "profile-context-old",
+            "save_id": "save-old",
+            "source_type": "memory",
+            "source_id": "character_profile:character-old",
+            "metadata_json": json.dumps({"entity_ids": ["character-old"]}),
+        },
+    )
+    location_state = remapper.remap_row(
+        "context_sources",
+        {
+            "id": "location-context-old",
+            "save_id": "save-old",
+            "source_type": "world_state",
+            "source_id": "location:location-old",
+            "metadata_json": json.dumps({"entity_ids": ["location-old"]}),
+        },
+    )
+
+    assert context_source["source_id"] == "observation-new"
+    assert json.loads(str(context_source["metadata_json"]))["observation_id"] == (
+        "observation-new"
+    )
+    assert json.loads(str(character_profile["metadata_json"]))["entity_ids"] == [
+        "character-new"
+    ]
+    assert json.loads(str(location_state["metadata_json"]))["entity_ids"] == [
+        "location-new"
+    ]
+    media_metadata = json.loads(str(media["metadata_json"]))
+    assert media_metadata == {
+        "request_source_message_id": "text-new",
+        "sender_character_id": "character-new",
+        "source_media_asset_id": "reference-new",
+        "source_media_asset_ids": ["reference-new"],
+        "source_character_reference_asset_id": "reference-new",
+        "source_character_reference_asset_ids": ["reference-new"],
+        "source_character_reference_character_ids": ["character-new"],
+    }
+
+
 def test_snapshot_knowledge_edge_merge_fails_closed_on_provenance_overflow() -> None:
     existing: dict[str, object] = {
         "knowledge_state": "knows",
@@ -188,6 +330,31 @@ def test_snapshot_knowledge_edge_merge_fails_closed_on_provenance_overflow() -> 
     assert existing["knowledge_state"] == "does_not_know"
     assert existing["acquisition_method"] == "unknown"
     assert existing["source_message_ids_json"] == "[]"
+
+
+def test_snapshot_context_merge_preserves_large_conjunctive_derivation() -> None:
+    first_group = [f"message-a-{index:02d}" for index in range(40)]
+    second_group = [f"message-b-{index:02d}" for index in range(40)]
+
+    merged = json.loads(
+        turn_snapshot_module._merged_context_source_metadata_json(
+            json.dumps(
+                {
+                    "source_provenance_groups": [first_group, second_group],
+                    "source_provenance_mode": "all",
+                }
+            ),
+            json.dumps(
+                {
+                    "source_provenance_groups": [["message-alternative"]],
+                    "source_provenance_mode": "any",
+                }
+            ),
+        )
+    )
+
+    assert merged["source_provenance_groups"] == [first_group, second_group]
+    assert merged["source_provenance_mode"] == "all"
 
 
 def test_legacy_memory_normalization_preserves_other_id_namespaces() -> None:

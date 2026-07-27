@@ -105,6 +105,9 @@ MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
+MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
+MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 128
+MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 250_000
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
@@ -3400,6 +3403,9 @@ class PersistenceRepositories:
     def _replace_context_source_search_terms(
         self,
         record: ContextSourceRecord,
+        *,
+        terms: tuple[str, ...] | None = None,
+        identifiers: tuple[str, ...] | None = None,
     ) -> None:
         self.connection.execute(
             "DELETE FROM context_source_search_terms WHERE context_source_id = ?",
@@ -3416,7 +3422,11 @@ class PersistenceRepositories:
             """,
             (
                 (record.id, record.save_id, term)
-                for term in _context_source_search_terms(record.title, record.body)
+                for term in (
+                    terms
+                    if terms is not None
+                    else _context_source_search_terms(record.title, record.body)
+                )
             ),
         )
         self.connection.execute(
@@ -3426,7 +3436,11 @@ class PersistenceRepositories:
             """,
             (record.id,),
         )
-        identifiers = _context_source_exact_identifiers(record.title, record.body)
+        resolved_identifiers = (
+            identifiers
+            if identifiers is not None
+            else _context_source_exact_identifiers(record.title, record.body)
+        )
         self.connection.executemany(
             """
             INSERT INTO context_source_exact_identifiers(
@@ -3438,14 +3452,34 @@ class PersistenceRepositories:
             """,
             (
                 (record.id, record.save_id, identifier)
-                for identifier in identifiers or ("",)
+                for identifier in resolved_identifiers or ("",)
             ),
         )
 
     def rebuild_context_source_search_terms(self, save_id: str) -> None:
         rows = self.list_context_sources(save_id)
+        prepared_indexes: list[
+            tuple[ContextSourceRecord, tuple[str, ...], tuple[str, ...]]
+        ] = []
         for record in rows:
-            self._replace_context_source_search_terms(record)
+            terms = _context_source_search_terms(record.title, record.body)
+            identifiers = _context_source_exact_identifiers(
+                record.title,
+                record.body,
+            )
+            prepared_indexes.append((record, terms, identifiers))
+        indexed_rows = sum(
+            len(terms) + max(1, len(identifiers))
+            for _record, terms, identifiers in prepared_indexes
+        )
+        if indexed_rows > MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
+            raise ValueError("Context source index is too large to rebuild")
+        for record, terms, identifiers in prepared_indexes:
+            self._replace_context_source_search_terms(
+                record,
+                terms=terms,
+                identifiers=identifiers,
+            )
         self.commit()
 
     def get_context_source(self, context_source_id: str) -> ContextSourceRecord | None:
@@ -3708,6 +3742,30 @@ class PersistenceRepositories:
             indexed_terms_json = _dump_json(indexed_terms)
             term_rows = self._fetch_all(
                 f"""
+                WITH ranked_ids AS (
+                    SELECT
+                        context_sources.id,
+                        -COUNT(DISTINCT search_terms.term) AS bm25_rank
+                    FROM context_source_search_terms search_terms
+                    JOIN context_sources
+                      ON context_sources.id = search_terms.context_source_id
+                    WHERE search_terms.save_id = ?
+                      AND search_terms.term IN (
+                          SELECT CAST(value AS TEXT) FROM json_each(?)
+                      )
+                      AND context_sources.archived_at IS NULL
+                      AND context_sources.source_type IN (
+                          {_placeholders(len(source_type_values))}
+                      )
+                      {eligibility_sql}
+                    GROUP BY context_sources.id
+                    HAVING ? = 0
+                        OR COUNT(DISTINCT search_terms.term) = ?
+                    ORDER BY bm25_rank,
+                             context_sources.created_at DESC,
+                             context_sources.rowid DESC
+                    LIMIT ?
+                )
                 SELECT
                     context_sources.id,
                     context_sources.save_id,
@@ -3721,26 +3779,13 @@ class PersistenceRepositories:
                     context_sources.scene_generation,
                     context_sources.created_turn_number,
                     context_sources.expires_after_turn_number,
-                    -COUNT(DISTINCT search_terms.term) AS bm25_rank
-                FROM context_source_search_terms search_terms
+                    ranked_ids.bm25_rank
+                FROM ranked_ids
                 JOIN context_sources
-                  ON context_sources.id = search_terms.context_source_id
-                WHERE search_terms.save_id = ?
-                  AND search_terms.term IN (
-                      SELECT CAST(value AS TEXT) FROM json_each(?)
-                  )
-                  AND context_sources.archived_at IS NULL
-                  AND context_sources.source_type IN (
-                      {_placeholders(len(source_type_values))}
-                  )
-                  {eligibility_sql}
-                GROUP BY context_sources.id
-                HAVING ? = 0
-                    OR COUNT(DISTINCT search_terms.term) = ?
-                ORDER BY bm25_rank,
+                  ON context_sources.id = ranked_ids.id
+                ORDER BY ranked_ids.bm25_rank,
                          context_sources.created_at DESC,
                          context_sources.rowid DESC
-                LIMIT ?
                 """,
                 (
                     save_id,
@@ -3755,6 +3800,26 @@ class PersistenceRepositories:
         exact_identifier_rows = (
             self._fetch_all(
                 f"""
+                WITH ranked_ids AS (
+                    SELECT context_sources.id
+                    FROM context_source_exact_identifiers exact_identifier
+                    JOIN context_sources
+                      ON context_sources.id =
+                         exact_identifier.context_source_id
+                    WHERE exact_identifier.save_id = ?
+                      AND exact_identifier.identifier IN (
+                          SELECT CAST(value AS TEXT) FROM json_each(?)
+                      )
+                      AND context_sources.archived_at IS NULL
+                      AND context_sources.source_type IN (
+                          {_placeholders(len(source_type_values))}
+                      )
+                      {eligibility_sql}
+                    GROUP BY context_sources.id
+                    ORDER BY context_sources.created_at DESC,
+                             context_sources.rowid DESC
+                    LIMIT ?
+                )
                 SELECT
                     context_sources.id,
                     context_sources.save_id,
@@ -3769,23 +3834,11 @@ class PersistenceRepositories:
                     context_sources.created_turn_number,
                     context_sources.expires_after_turn_number,
                     -1000.0 AS bm25_rank
-                FROM context_source_exact_identifiers exact_identifier
+                FROM ranked_ids
                 JOIN context_sources
-                  ON context_sources.id =
-                     exact_identifier.context_source_id
-                WHERE exact_identifier.save_id = ?
-                  AND exact_identifier.identifier IN (
-                      SELECT CAST(value AS TEXT) FROM json_each(?)
-                  )
-                  AND context_sources.archived_at IS NULL
-                  AND context_sources.source_type IN (
-                      {_placeholders(len(source_type_values))}
-                  )
-                  {eligibility_sql}
-                GROUP BY context_sources.id
+                  ON context_sources.id = ranked_ids.id
                 ORDER BY context_sources.created_at DESC,
                          context_sources.rowid DESC
-                LIMIT ?
                 """,
                 (
                     save_id,
@@ -3801,6 +3854,24 @@ class PersistenceRepositories:
         exact_phrase_rows = (
             self._fetch_all(
                 f"""
+            WITH ranked_ids AS (
+                SELECT
+                    context_sources.id,
+                    bm25(context_source_fts, 1.2, 1.0) AS bm25_rank
+                FROM context_source_fts
+                JOIN context_sources
+                  ON context_sources.rowid = context_source_fts.rowid
+                WHERE context_source_fts MATCH ?
+                  AND context_sources.save_id = ?
+                  AND context_sources.archived_at IS NULL
+                  AND context_sources.source_type IN (
+                      {_placeholders(len(source_type_values))}
+                  )
+                  {eligibility_sql}
+                ORDER BY bm25_rank, context_sources.created_at DESC,
+                         context_sources.rowid DESC
+                LIMIT ?
+            )
             SELECT
                 context_sources.id,
                 context_sources.save_id,
@@ -3814,20 +3885,12 @@ class PersistenceRepositories:
                 context_sources.scene_generation,
                 context_sources.created_turn_number,
                 context_sources.expires_after_turn_number,
-                bm25(context_source_fts, 1.2, 1.0) AS bm25_rank
-            FROM context_source_fts
+                ranked_ids.bm25_rank
+            FROM ranked_ids
             JOIN context_sources
-              ON context_sources.rowid = context_source_fts.rowid
-            WHERE context_source_fts MATCH ?
-              AND context_sources.save_id = ?
-              AND context_sources.archived_at IS NULL
-              AND context_sources.source_type IN (
-                  {_placeholders(len(source_type_values))}
-              )
-              {eligibility_sql}
-            ORDER BY bm25_rank, context_sources.created_at DESC,
+              ON context_sources.id = ranked_ids.id
+            ORDER BY ranked_ids.bm25_rank, context_sources.created_at DESC,
                      context_sources.rowid DESC
-            LIMIT ?
                 """,
                 (
                     phrase_match_query,
@@ -3843,6 +3906,24 @@ class PersistenceRepositories:
         fts_rows = (
             self._fetch_all(
                 f"""
+            WITH ranked_ids AS (
+                SELECT
+                    context_sources.id,
+                    bm25(context_source_fts, 1.2, 1.0) AS bm25_rank
+                FROM context_source_fts
+                JOIN context_sources
+                  ON context_sources.rowid = context_source_fts.rowid
+                WHERE context_source_fts MATCH ?
+                  AND context_sources.save_id = ?
+                  AND context_sources.archived_at IS NULL
+                  AND context_sources.source_type IN (
+                      {_placeholders(len(source_type_values))}
+                  )
+                  {eligibility_sql}
+                ORDER BY bm25_rank, context_sources.created_at DESC,
+                         context_sources.rowid DESC
+                LIMIT ?
+            )
             SELECT
                 context_sources.id,
                 context_sources.save_id,
@@ -3856,20 +3937,12 @@ class PersistenceRepositories:
                 context_sources.scene_generation,
                 context_sources.created_turn_number,
                 context_sources.expires_after_turn_number,
-                bm25(context_source_fts, 1.2, 1.0) AS bm25_rank
-            FROM context_source_fts
+                ranked_ids.bm25_rank
+            FROM ranked_ids
             JOIN context_sources
-              ON context_sources.rowid = context_source_fts.rowid
-            WHERE context_source_fts MATCH ?
-              AND context_sources.save_id = ?
-              AND context_sources.archived_at IS NULL
-              AND context_sources.source_type IN (
-                  {_placeholders(len(source_type_values))}
-              )
-              {eligibility_sql}
-            ORDER BY bm25_rank, context_sources.created_at DESC,
+              ON context_sources.id = ranked_ids.id
+            ORDER BY ranked_ids.bm25_rank, context_sources.created_at DESC,
                      context_sources.rowid DESC
-            LIMIT ?
                 """,
                 (
                     match_query,
@@ -13328,7 +13401,7 @@ def _context_source_search_terms(title: str, body: str) -> tuple[str, ...]:
         *unicode_word_terms(bounded_body),
         *cjk_lexical_anchors(bounded_body),
     )
-    return tuple(dict.fromkeys(terms))[:4096]
+    return tuple(dict.fromkeys(terms))[:MAX_CONTEXT_SOURCE_INDEX_TERMS]
 
 
 def _context_source_exact_identifiers(
@@ -13348,7 +13421,7 @@ def _context_source_exact_identifiers(
                 ),
             )
         )
-    )[:4096]
+    )[:MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS]
 
 
 def _validate_context_source_provenance_metadata(

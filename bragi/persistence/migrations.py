@@ -22,6 +22,9 @@ from bragi.text_search import (
 
 CURRENT_SCHEMA_VERSION = 72
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
+_MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
+_MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 128
+_MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 250_000
 _MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
 _MAX_MEMORY_PROVENANCE_IDS = 64
 
@@ -4325,11 +4328,15 @@ def _ensure_context_source_search_terms_schema(
         ORDER BY source.rowid
         """
     ).fetchall()
+    indexed_rows = 0
     for source_id, save_id, title, body in missing_rows:
         terms = _migration_context_source_search_terms(
             str(title or ""),
             str(body or ""),
         )
+        indexed_rows += len(terms)
+        if indexed_rows > _MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
+            raise RuntimeError("Context source index is too large to rebuild")
         connection.executemany(
             """
             INSERT OR IGNORE INTO context_source_search_terms(
@@ -4359,6 +4366,9 @@ def _ensure_context_source_search_terms_schema(
             str(title or ""),
             str(body or ""),
         )
+        indexed_rows += max(1, len(identifiers))
+        if indexed_rows > _MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
+            raise RuntimeError("Context source index is too large to rebuild")
         connection.executemany(
             """
             INSERT OR IGNORE INTO context_source_exact_identifiers(
@@ -4387,7 +4397,7 @@ def _migration_context_source_search_terms(
         *unicode_word_terms(bounded_body),
         *cjk_lexical_anchors(bounded_body),
     )
-    return tuple(dict.fromkeys(terms))[:4096]
+    return tuple(dict.fromkeys(terms))[:_MAX_CONTEXT_SOURCE_INDEX_TERMS]
 
 
 def _migration_context_source_exact_identifiers(
@@ -4407,7 +4417,7 @@ def _migration_context_source_exact_identifiers(
                 ),
             )
         )
-    )[:4096]
+    )[:_MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS]
 
 
 def _ensure_message_context_revision_schema(connection: sqlite3.Connection) -> None:

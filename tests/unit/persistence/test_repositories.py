@@ -12,6 +12,7 @@ from typing import cast
 
 import pytest
 
+from bragi.persistence import repositories as repositories_module
 from bragi.persistence.repositories import (
     BragiRepository,
     PersistenceRepositories,
@@ -4560,6 +4561,49 @@ def test_repositories_filters_exact_identifier_candidates_before_udf(
 
     assert hits == []
     assert calls == 0
+
+
+def test_repositories_bounds_index_rebuild_before_writing(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    first = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-first",
+        title="First memory",
+        body="The amber marker opens archive seven.",
+    )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-second",
+        title="Second memory",
+        body="The cobalt marker opens archive eight.",
+    )
+    repositories.connection.execute(
+        "DELETE FROM context_source_search_terms WHERE context_source_id = ?",
+        (first.id,),
+    )
+    repositories.commit()
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_INDEX_ROWS_PER_REBUILD",
+        1,
+    )
+
+    with pytest.raises(ValueError, match="too large to rebuild"):
+        repositories.rebuild_context_source_search_terms(save_id)
+
+    assert repositories.connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM context_source_search_terms
+        WHERE context_source_id = ?
+        """,
+        (first.id,),
+    ).fetchone()[0] == 0
 
 
 def test_repositories_mixed_unicode_match_all_requires_ascii_terms(

@@ -668,6 +668,46 @@ def test_persisted_observation_revalidation_rejects_subject_prefix() -> None:
             "Mara has the red key",
             "Mara has the red key.",
         ),
+        (
+            "Mara has the red key?!",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "Mara has the red key⁈!",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "Mara has the red key‽",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "مارا لديها المفتاح الأحمر؟!",
+            "مارا لديها المفتاح الأحمر",
+            "مارا لديها المفتاح الأحمر.",
+        ),
+        (
+            "Mara has the red key⁇.",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "Mara has the red key՞️",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "Mara has the red key? —",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "Mara has the red key? 😕",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
     ],
 )
 def test_persisted_observation_revalidation_rejects_unpreserved_reported_modality(

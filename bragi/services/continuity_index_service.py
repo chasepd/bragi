@@ -485,6 +485,23 @@ class ContinuityIndexService:
             for source_id in source_message_ids
             if source_id not in grouped_source_ids
         ]
+        if (
+            ungrouped_source_ids
+            and len(provenance_groups) >= MAX_MEMORY_PROVENANCE_GROUPS
+        ):
+            provenance_groups = provenance_groups[
+                : MAX_MEMORY_PROVENANCE_GROUPS - 1
+            ]
+            grouped_source_ids = {
+                source_id
+                for group in provenance_groups
+                for source_id in group
+            }
+            ungrouped_source_ids = [
+                source_id
+                for source_id in source_message_ids
+                if source_id not in grouped_source_ids
+            ]
         if ungrouped_source_ids:
             provenance_groups.append(
                 ungrouped_source_ids[:MAX_MEMORY_PROVENANCE_GROUP_MEMBERS]
