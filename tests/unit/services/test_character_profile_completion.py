@@ -18,6 +18,7 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolCallResponse,
 )
+from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.services.character_profile_completion import (
     CHARACTER_STARTERS_CONTENT_KEY,
     CharacterFieldEnhancementRequest,
@@ -54,6 +55,33 @@ class RecordingStructuredProfileProvider:
             raise AssertionError("unexpected structured-output request")
         return StructuredOutputResponse(
             data=self.responses.pop(0),
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+class SequencedStructuredProfileProvider:
+    provider_name = "fake"
+
+    def __init__(
+        self,
+        responses: list[dict[str, object] | ProviderError],
+    ) -> None:
+        self.responses = responses
+        self.requests: list[StructuredOutputRequest] = []
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.requests.append(request)
+        if not self.responses:
+            raise AssertionError("unexpected structured-output request")
+        response = self.responses.pop(0)
+        if isinstance(response, ProviderError):
+            raise response
+        return StructuredOutputResponse(
+            data=response,
             provider=request.provider,
             model_id=request.model_id,
         )
@@ -232,7 +260,7 @@ def test_structured_starter_generation_honors_count_and_context() -> None:
     assert [starter.name for starter in starters] == ["Emily Carter", "Lily Chen"]
     request = provider.requests[0]
     assert request.schema_name == "scenario_character_starters"
-    assert request.max_output_tokens == 1024
+    assert request.max_output_tokens == 2048
     assert "Create exactly 2 new character starters" in request.messages[0].body
     request_body = request.messages[1].body
     assert "Scenario types: dating_sim, heist_infiltration" in request_body
@@ -250,10 +278,13 @@ def test_structured_starter_generation_honors_count_and_context() -> None:
     )
     character_schema = request.schema["properties"]["characters"]
     assert isinstance(character_schema, dict)
+    assert character_schema["minItems"] == 2
+    assert character_schema["maxItems"] == 2
     item_schema = character_schema["items"]
     assert isinstance(item_schema, dict)
     item_properties = item_schema["properties"]
     assert isinstance(item_properties, dict)
+    assert set(item_schema["required"]) == set(item_properties)
     assert {
         "goals",
         "motivations",
@@ -267,6 +298,55 @@ def test_structured_starter_generation_honors_count_and_context() -> None:
     assert "hostile" in system_body
     assert "unreasonable" in system_body
     assert len(provider.requests) == 1
+
+
+def test_structured_starter_generation_scales_budget_to_maximum_count() -> None:
+    names = (
+        "Avery Example",
+        "Blake Example",
+        "Casey Example",
+        "Drew Example",
+        "Emery Example",
+        "Flynn Example",
+        "Gray Example",
+        "Harper Example",
+        "Indigo Example",
+        "Jules Example",
+        "Kai Example",
+        "Lane Example",
+    )
+    provider = RecordingStructuredProfileProvider(
+        {
+            "characters": [
+                {"name": name}
+                for name in names
+            ]
+        }
+    )
+    completer = StructuredProviderCharacterProfileCompleter(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-structured",
+    )
+
+    starters = asyncio.run(
+        completer.generate_starters(
+            CharacterStarterGenerationRequest(
+                scenario_type="full_roleplay",
+                scenario_context="Title: The Twelve",
+                content={"player_character_name": "Mara Voss"},
+                count=12,
+            )
+        )
+    )
+
+    assert len(starters) == 12
+    request = provider.requests[0]
+    assert request.max_output_tokens == 12_288
+    characters_schema = request.schema["properties"]["characters"]
+    assert isinstance(characters_schema, dict)
+    assert characters_schema["minItems"] == 12
+    assert characters_schema["maxItems"] == 12
 
 
 def test_structured_starter_generation_honors_custom_description() -> None:
@@ -356,6 +436,73 @@ def test_structured_starter_generation_retries_duplicate_names() -> None:
     assert "duplicates the player or existing starter" in (
         provider.requests[1].messages[-1].body
     )
+
+
+def test_structured_starter_generation_retries_provider_schema_violation() -> None:
+    provider = SequencedStructuredProfileProvider(
+        [
+            ProviderError(
+                ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID,
+                "Structured provider response violated its JSON Schema",
+            ),
+            {"characters": [{"name": "Avery Quinn", "role": "Gallery docent."}]},
+        ]
+    )
+    completer = StructuredProviderCharacterProfileCompleter(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-structured",
+    )
+
+    starters = asyncio.run(
+        completer.generate_starters(
+            CharacterStarterGenerationRequest(
+                scenario_type="full_roleplay",
+                scenario_context="Title: Gallery Night",
+                content={"player_character_name": "James Mitchell"},
+                count=1,
+            )
+        )
+    )
+
+    assert [starter.name for starter in starters] == ["Avery Quinn"]
+    assert len(provider.requests) == 2
+    assert "violated its JSON Schema" in provider.requests[1].messages[-1].body
+
+
+def test_structured_starter_generation_bounds_provider_schema_retries() -> None:
+    provider = SequencedStructuredProfileProvider(
+        [
+            ProviderError(
+                ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID,
+                "Structured provider response violated its JSON Schema",
+            )
+            for _attempt in range(3)
+        ]
+    )
+    completer = StructuredProviderCharacterProfileCompleter(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-structured",
+    )
+
+    with pytest.raises(ProviderError) as captured:
+        asyncio.run(
+            completer.generate_starters(
+                CharacterStarterGenerationRequest(
+                    scenario_type="full_roleplay",
+                    scenario_context="Title: Gallery Night",
+                    content={"player_character_name": "James Mitchell"},
+                    count=1,
+                )
+            )
+        )
+
+    assert (
+        captured.value.category
+        == ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID
+    )
+    assert len(provider.requests) == 3
 
 
 def test_tool_starter_generation_is_disabled() -> None:
