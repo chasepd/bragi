@@ -1003,6 +1003,149 @@ def test_narrator_planner_returns_message_spec_from_structured_output() -> None:
     assert "candidate only" in brief
 
 
+def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player_message = repositories.list_messages(save.id)[0]
+    lio = repositories.add_character(save_id=save.id, name="Lio", met=True)
+    repositories.add_character(save_id=save.id, name="Mara", met=True)
+    repositories.add_character(save_id=save.id, name="Mara", met=True)
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_plan": {
+                "intent": "Answer the player move.",
+                "thesis": "The beacon warning changes the scene.",
+                "narrative_beats": [],
+                "required_facts": [],
+                "must_say": [],
+                "avoid": [],
+                "agency_constraints": [],
+                "tone": "grounded",
+                "uncertainties": [],
+                "evidence_source_ids": [f"message:{player_message.id}"],
+                "npc_intents": [],
+                "state_commit_candidates": [
+                    {
+                        "candidate_id": "memory:lio",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "field_path": "",
+                        "character_id": "Lio",
+                        "target_type": "",
+                        "target_id": "",
+                        "value": {
+                            "body": "Lio learned the player is climbing.",
+                        },
+                        "safe_without_narration_allowed": False,
+                        "reason": "The player said they were climbing.",
+                        "confidence": 0.9,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": "I climb toward the beacon lens",
+                    },
+                    {
+                        "candidate_id": "presence:ambiguous",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "field_path": "present_character_ids",
+                        "character_id": "Mara",
+                        "target_type": "",
+                        "target_id": "",
+                        "value": {"action": "enter"},
+                        "safe_without_narration_allowed": False,
+                        "reason": "A Mara enters.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": "I climb toward the beacon lens",
+                    },
+                    {
+                        "candidate_id": "memory:unknown-source",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "field_path": "",
+                        "character_id": lio.id,
+                        "target_type": "",
+                        "target_id": "",
+                        "value": {"body": "Unsupported memory."},
+                        "safe_without_narration_allowed": False,
+                        "reason": "Unsupported source.",
+                        "confidence": 0.7,
+                        "evidence_source_ids": ["message:not-assembled"],
+                        "evidence_quote": "unsupported",
+                    },
+                ],
+            }
+        }
+    )
+    planner = StructuredProviderNarratorPlanner(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="planner",
+        repositories=repositories,
+    )
+    request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(
+            ChatMessage(role="player", body=player_message.body),
+        ),
+        context_breakdown={
+            "sources": [
+                {
+                    "source_type": "message",
+                    "source_id": player_message.id,
+                    "included": True,
+                },
+                {
+                    "source_type": "character",
+                    "source_id": ",".join(
+                        character.id
+                        for character in repositories.list_characters(save.id)
+                    ),
+                    "included": True,
+                },
+            ]
+        },
+    )
+
+    spec = asyncio.run(planner.plan(save_id=save.id, request=request))
+
+    schema = provider.structured_output_requests[0].schema
+    candidate_properties = schema["properties"]["state_commit_candidates"]["items"][
+        "properties"
+    ]
+    assert candidate_properties["character_id"]["enum"] == [
+        "",
+        *sorted(character.id for character in repositories.list_characters(save.id)),
+    ]
+    assert candidate_properties["evidence_source_ids"]["items"]["enum"] == [
+        *sorted(
+            [
+                f"message:{player_message.id}",
+                *(
+                    f"character:{character.id}"
+                    for character in repositories.list_characters(save.id)
+                ),
+            ]
+        ),
+        "message:latest",
+    ]
+    assert [candidate.candidate_id for candidate in spec.state_commit_candidates] == [
+        "memory:lio"
+    ]
+    assert spec.state_commit_candidates[0].character_id == lio.id
+    assert {
+        (rejection.candidate_id, rejection.reason)
+        for rejection in spec.planner_rejections
+    } == {
+        ("presence:ambiguous", "ambiguous_character_name"),
+        ("memory:unknown-source", "unknown_evidence_source_id"),
+    }
+
+
 def test_narrator_planner_defaults_missing_new_plan_fields() -> None:
     provider = RecordingStructuredProvider(
         {

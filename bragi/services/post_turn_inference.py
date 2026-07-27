@@ -38,6 +38,8 @@ class VerifiedPostTurnCoverage:
     scene_presence_character_ids: frozenset[str] = frozenset()
     memory_fingerprints: frozenset[str] = frozenset()
     knowledge_edge_targets: frozenset[tuple[str, str, str]] = frozenset()
+    applied_domains: frozenset[str] = frozenset()
+    queued_domains: frozenset[str] = frozenset()
     committed_count: int = 0
     confirmation_queued_count: int = 0
     metadata: dict[str, object] = field(default_factory=dict, compare=False)
@@ -50,6 +52,8 @@ class VerifiedPostTurnCoverage:
             or self.scene_presence_character_ids
             or self.memory_fingerprints
             or self.knowledge_edge_targets
+            or self.applied_domains
+            or self.queued_domains
             or self.committed_count
             or self.confirmation_queued_count
         )
@@ -66,6 +70,8 @@ class VerifiedPostTurnCoverage:
             "knowledge_edge_targets": [
                 list(target) for target in sorted(self.knowledge_edge_targets)
             ],
+            "applied_domains": sorted(self.applied_domains),
+            "queued_domains": sorted(self.queued_domains),
             "committed_count": self.committed_count,
             "confirmation_queued_count": self.confirmation_queued_count,
             **dict(self.metadata),
@@ -112,6 +118,8 @@ def verified_post_turn_coverage_from_mapping(
     knowledge_edge_targets = frozenset(
         _knowledge_edge_target_tuple(value.get("knowledge_edge_targets"))
     )
+    applied_domains = frozenset(_string_tuple(value.get("applied_domains")))
+    queued_domains = frozenset(_string_tuple(value.get("queued_domains")))
     return VerifiedPostTurnCoverage(
         source_message_ids=source_message_ids,
         state_keys=state_keys,
@@ -119,6 +127,8 @@ def verified_post_turn_coverage_from_mapping(
         scene_presence_character_ids=scene_presence_character_ids,
         memory_fingerprints=memory_fingerprints,
         knowledge_edge_targets=knowledge_edge_targets,
+        applied_domains=applied_domains,
+        queued_domains=queued_domains,
         committed_count=_nonnegative_int(value.get("committed_count")),
         confirmation_queued_count=_nonnegative_int(
             value.get("confirmation_queued_count")
@@ -166,6 +176,8 @@ def _coverage_metadata(value: Mapping[object, object]) -> dict[str, object]:
         "memory_fingerprints",
         "knowledge_edge_count",
         "knowledge_edge_targets",
+        "applied_domains",
+        "queued_domains",
         "committed_count",
         "confirmation_queued_count",
     }

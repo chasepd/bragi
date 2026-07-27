@@ -3125,13 +3125,13 @@ def test_submit_player_turn_uses_response_planning_model_preference(
             "narrative_beats": [
                 {
                     "description": "The red lens dominates the beacon gallery.",
-                    "evidence_source_ids": ["observation:warning"],
+                    "evidence_source_ids": ["message:latest"],
                 }
             ],
             "required_facts": [
                 {
                     "fact": "The beacon lens is red.",
-                    "evidence_source_ids": ["observation:warning"],
+                    "evidence_source_ids": ["message:latest"],
                 }
             ],
             "must_say": ["The lens burns red."],
@@ -3140,21 +3140,28 @@ def test_submit_player_turn_uses_response_planning_model_preference(
                 {
                     "constraint": "Mara chooses whether to show the warrant.",
                     "reason": "The player has not chosen that action.",
-                    "evidence_source_ids": ["message:player-1"],
+                    "evidence_source_ids": ["message:latest"],
                 }
             ],
             "tone": "tense and grounded",
             "uncertainties": ["Whether the riders saw the tower."],
-            "evidence_source_ids": ["message:source-narrator"],
+            "evidence_source_ids": ["message:latest"],
             "npc_intents": [],
             "state_commit_candidates": [
                 {
-                    "operation": "upsert",
-                    "state_key": "scene.beacon_lens",
-                    "value": {"status": "red"},
+                    "candidate_id": "scene_snapshot:mood",
+                    "candidate_type": "scene_snapshot_field",
+                    "operation": "update",
+                    "state_key": "scene_snapshot.mood",
+                    "field_path": "mood",
+                    "character_id": "",
+                    "target_type": "",
+                    "target_id": "",
+                    "value": {"mood": "uneasy"},
+                    "safe_without_narration_allowed": False,
                     "reason": "The turn may establish the warning.",
                     "confidence": 0.82,
-                    "evidence_source_ids": ["state:beacon.lens"],
+                    "evidence_source_ids": ["message:latest"],
                     "evidence_quote": "The beacon lens is red.",
                 }
             ],
@@ -3188,12 +3195,7 @@ def test_submit_player_turn_uses_response_planning_model_preference(
     assert "State commit candidates (do not persist automatically):" in (
         request.narration_brief
     )
-    assert request.narration_evidence == (
-        "message:source-narrator",
-        "observation:warning",
-        "message:player-1",
-        "state:beacon.lens",
-    )
+    assert request.narration_evidence == ("message:latest",)
 
 
 def test_submit_player_turn_retries_once_after_narrator_verifier_failure(
@@ -4466,6 +4468,89 @@ def test_submit_player_turn_commits_verified_scene_snapshot_field(
     assert planned["by_type"]["scene_snapshot_field"]["committed"] == 1
 
 
+def test_submit_player_turn_commits_plan_grounded_in_assembled_context(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The red beacon lens warns of riders in the ash.",
+        mood="steady",
+    )
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert snapshot is not None
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    evidence_source_id = f"scene_snapshot:{snapshot.id}"
+    candidate = replace(
+        _scene_snapshot_field_candidate(
+            field_path="mood",
+            value="uneasy",
+            evidence_quote="red beacon lens warns",
+        ),
+        evidence_source_ids=(evidence_source_id,),
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="The warning makes the room uneasy.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(evidence_source_id,),
+        state_commit_candidates=(candidate,),
+        evidence_source_text_by_id={
+            evidence_source_id: (
+                "Scene snapshot: situation: The red beacon lens warns of riders "
+                "in the ash.; mood: steady"
+            )
+        },
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("Uneasy silence gathers around the warning light.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(_commit_decision(candidate))
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I study the warning.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    updated = repositories.get_scene_snapshot(save.id)
+    assert updated is not None
+    assert updated.mood == "uneasy"
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["committed_count"] == 1
+    assert planned["by_domain"]["scene_snapshot"]["committed"] == 1
+    assert planned["rejected_count"] == 0
+
+
 def test_submit_player_turn_syncs_canonical_time_for_planned_scene_time_field(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -5201,6 +5286,9 @@ def test_submit_player_turn_queues_verified_learned_memory_when_confirmation_ena
     ]
     assert planned["confirmation_queued_count"] == 1
     assert planned["committed_count"] == 0
+    assert planned["coverage"]["memory_count"] == 0
+    assert planned["coverage"]["applied_domains"] == []
+    assert planned["coverage"]["queued_domains"] == ["memories"]
 
 
 def test_submit_player_turn_skips_learned_memory_with_ungrounded_evidence(
@@ -5287,6 +5375,9 @@ def test_submit_player_turn_skips_learned_memory_with_ungrounded_evidence(
     assert {
         decision["reason"] for decision in planned["decisions"]
     } == {"ungrounded_evidence_metadata"}
+    assert planned["rejected_count"] == 2
+    assert planned["by_reason"]["ungrounded_evidence_metadata"] == 2
+    assert planned["by_domain"]["memories"]["rejected"] == 2
 
 
 def test_hybrid_post_turn_mode_does_not_duplicate_verified_planned_memory(
@@ -5391,7 +5482,7 @@ def test_hybrid_post_turn_mode_does_not_duplicate_verified_planned_memory(
     assert state_result["verified_plan_coverage"]["memory_count"] == 1
 
 
-def test_plan_owned_post_turn_mode_skips_legacy_state_and_context_inference(
+def test_plan_owned_post_turn_mode_keeps_hybrid_fallback_for_partial_coverage(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -5472,7 +5563,7 @@ def test_plan_owned_post_turn_mode_skips_legacy_state_and_context_inference(
                     "value": {"status": "bad"},
                     "category": "debug",
                     "confidence": 0.8,
-                    "evidence_quote": "legacy",
+                    "evidence_quote": "uneasy quiet",
                 }
             ],
             "memories": [],
@@ -5507,22 +5598,23 @@ def test_plan_owned_post_turn_mode_skips_legacy_state_and_context_inference(
         )
     )
 
-    assert "state_memory_extraction" not in events
-    assert "context_update" not in events
-    assert "context_observation_extraction" not in events
+    assert "state_memory_extraction" in events
+    assert "context_update" in events
     assert "scenario_evolution" in events
     assert "automatic_media" in events
-    assert repositories.list_world_state(save.id) == []
+    assert [state.key for state in repositories.list_world_state(save.id)] == [
+        "legacy.should_not_run"
+    ]
     coordinator = _post_turn_jobs(repositories, save.id)[-1]
     assert coordinator["payload"]["post_turn_inference_mode"] == "plan_owned"
-    assert _post_turn_child_status(coordinator, "state") == "skipped"
-    assert _post_turn_child_status(coordinator, "context") == "skipped"
-    assert _post_turn_child_result(coordinator, "state")["skipped_reason"] == (
-        "post_turn_inference_mode_plan_owned"
+    assert coordinator["payload"]["effective_post_turn_inference_mode"] == "hybrid"
+    assert coordinator["result"]["post_turn_inference_mode_reason"] == (
+        "plan_owned_partial_domain_fallback"
     )
-    assert _post_turn_child_result(coordinator, "context")["skipped_reason"] == (
-        "post_turn_inference_mode_plan_owned"
-    )
+    coverage = coordinator["result"]["verified_plan_coverage"]
+    assert coverage["applied_domains"] == ["scene_snapshot"]
+    assert _post_turn_child_status(coordinator, "state") == "succeeded"
+    assert _post_turn_child_status(coordinator, "context") == "succeeded"
 
 
 def test_plan_owned_post_turn_mode_falls_back_when_commits_still_need_updates(
