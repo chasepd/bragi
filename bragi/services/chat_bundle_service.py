@@ -60,7 +60,10 @@ from bragi.services.scenario_service import (
     scenario_record_is_retired,
     strip_deprecated_scenario_character_sections,
 )
-from bragi.services.turn_snapshot_service import TurnSnapshotService
+from bragi.services.turn_snapshot_service import (
+    TurnSnapshotService,
+    portable_context_observation_curation_state_row,
+)
 from bragi.world_time_model import (
     canonical_world_time_from_values,
     legacy_world_time_fields,
@@ -477,18 +480,21 @@ class ChatBundleService:
                 """,
                 (save_id,),
             ),
-            "context_observation_curation_states": self._rows(
-                """
-                SELECT observation_id, save_id, attempt_count,
-                       next_eligible_at, NULL AS lease_token,
-                       NULL AS lease_until, last_error, terminal_outcome,
-                       completed_at, created_at, updated_at
-                FROM context_observation_curation_state
-                WHERE save_id = ?
-                ORDER BY created_at, observation_id
-                """,
-                (save_id,),
-            ),
+            "context_observation_curation_states": [
+                portable_context_observation_curation_state_row(row)
+                for row in self._rows(
+                    """
+                    SELECT observation_id, save_id, attempt_count,
+                           next_eligible_at, lease_token, lease_until,
+                           last_error, terminal_outcome, completed_at,
+                           created_at, updated_at
+                    FROM context_observation_curation_state
+                    WHERE save_id = ?
+                    ORDER BY created_at, observation_id
+                    """,
+                    (save_id,),
+                )
+            ],
             "scene_snapshots": self._rows(
                 """
                 SELECT id, save_id, current_location_id, situation, objective,

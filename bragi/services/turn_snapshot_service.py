@@ -10,6 +10,7 @@ import sqlite3
 import zlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import cast
@@ -1013,11 +1014,7 @@ class TurnSnapshotService:
                 rows[table.name] = _media_rows_parent_first(table_rows)
             elif table.name == "context_observation_curation_state":
                 rows[table.name] = tuple(
-                    {
-                        **row,
-                        "lease_token": None,
-                        "lease_until": None,
-                    }
+                    portable_context_observation_curation_state_row(row)
                     for row in table_rows
                 )
             else:
@@ -1800,7 +1797,7 @@ def _sanitize_snapshot_rows_for_safety(
         for table_name, table_rows in rows_by_table.items()
     }
     rows["context_observation_curation_state"] = tuple(
-        {**row, "lease_token": None, "lease_until": None}
+        portable_context_observation_curation_state_row(row)
         for row in rows.get("context_observation_curation_state", ())
     )
     rows["messages"] = tuple(
@@ -1877,6 +1874,39 @@ def _sanitize_snapshot_rows_for_safety(
         rows[table_name] = tuple(sanitized_rows)
     _filter_context_observation_curation_snapshot_rows(rows)
     return rows
+
+
+def portable_context_observation_curation_state_row(
+    row: Mapping[str, object],
+) -> dict[str, object]:
+    copied = dict(row)
+    lease_token = copied.get("lease_token")
+    lease_until = copied.get("lease_until")
+    attempt_count = copied.get("attempt_count")
+    if (
+        isinstance(lease_token, str)
+        and lease_token
+        and _timestamp_is_in_future(lease_until)
+        and isinstance(attempt_count, int)
+        and not isinstance(attempt_count, bool)
+        and attempt_count > 0
+    ):
+        copied["attempt_count"] = attempt_count - 1
+    copied["lease_token"] = None
+    copied["lease_until"] = None
+    return copied
+
+
+def _timestamp_is_in_future(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC) > datetime.now(UTC)
 
 
 def _filter_context_observation_curation_snapshot_rows(
