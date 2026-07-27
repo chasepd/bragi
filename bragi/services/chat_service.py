@@ -9229,11 +9229,13 @@ def _budgeted_narrator_context(
             context_result.selected_character_voice,
             blocked_character_ids=covered_character_voice_ids,
             suppressed_keys=deterministic_source_keys,
+            relevance_query=player_message.body,
         ),
         *_selected_context_sources(
             context_result.selected_open_obligations,
             tier="open_obligations",
             suppressed_keys=deterministic_source_keys,
+            relevance_query=player_message.body,
         ),
         *pending_context_suggestion_sources(
             repositories=repositories,
@@ -9248,36 +9250,43 @@ def _budgeted_narrator_context(
             context_result.selected_state,
             tier="retrieved_state",
             suppressed_keys=deterministic_source_keys,
+            relevance_query=player_message.body,
         ),
         *_selected_context_sources(
             context_result.selected_state_changes,
             tier="retrieved_state_changes",
             suppressed_keys=deterministic_source_keys,
+            relevance_query=player_message.body,
         ),
         *_selected_context_sources(
             context_result.selected_recent_messages,
             tier="retrieved_recent_messages",
             suppressed_keys=deterministic_source_keys,
+            relevance_query=player_message.body,
         ),
         *_selected_context_sources(
             context_result.selected_media_assets,
             tier="retrieved_media_assets",
             suppressed_keys=deterministic_source_keys,
+            relevance_query=player_message.body,
         ),
         *_selected_context_sources(
             context_result.selected_character_text_context,
             tier="retrieved_character_text_context",
             suppressed_keys=deterministic_source_keys,
+            relevance_query=player_message.body,
         ),
         *_selected_context_sources(
             context_result.selected_memories,
             tier="retrieved_memories",
             suppressed_keys=deterministic_source_keys,
+            relevance_query=player_message.body,
         ),
         *_selected_context_sources(
             context_result.selected_observations,
             tier="retrieved_observations",
             suppressed_keys=deterministic_source_keys,
+            relevance_query=player_message.body,
         ),
         *_latest_summary_sources(
             repositories=repositories,
@@ -9314,11 +9323,13 @@ def _budgeted_narrator_context(
             context_result.selected_summaries,
             tier="summary",
             suppressed_keys=deterministic_source_keys,
+            relevance_query=player_message.body,
         ),
         *_selected_context_sources(
             context_result.selected_scenario_sections,
             tier="retrieved_scenario_sections",
             suppressed_keys=deterministic_source_keys,
+            relevance_query=player_message.body,
         ),
     )
     selected_sources, breakdown = apply_context_budget(
@@ -9539,6 +9550,7 @@ def _selected_context_sources(
     *,
     tier: str,
     suppressed_keys: frozenset[tuple[str, str]] = frozenset(),
+    relevance_query: str,
 ) -> tuple[ContextSource, ...]:
     return tuple(
         ContextSource(
@@ -9548,6 +9560,8 @@ def _selected_context_sources(
             text=item.format_for_prompt(),
             reason="selected by context search",
             always_include=_selected_context_always_include(tier, item),
+            relevance_query=relevance_query,
+            trimmable=True,
         )
         for item in items
         if (item.source_type, item.source_id) not in suppressed_keys
@@ -9559,11 +9573,13 @@ def _selected_character_voice_sources(
     *,
     blocked_character_ids: set[str],
     suppressed_keys: frozenset[tuple[str, str]] = frozenset(),
+    relevance_query: str,
 ) -> tuple[ContextSource, ...]:
     return _selected_context_sources(
         tuple(item for item in items if item.source_id not in blocked_character_ids),
         tier="character_voice_profiles",
         suppressed_keys=suppressed_keys,
+        relevance_query=relevance_query,
     )
 
 

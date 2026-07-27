@@ -137,11 +137,7 @@ class SelectedContextItem:
     excerpted: bool = False
 
     def format_for_prompt(self) -> str:
-        excerpt_note = "; excerpted to selector-visible text" if self.excerpted else ""
-        return (
-            f"[{self.source_type}:{self.source_id}] {self.text} "
-            f"(relevance: {self.relevance_note}{excerpt_note})"
-        )
+        return f"[{self.source_type}:{self.source_id}] {self.text}"
 
 
 @dataclass(frozen=True)
@@ -700,6 +696,14 @@ class ContextSearchService:
                     summary_count=len(result.selected_summaries),
                     recent_message_count=len(result.selected_recent_messages),
                 )
+            result, narration_snapshot = _rehydrate_selected_context(
+                repositories=self.repositories,
+                save_id=save_id,
+                player_message_id=player_message_id,
+                focus_message=focus_message,
+                result=result,
+                fallback_snapshot=narration_snapshot,
+            )
             result = replace(
                 result,
                 continuity_index_synced=continuity_index_synced,
@@ -782,6 +786,95 @@ class ContextSearchService:
                 self._next_turn_cache.pop(save_id, None)
         log_event("context_search.precompute_cache_stale", save_id=save_id)
         return None
+
+
+def _rehydrate_selected_context(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    player_message_id: str,
+    focus_message: MessageRecord | None,
+    result: ContextSearchResult,
+    fallback_snapshot: NarrationContextSnapshot | None,
+) -> tuple[ContextSearchResult, NarrationContextSnapshot | None]:
+    selected_items = _selected_context_items(result)
+    if not selected_items:
+        return result, fallback_snapshot
+
+    ContinuityIndexService(repositories).sync_save(save_id)
+    details = repositories.load_save_details(save_id)
+    if details is None:
+        raise ValueError(f"Unknown save id: {save_id}")
+    messages = (
+        details.messages
+        if focus_message is None
+        else [*details.messages, focus_message]
+    )
+    snapshot = load_narration_context_snapshot(
+        repositories,
+        save_id=save_id,
+        details=details,
+        include_context_sources=True,
+    )
+    if snapshot is None:
+        raise ValueError(f"Unknown save id: {save_id}")
+    fresh_candidates = _context_candidate_set(
+        scenario=details.scenario,
+        scene_snapshot=snapshot.scene_snapshot,
+        characters=list(snapshot.characters),
+        character_knowledge_edges=list(snapshot.character_knowledge_edges),
+        message_visibility=list(snapshot.message_visibility),
+        entity_links=list(snapshot.entity_links),
+        world_state=list(snapshot.world_state),
+        world_state_for_scope=list(snapshot.world_state_for_scope),
+        state_changes=list(snapshot.state_changes),
+        media_assets=list(snapshot.media_assets),
+        memories=list(snapshot.memories),
+        summaries=list(snapshot.summaries),
+        observations=list(snapshot.observations),
+        context_sources=list(snapshot.context_sources),
+        recent_messages=messages,
+        player_message_id=player_message_id,
+        include_missing_raw_candidates=True,
+        narrow=False,
+    ).candidates
+    candidates_by_key = {
+        (candidate.source_type, candidate.source_id): candidate
+        for candidate in fresh_candidates
+    }
+    rehydrated_items: list[SelectedContextItem] = []
+    dropped_keys: list[tuple[str, str]] = []
+    for item in selected_items:
+        key = (item.source_type, item.source_id)
+        candidate = candidates_by_key.get(key)
+        if candidate is None:
+            dropped_keys.append(key)
+            continue
+        rehydrated_items.append(
+            _selected_context_item(
+                candidate,
+                relevance_note=item.relevance_note,
+            )
+        )
+    if dropped_keys:
+        log_event(
+            "context_search.stale_selected_sources_dropped",
+            save_id=save_id,
+            source_keys=[
+                f"{source_type}:{source_id}"
+                for source_type, source_id in dropped_keys
+            ],
+        )
+    rehydrated = _context_result_from_items(rehydrated_items)
+    return (
+        replace(
+            rehydrated,
+            continuity_index_synced=result.continuity_index_synced,
+            retrieval_degraded=result.retrieval_degraded,
+            retrieval_recovery=result.retrieval_recovery,
+        ),
+        snapshot,
+    )
 
 
 def _indexed_context_source_retrieval(
@@ -897,6 +990,7 @@ def _context_candidate_set(
     active_message_ids: set[str] | None = None,
     include_missing_raw_candidates: bool = True,
     retrieval_diagnostics: Mapping[str, object] | None = None,
+    narrow: bool = True,
 ) -> _ContextCandidateSet:
     latest_player_message = _message_body(recent_messages, player_message_id)
     character_records = characters or []
@@ -996,9 +1090,13 @@ def _context_candidate_set(
         *_media_asset_candidates(media_assets, recent_message_ids),
         *message_candidates,
     )
-    narrowed = _narrow_context_candidates(
-        candidates,
-        latest_player_message=latest_player_message,
+    narrowed = (
+        _narrow_context_candidates(
+            candidates,
+            latest_player_message=latest_player_message,
+        )
+        if narrow
+        else candidates
     )
     return _ContextCandidateSet(
         candidates=narrowed,
@@ -1701,9 +1799,15 @@ async def _select_context_with_tool_feedback(
     candidates: tuple[_ContextCandidate, ...],
 ) -> ContextSearchResult:
     messages = list(request.messages)
-    candidates_by_id = {candidate.source_id: candidate for candidate in candidates}
+    candidates_by_key = {
+        (candidate.source_type, candidate.source_id): candidate
+        for candidate in candidates
+    }
+    candidate_keys_by_id: dict[str, list[tuple[str, str]]] = {}
+    for key in candidates_by_key:
+        candidate_keys_by_id.setdefault(key[1], []).append(key)
     tool_schemas = {tool.name: tool.parameters for tool in request.tools}
-    selected_ids: set[str] = set()
+    selected_keys: set[tuple[str, str]] = set()
     selected_items: list[SelectedContextItem] = []
     last_errors: list[str] = []
 
@@ -1717,12 +1821,15 @@ async def _select_context_with_tool_feedback(
             accepted, result, item = _validate_context_search_tool_call(
                 call,
                 tool_schemas=tool_schemas,
-                candidates_by_id=candidates_by_id,
+                candidates_by_key=candidates_by_key,
+                candidate_keys_by_id=candidate_keys_by_id,
             )
             if accepted:
-                if item is not None and item.source_id not in selected_ids:
-                    selected_ids.add(item.source_id)
-                    selected_items.append(item)
+                if item is not None:
+                    selected_key = (item.source_type, item.source_id)
+                    if selected_key not in selected_keys:
+                        selected_keys.add(selected_key)
+                        selected_items.append(item)
                 tool_results.append((call, _accepted_tool_result()))
                 continue
             errors.append(result["error"])
@@ -1766,7 +1873,8 @@ def _validate_context_search_tool_call(
     call: ProviderToolCall,
     *,
     tool_schemas: dict[str, dict[str, object]],
-    candidates_by_id: dict[str, _ContextCandidate],
+    candidates_by_key: dict[tuple[str, str], _ContextCandidate],
+    candidate_keys_by_id: dict[str, list[tuple[str, str]]],
 ) -> tuple[bool, dict[str, str], SelectedContextItem | None]:
     schema = tool_schemas.get(call.name)
     if schema is None:
@@ -1778,20 +1886,21 @@ def _validate_context_search_tool_call(
     if error is not None:
         return _invalid_tool_call(error)
     source_id = cast(str, arguments["source_id"])
-    candidate = candidates_by_id.get(source_id)
-    if candidate is None:
-        return _invalid_tool_call(f"source_id is not a context candidate: {source_id}")
     source_type = arguments.get("source_type")
-    if (
-        isinstance(source_type, str)
-        and source_type
-        and source_type != candidate.source_type
-    ):
-        log_event(
-            "context_search.source_type_normalized",
-            selected_source_type=source_type,
-            candidate_source_type=candidate.source_type,
-            source_id=source_id,
+    if isinstance(source_type, str) and source_type:
+        candidate = candidates_by_key.get((source_type, source_id))
+    else:
+        matching_keys = candidate_keys_by_id.get(source_id, [])
+        if len(matching_keys) != 1:
+            return _invalid_tool_call(
+                "source_type is required when a source_id is shared by "
+                f"multiple context candidates: {source_id}"
+            )
+        candidate = candidates_by_key[matching_keys[0]]
+    if candidate is None:
+        return _invalid_tool_call(
+            "source_type/source_id is not a context candidate: "
+            f"{source_type}:{source_id}"
         )
     note = str(arguments.get("relevance_note", "")).strip()
     return (
@@ -2105,27 +2214,27 @@ def _context_result_from_structured_data(
     raw_selections = data.get("selections", [])
     if not isinstance(raw_selections, list):
         raise ValueError("Structured context selection selections must be a list")
-    candidates_by_id = {candidate.source_id: candidate for candidate in candidates}
+    candidates_by_key = {
+        (candidate.source_type, candidate.source_id): candidate
+        for candidate in candidates
+    }
     selected_items: list[SelectedContextItem] = []
-    selected_ids: set[str] = set()
+    selected_keys: set[tuple[str, str]] = set()
     for raw_selection in raw_selections:
         if not isinstance(raw_selection, dict):
             raise ValueError("Structured context selection item must be an object")
-        source_id = str(raw_selection.get("source_id", ""))
-        candidate = candidates_by_id.get(source_id)
-        if candidate is None:
-            raise ValueError(f"Unknown context source_id: {source_id}")
         source_type = str(raw_selection.get("source_type", ""))
-        if source_type != candidate.source_type:
-            log_event(
-                "context_search.source_type_normalized",
-                selected_source_type=source_type,
-                candidate_source_type=candidate.source_type,
-                source_id=source_id,
+        source_id = str(raw_selection.get("source_id", ""))
+        key = (source_type, source_id)
+        candidate = candidates_by_key.get(key)
+        if candidate is None:
+            raise ValueError(
+                "Unknown context source_type/source_id: "
+                f"{source_type}:{source_id}"
             )
-        if source_id in selected_ids:
+        if key in selected_keys:
             continue
-        selected_ids.add(source_id)
+        selected_keys.add(key)
         note = str(raw_selection.get("relevance_note", "")).strip()
         selected_items.append(
             _selected_context_item(
@@ -2141,13 +2250,12 @@ def _selected_context_item(
     *,
     relevance_note: str,
 ) -> SelectedContextItem:
-    text, excerpted = _selector_visible_context_text(candidate)
     return SelectedContextItem(
         source_type=candidate.source_type,
         source_id=candidate.source_id,
-        text=text,
+        text=candidate.text,
         relevance_note=relevance_note,
-        excerpted=excerpted,
+        excerpted=False,
     )
 
 
@@ -2223,6 +2331,24 @@ def _context_result_is_empty(result: ContextSearchResult) -> bool:
         or result.selected_character_voice
         or result.selected_summaries
         or result.selected_recent_messages
+    )
+
+
+def _selected_context_items(
+    result: ContextSearchResult,
+) -> tuple[SelectedContextItem, ...]:
+    return (
+        *result.selected_open_obligations,
+        *result.selected_scenario_sections,
+        *result.selected_state,
+        *result.selected_state_changes,
+        *result.selected_media_assets,
+        *result.selected_character_text_context,
+        *result.selected_memories,
+        *result.selected_observations,
+        *result.selected_character_voice,
+        *result.selected_summaries,
+        *result.selected_recent_messages,
     )
 
 

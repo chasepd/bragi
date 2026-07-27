@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -93,6 +93,25 @@ class RecordingStructuredContextProvider:
 
     async def generate_image(self, request: ImageRequest) -> ImageResponse:
         raise AssertionError("context search must not request image generation")
+
+
+class MutatingStructuredContextProvider(RecordingStructuredContextProvider):
+    def __init__(
+        self,
+        response_data: dict[str, object],
+        *,
+        after_selection: Callable[[], None],
+    ) -> None:
+        super().__init__(response_data)
+        self.after_selection = after_selection
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        response = await super().generate_structured_output(request)
+        self.after_selection()
+        return response
 
 
 class ScriptedContextCurator:
@@ -2078,7 +2097,7 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
         "scenario_section",
     ]
     assert [item.text for item in result.selected_scenario_sections] == [
-        f"{selected_section} | fact_type: scenario_section | importance: 0.35",
+        selected_section,
     ]
     assert result.selected_scenario_sections[0].relevance_note == (
         "The tower details shape the next beat."
@@ -3020,7 +3039,7 @@ def test_context_search_structured_empty_selection_stays_empty(
     assert "deterministic fallback" not in jobs[-1]["result_json"]
 
 
-def test_context_search_selected_items_use_selector_visible_excerpt(
+def test_context_search_rehydrates_selected_items_beyond_selector_excerpt(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(repositories)
@@ -3062,10 +3081,9 @@ def test_context_search_selected_items_use_selector_visible_excerpt(
 
     selected = result.selected_memories[0]
     assert selected.source_id == memory.id
-    assert selected.excerpted is True
+    assert selected.excerpted is False
     assert "Mara remembers the bridge bell" in selected.text
-    assert "SECRET TAIL THAT THE SELECTOR NEVER SAW" not in selected.text
-    assert selected.text.endswith("...")
+    assert "SECRET TAIL THAT THE SELECTOR NEVER SAW" in selected.text
     prompt = "\n".join(
         message.body for message in provider.structured_output_requests[0].messages
     )
@@ -3074,7 +3092,82 @@ def test_context_search_selected_items_use_selector_visible_excerpt(
     assert jobs[-1]["status"] == "succeeded"
     assert jobs[-1]["result_json"] is not None
     job_result = json.loads(jobs[-1]["result_json"])
-    assert job_result["selected_memories"][0]["excerpted"] is True
+    assert job_result["selected_memories"][0]["excerpted"] is False
+
+
+def test_context_search_drops_source_deleted_after_selection(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="Mara remembers that the bridge bell is cracked.",
+        tags=["bells"],
+        source_message_id=player_message.id,
+    )
+    provider = MutatingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": memory.id,
+                    "relevance_note": "The cracked bell matters.",
+                }
+            ]
+        },
+        after_selection=lambda: repositories.archive_memory(memory.id),
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert result.selected_memories == ()
+    job_result = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    assert job_result["selected_memories"] == []
+
+
+def test_context_search_uses_composite_source_identity_for_colliding_ids(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    state = repositories.list_world_state(save.id)[0]
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="Mara remembers the bell keeper's private warning.",
+        tags=["bells", "warning"],
+        source_message_id=player_message.id,
+        memory_id=state.id,
+    )
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": memory.id,
+                    "relevance_note": "Select the memory, not state.",
+                }
+            ]
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert result.selected_state == ()
+    assert [item.source_id for item in result.selected_memories] == [memory.id]
+    assert result.selected_memories[0].text == memory.body
 
 
 def test_context_search_recovers_from_unknown_structured_selection_ids(
@@ -3116,7 +3209,7 @@ def test_context_search_recovers_from_unknown_structured_selection_ids(
     assert job_result["fallback_used"] is False
 
 
-def test_context_search_normalizes_mismatched_source_type_by_source_id(
+def test_context_search_rejects_mismatched_source_type_and_source_id(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(repositories)
@@ -3148,14 +3241,14 @@ def test_context_search_normalizes_mismatched_source_type_by_source_id(
 
     assert provider.chat_requests == []
     assert len(provider.structured_output_requests) == 1
-    assert result.selected_state == ()
-    assert len(result.selected_memories) == 1
-    selected_memory = result.selected_memories[0]
-    assert selected_memory.source_type == "memory"
-    assert selected_memory.source_id == memory.id
-    assert selected_memory.relevance_note == (
-        "The memory id is valid despite the type."
+    assert result.selected_state
+    assert all(
+        item.relevance_note
+        == "Selected by deterministic fallback after empty context selection."
+        for item in result.selected_memories
     )
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "deterministic_fallback"
 
     jobs = _context_search_jobs(repositories, save.id)
     assert jobs[-1]["status"] == "succeeded"

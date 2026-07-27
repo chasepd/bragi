@@ -72,9 +72,7 @@ class ContextThenNarratorProvider:
             "world_state:state-beacon"
         ]
         assert request.retrieved_memories == (
-            "[memory:memory-elian] Mara promised Elian the beacon would burn. "
-            "| fact_type: promise | importance: 1 "
-            f"(relevance: {self.memory_note})",
+            "[memory:memory-elian] Mara promised Elian the beacon would burn.",
         )
         assert request.summary == (
             "[summary:summary-opening] The keep is cut off by the ash storm. "
