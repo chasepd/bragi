@@ -3772,6 +3772,17 @@ def _apply_focused_scene_update(
             save_id=applier.save_id,
             source_message_id=extracted.source_message_id,
         )
+        applier._record_applied(
+            operation="scene_generation_advanced",
+            entity_type="scene_snapshot",
+            entity_id=snapshot.id,
+            field_path="scene_generation",
+            before=generation_before,
+            after=snapshot.scene_generation,
+            reason=extracted.reason,
+            confidence=extracted.confidence,
+            source_message_ids=[extracted.source_message_id],
+        )
     applier.scene_snapshot = snapshot
     if extracted.in_world_time.strip():
         scene_updates.append(("in_world_time", extracted.in_world_time.strip()))
@@ -3806,6 +3817,7 @@ def _apply_focused_scene_update(
     applier._archive_scene_local_threads_after_scene_change(
         previous_location_id=previous_location_id,
         current_location_id=snapshot.current_location_id,
+        scene_transition=extracted.scene_transition,
         reason=extracted.reason,
         confidence=extracted.confidence,
         source_message_id=extracted.source_message_id,
@@ -4956,6 +4968,17 @@ class _ContextUpdateApplier:
                 source_message_id=extracted.source_message_id,
             )
             snapshot = existing
+            self._record_applied(
+                operation="scene_generation_advanced",
+                entity_type="scene_snapshot",
+                entity_id=snapshot.id,
+                field_path="scene_generation",
+                before=generation_before,
+                after=snapshot.scene_generation,
+                reason=extracted.reason,
+                confidence=extracted.confidence,
+                source_message_ids=[extracted.source_message_id],
+            )
         location_changed = snapshot.current_location_id != previous_location_id
         scene_updates: list[tuple[str, object]] = [
             ("situation", extracted.situation.strip()),
@@ -4991,6 +5014,7 @@ class _ContextUpdateApplier:
         self._archive_scene_local_threads_after_scene_change(
             previous_location_id=previous_location_id,
             current_location_id=snapshot.current_location_id,
+            scene_transition=extracted.scene_transition,
             reason=extracted.reason,
             confidence=extracted.confidence,
             source_message_id=extracted.source_message_id,
@@ -5001,11 +5025,12 @@ class _ContextUpdateApplier:
         *,
         previous_location_id: str | None,
         current_location_id: str | None,
+        scene_transition: bool = False,
         reason: str,
         confidence: float,
         source_message_id: str,
     ) -> None:
-        if previous_location_id == current_location_id:
+        if previous_location_id == current_location_id and not scene_transition:
             return
         for thread in tuple(self.snapshot.active_threads):
             if thread.id not in self.scene_local_thread_ids_before_scene:

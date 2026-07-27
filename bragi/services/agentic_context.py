@@ -1501,11 +1501,9 @@ def _observation_evidence_is_grounded(
         observation.evidence_quote,
     ):
         return False
-    claim_terms = _grounding_terms(observation.claim)
-    evidence_terms = _grounding_terms(observation.evidence_quote)
-    return bool(
-        claim_terms
-        and claim_terms <= evidence_terms
+    return _grounding_order_is_preserved(
+        observation.claim,
+        observation.evidence_quote,
     )
 
 
@@ -1812,9 +1810,19 @@ def _context_observation_evidence_is_grounded(
         or not observation.source_message_ids
     ):
         return False
-    return any(
-        quote_matches_source(observation.evidence_quote, source_text)
-        for source_text in source_texts_by_observation.get(observation.id, ())
+    return (
+        any(
+            quote_matches_source(observation.evidence_quote, source_text)
+            for source_text in source_texts_by_observation.get(observation.id, ())
+        )
+        and not _grounding_negation_conflicts(
+            observation.claim,
+            observation.evidence_quote,
+        )
+        and _grounding_order_is_preserved(
+            observation.claim,
+            observation.evidence_quote,
+        )
     )
 
 
@@ -3237,25 +3245,9 @@ def _curated_decision_is_grounded(
         if decision.action == "durable_memory"
         else (decision.context_body.strip() or observation.claim)
     )
-    grounding_text = " ".join(
-        (
-            observation.claim,
-            observation.evidence_quote,
-            decision.supporting_evidence_quote,
-        )
+    return canonical_claim_fingerprint(proposed) == canonical_claim_fingerprint(
+        observation.claim
     )
-    if _grounding_negation_conflicts(proposed, observation.claim):
-        return False
-    if (
-        decision.action == "durable_memory"
-        and _grounding_anchor_conflicts(proposed, observation.claim)
-    ):
-        return False
-    proposed_terms = _grounding_terms(proposed)
-    grounding_terms = _grounding_terms(grounding_text)
-    if not proposed_terms:
-        return False
-    return proposed_terms <= grounding_terms
 
 
 def _grounding_terms(value: str) -> set[str]:
@@ -3310,17 +3302,39 @@ def _grounding_anchor_conflicts(proposed: str, observation_claim: str) -> bool:
     )
 
 
+def _grounding_order_is_preserved(claim: str, evidence: str) -> bool:
+    claim_terms = _ordered_grounding_terms(claim)
+    evidence_terms = _ordered_grounding_terms(evidence)
+    if not claim_terms:
+        return False
+    evidence_index = 0
+    for claim_term in claim_terms:
+        try:
+            evidence_index = evidence_terms.index(claim_term, evidence_index) + 1
+        except ValueError:
+            return False
+    return True
+
+
 def _ordered_grounding_terms(value: str) -> list[str]:
     ignored = {
         "a",
         "an",
         "and",
+        "as",
+        "at",
+        "by",
         "for",
         "from",
+        "in",
         "into",
+        "is",
+        "of",
+        "on",
         "that",
         "the",
         "this",
+        "to",
         "was",
         "with",
     }

@@ -2032,7 +2032,11 @@ class ChatBundleService:
                 repair_tracker=repair_tracker,
             )
             context_sources.append(copied)
-        _insert_rows(connection, "context_sources", context_sources)
+        _insert_rows(
+            connection,
+            "context_sources",
+            _coalesce_import_context_sources(context_sources),
+        )
 
         characters: list[dict[str, object]] = []
         for row in _list_of_objects(data.get("characters"), "characters"):
@@ -2526,7 +2530,11 @@ class ChatBundleService:
                 existing_links=links,
             )
         )
-        _insert_rows(connection, "entity_links", links)
+        _insert_rows(
+            connection,
+            "entity_links",
+            _coalesce_import_entity_links(links),
+        )
 
         knowledge_edges: list[dict[str, object]] = []
         for row in _list_of_objects(
@@ -2568,7 +2576,11 @@ class ChatBundleService:
                 repair_tracker,
             )
             knowledge_edges.append(copied)
-        _insert_rows(connection, "character_knowledge_edges", knowledge_edges)
+        _insert_rows(
+            connection,
+            "character_knowledge_edges",
+            _coalesce_import_knowledge_edges(knowledge_edges),
+        )
 
         message_visibility: list[dict[str, object]] = []
         for row in _list_of_objects(
@@ -5709,6 +5721,109 @@ def _insert_rows(
         f"INSERT INTO {table_name}({column_sql}) VALUES ({placeholders})",
         values,
     )
+
+
+def _coalesce_import_context_sources(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    coalesced: dict[tuple[object, object, object], dict[str, object]] = {}
+    for row in rows:
+        key = (row.get("save_id"), row.get("source_type"), row.get("source_id"))
+        existing = coalesced.get(key)
+        if existing is None or (
+            existing.get("archived_at") is not None
+            and row.get("archived_at") is None
+        ):
+            coalesced[key] = row
+    return list(coalesced.values())
+
+
+def _coalesce_import_entity_links(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    coalesced: dict[tuple[object, ...], dict[str, object]] = {}
+    for row in rows:
+        key = (
+            row.get("save_id"),
+            row.get("entity_type"),
+            row.get("entity_id"),
+            row.get("target_type"),
+            row.get("target_id"),
+            row.get("relation"),
+        )
+        existing = coalesced.get(key)
+        if existing is None:
+            coalesced[key] = row
+        elif existing.get("source_message_id") is None:
+            existing["source_message_id"] = row.get("source_message_id")
+    return list(coalesced.values())
+
+
+def _coalesce_import_knowledge_edges(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    coalesced: dict[tuple[object, ...], dict[str, object]] = {}
+    state_rank = {"knows": 0, "may_know": 1, "does_not_know": 2}
+    for row in rows:
+        key = (
+            row.get("save_id"),
+            row.get("character_id"),
+            row.get("target_type"),
+            row.get("target_id"),
+        )
+        existing = coalesced.get(key)
+        if existing is None:
+            coalesced[key] = row
+            continue
+        existing_active = existing.get("archived_at") is None
+        row_active = row.get("archived_at") is None
+        if row_active and not existing_active:
+            coalesced[key] = row
+            continue
+        if existing_active and not row_active:
+            continue
+        if state_rank.get(str(row.get("knowledge_state")), 1) > state_rank.get(
+            str(existing.get("knowledge_state")),
+            1,
+        ):
+            for field in (
+                "knowledge_state",
+                "acquisition_method",
+                "source_message_id",
+                "evidence_quote",
+            ):
+                existing[field] = row.get(field)
+        existing["confidence"] = max(
+            _numeric_import_value(existing.get("confidence")),
+            _numeric_import_value(row.get("confidence")),
+        )
+        existing["source_message_ids_json"] = _merge_json_string_lists(
+            existing.get("source_message_ids_json"),
+            row.get("source_message_ids_json"),
+        )
+    return list(coalesced.values())
+
+
+def _merge_json_string_lists(first: object, second: object) -> str:
+    values: list[str] = []
+    for raw in (first, second):
+        try:
+            loaded = json.loads(str(raw))
+        except (json.JSONDecodeError, TypeError):
+            loaded = []
+        if isinstance(loaded, list):
+            values.extend(
+                str(value)
+                for value in loaded
+                if isinstance(value, str) and value
+            )
+    return _dump_json_compact(list(dict.fromkeys(values)))
+
+
+def _numeric_import_value(value: object) -> float:
+    if isinstance(value, int | float):
+        return float(value)
+    return 0.0
 
 
 def _backfill_imported_character_contact_states(connection: Any, save_id: str) -> None:

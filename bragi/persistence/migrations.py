@@ -1884,6 +1884,31 @@ def _remap_migrated_memory_references(
     keeper_id: str,
 ) -> None:
     if _table_exists(connection, "character_knowledge_edges"):
+        _merge_migrated_memory_knowledge_edge_conflicts(
+            connection,
+            save_id=save_id,
+            duplicate_id=duplicate_id,
+            keeper_id=keeper_id,
+        )
+        connection.execute(
+            """
+            DELETE FROM character_knowledge_edges AS keeper_edge
+            WHERE keeper_edge.save_id = ?
+              AND keeper_edge.target_type IN ('memory', 'memories')
+              AND keeper_edge.target_id = ?
+              AND keeper_edge.archived_at IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM character_knowledge_edges AS duplicate_edge
+                  WHERE duplicate_edge.save_id = keeper_edge.save_id
+                    AND duplicate_edge.character_id = keeper_edge.character_id
+                    AND duplicate_edge.target_type = keeper_edge.target_type
+                    AND duplicate_edge.target_id = ?
+                    AND duplicate_edge.archived_at IS NULL
+              )
+            """,
+            (save_id, keeper_id, duplicate_id),
+        )
         connection.execute(
             """
             UPDATE OR IGNORE character_knowledge_edges
@@ -1902,6 +1927,35 @@ def _remap_migrated_memory_references(
               AND target_id = ?
             """,
             (save_id, duplicate_id),
+        )
+    if _table_exists(connection, "context_sources"):
+        connection.execute(
+            """
+            DELETE FROM context_sources AS keeper_source
+            WHERE keeper_source.save_id = ?
+              AND keeper_source.source_type = 'memory'
+              AND keeper_source.source_id = ?
+              AND keeper_source.archived_at IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM context_sources AS duplicate_source
+                  WHERE duplicate_source.save_id = keeper_source.save_id
+                    AND duplicate_source.source_type = 'memory'
+                    AND duplicate_source.source_id = ?
+                    AND duplicate_source.archived_at IS NULL
+              )
+            """,
+            (save_id, keeper_id, duplicate_id),
+        )
+        connection.execute(
+            """
+            UPDATE OR IGNORE context_sources
+            SET source_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE save_id = ?
+              AND source_type = 'memory'
+              AND source_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
         )
     if _table_exists(connection, "entity_links"):
         connection.execute(
@@ -1954,6 +2008,86 @@ def _remap_migrated_memory_references(
               AND entity_id = ?
             """,
             (keeper_id, save_id, duplicate_id),
+        )
+
+
+def _merge_migrated_memory_knowledge_edge_conflicts(
+    connection: sqlite3.Connection,
+    *,
+    save_id: str,
+    duplicate_id: str,
+    keeper_id: str,
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT
+            keeper_edge.id, keeper_edge.knowledge_state,
+            keeper_edge.acquisition_method, keeper_edge.confidence,
+            keeper_edge.source_message_id,
+            keeper_edge.source_message_ids_json, keeper_edge.evidence_quote,
+            duplicate_edge.id, duplicate_edge.knowledge_state,
+            duplicate_edge.acquisition_method, duplicate_edge.confidence,
+            duplicate_edge.source_message_id,
+            duplicate_edge.source_message_ids_json,
+            duplicate_edge.evidence_quote
+        FROM character_knowledge_edges AS keeper_edge
+        JOIN character_knowledge_edges AS duplicate_edge
+          ON duplicate_edge.save_id = keeper_edge.save_id
+         AND duplicate_edge.character_id = keeper_edge.character_id
+         AND duplicate_edge.target_type = keeper_edge.target_type
+        WHERE keeper_edge.save_id = ?
+          AND keeper_edge.target_type IN ('memory', 'memories')
+          AND keeper_edge.target_id = ?
+          AND duplicate_edge.target_id = ?
+          AND keeper_edge.archived_at IS NULL
+          AND duplicate_edge.archived_at IS NULL
+        """,
+        (save_id, keeper_id, duplicate_id),
+    ).fetchall()
+    state_rank = {"knows": 0, "may_know": 1, "does_not_know": 2}
+    for row in rows:
+        duplicate_dominates = state_rank.get(str(row[8]), 1) > state_rank.get(
+            str(row[1]),
+            1,
+        )
+        dominant_offset = 7 if duplicate_dominates else 0
+        source_ids: list[str] = []
+        for raw_json in (row[5], row[12]):
+            try:
+                values = json.loads(str(raw_json))
+            except (json.JSONDecodeError, TypeError):
+                values = []
+            if isinstance(values, list):
+                source_ids.extend(
+                    str(value)
+                    for value in values
+                    if isinstance(value, str) and value
+                )
+        connection.execute(
+            """
+            UPDATE character_knowledge_edges
+            SET knowledge_state = ?, acquisition_method = ?,
+                confidence = ?, source_message_id = ?,
+                source_message_ids_json = ?, evidence_quote = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                row[dominant_offset + 1],
+                row[dominant_offset + 2],
+                max(float(str(row[3])), float(str(row[10]))),
+                row[dominant_offset + 4],
+                json.dumps(
+                    list(dict.fromkeys(source_ids)),
+                    separators=(",", ":"),
+                ),
+                row[dominant_offset + 6],
+                row[0],
+            ),
+        )
+        connection.execute(
+            "DELETE FROM character_knowledge_edges WHERE id = ?",
+            (row[7],),
         )
 
 

@@ -3171,25 +3171,19 @@ class PersistenceRepositories:
     ) -> list[ContextSourceSearchHit]:
         if limit <= 0:
             return []
-        bounded_query_terms = tuple(
-            sorted(
-                {
-                    str(term)
-                    for term in query_terms
-                    if str(term).strip()
-                },
-                key=lambda term: (
-                    -int(any(ord(character) > 127 for character in term)),
-                    -len(term),
-                    term,
-                ),
-            )[:MAX_CONTEXT_SEARCH_TERMS]
+        bounded_query_terms = _bounded_repository_search_terms(
+            {
+                str(term)
+                for term in query_terms
+                if str(term).strip()
+            },
+            limit=MAX_CONTEXT_SEARCH_TERMS,
         )
         match_query = _fts_query_from_terms(
             bounded_query_terms,
             match_all=match_all,
         )
-        if not match_query:
+        if not match_query and not exact_phrases:
             return []
         source_type_values = tuple(dict.fromkeys(str(item) for item in source_types))
         if not source_type_values:
@@ -3350,8 +3344,9 @@ class PersistenceRepositories:
                     limit,
                 ),
             )
-        fts_rows = self._fetch_all(
-            f"""
+        fts_rows = (
+            self._fetch_all(
+                f"""
             SELECT
                 context_sources.id,
                 context_sources.save_id,
@@ -3379,14 +3374,17 @@ class PersistenceRepositories:
             ORDER BY bm25_rank, context_sources.created_at DESC,
                      context_sources.rowid DESC
             LIMIT ?
-            """,
-            (
-                match_query,
-                save_id,
-                *source_type_values,
-                *eligibility_params,
-                limit,
-            ),
+                """,
+                (
+                    match_query,
+                    save_id,
+                    *source_type_values,
+                    *eligibility_params,
+                    limit,
+                ),
+            )
+            if match_query
+            else []
         )
         rows_by_id = {
             str(row["id"]): row
@@ -3885,6 +3883,7 @@ class PersistenceRepositories:
         snapshot_id: str | None = None,
         first_seen_message_id: str | None = None,
         last_updated_message_id: str | None = None,
+        preserve_scene_generation: bool = False,
     ) -> SceneSnapshotRecord:
         self._validate_location_reference(
             save_id=save_id,
@@ -3919,7 +3918,10 @@ class PersistenceRepositories:
         scene_generation = 1
         if existing is not None:
             scene_generation = int(existing["scene_generation"])
-            if existing["current_location_id"] != current_location_id:
+            if (
+                existing["current_location_id"] != current_location_id
+                and not preserve_scene_generation
+            ):
                 scene_generation += 1
         provided_legacy_values = {
             "in_world_time": in_world_time,
@@ -8662,6 +8664,32 @@ class PersistenceRepositories:
                 )
                 for duplicate in group[1:]:
                     remapped_ids[duplicate.id] = keeper.id
+                    self._merge_active_memory_knowledge_edge_conflicts(
+                        save_id=save_id,
+                        keeper_id=keeper.id,
+                        duplicate_id=duplicate.id,
+                    )
+                    self.connection.execute(
+                        """
+                        DELETE FROM character_knowledge_edges AS keeper_edge
+                        WHERE keeper_edge.save_id = ?
+                          AND keeper_edge.target_type IN ('memory', 'memories')
+                          AND keeper_edge.target_id = ?
+                          AND keeper_edge.archived_at IS NOT NULL
+                          AND EXISTS (
+                            SELECT 1
+                            FROM character_knowledge_edges AS duplicate_edge
+                            WHERE duplicate_edge.save_id = keeper_edge.save_id
+                              AND duplicate_edge.character_id =
+                                  keeper_edge.character_id
+                              AND duplicate_edge.target_type =
+                                  keeper_edge.target_type
+                              AND duplicate_edge.target_id = ?
+                              AND duplicate_edge.archived_at IS NULL
+                          )
+                        """,
+                        (save_id, keeper.id, duplicate.id),
+                    )
                     self.connection.execute(
                         """
                         DELETE FROM character_knowledge_edges AS duplicate_edge
@@ -8688,6 +8716,35 @@ class PersistenceRepositories:
                         WHERE save_id = ?
                           AND target_type IN ('memory', 'memories')
                           AND target_id = ?
+                        """,
+                        (keeper.id, save_id, duplicate.id),
+                    )
+                    self.connection.execute(
+                        """
+                        DELETE FROM context_sources AS keeper_source
+                        WHERE keeper_source.save_id = ?
+                          AND keeper_source.source_type = 'memory'
+                          AND keeper_source.source_id = ?
+                          AND keeper_source.archived_at IS NOT NULL
+                          AND EXISTS (
+                            SELECT 1
+                            FROM context_sources AS duplicate_source
+                            WHERE duplicate_source.save_id =
+                                  keeper_source.save_id
+                              AND duplicate_source.source_type = 'memory'
+                              AND duplicate_source.source_id = ?
+                              AND duplicate_source.archived_at IS NULL
+                          )
+                        """,
+                        (save_id, keeper.id, duplicate.id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE OR IGNORE context_sources
+                        SET source_id = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE save_id = ?
+                          AND source_type = 'memory'
+                          AND source_id = ?
                         """,
                         (keeper.id, save_id, duplicate.id),
                     )
@@ -8780,6 +8837,86 @@ class PersistenceRepositories:
             self.rollback_transaction()
             raise
         return remapped_ids
+
+    def _merge_active_memory_knowledge_edge_conflicts(
+        self,
+        *,
+        save_id: str,
+        keeper_id: str,
+        duplicate_id: str,
+    ) -> None:
+        rows = self._fetch_all(
+            """
+            SELECT
+                keeper_edge.id AS keeper_edge_id,
+                keeper_edge.knowledge_state AS keeper_state,
+                keeper_edge.acquisition_method AS keeper_method,
+                keeper_edge.confidence AS keeper_confidence,
+                keeper_edge.source_message_id AS keeper_source_message_id,
+                keeper_edge.source_message_ids_json AS keeper_source_ids_json,
+                keeper_edge.evidence_quote AS keeper_evidence,
+                duplicate_edge.id AS duplicate_edge_id,
+                duplicate_edge.knowledge_state AS duplicate_state,
+                duplicate_edge.acquisition_method AS duplicate_method,
+                duplicate_edge.confidence AS duplicate_confidence,
+                duplicate_edge.source_message_id AS duplicate_source_message_id,
+                duplicate_edge.source_message_ids_json AS duplicate_source_ids_json,
+                duplicate_edge.evidence_quote AS duplicate_evidence
+            FROM character_knowledge_edges AS keeper_edge
+            JOIN character_knowledge_edges AS duplicate_edge
+              ON duplicate_edge.save_id = keeper_edge.save_id
+             AND duplicate_edge.character_id = keeper_edge.character_id
+             AND duplicate_edge.target_type = keeper_edge.target_type
+            WHERE keeper_edge.save_id = ?
+              AND keeper_edge.target_type IN ('memory', 'memories')
+              AND keeper_edge.target_id = ?
+              AND duplicate_edge.target_id = ?
+              AND keeper_edge.archived_at IS NULL
+              AND duplicate_edge.archived_at IS NULL
+            """,
+            (save_id, keeper_id, duplicate_id),
+        )
+        state_rank = {"knows": 0, "may_know": 1, "does_not_know": 2}
+        for row in rows:
+            duplicate_dominates = state_rank.get(
+                str(row["duplicate_state"]),
+                1,
+            ) > state_rank.get(str(row["keeper_state"]), 1)
+            dominant_prefix = "duplicate" if duplicate_dominates else "keeper"
+            source_ids = list(
+                dict.fromkeys(
+                    (
+                        *_load_list(row["keeper_source_ids_json"]),
+                        *_load_list(row["duplicate_source_ids_json"]),
+                    )
+                )
+            )
+            self.connection.execute(
+                """
+                UPDATE character_knowledge_edges
+                SET knowledge_state = ?, acquisition_method = ?,
+                    confidence = ?, source_message_id = ?,
+                    source_message_ids_json = ?, evidence_quote = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    row[f"{dominant_prefix}_state"],
+                    row[f"{dominant_prefix}_method"],
+                    max(
+                        float(row["keeper_confidence"]),
+                        float(row["duplicate_confidence"]),
+                    ),
+                    row[f"{dominant_prefix}_source_message_id"],
+                    _dump_json(source_ids),
+                    row[f"{dominant_prefix}_evidence"],
+                    row["keeper_edge_id"],
+                ),
+            )
+            self.connection.execute(
+                "DELETE FROM character_knowledge_edges WHERE id = ?",
+                (row["duplicate_edge_id"],),
+            )
 
     def count_active_memories(self, save_id: str) -> int:
         row = self._fetch_one(
@@ -11114,14 +11251,38 @@ def _unicode_search_terms(value: str) -> tuple[str, ...]:
             continue
         if current:
             term = "".join(current).strip("'")
-            if len(term) >= 2 or any(ord(character) > 127 for character in term):
+            if term:
                 terms.append(term)
             current = []
     if current:
         term = "".join(current).strip("'")
-        if len(term) >= 2 or any(ord(character) > 127 for character in term):
+        if term:
             terms.append(term)
     return tuple(terms)
+
+
+def _bounded_repository_search_terms(
+    terms: set[str] | frozenset[str],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    if limit <= 0:
+        return ()
+    ordered = sorted(terms, key=lambda term: (-len(term), term))
+    non_ascii = [
+        term
+        for term in ordered
+        if any(ord(character) > 127 for character in term)
+    ]
+    non_ascii_set = set(non_ascii)
+    ascii_terms = [term for term in ordered if term not in non_ascii_set]
+    if not non_ascii or not ascii_terms:
+        return tuple(ordered[:limit])
+    reserve = limit // 2
+    selected = [*non_ascii[:reserve], *ascii_terms[:reserve]]
+    selected_set = set(selected)
+    selected.extend(term for term in ordered if term not in selected_set)
+    return tuple(selected[:limit])
 
 
 def _normalized_search_text(value: object) -> str:

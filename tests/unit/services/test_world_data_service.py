@@ -1271,6 +1271,79 @@ def test_world_data_service_applies_scene_time_suggestion_with_canonical_provena
     assert snapshot.world_time_confidence == 0.91
 
 
+def test_world_data_service_accepts_locked_transition_without_advancing_twice(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    world_data = _import_world_data_service_without_gtk(monkeypatch)
+    save_id, ids = _persist_normalized_world_data_fixture(repositories)
+    next_location = repositories.add_location(
+        save_id=save_id,
+        name="Gatehouse",
+        source_message_id=ids["message"],
+    )
+    before_transition = repositories.get_scene_snapshot(save_id)
+    assert before_transition is not None
+    transitioned = repositories.advance_scene_generation(
+        save_id=save_id,
+        source_message_id=ids["message"],
+    )
+    repositories.add_context_update_audit(
+        save_id=save_id,
+        operation="scene_generation_advanced",
+        entity_type="scene_snapshot",
+        entity_id=transitioned.id,
+        field_path="scene_generation",
+        before=before_transition.scene_generation,
+        after=transitioned.scene_generation,
+        source_message_ids=[ids["message"]],
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="observation",
+        source_id="new-scene-scratch",
+        title="Gatehouse arrival",
+        body="The gatehouse doors are closing.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=transitioned.id,
+        scene_generation=transitioned.scene_generation,
+        created_turn_number=1,
+        expires_after_turn_number=13,
+    )
+    suggestion = repositories.add_context_update_suggestion(
+        save_id=save_id,
+        update_type="field_update",
+        entity_type="scene_snapshot",
+        entity_id=transitioned.id,
+        field_path="current_location_id",
+        proposed_value=next_location.id,
+        source_message_ids=[ids["message"]],
+    )
+    repositories.add_context_update_audit(
+        save_id=save_id,
+        suggestion_id=suggestion.id,
+        operation="queued",
+        entity_type="scene_snapshot",
+        entity_id=transitioned.id,
+        field_path="current_location_id",
+        before=before_transition.current_location_id,
+        after=next_location.id,
+        source_message_ids=[ids["message"]],
+    )
+    service = world_data.WorldDataService(
+        repositories=repositories,
+        active_save_id=save_id,
+    )
+
+    service.apply_suggestions((suggestion.id,))
+
+    updated = repositories.get_scene_snapshot(save_id)
+    assert updated is not None
+    assert updated.current_location_id == next_location.id
+    assert updated.scene_generation == transitioned.scene_generation
+    assert repositories.get_context_source(scratch.id) is not None
+
+
 def test_world_data_service_rejects_protected_character_archive_suggestion(
     repositories: PersistenceRepositories,
     monkeypatch: MonkeyPatch,

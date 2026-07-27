@@ -17,6 +17,11 @@ from bragi.persistence.repositories import (
     PersistenceRepositories,
     canonical_claim_fingerprint,
 )
+from bragi.services.chat_bundle_service import (
+    _coalesce_import_context_sources,
+    _coalesce_import_entity_links,
+    _coalesce_import_knowledge_edges,
+)
 from bragi.services.director_pressure_service import DIRECTOR_PRESSURE_STATE_KEY
 from bragi.services.generation_settings import MODEL_THINKING_PREFERENCES_SETTING
 from bragi.services.image_style_settings import (
@@ -60,6 +65,87 @@ def repositories(tmp_path: Path) -> Iterator[PersistenceRepositories]:
 
     with sqlite3.connect(database_path) as connection:
         yield PersistenceRepositories(connection)
+
+
+def test_legacy_import_rows_coalesce_after_memory_id_remapping() -> None:
+    active_source: dict[str, object] = {
+        "id": "source-active",
+        "save_id": "target-save",
+        "source_type": "memory",
+        "source_id": "merged-memory",
+        "archived_at": None,
+    }
+    sources = _coalesce_import_context_sources(
+        [
+            {
+                **active_source,
+                "id": "source-archived",
+                "archived_at": "2026-01-01",
+            },
+            active_source,
+        ]
+    )
+    links = _coalesce_import_entity_links(
+        [
+            {
+                "id": "link-one",
+                "save_id": "target-save",
+                "entity_type": "character",
+                "entity_id": "character-one",
+                "target_type": "memory",
+                "target_id": "merged-memory",
+                "relation": "recalls",
+                "source_message_id": None,
+            },
+            {
+                "id": "link-two",
+                "save_id": "target-save",
+                "entity_type": "character",
+                "entity_id": "character-one",
+                "target_type": "memory",
+                "target_id": "merged-memory",
+                "relation": "recalls",
+                "source_message_id": "message-two",
+            },
+        ]
+    )
+    edges = _coalesce_import_knowledge_edges(
+        [
+            {
+                "id": "edge-knows",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "memory",
+                "target_id": "merged-memory",
+                "knowledge_state": "knows",
+                "confidence": 0.9,
+                "source_message_ids_json": '["message-one"]',
+                "archived_at": None,
+            },
+            {
+                "id": "edge-denial",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "memory",
+                "target_id": "merged-memory",
+                "knowledge_state": "does_not_know",
+                "confidence": 0.7,
+                "source_message_ids_json": '["message-two"]',
+                "archived_at": None,
+            },
+        ]
+    )
+
+    assert sources == [active_source]
+    assert len(links) == 1
+    assert links[0]["source_message_id"] == "message-two"
+    assert len(edges) == 1
+    assert edges[0]["knowledge_state"] == "does_not_know"
+    assert edges[0]["confidence"] == 0.9
+    assert json.loads(cast(str, edges[0]["source_message_ids_json"])) == [
+        "message-one",
+        "message-two",
+    ]
 
 
 def test_export_save_writes_manifest_data_and_referenced_media(

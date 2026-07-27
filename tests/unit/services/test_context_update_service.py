@@ -6273,6 +6273,14 @@ def test_focused_scene_transition_expires_scratch_at_same_location(
         created_turn_number=1,
         expires_after_turn_number=13,
     )
+    scene_thread = repositories.add_active_thread(
+        save_id=save.id,
+        title="Inspect the cracked lens",
+        description="This obligation belongs only to the current scene.",
+        visibility="scene",
+        related_entities=[f"location:{location.id}"],
+        source_message_id=narrator_message.id,
+    )
     narrator_message = repositories.update_message_body(
         save_id=save.id,
         message_id=narrator_message.id,
@@ -6300,6 +6308,7 @@ def test_focused_scene_transition_expires_scratch_at_same_location(
                 ),
             ),
             (),
+            (),
         ]
     )
     service = module.ContextUpdateService(
@@ -6324,6 +6333,9 @@ def test_focused_scene_transition_expires_scratch_at_same_location(
     assert updated_scene.current_location_id == location.id
     assert updated_scene.scene_generation == scene.scene_generation + 1
     assert repositories.get_context_source(scratch.id) is None
+    assert scene_thread.id not in {
+        thread.id for thread in repositories.list_active_threads(save.id)
+    }
 
 
 def test_focused_scene_transition_advances_when_location_change_is_locked(
@@ -6354,6 +6366,14 @@ def test_focused_scene_transition_advances_when_location_change_is_locked(
         created_turn_number=1,
         expires_after_turn_number=13,
     )
+    scene_thread = repositories.add_active_thread(
+        save_id=save.id,
+        title="Hold the gallery",
+        description="This obligation belongs only to the locked scene.",
+        visibility="scene",
+        related_entities=[f"location:{old_location.id}"],
+        source_message_id=narrator_message.id,
+    )
     narrator_message = repositories.update_message_body(
         save_id=save.id,
         message_id=narrator_message.id,
@@ -6378,6 +6398,7 @@ def test_focused_scene_transition_advances_when_location_change_is_locked(
                     ),
                 ),
             ),
+            (),
             (),
         ]
     )
@@ -6404,6 +6425,9 @@ def test_focused_scene_transition_advances_when_location_change_is_locked(
     assert updated.current_location_id == old_location.id
     assert updated.scene_generation == scene.scene_generation + 1
     assert repositories.get_context_source(scratch.id) is None
+    assert scene_thread.id not in {
+        thread.id for thread in repositories.list_active_threads(save.id)
+    }
     assert any(
         suggestion.entity_type == "scene_snapshot"
         and suggestion.field_path == "current_location_id"

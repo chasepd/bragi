@@ -2336,6 +2336,9 @@ def _upsert_scene_snapshot(
         source_message_id=cast(str | None, values["source_message_id"]),
         locked_fields=cast(list[str], values["locked_fields"]),
         snapshot_id=cast(str | None, values["snapshot_id"]),
+        preserve_scene_generation=bool(
+            values.get("preserve_scene_generation", False)
+        ),
         **world_time_kwargs,
     )
     if values.get("world_time_changed"):
@@ -3090,6 +3093,29 @@ def _apply_suggestion_value(
         if field not in kwargs:
             raise ValueError(f"Unsupported scene suggestion field: {field}")
         kwargs[field] = _coerce_scene_value(field, value)
+        if field == "current_location_id":
+            transition_source_message_ids = set(
+                _csv(suggestion.source_message_ids_text)
+            )
+            current_snapshot = repositories.get_scene_snapshot(save_id)
+            audit_entries = repositories.list_context_update_audit(save_id)
+            suggestion_was_queued = any(
+                audit.operation == "queued"
+                and audit.suggestion_id == suggestion.suggestion_id
+                and audit.entity_id == current.snapshot_id
+                and audit.field_path == "current_location_id"
+                for audit in audit_entries
+            )
+            kwargs["preserve_scene_generation"] = suggestion_was_queued and any(
+                audit.operation == "scene_generation_advanced"
+                and audit.entity_id == current.snapshot_id
+                and current_snapshot is not None
+                and audit.after == current_snapshot.scene_generation
+                and bool(
+                    transition_source_message_ids & set(audit.source_message_ids)
+                )
+                for audit in audit_entries
+            )
         if field in SCENE_WORLD_TIME_FIELDS:
             kwargs["world_time_changed"] = True
             kwargs["world_time_changed_fields"] = (field,)

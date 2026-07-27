@@ -42,8 +42,11 @@ from bragi.services.context_search_service import (
     RECENT_MESSAGE_CANDIDATE_LIMIT,
     ContextSearchResult,
     ContextSearchService,
+    _balanced_script_terms,
+    _bounded_context_query_terms,
     _context_selection_instruction,
     _meaningful_terms,
+    _memory_provenance_visible_to_present_characters,
 )
 from bragi.services.continuity_index_service import ContinuityIndexService
 
@@ -520,6 +523,100 @@ def test_context_selection_instruction_prioritizes_mystery_context() -> None:
 def test_meaningful_terms_preserve_single_character_cjk_entities() -> None:
     assert _meaningful_terms("李は東門にいる") == {"李は東門にいる"}
     assert _meaningful_terms("ask 李 now") == {"ask", "李", "now"}
+
+
+def test_context_query_terms_keep_short_ascii_identifiers_and_mixed_scripts() -> None:
+    assert _meaningful_terms("X") == {"x"}
+    assert _meaningful_terms("A-7") == {"a", "7"}
+    assert {"x", "a", "7"} <= _meaningful_terms(
+        "I ask X whether A-7 opens the vault."
+    )
+    mixed_terms = {f"漢字{index:02d}" for index in range(70)}
+    mixed_terms.add("moonstone")
+
+    bounded = _balanced_script_terms(mixed_terms, limit=64)
+    bounded_query = _bounded_context_query_terms(
+        " ".join((*sorted(mixed_terms - {"moonstone"}), "moonstone"))
+    )
+
+    assert len(bounded) == 64
+    assert "moonstone" in bounded
+    assert "moonstone" in bounded_query
+
+
+def test_context_query_terms_bound_large_raw_inputs_and_keep_tail_terms() -> None:
+    query = " ".join(f"noise{index:05d}" for index in range(2_000))
+    query = f"{query} moonstone"
+
+    terms = _bounded_context_query_terms(query)
+
+    assert len(terms) <= 64
+    assert "moonstone" in terms
+
+
+def test_raw_memory_provenance_allows_one_independently_visible_observation(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Archive",
+        premise="A guarded archive.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Boundary")
+    hidden = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The moonstone opens the archive.",
+    )
+    visible = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="A public witness confirms the moonstone opens the archive.",
+    )
+    character = repositories.add_character(save_id=save.id, name="Ilyra")
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden.id,
+        character_id=character.id,
+        visibility="not_visible",
+    )
+    observations = [
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="character_fact",
+            claim="The moonstone opens the archive.",
+            evidence_quote="moonstone opens the archive",
+            source_message_ids=[message.id],
+            scope="durable",
+            status="accepted",
+            metadata={
+                "curation": {
+                    "action": "durable_memory",
+                    "memory_body": "The moonstone opens the archive.",
+                }
+            },
+        )
+        for message in (hidden, visible)
+    ]
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The moonstone opens the archive.",
+        tags=["archive"],
+        source_message_ids=[hidden.id, visible.id],
+        source_observation_ids=[observation.id for observation in observations],
+    )
+
+    assert _memory_provenance_visible_to_present_characters(
+        memory,
+        source_message_ids=tuple(memory.source_message_ids),
+        observations_by_id={
+            observation.id: observation for observation in observations
+        },
+        present_character_ids=frozenset({character.id}),
+        message_visibility=repositories.list_message_visibility(save.id),
+    )
 
 
 def test_retired_character_interaction_type_has_no_context_specialization() -> None:

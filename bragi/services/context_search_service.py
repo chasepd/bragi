@@ -31,7 +31,10 @@ from bragi.persistence.models import (
     SummaryRecord,
     WorldStateRecord,
 )
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.providers.contracts import (
     ChatMessage,
     ProviderClient,
@@ -939,18 +942,10 @@ def _indexed_context_source_retrieval(
     additional_query_terms: tuple[str, ...] = (),
 ) -> _IndexedContextSourceRetrieval:
     started_at = perf_counter()
-    query_text = " ".join((latest_player_message, *additional_query_terms))
-    if len(query_text) > MAX_CONTEXT_QUERY_CHARS:
-        half = MAX_CONTEXT_QUERY_CHARS // 2
-        query_text = f"{query_text[:half]} {query_text[-half:]}"
-    query_terms = sorted(
-        _meaningful_terms(query_text),
-        key=lambda term: (
-            -int(any(ord(character) > 127 for character in term)),
-            -len(term),
-            term,
-        ),
-    )[:MAX_CONTEXT_QUERY_TERMS]
+    query_text = _bounded_context_query_text(
+        " ".join((latest_player_message, *additional_query_terms))
+    )
+    query_terms = list(_bounded_context_query_terms(query_text))
     exact_phrases = tuple(
         dict.fromkeys(
             phrase.strip()[:MAX_CONTEXT_EXACT_PHRASE_CHARS]
@@ -1568,6 +1563,9 @@ def _context_candidate_set(
         scoped_targets=scoped_targets,
         present_character_ids=turn_scope.present_character_ids,
         message_visibility=message_visibility or [],
+        observations_by_id={
+            observation.id: observation for observation in observation_records
+        },
     )
     state_candidates = (
         raw_state_candidates if include_missing_raw_candidates else ()
@@ -3306,7 +3304,7 @@ def _exact_raw_candidates(
     latest_player_message: str,
     limit: int = 24,
 ) -> tuple[_ContextCandidate, ...]:
-    query_terms = _meaningful_terms(latest_player_message)
+    query_terms = set(_bounded_context_query_terms(latest_player_message))
     if not query_terms or limit <= 0:
         return ()
     indexed_keys = {
@@ -3317,8 +3315,10 @@ def _exact_raw_candidates(
     for candidate in candidates:
         if (candidate.source_type, candidate.source_id) in indexed_keys:
             continue
-        candidate_terms = _meaningful_terms(
-            candidate.selection_text or candidate.text
+        candidate_terms = set(
+            _bounded_context_query_terms(
+                candidate.selection_text or candidate.text
+            )
         )
         overlap_count = len(query_terms & candidate_terms)
         if overlap_count < min(2, len(query_terms)):
@@ -3566,6 +3566,10 @@ def _candidate_rank(
 
 
 def _meaningful_terms(text: str) -> set[str]:
+    return set(_ordered_meaningful_query_terms(text))
+
+
+def _ordered_meaningful_query_terms(text: str) -> tuple[str, ...]:
     normalized = unicodedata.normalize("NFKC", text).casefold()
     terms: list[str] = []
     current: list[str] = []
@@ -3578,22 +3582,71 @@ def _meaningful_terms(text: str) -> set[str]:
             current = []
     if current:
         terms.append("".join(current).strip("'"))
-    return {
+    return tuple(
+        dict.fromkeys(
+            term
+            for term in terms
+            if term
+            and term
+            not in {
+                "and",
+                "for",
+                "i",
+                "the",
+                "that",
+                "this",
+                "with",
+                "you",
+                "your",
+            }
+        )
+    )
+
+
+def _bounded_context_query_text(text: str) -> str:
+    if len(text) <= MAX_CONTEXT_QUERY_CHARS:
+        return text
+    half = MAX_CONTEXT_QUERY_CHARS // 2
+    return f"{text[:half]} {text[-half:]}"
+
+
+def _bounded_context_query_terms(text: str) -> tuple[str, ...]:
+    ordered = _ordered_meaningful_query_terms(_bounded_context_query_text(text))
+    if len(ordered) > MAX_CONTEXT_QUERY_TERMS:
+        reserve = MAX_CONTEXT_QUERY_TERMS // 2
+        ordered = (*ordered[:reserve], *ordered[-reserve:])
+    return _balanced_script_terms(
+        set(ordered),
+        limit=MAX_CONTEXT_QUERY_TERMS,
+    )
+
+
+def _balanced_script_terms(
+    terms: set[str] | frozenset[str],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    if limit <= 0:
+        return ()
+    ordered = sorted(terms, key=lambda term: (-len(term), term))
+    non_ascii = [
         term
-        for term in terms
-        if (len(term) >= 2 or any(ord(character) > 127 for character in term))
-        and term
-        not in {
-            "and",
-            "for",
-            "the",
-            "that",
-            "this",
-            "with",
-            "you",
-            "your",
-        }
-    }
+        for term in ordered
+        if any(ord(character) > 127 for character in term)
+    ]
+    non_ascii_set = set(non_ascii)
+    ascii_terms = [term for term in ordered if term not in non_ascii_set]
+    if not non_ascii or not ascii_terms:
+        return tuple(ordered[:limit])
+    reserve = limit // 2
+    selected = [*non_ascii[:reserve], *ascii_terms[:reserve]]
+    selected_set = set(selected)
+    selected.extend(
+        term
+        for term in ordered
+        if term not in selected_set
+    )
+    return tuple(selected[:limit])
 
 
 def _state_candidates(
@@ -3755,6 +3808,7 @@ def _memory_candidates(
     scoped_targets: ScopedTargets,
     present_character_ids: frozenset[str],
     message_visibility: list[MessageVisibilityRecord],
+    observations_by_id: dict[str, ContextObservationRecord],
 ) -> tuple[_ContextCandidate, ...]:
     candidates: list[_ContextCandidate] = []
     for record in records:
@@ -3766,8 +3820,10 @@ def _memory_candidates(
                 )
             )
         )
-        if not _source_messages_visible_to_present_characters(
-            source_message_ids,
+        if not _memory_provenance_visible_to_present_characters(
+            record,
+            source_message_ids=source_message_ids,
+            observations_by_id=observations_by_id,
             present_character_ids=present_character_ids,
             message_visibility=message_visibility,
         ):
@@ -3789,6 +3845,62 @@ def _memory_candidates(
             )
         )
     return tuple(candidates)
+
+
+def _memory_provenance_visible_to_present_characters(
+    memory: MemoryRecord,
+    *,
+    source_message_ids: tuple[str, ...],
+    observations_by_id: dict[str, ContextObservationRecord],
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
+) -> bool:
+    groups: list[tuple[str, ...]] = []
+    memory_fingerprint = (
+        memory.claim_fingerprint or canonical_claim_fingerprint(memory.body)
+    )
+    provenance_mode = "any"
+    grouped_source_ids: set[str] = set()
+    for observation_id in memory.source_observation_ids:
+        observation = observations_by_id.get(observation_id)
+        if observation is None:
+            provenance_mode = "all"
+            continue
+        group = tuple(dict.fromkeys(observation.source_message_ids))
+        if group:
+            groups.append(group)
+            grouped_source_ids.update(group)
+        curation = observation.metadata.get("curation")
+        curated_body = (
+            curation.get("memory_body")
+            if isinstance(curation, dict)
+            else None
+        )
+        supporting_body = (
+            curated_body.strip()
+            if isinstance(curated_body, str) and curated_body.strip()
+            else observation.claim
+        )
+        if canonical_claim_fingerprint(supporting_body) != memory_fingerprint:
+            provenance_mode = "all"
+    ungrouped = tuple(
+        source_id
+        for source_id in source_message_ids
+        if source_id not in grouped_source_ids
+    )
+    if ungrouped:
+        groups.append(ungrouped)
+    if not groups:
+        groups.append(source_message_ids)
+    visible_groups = (
+        _source_messages_visible_to_present_characters(
+            group,
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility,
+        )
+        for group in groups
+    )
+    return all(visible_groups) if provenance_mode == "all" else any(visible_groups)
 
 
 def _observation_candidates(

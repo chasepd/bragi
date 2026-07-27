@@ -444,7 +444,7 @@ def test_context_curation_service_applies_memory_and_context_decisions(
     memory_observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="player_preference",
-        claim="Mara likes concise narration.",
+        claim="Keep it grounded.",
         evidence_quote="Keep it grounded",
         source_message_ids=[player.id],
         scope="durable",
@@ -454,7 +454,7 @@ def test_context_curation_service_applies_memory_and_context_decisions(
     context_observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="open_thread",
-        claim="The red lens warning may return.",
+        claim="Riders in the ash.",
         evidence_quote="riders in the ash",
         source_message_ids=[narrator.id],
         scope="save",
@@ -470,7 +470,7 @@ def test_context_curation_service_applies_memory_and_context_decisions(
                         "action": "durable_memory",
                         "reason": "Stable narrator preference.",
                         "confidence": 0.88,
-                        "memory_body": "Mara likes concise, grounded narration.",
+                        "memory_body": "Keep it grounded.",
                         "context_title": "",
                         "context_body": "",
                         "tags": ["tone"],
@@ -482,7 +482,7 @@ def test_context_curation_service_applies_memory_and_context_decisions(
                         "confidence": 0.81,
                         "memory_body": "",
                         "context_title": "Red lens warning",
-                        "context_body": "The red lens warning may return.",
+                        "context_body": "Riders in the ash.",
                         "tags": ["beacon"],
                     },
                 ]
@@ -503,7 +503,7 @@ def test_context_curation_service_applies_memory_and_context_decisions(
     assert result.accepted_count == 2
     memories = repositories.list_memories(save.id)
     assert [memory.body for memory in memories] == [
-        "Mara likes concise, grounded narration."
+        "Keep it grounded."
     ]
     assert memories[0].source_message_ids == [player.id]
     context_source = repositories.list_context_sources(
@@ -586,7 +586,7 @@ def test_context_curation_rejects_unexpected_generated_script(
     memory_observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="player_preference",
-        claim="Mara likes concise narration.",
+        claim="Keep it grounded.",
         evidence_quote="Keep it grounded",
         source_message_ids=[player.id],
         scope="durable",
@@ -596,7 +596,7 @@ def test_context_curation_rejects_unexpected_generated_script(
     context_observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="open_thread",
-        claim="The red lens warning may return.",
+        claim="Riders in the ash.",
         evidence_quote="riders in the ash",
         source_message_ids=[narrator.id],
         scope="save",
@@ -678,7 +678,7 @@ def test_context_curation_service_rejects_custom_curator_unexpected_script(
     observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="player_preference",
-        claim="Mara likes concise narration.",
+        claim="Keep it grounded.",
         evidence_quote="Keep it grounded",
         source_message_ids=[player.id],
         scope="durable",
@@ -688,7 +688,7 @@ def test_context_curation_service_rejects_custom_curator_unexpected_script(
     repositories.add_context_observation(
         save_id=save.id,
         observation_type="scene_detail",
-        claim="The player checks the beacon.",
+        claim="玩家正在检查灯塔。",
         evidence_quote="玩家正在检查灯塔",
         source_message_ids=[unrelated_multilingual_message.id],
         scope="scene",
@@ -772,7 +772,7 @@ def test_context_curation_discards_observations_with_missing_source_message(
     observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="player_preference",
-        claim="Mara wants grounded narration.",
+        claim="Keep it grounded.",
         evidence_quote="Keep it grounded",
         source_message_ids=["missing-message"],
         scope="durable",
@@ -788,7 +788,7 @@ def test_context_curation_discards_observations_with_missing_source_message(
                         "action": "durable_memory",
                         "reason": "Should not be applied.",
                         "confidence": 0.88,
-                        "memory_body": "Mara wants grounded narration.",
+                        "memory_body": "Keep it grounded.",
                         "context_title": "",
                         "context_body": "",
                         "tags": ["tone"],
@@ -824,7 +824,7 @@ def test_context_curation_queues_unsupported_curated_claim_for_confirmation(
     observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="player_preference",
-        claim="Mara wants grounded narration.",
+        claim="Keep it grounded.",
         evidence_quote="Keep it grounded",
         source_message_ids=[player.id],
         scope="durable",
@@ -888,7 +888,7 @@ def test_context_curation_rejects_quote_from_wrong_declared_source(
     observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="player_preference",
-        claim="Mara wants grounded narration.",
+        claim="Keep it grounded.",
         evidence_quote="Keep it grounded",
         source_message_ids=[player.id, narrator.id],
         scope="durable",
@@ -904,7 +904,7 @@ def test_context_curation_rejects_quote_from_wrong_declared_source(
                         "action": "durable_memory",
                         "reason": "Stable narrator preference.",
                         "confidence": 0.88,
-                        "memory_body": "Mara wants grounded narration.",
+                        "memory_body": "Keep it grounded.",
                         "context_title": "",
                         "context_body": "",
                         "tags": ["tone"],
@@ -1234,7 +1234,7 @@ def test_context_curation_queues_durable_memory_when_confirmation_enabled(
     observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="player_preference",
-        claim="Mara likes concise narration.",
+        claim="Keep it grounded.",
         evidence_quote="Keep it grounded",
         source_message_ids=[player.id],
         scope="durable",
@@ -1250,7 +1250,7 @@ def test_context_curation_queues_durable_memory_when_confirmation_enabled(
                         "action": "durable_memory",
                         "reason": "Stable narrator preference.",
                         "confidence": 0.88,
-                        "memory_body": "Mara likes concise, grounded narration.",
+                        "memory_body": "Keep it grounded.",
                         "context_title": "",
                         "context_body": "",
                         "tags": ["tone"],
@@ -1278,7 +1278,7 @@ def test_context_curation_queues_durable_memory_when_confirmation_enabled(
     assert suggestions[0].entity_type == "memory"
     assert suggestions[0].update_type == "create"
     assert suggestions[0].proposed_value == {
-        "body": "Mara likes concise, grounded narration.",
+        "body": "Keep it grounded.",
         "tags": ["tone"],
         "importance": 0.88,
         "source_message_id": player.id,
@@ -1286,7 +1286,7 @@ def test_context_curation_queues_durable_memory_when_confirmation_enabled(
         "source_observation_id": observation.id,
         "source_observation_ids": [observation.id],
         "claim_fingerprint": canonical_claim_fingerprint(
-            "Mara likes concise, grounded narration."
+            "Keep it grounded."
         ),
     }
     updated_observation = repositories.get_context_observation(observation.id)
@@ -1303,13 +1303,13 @@ def test_context_curation_suppresses_duplicate_durable_memory_records(
         save_id=save.id,
         role="player",
         speaker_name="Mara",
-        body="Please keep the narration concise and grounded.",
+        body="Keep it grounded.",
     )
     observations = (
         repositories.add_context_observation(
             save_id=save.id,
             observation_type="player_preference",
-            claim="Mara likes concise narration.",
+            claim="Keep it grounded.",
             evidence_quote="Keep it grounded",
             source_message_ids=[player.id],
             scope="durable",
@@ -1319,8 +1319,8 @@ def test_context_curation_suppresses_duplicate_durable_memory_records(
         repositories.add_context_observation(
             save_id=save.id,
             observation_type="player_preference",
-            claim="Mara likes concise narration!",
-            evidence_quote="keep the narration concise and grounded",
+            claim="Keep it grounded!",
+            evidence_quote="Keep it grounded",
             source_message_ids=[repeated_preference.id],
             scope="durable",
             confidence=0.95,
@@ -1336,10 +1336,7 @@ def test_context_curation_suppresses_duplicate_durable_memory_records(
                         "action": "durable_memory",
                         "reason": "Stable narrator preference.",
                         "confidence": 0.88 + (index * 0.05),
-                        "memory_body": (
-                            "Mara likes concise, grounded narration"
-                            + ("!" if index else ".")
-                        ),
+                        "memory_body": "Keep it grounded" + ("!" if index else "."),
                         "context_title": "",
                         "context_body": "",
                         "tags": [("tone" if index == 0 else "style")],
@@ -1363,7 +1360,7 @@ def test_context_curation_suppresses_duplicate_durable_memory_records(
     assert result.accepted_count == 1
     memories = repositories.list_memories(save.id)
     assert [memory.body for memory in memories] == [
-        "Mara likes concise, grounded narration."
+        "Keep it grounded."
     ]
     assert memories[0].source_message_ids == [player.id, repeated_preference.id]
     assert memories[0].source_observation_ids == [
@@ -1392,7 +1389,7 @@ def test_context_curation_suppresses_duplicate_memory_suggestions(
         repositories.add_context_observation(
             save_id=save.id,
             observation_type="player_preference",
-            claim="Mara likes concise narration.",
+            claim="Keep it grounded.",
             evidence_quote="Keep it grounded",
             source_message_ids=[player.id, narrator.id],
             scope="durable",
@@ -1402,7 +1399,7 @@ def test_context_curation_suppresses_duplicate_memory_suggestions(
         repositories.add_context_observation(
             save_id=save.id,
             observation_type="player_preference",
-            claim="Mara likes concise narration.",
+            claim="Keep it grounded.",
             evidence_quote="Keep it grounded",
             source_message_ids=[narrator.id, player.id],
             scope="durable",
@@ -1419,7 +1416,7 @@ def test_context_curation_suppresses_duplicate_memory_suggestions(
                         "action": "durable_memory",
                         "reason": "Stable narrator preference.",
                         "confidence": 0.88,
-                        "memory_body": "Mara likes concise, grounded narration.",
+                        "memory_body": "Keep it grounded.",
                         "context_title": "",
                         "context_body": "",
                         "tags": ["tone"],

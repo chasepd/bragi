@@ -410,11 +410,53 @@ def test_migrate_database_upgrades_schema_70_context_lifecycle(
             save_id=save.id,
             name="Captain Ilyra",
         )
+        archived_keeper_edge = repositories.add_character_knowledge_edge(
+            save_id=save.id,
+            character_id=character.id,
+            target_type="memory",
+            target_id=memory.id,
+        )
+        repositories.archive_character_knowledge_edge(archived_keeper_edge.id)
         repositories.add_character_knowledge_edge(
             save_id=save.id,
             character_id=character.id,
             target_type="memory",
             target_id=duplicate_id,
+        )
+        privacy_character = repositories.add_character(
+            save_id=save.id,
+            name="Archivist Ren",
+        )
+        repositories.add_character_knowledge_edge(
+            save_id=save.id,
+            character_id=privacy_character.id,
+            target_type="memory",
+            target_id=memory.id,
+            knowledge_state="knows",
+            source_message_ids=["keeper-proof"],
+        )
+        repositories.add_character_knowledge_edge(
+            save_id=save.id,
+            character_id=privacy_character.id,
+            target_type="memory",
+            target_id=duplicate_id,
+            knowledge_state="does_not_know",
+            source_message_ids=["duplicate-proof"],
+        )
+        archived_keeper_source = repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=memory.id,
+            title="Archived keeper source",
+            body=memory.body,
+        )
+        repositories.archive_context_source(archived_keeper_source.id)
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=duplicate_id,
+            title="Active duplicate source",
+            body="mara likes tea",
         )
         repositories.add_entity_link(
             save_id=save.id,
@@ -505,6 +547,29 @@ def test_migrate_database_upgrades_schema_70_context_lifecycle(
             """,
             (character.id,),
         ).fetchone() == (memory.id,)
+        assert connection.execute(
+            """
+            SELECT knowledge_state, source_message_ids_json
+            FROM character_knowledge_edges
+            WHERE character_id = ? AND archived_at IS NULL
+            """,
+            (privacy_character.id,),
+        ).fetchone() == (
+            "does_not_know",
+            json.dumps(
+                ["keeper-proof", "duplicate-proof"],
+                separators=(",", ":"),
+            ),
+        )
+        assert connection.execute(
+            """
+            SELECT source_id, title
+            FROM context_sources
+            WHERE save_id = ? AND source_type = 'memory'
+              AND archived_at IS NULL
+            """,
+            (save.id,),
+        ).fetchone() == (memory.id, "Active duplicate source")
         assert connection.execute(
             """
             SELECT target_id

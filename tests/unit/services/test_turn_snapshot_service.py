@@ -19,6 +19,7 @@ from bragi.services.message_revision_service import MessageRevisionService
 from bragi.services.save_fork_service import SaveForkService
 from bragi.services.turn_snapshot_service import (
     TurnSnapshotService,
+    _coalesce_remapped_snapshot_rows,
     _filter_character_text_snapshot_rows,
 )
 
@@ -30,6 +31,46 @@ def repositories(tmp_path: Path) -> Iterator[PersistenceRepositories]:
 
     with sqlite3.connect(database_path) as connection:
         yield PersistenceRepositories(connection)
+
+
+def test_snapshot_import_coalesces_many_to_one_memory_remaps() -> None:
+    rows = _coalesce_remapped_snapshot_rows(
+        "memories",
+        [
+            {
+                "id": "merged-memory",
+                "save_id": "target-save",
+                "body": "The moonstone opens the archive.",
+                "tags_json": '["moonstone"]',
+                "importance": 0.4,
+                "source_message_ids_json": '["message-one"]',
+                "source_observation_ids_json": '["observation-one"]',
+                "archived_at": None,
+            },
+            {
+                "id": "merged-memory",
+                "save_id": "target-save",
+                "body": "the moonstone opens the archive",
+                "tags_json": '["archive"]',
+                "importance": 0.9,
+                "source_message_ids_json": '["message-two"]',
+                "source_observation_ids_json": '["observation-two"]',
+                "archived_at": None,
+            },
+        ],
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["importance"] == 0.9
+    assert json.loads(str(rows[0]["tags_json"])) == ["moonstone", "archive"]
+    assert json.loads(str(rows[0]["source_message_ids_json"])) == [
+        "message-one",
+        "message-two",
+    ]
+    assert json.loads(str(rows[0]["source_observation_ids_json"])) == [
+        "observation-one",
+        "observation-two",
+    ]
 
 
 def test_capture_dedupes_objects_and_restore_recovers_exact_state(

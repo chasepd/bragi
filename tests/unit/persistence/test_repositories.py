@@ -11,7 +11,11 @@ from typing import cast
 
 import pytest
 
-from bragi.persistence.repositories import BragiRepository, PersistenceRepositories
+from bragi.persistence.repositories import (
+    BragiRepository,
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.services.image_style_settings import save_image_style_preset_setting_key
 from bragi.services.scenario_evolution_policy import (
     save_scenario_evolution_turn_interval_setting_key,
@@ -2563,6 +2567,102 @@ def test_repositories_count_active_memories(
     assert repositories.list_memories(save_id) == [kept]
 
 
+def test_repositories_consolidate_duplicates_without_losing_active_references(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    keeper = repositories.add_memory(
+        save_id=save_id,
+        body="Mara likes tea.",
+        tags=["preference"],
+    )
+    duplicate_id = "legacy-memory-duplicate"
+    repositories.connection.execute(
+        """
+        INSERT INTO memories(
+            id, save_id, body, tags_json, importance,
+            source_message_ids_json, claim_fingerprint,
+            source_observation_ids_json
+        )
+        VALUES (?, ?, ?, '["tea"]', 0.9, '[]', ?, '[]')
+        """,
+        (
+            duplicate_id,
+            save_id,
+            "mara likes tea",
+            canonical_claim_fingerprint("mara likes tea"),
+        ),
+    )
+    repositories.commit()
+    character = repositories.add_character(save_id=save_id, name="Captain Ilyra")
+    archived_keeper_edge = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="memory",
+        target_id=keeper.id,
+    )
+    repositories.archive_character_knowledge_edge(archived_keeper_edge.id)
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="memory",
+        target_id=duplicate_id,
+    )
+    privacy_character = repositories.add_character(
+        save_id=save_id,
+        name="Archivist Ren",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=privacy_character.id,
+        target_type="memory",
+        target_id=keeper.id,
+        knowledge_state="knows",
+        confidence=0.9,
+        source_message_ids=["keeper-proof"],
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=privacy_character.id,
+        target_type="memory",
+        target_id=duplicate_id,
+        knowledge_state="does_not_know",
+        confidence=0.7,
+        source_message_ids=["duplicate-proof"],
+    )
+    archived_keeper_source = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=keeper.id,
+        title="Archived keeper source",
+        body=keeper.body,
+    )
+    repositories.archive_context_source(archived_keeper_source.id)
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=duplicate_id,
+        title="Active duplicate source",
+        body="mara likes tea",
+    )
+
+    remapped = repositories.consolidate_active_memory_duplicates(save_id=save_id)
+
+    assert remapped == {duplicate_id: keeper.id}
+    assert [memory.id for memory in repositories.list_memories(save_id)] == [keeper.id]
+    edges = repositories.list_character_knowledge_edges(save_id)
+    assert {edge.target_id for edge in edges} == {keeper.id}
+    privacy_edge = next(
+        edge for edge in edges if edge.character_id == privacy_character.id
+    )
+    assert privacy_edge.knowledge_state == "does_not_know"
+    assert privacy_edge.confidence == 0.9
+    assert privacy_edge.source_message_ids == ["keeper-proof", "duplicate-proof"]
+    [source] = repositories.list_context_sources(save_id, source_type="memory")
+    assert source.source_id == keeper.id
+    assert source.title == "Active duplicate source"
+
+
 def test_repositories_check_unprotected_character_existence(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3743,6 +3843,29 @@ def test_repositories_unicode_match_all_cannot_be_starved_by_partial_matches(
         source_types={"memory"},
         limit=1,
         match_all=True,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_exact_phrase_supports_short_ascii_identifiers(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-short-code",
+        title="Vault code",
+        body="Only A 7 opens the vault.",
+    )
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms=set(),
+        source_types={"memory"},
+        limit=8,
+        exact_phrases=("A 7",),
     )
 
     assert [hit.record for hit in hits] == [target]

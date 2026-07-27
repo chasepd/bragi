@@ -745,10 +745,16 @@ class TurnSnapshotService:
             remapped_tables: dict[str, list[dict[str, str]]] = {}
             for table_name, rows in rows_by_table.items():
                 remapped_entries: list[dict[str, str]] = []
+                remapped_rows: list[dict[str, object]] = []
                 for row_data in rows:
                     remapped_row = remapper.remap_row(table_name, row_data)
                     if table_name == "messages":
                         remapped_row = _sanitize_snapshot_message_row(remapped_row)
+                    remapped_rows.append(remapped_row)
+                for remapped_row in _coalesce_remapped_snapshot_rows(
+                    table_name,
+                    remapped_rows,
+                ):
                     remapped_entries.append(
                         {
                             "id": str(remapped_row.get("id", "")),
@@ -1452,6 +1458,14 @@ class _SnapshotRemapper:
                 and column == "trigger_key"
             ):
                 remapped[column] = self._remap_trigger_key(value)
+            elif (
+                table_name == "memories"
+                and column == "source_observation_ids_json"
+            ):
+                remapped[column] = self._remap_json_id_list(
+                    value,
+                    "context_observations",
+                )
             elif column in _JSON_COLUMNS_BY_TABLE.get(table_name, frozenset()):
                 remapped[column] = self._remap_json_text(table_name, column, value)
             else:
@@ -1503,6 +1517,15 @@ class _SnapshotRemapper:
         if table_name == "active_threads" and column == "related_entities_json":
             return _compact_json(self._remap_related_entities(raw))
         return _compact_json(self._remap_json_value(raw))
+
+    def _remap_json_id_list(self, value: object, table_name: str) -> object:
+        if not isinstance(value, str):
+            return value
+        try:
+            raw = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+        return _compact_json(self._remap_id_list(raw, table_name))
 
     def _remap_id_list(self, raw: object, table_name: str) -> object:
         if not isinstance(raw, list):
@@ -2500,6 +2523,142 @@ def _media_asset_record_from_snapshot_row(
 
 def _snapshot_object_hash(*, kind: str, payload: bytes) -> str:
     return sha256(kind.encode("utf-8") + b"\0" + payload).hexdigest()
+
+
+def _coalesce_remapped_snapshot_rows(
+    table_name: str,
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    coalesced: dict[tuple[object, ...], dict[str, object]] = {}
+    for row in rows:
+        key = _snapshot_row_unique_key(table_name, row)
+        existing = coalesced.get(key)
+        if existing is None:
+            coalesced[key] = row
+            continue
+        if table_name == "memories":
+            _merge_snapshot_memory_rows(existing, row)
+        elif table_name == "character_knowledge_edges":
+            _merge_snapshot_knowledge_edge_rows(existing, row)
+        elif (
+            existing.get("archived_at") is not None
+            and row.get("archived_at") is None
+        ):
+            coalesced[key] = row
+    return list(coalesced.values())
+
+
+def _snapshot_row_unique_key(
+    table_name: str,
+    row: Mapping[str, object],
+) -> tuple[object, ...]:
+    if table_name == "context_sources":
+        return (
+            table_name,
+            row.get("save_id"),
+            row.get("source_type"),
+            row.get("source_id"),
+        )
+    if table_name == "entity_links":
+        return (
+            table_name,
+            row.get("save_id"),
+            row.get("entity_type"),
+            row.get("entity_id"),
+            row.get("target_type"),
+            row.get("target_id"),
+            row.get("relation"),
+        )
+    if table_name == "character_knowledge_edges":
+        return (
+            table_name,
+            row.get("save_id"),
+            row.get("character_id"),
+            row.get("target_type"),
+            row.get("target_id"),
+        )
+    return (table_name, row.get("id"))
+
+
+def _merge_snapshot_memory_rows(
+    existing: dict[str, object],
+    incoming: Mapping[str, object],
+) -> None:
+    for field in (
+        "tags_json",
+        "source_message_ids_json",
+        "source_observation_ids_json",
+    ):
+        existing[field] = _merged_snapshot_json_string_lists(
+            existing.get(field),
+            incoming.get(field),
+        )
+    existing["importance"] = max(
+        _snapshot_numeric_value(existing.get("importance")),
+        _snapshot_numeric_value(incoming.get("importance")),
+    )
+    if (
+        existing.get("archived_at") is not None
+        and incoming.get("archived_at") is None
+    ):
+        existing["archived_at"] = None
+
+
+def _merge_snapshot_knowledge_edge_rows(
+    existing: dict[str, object],
+    incoming: Mapping[str, object],
+) -> None:
+    existing_active = existing.get("archived_at") is None
+    incoming_active = incoming.get("archived_at") is None
+    if incoming_active and not existing_active:
+        replacement = dict(incoming)
+        existing.clear()
+        existing.update(replacement)
+        return
+    if existing_active and not incoming_active:
+        return
+    state_rank = {"knows": 0, "may_know": 1, "does_not_know": 2}
+    if state_rank.get(str(incoming.get("knowledge_state")), 1) > state_rank.get(
+        str(existing.get("knowledge_state")),
+        1,
+    ):
+        for field in (
+            "knowledge_state",
+            "acquisition_method",
+            "source_message_id",
+            "evidence_quote",
+        ):
+            existing[field] = incoming.get(field)
+    existing["confidence"] = max(
+        _snapshot_numeric_value(existing.get("confidence")),
+        _snapshot_numeric_value(incoming.get("confidence")),
+    )
+    existing["source_message_ids_json"] = _merged_snapshot_json_string_lists(
+        existing.get("source_message_ids_json"),
+        incoming.get("source_message_ids_json"),
+    )
+
+
+def _merged_snapshot_json_string_lists(first: object, second: object) -> str:
+    values: list[str] = []
+    for raw in (first, second):
+        try:
+            loaded = json.loads(str(raw))
+        except (json.JSONDecodeError, TypeError):
+            loaded = []
+        if isinstance(loaded, list):
+            values.extend(
+                str(value)
+                for value in loaded
+                if isinstance(value, str) and value
+            )
+    return _compact_json(list(dict.fromkeys(values)))
+
+
+def _snapshot_numeric_value(value: object) -> float:
+    if isinstance(value, int | float):
+        return float(value)
+    return 0.0
 
 
 def _merge_rows_by_table(

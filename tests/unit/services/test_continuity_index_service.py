@@ -646,7 +646,7 @@ def test_continuity_index_does_not_cap_active_threads_before_retrieval(
             description=f"Resolve signal duty {index:02d}.",
             priority=100 - index,
         )
-        for index in range(81)
+        for index in range(513)
     ]
 
     result = ContinuityIndexService(repositories).sync_save(save.id)
