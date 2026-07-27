@@ -14777,6 +14777,7 @@ describe("frontend helpers", () => {
 
   it("tracks an embedded opening choice job and applies its completed choices", async () => {
     const sources = installEventSourceDouble();
+    const client = new QueryClient();
     const generationJob = {
       id: "job-opening-choices",
       type: "action_choice_generate",
@@ -14805,7 +14806,7 @@ describe("frontend helpers", () => {
     const { Workbench } = await import("./main");
 
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <QueryClientProvider client={client}>
         <Workbench />
       </QueryClientProvider>
     );
@@ -14817,6 +14818,19 @@ describe("frontend helpers", () => {
     const jobSource = sources.find(
       (source) => source.url === "/api/jobs/job-opening-choices/events?save_id=save-1"
     );
+    act(() => {
+      client.setQueriesData<RuntimeModel>(
+        { queryKey: ["runtime"] },
+        (current) => current ? {
+          ...current,
+          action_choices: current.action_choices ? {
+            ...current.action_choices,
+            generation_job: null
+          } : null
+        } : current
+      );
+    });
+    expect(jobSource?.closed).toBe(false);
     act(() => {
       jobSource?.dispatch("done", {
         ...generationJob,
@@ -14834,6 +14848,14 @@ describe("frontend helpers", () => {
 
   it("clears an embedded opening choice job after terminal failure", async () => {
     const sources = installEventSourceDouble();
+    const regenerationJob = {
+      id: "job-opening-choices-retry",
+      type: "action_choice_regenerate",
+      save_id: "save-1",
+      status: "queued",
+      result: null,
+      error: null
+    } satisfies Job;
     const generationJob = {
       id: "job-opening-choices-failed",
       type: "action_choice_generate",
@@ -14858,7 +14880,17 @@ describe("frontend helpers", () => {
         generation_job: generationJob
       })
     });
-    vi.stubGlobal("fetch", workbenchFetch([], initialModel));
+    const baseFetch = workbenchFetch([], initialModel);
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(
+      (path: string, init?: RequestInit) => (
+        path === "/api/action-choices/regenerate"
+          ? Promise.resolve({
+              ok: true,
+              json: async () => regenerationJob
+            })
+          : baseFetch(path, init)
+      )
+    ));
     const { Workbench } = await import("./main");
 
     render(
@@ -14888,6 +14920,31 @@ describe("frontend helpers", () => {
     expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Regenerate options" })).toBeEnabled();
     expect(screen.queryByText("Generating action choices...")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Regenerate options" }));
+    await waitFor(() => expect(
+      sources.some(
+        (candidate) => candidate.url === "/api/jobs/job-opening-choices-retry/events?save_id=save-1"
+      )
+    ).toBe(true));
+    const retrySource = sources.find(
+      (candidate) => candidate.url === "/api/jobs/job-opening-choices-retry/events?save_id=save-1"
+    );
+    act(() => {
+      retrySource?.dispatch("done", {
+        ...regenerationJob,
+        status: "succeeded",
+        result: runtimeModel({
+          ...initialModel,
+          action_choices: cyoaActionChoices()
+        })
+      });
+    });
+
+    expect(await screen.findByRole("button", { name: "Open the brass door" })).toBeInTheDocument();
+    await waitFor(() => expect(
+      screen.queryByText("Action choices could not be generated.")
+    ).not.toBeInTheDocument());
   });
 
   it("starts CYOA action choice regeneration from the latest narrator message", async () => {

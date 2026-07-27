@@ -3058,8 +3058,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             else None
         )
         if (
-            payload.action_choices_enabled
+            not payload_dict.get("error")
+            and payload_dict.get("action_choices_enabled") is True
             and isinstance(action_choices, dict)
+            and action_choices.get("choices") == []
             and isinstance(save_id, str)
             and isinstance(narrator_message_id, str)
         ):

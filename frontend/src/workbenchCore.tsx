@@ -3318,7 +3318,7 @@ function Workbench({
     ) {
       return;
     }
-    return runJob(openingActionChoiceJob, {
+    runJob(openingActionChoiceJob, {
       onFailed: (error) => {
         setActionChoiceGenerationError(error);
         client.setQueryData<RuntimeModel>(
@@ -3346,7 +3346,11 @@ function Workbench({
 
   useEffect(() => {
     setActionChoiceGenerationError(model?.action_choices?.generation_error ?? "");
-  }, [activeSaveId, model?.action_choices?.narrator_message_id]);
+  }, [
+    activeSaveId,
+    model?.action_choices?.generation_error,
+    model?.action_choices?.narrator_message_id
+  ]);
 
   useEffect(() => {
     setTrackedJobs((current) => {

@@ -10794,6 +10794,121 @@ def test_save_scenario_draft_defers_opening_choices_to_background_job(
     assert runtime.regenerate_calls == [("narrator-1", "save-opening", True)]
 
 
+def test_failed_scenario_draft_save_does_not_generate_choices_for_active_save(
+    tmp_path: Path,
+) -> None:
+    class FailedDraftRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.regenerate_calls: list[str] = []
+
+        async def save_scenario_draft(self, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            return {
+                **_chat_model("An older chronicle remains active."),
+                "active_save_id": "save-existing",
+                "action_choices_enabled": True,
+                "action_choices": {
+                    "narrator_message_id": "narrator-existing",
+                    "choices": [],
+                },
+                "error": "The new draft could not be saved.",
+            }
+
+        async def regenerate_action_choices(
+            self,
+            *,
+            narrator_message_id: str,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            del kwargs
+            self.regenerate_calls.append(narrator_message_id)
+            return _chat_model("Unexpected generation.")
+
+    runtime = FailedDraftRuntime()
+
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, runtime)))
+    ) as client:
+        response = client.post(
+            "/api/scenarios/draft/save",
+            json={
+                "scenario_type": "full_roleplay",
+                "sections": {
+                    "title": "Lantern Keep",
+                    "opening_message": "The beacon snaps awake.",
+                },
+                "action_choices_enabled": True,
+                "save_title": "Lantern Keep",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["error"] == "The new draft could not be saved."
+    assert "generation_job" not in response.json()["action_choices"]
+    assert runtime.regenerate_calls == []
+
+
+def test_legacy_action_choice_draft_uses_normalized_result_to_queue_generation(
+    tmp_path: Path,
+) -> None:
+    class LegacyDraftRuntime(_RuntimeDouble):
+        async def save_scenario_draft(self, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            return {
+                **_chat_model("The old road opens."),
+                "active_save_id": "save-legacy",
+                "action_choices_enabled": True,
+                "action_choices": {
+                    "narrator_message_id": "narrator-legacy",
+                    "choices": [],
+                },
+            }
+
+        async def regenerate_action_choices(
+            self,
+            *,
+            narrator_message_id: str,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            del kwargs
+            return {
+                **_chat_model("The old road opens."),
+                "active_save_id": "save-legacy",
+                "action_choices_enabled": True,
+                "action_choices": {
+                    "narrator_message_id": narrator_message_id,
+                    "choices": [],
+                },
+            }
+
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, LegacyDraftRuntime())))
+    ) as client:
+        response = client.post(
+            "/api/scenarios/draft/save",
+            json={
+                "scenario_type": "choose_your_own_adventure",
+                "sections": {
+                    "title": "Old Road",
+                    "opening_message": "The old road opens.",
+                },
+                "action_choices_enabled": False,
+                "save_title": "Old Road",
+            },
+        )
+        generation_job = response.json()["action_choices"]["generation_job"]
+        job = _wait_for_terminal_job(
+            client,
+            generation_job["id"],
+            save_id="save-legacy",
+        )
+
+    assert response.status_code == 200
+    assert generation_job["type"] == "action_choice_generate"
+    assert job["status"] == "succeeded"
+
+
 def test_scenario_draft_character_starters_generation_uses_runtime_job(
     tmp_path: Path,
 ) -> None:
