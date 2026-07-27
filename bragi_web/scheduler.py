@@ -163,6 +163,12 @@ class WebMaintenanceScheduler:
                 ):
                     break
                 if _has_active_save_job(self._state, save_id):
+                    if definition.task_type == OBSERVATION_CURATION_DRAIN_TASK:
+                        _record_active_job_deferral(
+                            repositories,
+                            definition,
+                            save_id,
+                        )
                     observe(
                         "web.scheduler.run_skipped",
                         level="debug",
@@ -624,6 +630,49 @@ def _record_policy_not_due(
                 payload=_scheduled_task_payload(definition),
                 due_now=False,
             )
+
+
+def _record_active_job_deferral(
+    repositories: Any,
+    definition: _MaintenanceTaskDefinition,
+    save_id: str,
+) -> None:
+    due_tasks = repositories.list_due_scheduled_tasks(
+        task_types=(definition.task_type,),
+        save_id=save_id,
+        limit=1,
+    )
+    for task in due_tasks:
+        leased = repositories.lease_scheduled_task(
+            task.id,
+            lease_seconds=definition.lease_seconds,
+        )
+        if leased is None:
+            continue
+        repositories.complete_scheduled_task(
+            leased.id,
+            succeeded=True,
+            result={
+                "status": "skipped",
+                "skip_reason": "active_same_save_job",
+            },
+            next_run_after_seconds=definition.interval_seconds,
+        )
+        return
+    if (
+        repositories.get_scheduled_task(
+            task_type=definition.task_type,
+            save_id=save_id,
+        )
+        is None
+    ):
+        repositories.upsert_scheduled_task(
+            task_type=definition.task_type,
+            save_id=save_id,
+            interval_seconds=definition.interval_seconds,
+            payload=_scheduled_task_payload(definition),
+            due_now=False,
+        )
 
 
 def _complete_leased_task_policy_skip(
