@@ -1495,7 +1495,12 @@ class _SnapshotRemapper:
                     "context_observations",
                 )
             elif column in _JSON_COLUMNS_BY_TABLE.get(table_name, frozenset()):
-                remapped[column] = self._remap_json_text(table_name, column, value)
+                remapped[column] = self._remap_json_text(
+                    table_name,
+                    column,
+                    value,
+                    row=row,
+                )
             else:
                 remapped[column] = value
         return remapped
@@ -1579,6 +1584,8 @@ class _SnapshotRemapper:
         table_name: str,
         column: str,
         value: object,
+        *,
+        row: Mapping[str, object],
     ) -> object:
         if not isinstance(value, str):
             return value
@@ -1590,11 +1597,20 @@ class _SnapshotRemapper:
             return _compact_json(self._remap_id_list(raw, "characters"))
         if table_name == "active_threads" and column == "related_entities_json":
             return _compact_json(self._remap_related_entities(raw))
+        if table_name == "locations" and column == "connections_json":
+            return _compact_json(self._remap_id_list(raw, "locations"))
         if column == "source_message_ids_json":
             return _compact_json(self._remap_source_ref_list(raw))
         if table_name == "context_sources" and column == "metadata_json":
-            return _compact_json(self._remap_context_source_metadata(raw))
-        return _compact_json(self._remap_json_value(raw))
+            return _compact_json(
+                self._remap_context_source_metadata(
+                    raw,
+                    source_type=cast(str | None, row.get("source_type")),
+                )
+            )
+        if table_name == "media_assets" and column == "metadata_json":
+            return _compact_json(self._remap_known_metadata_ids(raw))
+        return value
 
     def _remap_json_id_list(self, value: object, table_name: str) -> object:
         if not isinstance(value, str):
@@ -1623,7 +1639,7 @@ class _SnapshotRemapper:
                 continue
             entity_type, separator, entity_id = item.partition(":")
             if not separator:
-                remapped.append(self._remap_string_id(item))
+                remapped.append(item)
                 continue
             mapped_id = self._mapped_entity_id(entity_type, entity_id)
             if isinstance(mapped_id, str):
@@ -1660,10 +1676,15 @@ class _SnapshotRemapper:
             raise ValueError("Snapshot context source provenance is invalid")
         return [self._mapped_source_ref(item) for item in raw]
 
-    def _remap_context_source_metadata(self, raw: object) -> object:
-        remapped = self._remap_json_value(raw)
-        if not isinstance(raw, dict) or not isinstance(remapped, dict):
-            return remapped
+    def _remap_context_source_metadata(
+        self,
+        raw: object,
+        *,
+        source_type: str | None,
+    ) -> object:
+        if not isinstance(raw, dict):
+            return raw
+        remapped = dict(raw)
         if "source_provenance_mode" in raw:
             mode = raw["source_provenance_mode"]
             if mode not in {"all", "any"}:
@@ -1712,30 +1733,48 @@ class _SnapshotRemapper:
                 raise ValueError(
                     "Snapshot context source provenance groups omit sources"
                 )
+        audience_ids = raw.get("audience_character_ids")
+        if isinstance(audience_ids, list):
+            remapped["audience_character_ids"] = self._remap_id_list(
+                audience_ids,
+                "characters",
+            )
+        entity_ids = raw.get("entity_ids")
+        if isinstance(entity_ids, list) and source_type is not None:
+            remapped["entity_ids"] = [
+                self._mapped_context_source_id(source_type, item)
+                if isinstance(item, str)
+                else item
+                for item in entity_ids
+            ]
+        thread_id = raw.get("thread_id")
+        if isinstance(thread_id, str) and source_type == "character_text_thread":
+            remapped["thread_id"] = self._mapped_table_id(
+                "character_text_threads",
+                thread_id,
+            )
         return remapped
 
-    def _remap_json_value(self, value: object) -> object:
-        if isinstance(value, str):
-            return self._remap_string_id(value)
+    def _remap_known_metadata_ids(self, value: object) -> object:
         if isinstance(value, list):
-            return [self._remap_json_value(item) for item in value]
+            return [self._remap_known_metadata_ids(item) for item in value]
         if isinstance(value, dict):
-            return {
-                key: self._remap_json_value(item)
-                for key, item in value.items()
+            remapped: dict[str, object] = {}
+            id_fields = {
+                "character_id": "characters",
+                "thread_id": "character_text_threads",
+                "text_message_id": "character_text_messages",
+                "source_message_id": "messages",
+                "media_asset_id": "media_assets",
             }
-        return value
-
-    def _remap_string_id(self, value: str) -> str:
-        for table_map in self.id_maps.values():
-            mapped = table_map.get(value)
-            if mapped is not None:
-                return mapped
-        entity_type, separator, entity_id = value.partition(":")
-        if separator:
-            mapped_value = self._mapped_entity_id(entity_type, entity_id)
-            if isinstance(mapped_value, str):
-                return f"{entity_type}:{mapped_value}"
+            for key, item in value.items():
+                table_name = id_fields.get(key)
+                remapped[key] = (
+                    self._mapped_table_id(table_name, item)
+                    if table_name is not None
+                    else self._remap_known_metadata_ids(item)
+                )
+            return remapped
         return value
 
     def _remap_trigger_key(self, value: object) -> object:
@@ -3151,14 +3190,7 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
             else:
                 metadata.pop(field, None)
     metadata["source_provenance_groups"] = groups
-    metadata["source_provenance_mode"] = (
-        "all"
-        if any(
-            item.get("source_provenance_mode") == "all"
-            for item in provenance_metadata
-        )
-        else "any"
-    )
+    metadata["source_provenance_mode"] = "any"
     if any(item.get("requires_audience") is True for item in loaded_metadata):
         metadata["requires_audience"] = True
     return _compact_json(metadata)
@@ -3208,6 +3240,16 @@ def _snapshot_context_source_provenance_groups(
         ]
         if ungrouped_item_ids:
             item_groups.append(ungrouped_item_ids)
+        if item.get("source_provenance_mode") == "all" and item_groups:
+            item_groups = [
+                list(
+                    dict.fromkeys(
+                        source_id
+                        for group in item_groups
+                        for source_id in group
+                    )
+                )
+            ]
         for group in item_groups:
             if group not in groups:
                 groups.append(group)
@@ -3247,12 +3289,19 @@ def _merge_snapshot_knowledge_edge_rows(
         _snapshot_numeric_value(existing.get("confidence")),
         _snapshot_numeric_value(incoming.get("confidence")),
     )
-    existing["source_message_ids_json"] = _merged_snapshot_json_string_lists(
-        existing.get("source_message_ids_json"),
-        incoming.get("source_message_ids_json"),
-        limit=_MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS,
-        extra_values=source_message_ids,
-    )
+    try:
+        existing["source_message_ids_json"] = _merged_snapshot_json_string_lists(
+            existing.get("source_message_ids_json"),
+            incoming.get("source_message_ids_json"),
+            limit=_MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS,
+            extra_values=source_message_ids,
+        )
+    except ValueError:
+        existing["knowledge_state"] = "does_not_know"
+        existing["acquisition_method"] = "unknown"
+        existing["source_message_id"] = None
+        existing["source_message_ids_json"] = "[]"
+        existing["evidence_quote"] = None
 
 
 def _merged_snapshot_json_string_lists(

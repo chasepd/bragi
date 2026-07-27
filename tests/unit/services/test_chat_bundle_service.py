@@ -228,6 +228,45 @@ def test_import_proactive_triggers_coalesce_and_remap_schema_keys() -> None:
     assert rows[0]["reason"] == "Replacement reason"
 
 
+def test_import_knowledge_edges_fail_closed_on_provenance_overflow() -> None:
+    [edge] = _coalesce_import_knowledge_edges(
+        [
+            {
+                "id": "edge-one",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "memory",
+                "target_id": "memory-one",
+                "knowledge_state": "knows",
+                "acquisition_method": "observed",
+                "confidence": 0.8,
+                "source_message_ids_json": json.dumps(
+                    [f"message-{index:02d}" for index in range(40)]
+                ),
+                "archived_at": None,
+            },
+            {
+                "id": "edge-two",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "memory",
+                "target_id": "memory-one",
+                "knowledge_state": "knows",
+                "acquisition_method": "told",
+                "confidence": 0.9,
+                "source_message_ids_json": json.dumps(
+                    [f"message-{index:02d}" for index in range(40, 80)]
+                ),
+                "archived_at": None,
+            },
+        ]
+    )
+
+    assert edge["knowledge_state"] == "does_not_know"
+    assert edge["acquisition_method"] == "unknown"
+    assert edge["source_message_ids_json"] == "[]"
+
+
 def test_import_knowledge_edges_coalesce_target_aliases_and_scalar_provenance() -> None:
     edges = _coalesce_import_knowledge_edges(
         [

@@ -29,3 +29,26 @@ def test_merge_context_source_metadata_preserves_first_on_union_overflow() -> No
 
     assert merged["source_message_ids"] == first_ids
     assert merged["source_provenance_groups"] == [first_ids]
+
+
+def test_merge_context_source_metadata_keeps_duplicate_derivations_alternative(
+) -> None:
+    merged = merge_context_source_metadata(
+        {
+            "source_provenance_groups": [
+                ["message-hidden-one"],
+                ["message-hidden-two"],
+            ],
+            "source_provenance_mode": "all",
+        },
+        {
+            "source_provenance_groups": [["message-visible"]],
+            "source_provenance_mode": "any",
+        },
+    )
+
+    assert merged["source_provenance_groups"] == [
+        ["message-hidden-one", "message-hidden-two"],
+        ["message-visible"],
+    ]
+    assert merged["source_provenance_mode"] == "any"

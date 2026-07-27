@@ -128,6 +128,68 @@ def test_snapshot_trigger_key_remapping_is_schema_aware() -> None:
     ) == "character_intent:shared-id:basis"
 
 
+def test_snapshot_json_remapping_preserves_ordinary_text_equal_to_ids() -> None:
+    remapper = turn_snapshot_module._SnapshotRemapper(
+        source_save_id="save-old",
+        target_save_id="save-new",
+        rows_by_table={
+            "characters": ({"id": "mara"},),
+            "memories": ({"id": "memory-one"},),
+        },
+    )
+
+    character = remapper.remap_row(
+        "characters",
+        {
+            "id": "mara",
+            "save_id": "save-old",
+            "aliases_json": '["mara"]',
+        },
+    )
+    memory = remapper.remap_row(
+        "memories",
+        {
+            "id": "memory-one",
+            "save_id": "save-old",
+            "tags_json": '["mara"]',
+        },
+    )
+
+    assert character["id"] != "mara"
+    assert character["aliases_json"] == '["mara"]'
+    assert memory["tags_json"] == '["mara"]'
+
+
+def test_snapshot_knowledge_edge_merge_fails_closed_on_provenance_overflow() -> None:
+    existing: dict[str, object] = {
+        "knowledge_state": "knows",
+        "acquisition_method": "observed",
+        "confidence": 0.8,
+        "source_message_ids_json": json.dumps(
+            [f"message-{index:02d}" for index in range(40)]
+        ),
+        "archived_at": None,
+    }
+    incoming: dict[str, object] = {
+        "knowledge_state": "knows",
+        "acquisition_method": "told",
+        "confidence": 0.9,
+        "source_message_ids_json": json.dumps(
+            [f"message-{index:02d}" for index in range(40, 80)]
+        ),
+        "archived_at": None,
+    }
+
+    turn_snapshot_module._merge_snapshot_knowledge_edge_rows(
+        existing,
+        incoming,
+    )
+
+    assert existing["knowledge_state"] == "does_not_know"
+    assert existing["acquisition_method"] == "unknown"
+    assert existing["source_message_ids_json"] == "[]"
+
+
 def test_legacy_memory_normalization_preserves_other_id_namespaces() -> None:
     rows = turn_snapshot_module._normalize_legacy_snapshot_memories(
         {

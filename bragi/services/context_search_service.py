@@ -96,7 +96,11 @@ from bragi.services.tool_call_helpers import (
     parse_tool_arguments_json,
     validate_tool_arguments_shape,
 )
-from bragi.text_search import cjk_lexical_anchors, unicode_word_terms
+from bragi.text_search import (
+    cjk_lexical_anchors,
+    structured_identifiers,
+    unicode_word_terms,
+)
 
 MAX_CONTEXT_SELECTIONS = 16
 MAX_CONTEXT_SEARCH_TOOL_FEEDBACK_TURNS = 2
@@ -3479,11 +3483,9 @@ def _exact_raw_candidates(
 def _bounded_structured_identifiers(text: str) -> tuple[str, ...]:
     ordered = tuple(
         dict.fromkeys(
-            identifier.casefold()
-            for identifier in re.findall(
-                r"(?<!\w)[^\W_]+(?:[-_.][^\W_]+)+(?!\w)",
+            structured_identifiers(
                 _bounded_context_query_text(text),
-                flags=re.UNICODE,
+                max_input_chars=MAX_CONTEXT_QUERY_CHARS,
             )
         )
     )

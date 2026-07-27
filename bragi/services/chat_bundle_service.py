@@ -73,6 +73,7 @@ from bragi.world_time_model import (
     canonical_world_time_from_values,
     legacy_world_time_fields,
 )
+from bragi.zip_safety import ZipSafetyError, validate_zip_directory
 from bragi_common.media_mime import imported_media_mime_type
 
 BUNDLE_FORMAT = "bragi-chat-bundle"
@@ -2758,6 +2759,7 @@ class ChatBundleService:
         read_data: bool = True,
     ) -> tuple[dict[str, object], dict[str, object]]:
         try:
+            validate_zip_directory(bundle_path)
             with zipfile.ZipFile(bundle_path) as bundle:
                 _validate_no_duplicate_bundle_members(bundle)
                 manifest = _json_object_from_bytes(
@@ -2782,7 +2784,13 @@ class ChatBundleService:
                 _validate_bundle_data(manifest, data)
                 _validate_bundle_members(bundle, data)
                 return manifest, data
-        except (OSError, KeyError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        except (
+            OSError,
+            KeyError,
+            ZipSafetyError,
+            zipfile.BadZipFile,
+            json.JSONDecodeError,
+        ) as exc:
             raise ChatBundleError("Invalid Bragi chat bundle") from exc
 
     def _rows(self, query: str, params: tuple[object, ...]) -> list[dict[str, object]]:
@@ -5978,12 +5986,19 @@ def _coalesce_import_knowledge_edges(
             _numeric_import_value(existing.get("confidence")),
             _numeric_import_value(row.get("confidence")),
         )
-        existing["source_message_ids_json"] = _merge_json_string_lists(
-            existing.get("source_message_ids_json"),
-            row.get("source_message_ids_json"),
-            limit=_MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS,
-            extra_values=source_message_ids,
-        )
+        try:
+            existing["source_message_ids_json"] = _merge_json_string_lists(
+                existing.get("source_message_ids_json"),
+                row.get("source_message_ids_json"),
+                limit=_MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS,
+                extra_values=source_message_ids,
+            )
+        except ChatBundleError:
+            existing["knowledge_state"] = "does_not_know"
+            existing["acquisition_method"] = "unknown"
+            existing["source_message_id"] = None
+            existing["source_message_ids_json"] = "[]"
+            existing["evidence_quote"] = None
     return list(coalesced.values())
 
 

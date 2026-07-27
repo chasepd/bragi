@@ -37,6 +37,7 @@ from bragi.services.scenario_service import (
     normalize_scenario_definition,
     scenario_record_is_retired,
 )
+from bragi.zip_safety import ZipSafetyError, validate_zip_directory
 
 SCENARIO_BUNDLE_FORMAT = "bragi-scenario-bundle"
 SCENARIO_BUNDLE_VERSION = 2
@@ -262,6 +263,7 @@ class ScenarioBundleService:
         bundle_path: Path,
     ) -> tuple[dict[str, object], dict[str, object]]:
         try:
+            validate_zip_directory(bundle_path)
             with zipfile.ZipFile(bundle_path) as bundle:
                 manifest = _json_object_from_bytes(
                     _read_limited_member(bundle, MANIFEST_NAME),
@@ -275,7 +277,13 @@ class ScenarioBundleService:
                 _validate_bundle_data(manifest, data)
                 _validate_bundle_members(manifest, data, bundle)
                 return manifest, data
-        except (OSError, KeyError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        except (
+            OSError,
+            KeyError,
+            ZipSafetyError,
+            zipfile.BadZipFile,
+            json.JSONDecodeError,
+        ) as exc:
             raise ScenarioBundleError("Invalid Bragi scenario bundle") from exc
 
 

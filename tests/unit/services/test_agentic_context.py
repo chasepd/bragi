@@ -639,7 +639,32 @@ def test_persisted_observation_revalidation_rejects_subject_prefix() -> None:
             "Mara has the red key.",
         ),
         (
+            "Mara moved the key from the vault.",
+            "Mara moved the key to the vault",
+            "Mara moved the key from the vault.",
+        ),
+        (
+            "Mara brought the key to Lio.",
+            "Mara brought the key from Lio",
+            "Mara brought the key to Lio.",
+        ),
+        (
             "Mara has the red key?",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "مارا لديها المفتاح الأحمر؟",
+            "مارا لديها المفتاح الأحمر",
+            "مارا لديها المفتاح الأحمر.",
+        ),
+        (
+            "Mara has the red key⁇",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "Mara has the red key՞",
             "Mara has the red key",
             "Mara has the red key.",
         ),

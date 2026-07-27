@@ -4528,14 +4528,13 @@ def test_repositories_filters_exact_identifier_candidates_before_udf(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, _ = _persist_repository_save(repositories)
-    for index in range(50):
+    for index in range(200):
         repositories.upsert_context_source(
             save_id=save_id,
             source_type="memory",
             source_id=f"memory-hidden-{index:02d}",
             title=f"Hidden split code {index:02d}",
             body="A 7 appears in a private maintenance record.",
-            metadata={"known_by": ["Lio"]},
         )
     calls = 0
 
@@ -4553,10 +4552,9 @@ def test_repositories_filters_exact_identifier_candidates_before_udf(
 
     hits = repositories.search_context_sources(
         save_id,
-        query_terms={"a", "7"},
+        query_terms=set(),
         source_types={"memory"},
         limit=1,
-        allowed_owner_names={"mara"},
         exact_identifiers=("A-7",),
     )
 

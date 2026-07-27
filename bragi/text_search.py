@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import unicodedata
 
 MAX_CJK_LEXICAL_INPUT_CHARS = 16_384
+MAX_STRUCTURED_IDENTIFIER_INPUT_CHARS = 65_536
+MAX_STRUCTURED_IDENTIFIER_CHARS = 512
+MAX_STRUCTURED_IDENTIFIERS = 4_096
 
 
 def unicode_word_terms(value: str) -> tuple[str, ...]:
@@ -25,6 +29,28 @@ def unicode_word_terms(value: str) -> tuple[str, ...]:
         if term:
             terms.append(term)
     return tuple(terms)
+
+
+def structured_identifiers(
+    value: str,
+    *,
+    max_input_chars: int = MAX_STRUCTURED_IDENTIFIER_INPUT_CHARS,
+    max_identifiers: int = MAX_STRUCTURED_IDENTIFIERS,
+) -> tuple[str, ...]:
+    normalized = unicodedata.normalize(
+        "NFKC",
+        value[:max_input_chars],
+    ).casefold()
+    identifiers = (
+        identifier
+        for identifier in re.findall(
+            r"(?<!\w)[^\W_]+(?:[-_.][^\W_]+)+(?!\w)",
+            normalized,
+            flags=re.UNICODE,
+        )
+        if len(identifier) <= MAX_STRUCTURED_IDENTIFIER_CHARS
+    )
+    return tuple(dict.fromkeys(identifiers))[:max_identifiers]
 
 
 def cjk_lexical_anchors(value: str) -> tuple[str, ...]:

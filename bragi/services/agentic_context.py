@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass, field, replace
@@ -3916,10 +3917,13 @@ def _grounding_context_preserves_claim_boundary(
     context: str,
 ) -> bool:
     assertion_context = context.rstrip().rstrip("'\"”’)]}")
-    if assertion_context.endswith(("?", "？")):
+    if (
+        assertion_context
+        and "QUESTION MARK" in unicodedata.name(assertion_context[-1], "")
+    ):
         return False
-    claim_terms = _ordered_grounding_terms(claim)
-    context_terms = _ordered_grounding_terms(context)
+    claim_terms = _grounding_boundary_terms(claim)
+    context_terms = _grounding_boundary_terms(context)
     return bool(claim_terms) and context_terms == claim_terms
 
 
@@ -3943,6 +3947,10 @@ def _grounding_order_is_preserved(claim: str, evidence: str) -> bool:
         evidence_terms[index : index + claim_length] == claim_terms
         for index in range(len(evidence_terms) - claim_length + 1)
     )
+
+
+def _grounding_boundary_terms(value: str) -> list[str]:
+    return re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
 
 
 _GROUNDING_IGNORED_TERMS = frozenset(

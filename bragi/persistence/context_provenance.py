@@ -58,14 +58,7 @@ def merge_context_source_metadata(
                 metadata.pop(field, None)
 
     metadata["source_provenance_groups"] = groups
-    metadata["source_provenance_mode"] = (
-        "all"
-        if any(
-            item.get("source_provenance_mode") == "all"
-            for item in selected_provenance
-        )
-        else "any"
-    )
+    metadata["source_provenance_mode"] = "any"
     if any(item.get("requires_audience") is True for item in loaded):
         metadata["requires_audience"] = True
     return metadata
@@ -137,6 +130,16 @@ def _provenance_groups(
         ]
         if ungrouped_ids:
             item_groups.append(ungrouped_ids)
+        if item.get("source_provenance_mode") == "all" and item_groups:
+            item_groups = [
+                list(
+                    dict.fromkeys(
+                        source_id
+                        for group in item_groups
+                        for source_id in group
+                    )
+                )
+            ]
         for group in item_groups:
             if group not in groups:
                 groups.append(group)

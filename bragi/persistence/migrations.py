@@ -14,7 +14,11 @@ from bragi.model_tasks import is_retired_model_task
 from bragi.observation_types import normalize_observation_type
 from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.private_files import ensure_private_file
-from bragi.text_search import cjk_lexical_anchors, unicode_word_terms
+from bragi.text_search import (
+    cjk_lexical_anchors,
+    structured_identifiers,
+    unicode_word_terms,
+)
 
 CURRENT_SCHEMA_VERSION = 72
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
@@ -4286,7 +4290,25 @@ def _ensure_context_source_search_terms_schema(
         CREATE INDEX IF NOT EXISTS idx_context_source_terms_save_term
         ON context_source_search_terms(save_id, term, context_source_id);
 
+        CREATE TABLE IF NOT EXISTS context_source_exact_identifiers (
+            context_source_id TEXT NOT NULL
+                REFERENCES context_sources(id) ON DELETE CASCADE,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            identifier TEXT NOT NULL,
+            PRIMARY KEY(context_source_id, identifier)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_source_identifiers_save_value
+        ON context_source_exact_identifiers(
+            save_id,
+            identifier,
+            context_source_id
+        );
+
         DELETE FROM context_source_search_terms
+        WHERE context_source_id NOT IN (SELECT id FROM context_sources);
+
+        DELETE FROM context_source_exact_identifiers
         WHERE context_source_id NOT IN (SELECT id FROM context_sources);
         """,
     )
@@ -4319,6 +4341,38 @@ def _ensure_context_source_search_terms_schema(
             """,
             ((str(source_id), str(save_id), term) for term in terms),
         )
+    missing_identifier_rows = connection.execute(
+        """
+        SELECT source.id, source.save_id, source.title, source.body
+        FROM context_sources source
+        WHERE source.archived_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM context_source_exact_identifiers identifier
+              WHERE identifier.context_source_id = source.id
+          )
+        ORDER BY source.rowid
+        """
+    ).fetchall()
+    for source_id, save_id, title, body in missing_identifier_rows:
+        identifiers = _migration_context_source_exact_identifiers(
+            str(title or ""),
+            str(body or ""),
+        )
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO context_source_exact_identifiers(
+                context_source_id,
+                save_id,
+                identifier
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                (str(source_id), str(save_id), identifier)
+                for identifier in identifiers or ("",)
+            ),
+        )
 
 
 def _migration_context_source_search_terms(
@@ -4334,6 +4388,26 @@ def _migration_context_source_search_terms(
         *cjk_lexical_anchors(bounded_body),
     )
     return tuple(dict.fromkeys(terms))[:4096]
+
+
+def _migration_context_source_exact_identifiers(
+    title: str,
+    body: str,
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            (
+                *structured_identifiers(
+                    title,
+                    max_input_chars=_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS,
+                ),
+                *structured_identifiers(
+                    body,
+                    max_input_chars=_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS,
+                ),
+            )
+        )
+    )[:4096]
 
 
 def _ensure_message_context_revision_schema(connection: sqlite3.Connection) -> None:
