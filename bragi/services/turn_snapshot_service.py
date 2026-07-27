@@ -630,6 +630,10 @@ class TurnSnapshotService:
                         )
                     self._insert_row(table_name, remapped)
             self._normalize_memory_fingerprints(fork_save.id)
+            self.repositories.copy_context_source_legacy_budget_limit(
+                source_save_id=source_save_id,
+                target_save_id=fork_save.id,
+            )
             self.repositories.rebuild_context_source_search_terms(fork_save.id)
             self.repositories.consolidate_active_memory_duplicates(
                 save_id=fork_save.id

@@ -4549,7 +4549,7 @@ def test_repositories_matches_middle_han_trigram_via_bigrams(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, _ = _persist_repository_save(repositories)
-    body = "".join(chr(0x4E00 + index) for index in range(220))
+    body = "".join(chr(0x4E00 + index) for index in range(1_000))
     target = repositories.upsert_context_source(
         save_id=save_id,
         source_type="memory",
@@ -4557,7 +4557,7 @@ def test_repositories_matches_middle_han_trigram_via_bigrams(
         title="長文",
         body=body,
     )
-    query = body[200:203]
+    query = body[700:703]
 
     hits = repositories.search_context_sources(
         save_id,

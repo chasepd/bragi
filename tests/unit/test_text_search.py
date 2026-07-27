@@ -98,6 +98,18 @@ def test_structured_identifier_bounds_drop_oversized_unbroken_token() -> None:
     assert structured_identifiers("A" * 1_000_000) == ()
 
 
+def test_structured_identifier_bounds_keep_identifier_before_oversized_token() -> None:
+    value = "TARGET-9999 " + ("A" * 1_000_000)
+
+    assert structured_identifiers(value) == ("target-9999",)
+
+
+def test_structured_identifier_bounds_keep_both_safe_oversized_token_edges() -> None:
+    value = "KEEP-1 " + ("A" * 70_000) + " TAIL-2"
+
+    assert structured_identifiers(value) == ("keep-1", "tail-2")
+
+
 def test_structured_identifier_bounds_preserve_contracting_token() -> None:
     identifier = ("A\u030A" * 300) + "-7"
     value = (" " * 37_000) + identifier + (" " * 32_000)

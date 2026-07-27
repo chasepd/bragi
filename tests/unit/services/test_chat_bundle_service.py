@@ -11,6 +11,7 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
+from bragi.persistence import repositories as repositories_module
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import SaveRecord
 from bragi.persistence.repositories import (
@@ -527,6 +528,56 @@ def test_export_rejects_snapshot_that_cannot_be_imported(
         )
 
     assert not bundle_path.exists()
+
+
+def test_import_preserves_exported_legacy_normalized_budget_allowance(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="custom_note",
+        source_id="legacy-budget-note",
+        title="Legacy note",
+        body="The moonstone opens the archive.",
+    )
+    normalized_text_bytes = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_index_budget_state
+        WHERE save_id = ?
+        """,
+        (save.id,),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD",
+        1,
+    )
+    repositories.ensure_context_source_legacy_budget_limit(
+        save_id=save.id,
+        normalized_text_bytes=normalized_text_bytes,
+    )
+    repositories.commit()
+    bundle_path = tmp_path / "exports" / "legacy-budget.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+
+    imported_save_id = _imported_save_id(imported)
+    imported_limit = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_legacy_budget_limits
+        WHERE save_id = ?
+        """,
+        (imported_save_id,),
+    ).fetchone()[0]
+    assert imported_limit == normalized_text_bytes
 
 
 def test_export_save_refunds_live_curation_attempt_when_clearing_lease(

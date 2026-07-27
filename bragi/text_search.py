@@ -111,7 +111,14 @@ def _bounded_identifier_input(value: str, *, max_input_chars: int) -> str:
         and _structured_identifier_character(value[prefix_end])
     ):
         token_span = _bounded_identifier_token_span(value, cut=prefix_end)
-        prefix_end = token_span[1] if token_span is not None else 0
+        if token_span is not None:
+            prefix_end = token_span[1]
+        else:
+            while (
+                prefix_end > 0
+                and _structured_identifier_character(value[prefix_end - 1])
+            ):
+                prefix_end -= 1
     suffix_start = len(value) - edge_chars
     if (
         suffix_start > 0
@@ -119,7 +126,14 @@ def _bounded_identifier_input(value: str, *, max_input_chars: int) -> str:
         and _structured_identifier_character(value[suffix_start])
     ):
         token_span = _bounded_identifier_token_span(value, cut=suffix_start)
-        suffix_start = token_span[0] if token_span is not None else len(value)
+        if token_span is not None:
+            suffix_start = token_span[0]
+        else:
+            while (
+                suffix_start < len(value)
+                and _structured_identifier_character(value[suffix_start])
+            ):
+                suffix_start += 1
     return f"{value[:prefix_end]} {value[suffix_start:]}"
 
 

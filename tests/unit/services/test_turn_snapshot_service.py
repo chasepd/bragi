@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from bragi.persistence import repositories as repositories_module
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import SaveRecord
 from bragi.persistence.repositories import PersistenceRepositories
@@ -1809,6 +1810,58 @@ def test_snapshot_backed_fork_remaps_rows_and_copies_media(
     assert fork_snapshot.source_message_id == fork_messages[0].id
     assert fork_snapshot.world_time_source_message_id == fork_messages[0].id
     assert fork_snapshot.world_time_confidence == 0.93
+
+
+def test_snapshot_fork_copies_legacy_normalized_budget_allowance(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="custom_note",
+        source_id="legacy-budget-note",
+        title="Legacy note",
+        body="The moonstone opens the archive.",
+    )
+    normalized_text_bytes = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_index_budget_state
+        WHERE save_id = ?
+        """,
+        (save.id,),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD",
+        1,
+    )
+    repositories.ensure_context_source_legacy_budget_limit(
+        save_id=save.id,
+        normalized_text_bytes=normalized_text_bytes,
+    )
+    repositories.commit()
+    service = TurnSnapshotService(repositories)
+    snapshot = service.capture_baseline_snapshot(save.id)
+
+    fork = service.fork_snapshot_to_save(
+        source_save_id=save.id,
+        snapshot_id=snapshot.id,
+        title="Forked legacy save",
+        media_dir=tmp_path / "media",
+    )
+
+    fork_limit = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_legacy_budget_limits
+        WHERE save_id = ?
+        """,
+        (fork.save.id,),
+    ).fetchone()[0]
+    assert fork_limit == normalized_text_bytes
 
 
 def test_snapshot_backed_fork_rejects_media_paths_outside_media_root(

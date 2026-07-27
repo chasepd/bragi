@@ -4616,13 +4616,24 @@ def _ensure_context_source_search_terms_schema(
             )
         """
     )
+    lexical_term_index_complete = connection.execute(
+        """
+        SELECT 1
+        FROM context_source_search_index_state
+        WHERE key = 'lexical_terms_complete_v2'
+        """
+    ).fetchone()
+    if lexical_term_index_complete is None:
+        connection.execute("DELETE FROM context_source_search_terms")
     exact_identifier_index_complete = connection.execute(
         """
         SELECT 1
         FROM context_source_search_index_state
-        WHERE key = 'exact_identifiers_complete_v2'
+        WHERE key = 'exact_identifiers_complete_v3'
         """
     ).fetchone()
+    if exact_identifier_index_complete is None:
+        connection.execute("DELETE FROM context_source_exact_identifiers")
     missing_rows = connection.execute(
         """
         SELECT source.id, source.save_id,
@@ -4695,7 +4706,13 @@ def _ensure_context_source_search_terms_schema(
     connection.execute(
         """
         INSERT OR REPLACE INTO context_source_search_index_state(key, value)
-        VALUES ('exact_identifiers_complete_v2', '1')
+        VALUES ('lexical_terms_complete_v2', '1')
+        """
+    )
+    connection.execute(
+        """
+        INSERT OR REPLACE INTO context_source_search_index_state(key, value)
+        VALUES ('exact_identifiers_complete_v3', '1')
         """
     )
 
@@ -4707,10 +4724,10 @@ def _migration_context_source_search_terms(
     bounded_title = title[:_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
     bounded_body = body[:_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
     terms = (
-        *unicode_word_terms(bounded_title),
         *cjk_lexical_anchors(bounded_title),
-        *unicode_word_terms(bounded_body),
         *cjk_lexical_anchors(bounded_body),
+        *unicode_word_terms(bounded_title),
+        *unicode_word_terms(bounded_body),
     )
     return tuple(dict.fromkeys(terms))[:_MAX_CONTEXT_SOURCE_INDEX_TERMS]
 

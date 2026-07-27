@@ -250,6 +250,12 @@ class PersistenceRepositories:
             _normalized_search_text,
             deterministic=True,
         )
+        self.connection.create_function(
+            "bragi_text_contains_all",
+            3,
+            _normalized_text_contains_all,
+            deterministic=True,
+        )
         self._transaction_depth = 0
 
     def commit(self) -> None:
@@ -3716,6 +3722,55 @@ class PersistenceRepositories:
             current_bytes,
         )
 
+    def copy_context_source_legacy_budget_limit(
+        self,
+        *,
+        source_save_id: str,
+        target_save_id: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO context_source_legacy_budget_limits(
+                save_id, normalized_text_bytes
+            )
+            SELECT ?, normalized_text_bytes
+            FROM context_source_legacy_budget_limits
+            WHERE save_id = ?
+            ON CONFLICT(save_id) DO UPDATE SET
+                normalized_text_bytes = MAX(
+                    normalized_text_bytes,
+                    excluded.normalized_text_bytes
+                )
+            """,
+            (target_save_id, source_save_id),
+        )
+
+    def ensure_context_source_legacy_budget_limit(
+        self,
+        *,
+        save_id: str,
+        normalized_text_bytes: int,
+    ) -> None:
+        if (
+            normalized_text_bytes
+            <= MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
+        ):
+            return
+        self.connection.execute(
+            """
+            INSERT INTO context_source_legacy_budget_limits(
+                save_id, normalized_text_bytes
+            )
+            VALUES (?, ?)
+            ON CONFLICT(save_id) DO UPDATE SET
+                normalized_text_bytes = MAX(
+                    normalized_text_bytes,
+                    excluded.normalized_text_bytes
+                )
+            """,
+            (save_id, normalized_text_bytes),
+        )
+
     def get_context_source(self, context_source_id: str) -> ContextSourceRecord | None:
         row = self._fetch_one(
             """
@@ -3971,6 +4026,11 @@ class PersistenceRepositories:
         indexed_terms = tuple(
             dict.fromkeys((*normalized_query_terms, *phrase_terms))
         )[:MAX_UNICODE_SUBSTRING_TERMS]
+        substring_scan_terms = (
+            indexed_terms
+            if any(cjk_lexical_anchors(term) for term in indexed_terms)
+            else ()
+        )
         term_rows: list[sqlite3.Row] = []
         if indexed_terms:
             indexed_terms_json = _dump_json(indexed_terms)
@@ -4031,6 +4091,50 @@ class PersistenceRepositories:
                     limit,
                 ),
             )
+        cjk_substring_rows = (
+            self._fetch_all(
+                f"""
+                SELECT
+                    context_sources.id,
+                    context_sources.save_id,
+                    context_sources.source_type,
+                    context_sources.source_id,
+                    context_sources.title,
+                    context_sources.body,
+                    context_sources.metadata_json,
+                    context_sources.token_estimate,
+                    context_sources.scene_snapshot_id,
+                    context_sources.scene_generation,
+                    context_sources.created_turn_number,
+                    context_sources.expires_after_turn_number,
+                    -900.0 AS bm25_rank
+                FROM context_sources
+                WHERE context_sources.save_id = ?
+                  AND context_sources.archived_at IS NULL
+                  AND context_sources.source_type IN (
+                      {_placeholders(len(source_type_values))}
+                  )
+                  {eligibility_sql}
+                  AND bragi_text_contains_all(
+                      context_sources.title,
+                      context_sources.body,
+                      ?
+                  ) = 1
+                ORDER BY context_sources.created_at DESC,
+                         context_sources.rowid DESC
+                LIMIT ?
+                """,
+                (
+                    save_id,
+                    *source_type_values,
+                    *eligibility_params,
+                    _dump_json(substring_scan_terms),
+                    limit,
+                ),
+            )
+            if match_all and substring_scan_terms
+            else []
+        )
         exact_identifier_rows = (
             self._fetch_all(
                 f"""
@@ -4190,6 +4294,8 @@ class PersistenceRepositories:
         )
         rows_by_id: dict[str, sqlite3.Row] = {}
         for row in exact_identifier_rows:
+            rows_by_id.setdefault(str(row["id"]), row)
+        for row in cjk_substring_rows:
             rows_by_id.setdefault(str(row["id"]), row)
         for row in exact_phrase_rows:
             rows_by_id.setdefault(str(row["id"]), row)
@@ -13643,6 +13749,41 @@ def _normalized_search_text(value: object) -> str:
     return unicodedata.normalize("NFKC", str(value)).casefold()
 
 
+def _normalized_text_contains_all(
+    title: object,
+    body: object,
+    terms_json: object,
+) -> int:
+    try:
+        terms_payload = json.loads(str(terms_json))
+    except (TypeError, ValueError):
+        return 0
+    if (
+        not isinstance(terms_payload, list)
+        or not terms_payload
+        or len(terms_payload) > MAX_UNICODE_SUBSTRING_TERMS
+    ):
+        return 0
+    terms = tuple(
+        unicodedata.normalize("NFKC", str(term)[:512]).casefold()
+        for term in terms_payload
+    )
+    if any(not term for term in terms):
+        return 0
+    normalized_title = _normalized_search_text(
+        str(title)[:MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
+    )
+    normalized_body = _normalized_search_text(
+        str(body)[:MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
+    )
+    return int(
+        all(
+            term in normalized_title or term in normalized_body
+            for term in terms
+        )
+    )
+
+
 def _bounded_context_source_exact_identifiers(
     identifiers: tuple[str, ...],
 ) -> tuple[str, ...]:
@@ -13663,10 +13804,10 @@ def _context_source_search_terms(title: str, body: str) -> tuple[str, ...]:
     bounded_title = title[:MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
     bounded_body = body[:MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
     terms = (
-        *unicode_word_terms(bounded_title),
         *cjk_lexical_anchors(bounded_title),
-        *unicode_word_terms(bounded_body),
         *cjk_lexical_anchors(bounded_body),
+        *unicode_word_terms(bounded_title),
+        *unicode_word_terms(bounded_body),
     )
     return tuple(dict.fromkeys(terms))[:MAX_CONTEXT_SOURCE_INDEX_TERMS]
 
@@ -13706,7 +13847,7 @@ def validate_context_source_index_budget(
     max_normalized_text_bytes: int = (
         MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
     ),
-) -> None:
+) -> int:
     indexed_rows = 0
     indexed_bytes = 0
     source_text_bytes = 0
@@ -13736,6 +13877,7 @@ def validate_context_source_index_budget(
             raise ValueError("Context source index is too large to rebuild")
         if indexed_bytes > MAX_CONTEXT_INDEX_BYTES_PER_REBUILD:
             raise ValueError("Context source index text is too large to rebuild")
+    return normalized_text_bytes
 
 
 def _context_source_text_budget_usage(

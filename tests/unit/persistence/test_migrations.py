@@ -15,6 +15,7 @@ from bragi.persistence.repositories import (
     PersistenceRepositories,
     canonical_claim_fingerprint,
 )
+from bragi.text_search import cjk_lexical_anchors
 
 EXPECTED_MIGRATION_VERSIONS = list(range(1, CURRENT_SCHEMA_VERSION + 1))
 
@@ -380,7 +381,7 @@ def test_migrate_database_rebuilds_incomplete_exact_identifier_index(
         connection.execute(
             """
             DELETE FROM context_source_search_index_state
-            WHERE key = 'exact_identifiers_complete_v2'
+            WHERE key = 'exact_identifiers_complete_v3'
             """
         )
         connection.execute(
@@ -430,6 +431,81 @@ def test_migrate_database_rebuilds_incomplete_exact_identifier_index(
             exact_identifiers=("ARCHIVE-128",),
         )
         assert [hit.record.id for hit in hits] == [source.id]
+
+
+def test_migrate_database_rebuilds_outdated_lexical_term_index(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    body = "".join(chr(0x4E00 + index) for index in range(220))
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        source = repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id="memory-long-han-run",
+            title="長文",
+            body=body,
+        )
+        connection.execute(
+            """
+            DELETE FROM context_source_search_index_state
+            WHERE key = 'lexical_terms_complete_v2'
+            """
+        )
+        connection.execute(
+            """
+            DELETE FROM context_source_search_terms
+            WHERE context_source_id = ?
+            """,
+            (source.id,),
+        )
+        connection.executemany(
+            """
+            INSERT INTO context_source_search_terms(
+                context_source_id, save_id, term
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                (source.id, save.id, body[index : index + 2])
+                for index in range(len(body) - 1)
+            ),
+        )
+        connection.commit()
+
+    query = body[200:203]
+    assert query not in {
+        body[index : index + 2] for index in range(len(body) - 1)
+    }
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        indexed_terms = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT term
+                FROM context_source_search_terms
+                WHERE context_source_id = ?
+                """,
+                (source.id,),
+            )
+        }
+        assert set(cjk_lexical_anchors(query)) <= indexed_terms
 
 
 def test_migrate_database_upgrades_main_schema_71_context_lifecycle(

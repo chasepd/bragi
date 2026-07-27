@@ -1039,11 +1039,13 @@ class ChatBundleService:
     ) -> ImportedChatBundle:
         manifest_payload, data = self._read_bundle(bundle_path)
         _manifest_from_payload(manifest_payload)
-        _validate_bundle_context_source_index_budget(
-            data,
-            max_normalized_text_bytes=(
-                _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
-            ),
+        imported_normalized_text_bytes = (
+            _validate_bundle_context_source_index_budget(
+                data,
+                max_normalized_text_bytes=(
+                    _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+                ),
+            )
         )
         media_members = _load_media_members(bundle_path, data)
         media_backups: dict[Path, bytes | None] = {}
@@ -1057,6 +1059,10 @@ class ChatBundleService:
                 media_backups,
                 owner_user_id=owner_user_id,
                 repair_tracker=repair_tracker,
+            )
+            self.repositories.ensure_context_source_legacy_budget_limit(
+                save_id=imported.save_id,
+                normalized_text_bytes=imported_normalized_text_bytes,
             )
             self.repositories.rebuild_context_source_search_terms(imported.save_id)
             self.repositories.commit_transaction()
@@ -4012,19 +4018,18 @@ def _validate_bundle_context_source_index_budget(
     data: Mapping[str, object],
     *,
     max_normalized_text_bytes: int | None = None,
-) -> None:
+) -> int:
     try:
         rows = _list_of_objects(
             data.get("context_sources"),
             "context_sources",
         )
         if max_normalized_text_bytes is None:
-            validate_context_source_index_budget(rows)
-        else:
-            validate_context_source_index_budget(
-                rows,
-                max_normalized_text_bytes=max_normalized_text_bytes,
-            )
+            return validate_context_source_index_budget(rows)
+        return validate_context_source_index_budget(
+            rows,
+            max_normalized_text_bytes=max_normalized_text_bytes,
+        )
     except ValueError as exc:
         raise ChatBundleError(str(exc)) from exc
 
