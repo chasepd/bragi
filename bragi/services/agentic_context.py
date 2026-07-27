@@ -2401,9 +2401,9 @@ def _source_context_for_evidence_quote(
         else len(searchable_source)
     )
     following = searchable_source[context_end:next_end]
-    if _grounding_adjacent_fragment_qualifies(previous):
+    if _grounding_adjacent_fragment_qualifies(previous, following=False):
         context = previous + context
-    if _grounding_adjacent_fragment_qualifies(following):
+    if _grounding_adjacent_fragment_qualifies(following, following=True):
         context += following
     return context
 
@@ -2420,16 +2420,16 @@ def _grounding_sentence_boundary(character: str) -> bool:
     )
 
 
-def _grounding_adjacent_fragment_qualifies(value: str) -> bool:
+def _grounding_adjacent_fragment_qualifies(
+    value: str,
+    *,
+    following: bool,
+) -> bool:
     ordered_terms = _ordered_grounding_terms(value)
     raw_terms = _grounding_boundary_terms(value)
-    has_semantic_symbol = any(
-        unicodedata.category(character).startswith("S")
-        or character in {"?", "~"}
-        or "QUESTION" in unicodedata.name(character, "")
-        or "INTERROBANG" in unicodedata.name(character, "")
-        or "CROSS MARK" in unicodedata.name(character, "")
-        for character in value
+    has_punctuation_only_qualifier = not raw_terms and any(
+        unicodedata.category(character).startswith(("P", "S"))
+        for character in unicodedata.normalize("NFKC", value)
     )
     anaphoric_terms = {"it", "so", "that", "this"}
     terms = set(ordered_terms)
@@ -2462,9 +2462,27 @@ def _grounding_adjacent_fragment_qualifies(value: str) -> bool:
     }
     is_short_fragment = len(ordered_terms) <= 2
     is_anaphoric_fragment = bool(set(raw_terms) & anaphoric_terms)
+    is_modal_adverb_fragment = (
+        len(ordered_terms) == 1 and ordered_terms[0].endswith("ly")
+    )
+    has_explicit_qualifier = bool(
+        ordered_terms and ordered_terms[0] in qualifier_terms
+    )
+    compact_fragment = "".join(
+        character for character in value if not character.isspace()
+    )
+    is_short_unsegmented_fragment = bool(
+        len(raw_terms) == 1
+        and len(compact_fragment) <= 12
+        and any(ord(character) > 127 for character in compact_fragment)
+        and following
+    )
     return bool(
-        has_semantic_symbol
+        has_punctuation_only_qualifier
         or is_anaphoric_fragment
+        or is_modal_adverb_fragment
+        or has_explicit_qualifier
+        or is_short_unsegmented_fragment
         or (
             is_short_fragment
             and (
@@ -2482,8 +2500,7 @@ def _compact_grounding_padding(value: str) -> str:
     for character in unicodedata.normalize("NFKC", value):
         name = unicodedata.name(character, "")
         semantic_punctuation = (
-            character in {".", "!", "?", "~"}
-            or unicodedata.category(character).startswith("S")
+            unicodedata.category(character).startswith(("P", "S"))
             or "FULL STOP" in name
             or "QUESTION" in name
             or "EXCLAMATION" in name
@@ -4064,38 +4081,35 @@ def _grounding_context_preserves_claim_boundary(
 ) -> bool:
     if "~~" in context:
         return False
-    claim_semantic_symbols = {
-        character
-        for character in unicodedata.normalize("NFKC", claim)
-        if (
-            unicodedata.category(character).startswith("S")
-            or character in {"?", "~"}
-            or "QUESTION" in unicodedata.name(character, "")
-            or "INTERROBANG" in unicodedata.name(character, "")
-            or "NOT SIGN" in unicodedata.name(character, "")
-            or "NEGATION" in unicodedata.name(character, "")
-            or "CROSS MARK" in unicodedata.name(character, "")
-        )
-    }
-    if any(
-        (
-            (
-                unicodedata.category(character).startswith("S")
-                or character in {"?", "~"}
-                or "QUESTION" in unicodedata.name(character, "")
-            )
-            and character not in claim_semantic_symbols
-            or "INTERROBANG" in unicodedata.name(character, "")
-            or "NOT SIGN" in unicodedata.name(character, "")
-            or "NEGATION" in unicodedata.name(character, "")
-            or "CROSS MARK" in unicodedata.name(character, "")
-        )
-        for character in context
-    ):
+    if _grounding_semantic_markers(context) != _grounding_semantic_markers(claim):
         return False
     claim_terms = _grounding_boundary_terms(claim)
     context_terms = _grounding_boundary_terms(context)
     return bool(claim_terms) and context_terms == claim_terms
+
+
+def _grounding_semantic_markers(value: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", value).rstrip()
+    if normalized and _grounding_benign_terminal_mark(normalized[-1]):
+        normalized = normalized[:-1]
+    return tuple(
+        character
+        for character in normalized
+        if (
+            character not in {"'", "’"}
+            and unicodedata.category(character).startswith(("P", "S"))
+        )
+    )
+
+
+def _grounding_benign_terminal_mark(character: str) -> bool:
+    name = unicodedata.name(character, "")
+    return bool(
+        character in {".", "!"}
+        or "FULL STOP" in name
+        or "EXCLAMATION" in name
+        or name.endswith("DANDA")
+    )
 
 
 def _grounding_anchor_conflicts(proposed: str, observation_claim: str) -> bool:

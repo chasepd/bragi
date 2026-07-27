@@ -419,7 +419,17 @@ def test_migrate_database_rebuilds_incomplete_exact_identifier_index(
             WHERE context_source_id = ?
             """,
             (source.id,),
-        ).fetchone()[0] == 257
+        ).fetchone()[0] == 0
+        repositories = PersistenceRepositories(connection)
+        repositories.restore_context_sources({source.id})
+        hits = repositories.search_context_sources(
+            save.id,
+            query_terms={"archive", "128"},
+            source_types={"memory"},
+            limit=1,
+            exact_identifiers=("ARCHIVE-128",),
+        )
+        assert [hit.record.id for hit in hits] == [source.id]
 
 
 def test_migrate_database_upgrades_main_schema_71_context_lifecycle(

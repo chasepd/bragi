@@ -51,7 +51,7 @@ _MAX_SNAPSHOT_OBJECT_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
 _MAX_SNAPSHOT_TOTAL_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
 _MAX_IMPORTED_SNAPSHOT_COUNT = 4_096
 _MAX_SNAPSHOT_MANIFEST_ENTRIES = 10_000
-_MAX_SNAPSHOT_IMPORT_REFERENCE_WORK = 65_536
+_MAX_SNAPSHOT_UNIQUE_ROW_OBJECTS = 65_536
 _MAX_SNAPSHOT_IMPORT_REFERENCED_BYTES = 128 * 1024 * 1024
 _MAX_SNAPSHOT_OBJECT_JSON_NODES = 100_000
 _MAX_SNAPSHOT_TOTAL_JSON_NODES = 2_000_000
@@ -2988,7 +2988,6 @@ def _validate_exported_snapshot_rows(
         object_sizes_by_hash[object_hash] = declared_size
 
     total_referenced_bytes = 0
-    total_manifest_reference_work = 0
     validated_table_signatures: set[str] = set()
     referenced_object_hashes: set[str] = set()
     unique_referenced_row_hashes: set[str] = set()
@@ -3040,7 +3039,7 @@ def _validate_exported_snapshot_rows(
                     unique_referenced_row_hashes.add(object_hash)
                     if (
                         len(unique_referenced_row_hashes)
-                        > _MAX_SNAPSHOT_IMPORT_REFERENCE_WORK
+                        > _MAX_SNAPSHOT_UNIQUE_ROW_OBJECTS
                     ):
                         raise ValueError(
                             "Snapshot manifests contain too many unique rows"
@@ -3056,14 +3055,6 @@ def _validate_exported_snapshot_rows(
                         raise ValueError(
                             "Snapshot manifests reference too much row data"
                         )
-                total_manifest_reference_work += 1
-                if (
-                    total_manifest_reference_work
-                    > _MAX_SNAPSHOT_IMPORT_REFERENCE_WORK
-                ):
-                    raise ValueError(
-                        "Snapshot manifests contain too many row references"
-                    )
                 value = _required_decoded_exported_snapshot_object(
                     raw_objects_by_hash,
                     objects_by_hash,

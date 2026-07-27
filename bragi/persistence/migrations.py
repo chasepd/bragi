@@ -4328,6 +4328,22 @@ def _ensure_context_source_search_terms_schema(
             value TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS context_source_index_budget_state (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            source_text_bytes INTEGER NOT NULL DEFAULT 0,
+            index_rows INTEGER NOT NULL DEFAULT 0,
+            index_bytes INTEGER NOT NULL DEFAULT 0
+        );
+
+        DROP TRIGGER IF EXISTS trg_context_source_budget_insert;
+        DROP TRIGGER IF EXISTS trg_context_source_budget_delete;
+        DROP TRIGGER IF EXISTS trg_context_source_budget_update;
+        DROP TRIGGER IF EXISTS trg_context_source_term_budget_insert;
+        DROP TRIGGER IF EXISTS trg_context_source_term_budget_delete;
+        DROP TRIGGER IF EXISTS trg_context_source_identifier_budget_insert;
+        DROP TRIGGER IF EXISTS trg_context_source_identifier_budget_delete;
+        DROP TRIGGER IF EXISTS trg_context_source_archive_index_cleanup;
+
         DELETE FROM context_source_search_terms
         WHERE context_source_id NOT IN (SELECT id FROM context_sources);
 
@@ -4336,6 +4352,174 @@ def _ensure_context_source_search_terms_schema(
 
         DELETE FROM context_source_exact_identifier_filters
         WHERE context_source_id NOT IN (SELECT id FROM context_sources);
+
+        DELETE FROM context_source_search_terms
+        WHERE context_source_id IN (
+            SELECT id FROM context_sources WHERE archived_at IS NOT NULL
+        );
+
+        DELETE FROM context_source_exact_identifiers
+        WHERE context_source_id IN (
+            SELECT id FROM context_sources WHERE archived_at IS NOT NULL
+        );
+
+        DELETE FROM context_source_index_budget_state;
+
+        INSERT INTO context_source_index_budget_state(
+            save_id, source_text_bytes, index_rows, index_bytes
+        )
+        SELECT
+            save_id,
+            SUM(
+                LENGTH(CAST(substr(title, 1, 65536) AS BLOB))
+                + LENGTH(CAST(substr(body, 1, 65536) AS BLOB))
+            ),
+            0,
+            0
+        FROM context_sources
+        WHERE archived_at IS NULL
+        GROUP BY save_id;
+
+        INSERT INTO context_source_index_budget_state(
+            save_id, source_text_bytes, index_rows, index_bytes
+        )
+        SELECT save_id, 0, COUNT(*), SUM(LENGTH(CAST(value AS BLOB)))
+        FROM (
+            SELECT save_id, term AS value FROM context_source_search_terms
+            UNION ALL
+            SELECT save_id, identifier AS value
+            FROM context_source_exact_identifiers
+        )
+        GROUP BY save_id
+        ON CONFLICT(save_id) DO UPDATE SET
+            index_rows = excluded.index_rows,
+            index_bytes = excluded.index_bytes;
+
+        CREATE TRIGGER trg_context_source_budget_insert
+        AFTER INSERT ON context_sources
+        WHEN NEW.archived_at IS NULL
+        BEGIN
+            INSERT INTO context_source_index_budget_state(
+                save_id, source_text_bytes, index_rows, index_bytes
+            )
+            VALUES (
+                NEW.save_id,
+                LENGTH(CAST(substr(NEW.title, 1, 65536) AS BLOB))
+                    + LENGTH(CAST(substr(NEW.body, 1, 65536) AS BLOB)),
+                0,
+                0
+            )
+            ON CONFLICT(save_id) DO UPDATE SET
+                source_text_bytes = source_text_bytes
+                    + excluded.source_text_bytes;
+        END;
+
+        CREATE TRIGGER trg_context_source_budget_delete
+        AFTER DELETE ON context_sources
+        WHEN OLD.archived_at IS NULL
+        BEGIN
+            UPDATE context_source_index_budget_state
+            SET source_text_bytes = MAX(
+                0,
+                source_text_bytes
+                    - LENGTH(CAST(substr(OLD.title, 1, 65536) AS BLOB))
+                    - LENGTH(CAST(substr(OLD.body, 1, 65536) AS BLOB))
+            )
+            WHERE save_id = OLD.save_id;
+        END;
+
+        CREATE TRIGGER trg_context_source_budget_update
+        AFTER UPDATE OF save_id, title, body, archived_at ON context_sources
+        BEGIN
+            UPDATE context_source_index_budget_state
+            SET source_text_bytes = MAX(
+                0,
+                source_text_bytes
+                    - CASE WHEN OLD.archived_at IS NULL THEN
+                        LENGTH(CAST(substr(OLD.title, 1, 65536) AS BLOB))
+                        + LENGTH(CAST(substr(OLD.body, 1, 65536) AS BLOB))
+                      ELSE 0 END
+            )
+            WHERE save_id = OLD.save_id;
+
+            INSERT INTO context_source_index_budget_state(
+                save_id, source_text_bytes, index_rows, index_bytes
+            )
+            SELECT
+                NEW.save_id,
+                LENGTH(CAST(substr(NEW.title, 1, 65536) AS BLOB))
+                    + LENGTH(CAST(substr(NEW.body, 1, 65536) AS BLOB)),
+                0,
+                0
+            WHERE NEW.archived_at IS NULL
+            ON CONFLICT(save_id) DO UPDATE SET
+                source_text_bytes = source_text_bytes
+                    + excluded.source_text_bytes;
+        END;
+
+        CREATE TRIGGER trg_context_source_term_budget_insert
+        AFTER INSERT ON context_source_search_terms
+        BEGIN
+            INSERT INTO context_source_index_budget_state(
+                save_id, source_text_bytes, index_rows, index_bytes
+            )
+            VALUES (
+                NEW.save_id, 0, 1, LENGTH(CAST(NEW.term AS BLOB))
+            )
+            ON CONFLICT(save_id) DO UPDATE SET
+                index_rows = index_rows + 1,
+                index_bytes = index_bytes + excluded.index_bytes;
+        END;
+
+        CREATE TRIGGER trg_context_source_term_budget_delete
+        AFTER DELETE ON context_source_search_terms
+        BEGIN
+            UPDATE context_source_index_budget_state
+            SET
+                index_rows = MAX(0, index_rows - 1),
+                index_bytes = MAX(
+                    0,
+                    index_bytes - LENGTH(CAST(OLD.term AS BLOB))
+                )
+            WHERE save_id = OLD.save_id;
+        END;
+
+        CREATE TRIGGER trg_context_source_identifier_budget_insert
+        AFTER INSERT ON context_source_exact_identifiers
+        BEGIN
+            INSERT INTO context_source_index_budget_state(
+                save_id, source_text_bytes, index_rows, index_bytes
+            )
+            VALUES (
+                NEW.save_id, 0, 1, LENGTH(CAST(NEW.identifier AS BLOB))
+            )
+            ON CONFLICT(save_id) DO UPDATE SET
+                index_rows = index_rows + 1,
+                index_bytes = index_bytes + excluded.index_bytes;
+        END;
+
+        CREATE TRIGGER trg_context_source_identifier_budget_delete
+        AFTER DELETE ON context_source_exact_identifiers
+        BEGIN
+            UPDATE context_source_index_budget_state
+            SET
+                index_rows = MAX(0, index_rows - 1),
+                index_bytes = MAX(
+                    0,
+                    index_bytes - LENGTH(CAST(OLD.identifier AS BLOB))
+                )
+            WHERE save_id = OLD.save_id;
+        END;
+
+        CREATE TRIGGER trg_context_source_archive_index_cleanup
+        AFTER UPDATE OF archived_at ON context_sources
+        WHEN OLD.archived_at IS NULL AND NEW.archived_at IS NOT NULL
+        BEGIN
+            DELETE FROM context_source_search_terms
+            WHERE context_source_id = NEW.id;
+            DELETE FROM context_source_exact_identifiers
+            WHERE context_source_id = NEW.id;
+        END;
         """,
     )
     exact_identifier_index_complete = connection.execute(
@@ -4382,12 +4566,15 @@ def _ensure_context_source_search_terms_schema(
                substr(source.title, 1, 65536),
                substr(source.body, 1, 65536)
         FROM context_sources source
-        WHERE ? = 1
-           OR NOT EXISTS (
+        WHERE source.archived_at IS NULL
+          AND (
+            ? = 1
+            OR NOT EXISTS (
                 SELECT 1
                 FROM context_source_exact_identifiers identifier
                 WHERE identifier.context_source_id = source.id
-           )
+            )
+          )
         ORDER BY source.rowid
         """,
         (int(exact_identifier_index_complete is None),),

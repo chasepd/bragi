@@ -65,11 +65,10 @@ def structured_identifiers(
     max_input_chars: int = MAX_STRUCTURED_IDENTIFIER_INPUT_CHARS,
     max_identifiers: int = MAX_STRUCTURED_IDENTIFIERS,
 ) -> tuple[str, ...]:
-    normalized = _bounded_nfkc_casefold(
-        value,
-        max_input_chars=max_input_chars,
-        max_output_chars=MAX_NORMALIZED_SEARCH_CHARS,
-    )
+    normalized = unicodedata.normalize(
+        "NFKC",
+        value[:max_input_chars],
+    ).casefold()
     identifiers = tuple(
         dict.fromkeys(
             identifier

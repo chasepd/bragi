@@ -107,10 +107,11 @@ MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
 MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
-MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 250_000
+MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 1_000_000
 MAX_CONTEXT_INDEX_BYTES_PER_REBUILD = 32 * 1024 * 1024
 MAX_CONTEXT_SOURCE_TEXT_BYTES_PER_REBUILD = 32 * 1024 * 1024
 MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD = 32 * 1024 * 1024
+MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD = 4 * 1024 * 1024
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
@@ -3506,93 +3507,87 @@ class PersistenceRepositories:
         terms: tuple[str, ...],
         identifiers: tuple[str, ...],
     ) -> None:
-        source_text_bytes = 0
-        normalized_text_bytes = 0
-        existing_source_rows = self.connection.execute(
+        state_row = self.connection.execute(
             """
-            SELECT title, body
-            FROM context_sources
+            SELECT source_text_bytes, index_rows, index_bytes
+            FROM context_source_index_budget_state
             WHERE save_id = ?
-              AND archived_at IS NULL
-              AND id != ?
             """,
-            (record.save_id, record.id),
+            (record.save_id,),
+        ).fetchone()
+        source_text_bytes, indexed_rows, indexed_bytes = (
+            (int(state_row[0]), int(state_row[1]), int(state_row[2]))
+            if state_row is not None
+            else (0, 0, 0)
         )
-        for title, body in existing_source_rows:
-            source_bytes, normalized_bytes = _context_source_text_budget_usage(
-                str(title or ""),
-                str(body or ""),
+        existing_source = self.connection.execute(
+            """
+            SELECT title, body, archived_at
+            FROM context_sources
+            WHERE id = ? AND save_id = ?
+            """,
+            (record.id, record.save_id),
+        ).fetchone()
+        if existing_source is not None and existing_source[2] is None:
+            existing_source_bytes, _ = _context_source_text_budget_usage(
+                str(existing_source[0] or ""),
+                str(existing_source[1] or ""),
             )
-            source_text_bytes += source_bytes
-            normalized_text_bytes += normalized_bytes
-            _raise_if_context_source_text_budget_exceeded(
-                source_text_bytes=source_text_bytes,
-                normalized_text_bytes=normalized_text_bytes,
-            )
+            source_text_bytes -= existing_source_bytes
         added_source_bytes, added_normalized_bytes = (
             _context_source_text_budget_usage(record.title, record.body)
         )
         source_text_bytes += added_source_bytes
-        normalized_text_bytes += added_normalized_bytes
-        _raise_if_context_source_text_budget_exceeded(
-            source_text_bytes=source_text_bytes,
-            normalized_text_bytes=normalized_text_bytes,
-        )
-        existing_rows, existing_bytes = self.connection.execute(
+        if source_text_bytes > MAX_CONTEXT_SOURCE_TEXT_BYTES_PER_REBUILD:
+            raise ValueError("Context source text is too large to rebuild")
+        if (
+            added_normalized_bytes
+            > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD
+        ):
+            raise ValueError("Normalized context source text is too large")
+        existing_index_rows, existing_index_bytes = self.connection.execute(
             """
             SELECT
                 (
                     SELECT COUNT(*)
-                    FROM context_source_search_terms terms
-                    JOIN context_sources source
-                      ON source.id = terms.context_source_id
-                    WHERE terms.save_id = ?
-                      AND source.archived_at IS NULL
-                      AND source.id != ?
+                    FROM context_source_search_terms
+                    WHERE context_source_id = ?
                 ) + (
                     SELECT COUNT(*)
-                    FROM context_source_exact_identifiers identifiers
-                    JOIN context_sources source
-                      ON source.id = identifiers.context_source_id
-                    WHERE identifiers.save_id = ?
-                      AND source.archived_at IS NULL
-                      AND source.id != ?
+                    FROM context_source_exact_identifiers
+                    WHERE context_source_id = ?
                 ),
                 (
-                    SELECT COALESCE(SUM(LENGTH(CAST(terms.term AS BLOB))), 0)
-                    FROM context_source_search_terms terms
-                    JOIN context_sources source
-                      ON source.id = terms.context_source_id
-                    WHERE terms.save_id = ?
-                      AND source.archived_at IS NULL
-                      AND source.id != ?
-                ) + (
                     SELECT COALESCE(
-                        SUM(LENGTH(CAST(identifiers.identifier AS BLOB))),
+                        SUM(LENGTH(CAST(term AS BLOB))),
                         0
                     )
-                    FROM context_source_exact_identifiers identifiers
-                    JOIN context_sources source
-                      ON source.id = identifiers.context_source_id
-                    WHERE identifiers.save_id = ?
-                      AND source.archived_at IS NULL
-                      AND source.id != ?
+                    FROM context_source_search_terms
+                    WHERE context_source_id = ?
+                ) + (
+                    SELECT COALESCE(
+                        SUM(LENGTH(CAST(identifier AS BLOB))),
+                        0
+                    )
+                    FROM context_source_exact_identifiers
+                    WHERE context_source_id = ?
                 )
             """,
             (
-                record.save_id,
                 record.id,
-                record.save_id,
                 record.id,
-                record.save_id,
                 record.id,
-                record.save_id,
                 record.id,
             ),
         ).fetchone()
         added_identifiers = identifiers or ("",)
-        indexed_rows = int(existing_rows) + len(terms) + len(added_identifiers)
-        indexed_bytes = int(existing_bytes) + sum(
+        indexed_rows = (
+            indexed_rows
+            - int(existing_index_rows)
+            + len(terms)
+            + len(added_identifiers)
+        )
+        indexed_bytes = indexed_bytes - int(existing_index_bytes) + sum(
             len(value.encode("utf-8"))
             for value in (*terms, *added_identifiers)
         )

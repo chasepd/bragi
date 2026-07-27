@@ -157,7 +157,7 @@ def test_snapshot_validation_bounds_unique_manifest_reference_work(
 ) -> None:
     monkeypatch.setattr(
         turn_snapshot_module,
-        "_MAX_SNAPSHOT_IMPORT_REFERENCE_WORK",
+        "_MAX_SNAPSHOT_UNIQUE_ROW_OBJECTS",
         1,
     )
     objects: dict[str, dict[str, object]] = {}
@@ -235,14 +235,7 @@ def test_snapshot_validation_bounds_aggregate_json_nodes(
         )
 
 
-def test_snapshot_validation_charges_distinct_manifest_permutations(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        turn_snapshot_module,
-        "_MAX_SNAPSHOT_IMPORT_REFERENCE_WORK",
-        3,
-    )
+def test_snapshot_validation_allows_distinct_manifests_with_shared_rows() -> None:
     objects: dict[str, dict[str, object]] = {}
     row_hashes = [
         turn_snapshot_module._add_snapshot_object_export(
@@ -274,14 +267,13 @@ def test_snapshot_validation_charges_distinct_manifest_permutations(
         for order in ((0, 1), (1, 0))
     ]
 
-    with pytest.raises(ValueError, match="too many row references"):
-        turn_snapshot_module._validate_exported_snapshot_rows(
-            [
-                {"id": f"snapshot-{index}", "root_manifest_hash": manifest_hash}
-                for index, manifest_hash in enumerate(manifest_hashes)
-            ],
-            objects.values(),
-        )
+    turn_snapshot_module._validate_exported_snapshot_rows(
+        [
+            {"id": f"snapshot-{index}", "root_manifest_hash": manifest_hash}
+            for index, manifest_hash in enumerate(manifest_hashes)
+        ],
+        objects.values(),
+    )
 
 
 def test_snapshot_validation_bounds_nested_json_string_nodes(

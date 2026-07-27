@@ -47,3 +47,13 @@ def test_unicode_normalization_preserves_tail_after_compatibility_expansion() ->
     value = ("\ufdfa " * 4_000) + "TARGET-9999"
 
     assert "target-9999" in structured_identifiers(value)
+
+
+def test_unicode_normalization_preserves_middle_after_compatibility_expansion() -> None:
+    value = (
+        ("\ufdfa " * 2_000)
+        + " TARGET-9999 "
+        + ("\ufdfa " * 2_000)
+    )
+
+    assert "target-9999" in structured_identifiers(value)

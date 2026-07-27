@@ -862,6 +862,16 @@ def test_persisted_observation_grounding_uses_unicode_sentence_boundaries(
         "Mara has the red key. 🤔",
         "Mara has the red key. 🤷",
         "Mara has the red key. ❓",
+        "Mara has the red key...",
+        "Mara has the red key. …",
+        "Mara has the red key. ‥",
+        "Mara has the red key. ;",
+        "Mara has the red key. Supposedly.",
+        "Mara has the red key. Presumably.",
+        "Mara has the red key. Seemingly.",
+        "Mara has the red key. Purportedly.",
+        "Mara has the red key. Allegedly, according to the guards.",
+        "Mara has the red key. たぶん。",
     ],
 )
 def test_curated_free_text_must_preserve_the_complete_source_message(
@@ -903,6 +913,10 @@ def test_curated_free_text_must_preserve_the_complete_source_message(
     [
         "The lamps flare. Mara has the red key.",
         "Mara has the red key. Lio watches the doorway.",
+        "Where is Lio? Mara has the red key.",
+        "The shop charges $5. Mara has the red key.",
+        "Mara has the red key. The ward is marked ♥.",
+        "Mara has the red key. 2 + 2 = 4.",
     ],
 )
 def test_curated_free_text_accepts_grounded_sentence_in_longer_message(
