@@ -17,6 +17,9 @@ MAX_IDENTIFIER_FILTER_UNCOMPRESSED_BYTES = 8 * (
 )
 MAX_NORMALIZED_SEARCH_CHARS = 65_536
 MAX_UNICODE_WORD_TERM_CHARS = 512
+MAX_STRUCTURED_IDENTIFIER_BOUNDARY_PROBE_CHARS = (
+    MAX_STRUCTURED_IDENTIFIER_CHARS * 4
+)
 
 
 def _bounded_nfkc_casefold(
@@ -107,47 +110,64 @@ def _bounded_identifier_input(value: str, *, max_input_chars: int) -> str:
         and _structured_identifier_character(value[prefix_end - 1])
         and _structured_identifier_character(value[prefix_end])
     ):
-        token_start = prefix_end
-        while (
-            token_start > 0
-            and _structured_identifier_character(value[token_start - 1])
-        ):
-            token_start -= 1
-        token_end = prefix_end
-        while (
-            token_end < len(value)
-            and _structured_identifier_character(value[token_end])
-        ):
-            token_end += 1
-        prefix_end = (
-            token_end
-            if token_end - token_start <= MAX_STRUCTURED_IDENTIFIER_CHARS
-            else token_start
-        )
+        token_span = _bounded_identifier_token_span(value, cut=prefix_end)
+        prefix_end = token_span[1] if token_span is not None else 0
     suffix_start = len(value) - edge_chars
     if (
         suffix_start > 0
         and _structured_identifier_character(value[suffix_start - 1])
         and _structured_identifier_character(value[suffix_start])
     ):
-        token_start = suffix_start
-        while (
-            token_start > 0
-            and _structured_identifier_character(value[token_start - 1])
-        ):
-            token_start -= 1
-        token_end = suffix_start
-        while (
-            token_end < len(value)
-            and _structured_identifier_character(value[token_end])
-        ):
-            token_end += 1
-        suffix_start = (
-            token_start
-            if token_end - token_start <= MAX_STRUCTURED_IDENTIFIER_CHARS
-            else token_end
-        )
+        token_span = _bounded_identifier_token_span(value, cut=suffix_start)
+        suffix_start = token_span[0] if token_span is not None else len(value)
     return f"{value[:prefix_end]} {value[suffix_start:]}"
+
+
+def _bounded_identifier_token_span(
+    value: str,
+    *,
+    cut: int,
+) -> tuple[int, int] | None:
+    token_start = cut
+    while (
+        token_start > 0
+        and cut - token_start <= MAX_STRUCTURED_IDENTIFIER_BOUNDARY_PROBE_CHARS
+        and _structured_identifier_character(value[token_start - 1])
+    ):
+        token_start -= 1
+    if (
+        cut - token_start
+        > MAX_STRUCTURED_IDENTIFIER_BOUNDARY_PROBE_CHARS
+    ):
+        return None
+    token_end = cut
+    while (
+        token_end < len(value)
+        and token_end - token_start
+        <= MAX_STRUCTURED_IDENTIFIER_BOUNDARY_PROBE_CHARS
+        and _structured_identifier_character(value[token_end])
+    ):
+        token_end += 1
+    if (
+        token_end - token_start
+        > MAX_STRUCTURED_IDENTIFIER_BOUNDARY_PROBE_CHARS
+    ):
+        return None
+    normalized_token = unicodedata.normalize(
+        "NFKC",
+        value[token_start:token_end],
+    ).casefold()
+    if (
+        len(normalized_token) > MAX_STRUCTURED_IDENTIFIER_CHARS
+        or re.fullmatch(
+            r"[^\W_]+(?:[-_.][^\W_]+)+",
+            normalized_token,
+            flags=re.UNICODE,
+        )
+        is None
+    ):
+        return None
+    return token_start, token_end
 
 
 def _structured_identifier_character(character: str) -> bool:
@@ -241,15 +261,10 @@ def cjk_lexical_anchors(value: str) -> tuple[str, ...]:
             if _cjk_script_family(run) == "han":
                 anchors.append(run)
             continue
-        if len(run) <= 64:
-            anchors.append(run)
-        for width in (2, 3):
-            if len(run) < width:
-                continue
-            anchors.extend(
-                run[index : index + width]
-                for index in range(len(run) - width + 1)
-            )
+        anchors.extend(
+            run[index : index + 2]
+            for index in range(len(run) - 1)
+        )
     return tuple(dict.fromkeys(anchors))
 
 

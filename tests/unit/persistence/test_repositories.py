@@ -23,6 +23,7 @@ from bragi.services.scenario_evolution_policy import (
     save_scenario_evolution_turn_interval_setting_key,
     scenario_template_evolution_turn_interval_setting_key,
 )
+from bragi.text_search import cjk_lexical_anchors
 
 
 @pytest.fixture
@@ -4536,6 +4537,31 @@ def test_repositories_indexes_middle_han_bigram_before_term_cap(
     hits = repositories.search_context_sources(
         save_id,
         query_terms={body[200:202]},
+        source_types={"memory"},
+        limit=1,
+        match_all=True,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_matches_middle_han_trigram_via_bigrams(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    body = "".join(chr(0x4E00 + index) for index in range(220))
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-long-han-trigram",
+        title="長文",
+        body=body,
+    )
+    query = body[200:203]
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms=set(cjk_lexical_anchors(query)),
         source_types={"memory"},
         limit=1,
         match_all=True,

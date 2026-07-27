@@ -9,7 +9,7 @@ from bragi.text_search import (
 def test_cjk_lexical_anchors_split_script_runs_and_preserve_entities() -> None:
     anchors = set(cjk_lexical_anchors("月石の羅針盤はどこ 李"))
 
-    assert {"月石", "羅針盤", "羅針", "針盤", "李"} <= anchors
+    assert {"月石", "羅針", "針盤", "李"} <= anchors
     assert "の" not in anchors
     assert "は" not in anchors
 
@@ -91,3 +91,18 @@ def test_structured_identifier_bounds_drop_split_compatibility_token() -> None:
     value = (" " * 37_000) + circled_a_run + "-7" + (" " * 32_000)
 
     assert structured_identifiers(value) == ()
+
+
+def test_structured_identifier_bounds_drop_oversized_unbroken_token() -> None:
+    assert structured_identifiers("A" * 1_000_000) == ()
+
+
+def test_structured_identifier_bounds_preserve_contracting_token() -> None:
+    identifier = ("A\u030A" * 300) + "-7"
+    value = (" " * 37_000) + identifier + (" " * 32_000)
+
+    identifiers = structured_identifiers(value)
+
+    assert len(identifiers) == 1
+    assert identifiers[0].endswith("-7")
+    assert len(identifiers[0]) == 302

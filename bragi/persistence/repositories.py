@@ -110,7 +110,7 @@ MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
 MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 1_000_000
 MAX_CONTEXT_INDEX_BYTES_PER_REBUILD = 32 * 1024 * 1024
 MAX_CONTEXT_SOURCE_TEXT_BYTES_PER_REBUILD = 32 * 1024 * 1024
-MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD = 384 * 1024 * 1024
+MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD = 32 * 1024 * 1024
 MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD = 4 * 1024 * 1024
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
@@ -3579,10 +3579,11 @@ class PersistenceRepositories:
             raise ValueError("Context source text is too large to rebuild")
         if added_normalized_bytes > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD:
             raise ValueError("Normalized context source text is too large")
-        if (
-            normalized_text_bytes
-            > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
-        ):
+        allowed_normalized_bytes = max(
+            MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD,
+            int(state_row[1]) if state_row is not None else 0,
+        )
+        if normalized_text_bytes > allowed_normalized_bytes:
             raise ValueError("Normalized context source text is too large to rebuild")
         existing_index_rows, existing_index_bytes = self.connection.execute(
             """
@@ -3636,6 +3637,9 @@ class PersistenceRepositories:
             raise ValueError("Context source index text is too large to rebuild")
 
     def rebuild_context_source_search_terms(self, save_id: str) -> None:
+        normalized_text_budget = self.context_source_normalized_budget_limit(
+            save_id
+        )
         self.begin_transaction()
         try:
             indexed_rows = 0
@@ -3674,6 +3678,7 @@ class PersistenceRepositories:
                 _raise_if_context_source_text_budget_exceeded(
                     source_text_bytes=source_text_bytes,
                     normalized_text_bytes=normalized_text_bytes,
+                    max_normalized_text_bytes=normalized_text_budget,
                 )
                 indexed_rows += len(terms) + max(1, len(identifiers))
                 indexed_bytes += sum(
@@ -3696,6 +3701,21 @@ class PersistenceRepositories:
         except Exception:
             self.rollback_transaction()
             raise
+
+    def context_source_normalized_budget_limit(self, save_id: str) -> int:
+        row = self.connection.execute(
+            """
+            SELECT normalized_text_bytes
+            FROM context_source_index_budget_state
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        ).fetchone()
+        current_bytes = int(row[0]) if row is not None else 0
+        return max(
+            MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD,
+            current_bytes,
+        )
 
     def get_context_source(self, context_source_id: str) -> ContextSourceRecord | None:
         row = self._fetch_one(
@@ -13683,6 +13703,10 @@ def _context_source_exact_identifiers(
 
 def validate_context_source_index_budget(
     rows: Iterable[Mapping[str, object]],
+    *,
+    max_normalized_text_bytes: int = (
+        MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
+    ),
 ) -> None:
     indexed_rows = 0
     indexed_bytes = 0
@@ -13699,6 +13723,7 @@ def validate_context_source_index_budget(
         _raise_if_context_source_text_budget_exceeded(
             source_text_bytes=source_text_bytes,
             normalized_text_bytes=normalized_text_bytes,
+            max_normalized_text_bytes=max_normalized_text_bytes,
         )
         terms = _context_source_search_terms(title, body)
         identifiers = _context_source_exact_identifiers(title, body)
@@ -13735,12 +13760,15 @@ def _raise_if_context_source_text_budget_exceeded(
     *,
     source_text_bytes: int,
     normalized_text_bytes: int,
+    max_normalized_text_bytes: int = (
+        MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
+    ),
 ) -> None:
     if source_text_bytes > MAX_CONTEXT_SOURCE_TEXT_BYTES_PER_REBUILD:
         raise ValueError("Context source text is too large to rebuild")
     if (
         normalized_text_bytes
-        > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
+        > max_normalized_text_bytes
     ):
         raise ValueError("Normalized context source text is too large to rebuild")
 

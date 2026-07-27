@@ -275,7 +275,12 @@ class ChatBundleService:
             json_node_budget=export_json_node_budget,
             allow_retired_scenario=True,
         )
-        _validate_bundle_context_source_index_budget(data)
+        _validate_bundle_context_source_index_budget(
+            data,
+            max_normalized_text_bytes=(
+                self.repositories.context_source_normalized_budget_limit(save_id)
+            ),
+        )
 
         _write_bundle_atomically(
             bundle_path=bundle_path,
@@ -3994,14 +3999,21 @@ def _validate_bundle_nested_json(
 
 def _validate_bundle_context_source_index_budget(
     data: Mapping[str, object],
+    *,
+    max_normalized_text_bytes: int | None = None,
 ) -> None:
     try:
-        validate_context_source_index_budget(
-            _list_of_objects(
-                data.get("context_sources"),
-                "context_sources",
-            )
+        rows = _list_of_objects(
+            data.get("context_sources"),
+            "context_sources",
         )
+        if max_normalized_text_bytes is None:
+            validate_context_source_index_budget(rows)
+        else:
+            validate_context_source_index_budget(
+                rows,
+                max_normalized_text_bytes=max_normalized_text_bytes,
+            )
     except ValueError as exc:
         raise ChatBundleError(str(exc)) from exc
 
