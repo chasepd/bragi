@@ -2388,24 +2388,7 @@ def _source_context_for_evidence_quote(
         if following_boundaries
         else len(searchable_source)
     )
-    context = searchable_source[context_start:context_end]
-    previous_start = (
-        preceding_boundaries[-2] + 1
-        if len(preceding_boundaries) > 1
-        else 0
-    )
-    previous = searchable_source[previous_start:context_start]
-    next_end = (
-        following_boundaries[1] + 1
-        if len(following_boundaries) > 1
-        else len(searchable_source)
-    )
-    following = searchable_source[context_end:next_end]
-    if _grounding_adjacent_fragment_qualifies(previous, following=False):
-        context = previous + context
-    if _grounding_adjacent_fragment_qualifies(following, following=True):
-        context += following
-    return context
+    return searchable_source[context_start:context_end]
 
 
 def _grounding_sentence_boundary(character: str) -> bool:
@@ -2417,80 +2400,6 @@ def _grounding_sentence_boundary(character: str) -> bool:
         or "EXCLAMATION" in name
         or "INTERROBANG" in name
         or name.endswith("DANDA")
-    )
-
-
-def _grounding_adjacent_fragment_qualifies(
-    value: str,
-    *,
-    following: bool,
-) -> bool:
-    ordered_terms = _ordered_grounding_terms(value)
-    raw_terms = _grounding_boundary_terms(value)
-    has_punctuation_only_qualifier = not raw_terms and any(
-        unicodedata.category(character).startswith(("P", "S"))
-        for character in unicodedata.normalize("NFKC", value)
-    )
-    anaphoric_terms = {"it", "so", "that", "this"}
-    terms = set(ordered_terms)
-    qualifier_terms = {
-        "allegedly",
-        "apparently",
-        "claim",
-        "claimed",
-        "claims",
-        "conjecture",
-        "could",
-        "doubt",
-        "doubts",
-        "guess",
-        "maybe",
-        "may",
-        "might",
-        "ostensibly",
-        "perhaps",
-        "possibility",
-        "possibly",
-        "reported",
-        "rumor",
-        "rumour",
-        "speculation",
-        "unconfirmed",
-        "uncertain",
-        "unverified",
-        "unsure",
-    }
-    is_short_fragment = len(ordered_terms) <= 2
-    is_anaphoric_fragment = bool(set(raw_terms) & anaphoric_terms)
-    is_modal_adverb_fragment = (
-        len(ordered_terms) == 1 and ordered_terms[0].endswith("ly")
-    )
-    has_explicit_qualifier = bool(
-        ordered_terms and ordered_terms[0] in qualifier_terms
-    )
-    compact_fragment = "".join(
-        character for character in value if not character.isspace()
-    )
-    is_short_unsegmented_fragment = bool(
-        len(raw_terms) == 1
-        and len(compact_fragment) <= 12
-        and any(ord(character) > 127 for character in compact_fragment)
-        and following
-    )
-    return bool(
-        has_punctuation_only_qualifier
-        or is_anaphoric_fragment
-        or is_modal_adverb_fragment
-        or has_explicit_qualifier
-        or is_short_unsegmented_fragment
-        or (
-            is_short_fragment
-            and (
-                terms & qualifier_terms
-                or _grounding_denial_conflicts("", value)
-                or _grounding_negation_conflicts("", value)
-            )
-        )
     )
 
 
@@ -4108,7 +4017,7 @@ def _grounding_semantic_markers(value: str) -> tuple[str, ...]:
                 "–",
                 "—",
             }
-            and unicodedata.category(character).startswith(("P", "S"))
+            and unicodedata.category(character).startswith(("M", "P", "S"))
         )
     )
 

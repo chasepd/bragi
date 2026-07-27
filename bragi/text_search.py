@@ -107,27 +107,57 @@ def _bounded_identifier_input(value: str, *, max_input_chars: int) -> str:
         and _structured_identifier_character(value[prefix_end - 1])
         and _structured_identifier_character(value[prefix_end])
     ):
+        token_start = prefix_end
         while (
-            prefix_end > 0
-            and _structured_identifier_character(value[prefix_end - 1])
+            token_start > 0
+            and _structured_identifier_character(value[token_start - 1])
         ):
-            prefix_end -= 1
+            token_start -= 1
+        token_end = prefix_end
+        while (
+            token_end < len(value)
+            and _structured_identifier_character(value[token_end])
+        ):
+            token_end += 1
+        prefix_end = (
+            token_end
+            if token_end - token_start <= MAX_STRUCTURED_IDENTIFIER_CHARS
+            else token_start
+        )
     suffix_start = len(value) - edge_chars
     if (
         suffix_start > 0
         and _structured_identifier_character(value[suffix_start - 1])
         and _structured_identifier_character(value[suffix_start])
     ):
+        token_start = suffix_start
         while (
-            suffix_start < len(value)
-            and _structured_identifier_character(value[suffix_start])
+            token_start > 0
+            and _structured_identifier_character(value[token_start - 1])
         ):
-            suffix_start += 1
+            token_start -= 1
+        token_end = suffix_start
+        while (
+            token_end < len(value)
+            and _structured_identifier_character(value[token_end])
+        ):
+            token_end += 1
+        suffix_start = (
+            token_start
+            if token_end - token_start <= MAX_STRUCTURED_IDENTIFIER_CHARS
+            else token_end
+        )
     return f"{value[:prefix_end]} {value[suffix_start:]}"
 
 
 def _structured_identifier_character(character: str) -> bool:
-    return character.isalnum() or character in {"-", "_", "."}
+    normalized = unicodedata.normalize("NFKC", character)
+    return bool(normalized) and all(
+        item.isalnum()
+        or item in {"-", "_", "."}
+        or unicodedata.category(item).startswith("M")
+        for item in normalized
+    )
 
 
 def structured_identifier_filter(title: str, body: str) -> bytes:
@@ -213,7 +243,7 @@ def cjk_lexical_anchors(value: str) -> tuple[str, ...]:
             continue
         if len(run) <= 64:
             anchors.append(run)
-        for width in (3, 2):
+        for width in (2, 3):
             if len(run) < width:
                 continue
             anchors.extend(

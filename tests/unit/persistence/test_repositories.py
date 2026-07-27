@@ -4520,6 +4520,30 @@ def test_repositories_unicode_match_all_cannot_be_starved_by_partial_matches(
     assert [hit.record for hit in hits] == [target]
 
 
+def test_repositories_indexes_middle_han_bigram_before_term_cap(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    body = "".join(chr(0x4E00 + index) for index in range(220))
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-long-han-run",
+        title="長文",
+        body=body,
+    )
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms={body[200:202]},
+        source_types={"memory"},
+        limit=1,
+        match_all=True,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
 def test_repositories_exact_phrase_supports_short_ascii_identifiers(
     repositories: PersistenceRepositories,
 ) -> None:

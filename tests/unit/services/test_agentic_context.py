@@ -709,39 +709,12 @@ def test_persisted_observation_revalidation_rejects_subject_prefix() -> None:
             "Mara has the red key.",
         ),
         (
-            "Mara has the red key. Allegedly.",
-            "Mara has the red key",
-            "Mara has the red key.",
-        ),
-        (
-            "Mara has the red key. Or so Lio claims.",
-            "Mara has the red key",
-            "Mara has the red key.",
-        ),
-        (
-            "Mara has the red key\n—allegedly.",
-            "Mara has the red key",
-            "Mara has the red key.",
-        ),
-        (
             "¬ Mara has the red key.",
             "Mara has the red key",
             "Mara has the red key.",
         ),
         (
             "~~Mara has the red key~~.",
-            "Mara has the red key",
-            "Mara has the red key.",
-        ),
-        (
-            "Mara has the red key."
-            + ("\u200b" * 241)
-            + " Allegedly.",
-            "Mara has the red key",
-            "Mara has the red key.",
-        ),
-        (
-            "Mara has the red key." + ("—" * 241) + " Allegedly.",
             "Mara has the red key",
             "Mara has the red key.",
         ),
@@ -780,6 +753,11 @@ def test_persisted_observation_revalidation_rejects_unpreserved_reported_modalit
         "The lamps might flare. Mara has the red key.",
         "Mara has the red key. Lio might leave.",
         "Mara has the red key. Lio claims the door is shut.",
+        "Mara has the red key. Allegedly.",
+        "Mara has the red key. Or so Lio claims.",
+        "Mara has the red key\n—allegedly.",
+        "Mara has the red key." + ("\u200b" * 241) + " Allegedly.",
+        "Mara has the red key." + ("—" * 241) + " Allegedly.",
     ],
 )
 def test_persisted_observation_grounding_allows_unrelated_adjacent_sentences(
@@ -872,6 +850,9 @@ def test_persisted_observation_grounding_uses_unicode_sentence_boundaries(
         "Mara has the red key. Purportedly.",
         "Mara has the red key. Allegedly, according to the guards.",
         "Mara has the red key. たぶん。",
+        "Mara has the red key\u0336.",
+        "Mara has the red key\u20e0.",
+        "Mara has the red key\u20e5.",
     ],
 )
 def test_curated_free_text_must_preserve_the_complete_source_message(
