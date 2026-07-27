@@ -4271,21 +4271,76 @@ def _validate_bundle_data(
     expected_snapshot_media_ids = (
         snapshot_object_media_ids - active_media_asset_ids
     )
+    repair_snapshot_media_ids = _referenced_snapshot_only_media_asset_ids(
+        data,
+        active_media_asset_ids=active_media_asset_ids,
+    )
     provided_snapshot_media_ids = {
         _text(row, "id") for row in snapshot_media_assets
     }
-    if not expected_snapshot_media_ids.issubset(
-        provided_snapshot_media_ids
-    ):
+    allowed_snapshot_media_ids = expected_snapshot_media_ids | repair_snapshot_media_ids
+    if not expected_snapshot_media_ids.issubset(provided_snapshot_media_ids):
         raise ChatBundleError(
             "Snapshot media assets do not cover snapshot media objects"
         )
+    unreferenced_snapshot_media_ids = (
+        provided_snapshot_media_ids - allowed_snapshot_media_ids
+    )
+    if unreferenced_snapshot_media_ids:
+        raise ChatBundleError("Chat bundle contains unreferenced snapshot media assets")
     for row in snapshot_media_assets:
         if _text(row, "id") in active_media_asset_ids:
             raise ChatBundleError(
                 "Snapshot media asset duplicates active media asset id: "
                 f"{_text(row, 'id')}"
             )
+
+
+def _referenced_snapshot_only_media_asset_ids(
+    data: dict[str, object],
+    *,
+    active_media_asset_ids: set[str],
+) -> set[str]:
+    referenced_ids: set[str] = set()
+
+    def add_media_id(value: object) -> None:
+        if isinstance(value, str) and value and value not in active_media_asset_ids:
+            referenced_ids.add(value)
+
+    def add_media_id_list(value: object) -> None:
+        if not isinstance(value, list):
+            return
+        for item in value:
+            add_media_id(item)
+
+    def add_media_source_metadata_refs(row: dict[str, object]) -> None:
+        metadata = _optional_json_object(row, "metadata_json") or {}
+        for field in _MEDIA_METADATA_SOURCE_ID_FIELDS:
+            add_media_id(metadata.get(field))
+        for field in _MEDIA_METADATA_SOURCE_ID_LIST_FIELDS:
+            add_media_id_list(metadata.get(field))
+
+    for row in _list_of_objects(data.get("media_assets"), "media_assets"):
+        add_media_id(_optional_text(row, "source_media_asset_id"))
+        add_media_source_metadata_refs(row)
+    for row in _list_of_objects(data.get("characters"), "characters"):
+        add_media_id(_optional_text(row, "reference_image_asset_id"))
+    for row in _list_of_objects(
+        data.get("character_text_message_attachments"),
+        "character_text_message_attachments",
+    ):
+        add_media_id(_optional_text(row, "media_asset_id"))
+    for row in _list_of_objects(data.get("entity_links"), "entity_links"):
+        if _text(row, "entity_type") == "media_asset":
+            add_media_id(_text(row, "entity_id"))
+        if _text(row, "target_type") == "media_asset":
+            add_media_id(_text(row, "target_id"))
+    for row in _list_of_objects(data.get("context_sources"), "context_sources"):
+        if _text(row, "source_type") != "media_asset":
+            continue
+        for source_id in _text(row, "source_id").split(","):
+            add_media_id(source_id.strip())
+    return referenced_ids
 
 
 def _validate_unique_ids(rows: list[dict[str, object]], label: str) -> None:

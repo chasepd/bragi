@@ -4745,6 +4745,34 @@ def test_repositories_rebuild_preserves_exact_identifier_after_long_token(
     assert identifiers == {"keep-1", "tail-2"}
 
 
+def test_repositories_rebuild_preserves_identifier_in_overlapping_edge_samples(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-overlap-sample",
+        title="Archive codes",
+        body=(" " * 40_000) + "MIDDLE-7" + (" " * 10_000),
+    )
+
+    repositories.rebuild_context_source_search_terms(save_id)
+
+    identifiers = {
+        row[0]
+        for row in repositories.connection.execute(
+            """
+            SELECT identifier
+            FROM context_source_exact_identifiers
+            WHERE context_source_id = ?
+            """,
+            (target.id,),
+        )
+    }
+    assert identifiers == {"middle-7"}
+
+
 def test_repositories_restore_rebuilds_archived_exact_identifier_index(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -5088,6 +5116,43 @@ def test_repositories_mixed_unicode_match_all_requires_ascii_terms(
     hits = repositories.search_context_sources(
         save.id,
         query_terms={"秘密", "vault"},
+        source_types={"memory"},
+        limit=1,
+        match_all=True,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_mixed_cjk_trigram_match_all_requires_ascii_terms(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-target",
+        title="秘密地図 vault marker",
+        body="The mixed-script marker identifies the old vault.",
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-newer-cjk-only",
+        title="秘密地図 only",
+        body="秘密地図だけを記録した新しいメモ。",
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"秘密地図", "vault"},
         source_types={"memory"},
         limit=1,
         match_all=True,

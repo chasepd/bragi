@@ -117,6 +117,35 @@ MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD = 4 * 1024 * 1024
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
+_CJK_SUBSTRING_OPTIONAL_QUERY_TERMS = frozenset(
+    {
+        "a",
+        "about",
+        "an",
+        "are",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "from",
+        "have",
+        "is",
+        "learn",
+        "remember",
+        "tell",
+        "that",
+        "the",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "would",
+        "you",
+        "your",
+    }
+)
 _UNSET = object()
 CHARACTER_TEXT_DELIVERY_STATUSES = frozenset(
     {"pending", "retrying", "sent", "failed"}
@@ -4111,8 +4140,13 @@ class PersistenceRepositories:
             or cjk_terms
         )
         substring_required_terms = (
-            tuple(term for term in indexed_terms if term not in cjk_terms)
-            if match_all and not cjk_trigrams
+            tuple(
+                term
+                for term in indexed_terms
+                if term not in cjk_terms
+                and term not in _CJK_SUBSTRING_OPTIONAL_QUERY_TERMS
+            )
+            if match_all
             else ()
         )
         term_rows: list[sqlite3.Row] = []

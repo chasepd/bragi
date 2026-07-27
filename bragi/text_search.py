@@ -182,7 +182,8 @@ def _bounded_identifier_input_from_edges(
     if max_input_chars <= 0 or total_chars <= 0:
         return ""
     if total_chars <= max_input_chars:
-        return prefix[:total_chars]
+        overlap_chars = max(0, len(prefix) + len(suffix) - total_chars)
+        return f"{prefix}{suffix[overlap_chars:]}"[:total_chars]
     edge_chars = max(1, (max_input_chars - 1) // 2)
     prefix_end = min(edge_chars, len(prefix))
     if (

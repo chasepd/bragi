@@ -3624,6 +3624,52 @@ def test_import_save_repairs_live_graph_media_refs_when_asset_is_snapshot_only(
     ] == []
 
 
+def test_import_save_rejects_unreferenced_snapshot_media_payload(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    module = _chat_bundle_module()
+    service, manifest, data, bundle_media_path = _export_bundle_payloads(
+        repositories,
+        tmp_path,
+    )
+    metadata = _media_file_metadata(data)
+    media_assets = data["media_assets"]
+    assert isinstance(media_assets, list)
+    snapshot_media = dict(_media_asset_by_id(media_assets, MEDIA_ASSET_ID))
+    snapshot_media["id"] = "media-unreferenced-snapshot"
+    snapshot_media["path"] = "save-night-watch/images/unreferenced.png"
+    snapshot_media["thumbnail_path"] = None
+    snapshot_media["source_message_id"] = None
+    snapshot_media["source_media_asset_id"] = None
+    snapshot_media["files"] = {
+        "path": {
+            "bundle_path": "media/unreferenced.png",
+            "sha256": metadata["sha256"],
+            "byte_count": len(MEDIA_BYTES),
+        }
+    }
+    snapshot_media_assets = data.setdefault("snapshot_media_assets", [])
+    assert isinstance(snapshot_media_assets, list)
+    snapshot_media_assets.append(snapshot_media)
+    bundle_path = tmp_path / "night-watch-unreferenced-snapshot-media.bragi-chat"
+    _write_bundle_with_members(
+        bundle_path,
+        manifest=manifest,
+        data=data,
+        members={
+            bundle_media_path: MEDIA_BYTES,
+            "media/unreferenced.png": MEDIA_BYTES,
+        },
+    )
+    save_ids = [save.id for save in repositories.list_saves()]
+
+    with pytest.raises(module.ChatBundleError, match="unreferenced snapshot media"):
+        service.import_save(bundle_path)
+
+    assert [save.id for save in repositories.list_saves()] == save_ids
+
+
 def test_import_save_assigns_owner_from_import_context(
     repositories: PersistenceRepositories,
     tmp_path: Path,
