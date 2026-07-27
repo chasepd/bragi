@@ -8051,22 +8051,6 @@ class PersistenceRepositories:
         )
         self.commit()
 
-    def mark_provider_model_unavailable(
-        self,
-        *,
-        provider: str,
-        model_id: str,
-    ) -> None:
-        self.connection.execute(
-            """
-            UPDATE provider_models
-            SET available = 0, refreshed_at = CURRENT_TIMESTAMP
-            WHERE provider = ? AND model_id = ?
-            """,
-            (provider, model_id),
-        )
-        self.commit()
-
     def upsert_provider_config(
         self,
         *,

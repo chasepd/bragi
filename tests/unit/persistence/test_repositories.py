@@ -2222,35 +2222,6 @@ def test_repositories_count_provider_models(
     assert repositories.count_provider_models("missing") == 0
 
 
-def test_repositories_mark_provider_model_unavailable(
-    repositories: PersistenceRepositories,
-) -> None:
-    repositories.save_provider_model(
-        provider="openrouter",
-        model_id="openrouter/context",
-        display_name="OpenRouter Context",
-        capabilities=["tool_calling"],
-    )
-    repositories.save_provider_model(
-        provider="openrouter",
-        model_id="openrouter/chat",
-        display_name="OpenRouter Chat",
-        capabilities=["chat"],
-    )
-
-    repositories.mark_provider_model_unavailable(
-        provider="openrouter",
-        model_id="openrouter/context",
-    )
-
-    models_by_id = {
-        model.model_id: model
-        for model in repositories.list_provider_models("openrouter")
-    }
-    assert models_by_id["openrouter/context"].available is False
-    assert models_by_id["openrouter/chat"].available is True
-
-
 def test_repositories_replace_provider_catalog_entries(
     repositories: PersistenceRepositories,
 ) -> None:
