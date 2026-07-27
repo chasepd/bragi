@@ -17,6 +17,7 @@ import pytest
 
 from bragi.persistence.models import MediaAssetRecord, MessageRecord, SaveRecord
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.providers.chat_rendering import chat_system_body
 from bragi.providers.contracts import (
     ChatRequest,
     ChatResponse,
@@ -1293,6 +1294,15 @@ def test_generate_for_message_uses_image_prompt_preference_for_prompt_drafting(
     chat_request = prompt_provider.chat_requests[0]
     assert chat_request.provider == "prompt"
     assert chat_request.model_id == "prompt/drafter"
+    assert chat_request.current_scene_recap
+    assert all(message.role != "user" for message in chat_request.messages)
+    rendered = chat_system_body(chat_request)
+    assert rendered.index("BEGIN BRAGI CONTEXT DATA") < rendered.index(
+        chat_request.current_scene_recap[0]
+    )
+    assert rendered.index(chat_request.current_scene_recap[0]) < rendered.rindex(
+        "END BRAGI CONTEXT DATA"
+    )
     assert len(image_provider.image_requests) == 1
     assert image_provider.image_requests[0].provider == "fake"
     assert image_provider.image_requests[0].model_id == "fake-image"
@@ -8324,14 +8334,7 @@ def _configure_video_fallback(
 
 
 def _chat_request_context(request: ChatRequest) -> str:
-    parts = [
-        request.scenario_instructions,
-        request.summary or "",
-        *request.retrieved_state,
-        *request.retrieved_memories,
-        *(message.body for message in request.messages),
-    ]
-    return "\n".join(part for part in parts if part)
+    return chat_system_body(request)
 
 
 def _chat_request_system_message(request: ChatRequest) -> str:
