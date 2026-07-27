@@ -10679,6 +10679,121 @@ def test_save_scenario_draft_awaits_async_runtime(tmp_path: Path) -> None:
     ]
 
 
+def test_save_scenario_draft_defers_opening_choices_to_background_job(
+    tmp_path: Path,
+) -> None:
+    class DeferredChoicesRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deferred = False
+            self.regenerate_calls: list[tuple[str, object, bool]] = []
+
+        async def save_scenario_draft(
+            self,
+            *,
+            scenario_type: str,
+            scenario_types: list[str] | None,
+            sections: dict[str, str],
+            character_starters: list[dict[str, object]],
+            action_choices_enabled: bool,
+            save_title: str,
+            source_metadata: dict[str, object] | None,
+            defer_opening_action_choices: bool = False,
+        ) -> dict[str, object]:
+            del (
+                scenario_type,
+                scenario_types,
+                sections,
+                character_starters,
+                action_choices_enabled,
+                save_title,
+                source_metadata,
+            )
+            self.deferred = defer_opening_action_choices
+            return {
+                **_chat_model("The beacon snaps awake."),
+                "active_save_id": "save-opening",
+                "action_choices_enabled": True,
+                "action_choices": {
+                    "narrator_message_id": "narrator-1",
+                    "choices": [],
+                },
+            }
+
+        async def regenerate_action_choices(
+            self,
+            *,
+            narrator_message_id: str,
+            active_save_id: str | None | object = ...,
+            retry_progress_callback: object | None = None,
+        ) -> dict[str, object]:
+            self.regenerate_calls.append(
+                (
+                    narrator_message_id,
+                    active_save_id,
+                    retry_progress_callback is not None,
+                )
+            )
+            return {
+                **_chat_model("The beacon snaps awake."),
+                "active_save_id": "save-opening",
+                "action_choices_enabled": True,
+                "action_choices": {
+                    "narrator_message_id": narrator_message_id,
+                    "choices": [
+                        {
+                            "choice_id": f"choice-{ordinal}",
+                            "ordinal": ordinal,
+                            "body": body,
+                        }
+                        for ordinal, body in enumerate(
+                            (
+                                "Climb the beacon stair.",
+                                "Inspect the dark lens.",
+                                "Signal the harbor watch.",
+                                "Search the keeper's desk.",
+                            ),
+                            start=1,
+                        )
+                    ],
+                },
+                "status": "Action choices generated",
+            }
+
+    runtime = DeferredChoicesRuntime()
+
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, runtime)))
+    ) as client:
+        response = client.post(
+            "/api/scenarios/draft/save",
+            json={
+                "scenario_type": "full_roleplay",
+                "sections": {
+                    "title": "Lantern Keep",
+                    "opening_message": "The beacon snaps awake.",
+                },
+                "action_choices_enabled": True,
+                "save_title": "Lantern Keep",
+            },
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        generation_job = payload["action_choices"]["generation_job"]
+        job = _wait_for_terminal_job(
+            client,
+            generation_job["id"],
+            save_id="save-opening",
+        )
+
+    assert runtime.deferred is True
+    assert generation_job["type"] == "action_choice_generate"
+    assert generation_job["save_id"] == "save-opening"
+    assert job["status"] == "succeeded"
+    assert len(job["result"]["action_choices"]["choices"]) == 4
+    assert runtime.regenerate_calls == [("narrator-1", "save-opening", True)]
+
+
 def test_scenario_draft_character_starters_generation_uses_runtime_job(
     tmp_path: Path,
 ) -> None:

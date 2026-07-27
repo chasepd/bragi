@@ -14717,6 +14717,179 @@ describe("frontend helpers", () => {
     expect(screen.queryByRole("textbox", { name: "Custom action" })).not.toBeInTheDocument();
   });
 
+  it("shows opening action choice generation before choices are ready", async () => {
+    const { CyoaActionPicker } = await import("./main");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }));
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CyoaActionPicker
+          disabled={false}
+          runJob={vi.fn()}
+          activeSaveId="save-1"
+          actionChoices={cyoaActionChoices({
+            choices: [],
+            generation_job: {
+              id: "job-opening-choices",
+              type: "action_choice_generate",
+              save_id: "save-1",
+              status: "queued",
+              result: null,
+              error: null
+            }
+          })}
+          pendingAfterMessageId="narrator-1"
+          onPendingMessage={vi.fn()}
+        />
+      </QueryClientProvider>
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("Generating action choices");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+  });
+
+  it("keeps empty opening choices retryable after generation fails", async () => {
+    const { CyoaActionPicker } = await import("./main");
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }));
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CyoaActionPicker
+          disabled={false}
+          runJob={vi.fn()}
+          activeSaveId="save-1"
+          actionChoices={cyoaActionChoices({
+            choices: [],
+            generation_job: null,
+            generation_error: "Action choices could not be generated."
+          })}
+          pendingAfterMessageId="narrator-1"
+          onPendingMessage={vi.fn()}
+        />
+      </QueryClientProvider>
+    );
+
+    expect(screen.getByText("Action choices could not be generated.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeEnabled();
+  });
+
+  it("tracks an embedded opening choice job and applies its completed choices", async () => {
+    const sources = installEventSourceDouble();
+    const generationJob = {
+      id: "job-opening-choices",
+      type: "action_choice_generate",
+      save_id: "save-1",
+      status: "queued",
+      result: null,
+      error: null
+    } satisfies Job;
+    const initialModel = runtimeModel({
+      saves: [
+        {
+          save_id: "save-1",
+          title: "Lantern Keep",
+          active: true,
+          scenario_id: "scenario-1",
+          scenario_title: "Lantern Keep"
+        }
+      ],
+      action_choices_enabled: true,
+      action_choices: cyoaActionChoices({
+        choices: [],
+        generation_job: generationJob
+      })
+    });
+    vi.stubGlobal("fetch", workbenchFetch([], initialModel));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByText("Generating action choices...")).toBeInTheDocument();
+    await waitFor(() => expect(
+      sources.some((source) => source.url === "/api/jobs/job-opening-choices/events?save_id=save-1")
+    ).toBe(true));
+    const jobSource = sources.find(
+      (source) => source.url === "/api/jobs/job-opening-choices/events?save_id=save-1"
+    );
+    act(() => {
+      jobSource?.dispatch("done", {
+        ...generationJob,
+        status: "succeeded",
+        result: runtimeModel({
+          ...initialModel,
+          action_choices: cyoaActionChoices()
+        })
+      });
+    });
+
+    expect(await screen.findByRole("button", { name: "Open the brass door" })).toBeInTheDocument();
+    expect(screen.queryByText("Generating action choices...")).not.toBeInTheDocument();
+  });
+
+  it("clears an embedded opening choice job after terminal failure", async () => {
+    const sources = installEventSourceDouble();
+    const generationJob = {
+      id: "job-opening-choices-failed",
+      type: "action_choice_generate",
+      save_id: "save-1",
+      status: "queued",
+      result: null,
+      error: null
+    } satisfies Job;
+    const initialModel = runtimeModel({
+      saves: [
+        {
+          save_id: "save-1",
+          title: "Lantern Keep",
+          active: true,
+          scenario_id: "scenario-1",
+          scenario_title: "Lantern Keep"
+        }
+      ],
+      action_choices_enabled: true,
+      action_choices: cyoaActionChoices({
+        choices: [],
+        generation_job: generationJob
+      })
+    });
+    vi.stubGlobal("fetch", workbenchFetch([], initialModel));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(
+      sources.some(
+        (candidate) => candidate.url === "/api/jobs/job-opening-choices-failed/events?save_id=save-1"
+      )
+    ).toBe(true));
+    const jobSource = sources.find(
+      (candidate) => candidate.url === "/api/jobs/job-opening-choices-failed/events?save_id=save-1"
+    );
+    if (!jobSource) throw new Error("opening action choice job watcher was not created");
+    act(() => {
+      jobSource.dispatch("done", {
+        ...generationJob,
+        status: "failed",
+        error: "Action choices could not be generated."
+      });
+    });
+
+    expect(await screen.findByText("Action choices could not be generated.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeEnabled();
+    expect(screen.queryByText("Generating action choices...")).not.toBeInTheDocument();
+  });
+
   it("starts CYOA action choice regeneration from the latest narrator message", async () => {
     const { CyoaActionPicker } = await import("./main");
     const job = {

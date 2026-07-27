@@ -1401,6 +1401,8 @@ def test_venice_tool_call_payload_uses_tools_and_preserves_arguments() -> None:
 def test_venice_structured_output_retries_empty_success_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    retry_progress: list[object] = []
+
     async def no_sleep(_delay: float) -> None:
         return None
 
@@ -1447,6 +1449,7 @@ def test_venice_structured_output_retries_empty_success_content(
                     "required": ["state_changes", "memories"],
                     "additionalProperties": False,
                 },
+                retry_progress_callback=retry_progress.append,
             )
         )
     )
@@ -1457,6 +1460,7 @@ def test_venice_structured_output_retries_empty_success_content(
     retry_metadata = response.raw_metadata["_bragi_retry"]
     assert retry_metadata["attempt_count"] == 2
     assert retry_metadata["max_attempts"] == 3
+    assert len(retry_progress) == 1
 
     attempts = retry_metadata["attempts"]
     assert len(attempts) == 2

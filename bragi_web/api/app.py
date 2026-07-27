@@ -215,6 +215,7 @@ _CHAT_JOB_TYPES = frozenset(
         "chat_turn",
         "look_around",
         "chat_regenerate",
+        "action_choice_generate",
         "action_choice_regenerate",
         "chat_edit",
         "message_edit",
@@ -3026,6 +3027,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "character_starters",
             ):
                 kwargs["character_starters"] = payload.character_starters
+            if _call_accepts_keyword(
+                state.runtime.save_scenario_draft,
+                "defer_opening_action_choices",
+            ):
+                kwargs["defer_opening_action_choices"] = True
             result = state.runtime.save_scenario_draft(
                 scenario_type=payload.scenario_type,
                 sections=payload.sections,
@@ -3044,6 +3050,32 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             reason="save_created",
         )
         _publish_save_event(state, None, "saves_changed", {"reason": "save_created"})
+        action_choices = payload_dict.get("action_choices")
+        save_id = payload_dict.get("active_save_id")
+        narrator_message_id = (
+            action_choices.get("narrator_message_id")
+            if isinstance(action_choices, dict)
+            else None
+        )
+        if (
+            payload.action_choices_enabled
+            and isinstance(action_choices, dict)
+            and isinstance(save_id, str)
+            and isinstance(narrator_message_id, str)
+        ):
+            try:
+                action_choices["generation_job"] = (
+                    await _create_action_choice_job_summary(
+                        state,
+                        save_id=save_id,
+                        narrator_message_id=narrator_message_id,
+                        current_user_id=current_user_id,
+                        job_type="action_choice_generate",
+                        progress_label="Generating action choices",
+                    )
+                )
+            except HTTPException as exc:
+                action_choices["generation_error"] = str(exc.detail)
         return payload_dict
 
     @app.post("/api/scenarios/draft/character-starters/generate")
@@ -3481,28 +3513,62 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             if not status["can_submit"]:
                 raise HTTPException(status_code=409, detail=_CHAT_TURN_ACTIVE_DETAIL)
 
+        return await _create_action_choice_job_summary(
+            state,
+            save_id=action_save_id,
+            narrator_message_id=payload.message_id,
+            current_user_id=_owner_user_id_for_request(state),
+            job_type="action_choice_regenerate",
+            progress_label="Regenerating options",
+        )
+
+
+    async def _create_action_choice_job_summary(
+        state: WebAppState,
+        *,
+        save_id: str,
+        narrator_message_id: str,
+        current_user_id: str | None,
+        job_type: str,
+        progress_label: str,
+    ) -> dict[str, Any]:
         async def worker(handle: JobHandle) -> Any:
-            await handle.event("progress", {"label": "Regenerating options"})
+            await handle.event("progress", {"label": progress_label})
+            retry_callback, flush_retry_progress = _retry_progress_callback(
+                handle,
+                task_label="action choices",
+            )
             regenerate = state.runtime.regenerate_action_choices
             regenerate_kwargs: dict[str, object] = {
-                "narrator_message_id": payload.message_id,
-                "active_save_id": action_save_id,
+                "narrator_message_id": narrator_message_id,
+                "active_save_id": save_id,
             }
             if _call_accepts_keyword(regenerate, "current_user_id"):
-                regenerate_kwargs["current_user_id"] = _owner_user_id_for_request(state)
-            result = await regenerate(**regenerate_kwargs)
+                regenerate_kwargs["current_user_id"] = current_user_id
+            if _call_accepts_keyword(regenerate, "retry_progress_callback"):
+                regenerate_kwargs["retry_progress_callback"] = retry_callback
+            try:
+                result = await regenerate(**regenerate_kwargs)
+            finally:
+                await flush_retry_progress()
             error = _runtime_model_error(result)
             if error:
                 raise RuntimeError(error)
+            payload_dict = _runtime_json_dict(state, result)
+            _publish_runtime_changed_from_model_result(
+                state,
+                payload_dict,
+                reason="action_choices",
+            )
             return result
 
         return await _create_job_summary(
             state,
-            "action_choice_regenerate",
+            job_type,
             worker,
-            save_id=action_save_id,
-            exclusive_key=_chat_turn_exclusive_key(action_save_id),
-            operation_queue_key=action_save_id,
+            save_id=save_id,
+            exclusive_key=_chat_turn_exclusive_key(save_id),
+            operation_queue_key=save_id,
         )
 
     @app.get("/api/messages/{message_id}/scene-presence")

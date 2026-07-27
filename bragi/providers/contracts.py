@@ -346,6 +346,11 @@ class StructuredOutputRequest:
     reasoning: ChatReasoningConfig | None = None
     openrouter_provider_routing: dict[str, Any] | None = None
     openrouter_app_title: str | None = None
+    retry_progress_callback: ProviderRetryProgressCallback | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(

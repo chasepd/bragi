@@ -772,6 +772,55 @@ def test_save_action_choice_scenario_draft_returns_opening_action_choices(
     assert _value(model, "error") is None
 
 
+def test_save_action_choice_scenario_draft_can_defer_opening_action_choices(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    provider = RuntimeActionChoiceProvider()
+    repositories.set_model_preference(
+        task=CHARACTER_ACTION_PLANNING_TASK,
+        provider="fake",
+        model_id="fake-chat",
+    )
+    _save_fake_provider_model(
+        repositories,
+        model_id="fake-chat",
+        capabilities=["chat", "structured_output"],
+    )
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        providers={"fake": provider},
+    )
+
+    model = asyncio.run(
+        controller.save_scenario_draft(
+            scenario_type="full_roleplay",
+            sections=_reviewed_cyoa_sections(),
+            action_choices_enabled=True,
+            save_title="Reviewed Library",
+            source_metadata=None,
+            defer_opening_action_choices=True,
+        )
+    )
+
+    save_id = _value(model, "active_save_id")
+    narrator = next(
+        message
+        for message in repositories.list_messages(save_id)
+        if message.role == "narrator"
+    )
+    choices = _value(model, "action_choices")
+    assert _value(choices, "narrator_message_id") == narrator.id
+    assert _value(choices, "choices") == ()
+    assert repositories.latest_message_action_choices(save_id) == []
+    assert provider.structured_requests == []
+    assert _value(model, "error") is None
+
+
 def test_start_saved_action_choice_scenario_returns_opening_action_choices(
     repositories: PersistenceRepositories,
     tmp_path: Path,

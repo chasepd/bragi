@@ -494,6 +494,7 @@ class VeniceClient:
             lambda: self._request_structured_output(payload),
             provider=self.provider_name,
             task="structured_output",
+            retry_progress_callback=request.retry_progress_callback,
         )
         raw_metadata = dict(response)
         data = raw_metadata.pop(_STRUCTURED_DATA_METADATA_KEY)

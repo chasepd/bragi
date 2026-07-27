@@ -2826,6 +2826,7 @@ function Workbench({
   const [saveSelectionError, setSaveSelectionError] = useState("");
   const [pendingMessage, setPendingMessage] = useState<PendingChronicleMessage | null>(null);
   const [pendingNarratorMessage, setPendingNarratorMessage] = useState<PendingChronicleMessage | null>(null);
+  const [actionChoiceGenerationError, setActionChoiceGenerationError] = useState("");
   const [layout, setLayout] = useState<WorkbenchLayout>(loadWorkbenchLayout);
   const [resizingSide, setResizingSide] = useState<ResizeSide | null>(null);
   const layoutDrag = useRef<{ side: ResizeSide; startX: number; startLayout: WorkbenchLayout } | null>(null);
@@ -3309,6 +3310,44 @@ function Workbench({
     }
   }, [activeJobs.data?.jobs, runJob]);
 
+  const openingActionChoiceJob = model?.action_choices?.generation_job;
+  useEffect(() => {
+    if (
+      !openingActionChoiceJob
+      || !["queued", "running"].includes(openingActionChoiceJob.status)
+    ) {
+      return;
+    }
+    return runJob(openingActionChoiceJob, {
+      onFailed: (error) => {
+        setActionChoiceGenerationError(error);
+        client.setQueryData<RuntimeModel>(
+          runtimeQueryKey(openingActionChoiceJob.save_id ?? activeSaveIdRef.current),
+          (current) => {
+            if (
+              !current?.action_choices
+              || current.action_choices.generation_job?.id !== openingActionChoiceJob.id
+            ) {
+              return current;
+            }
+            return {
+              ...current,
+              action_choices: {
+                ...current.action_choices,
+                generation_job: null,
+                generation_error: error
+              }
+            };
+          }
+        );
+      }
+    });
+  }, [client, openingActionChoiceJob?.id, openingActionChoiceJob?.status, runJob]);
+
+  useEffect(() => {
+    setActionChoiceGenerationError(model?.action_choices?.generation_error ?? "");
+  }, [activeSaveId, model?.action_choices?.narrator_message_id]);
+
   useEffect(() => {
     setTrackedJobs((current) => {
       const next: Record<string, TrackedJob> = {};
@@ -3359,6 +3398,9 @@ function Workbench({
     .filter((tracked) => jobBelongsToActiveSave(tracked.job, activeSaveId))
     .filter((tracked) => tracked.job.type !== "character_text_send")
     .sort((left, right) => (left.job.created_at ?? 0) - (right.job.created_at ?? 0));
+  const actionChoiceGenerationJob = pendingJobs.find(
+    ({ job }) => job.type === "action_choice_generate"
+  );
   const activeSaveChatBlockers = pendingJobs.filter(({ job }) => jobBlocksChatSubmission(job, activeSaveId));
   const backendChatBlocker = chatSubmissionStatus.data?.blocking_job_id
     ? pendingJobs.find((tracked) => tracked.job.id === chatSubmissionStatus.data?.blocking_job_id && isChatJobType(tracked.job.type))
@@ -3562,6 +3604,8 @@ function Workbench({
             runJob={runJob}
             activeSaveId={activeSaveId}
             actionChoices={model?.action_choices ?? null}
+            generationStatus={actionChoiceGenerationJob?.progress}
+            generationError={actionChoiceGenerationError}
             pendingAfterMessageId={pendingAfterMessageId}
             onPendingMessage={setPendingMessage}
           />
@@ -6541,6 +6585,8 @@ function CyoaActionPicker({
   runJob,
   activeSaveId,
   actionChoices,
+  generationStatus = "",
+  generationError = "",
   pendingAfterMessageId = null,
   onPendingMessage
 }: {
@@ -6548,6 +6594,8 @@ function CyoaActionPicker({
   runJob: RunJob;
   activeSaveId: string | null;
   actionChoices: RuntimeModel["action_choices"];
+  generationStatus?: string;
+  generationError?: string;
   pendingAfterMessageId?: string | null;
   onPendingMessage: (message: PendingChronicleMessage | null) => void;
 }) {
@@ -6601,10 +6649,19 @@ function CyoaActionPicker({
   }, [activeSaveId, actionChoices?.narrator_message_id]);
 
   const choices = [...(actionChoices?.choices ?? [])].sort((left, right) => left.ordinal - right.ordinal);
+  const embeddedGenerationActive = Boolean(
+    actionChoices?.generation_job
+    && ["queued", "running"].includes(actionChoices.generation_job.status)
+  );
+  const generationActive = embeddedGenerationActive || Boolean(generationStatus);
+  const displayedGenerationStatus = generationStatus || (
+    embeddedGenerationActive ? "Generating action choices..." : ""
+  );
+  const displayedGenerationError = generationError || actionChoices?.generation_error || "";
   const submitBusy = submittingSaveId === activeSaveId || submittingSaveIdRef.current === activeSaveId;
   const regenerateBusy = regenerate.isPending;
-  const canSubmit = !disabled && !submitBusy;
-  const canRegenerate = !disabled && !submitBusy && !regenerateBusy && Boolean(activeSaveId && actionChoices?.narrator_message_id);
+  const canSubmit = !disabled && !submitBusy && !generationActive;
+  const canRegenerate = !disabled && !submitBusy && !regenerateBusy && !generationActive && Boolean(activeSaveId && actionChoices?.narrator_message_id);
   const submitBody = (body: string) => {
     const submittedBody = body.trim();
     if (!canSubmit || !submittedBody) return;
@@ -6626,6 +6683,11 @@ function CyoaActionPicker({
 
   return (
     <section className="cyoa-picker" aria-label="Choose your next action">
+      {displayedGenerationStatus ? (
+        <p className="muted" role="status" aria-live="polite">
+          {displayedGenerationStatus}
+        </p>
+      ) : null}
       <ol className="cyoa-choice-list" aria-label="Generated actions" role="list">
         {choices.map((choice, index) => (
           <li key={choice.choice_id} className="cyoa-choice-item" role="listitem">
@@ -6646,7 +6708,7 @@ function CyoaActionPicker({
           <button
             type="button"
             className="cyoa-custom-toggle"
-            disabled={disabled || submitBusy}
+            disabled={disabled || submitBusy || generationActive}
             title="Write your own"
             aria-label="Write your own"
             aria-expanded={manualOpen}
@@ -6689,6 +6751,7 @@ function CyoaActionPicker({
           </button>
         ) : null}
       </div>
+      {displayedGenerationError ? <InlineNotice className="composer-error">{displayedGenerationError}</InlineNotice> : null}
       {submitError ? <InlineNotice className="composer-error">{submitError}</InlineNotice> : null}
     </section>
   );
@@ -9141,6 +9204,7 @@ function jobTypeLabel(type: string) {
     chat_turn: "Chat turn",
     look_around: "Looking around",
     chat_regenerate: "Regenerating message",
+    action_choice_generate: "Generating action choices",
     action_choice_regenerate: "Regenerating options",
     character_text_send: "Sending text",
     character_text_message_edit: "Editing text",
@@ -9178,6 +9242,7 @@ function isChatJobType(type: string) {
   return type === "chat_turn"
     || type === "look_around"
     || type === "chat_regenerate"
+    || type === "action_choice_generate"
     || type === "action_choice_regenerate"
     || type === "chat_edit"
     || type === "message_edit"
