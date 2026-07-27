@@ -14228,7 +14228,7 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
-        context_window=1300,
+        context_window=2600,
     )
     repositories.save_provider_model(
         provider="venice",
@@ -14248,9 +14248,12 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
         model_id="venice/fallback-chat",
     )
     repositories.set_app_setting("chat_fallback_enabled", True)
+    selected_state_text = (
+        "beacon.fuse: The spare fuse is under the red lens. "
+        + "The fuse remains relevant to the active beacon repair. " * 40
+    )
     selected_state = (
-        "[world_state:state-lens-fuse] "
-        "beacon.fuse: The spare fuse is under the red lens."
+        "[world_state:state-lens-fuse] " + selected_state_text
     )
     primary = StaticChatProvider("openrouter", " \n\t ")
     fallback = StaticChatProvider(
@@ -14266,7 +14269,7 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
                     SelectedContextItem(
                         source_type="world_state",
                         source_id="state-lens-fuse",
-                        text="beacon.fuse: The spare fuse is under the red lens.",
+                        text=selected_state_text,
                         relevance_note="The player is asking about the lens.",
                     ),
                 ),
@@ -14284,7 +14287,7 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
 
     assert primary.chat_requests[0].retrieved_state == ()
     primary_budget = primary.chat_requests[0].context_breakdown["final_prompt_budget"]
-    assert primary_budget["model_context_window"] == 1300
+    assert primary_budget["model_context_window"] == 2600
     assert primary_budget["trimmed"] is True
     assert fallback.chat_requests[0].retrieved_state == (selected_state,)
     fallback_budget = fallback.chat_requests[0].context_breakdown[
@@ -17613,7 +17616,7 @@ def test_submit_player_turn_final_prompt_budget_trims_baseline_before_retrieval(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
-        context_window=2200,
+        context_window=3000,
     )
     repositories.set_model_preference(
         task="chat",
@@ -17726,6 +17729,22 @@ def test_final_prompt_budget_can_trim_phone_context() -> None:
     assert "phone_context" in trimmed_sections
 
 
+def test_final_prompt_budget_rejects_irreducible_overflow() -> None:
+    with pytest.raises(ProviderError) as exc_info:
+        chat_service_module._apply_final_prompt_budget(
+            ChatRequest(
+                provider="fake",
+                model_id="tiny-chat",
+                messages=(ChatMessage(role="player", body="界" * 500),),
+                max_output_tokens=64,
+            ),
+            model_context_window=128,
+        )
+
+    assert exc_info.value.category == ProviderErrorCategory.CONTEXT_LIMIT_EXCEEDED
+    assert exc_info.value.diagnostics["still_over_budget"] is True
+
+
 def test_submit_player_turn_final_prompt_budget_trims_selected_retrieval(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -17742,7 +17761,7 @@ def test_submit_player_turn_final_prompt_budget_trims_selected_retrieval(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
-        context_window=1500,
+        context_window=3000,
     )
     repositories.set_model_preference(
         task="chat",
@@ -18488,7 +18507,7 @@ def test_submit_player_turn_counts_pending_player_message_for_summary_pressure(
         model_id="fake-chat",
         display_name="Fake Chat",
         capabilities=["chat"],
-        context_window=200,
+        context_window=3000,
     )
     repositories.set_model_preference(
         task="chat",
@@ -18517,7 +18536,7 @@ def test_submit_player_turn_counts_pending_player_message_for_summary_pressure(
         summary_service=SummaryService(
             repositories=repositories,
             providers={"fake-summary": summary_provider},
-            threshold=0.75,
+            threshold=0.03,
         ),
     )
 

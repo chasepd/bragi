@@ -12,6 +12,7 @@ from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     ChatMessage,
+    ChatPromptPurpose,
     ChatRequest,
     ChatResponse,
     ImageRequest,
@@ -337,6 +338,52 @@ def test_chat_with_fallback_failure_reports_attempted_fallback(
     assert fields["fallback_attempted"] is True
     assert fields["fallback_provider"] == "fallback"
     assert fields["fallback_model_id"] == "fallback-chat"
+
+
+def test_chat_fallback_rebudgets_against_fallback_model_window(
+    repositories: PersistenceRepositories,
+) -> None:
+    _configure_working_chat_fallback(repositories)
+    repositories.save_provider_model(
+        provider="primary",
+        model_id="primary-chat",
+        display_name="Primary Chat",
+        capabilities=["chat"],
+        context_window=100,
+    )
+    repositories.save_provider_model(
+        provider="fallback",
+        model_id="fallback-chat",
+        display_name="Fallback Chat",
+        capabilities=["chat"],
+        context_window=4096,
+    )
+    primary = RecordingChatProvider(provider_name="primary")
+    fallback = RecordingChatProvider(
+        provider_name="fallback",
+        response_body="A concise summary.",
+    )
+
+    response = asyncio.run(
+        chat_with_fallback(
+            repositories=repositories,
+            providers={"primary": primary, "fallback": fallback},
+            request=ChatRequest(
+                provider="primary",
+                model_id="primary-chat",
+                prompt_purpose=ChatPromptPurpose.SUMMARY,
+                messages=(ChatMessage(role="user", body="界" * 300),),
+                max_output_tokens=64,
+            ),
+            task="summarization",
+            save_id="save-1",
+        )
+    )
+
+    assert primary.chat_requests == []
+    assert len(fallback.chat_requests) == 1
+    assert fallback.chat_requests[0].model_id == "fallback-chat"
+    assert response.body == "A concise summary."
 
 
 def test_chat_with_fallback_blank_primary_failure_reports_attempted_fallback(

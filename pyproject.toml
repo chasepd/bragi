@@ -15,6 +15,7 @@ authors = [{ name = "Bragi contributors" }]
 dependencies = [
   "argon2-cffi>=25.1",
   "fastapi>=0.111",
+  "jsonschema>=4.23",
   "keyring>=25",
   "python-multipart>=0.0.31",
   "uvicorn[standard]>=0.30",
@@ -31,6 +32,7 @@ dev = [
   "pytest-xdist>=3.8.0",
   "ruff>=0.5",
   "setuptools>=77",
+  "types-jsonschema>=4.23",
   "wheel>=0.43",
 ]
 

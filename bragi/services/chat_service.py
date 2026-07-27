@@ -8588,6 +8588,15 @@ def _apply_final_prompt_budget(
             }
         )
         request = trimmed_request
+    if diagnostics["still_over_budget"] is True:
+        raise ProviderError(
+            category=ProviderErrorCategory.CONTEXT_LIMIT_EXCEEDED,
+            message=(
+                "Narrator core context cannot fit the selected model after "
+                "optional context trimming and output reservation"
+            ),
+            diagnostics=diagnostics,
+        )
     return _request_with_final_prompt_diagnostics(request, diagnostics)
 
 

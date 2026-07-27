@@ -1311,13 +1311,22 @@ async def _recover_context_structured_selection(
     save_id: str | None,
     primary_error: Exception | None,
 ) -> _ContextSelectionOutcome:
-    fallback_request = structured_output_fallback_request(
-        repositories=repositories,
-        providers=providers,
-        request=request,
-        save_id=save_id,
-        task="context_search",
-    )
+    try:
+        fallback_request = structured_output_fallback_request(
+            repositories=repositories,
+            providers=providers,
+            request=request,
+            save_id=save_id,
+            task="context_search",
+        )
+    except ProviderError as exc:
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=request.provider,
+            primary_model_id=request.model_id,
+            fallback_skipped_reason="fallback_request_over_budget",
+            exc=exc,
+        )
     if fallback_request is None:
         reason = structured_output_fallback_skip_reason(
             repositories=repositories,

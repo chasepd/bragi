@@ -17,6 +17,7 @@ class ProviderErrorCategory(StrEnum):
     PROVIDER_ERROR = "provider_error"
     IMAGE_GENERATION_FAILED = "image_generation_failed"
     CONTENT_BLOCKED = "content_blocked"
+    STRUCTURED_OUTPUT_INVALID = "structured_output_invalid"
 
 
 @dataclass
