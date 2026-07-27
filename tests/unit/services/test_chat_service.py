@@ -9235,7 +9235,9 @@ def test_submit_player_turn_omits_latest_summary_blocked_for_active_npc(
         )
     )
 
-    assert provider.chat_requests[0].summary is None
+    request = provider.chat_requests[0]
+    assert request.summary is None
+    assert summary.body not in request.scenario_instructions
 
 
 def test_submit_player_turn_does_not_include_summary_for_absent_mention(
@@ -9310,7 +9312,9 @@ def test_submit_player_turn_does_not_include_summary_for_absent_mention(
         )
     )
 
-    assert provider.chat_requests[0].summary is None
+    request = provider.chat_requests[0]
+    assert request.summary is None
+    assert summary.body not in request.scenario_instructions
 
 
 @pytest.mark.parametrize(
@@ -18604,6 +18608,14 @@ def test_submit_player_turn_excludes_summary_covering_hidden_message(
         provider="fake",
         model="fake-summary",
     )
+    repositories.add_entity_link(
+        save_id=save.id,
+        entity_type="character",
+        entity_id=character.id,
+        target_type="summary",
+        target_id=summary.id,
+        relation="related",
+    )
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
@@ -18635,7 +18647,9 @@ def test_submit_player_turn_excludes_summary_covering_hidden_message(
         )
     )
 
-    assert provider.chat_requests[0].summary is None
+    request = provider.chat_requests[0]
+    assert request.summary is None
+    assert summary.body not in request.scenario_instructions
 
 
 def test_submit_player_turn_summarizes_before_context_search_and_keeps_context_separate(

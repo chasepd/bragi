@@ -9340,6 +9340,20 @@ def _budgeted_narrator_context(
         if narration_snapshot is not None
         else repositories.get_scene_snapshot(save_id)
     )
+    summary_records = (
+        tuple(narration_snapshot.summaries)
+        if narration_snapshot is not None
+        else tuple(repositories.list_summaries(save_id))
+    )
+    visible_summary_records = tuple(
+        summary
+        for summary in summary_records
+        if _summary_visible_to_present_characters(
+            repositories=repositories,
+            summary=summary,
+            scene_snapshot=snapshot,
+        )
+    )
     deterministic_sources = deterministic_context_sources(
         repositories=repositories,
         save_id=save_id,
@@ -9377,9 +9391,7 @@ def _budgeted_narrator_context(
         world_state=(
             narration_snapshot.world_state if narration_snapshot is not None else None
         ),
-        summaries=(
-            narration_snapshot.summaries if narration_snapshot is not None else None
-        ),
+        summaries=visible_summary_records,
     )
     pre_turn_hint_sources = pre_turn_scene_hint_sources(
         repositories=repositories,
@@ -9457,20 +9469,6 @@ def _budgeted_narrator_context(
     suppressed_duplicate_keys = _suppressed_duplicate_retrieval_keys(
         context_result,
         suppressed_keys=deterministic_source_keys,
-    )
-    summary_records = (
-        tuple(narration_snapshot.summaries)
-        if narration_snapshot is not None
-        else tuple(repositories.list_summaries(save_id))
-    )
-    visible_summary_records = tuple(
-        summary
-        for summary in summary_records
-        if _summary_visible_to_present_characters(
-            repositories=repositories,
-            summary=summary,
-            scene_snapshot=snapshot,
-        )
     )
     visible_summary_ids = {summary.id for summary in visible_summary_records}
     visible_selected_summaries = tuple(
