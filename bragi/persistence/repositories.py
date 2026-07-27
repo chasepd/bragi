@@ -2222,6 +2222,32 @@ class PersistenceRepositories:
         )
         return [MessageRecord(**dict(row)) for row in rows]
 
+    def list_messages_by_ids(
+        self,
+        save_id: str,
+        message_ids: Iterable[str],
+        *,
+        include_deleted: bool = False,
+    ) -> list[MessageRecord]:
+        ids = list(dict.fromkeys(message_ids))
+        if not ids:
+            return []
+        deleted_filter = "" if include_deleted else "AND deleted_at IS NULL"
+        rows = self._fetch_all(
+            f"""
+            SELECT id, save_id, role, body, speaker_name, provider, model,
+                   token_estimate, deleted_at, created_at, updated_at,
+                   safety_transition, content_rating
+            FROM messages
+            WHERE save_id = ?
+              AND id IN ({_placeholders(len(ids))})
+              {deleted_filter}
+            ORDER BY rowid
+            """,
+            (save_id, *ids),
+        )
+        return [MessageRecord(**dict(row)) for row in rows]
+
     def count_active_messages_by_role(
         self,
         save_id: str,
@@ -3435,11 +3461,21 @@ class PersistenceRepositories:
                   curation.lease_until IS NULL
                   OR curation.lease_until <= CURRENT_TIMESTAMP
               )
+              AND (
+                  scheduled.id IS NULL
+                  OR (
+                      scheduled.enabled = 1
+                      AND scheduled.next_run_at <= CURRENT_TIMESTAMP
+                      AND (
+                          scheduled.lease_until IS NULL
+                          OR scheduled.lease_until <= CURRENT_TIMESTAMP
+                      )
+                  )
+              )
             GROUP BY observation.save_id
             ORDER BY
-                CASE WHEN MAX(scheduled.last_completed_at) IS NULL
-                    THEN 0 ELSE 1 END,
-                MAX(scheduled.last_completed_at),
+                CASE WHEN MAX(scheduled.id) IS NULL THEN 0 ELSE 1 END,
+                MAX(scheduled.updated_at),
                 MIN(observation.created_at),
                 MIN(observation.rowid)
             LIMIT ? OFFSET ?

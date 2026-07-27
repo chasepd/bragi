@@ -2006,8 +2006,19 @@ def _curation_source_texts_by_observation(
             )
             for observation in observations
         }
+    source_message_ids = tuple(
+        dict.fromkeys(
+            source_message_id
+            for observation in observations
+            for source_message_id in observation.source_message_ids
+        )
+    )
     messages_by_id = {
-        message.id: message.body for message in repositories.list_messages(save_id)
+        message.id: message.body
+        for message in repositories.list_messages_by_ids(
+            save_id,
+            source_message_ids,
+        )
     }
     texts_by_observation: dict[str, tuple[str, ...]] = {}
     for observation in observations:

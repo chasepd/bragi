@@ -371,6 +371,7 @@ class WebMaintenanceScheduler:
                 worker,
                 save_id=save_id,
                 exclusive_key=_task_exclusive_key(definition.task_type, save_id),
+                operation_queue_key=save_id,
             )
         except JobRegistryExclusiveKeyError as exc:
             self._state.repositories.complete_scheduled_task(
@@ -483,22 +484,12 @@ def _task_target_save_ids(
             None,
         )
         if callable(list_due_curation):
-            runnable_save_ids: list[str] = []
-            offset = 0
-            while True:
-                page = tuple(
-                    list_due_curation(
-                        limit=_DUE_ROUTINE_TARGET_LIMIT,
-                        offset=offset,
-                    )
+            return tuple(
+                list_due_curation(
+                    limit=_DUE_ROUTINE_TARGET_LIMIT,
+                    offset=0,
                 )
-                if not page:
-                    break
-                for save_id in page:
-                    if _observation_curation_drain_due(repositories, save_id):
-                        _append_unique_save_id(runnable_save_ids, save_id)
-                offset += len(page)
-            return tuple(runnable_save_ids)
+            )
     retry_job_type = _RETRY_DRAIN_JOB_TYPES.get(definition.task_type)
     if retry_job_type is not None:
         return _save_ids_with_queued_jobs(repositories, job_type=retry_job_type)
@@ -1025,6 +1016,7 @@ _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
         runtime_method="run_observation_curation",
         event_reason="observation_curation",
         should_schedule=_observation_curation_drain_due,
+        cache_policy_checks=True,
     ),
     _MaintenanceTaskDefinition(
         task_type=CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_TASK,

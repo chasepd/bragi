@@ -1868,6 +1868,45 @@ def test_repositories_persist_context_observations_with_source_evidence(
     }
 
 
+def test_repositories_list_messages_by_ids_is_save_scoped(
+    repositories: PersistenceRepositories,
+) -> None:
+    first_scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    first_save = repositories.create_save(
+        scenario_id=first_scenario.id,
+        title="Night Watch",
+    )
+    first_message = repositories.append_message(
+        save_id=first_save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I mark the eastern signal code in my notebook.",
+    )
+    second_save = repositories.create_save(
+        scenario_id=first_scenario.id,
+        title="Dawn Watch",
+    )
+    second_message = repositories.append_message(
+        save_id=second_save.id,
+        role="player",
+        speaker_name="Tarin",
+        body="I inspect the western gate.",
+    )
+
+    messages = repositories.list_messages_by_ids(
+        first_save.id,
+        (first_message.id, second_message.id, first_message.id),
+    )
+
+    assert messages == [first_message]
+
+
 def test_repositories_claim_context_observations_in_bounded_fifo_batches(
     repositories: PersistenceRepositories,
 ) -> None:

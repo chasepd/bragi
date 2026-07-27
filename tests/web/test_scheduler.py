@@ -754,6 +754,111 @@ def test_scheduler_drains_observation_curation_for_inactive_save(
     assert task.payload["active_save_only"] is False
 
 
+def test_scheduler_serializes_maintenance_tasks_selected_for_same_save(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_id = _save(repositories, title="Busy Save")
+    repositories.set_model_preference(
+        task="memory_curation",
+        provider="fake",
+        model_id="fake-curator",
+    )
+    repositories.set_model_preference(
+        task="context_update",
+        provider="fake",
+        model_id="fake-context",
+    )
+    repositories.add_context_observation(
+        save_id=save_id,
+        observation_type="event",
+        claim="The beacon was relit.",
+        evidence_quote="The beacon was relit.",
+        source_message_ids=[],
+        scope="durable",
+        confidence=0.9,
+    )
+    for index in range(MEMORY_CONSOLIDATION_THRESHOLD):
+        repositories.add_memory(
+            save_id=save_id,
+            body=f"Memory {index}",
+            tags=["test"],
+        )
+    runtime = _ReviewRuntime(active_save_id=save_id)
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.observation_curation_calls == [save_id]
+    assert runtime.memory_consolidation_calls == [save_id]
+    task_job_ids = [
+        task.last_job_id
+        for task_type in (OBSERVATION_CURATION_DRAIN_TASK, MEMORY_CONSOLIDATION_TASK)
+        if (
+            task := repositories.get_scheduled_task(
+                task_type=task_type,
+                save_id=save_id,
+            )
+        )
+        is not None
+    ]
+    assert len(task_job_ids) == 2
+    jobs = [state.jobs.get(job_id) for job_id in task_job_ids if job_id is not None]
+    assert len(jobs) == 2
+    assert all(job is not None and job.operation_queue_key == save_id for job in jobs)
+
+
+def test_scheduler_bounds_observation_curation_discovery_per_poll(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_ids = [_save(repositories, title=f"Backlog {index}") for index in range(25)]
+    for index, save_id in enumerate(save_ids):
+        repositories.add_context_observation(
+            save_id=save_id,
+            observation_type="event",
+            claim=f"Observation {index}",
+            evidence_quote=f"Observation {index}",
+            source_message_ids=[],
+            scope="durable",
+            confidence=0.9,
+        )
+    discovery_calls: list[tuple[int, int]] = []
+    original_list_due = (
+        repositories.list_save_ids_with_due_context_observation_curation
+    )
+
+    def record_list_due(*, limit: int, offset: int = 0) -> list[str]:
+        discovery_calls.append((limit, offset))
+        return original_list_due(limit=limit, offset=offset)
+
+    repositories.list_save_ids_with_due_context_observation_curation = record_list_due  # type: ignore[method-assign]
+    runtime = _ReviewRuntime(active_save_id=save_ids[0])
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert discovery_calls == [(10, 0)]
+
+
 def test_scheduler_persists_only_metadata_for_curation_failures(
     tmp_path: Path,
 ) -> None:
@@ -837,8 +942,9 @@ def test_scheduler_skips_unconfigured_curation_backlogs_without_starvation(
             poll_interval_seconds=999,
             startup_delay_seconds=0,
         )
-        await scheduler.run_once()
-        await _wait_for_jobs_to_finish(state.jobs)
+        for _ in range(2):
+            await scheduler.run_once()
+            await _wait_for_jobs_to_finish(state.jobs)
 
     asyncio.run(run())
 

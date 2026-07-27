@@ -1266,6 +1266,59 @@ def test_context_curation_discards_observations_with_missing_source_message(
     assert updated.status == "discarded"
 
 
+def test_context_curation_reads_only_referenced_source_messages(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _seed_save(repositories)
+    player, _narrator = repositories.list_messages(save.id)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara wants grounded narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+        tags=["tone"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "Stable narrator preference.",
+                        "confidence": 0.88,
+                        "memory_body": "Mara wants grounded narration.",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                    }
+                ]
+            }
+        }
+    )
+
+    def fail_full_chronicle_scan(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("curation must not scan the full chronicle")
+
+    monkeypatch.setattr(repositories, "list_messages", fail_full_chronicle_scan)
+    result = asyncio.run(
+        ContextCurationService(
+            repositories=repositories,
+            curator=StructuredProviderContextCurator(
+                provider=provider,
+                provider_name=provider.provider_name,
+                model_id="curator",
+            ),
+        ).curate_pending(save.id)
+    )
+
+    assert result.accepted_count == 1
+
+
 def test_context_curation_queues_durable_memory_when_confirmation_enabled(
     repositories: PersistenceRepositories,
 ) -> None:

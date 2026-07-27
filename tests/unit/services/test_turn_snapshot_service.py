@@ -251,7 +251,7 @@ def test_snapshot_restores_curation_progress_without_reviving_worker_lease(
 
     state = repositories.get_context_observation_curation_state(observation.id)
     assert state is not None
-    assert state.attempt_count == 1
+    assert state.attempt_count == 0
     assert state.lease_token is None
     assert state.lease_until is None
     assert state.last_error is None
@@ -262,20 +262,34 @@ def test_imported_snapshot_rows_clear_curation_worker_lease() -> None:
     sanitized = _sanitize_snapshot_rows_for_safety(
         {
             "messages": (),
-            "context_observations": ({"id": "observation-1"},),
+            "context_observations": (
+                {"id": "observation-1"},
+                {"id": "observation-2"},
+            ),
             "context_observation_curation_state": (
                 {
                     "observation_id": "observation-1",
+                    "attempt_count": 5,
                     "lease_token": "crafted-worker-token",
                     "lease_until": "2999-01-01 00:00:00",
+                },
+                {
+                    "observation_id": "observation-2",
+                    "attempt_count": 5,
+                    "lease_token": "expired-worker-token",
+                    "lease_until": "2000-01-01 00:00:00",
                 },
             ),
         }
     )
 
-    [state] = sanitized["context_observation_curation_state"]
-    assert state["lease_token"] is None
-    assert state["lease_until"] is None
+    live_state, expired_state = sanitized["context_observation_curation_state"]
+    assert live_state["attempt_count"] == 4
+    assert live_state["lease_token"] is None
+    assert live_state["lease_until"] is None
+    assert expired_state["attempt_count"] == 5
+    assert expired_state["lease_token"] is None
+    assert expired_state["lease_until"] is None
 
 
 def test_restore_rolls_back_when_snapshot_row_insert_fails(

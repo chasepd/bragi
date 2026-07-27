@@ -156,6 +156,43 @@ def test_export_save_writes_manifest_data_and_referenced_media(
         assert curation_state["lease_until"] is None
 
 
+def test_export_save_refunds_live_curation_attempt_when_clearing_lease(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The beacon was relit.",
+        evidence_quote="The beacon was relit.",
+        source_message_ids=[NARRATOR_MESSAGE_ID],
+        scope="durable",
+        confidence=0.9,
+    )
+    claimed = repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="export-worker-secret",
+        lease_seconds=600,
+    )
+    assert [row.id for row in claimed] == [observation.id]
+    bundle_path = tmp_path / "exports" / "night-watch.bragi-chat"
+
+    _chat_bundle_service(repositories, media_dir).export_save(save.id, bundle_path)
+
+    with zipfile.ZipFile(bundle_path) as bundle:
+        data = json.loads(bundle.read("data.json"))
+    [state] = [
+        row
+        for row in data["context_observation_curation_states"]
+        if row["observation_id"] == observation.id
+    ]
+    assert state["attempt_count"] == 0
+    assert state["lease_token"] is None
+    assert state["lease_until"] is None
+
+
 def test_export_save_uses_consistent_read_snapshot(
     repositories: PersistenceRepositories,
     tmp_path: Path,
