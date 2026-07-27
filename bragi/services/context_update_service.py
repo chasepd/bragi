@@ -12,6 +12,7 @@ from typing import Any, Protocol, cast
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
 from bragi.content_rating_instructions import maximum_content_rating
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import (
     ActiveThreadRecord,
     CharacterRecord,
@@ -4328,9 +4329,15 @@ class _ContextUpdateApplier:
         default_factory=set
     )
     snapshot: _SaveWorldDataSnapshot = field(init=False)
+    storyteller_mode: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.snapshot = _SaveWorldDataSnapshot.load(self.repositories, self.save_id)
+        save = self.repositories.get_save(self.save_id)
+        self.storyteller_mode = (
+            save is not None
+            and save.interaction_mode is InteractionMode.STORYTELLER
+        )
 
     def apply(self, extraction: ContextUpdateExtraction) -> None:
         confirm_new_characters = manual_character_registry_confirmation_enabled(
@@ -4370,8 +4377,9 @@ class _ContextUpdateApplier:
             self._apply_scene(extraction.scene)
         for link in extraction.entity_links:
             self._apply_entity_link(link)
-        for exchange in extraction.phone_number_exchanges:
-            self._apply_phone_number_exchange(exchange)
+        if not self.storyteller_mode:
+            for exchange in extraction.phone_number_exchanges:
+                self._apply_phone_number_exchange(exchange)
 
     def apply_world_data_enrichment(self, enrichment: WorldDataEnrichment) -> None:
         for location in enrichment.locations:
@@ -4535,7 +4543,11 @@ class _ContextUpdateApplier:
                 motivations=extracted.motivations.strip(),
                 current_intent=extracted.current_intent.strip(),
                 boundaries=extracted.boundaries.strip(),
-                attitude_toward_player=extracted.attitude_toward_player.strip(),
+                attitude_toward_player=(
+                    ""
+                    if self.storyteller_mode
+                    else extracted.attitude_toward_player.strip()
+                ),
                 cooperation_conditions=extracted.cooperation_conditions.strip(),
                 status=extracted.status.strip(),
                 location_id=location_id,
@@ -4578,10 +4590,6 @@ class _ContextUpdateApplier:
             ("current_intent", extracted.current_intent.strip()),
             ("boundaries", extracted.boundaries.strip()),
             (
-                "attitude_toward_player",
-                extracted.attitude_toward_player.strip(),
-            ),
-            (
                 "cooperation_conditions",
                 extracted.cooperation_conditions.strip(),
             ),
@@ -4589,6 +4597,13 @@ class _ContextUpdateApplier:
             ("location_id", location_id),
             ("private_notes", extracted.private_notes.strip()),
         ]
+        if not self.storyteller_mode:
+            field_values.append(
+                (
+                    "attitude_toward_player",
+                    extracted.attitude_toward_player.strip(),
+                )
+            )
         if extracted.met is not None:
             field_values.append(("met", extracted.met))
         for field_path, value in field_values:

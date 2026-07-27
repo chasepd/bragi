@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from bragi import __version__
 from bragi.app_logging import log_event
+from bragi.interaction_mode import normalize_interaction_mode
 from bragi.json_safety import JsonSafetyError, validate_json_structure
 from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION
@@ -331,7 +332,7 @@ class ChatBundleService:
             self.repositories.connection.execute(
                 """
                 SELECT id, scenario_id, title, active, created_at, updated_at,
-                       last_opened_at, custom_instructions
+                       last_opened_at, custom_instructions, interaction_mode
                 FROM saves
                 WHERE id = ?
                 """,
@@ -342,7 +343,8 @@ class ChatBundleService:
         scenario = _require_row(
             self.repositories.connection.execute(
                 """
-                SELECT id, type, title, premise, player_role, content_json,
+                SELECT id, type, title, premise, player_role, interaction_mode,
+                       content_json,
                        created_at, updated_at
                 FROM scenarios
                 WHERE id = ?
@@ -1187,6 +1189,9 @@ class ChatBundleService:
             premise=_text(scenario_data, "premise"),
             player_role=_text(scenario_data, "player_role"),
             content=scenario_content,
+            interaction_mode=normalize_interaction_mode(
+                _optional_text(scenario_data, "interaction_mode")
+            ),
         )
         scenario_id_map = {_text(scenario_data, "id"): scenario.id}
         save = self.repositories.create_save(
@@ -1194,6 +1199,9 @@ class ChatBundleService:
             title=_text(save_data, "title"),
             custom_instructions=_optional_text(save_data, "custom_instructions") or "",
             owner_user_id=owner_user_id,
+            interaction_mode=normalize_interaction_mode(
+                _optional_text(save_data, "interaction_mode")
+            ),
         )
         _apply_save_app_settings(
             self.repositories,

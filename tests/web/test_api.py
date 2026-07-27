@@ -11505,6 +11505,54 @@ def test_venice_character_routes_are_absent(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "path,payload",
+    [
+        (
+            "/api/scenarios/manual",
+            {
+                "scenario_type": "full_roleplay",
+                "title": "Invalid",
+                "premise": "Invalid",
+                "opening_message": "Invalid",
+            },
+        ),
+        (
+            "/api/scenarios/draft",
+            {"scenario_type": "full_roleplay", "seed": "Invalid"},
+        ),
+        (
+            "/api/scenarios/draft/save",
+            {"scenario_type": "full_roleplay", "sections": {"title": "Invalid"}},
+        ),
+        (
+            "/api/scenarios/draft/section",
+            {
+                "scenario_type": "full_roleplay",
+                "seed": "Invalid",
+                "section_id": "title",
+                "sections": {},
+            },
+        ),
+    ],
+)
+def test_scenario_creation_rejects_invalid_interaction_mode(
+    tmp_path: Path,
+    path: str,
+    payload: dict[str, object],
+) -> None:
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, _RuntimeDouble())))
+    ) as client:
+        response = client.post(
+            path,
+            json={**payload, "interaction_mode": "cinematic"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Unknown interaction mode: cinematic"
+
+
+@pytest.mark.parametrize(
     ("path", "payload"),
     [
         (

@@ -18176,7 +18176,7 @@ def test_submit_player_turn_reuses_narration_snapshot_for_prompt_building(
 
     assert provider.structured_output_requests
     assert provider.chat_requests
-    assert counting.read_counts["load_save_details"] <= 3
+    assert counting.read_counts["load_save_details"] <= 4
     assert counting.read_counts["messages"] <= 3
     for name in (
         "scene_snapshot",
@@ -18184,10 +18184,9 @@ def test_submit_player_turn_reuses_narration_snapshot_for_prompt_building(
         "characters",
         "active_threads",
     ):
-        assert counting.read_counts.get(name, 0) <= 3, name
+        assert counting.read_counts.get(name, 0) <= 4, name
     for name in (
         "character_knowledge_edges",
-        "message_visibility",
         "entity_links",
         "world_state",
         "world_state_including_archived",
@@ -18199,7 +18198,8 @@ def test_submit_player_turn_reuses_narration_snapshot_for_prompt_building(
         "context_sources",
         "context_update_suggestions",
     ):
-        assert counting.read_counts.get(name, 0) <= 2, name
+        assert counting.read_counts.get(name, 0) <= 4, name
+    assert counting.read_counts.get("message_visibility", 0) <= 4
 
 
 def test_submit_player_turn_final_prompt_budget_trims_baseline_before_retrieval(

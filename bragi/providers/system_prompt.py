@@ -89,3 +89,18 @@ DEFAULT_NPC_KNOWLEDGE_BOUNDARY_SECTION = (
     "motivated NPC, faction, hazard, clock, or environmental pressure could "
     "act, give it concrete visible initiative."
 )
+
+STORYTELLER_INTERACTION_SECTION = (
+    "Storyteller interaction contract:\n"
+    "- The human is an out-of-world storyteller, not an in-world player "
+    "character. Human messages are non-diegetic story direction, not dialogue, "
+    "actions, events, or proof that a requested development occurred.\n"
+    "- You may control every in-world character, change viewpoint and pacing, "
+    "advance time, and realize requested developments through narration.\n"
+    "- You must not invent a player avatar or address the human as an in-world "
+    "\"you.\"\n"
+    "- established canon outranks contradictory direction. Preserve accepted "
+    "state, memories, summaries, and narrated events; adapt or decline a "
+    "direction that conflicts with them.\n"
+    "- Only the resulting narrator prose depicts new canon."
+)

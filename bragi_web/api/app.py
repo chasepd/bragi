@@ -49,6 +49,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from bragi.interaction_mode import normalize_interaction_mode
 from bragi_common.media_mime import safe_served_media_mime_type
 from bragi_web.auth_throttle import AuthAttemptThrottle
 from bragi_web.bragi_adapter import (
@@ -330,6 +331,7 @@ class ScenarioDraftRequest(BaseModel):
     scenario_types: list[str] | None = None
     seed: str = ""
     action_choices_enabled: bool = False
+    interaction_mode: str = "roleplay"
 
 
 class SaveScenarioDraftRequest(BaseModel):
@@ -340,6 +342,7 @@ class SaveScenarioDraftRequest(BaseModel):
     action_choices_enabled: bool = False
     save_title: str = ""
     source_metadata: dict[str, object] | None = None
+    interaction_mode: str = "roleplay"
 
 
 class ScenarioDraftCharacterStarterGenerationRequest(BaseModel):
@@ -352,6 +355,7 @@ class ScenarioDraftCharacterStarterGenerationRequest(BaseModel):
     count: StrictInt | None = None
     custom_description: str = ""
     action_choices_enabled: bool = False
+    interaction_mode: str = "roleplay"
 
 
 class RegenerateScenarioSectionRequest(BaseModel):
@@ -361,6 +365,7 @@ class RegenerateScenarioSectionRequest(BaseModel):
     section_id: str
     sections: dict[str, str] = Field(default_factory=dict)
     action_choices_enabled: bool = False
+    interaction_mode: str = "roleplay"
 
 
 class ChatRequest(BaseModel):
@@ -2814,6 +2819,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             payload.get("scenario_type"),
             payload.get("scenario_types"),
         )
+        _raise_if_invalid_interaction_mode(payload.get("interaction_mode"))
         try:
             scenario = ManualScenarioInput(**payload)
         except TypeError as exc:
@@ -2920,6 +2926,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             payload.scenario_type,
             payload.scenario_types,
         )
+        _raise_if_invalid_interaction_mode(payload.interaction_mode)
         async with state.lock.async_access():
             current_user_id = _owner_user_id_for_request(state)
 
@@ -2938,6 +2945,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "current_user_id",
             ):
                 kwargs["current_user_id"] = current_user_id
+            if _call_accepts_keyword(
+                state.runtime.generate_scenario_draft,
+                "interaction_mode",
+            ):
+                kwargs["interaction_mode"] = payload.interaction_mode
             return await state.runtime.generate_scenario_draft(
                 scenario_type=payload.scenario_type,
                 seed=payload.seed,
@@ -2996,6 +3008,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             payload.scenario_type,
             payload.scenario_types,
         )
+        _raise_if_invalid_interaction_mode(payload.interaction_mode)
         async with state.lock.async_access():
             kwargs: dict[str, Any] = {}
             current_user_id = _owner_user_id_for_request(state)
@@ -3026,6 +3039,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "character_starters",
             ):
                 kwargs["character_starters"] = payload.character_starters
+            if _call_accepts_keyword(
+                state.runtime.save_scenario_draft,
+                "interaction_mode",
+            ):
+                kwargs["interaction_mode"] = payload.interaction_mode
             result = state.runtime.save_scenario_draft(
                 scenario_type=payload.scenario_type,
                 sections=payload.sections,
@@ -3055,6 +3073,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             payload.scenario_type,
             payload.scenario_types,
         )
+        _raise_if_invalid_interaction_mode(payload.interaction_mode)
         async with state.lock.async_access():
             current_user = _save_access_user(state)
             if current_user is not None and current_user.role == "child":
@@ -3084,6 +3103,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "action_choices_enabled",
             ):
                 kwargs["action_choices_enabled"] = payload.action_choices_enabled
+            if _call_accepts_keyword(
+                state.runtime.generate_scenario_draft_character_starters,
+                "interaction_mode",
+            ):
+                kwargs["interaction_mode"] = payload.interaction_mode
             return await state.runtime.generate_scenario_draft_character_starters(
                 scenario_type=payload.scenario_type,
                 sections=payload.sections,
@@ -3109,6 +3133,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             payload.scenario_type,
             payload.scenario_types,
         )
+        _raise_if_invalid_interaction_mode(payload.interaction_mode)
         async with state.lock.async_access():
             current_user_id = _owner_user_id_for_request(state)
 
@@ -3125,6 +3150,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "current_user_id",
             ):
                 kwargs["current_user_id"] = current_user_id
+            if _call_accepts_keyword(
+                state.runtime.regenerate_scenario_section,
+                "interaction_mode",
+            ):
+                kwargs["interaction_mode"] = payload.interaction_mode
             return await state.runtime.regenerate_scenario_section(
                 scenario_type=payload.scenario_type,
                 seed=payload.seed,
@@ -6542,6 +6572,13 @@ def _raise_if_retired_scenario_request(
         raise HTTPException(status_code=400, detail=_RETIRED_SCENARIO_DETAIL)
 
 
+def _raise_if_invalid_interaction_mode(value: object) -> None:
+    try:
+        normalize_interaction_mode(value if isinstance(value, str) else None)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _raise_unless_save_diagnostics_allowed(
     state: WebAppState,
     save_id: str,
@@ -9639,6 +9676,7 @@ def _scenario_edit_from_json(payload: object) -> ScenarioEdit:
         player_role=_string_field(payload, "player_role", "ScenarioEdit"),
         content=cast(dict[str, object], content),
         character_starters=character_starters,
+        interaction_mode=cast(str | None, payload.get("interaction_mode")),
     )
 
 

@@ -185,6 +185,9 @@ class ContinuationScenarioService:
             save_id,
             chapter_start_instructions=chapter_start_instructions,
         )
+        save = self.repositories.get_save(save_id)
+        if save is None:
+            raise ValueError(f"Unknown save id: {save_id}")
         source_type = _text(snapshot.metadata.get("source_scenario_type"))
         section_ids: tuple[str, ...]
         if source_type == ScenarioType.DATING_SIM.value:
@@ -231,6 +234,7 @@ class ContinuationScenarioService:
             section_ids = CONTINUATION_SECTION_IDS
         return await self.scenario_service.generate_draft(
             scenario_type=scenario_type,
+            interaction_mode=save.interaction_mode,
             seed=snapshot.seed,
             section_ids=section_ids,
             metadata=snapshot.metadata,

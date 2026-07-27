@@ -66,6 +66,7 @@ export function ScenarioDialog({
         ? model.scenario_draft.scenario_types
         : [model?.scenario_draft?.scenario_type ?? "full_roleplay"],
     action_choices_enabled: initialDraftPrefill?.action_choices_enabled ?? model?.scenario_draft?.action_choices_enabled ?? false,
+    interaction_mode: initialDraftPrefill?.interaction_mode ?? model?.scenario_draft?.interaction_mode ?? "roleplay",
     title: "",
     premise: "",
     player_role: "",
@@ -185,7 +186,8 @@ export function ScenarioDialog({
         ...current,
         scenario_type: nextDraft.scenario_type,
         scenario_types: normalizedScenarioTypes(nextDraft.scenario_type, nextDraft.scenario_types),
-        action_choices_enabled: Boolean(nextDraft.action_choices_enabled)
+        action_choices_enabled: Boolean(nextDraft.action_choices_enabled),
+        interaction_mode: nextDraft.interaction_mode ?? "roleplay"
       }));
     }
   };
@@ -218,6 +220,7 @@ export function ScenarioDialog({
         scenario_type: form.scenario_type,
         scenario_types: selectedScenarioTypes,
         seed,
+        interaction_mode: form.interaction_mode,
         action_choices_enabled: form.action_choices_enabled
       });
       watchDialogJob(
@@ -312,11 +315,26 @@ export function ScenarioDialog({
               </label>
             ) : null}
         </>
+        <SegmentedTabs
+          label="Interaction mode"
+          value={form.interaction_mode}
+          onChange={(interaction_mode) => setForm({
+            ...form,
+            interaction_mode,
+            action_choices_enabled: interaction_mode === "storyteller"
+              ? false
+              : form.action_choices_enabled
+          })}
+          options={[
+            { value: "roleplay", label: "Roleplay" },
+            { value: "storyteller", label: "Storyteller" }
+          ]}
+        />
         <label className="toggle-row compact-toggle">
             <input
               type="checkbox"
               checked={form.action_choices_enabled}
-              disabled={mode === "draft" && draft !== null}
+              disabled={form.interaction_mode === "storyteller" || (mode === "draft" && draft !== null)}
               onChange={(event) => setForm({ ...form, action_choices_enabled: event.target.checked })}
             />
             <span>Action choices</span>
@@ -361,6 +379,10 @@ function ManualScenarioForm({
   const actionChoiceSectionIds = form.action_choices_enabled ? ["choice_style"] : [];
   const extraSectionIds = [...new Set([...flowSectionIds, ...actionChoiceSectionIds])]
     .filter((sectionId) => !MANUAL_BASE_SECTION_IDS.has(sectionId))
+    .filter((sectionId) => (
+      form.interaction_mode === "roleplay"
+      || !["player_role", "player_character_name", "player_character_profile"].includes(sectionId)
+    ))
     .filter(isScenarioFormTextField);
   return (
     <>
@@ -372,14 +394,14 @@ function ManualScenarioForm({
         <span>Premise</span>
         <textarea required value={form.premise} onChange={(e) => update("premise", e.target.value)} />
       </label>
-      <label className="field-label">
+      {form.interaction_mode === "roleplay" ? <label className="field-label">
         <span>Player Role</span>
         <input required value={form.player_role} onChange={(e) => update("player_role", e.target.value)} />
-      </label>
-      <label className="field-label">
+      </label> : null}
+      {form.interaction_mode === "roleplay" ? <label className="field-label">
         <span>Player Character</span>
         <input value={form.player_character_name} onChange={(e) => update("player_character_name", e.target.value)} />
-      </label>
+      </label> : null}
       {extraSectionIds.map((sectionId) => (
         <label className="field-label" key={sectionId}>
           <span>{labelize(sectionId)}</span>
@@ -409,6 +431,7 @@ function emptyScenarioFormFields(): ScenarioForm {
     scenario_type: "",
     scenario_types: [],
     action_choices_enabled: false,
+    interaction_mode: "roleplay",
     title: "",
     premise: "",
     player_role: "",
@@ -537,13 +560,23 @@ function ScenarioDraftEditor({
   const [openingImage, setOpeningImage] = useState(false);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const storytellerMode = draft.interaction_mode === "storyteller";
+  const hiddenSectionIds = storytellerMode
+    ? new Set(["player_role", "player_character_name", "player_character_profile", "choice_style"])
+    : new Set<string>();
+  const visibleSections = Object.fromEntries(
+    Object.entries(sections).filter(([sectionId]) => !hiddenSectionIds.has(sectionId))
+  );
   const baseGroups = draftReviewGroups(
     flow?.review_groups ?? [{ label: "Draft", section_ids: Object.keys(sections) }],
     draft.action_choices_enabled,
-    sections
-  );
+    visibleSections
+  ).map((group) => ({
+    ...group,
+    section_ids: group.section_ids.filter((sectionId) => !hiddenSectionIds.has(sectionId))
+  }));
   const groupedSectionIds = new Set(baseGroups.flatMap((group) => group.section_ids));
-  const extraSectionIds = Object.keys(sections).filter((sectionId) => !groupedSectionIds.has(sectionId));
+  const extraSectionIds = Object.keys(visibleSections).filter((sectionId) => !groupedSectionIds.has(sectionId));
   const groups = extraSectionIds.length
     ? [...baseGroups, { label: "Continuity", section_ids: extraSectionIds }]
     : baseGroups;
@@ -616,6 +649,7 @@ function ScenarioDraftEditor({
         character_starters: starterPayload.value,
         count,
         custom_description: mode === "custom" ? description : "",
+        interaction_mode: draft.interaction_mode ?? "roleplay",
         action_choices_enabled: Boolean(draft.action_choices_enabled)
       });
       watchStarterJob(created.id, (done) => {
@@ -669,6 +703,7 @@ function ScenarioDraftEditor({
                         seed: draft.regeneration_seed,
                         section_id: sectionId,
                         sections,
+                        interaction_mode: draft.interaction_mode ?? "roleplay",
                         action_choices_enabled: Boolean(draft.action_choices_enabled)
                       });
                       watchSectionJob(created.id, (done) => {
@@ -737,6 +772,7 @@ function ScenarioDraftEditor({
                 character_starters: starterPayload.value,
                 save_title: sections.title ?? "",
                 source_metadata: Object.fromEntries(draft.source_metadata ?? []),
+                interaction_mode: draft.interaction_mode ?? "roleplay",
                 action_choices_enabled: Boolean(draft.action_choices_enabled)
               });
               onRuntimeChanged(result);

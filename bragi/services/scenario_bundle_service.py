@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from bragi import __version__
 from bragi.app_logging import log_event
+from bragi.interaction_mode import normalize_interaction_mode
 from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.private_files import write_private_bytes
@@ -103,7 +104,8 @@ class ScenarioBundleService:
         row = _require_row(
             self.repositories.connection.execute(
                 """
-                SELECT id, type, title, premise, player_role, content_json,
+                SELECT id, type, title, premise, player_role, interaction_mode,
+                       content_json,
                        created_at, updated_at
                 FROM scenarios
                 WHERE id = ?
@@ -139,6 +141,7 @@ class ScenarioBundleService:
                 "title": safe_title,
                 "premise": _redacted_text(normalized_premise),
                 "player_role": _redacted_text(row["player_role"]),
+                "interaction_mode": _text_value(row["interaction_mode"]),
                 "content": normalized_content,
                 "created_at": safe_created_at,
                 "updated_at": safe_updated_at,
@@ -239,6 +242,9 @@ class ScenarioBundleService:
                 premise=premise,
                 player_role=_text(scenario, "player_role"),
                 content=content,
+                interaction_mode=normalize_interaction_mode(
+                    _optional_text_value(scenario.get("interaction_mode"))
+                ),
             )
         except Exception:
             if self.media_dir is not None:

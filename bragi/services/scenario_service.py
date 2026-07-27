@@ -10,6 +10,7 @@ from types import MappingProxyType
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
 from bragi.content_rating_instructions import maximum_content_rating
+from bragi.interaction_mode import InteractionMode, normalize_interaction_mode
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     ChatMessage,
@@ -923,6 +924,7 @@ _SECTION_GUIDANCE = {
 class ScenarioDraft:
     type: ScenarioType
     sections: Mapping[str, str]
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
     scenario_types: tuple[ScenarioType, ...] = ()
     metadata: Mapping[str, object] | None = None
     regeneration_seed: str = ""
@@ -936,6 +938,11 @@ class ScenarioDraft:
             self.scenario_types or (normalized_type,),
         )
         object.__setattr__(self, "type", normalized_type)
+        object.__setattr__(
+            self,
+            "interaction_mode",
+            normalize_interaction_mode(self.interaction_mode),
+        )
         object.__setattr__(self, "scenario_types", normalized_genres)
         object.__setattr__(
             self,
@@ -963,7 +970,7 @@ class ScenarioDraft:
 
     @property
     def player_role(self) -> str:
-        return self.sections["player_role"]
+        return self.sections.get("player_role", "")
 
     @property
     def player_character_name(self) -> str:
@@ -981,6 +988,7 @@ class ScenarioGenerationProgress:
     scenario_types: tuple[ScenarioType, ...] = ()
     action_choices_enabled: bool = False
     error: str = ""
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -1040,11 +1048,13 @@ class ScenarioService:
         scenario_type: ScenarioType | str,
         scenario_types: Iterable[ScenarioType | str] | None = None,
         seed: str,
+        interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
         action_choices_enabled: bool = False,
         section_ids: tuple[str, ...] | None = None,
         metadata: Mapping[str, object] | None = None,
         progress_callback: ScenarioGenerationProgressCallback | None = None,
     ) -> ScenarioDraft:
+        normalized_interaction_mode = normalize_interaction_mode(interaction_mode)
         normalized_type, normalized_genres, action_choices_enabled = (
             normalized_scenario_types_and_flag(
                 scenario_type,
@@ -1052,14 +1062,20 @@ class ScenarioService:
                 action_choices_enabled=action_choices_enabled,
             )
         )
-        resolved_section_ids = (
+        if normalized_interaction_mode is InteractionMode.STORYTELLER:
+            action_choices_enabled = False
+        resolved_section_ids = _sections_for_interaction_mode(
+            (
             section_ids
             if section_ids is not None
             else _generated_section_ids(
                 normalized_type,
                 scenario_types=normalized_genres,
                 action_choices_enabled=action_choices_enabled,
+                interaction_mode=normalized_interaction_mode,
             )
+            ),
+            normalized_interaction_mode,
         )
         _validate_section_ids(
             normalized_type,
@@ -1096,6 +1112,7 @@ class ScenarioService:
                     progress_callback,
                     ScenarioGenerationProgress(
                         scenario_type=normalized_type,
+                        interaction_mode=normalized_interaction_mode,
                         scenario_types=normalized_genres,
                         action_choices_enabled=action_choices_enabled,
                         section_id=section_id,
@@ -1109,6 +1126,7 @@ class ScenarioService:
                     scenario_type=normalized_type,
                     scenario_types=normalized_genres,
                     action_choices_enabled=action_choices_enabled,
+                    interaction_mode=normalized_interaction_mode,
                     seed=seed,
                     section_id=section_id,
                     sections=sections,
@@ -1128,6 +1146,7 @@ class ScenarioService:
                     progress_callback,
                     ScenarioGenerationProgress(
                         scenario_type=normalized_type,
+                        interaction_mode=normalized_interaction_mode,
                         scenario_types=normalized_genres,
                         action_choices_enabled=action_choices_enabled,
                         section_id=section_id,
@@ -1146,6 +1165,7 @@ class ScenarioService:
                 progress_callback,
                 ScenarioGenerationProgress(
                     scenario_type=normalized_type,
+                    interaction_mode=normalized_interaction_mode,
                     scenario_types=normalized_genres,
                     action_choices_enabled=action_choices_enabled,
                     section_id=section_id,
@@ -1176,6 +1196,7 @@ class ScenarioService:
         )
         return ScenarioDraft(
             type=normalized_type,
+            interaction_mode=normalized_interaction_mode,
             scenario_types=normalized_genres,
             sections=sections,
             metadata=draft_metadata,
@@ -1192,8 +1213,10 @@ class ScenarioService:
         seed: str,
         section_id: str,
         sections: Mapping[str, str],
+        interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
         action_choices_enabled: bool = False,
     ) -> ScenarioSectionGenerationResult:
+        normalized_interaction_mode = normalize_interaction_mode(interaction_mode)
         normalized_type, normalized_genres, action_choices_enabled = (
             normalized_scenario_types_and_flag(
                 scenario_type,
@@ -1201,6 +1224,8 @@ class ScenarioService:
                 action_choices_enabled=action_choices_enabled,
             )
         )
+        if normalized_interaction_mode is InteractionMode.STORYTELLER:
+            action_choices_enabled = False
         if section_id not in _allowed_section_ids(
             normalized_type,
             scenario_types=normalized_genres,
@@ -1226,6 +1251,7 @@ class ScenarioService:
                 scenario_type=normalized_type,
                 scenario_types=normalized_genres,
                 action_choices_enabled=action_choices_enabled,
+                interaction_mode=normalized_interaction_mode,
                 seed=seed,
                 section_id=section_id,
                 sections={
@@ -1262,6 +1288,7 @@ class ScenarioService:
         scenario_type: ScenarioType,
         scenario_types: tuple[ScenarioType, ...],
         action_choices_enabled: bool,
+        interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
         seed: str,
         section_id: str,
         sections: Mapping[str, str],
@@ -1285,6 +1312,7 @@ class ScenarioService:
                         scenario_type,
                         scenario_types=scenario_types,
                         action_choices_enabled=action_choices_enabled,
+                        interaction_mode=interaction_mode,
                     ),
                 ),
                 ChatMessage(
@@ -1301,6 +1329,7 @@ class ScenarioService:
             ),
             content_rating=content_safety.rating,
             fade_to_black_enabled=content_safety.fade_to_black_enabled,
+            interaction_mode=interaction_mode,
         )
         response = await self._chat_for_section(
             request=request,
@@ -1458,6 +1487,7 @@ class ScenarioService:
             raise ValueError(f"Unknown scenario section edits: {sorted(unknown)}")
         return ScenarioDraft(
             type=draft.type,
+            interaction_mode=draft.interaction_mode,
             scenario_types=draft.scenario_types,
             sections={**draft.sections, **edits},
             metadata=draft.metadata,
@@ -1476,6 +1506,7 @@ class ScenarioService:
             normalized_payload,
             scenario_types=draft.scenario_types,
             action_choices_enabled=draft.action_choices_enabled,
+            interaction_mode=draft.interaction_mode,
         )
         allowed = set(
             _allowed_section_ids(draft.type, scenario_types=draft.scenario_types)
@@ -1494,7 +1525,8 @@ class ScenarioService:
             type=draft.type.value,
             title=sections["title"],
             premise=sections.get("premise", ""),
-            player_role=sections["player_role"],
+            player_role=sections.get("player_role", ""),
+            interaction_mode=draft.interaction_mode,
             content=content_with_character_starters(
                 scenario_type=draft.type.value,
                 content=content,
@@ -1515,6 +1547,7 @@ def _generation_instruction(
     *,
     scenario_types: tuple[ScenarioType, ...] = (),
     action_choices_enabled: bool = False,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
 ) -> str:
     normalized_genres = _validate_scenario_type_tuple(
         scenario_type,
@@ -1646,11 +1679,20 @@ def _generation_instruction(
             "opportunity for choices without including numbered options or "
             "action-choice lists."
         )
+    interaction_scope = ""
+    if interaction_mode is InteractionMode.STORYTELLER:
+        interaction_scope = (
+            " This is storyteller mode: the human guides the narrative from "
+            "outside the world. Do not invent a player avatar, player identity, "
+            "player role, or player-character profile. Do not address the human "
+            "as an in-world \"you.\" Opening narration must depict only "
+            "narrator-controlled in-world characters."
+        )
     return (
         f"You are helping draft a {scenario_label} for Bragi. "
         "Generate only the requested field as natural prose. "
         "Do not include JSON, Markdown fences, headings, labels, or commentary."
-        f"{scope}"
+        f"{scope}{interaction_scope}"
     )
 
 
@@ -1683,22 +1725,39 @@ def _generated_section_ids(
     *,
     scenario_types: tuple[ScenarioType, ...] = (),
     action_choices_enabled: bool = False,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
 ) -> tuple[str, ...]:
     normalized_genres = _validate_scenario_type_tuple(
         scenario_type,
         scenario_types or (scenario_type,),
     )
     if len(normalized_genres) > 1:
-        return _with_choice_style(
+        section_ids = _with_choice_style(
             _merged_section_ids(
                 _single_generated_section_ids(genre)
                 for genre in normalized_genres
             ),
             action_choices_enabled=action_choices_enabled,
         )
-    return _with_choice_style(
+        return _sections_for_interaction_mode(section_ids, interaction_mode)
+    section_ids = _with_choice_style(
         _single_generated_section_ids(scenario_type),
         action_choices_enabled=action_choices_enabled,
+    )
+    return _sections_for_interaction_mode(section_ids, interaction_mode)
+
+
+def _sections_for_interaction_mode(
+    section_ids: tuple[str, ...],
+    interaction_mode: InteractionMode,
+) -> tuple[str, ...]:
+    if interaction_mode is InteractionMode.ROLEPLAY:
+        return section_ids
+    return tuple(
+        section_id
+        for section_id in section_ids
+        if section_id
+        not in {"player_character_name", "player_character_profile", "player_role"}
     )
 
 
@@ -1974,6 +2033,7 @@ def _select_sections(
     *,
     scenario_types: tuple[ScenarioType, ...] = (),
     action_choices_enabled: bool = False,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
 ) -> dict[str, str]:
     payload = normalize_scenario_draft_sections(scenario_type, payload)
     normalized_genres = _validate_scenario_type_tuple(
@@ -1984,6 +2044,7 @@ def _select_sections(
         scenario_type,
         scenario_types=normalized_genres,
         action_choices_enabled=action_choices_enabled,
+        interaction_mode=interaction_mode,
     )
     allowed_section_ids = _allowed_section_ids(
         scenario_type,

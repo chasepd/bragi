@@ -18,6 +18,7 @@ from bragi.app_logging import (
     log_error_event,
     log_event,
 )
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import (
     CharacterKnowledgeEdgeRecord,
     CharacterRecord,
@@ -1313,6 +1314,7 @@ class ChatService:
             ChatRequest(
                 provider=preference.provider,
                 model_id=preference.model_id,
+                interaction_mode=details.save.interaction_mode,
                 messages=_narrator_messages(
                     repositories=self.repositories,
                     messages=messages,
@@ -1953,6 +1955,7 @@ class ChatService:
             ChatRequest(
                 provider=preference.provider,
                 model_id=preference.model_id,
+                interaction_mode=save.interaction_mode,
                 messages=_narrator_messages(
                     repositories=self.repositories,
                     messages=messages,
@@ -2081,6 +2084,14 @@ class ChatService:
                 ),
             ),
         )
+        if (
+            save.interaction_mode is InteractionMode.STORYTELLER
+            and narrator_spec is not None
+        ):
+            narrator_spec = replace(
+                narrator_spec,
+                state_commit_candidates=(),
+            )
         usable_narrator_spec = (
             narrator_spec
             if _narrator_message_spec_has_prompt_guidance(narrator_spec)
@@ -3826,12 +3837,19 @@ class ChatService:
         )
         current_head = self._turn_revision_is_current_head(boundary)
         stale_rebase = not current_head
+        canonical_source_message_ids = _canonical_turn_source_message_ids(
+            self.repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+        )
         configured_inference_mode = post_turn_inference_mode(
             self.repositories,
             save_id=save_id,
         )
         verified_coverage = verified_coverage or _verified_post_turn_coverage_for_turn(
             repositories=self.repositories,
+            save_id=save_id,
             player_message_id=player_message_id,
             narrator_message_id=narrator_message_id,
         )
@@ -4069,7 +4087,7 @@ class ChatService:
                 if name == "context":
                     retry_job = self._ensure_context_update_retry_job(
                         save_id=save_id,
-                        source_message_ids=(player_message_id, narrator_message_id),
+                        source_message_ids=canonical_source_message_ids,
                         reason="provider_pressure_deferred",
                         pressure=current_pressure,
                         inference_mode=inference_mode,
@@ -4080,10 +4098,7 @@ class ChatService:
                         "deferred": True,
                         "deferred_reason": "provider_pressure",
                         "retry_job_id": retry_job.id,
-                        "source_message_ids": [
-                            player_message_id,
-                            narrator_message_id,
-                        ],
+                        "source_message_ids": list(canonical_source_message_ids),
                         "provider_pressure": current_pressure.to_result(),
                     }
                     publish(name, "deferred")
@@ -4132,7 +4147,7 @@ class ChatService:
             except TimeoutError:
                 retry_job = self._ensure_context_update_retry_job(
                     save_id=save_id,
-                    source_message_ids=(player_message_id, narrator_message_id),
+                    source_message_ids=canonical_source_message_ids,
                     reason="post_turn_context_update_timeout",
                     inference_mode=inference_mode,
                     verified_coverage=verified_coverage,
@@ -4142,10 +4157,7 @@ class ChatService:
                     "deferred": True,
                     "deferred_reason": "timeout",
                     "retry_job_id": retry_job.id,
-                    "source_message_ids": [
-                        player_message_id,
-                        narrator_message_id,
-                    ],
+                    "source_message_ids": list(canonical_source_message_ids),
                     "timeout_seconds": POST_TURN_CONTEXT_UPDATE_BUDGET_SECONDS,
                 }
                 publish(name, "deferred")
@@ -4279,7 +4291,7 @@ class ChatService:
         def run_context_barrier() -> None:
             self._run_post_turn_context_barrier(
                 save_id=save_id,
-                source_message_ids=(player_message_id, narrator_message_id),
+                source_message_ids=canonical_source_message_ids,
                 source="post_turn_context",
                 base_snapshot_id=boundary.base_snapshot_id,
                 source_scoped_only=stale_rebase,
@@ -5196,7 +5208,12 @@ class ChatService:
             extractor=extractor,
         ).extract_and_apply_turn(
             save_id=save_id,
-            source_message_ids=(player_message_id, narrator_message_id),
+            source_message_ids=_canonical_turn_source_message_ids(
+                self.repositories,
+                save_id=save_id,
+                player_message_id=player_message_id,
+                narrator_message_id=narrator_message_id,
+            ),
             include_memories=include_memories,
             suppressed_memory_fingerprints=suppressed_memory_fingerprints,
             suppressed_state_keys=suppressed_state_keys,
@@ -5523,6 +5540,11 @@ class ChatService:
         save_id: str,
         source_message_id: str | None,
     ) -> DatingRouteProfileResult:
+        if _save_is_storyteller(self.repositories, save_id):
+            return DatingRouteProfileResult(
+                status="skipped",
+                skipped_reason="storyteller_mode",
+            )
         service = self.dating_route_profile_service or DatingRouteProfileService(
             repositories=self.repositories,
             providers=self.providers,
@@ -5581,6 +5603,11 @@ class ChatService:
         narrator_message_id: str,
         current_user_id: str | None = None,
     ) -> _PostTurnStepResult:
+        if _save_is_storyteller(self.repositories, save_id):
+            return _PostTurnStepResult(
+                status="skipped",
+                result={"status": "skipped", "reason": "storyteller_mode"},
+            )
         narrator_message = next(
             (
                 message
@@ -6369,8 +6396,14 @@ class ChatService:
         source_scoped_only: bool = False,
         turn_revision: TurnRevisionBoundary | None = None,
     ) -> str | _PostTurnStepResult:
+        source_message_ids = _canonical_turn_source_message_ids(
+            self.repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+        )
         verified_coverage = verified_coverage or VerifiedPostTurnCoverage(
-            source_message_ids=(player_message_id, narrator_message_id)
+            source_message_ids=source_message_ids
         )
         if inference_mode == POST_TURN_INFERENCE_MODE_PLAN_OWNED:
             return _PostTurnStepResult(
@@ -6400,7 +6433,7 @@ class ChatService:
         if extractor is None:
             retry_job = self._ensure_state_extraction_retry_job(
                 save_id=save_id,
-                source_message_ids=(player_message_id, narrator_message_id),
+                source_message_ids=source_message_ids,
                 include_memories=True,
                 inference_mode=inference_mode,
                 verified_coverage=verified_coverage,
@@ -6426,7 +6459,7 @@ class ChatService:
                     "state_extraction_failed": True,
                     "failed_reason": "state_extraction_unavailable",
                     "retry_job_id": retry_job.id,
-                    "source_message_ids": [player_message_id, narrator_message_id],
+                    "source_message_ids": list(source_message_ids),
                     "retry_attempt": _retry_attempt(retry_job.payload),
                     "max_retry_attempts": _retry_max_attempts(retry_job.payload),
                     "verified_plan_coverage": verified_coverage.to_json(),
@@ -6453,7 +6486,7 @@ class ChatService:
             pressure = provider_pressure_from_exception(exc)
             retry_job = self._ensure_state_extraction_retry_job(
                 save_id=save_id,
-                source_message_ids=(player_message_id, narrator_message_id),
+                source_message_ids=source_message_ids,
                 include_memories=include_memories,
                 inference_mode=inference_mode,
                 verified_coverage=verified_coverage,
@@ -6474,7 +6507,7 @@ class ChatService:
             result: dict[str, object] = {
                 "state_extraction_failed": True,
                 "retry_job_id": retry_job.id,
-                "source_message_ids": [player_message_id, narrator_message_id],
+                "source_message_ids": list(source_message_ids),
                 "retry_attempt": _retry_attempt(retry_job.payload),
                 "max_retry_attempts": _retry_max_attempts(retry_job.payload),
                 "verified_plan_coverage": verified_coverage.to_json(),
@@ -6518,7 +6551,12 @@ class ChatService:
             try:
                 observed = await observation_service.observe_turn(
                     save_id=save_id,
-                    source_message_ids=(player_message_id, narrator_message_id),
+                    source_message_ids=_canonical_turn_source_message_ids(
+                        self.repositories,
+                        save_id=save_id,
+                        player_message_id=player_message_id,
+                        narrator_message_id=narrator_message_id,
+                    ),
                 )
                 result["observation"] = _agentic_result_mapping(observed)
             except Exception as exc:
@@ -6632,8 +6670,14 @@ class ChatService:
         verified_coverage: VerifiedPostTurnCoverage | None = None,
         turn_revision: TurnRevisionBoundary | None = None,
     ) -> str | _PostTurnStepResult:
+        source_message_ids = _canonical_turn_source_message_ids(
+            self.repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+        )
         verified_coverage = verified_coverage or VerifiedPostTurnCoverage(
-            source_message_ids=(player_message_id, narrator_message_id)
+            source_message_ids=source_message_ids
         )
         if inference_mode == POST_TURN_INFERENCE_MODE_PLAN_OWNED:
             return _PostTurnStepResult(
@@ -6699,19 +6743,13 @@ class ChatService:
             ):
                 update_result = await service.update_after_turn(
                     save_id=save_id,
-                    source_message_ids=(
-                        player_message_id,
-                        narrator_message_id,
-                    ),
+                    source_message_ids=source_message_ids,
                     verified_coverage=verified_coverage,
                 )
             else:
                 update_result = await service.update_after_turn(
                     save_id=save_id,
-                    source_message_ids=(
-                        player_message_id,
-                        narrator_message_id,
-                    ),
+                    source_message_ids=source_message_ids,
                 )
             step_result = self._context_update_step_result(
                 update_result,
@@ -6729,7 +6767,7 @@ class ChatService:
             pressure = provider_pressure_from_exception(exc)
             retry_job = self._ensure_context_update_retry_job(
                 save_id=save_id,
-                source_message_ids=(player_message_id, narrator_message_id),
+                source_message_ids=source_message_ids,
                 reason="post_turn_context_update_failed",
                 provider=preference.provider if preference is not None else None,
                 model=preference.model_id if preference is not None else None,
@@ -6756,7 +6794,7 @@ class ChatService:
                         else {}
                     ),
                     "retry_job_id": retry_job.id,
-                    "source_message_ids": [player_message_id, narrator_message_id],
+                    "source_message_ids": list(source_message_ids),
                     "retry_attempt": _retry_attempt(retry_job.payload),
                     "max_retry_attempts": _retry_max_attempts(retry_job.payload),
                     **(
@@ -7042,6 +7080,12 @@ class ChatService:
         player_message_id: str,
         narrator_message_id: str,
     ) -> str | _PostTurnStepResult:
+        source_message_ids = _canonical_turn_source_message_ids(
+            self.repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+        )
         preference = roleplay_model_preference(
             repositories=self.repositories,
             save_id=save_id,
@@ -7074,7 +7118,7 @@ class ChatService:
             job = record_scenario_evolution_skip(
                 repositories=self.repositories,
                 save_id=save_id,
-                source_message_ids=(player_message_id, narrator_message_id),
+                source_message_ids=source_message_ids,
                 skip_reason=due.skip_reason or "not_due",
                 result=result,
             )
@@ -7145,7 +7189,7 @@ class ChatService:
         try:
             await scenario_evolution_service.evolve_after_turn(
                 save_id=save_id,
-                source_message_ids=(player_message_id, narrator_message_id),
+                source_message_ids=source_message_ids,
             )
             return "succeeded"
         except Exception as exc:
@@ -7171,6 +7215,29 @@ def _to_chat_message(message: MessageRecord) -> ChatMessage:
         body=message.body,
         speaker_name=message.speaker_name,
     )
+
+
+def _save_is_storyteller(
+    repositories: PersistenceRepositories,
+    save_id: str,
+) -> bool:
+    save = repositories.get_save(save_id)
+    return (
+        save is not None
+        and save.interaction_mode is InteractionMode.STORYTELLER
+    )
+
+
+def _canonical_turn_source_message_ids(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    player_message_id: str,
+    narrator_message_id: str,
+) -> tuple[str, ...]:
+    if _save_is_storyteller(repositories, save_id):
+        return (narrator_message_id,)
+    return (player_message_id, narrator_message_id)
 
 
 def timeskip_message_body(instruction: str) -> str:
@@ -7667,7 +7734,12 @@ def _apply_verified_planned_commits(
     )
     diagnostics = _planned_commit_diagnostics(candidates, planner_rejections)
     coverage = _empty_verified_coverage(
-        source_message_ids=(player_message_id, narrator_message_id),
+        source_message_ids=_canonical_turn_source_message_ids(
+            repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+        ),
     )
     if not candidates:
         coverage = _coverage_with_planned_commit_metadata(
@@ -7857,26 +7929,33 @@ def _planned_commit_diagnostics(
 def _verified_post_turn_coverage_for_turn(
     *,
     repositories: PersistenceRepositories,
+    save_id: str,
     player_message_id: str,
     narrator_message_id: str,
 ) -> VerifiedPostTurnCoverage:
+    source_message_ids = _canonical_turn_source_message_ids(
+        repositories,
+        save_id=save_id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator_message_id,
+    )
     job = repositories.find_chat_completion_job_for_narrator_message(
         narrator_message_id
     )
     if job is None or not isinstance(job.result, Mapping):
         return VerifiedPostTurnCoverage(
-            source_message_ids=(player_message_id, narrator_message_id)
+            source_message_ids=source_message_ids
         )
     planned_commits = job.result.get("planned_commits")
     if not isinstance(planned_commits, Mapping):
         return VerifiedPostTurnCoverage(
-            source_message_ids=(player_message_id, narrator_message_id)
+            source_message_ids=source_message_ids
         )
     coverage = verified_post_turn_coverage_from_mapping(planned_commits.get("coverage"))
     if coverage.source_message_ids:
         return coverage
     return VerifiedPostTurnCoverage(
-        source_message_ids=(player_message_id, narrator_message_id),
+        source_message_ids=source_message_ids,
         state_keys=coverage.state_keys,
         scene_snapshot_fields=coverage.scene_snapshot_fields,
         scene_presence_character_ids=coverage.scene_presence_character_ids,

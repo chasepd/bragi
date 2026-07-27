@@ -18,6 +18,7 @@ from bragi.app_logging import (
     log_event,
 )
 from bragi.content_rating_instructions import CONTENT_RATING_PROHIBITED
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import (
     ActiveThreadRecord,
     CharacterContactStateRecord,
@@ -496,6 +497,16 @@ class CharacterTextAttachmentMediaRunner(Protocol):
     ) -> MediaAssetRecord: ...
 
 
+def _character_text_disabled_error(
+    repositories: PersistenceRepositories,
+    save_id: str,
+) -> ValueError:
+    save = repositories.get_save(save_id)
+    if save is not None and save.interaction_mode is InteractionMode.STORYTELLER:
+        return ValueError("Character texts are unavailable in storyteller mode")
+    return ValueError("Character texts are not enabled for this save")
+
+
 @dataclass(frozen=True)
 class _AttachmentDecision:
     kind: str
@@ -536,6 +547,12 @@ class CharacterTextService:
         )
 
     def is_enabled(self, save_id: str) -> bool:
+        save = self.repositories.get_save(save_id)
+        if (
+            save is not None
+            and save.interaction_mode is InteractionMode.STORYTELLER
+        ):
+            return False
         configured = self.repositories.get_effective_setting(
             CHARACTER_TEXTS_ENABLED_SETTING,
             save_id=save_id,
@@ -607,7 +624,7 @@ class CharacterTextService:
         character_id: str,
     ) -> CharacterTextThread:
         if not self.is_enabled(save_id):
-            raise ValueError("Character texts are not enabled for this save")
+            raise _character_text_disabled_error(self.repositories, save_id)
         character = self.repositories.get_character(character_id)
         if (
             character is None
@@ -806,7 +823,7 @@ class CharacterTextService:
         character_has_player_number: bool,
     ) -> CharacterTextsModel:
         if not self.is_enabled(save_id):
-            raise ValueError("Character texts are not enabled for this save")
+            raise _character_text_disabled_error(self.repositories, save_id)
         character = self.repositories.get_character(character_id)
         if (
             character is None
@@ -860,7 +877,7 @@ class CharacterTextService:
         character_ids: tuple[str, ...],
     ) -> CharacterTextThread:
         if not self.is_enabled(save_id):
-            raise ValueError("Character texts are not enabled for this save")
+            raise _character_text_disabled_error(self.repositories, save_id)
         normalized_character_ids = tuple(
             dict.fromkeys(character_id.strip() for character_id in character_ids)
         )
@@ -921,7 +938,7 @@ class CharacterTextService:
         content_rating: str = CONTENT_RATING_PROHIBITED,
     ) -> CharacterTextQueuedSendResult:
         if not self.is_enabled(save_id):
-            raise ValueError("Character texts are not enabled for this save")
+            raise _character_text_disabled_error(self.repositories, save_id)
         text = body.strip()
         if not text:
             raise ValueError("Character text body is required")
@@ -1012,7 +1029,7 @@ class CharacterTextService:
         content_rating: str = CONTENT_RATING_PROHIBITED,
     ) -> CharacterTextQueuedSendResult:
         if not self.is_enabled(save_id):
-            raise ValueError("Character texts are not enabled for this save")
+            raise _character_text_disabled_error(self.repositories, save_id)
         text = body.strip()
         if not text:
             raise ValueError("Character text body is required")

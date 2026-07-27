@@ -1855,6 +1855,46 @@ describe("frontend helpers", () => {
     });
   });
 
+  it("renders storyteller human messages as directions with guiding composer copy", async () => {
+    const { Chronicle, Composer } = await import("./main");
+    const model = runtimeModel({
+      interaction_mode: "storyteller",
+      chronicle: {
+        messages: [
+          {
+            message_id: "direction-1",
+            role: "player",
+            speaker_name: "Legacy avatar",
+            body: "Have the rival interrupt the ceremony.",
+            actions: []
+          }
+        ]
+      }
+    });
+
+    const { container } = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <>
+          <Chronicle model={model} runJob={vi.fn()} pendingMessage={null} />
+          <Composer
+            disabled={false}
+            runJob={vi.fn()}
+            activeSaveId="save-1"
+            onPendingMessage={vi.fn()}
+            storytellerMode
+          />
+        </>
+      </QueryClientProvider>
+    );
+
+    expect(screen.getByText("Direction")).toBeInTheDocument();
+    expect(container.querySelector(".message.direction")).not.toBeNull();
+    expect(screen.getByLabelText("Message")).toHaveAttribute(
+      "placeholder",
+      "Guide what happens next…"
+    );
+  });
+
   it("keeps regenerate feedback open and usable when submission fails", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: false,
@@ -11883,6 +11923,7 @@ describe("frontend helpers", () => {
     expect(JSON.parse(String(createCall?.[1].body))).toEqual({
       scenario_type: "full_roleplay",
       scenario_types: ["full_roleplay"],
+      interaction_mode: "roleplay",
       action_choices_enabled: false,
       title: "Mist Run",
       premise: "The fog has teeth.",
@@ -11985,6 +12026,56 @@ describe("frontend helpers", () => {
       expect(fetchMock.mock.calls.filter(([path]) => path === "/api/scenarios").length).toBeGreaterThanOrEqual(2);
     });
     expect(await screen.findByRole("button", { name: "Start Mist Run" })).toBeInTheDocument();
+  });
+
+  it("creates storyteller scenarios without player-only fields or choices", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => runtimeModel({ interaction_mode: "storyteller" })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog
+          model={runtimeModel()}
+          onClose={vi.fn()}
+          onRuntimeChanged={vi.fn()}
+          runJob={vi.fn()}
+        />
+      </QueryClientProvider>
+    );
+
+    const dialog = screen.getByRole("dialog", { name: "New scenario" });
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Storyteller" }));
+    expect(within(dialog).queryByLabelText("Player Role")).not.toBeInTheDocument();
+    expect(within(dialog).queryByLabelText("Player Character")).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByLabelText("Player Character Profile")
+    ).not.toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Action choices")).toBeDisabled();
+    await userEvent.type(within(dialog).getByLabelText("Title"), "The Ceremony");
+    await userEvent.type(
+      within(dialog).getByLabelText("Premise"),
+      "A rival waits in the wings."
+    );
+    await userEvent.type(
+      within(dialog).getByLabelText("Opening Message"),
+      "The orchestra falls silent."
+    );
+    await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const createCall = fetchMock.mock.calls.find(
+      ([path]) => path === "/api/scenarios/manual"
+    );
+    const payload = JSON.parse(String(createCall?.[1].body));
+    expect(payload.interaction_mode).toBe("storyteller");
+    expect(payload.action_choices_enabled).toBe(false);
+    expect(payload.player_role).toBe("");
+    expect(payload.player_character_name).toBe("");
+    expect(payload.player_character_profile).toBe("");
   });
 
   it("creates manual hybrid scenarios with fields from both genres", async () => {
@@ -12899,6 +12990,7 @@ describe("frontend helpers", () => {
       scenario_types: ["full_roleplay"],
       seed: "fog seed",
       section_id: "premise",
+      interaction_mode: "roleplay",
       action_choices_enabled: false,
       sections: {
         title: "Fog Gate",

@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from bragi.app_logging import exception_log_fields, log_error_event
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import (
     ActiveThreadRecord,
     CharacterRecord,
@@ -834,6 +835,10 @@ def _character_presence_messages(
 ) -> tuple[ChatMessage, ...]:
     details = repositories.load_save_details(save_id)
     scenario = details.scenario if details is not None else None
+    storyteller_mode = (
+        details is not None
+        and details.save.interaction_mode is InteractionMode.STORYTELLER
+    )
     snapshot = repositories.get_scene_snapshot(save_id)
     recent_messages = _visible_recent_messages_for_character(
         repositories=repositories,
@@ -846,13 +851,19 @@ def _character_presence_messages(
         ChatMessage(
             role="system",
             body=(
-                "Assess one non-player character's scene presence for the "
-                "next Bragi narrator turn. Decide only whether this character "
-                "is present, entering, or leaving the current scene. Use the "
-                "enforced structured schema only. Do not plan their next "
-                "action and never plan or control the player character. Use "
-                "only evidence_source_ids listed in Evidence sources, and copy "
-                "evidence_quote exactly from one cited evidence source."
+                (
+                    "Assess one narrator-controlled character's scene presence "
+                    if storyteller_mode
+                    else "Assess one non-player character's scene presence "
+                )
+                + (
+                    "for the next Bragi narrator turn. Decide only whether this "
+                    "character is present, entering, or leaving the current scene. "
+                    "Use the enforced structured schema only. Do not plan their "
+                    "next action and never plan or control the player character. "
+                    "Use only evidence_source_ids listed in Evidence sources, and "
+                    "copy evidence_quote exactly from one cited evidence source."
+                )
             ),
         ),
         ChatMessage(
@@ -862,15 +873,34 @@ def _character_presence_messages(
                 for part in (
                     _scenario_text(scenario),
                     _scene_text(snapshot),
-                    _player_character_text(repositories, save_id=save_id),
+                    (
+                        ""
+                        if storyteller_mode
+                        else _player_character_text(repositories, save_id=save_id)
+                    ),
                     _active_threads_text(repositories.list_active_threads(save_id)),
                     _character_text(character),
-                    _dating_route_text(repositories, save_id, character),
+                    (
+                        ""
+                        if storyteller_mode
+                        else _dating_route_text(repositories, save_id, character)
+                    ),
                     _evidence_sources_text(evidence_sources),
                     "Recent chronicle:",
-                    *(_message_line(message) for message in recent_messages),
+                    *(
+                        _planning_message_line(
+                            message,
+                            storyteller_mode=storyteller_mode,
+                        )
+                        for message in recent_messages
+                    ),
                     "",
-                    "Latest turn source message:",
+                    (
+                        "Latest non-diegetic story direction (guidance only; "
+                        "not canonical evidence):"
+                        if storyteller_mode
+                        else "Latest turn source message:"
+                    ),
                     source_message.body,
                 )
                 if part != ""
@@ -892,6 +922,10 @@ def _character_intent_messages(
 ) -> tuple[ChatMessage, ...]:
     details = repositories.load_save_details(save_id)
     scenario = details.scenario if details is not None else None
+    storyteller_mode = (
+        details is not None
+        and details.save.interaction_mode is InteractionMode.STORYTELLER
+    )
     snapshot = repositories.get_scene_snapshot(save_id)
     recent_messages = _visible_recent_messages_for_character(
         repositories=repositories,
@@ -904,7 +938,12 @@ def _character_intent_messages(
         ChatMessage(
             role="system",
             body=(
-                "Plan one non-player character's next visible intent and "
+                (
+                    "Plan one narrator-controlled character's next visible intent and "
+                    if storyteller_mode
+                    else "Plan one non-player character's next visible intent and "
+                )
+                + (
                 "action for the next Bragi narrator turn. Use the enforced "
                 "structured schema only. The character was already assessed "
                 "as present, entering, or leaving, so choose only the action "
@@ -927,6 +966,7 @@ def _character_intent_messages(
                 "exactly from one cited source, and copy evidence_quote exactly "
                 "from one cited evidence source for every learned memory or "
                 "knowledge edge candidate."
+                )
             ),
         ),
         ChatMessage(
@@ -936,17 +976,36 @@ def _character_intent_messages(
                 for part in (
                     _scenario_text(scenario),
                     _scene_text(snapshot),
-                    _player_character_text(repositories, save_id=save_id),
+                    (
+                        ""
+                        if storyteller_mode
+                        else _player_character_text(repositories, save_id=save_id)
+                    ),
                     _active_threads_text(repositories.list_active_threads(save_id)),
                     _character_text(character),
                     _presence_assessment_text(presence_assessment),
-                    _dating_route_text(repositories, save_id, character),
+                    (
+                        ""
+                        if storyteller_mode
+                        else _dating_route_text(repositories, save_id, character)
+                    ),
                     _linkable_knowledge_targets_text(valid_knowledge_targets),
                     _evidence_sources_text(evidence_sources),
                     "Recent chronicle:",
-                    *(_message_line(message) for message in recent_messages),
+                    *(
+                        _planning_message_line(
+                            message,
+                            storyteller_mode=storyteller_mode,
+                        )
+                        for message in recent_messages
+                    ),
                     "",
-                    "Latest turn source message:",
+                    (
+                        "Latest non-diegetic story direction (guidance only; "
+                        "not canonical evidence):"
+                        if storyteller_mode
+                        else "Latest turn source message:"
+                    ),
                     source_message.body,
                 )
                 if part != ""
@@ -1081,11 +1140,19 @@ def _planning_characters_for_turn(
     snapshot = repositories.get_scene_snapshot(save_id)
     present_ids = set(snapshot.present_character_ids if snapshot else ())
     source_text = source_message.body
+    all_characters = tuple(repositories.list_characters(save_id))
     characters = tuple(
         character
-        for character in repositories.list_characters(save_id)
+        for character in all_characters
         if not character.is_player_character
     )
+    save = repositories.get_save(save_id)
+    if (
+        save is not None
+        and save.interaction_mode is InteractionMode.STORYTELLER
+        and not any(character.is_player_character for character in all_characters)
+    ):
+        return characters
     present = tuple(
         character for character in characters if character.id in present_ids
     )
@@ -1172,7 +1239,14 @@ def _planning_evidence_sources(
         source_message=source_message,
         messages=messages,
     )
+    save = repositories.get_save(save_id)
+    storyteller_mode = (
+        save is not None
+        and save.interaction_mode is InteractionMode.STORYTELLER
+    )
     for message in (*recent_messages, source_message):
+        if storyteller_mode and message.role != "narrator":
+            continue
         add(f"message:{message.id}", message.body)
     return sources
 
@@ -1648,6 +1722,16 @@ def _relationships_text(value: Mapping[str, object]) -> str:
 def _message_line(message: MessageRecord) -> str:
     speaker = message.speaker_name or message.role
     return f"- {speaker}: {message.body}"
+
+
+def _planning_message_line(
+    message: MessageRecord,
+    *,
+    storyteller_mode: bool,
+) -> str:
+    if storyteller_mode and message.role == "player":
+        return f"- Non-diegetic story direction (not canonical): {message.body}"
+    return _message_line(message)
 
 
 def _string(value: object) -> str:

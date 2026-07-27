@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.chat_rendering import provider_chat_messages
@@ -437,6 +438,46 @@ def test_generate_full_roleplay_draft_uses_provider_chat_and_returns_minimal_sec
         provider.chat_requests,
         _full_roleplay_sections(),
     )
+
+
+def test_generate_storyteller_draft_omits_player_sections_and_forbids_avatar(
+    repositories: PersistenceRepositories,
+) -> None:
+    expected = {
+        key: value
+        for key, value in _full_roleplay_sections().items()
+        if key not in {"player_character_name", "player_role"}
+    }
+    provider = RecordingScenarioProvider(_provider_response_sections(expected))
+    service = ScenarioService(
+        repositories=repositories,
+        provider=provider,
+        provider_name="openrouter",
+        model_id="scenario-drafter",
+    )
+
+    draft = asyncio.run(
+        service.generate_draft(
+            scenario_type=ScenarioType.FULL_ROLEPLAY,
+            interaction_mode=InteractionMode.STORYTELLER,
+            seed="A ceremony disrupted by a rival claimant.",
+            action_choices_enabled=True,
+        )
+    )
+
+    assert draft.interaction_mode is InteractionMode.STORYTELLER
+    assert tuple(draft.sections) == (
+        "title",
+        "premise",
+        "tone_genre",
+        "opening_message",
+    )
+    assert draft.action_choices_enabled is False
+    request_text = "\n".join(
+        _request_text(request) for request in provider.chat_requests
+    )
+    assert "Do not invent a player avatar" in request_text
+    assert "Do not address the human as an in-world" in request_text
 
 
 def test_generate_action_choice_draft_uses_choice_sections(
@@ -1510,6 +1551,35 @@ def test_save_draft_persists_scenario_content_json_and_returns_id(
         **_full_roleplay_sections(),
         "premise": "The keep has one night before the ash gates fail.",
     }
+
+
+def test_save_storyteller_draft_does_not_require_player_sections(
+    repositories: PersistenceRepositories,
+) -> None:
+    service = ScenarioService(
+        repositories=repositories,
+        provider=RecordingScenarioProvider({}),
+        provider_name="openrouter",
+        model_id="scenario-drafter",
+    )
+    draft = ScenarioDraft(
+        type=ScenarioType.FULL_ROLEPLAY,
+        interaction_mode=InteractionMode.STORYTELLER,
+        sections={
+            "title": "The Ceremony",
+            "premise": "A rival waits in the wings.",
+            "tone_genre": "Political drama",
+            "opening_message": "The bells begin.",
+        },
+    )
+
+    scenario_id = service.save_draft(draft)
+
+    scenario = repositories.get_scenario(scenario_id)
+    assert scenario is not None
+    assert scenario.interaction_mode is InteractionMode.STORYTELLER
+    assert scenario.player_role == ""
+    assert "player_character_name" not in json.loads(scenario.content_json)
 
 
 def test_save_draft_persists_explicit_character_starters(

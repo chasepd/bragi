@@ -476,6 +476,7 @@ const STARTER_TEXTAREA_FIELDS = [
   ["relationships_json", "Relationships", "relationships"]
 ] as const satisfies readonly (readonly [ScenarioStarterTextField, string, string])[];
 type ScenarioEditorCore = {
+  interaction_mode: "roleplay" | "storyteller";
   title: string;
   premise: string;
   player_character_name: string;
@@ -489,6 +490,7 @@ type ScenarioEditorDraftState = {
 type ScenarioEditorValue = {
   scenario_id?: string;
   scenario_type: string;
+  interaction_mode: "roleplay" | "storyteller";
   title: string;
   premise: string;
   player_character_name: string;
@@ -497,6 +499,7 @@ type ScenarioEditorValue = {
   character_starters: ScenarioEditorStarter[];
 };
 type ScenarioEditPayload = {
+  interaction_mode: "roleplay" | "storyteller";
   title: string;
   premise: string;
   player_character_name: string;
@@ -1242,6 +1245,7 @@ const SCENARIO_TYPE_LABELS: Record<string, string> = {
 type ScenarioForm = {
   scenario_type: string;
   scenario_types: string[];
+  interaction_mode: "roleplay" | "storyteller";
   action_choices_enabled: boolean;
   title: string;
   premise: string;
@@ -1337,12 +1341,13 @@ type ScenarioForm = {
   choice_style: string;
   opening_message: string;
 };
-type ScenarioFormTextField = Exclude<keyof ScenarioForm, "action_choices_enabled" | "scenario_types">;
+type ScenarioFormTextField = Exclude<keyof ScenarioForm, "action_choices_enabled" | "scenario_types" | "interaction_mode">;
 type ScenarioDraftPrefill = {
   scenario_type: string;
   scenario_types: string[];
   action_choices_enabled: boolean;
   seed: string;
+  interaction_mode?: "roleplay" | "storyteller";
 };
 const MANUAL_BASE_SECTION_IDS = new Set(["title", "premise", "player_character_name", "player_role", "opening_message"]);
 const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
@@ -3556,7 +3561,7 @@ function Workbench({
             }}
           />
         ) : null}
-        {model?.action_choices_enabled ? (
+        {model?.interaction_mode !== "storyteller" && model?.action_choices_enabled ? (
           <CyoaActionPicker
             disabled={chatInputDisabled}
             runJob={runJob}
@@ -3572,6 +3577,7 @@ function Workbench({
             activeSaveId={activeSaveId}
             pendingAfterMessageId={pendingAfterMessageId}
             onPendingMessage={setPendingMessage}
+            storytellerMode={model?.interaction_mode === "storyteller"}
           />
         )}
       </main>
@@ -4931,6 +4937,7 @@ type ChronicleMessageRowProps = {
   pendingJobActionKeys: Set<string>;
   onAction: (actionId: string, message: ChronicleMessage) => void;
   mutationsDisabled?: boolean;
+  storytellerMode?: boolean;
 };
 
 const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
@@ -4939,8 +4946,10 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
   jobActionErrors,
   pendingJobActionKeys,
   onAction,
-  mutationsDisabled = false
+  mutationsDisabled = false,
+  storytellerMode = false
 }: ChronicleMessageRowProps) {
+  const isDirection = storytellerMode && message.role === "player";
   const messageActionErrors = message.actions
     .map((action) => {
       const key = chronicleJobActionKey(message.message_id, action.action_id);
@@ -4948,9 +4957,9 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
     })
     .filter((item) => item.error);
   return (
-    <article className={`message ${message.role}`}>
+    <article className={`message ${isDirection ? "direction" : message.role}`}>
       <header>
-        <span>{message.speaker_name || message.role}</span>
+        <span>{isDirection ? "Direction" : message.speaker_name || message.role}</span>
         {message.revision_count ? <small className="message-edited">Edited</small> : null}
         <div className="message-actions">
           {message.actions.map((action) => {
@@ -5232,6 +5241,7 @@ function Chronicle({
                   jobActionErrors={jobActionErrors}
                   pendingJobActionKeys={pendingJobActionKeys}
                   mutationsDisabled={mutationsDisabled}
+                  storytellerMode={model?.interaction_mode === "storyteller"}
                   onAction={handleChronicleAction}
                 />
               </div>
@@ -6377,13 +6387,15 @@ function Composer({
   runJob,
   activeSaveId,
   pendingAfterMessageId = null,
-  onPendingMessage
+  onPendingMessage,
+  storytellerMode = false
 }: {
   disabled: boolean;
   runJob: RunJob;
   activeSaveId: string | null;
   pendingAfterMessageId?: string | null;
   onPendingMessage: (message: PendingChronicleMessage | null) => void;
+  storytellerMode?: boolean;
 }) {
   const [body, setBody] = useState("");
   const [submitError, setSubmitError] = useState("");
@@ -6499,7 +6511,7 @@ function Composer({
               event.preventDefault();
               applyFormat(actionId, "while-focused");
             }}
-            placeholder="Say what you do..."
+            placeholder={storytellerMode ? "Guide what happens next…" : "Say what you do..."}
             aria-label="Message"
           />
           {submitError ? <InlineNotice className="composer-error">{submitError}</InlineNotice> : null}
@@ -6909,6 +6921,7 @@ function scenarioEditorValue(scenario: WorldDataScenario | Record<string, unknow
   return {
     scenario_id: textValue(record.scenario_id),
     scenario_type: textValue(record.scenario_type) || "full_roleplay",
+    interaction_mode: record.interaction_mode === "storyteller" ? "storyteller" : "roleplay",
     title: textValue(record.title),
     premise: textValue(record.premise),
     player_character_name: textValue(record.player_character_name),
@@ -6984,7 +6997,9 @@ function scenarioEditPayload(scenario: ScenarioEditorValue): { edit: ScenarioEdi
   const playerRole = scenario.player_role.trim();
   if (!title) return { error: "Title is required" };
   if (!premise) return { error: "Premise is required" };
-  if (!playerRole) return { error: "Player role is required" };
+  if (scenario.interaction_mode === "roleplay" && !playerRole) {
+    return { error: "Player role is required" };
+  }
   const contentSections: [string, string][] = [];
   const seen = new Set<string>();
   for (const section of scenario.content_sections) {
@@ -6999,6 +7014,7 @@ function scenarioEditPayload(scenario: ScenarioEditorValue): { edit: ScenarioEdi
   if ("error" in starterPayload) return starterPayload;
   return {
     edit: {
+      interaction_mode: scenario.interaction_mode,
       title,
       premise,
       player_character_name: scenario.player_character_name.trim(),
@@ -7113,6 +7129,7 @@ function stableSnapshotValue(value: unknown): unknown {
 function scenarioEditorDraftState(scenario: ScenarioEditorValue): ScenarioEditorDraftState {
   return {
     core: {
+      interaction_mode: scenario.interaction_mode,
       title: scenario.title,
       premise: scenario.premise,
       player_character_name: scenario.player_character_name,
@@ -7303,7 +7320,8 @@ function ScenarioStructuredEditor({
   onCancel,
   saveLabel = "Save scenario",
   onDirtyChange,
-  starterReferenceImages = false
+  starterReferenceImages = false,
+  interactionModeEditable = false
 }: {
   scenario: ScenarioEditorValue;
   onSave: (edit: ScenarioEditPayload) => Promise<void>;
@@ -7311,6 +7329,7 @@ function ScenarioStructuredEditor({
   saveLabel?: string;
   onDirtyChange?: (dirty: boolean) => void;
   starterReferenceImages?: boolean;
+  interactionModeEditable?: boolean;
 }) {
   const initialDraft = scenarioEditorDraftState(scenario);
   const incomingSnapshot = scenarioEditorDraftSnapshot(initialDraft);
@@ -7360,7 +7379,10 @@ function ScenarioStructuredEditor({
   useEffect(() => {
     onDirtyChange?.(hasUnsavedChanges);
   }, [hasUnsavedChanges, onDirtyChange]);
-  const updateCore = (key: keyof typeof core, value: string) => setCore((current) => ({ ...current, [key]: value }));
+  const updateCore = (
+    key: keyof typeof core,
+    value: string
+  ) => setCore((current) => ({ ...current, [key]: value }));
   const updateSectionValue = (sectionId: string, value: string) => {
     setSections((current) => current.map((section) => section.key === sectionId ? { ...section, value } : section));
   };
@@ -7498,17 +7520,29 @@ function ScenarioStructuredEditor({
       />
       <div className="scenario-core-grid">
         <label className="field-label">
+          <span>Interaction Mode</span>
+          <select
+            aria-label="Interaction Mode"
+            disabled={!interactionModeEditable}
+            value={core.interaction_mode}
+            onChange={(event) => updateCore("interaction_mode", event.target.value)}
+          >
+            <option value="roleplay">Roleplay</option>
+            <option value="storyteller">Storyteller</option>
+          </select>
+        </label>
+        <label className="field-label">
           <span>Title</span>
           <input required value={core.title} onChange={(event) => updateCore("title", event.target.value)} />
         </label>
-        <label className="field-label">
+        {core.interaction_mode === "roleplay" ? <label className="field-label">
           <span>Player Character</span>
           <input value={core.player_character_name} onChange={(event) => updateCore("player_character_name", event.target.value)} />
-        </label>
-        <label className="field-label">
+        </label> : null}
+        {core.interaction_mode === "roleplay" ? <label className="field-label">
           <span>Player Role</span>
           <input required value={core.player_role} onChange={(event) => updateCore("player_role", event.target.value)} />
-        </label>
+        </label> : null}
         <label className="field-label scenario-premise-field">
           <span>Premise / Setup</span>
           <textarea required value={core.premise} onChange={(event) => updateCore("premise", event.target.value)} />
@@ -7721,6 +7755,7 @@ function ScenarioDefinitionModal({ scenario, onClose, onSaved }: { scenario: Sce
             onCancel={onClose}
             onDirtyChange={setEditorDirty}
             starterReferenceImages
+            interactionModeEditable
             onSave={async (edit) => {
               await postJson(`/api/scenarios/${scenario.scenario_id}/definition`, { edit });
               onSaved();

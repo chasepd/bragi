@@ -8,6 +8,7 @@ from typing import cast
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.fake import FakeProviderClient
@@ -114,6 +115,26 @@ def test_action_choice_service_requests_structured_four_choice_schema_and_persis
     assert "Archivist Ren" in request.messages[-1].body
     assert "Ren intends to steal the atlas" not in request.messages[-1].body
     assert "numbering" in request.messages[0].body
+
+
+def test_action_choice_service_skips_storyteller_saves(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, narrator_id = _create_cyoa_save(
+        repositories,
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    provider = FakeProviderClient()
+
+    records = asyncio.run(
+        ActionChoiceService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).generate_for_message(save_id=save_id, narrator_message_id=narrator_id)
+    )
+
+    assert records == []
+    assert provider.structured_output_requests == []
 
 
 def test_action_choice_service_uses_dedicated_model_preference(
@@ -511,12 +532,17 @@ def test_action_choice_service_skips_saves_without_action_choices_enabled(
     assert provider.structured_output_requests == []
 
 
-def _create_cyoa_save(repositories: PersistenceRepositories) -> tuple[str, str]:
+def _create_cyoa_save(
+    repositories: PersistenceRepositories,
+    *,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
+) -> tuple[str, str]:
     scenario = repositories.create_scenario(
         type="full_roleplay",
         title="Library of Falling Doors",
         premise="Every shelf is a door.",
         player_role="Courier",
+        interaction_mode=interaction_mode,
         content={
             "action_choices_enabled": True,
             "title": "Library of Falling Doors",

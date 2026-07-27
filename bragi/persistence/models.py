@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from bragi.interaction_mode import InteractionMode
+
 
 @dataclass(frozen=True)
 class ScenarioRecord:
@@ -15,6 +17,7 @@ class ScenarioRecord:
     content_json: str
     created_at: str | None = None
     updated_at: str | None = None
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,7 @@ class SaveRecord:
     created_at: str | None = None
     updated_at: str | None = None
     last_opened_at: str | None = None
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
 
 
 @dataclass(frozen=True)
