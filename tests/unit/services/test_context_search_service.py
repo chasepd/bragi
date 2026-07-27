@@ -4521,6 +4521,83 @@ def test_context_search_retrieves_matching_world_state_from_index(
     assert [item.source_id for item in result.selected_state] == [target_state.id]
 
 
+def test_context_search_indexes_legacy_state_source(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    source_message = next(
+        message
+        for message in repositories.list_messages(save.id)
+        if message.role == "narrator"
+    )
+    target_state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="zzzz.cobalt_ledger_phrase",
+        value={"phrase": "moonstone opens the cobalt ledger"},
+        category="world_fact",
+        confidence=1.0,
+        source_message_id=source_message.id,
+    )
+    legacy_source = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="state",
+        source_id=target_state.id,
+        title="Cobalt ledger phrase",
+        body="zzzz.cobalt_ledger_phrase: moonstone opens the cobalt ledger",
+        metadata={
+            "fact_type": "world_state",
+            "source_message_ids": [source_message.id],
+        },
+    )
+    assert "state" in context_search_module.INDEXED_CONTEXT_SOURCE_TYPES
+    assert (
+        context_search_module._indexed_candidate_source_type(
+            legacy_source,
+            accepted_observation_ids=frozenset(),
+        )
+        == "world_state"
+    )
+    for index in range(520):
+        repositories.upsert_world_state(
+            save_id=save.id,
+            key=f"aaaa.low_priority_fact_{index:03d}",
+            value={"detail": f"flour shelf marker {index}"},
+            category="world_fact",
+            confidence=1.0,
+            source_message_id=source_message.id,
+        )
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="Which fact says what opens the cobalt ledger?",
+    )
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "world_state",
+                    "source_id": target_state.id,
+                    "relevance_note": "The legacy indexed state answers the query.",
+                }
+            ]
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    prompt = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert "moonstone opens the cobalt ledger" in prompt
+    assert [item.source_id for item in result.selected_state] == [target_state.id]
+
+
 def test_context_search_retrieves_matching_memory_from_index(
     repositories: PersistenceRepositories,
 ) -> None:
