@@ -59,6 +59,7 @@ from bragi.services.agentic_context import (
     NarratorMessageSpec,
     NarratorVerificationResult,
     ObservationService,
+    PlannerRejection,
     StateCommitCandidate,
     StructuredProviderContextCurator,
     StructuredProviderNarratorPlanner,
@@ -1959,6 +1960,18 @@ class ChatService:
                 summary=planner_budgeted_context.summary,
                 context_breakdown=planner_budgeted_context.context_breakdown,
             )
+        )
+        planner_request = replace(
+            planner_request,
+            context_breakdown={
+                **planner_request.context_breakdown,
+                "planner_message_source_ids": list(
+                    _planner_message_source_ids(
+                        messages=messages,
+                        request_messages=planner_request.messages,
+                    )
+                ),
+            },
         )
         narrator_spec = await self._plan_narrator_message_if_configured(
             save_id=save_id,
@@ -7135,6 +7148,32 @@ def _narrator_messages(
     )
 
 
+def _planner_message_source_ids(
+    *,
+    messages: list[MessageRecord],
+    request_messages: tuple[ChatMessage, ...],
+) -> tuple[str, ...]:
+    source_ids: list[str] = []
+    search_start = 0
+    for request_message in request_messages:
+        match_index = next(
+            (
+                index
+                for index in range(search_start, len(messages))
+                if messages[index].role == request_message.role
+                and messages[index].body == request_message.body
+                and messages[index].speaker_name == request_message.speaker_name
+            ),
+            None,
+        )
+        if match_index is None:
+            source_ids.append("")
+            continue
+        source_ids.append(messages[match_index].id)
+        search_start = match_index + 1
+    return tuple(source_ids)
+
+
 def _rich_narrator_request_with_plan(
     request: ChatRequest,
     *,
@@ -7309,7 +7348,10 @@ def _apply_verified_planned_commits(
     verification_result: NarratorVerificationResult | None,
 ) -> tuple[dict[str, object], VerifiedPostTurnCoverage]:
     candidates = tuple(narrator_spec.state_commit_candidates if narrator_spec else ())
-    diagnostics = _planned_commit_diagnostics(candidates)
+    planner_rejections = tuple(
+        narrator_spec.planner_rejections if narrator_spec else ()
+    )
+    diagnostics = _planned_commit_diagnostics(candidates, planner_rejections)
     coverage = _empty_verified_coverage(
         source_message_ids=(player_message_id, narrator_message_id),
     )
@@ -7384,6 +7426,11 @@ def _apply_verified_planned_commits(
                 player_message_id=player_message_id,
                 narrator_message_id=narrator_message_id,
                 candidate=candidate,
+                evidence_source_text_by_id=(
+                    narrator_spec.evidence_source_text_by_id
+                    if narrator_spec is not None
+                    else {}
+                ),
             )
         except Exception as exc:
             log_error_event(
@@ -7423,20 +7470,58 @@ def _apply_verified_planned_commits(
 
 def _planned_commit_diagnostics(
     candidates: tuple[StateCommitCandidate, ...],
+    planner_rejections: tuple[PlannerRejection, ...] = (),
 ) -> dict[str, object]:
     by_type: dict[str, dict[str, int]] = {}
+    by_domain: dict[str, dict[str, int]] = {}
     for candidate in candidates:
         candidate_type = candidate.candidate_type or "unknown"
         bucket = by_type.setdefault(candidate_type, _empty_planned_commit_counts())
         bucket["proposed"] += 1
+        domain_bucket = by_domain.setdefault(
+            _planned_commit_domain(candidate_type),
+            _empty_planned_commit_counts(),
+        )
+        domain_bucket["proposed"] += 1
+    decisions = [
+        {
+            **rejection.to_json(),
+            "status": "rejected",
+            "safe_to_commit": False,
+            "application_status": "rejected",
+            "changed": False,
+        }
+        for rejection in planner_rejections
+    ]
+    by_reason: dict[str, int] = {}
+    for rejection in planner_rejections:
+        type_bucket = by_type.setdefault(
+            rejection.candidate_type,
+            _empty_planned_commit_counts(),
+        )
+        type_bucket["proposed"] += 1
+        type_bucket["rejected"] += 1
+        type_bucket["skipped"] += 1
+        domain_bucket = by_domain.setdefault(
+            rejection.domain,
+            _empty_planned_commit_counts(),
+        )
+        domain_bucket["proposed"] += 1
+        domain_bucket["rejected"] += 1
+        domain_bucket["skipped"] += 1
+        by_reason[rejection.reason] = by_reason.get(rejection.reason, 0) + 1
     return {
-        "proposed_count": len(candidates),
+        "proposed_count": len(candidates) + len(planner_rejections),
         "committed_count": 0,
-        "skipped_count": 0,
+        "queued_count": 0,
+        "rejected_count": len(planner_rejections),
+        "skipped_count": len(planner_rejections),
         "contradicted_count": 0,
         "confirmation_queued_count": 0,
         "by_type": by_type,
-        "decisions": [],
+        "by_domain": by_domain,
+        "by_reason": by_reason,
+        "decisions": decisions,
         "coverage": VerifiedPostTurnCoverage().to_json(),
     }
 
@@ -7469,6 +7554,8 @@ def _verified_post_turn_coverage_for_turn(
         scene_presence_character_ids=coverage.scene_presence_character_ids,
         memory_fingerprints=coverage.memory_fingerprints,
         knowledge_edge_targets=coverage.knowledge_edge_targets,
+        applied_domains=coverage.applied_domains,
+        queued_domains=coverage.queued_domains,
         committed_count=coverage.committed_count,
         confirmation_queued_count=coverage.confirmation_queued_count,
         metadata=coverage.metadata,
@@ -7496,6 +7583,18 @@ def _coverage_with_planned_commit_metadata(
                 diagnostics,
                 "contradicted_count",
             ),
+            "planned_commit_committed_count": _int_diagnostic(
+                diagnostics,
+                "committed_count",
+            ),
+            "planned_commit_queued_count": _int_diagnostic(
+                diagnostics,
+                "queued_count",
+            ),
+            "planned_commit_rejected_count": _int_diagnostic(
+                diagnostics,
+                "rejected_count",
+            ),
             "planned_commit_verifier_available": verification_result is not None,
             "planned_commit_verification_passed": (
                 verification_result.passed if verification_result is not None else False
@@ -7519,6 +7618,20 @@ def _effective_post_turn_inference_mode(
         return configured_mode, "configured"
     if _plan_owned_coverage_is_strong(verified_coverage):
         return POST_TURN_INFERENCE_MODE_PLAN_OWNED, "plan_owned_coverage_strong"
+    if verified_coverage.confirmation_queued_count:
+        return (
+            POST_TURN_INFERENCE_MODE_HYBRID,
+            "plan_owned_confirmation_queued_fallback",
+        )
+    if (
+        verified_coverage.committed_count
+        and verified_coverage.metadata.get("planned_commit_post_turn_update_needed")
+        is False
+    ):
+        return (
+            POST_TURN_INFERENCE_MODE_HYBRID,
+            "plan_owned_partial_domain_fallback",
+        )
     return POST_TURN_INFERENCE_MODE_HYBRID, "plan_owned_safety_fallback"
 
 
@@ -7532,15 +7645,7 @@ def _plan_owned_coverage_is_strong(coverage: VerifiedPostTurnCoverage) -> bool:
             metadata.get("planned_commit_verification_passed") is True
             and metadata.get("planned_commit_post_turn_update_needed") is False
         )
-    if (
-        _int_mapping_value(metadata, "planned_commit_skipped_count") > 0
-        or _int_mapping_value(metadata, "planned_commit_contradicted_count") > 0
-    ):
-        return False
-    return (
-        metadata.get("planned_commit_post_turn_update_needed") is False
-        and coverage.committed_count + coverage.confirmation_queued_count > 0
-    )
+    return False
 
 
 def _int_diagnostic(value: Mapping[str, object], key: str) -> int:
@@ -7577,40 +7682,47 @@ def _coverage_with_candidate(
     scene_presence_ids = set(coverage.scene_presence_character_ids)
     memory_fingerprints = set(coverage.memory_fingerprints)
     knowledge_edges = set(coverage.knowledge_edge_targets)
-    if candidate.state_key:
-        state_keys.add(candidate.state_key)
-    if candidate.candidate_type == "scene_presence":
-        character_id = candidate.character_id or _string_mapping_value(
-            candidate.value,
-            "character_id",
-        )
-        if character_id:
-            scene_presence_ids.add(character_id)
-    elif candidate.candidate_type == "scene_snapshot_field":
-        field_path = candidate.field_path or candidate.state_key.removeprefix(
-            "scene_snapshot."
-        )
-        if field_path:
-            scene_fields.add(field_path)
-    elif candidate.candidate_type == "character_learned_memory":
-        body = _string_mapping_value(candidate.value, "body")
-        if body:
-            memory_fingerprints.add(memory_fingerprint(body))
-    elif candidate.candidate_type == "character_knowledge_edge":
-        character_id = candidate.character_id or _string_mapping_value(
-            candidate.value,
-            "character_id",
-        )
-        target_type = candidate.target_type or _string_mapping_value(
-            candidate.value,
-            "target_type",
-        )
-        target_id = candidate.target_id or _string_mapping_value(
-            candidate.value,
-            "target_id",
-        )
-        if character_id and target_type and target_id:
-            knowledge_edges.add((character_id, target_type, target_id))
+    applied_domains = set(coverage.applied_domains)
+    queued_domains = set(coverage.queued_domains)
+    domain = _planned_commit_domain(candidate.candidate_type)
+    if committed:
+        applied_domains.add(domain)
+        if candidate.state_key:
+            state_keys.add(candidate.state_key)
+        if candidate.candidate_type == "scene_presence":
+            character_id = candidate.character_id or _string_mapping_value(
+                candidate.value,
+                "character_id",
+            )
+            if character_id:
+                scene_presence_ids.add(character_id)
+        elif candidate.candidate_type == "scene_snapshot_field":
+            field_path = candidate.field_path or candidate.state_key.removeprefix(
+                "scene_snapshot."
+            )
+            if field_path:
+                scene_fields.add(field_path)
+        elif candidate.candidate_type == "character_learned_memory":
+            body = _string_mapping_value(candidate.value, "body")
+            if body:
+                memory_fingerprints.add(memory_fingerprint(body))
+        elif candidate.candidate_type == "character_knowledge_edge":
+            character_id = candidate.character_id or _string_mapping_value(
+                candidate.value,
+                "character_id",
+            )
+            target_type = candidate.target_type or _string_mapping_value(
+                candidate.value,
+                "target_type",
+            )
+            target_id = candidate.target_id or _string_mapping_value(
+                candidate.value,
+                "target_id",
+            )
+            if character_id and target_type and target_id:
+                knowledge_edges.add((character_id, target_type, target_id))
+    elif confirmation_queued:
+        queued_domains.add(domain)
     return VerifiedPostTurnCoverage(
         source_message_ids=coverage.source_message_ids,
         state_keys=frozenset(state_keys),
@@ -7618,6 +7730,8 @@ def _coverage_with_candidate(
         scene_presence_character_ids=frozenset(scene_presence_ids),
         memory_fingerprints=frozenset(memory_fingerprints),
         knowledge_edge_targets=frozenset(knowledge_edges),
+        applied_domains=frozenset(applied_domains),
+        queued_domains=frozenset(queued_domains),
         committed_count=coverage.committed_count + (1 if committed else 0),
         confirmation_queued_count=(
             coverage.confirmation_queued_count + (1 if confirmation_queued else 0)
@@ -7630,6 +7744,8 @@ def _empty_planned_commit_counts() -> dict[str, int]:
     return {
         "proposed": 0,
         "committed": 0,
+        "queued": 0,
+        "rejected": 0,
         "skipped": 0,
         "contradicted": 0,
         "confirmation_queued": 0,
@@ -7655,10 +7771,14 @@ def _record_planned_commit_decision(
             cast(int, diagnostics["committed_count"]) + 1
         )
     elif application_status == "confirmation_queued":
+        diagnostics["queued_count"] = cast(int, diagnostics["queued_count"]) + 1
         diagnostics["confirmation_queued_count"] = (
             cast(int, diagnostics["confirmation_queued_count"]) + 1
         )
     else:
+        diagnostics["rejected_count"] = (
+            cast(int, diagnostics["rejected_count"]) + 1
+        )
         diagnostics["skipped_count"] = cast(int, diagnostics["skipped_count"]) + 1
     if status == "contradicted":
         diagnostics["contradicted_count"] = (
@@ -7669,11 +7789,28 @@ def _record_planned_commit_decision(
     if application_status == "committed":
         bucket["committed"] += 1
     elif application_status == "confirmation_queued":
+        bucket["queued"] += 1
         bucket["confirmation_queued"] += 1
     else:
+        bucket["rejected"] += 1
         bucket["skipped"] += 1
     if status == "contradicted":
         bucket["contradicted"] += 1
+    domain = _planned_commit_domain(candidate_type)
+    by_domain = cast(dict[str, dict[str, int]], diagnostics["by_domain"])
+    domain_bucket = by_domain.setdefault(domain, _empty_planned_commit_counts())
+    if application_status == "committed":
+        domain_bucket["committed"] += 1
+    elif application_status == "confirmation_queued":
+        domain_bucket["queued"] += 1
+        domain_bucket["confirmation_queued"] += 1
+    else:
+        domain_bucket["rejected"] += 1
+        domain_bucket["skipped"] += 1
+        by_reason = cast(dict[str, int], diagnostics["by_reason"])
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    if status == "contradicted":
+        domain_bucket["contradicted"] += 1
     decisions = cast(list[dict[str, object]], diagnostics["decisions"])
     decisions.append(
         {
@@ -7686,6 +7823,15 @@ def _record_planned_commit_decision(
             "changed": changed,
         }
     )
+
+
+def _planned_commit_domain(candidate_type: str) -> str:
+    return {
+        "scene_presence": "scene_presence",
+        "scene_snapshot_field": "scene_snapshot",
+        "character_learned_memory": "memories",
+        "character_knowledge_edge": "knowledge_edges",
+    }.get(candidate_type, "unknown")
 
 
 def _planned_commit_decision_allows_commit(
@@ -7727,6 +7873,7 @@ def _apply_planned_commit_candidate(
     player_message_id: str,
     narrator_message_id: str,
     candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
 ) -> tuple[str, str, bool]:
     if candidate.candidate_type == "scene_presence":
         return _apply_scene_presence_candidate(
@@ -7735,6 +7882,7 @@ def _apply_planned_commit_candidate(
             player_message_id=player_message_id,
             narrator_message_id=narrator_message_id,
             candidate=candidate,
+            evidence_source_text_by_id=evidence_source_text_by_id,
         )
     if candidate.candidate_type == "scene_snapshot_field":
         return _apply_scene_snapshot_field_candidate(
@@ -7743,6 +7891,7 @@ def _apply_planned_commit_candidate(
             player_message_id=player_message_id,
             narrator_message_id=narrator_message_id,
             candidate=candidate,
+            evidence_source_text_by_id=evidence_source_text_by_id,
         )
     if candidate.candidate_type == "character_learned_memory":
         return _apply_character_learned_memory_candidate(
@@ -7751,6 +7900,7 @@ def _apply_planned_commit_candidate(
             player_message_id=player_message_id,
             narrator_message_id=narrator_message_id,
             candidate=candidate,
+            evidence_source_text_by_id=evidence_source_text_by_id,
         )
     if candidate.candidate_type == "character_knowledge_edge":
         return _apply_character_knowledge_edge_candidate(
@@ -7759,6 +7909,7 @@ def _apply_planned_commit_candidate(
             player_message_id=player_message_id,
             narrator_message_id=narrator_message_id,
             candidate=candidate,
+            evidence_source_text_by_id=evidence_source_text_by_id,
         )
     return "skipped", "unsupported_candidate_type", False
 
@@ -7770,6 +7921,7 @@ def _apply_scene_presence_candidate(
     player_message_id: str,
     narrator_message_id: str,
     candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
 ) -> tuple[str, str, bool]:
     character_id = candidate.character_id or _string_mapping_value(
         candidate.value,
@@ -7787,6 +7939,7 @@ def _apply_scene_presence_candidate(
         player_message_id=player_message_id,
         narrator_message_id=narrator_message_id,
         candidate=candidate,
+        evidence_source_text_by_id=evidence_source_text_by_id,
     ):
         return "skipped", "ungrounded_evidence_metadata", False
     action = _string_mapping_value(candidate.value, "action").lower()
@@ -7847,6 +8000,7 @@ def _apply_scene_snapshot_field_candidate(
     player_message_id: str,
     narrator_message_id: str,
     candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
 ) -> tuple[str, str, bool]:
     snapshot = repositories.get_scene_snapshot(save_id)
     if snapshot is None:
@@ -7868,6 +8022,7 @@ def _apply_scene_snapshot_field_candidate(
         player_message_id=player_message_id,
         narrator_message_id=narrator_message_id,
         candidate=candidate,
+        evidence_source_text_by_id=evidence_source_text_by_id,
     ):
         return "skipped", "ungrounded_evidence_metadata", False
     changed = getattr(snapshot, field_path) != value
@@ -7997,6 +8152,7 @@ def _apply_character_learned_memory_candidate(
     player_message_id: str,
     narrator_message_id: str,
     candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
 ) -> tuple[str, str, bool]:
     character_id = candidate.character_id or _string_mapping_value(
         candidate.value,
@@ -8017,6 +8173,7 @@ def _apply_character_learned_memory_candidate(
         player_message_id=player_message_id,
         narrator_message_id=narrator_message_id,
         candidate=candidate,
+        evidence_source_text_by_id=evidence_source_text_by_id,
     ):
         return "skipped", "ungrounded_evidence_metadata", False
     body = _string_mapping_value(candidate.value, "body")
@@ -8100,6 +8257,7 @@ def _apply_character_knowledge_edge_candidate(
     player_message_id: str,
     narrator_message_id: str,
     candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
 ) -> tuple[str, str, bool]:
     character_id = candidate.character_id or _string_mapping_value(
         candidate.value,
@@ -8120,6 +8278,7 @@ def _apply_character_knowledge_edge_candidate(
         player_message_id=player_message_id,
         narrator_message_id=narrator_message_id,
         candidate=candidate,
+        evidence_source_text_by_id=evidence_source_text_by_id,
     ):
         return "skipped", "ungrounded_evidence_metadata", False
     target_type = candidate.target_type or _string_mapping_value(
@@ -8187,6 +8346,7 @@ def _planned_commit_evidence_is_grounded(
     player_message_id: str,
     narrator_message_id: str,
     candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
 ) -> bool:
     quote = _planned_commit_evidence_quote(candidate)
     if not candidate.evidence_source_ids or not quote:
@@ -8197,7 +8357,7 @@ def _planned_commit_evidence_is_grounded(
         for message in repositories.list_messages(save_id)
         if message.id in message_ids
     }
-    source_text_by_id: dict[str, str] = {}
+    source_text_by_id = dict(evidence_source_text_by_id)
     player_message = messages_by_id.get(player_message_id)
     if player_message is not None:
         source_text_by_id[f"message:{player_message_id}"] = player_message.body

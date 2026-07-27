@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+import re
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
-from bragi.persistence.models import ContextObservationRecord, MessageRecord
+from bragi.persistence.models import (
+    CharacterRecord,
+    ContextObservationRecord,
+    MessageRecord,
+)
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.chat_rendering import rendered_chat_request_text
 from bragi.providers.contracts import (
@@ -147,6 +152,26 @@ class StateCommitCandidate:
 
 
 @dataclass(frozen=True)
+class PlannerRejection:
+    candidate_id: str
+    candidate_type: str
+    domain: str
+    reason: str
+    field: str
+    rejected_value: str
+
+    def to_json(self) -> dict[str, str]:
+        return {
+            "candidate_id": self.candidate_id,
+            "candidate_type": self.candidate_type,
+            "domain": self.domain,
+            "reason": self.reason,
+            "field": self.field,
+            "rejected_value": self.rejected_value,
+        }
+
+
+@dataclass(frozen=True)
 class NarratorCommitDecision:
     candidate_id: str
     candidate_type: str
@@ -180,6 +205,19 @@ class NarratorMessageSpec:
     required_facts: tuple[RequiredFact, ...] = ()
     agency_constraints: tuple[PlayerAgencyConstraint, ...] = ()
     state_commit_candidates: tuple[StateCommitCandidate, ...] = ()
+    planner_rejections: tuple[PlannerRejection, ...] = ()
+    evidence_source_text_by_id: dict[str, str] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+
+
+@dataclass(frozen=True)
+class _PlannerInventory:
+    source_text_by_id: dict[str, str] = field(default_factory=dict)
+    characters: tuple[CharacterRecord, ...] = ()
+    enforce_canonical_ids: bool = False
 
 
 @dataclass(frozen=True)
@@ -761,13 +799,23 @@ class StructuredProviderNarratorPlanner:
         save_id: str,
         request: ChatRequest,
     ) -> NarratorMessageSpec:
+        inventory = _planner_inventory(
+            request=request,
+            repositories=self.repositories,
+            save_id=save_id,
+        )
         structured_request = request_with_openrouter_routing(
             self.repositories,
             StructuredOutputRequest(
                 provider=self.provider_name,
                 model_id=self.model_id,
                 schema_name="narrator_message_plan",
-                schema=_planner_schema(),
+                schema=_planner_schema(
+                    evidence_source_ids=tuple(inventory.source_text_by_id),
+                    character_ids=tuple(
+                        sorted(character.id for character in inventory.characters)
+                    ),
+                ),
                 messages=_planner_messages(request),
                 temperature=0.0,
             ),
@@ -782,7 +830,10 @@ class StructuredProviderNarratorPlanner:
             task="response_planning",
             save_id=save_id,
         )
-        return _narrator_message_spec_from_data(response.data)
+        return _narrator_message_spec_from_data(
+            response.data,
+            inventory=inventory,
+        )
 
 
 class StructuredProviderNarratorVerifier:
@@ -1478,14 +1529,209 @@ def _structured_request_with_script_policy_feedback(
     )
 
 
-def _planner_schema() -> dict[str, object]:
+_PLANNER_SOURCE_MARKER = re.compile(r"\[([a-z][a-z0-9_]*):([^\]]+)\]")
+
+
+def _planner_inventory(
+    *,
+    request: ChatRequest,
+    repositories: PersistenceRepositories | None,
+    save_id: str,
+) -> _PlannerInventory:
+    if repositories is None:
+        return _PlannerInventory()
+    allowed_ids = _included_planner_source_ids(request.context_breakdown)
+    character_ids = {
+        source_id.split(":", 1)[1]
+        for source_id in allowed_ids
+        if source_id.startswith(("character:", "character_voice:"))
+        and ":" in source_id
+    }
+    characters = tuple(
+        character
+        for character_id in sorted(character_ids)
+        if (character := repositories.get_character(character_id)) is not None
+        and character.save_id == save_id
+    )
+    source_text_by_id: dict[str, str] = {}
+    request_texts = _planner_request_source_texts(request)
+    for text in request_texts:
+        for source_type, source_id in _PLANNER_SOURCE_MARKER.findall(text):
+            canonical_id = f"{source_type}:{source_id.strip()}"
+            if source_id.strip():
+                allowed_ids.add(canonical_id)
+                source_text_by_id[canonical_id] = text
+    raw_message_source_ids = request.context_breakdown.get(
+        "planner_message_source_ids"
+    )
+    if isinstance(raw_message_source_ids, list):
+        for chat_message, raw_source_id in zip(
+            request.messages,
+            raw_message_source_ids,
+            strict=False,
+        ):
+            source_id = _string(raw_source_id)
+            if not source_id:
+                continue
+            canonical_id = f"message:{source_id}"
+            allowed_ids.add(canonical_id)
+            source_text_by_id[canonical_id] = chat_message.body
+    for source_id in tuple(allowed_ids):
+        if not source_id.startswith("message:"):
+            continue
+        message = repositories.get_message(
+            save_id=save_id,
+            message_id=source_id.removeprefix("message:")
+        )
+        if message is not None:
+            source_text_by_id[source_id] = message.body
+    source_text_by_id.update(_planner_breakdown_source_texts(request))
+    allowed_ids.add("message:latest")
+    ordered_source_text = {
+        source_id: source_text_by_id.get(source_id, "")
+        for source_id in sorted(allowed_ids - {"message:latest"})
+    }
+    ordered_source_text["message:latest"] = ""
+    return _PlannerInventory(
+        source_text_by_id=ordered_source_text,
+        characters=characters,
+        enforce_canonical_ids=True,
+    )
+
+
+def _included_planner_source_ids(
+    context_breakdown: dict[str, object],
+) -> set[str]:
+    raw_sources = context_breakdown.get("sources")
+    if not isinstance(raw_sources, list):
+        return set()
+    source_ids: set[str] = set()
+    for raw_source in raw_sources:
+        if not isinstance(raw_source, dict) or raw_source.get("included") is False:
+            continue
+        source_type = _string(raw_source.get("source_type"))
+        raw_source_ids = _string(raw_source.get("source_id"))
+        if not source_type or not raw_source_ids:
+            continue
+        source_ids.update(
+            f"{source_type}:{source_id.strip()}"
+            for source_id in raw_source_ids.split(",")
+            if source_id.strip()
+        )
+    return source_ids
+
+
+def _planner_breakdown_source_texts(request: ChatRequest) -> dict[str, str]:
+    tier_texts: dict[str, tuple[str, ...]] = {
+        "scenario_header": (request.scenario_instructions,),
+        "character_voice_profiles": request.character_voice_profiles,
+        "open_obligations": request.open_obligations,
+        "pending_context_suggestions": request.pending_context_suggestions,
+        "retrieved_scenario_sections": request.retrieved_scenario_sections,
+        "retrieved_state": request.retrieved_state,
+        "retrieved_state_changes": request.retrieved_state_changes,
+        "retrieved_recent_messages": request.retrieved_recent_messages,
+        "retrieved_media_assets": request.retrieved_media_assets,
+        "retrieved_character_text_context": (
+            request.retrieved_character_text_context
+        ),
+        "retrieved_memories": request.retrieved_memories,
+        "retrieved_observations": request.retrieved_observations,
+        "summary": (request.summary or "",),
+    }
+    current_scene_tiers = {
+        "current_scene",
+        "current_location",
+        "present_characters",
+        "legacy_scene_state",
+        "active_threads",
+        "active_linked_facts",
+        "active_participant_facts",
+        "dating_route_pacing",
+        "pre_turn_scene_hints",
+        "current_scene_recap",
+    }
+    current_scene_index = 0
+    tier_indexes: dict[str, int] = {}
+    source_texts: dict[str, str] = {}
+    raw_sources = request.context_breakdown.get("sources")
+    if not isinstance(raw_sources, list):
+        return source_texts
+    for raw_source in raw_sources:
+        if not isinstance(raw_source, dict) or raw_source.get("included") is False:
+            continue
+        tier = _string(raw_source.get("tier"))
+        if tier in current_scene_tiers:
+            text = (
+                request.current_scene_recap[current_scene_index]
+                if current_scene_index < len(request.current_scene_recap)
+                else ""
+            )
+            current_scene_index += 1
+        else:
+            values = tier_texts.get(tier, ())
+            index = tier_indexes.get(tier, 0)
+            text = values[index] if index < len(values) else ""
+            tier_indexes[tier] = index + 1
+        source_type = _string(raw_source.get("source_type"))
+        raw_source_ids = _string(raw_source.get("source_id"))
+        if not text or not source_type or not raw_source_ids:
+            continue
+        for source_id in raw_source_ids.split(","):
+            if source_id.strip():
+                source_texts[f"{source_type}:{source_id.strip()}"] = text
+    return source_texts
+
+
+def _planner_request_source_texts(request: ChatRequest) -> tuple[str, ...]:
+    texts: list[str] = [message.body for message in request.messages]
+    for value in (
+        request.scenario_instructions,
+        request.user_narration_guidance,
+        request.custom_instructions,
+        request.regeneration_feedback,
+        request.turn_directive,
+        request.summary or "",
+        *request.phone_activity_context,
+        *request.phone_context,
+        *request.current_scene_recap,
+        *request.character_voice_profiles,
+        *request.character_action_plans,
+        *request.open_obligations,
+        *request.pending_context_suggestions,
+        *request.retrieved_scenario_sections,
+        *request.retrieved_state,
+        *request.retrieved_state_changes,
+        *request.retrieved_recent_messages,
+        *request.retrieved_media_assets,
+        *request.retrieved_character_text_context,
+        *request.retrieved_memories,
+        *request.retrieved_observations,
+    ):
+        if value:
+            texts.append(value)
+    return tuple(texts)
+
+
+def _planner_schema(
+    *,
+    evidence_source_ids: tuple[str, ...] = (),
+    character_ids: tuple[str, ...] = (),
+) -> dict[str, object]:
     string_array = {"type": "array", "items": {"type": "string"}}
+    evidence_item: dict[str, object] = {"type": "string"}
+    if evidence_source_ids:
+        evidence_item["enum"] = list(evidence_source_ids)
+    evidence_array = {"type": "array", "items": evidence_item}
+    character_id_schema: dict[str, object] = {"type": "string"}
+    if character_ids:
+        character_id_schema["enum"] = ["", *character_ids]
     narrative_beat = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
             "description": {"type": "string"},
-            "evidence_source_ids": string_array,
+            "evidence_source_ids": evidence_array,
         },
         "required": ["description", "evidence_source_ids"],
     }
@@ -1494,7 +1740,7 @@ def _planner_schema() -> dict[str, object]:
         "additionalProperties": False,
         "properties": {
             "fact": {"type": "string"},
-            "evidence_source_ids": string_array,
+            "evidence_source_ids": evidence_array,
         },
         "required": ["fact", "evidence_source_ids"],
     }
@@ -1504,7 +1750,7 @@ def _planner_schema() -> dict[str, object]:
         "properties": {
             "constraint": {"type": "string"},
             "reason": {"type": "string"},
-            "evidence_source_ids": string_array,
+            "evidence_source_ids": evidence_array,
         },
         "required": ["constraint", "reason", "evidence_source_ids"],
     }
@@ -1512,7 +1758,7 @@ def _planner_schema() -> dict[str, object]:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "character_id": {"type": "string"},
+            "character_id": character_id_schema,
             "character_name": {"type": "string"},
             "stance": {"type": "string"},
             "current_goal": {"type": "string"},
@@ -1523,7 +1769,7 @@ def _planner_schema() -> dict[str, object]:
             "route_stage": {"type": "string"},
             "max_plausible_escalation": {"type": "string"},
             "reason": {"type": "string"},
-            "evidence_source_ids": string_array,
+            "evidence_source_ids": evidence_array,
         },
         "required": [
             "character_id",
@@ -1560,14 +1806,14 @@ def _planner_schema() -> dict[str, object]:
             },
             "state_key": {"type": "string"},
             "field_path": {"type": "string"},
-            "character_id": {"type": "string"},
+            "character_id": character_id_schema,
             "target_type": {"type": "string"},
             "target_id": {"type": "string"},
             "value": {"type": "object"},
             "safe_without_narration_allowed": {"type": "boolean"},
             "reason": {"type": "string"},
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "evidence_source_ids": string_array,
+            "evidence_source_ids": evidence_array,
             "evidence_quote": {"type": "string"},
         },
         "required": [
@@ -1612,7 +1858,7 @@ def _planner_schema() -> dict[str, object]:
             },
             "tone": {"type": "string"},
             "uncertainties": string_array,
-            "evidence_source_ids": string_array,
+            "evidence_source_ids": evidence_array,
             "npc_intents": {"type": "array", "items": npc_intent, "maxItems": 12},
             "state_commit_candidates": {
                 "type": "array",
@@ -1673,8 +1919,12 @@ def _planner_messages(request: ChatRequest) -> tuple[ChatMessage, ...]:
     )
 
 
-def _narrator_message_spec_from_data(data: dict[str, object]) -> NarratorMessageSpec:
-    return NarratorMessageSpec(
+def _narrator_message_spec_from_data(
+    data: dict[str, object],
+    *,
+    inventory: _PlannerInventory | None = None,
+) -> NarratorMessageSpec:
+    spec = NarratorMessageSpec(
         intent=_string(data.get("intent")),
         thesis=_string(data.get("thesis")),
         must_say=_string_tuple(data.get("must_say")),
@@ -1692,6 +1942,287 @@ def _narrator_message_spec_from_data(data: dict[str, object]) -> NarratorMessage
         ),
         npc_intents=_npc_intents_from_data(data.get("npc_intents")),
     )
+    if inventory is None or not inventory.enforce_canonical_ids:
+        return spec
+    return _validated_narrator_message_spec(spec, inventory=inventory)
+
+
+def _validated_narrator_message_spec(
+    spec: NarratorMessageSpec,
+    *,
+    inventory: _PlannerInventory,
+) -> NarratorMessageSpec:
+    rejections: list[PlannerRejection] = []
+    candidates: list[StateCommitCandidate] = []
+    for candidate in spec.state_commit_candidates:
+        invalid_source_id = next(
+            (
+                source_id
+                for source_id in candidate.evidence_source_ids
+                if source_id not in inventory.source_text_by_id
+            ),
+            "",
+        )
+        if invalid_source_id:
+            rejections.append(
+                _planner_rejection(
+                    candidate=candidate,
+                    reason="unknown_evidence_source_id",
+                    field_name="evidence_source_ids",
+                    rejected_value=invalid_source_id,
+                )
+            )
+            continue
+        if not _planner_candidate_evidence_is_grounded(
+            candidate,
+            source_text_by_id=inventory.source_text_by_id,
+        ):
+            rejections.append(
+                _planner_rejection(
+                    candidate=candidate,
+                    reason="evidence_quote_not_found",
+                    field_name="evidence_quote",
+                    rejected_value=candidate.evidence_quote,
+                )
+            )
+            continue
+        resolved_candidate, identity_rejection = _candidate_with_canonical_character(
+            candidate,
+            characters=inventory.characters,
+        )
+        if identity_rejection is not None:
+            rejections.append(identity_rejection)
+            continue
+        candidates.append(resolved_candidate)
+    npc_intents: list[NpcIntent] = []
+    for intent in spec.npc_intents:
+        resolved_id, reason = _resolve_character_id(
+            intent.character_id or intent.character_name,
+            characters=inventory.characters,
+        )
+        invalid_source_id = next(
+            (
+                source_id
+                for source_id in intent.evidence_source_ids
+                if source_id not in inventory.source_text_by_id
+            ),
+            "",
+        )
+        if invalid_source_id:
+            rejections.append(
+                PlannerRejection(
+                    candidate_id=f"npc_intent:{intent.character_name}",
+                    candidate_type="npc_intent",
+                    domain="character_state",
+                    reason="unknown_evidence_source_id",
+                    field="evidence_source_ids",
+                    rejected_value=invalid_source_id,
+                )
+            )
+            continue
+        if reason is not None:
+            rejections.append(
+                PlannerRejection(
+                    candidate_id=f"npc_intent:{intent.character_name}",
+                    candidate_type="npc_intent",
+                    domain="character_state",
+                    reason=reason,
+                    field="character_id",
+                    rejected_value=intent.character_id or intent.character_name,
+                )
+            )
+            continue
+        npc_intents.append(replace(intent, character_id=resolved_id))
+    valid_top_level_evidence = _validated_evidence_ids(
+        spec.evidence_source_ids,
+        inventory=inventory,
+        rejections=rejections,
+        candidate_id="narration",
+        candidate_type="narration",
+    )
+    narrative_beats = tuple(
+        replace(
+            beat,
+            evidence_source_ids=_validated_evidence_ids(
+                beat.evidence_source_ids,
+                inventory=inventory,
+                rejections=rejections,
+                candidate_id=f"narrative_beat:{index}",
+                candidate_type="narrative_beat",
+            ),
+        )
+        for index, beat in enumerate(spec.narrative_beats)
+    )
+    required_facts = tuple(
+        replace(
+            fact,
+            evidence_source_ids=_validated_evidence_ids(
+                fact.evidence_source_ids,
+                inventory=inventory,
+                rejections=rejections,
+                candidate_id=f"required_fact:{index}",
+                candidate_type="required_fact",
+            ),
+        )
+        for index, fact in enumerate(spec.required_facts)
+    )
+    agency_constraints = tuple(
+        replace(
+            constraint,
+            evidence_source_ids=_validated_evidence_ids(
+                constraint.evidence_source_ids,
+                inventory=inventory,
+                rejections=rejections,
+                candidate_id=f"agency_constraint:{index}",
+                candidate_type="agency_constraint",
+            ),
+        )
+        for index, constraint in enumerate(spec.agency_constraints)
+    )
+    return replace(
+        spec,
+        evidence_source_ids=valid_top_level_evidence,
+        narrative_beats=narrative_beats,
+        required_facts=required_facts,
+        agency_constraints=agency_constraints,
+        npc_intents=tuple(npc_intents),
+        state_commit_candidates=tuple(candidates),
+        planner_rejections=tuple(rejections),
+        evidence_source_text_by_id=dict(inventory.source_text_by_id),
+    )
+
+
+def _validated_evidence_ids(
+    source_ids: tuple[str, ...],
+    *,
+    inventory: _PlannerInventory,
+    rejections: list[PlannerRejection],
+    candidate_id: str,
+    candidate_type: str,
+) -> tuple[str, ...]:
+    valid: list[str] = []
+    for source_id in source_ids:
+        if source_id in inventory.source_text_by_id:
+            valid.append(source_id)
+            continue
+        rejections.append(
+            PlannerRejection(
+                candidate_id=candidate_id,
+                candidate_type=candidate_type,
+                domain="narration",
+                reason="unknown_evidence_source_id",
+                field="evidence_source_ids",
+                rejected_value=source_id,
+            )
+        )
+    return tuple(valid)
+
+
+def _planner_candidate_evidence_is_grounded(
+    candidate: StateCommitCandidate,
+    *,
+    source_text_by_id: dict[str, str],
+) -> bool:
+    if not candidate.evidence_source_ids or not candidate.evidence_quote:
+        return False
+    for source_id in candidate.evidence_source_ids:
+        source_text = source_text_by_id.get(source_id, "")
+        if source_id == "message:latest" and not source_text:
+            return True
+        if source_text and quote_matches_source(candidate.evidence_quote, source_text):
+            return True
+    return False
+
+
+def _candidate_with_canonical_character(
+    candidate: StateCommitCandidate,
+    *,
+    characters: tuple[CharacterRecord, ...],
+) -> tuple[StateCommitCandidate, PlannerRejection | None]:
+    if candidate.candidate_type not in {
+        "scene_presence",
+        "character_learned_memory",
+        "character_knowledge_edge",
+    }:
+        return candidate, None
+    raw_character_id = candidate.character_id or _string(
+        candidate.value.get("character_id")
+    )
+    resolved_id, reason = _resolve_character_id(
+        raw_character_id,
+        characters=characters,
+    )
+    if reason is not None:
+        return (
+            candidate,
+            _planner_rejection(
+                candidate=candidate,
+                reason=reason,
+                field_name="character_id",
+                rejected_value=raw_character_id,
+            ),
+        )
+    value = dict(candidate.value)
+    if "character_id" in value:
+        value["character_id"] = resolved_id
+    return replace(candidate, character_id=resolved_id, value=value), None
+
+
+def _resolve_character_id(
+    value: str,
+    *,
+    characters: tuple[CharacterRecord, ...],
+) -> tuple[str, str | None]:
+    normalized = value.strip()
+    characters_by_id = {character.id: character for character in characters}
+    if normalized in characters_by_id:
+        return normalized, None
+    if normalized.startswith("character:"):
+        unprefixed = normalized.removeprefix("character:")
+        if unprefixed in characters_by_id:
+            return unprefixed, None
+    name_key = normalized.casefold()
+    matching_ids = {
+        character.id
+        for character in characters
+        if name_key
+        and name_key
+        in {
+            character.name.strip().casefold(),
+            *(alias.strip().casefold() for alias in character.aliases),
+        }
+    }
+    if len(matching_ids) == 1:
+        return next(iter(matching_ids)), None
+    if len(matching_ids) > 1:
+        return "", "ambiguous_character_name"
+    return "", "unknown_character_id"
+
+
+def _planner_rejection(
+    *,
+    candidate: StateCommitCandidate,
+    reason: str,
+    field_name: str,
+    rejected_value: str,
+) -> PlannerRejection:
+    return PlannerRejection(
+        candidate_id=candidate.candidate_id,
+        candidate_type=candidate.candidate_type or "unknown",
+        domain=_planner_candidate_domain(candidate.candidate_type),
+        reason=reason,
+        field=field_name,
+        rejected_value=rejected_value,
+    )
+
+
+def _planner_candidate_domain(candidate_type: str) -> str:
+    return {
+        "scene_presence": "scene_presence",
+        "scene_snapshot_field": "scene_snapshot",
+        "character_learned_memory": "memories",
+        "character_knowledge_edge": "knowledge_edges",
+    }.get(candidate_type, "unknown")
 
 
 def _narrative_beats_from_data(value: object) -> tuple[NarrativeBeat, ...]:
