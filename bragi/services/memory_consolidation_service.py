@@ -163,7 +163,7 @@ class MemoryConsolidationService:
                 )
             async with _apply_guard_context(apply_guard):
                 batch_results: list[MemoryConsolidationResult] = []
-                self.repositories.begin_transaction()
+                self.repositories.begin_immediate_transaction()
                 transaction_started = True
                 for batch, clusters in batch_clusters:
                     batch_results.append(
@@ -360,6 +360,13 @@ class MemoryConsolidationService:
                 rejected_count += 1
                 continue
             source_message_ids = _union_memory_source_ids((canonical, *merged))
+            source_observation_ids = list(
+                dict.fromkeys(
+                    observation_id
+                    for memory in (canonical, *merged)
+                    for observation_id in memory.source_observation_ids
+                )
+            )
             before = _memory_audit_value(canonical)
             updated = self.repositories.update_memory(
                 memory_id=canonical.id,
@@ -367,6 +374,7 @@ class MemoryConsolidationService:
                 tags=list(cluster.tags),
                 importance=cluster.importance,
                 source_message_ids=source_message_ids,
+                source_observation_ids=source_observation_ids,
             )
             self.repositories.add_context_update_audit(
                 save_id=save_id,

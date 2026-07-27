@@ -10524,7 +10524,9 @@ def test_run_context_cleanup_locks_apply_and_finalize_after_provider_calls(
     )
     precomputed_save_ids: list[str] = []
 
-    original_begin_transaction = repositories.begin_transaction
+    original_begin_immediate_transaction = (
+        repositories.begin_immediate_transaction
+    )
     original_update_job = repositories.update_job
 
     class InstrumentedSaveOperationLock:
@@ -10551,10 +10553,10 @@ def test_run_context_cleanup_locks_apply_and_finalize_after_provider_calls(
         events.append("lock:requested")
         return InstrumentedSaveOperationLock()
 
-    def begin_transaction() -> None:
+    def begin_immediate_transaction() -> None:
         assert lock_depth == 1
-        events.append("apply:begin_transaction")
-        original_begin_transaction()
+        events.append("apply:begin_immediate_transaction")
+        original_begin_immediate_transaction()
 
     def update_job(
         job_id: str,
@@ -10577,7 +10579,11 @@ def test_run_context_cleanup_locks_apply_and_finalize_after_provider_calls(
         assert lock_depth == 0
         precomputed_save_ids.append(save_id)
 
-    monkeypatch.setattr(repositories, "begin_transaction", begin_transaction)
+    monkeypatch.setattr(
+        repositories,
+        "begin_immediate_transaction",
+        begin_immediate_transaction,
+    )
     monkeypatch.setattr(repositories, "update_job", update_job)
     monkeypatch.setattr(controller, "_save_operation_lock", save_operation_lock)
     controller.precompute_next_turn_context = precompute
@@ -10598,7 +10604,7 @@ def test_run_context_cleanup_locks_apply_and_finalize_after_provider_calls(
         "provider:context_cleanup_actions",
         "lock:requested",
         "lock:enter",
-        "apply:begin_transaction",
+        "apply:begin_immediate_transaction",
         "job:succeeded",
         "lock:exit",
     ]

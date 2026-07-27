@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Protocol, cast
+from typing import Protocol, TypedDict, cast
 
 from bragi.app_logging import exception_log_fields, log_error_event
 from bragi.persistence.models import MessageRecord, SceneSnapshotRecord
@@ -39,6 +39,16 @@ WORLD_TIME_SCHEMA_NAME = "world_time_advance"
 WORLD_TIME_RECONCILIATION_SCHEMA_NAME = "world_time_reconciliation"
 WORLD_TIME_CONFIDENCE_THRESHOLD = 0.65
 NARRATOR_ONLY_WORLD_TIME_CONFIDENCE_THRESHOLD = 0.9
+
+
+class _WorldTimeSnapshotKwargs(TypedDict, total=False):
+    world_time_day_index: int | None
+    world_time_day_label: str
+    world_time_phase: str
+    world_time_clock_minutes: int | None
+    world_time_period_label: str
+    world_time_source_message_id: str | None
+    world_time_confidence: float | None
 
 
 @dataclass(frozen=True)
@@ -520,7 +530,7 @@ class WorldTimeService:
             legacy_day_of_week=updated["day_of_week"],
             legacy_world_day_index=updated["world_day_index"],
         )
-        world_time_kwargs: dict[str, object] = {
+        world_time_kwargs: _WorldTimeSnapshotKwargs = {
             "world_time_day_index": canonical_world_time.day_index,
             "world_time_source_message_id": canonical_world_time.source_message_id,
             "world_time_confidence": canonical_world_time.confidence,

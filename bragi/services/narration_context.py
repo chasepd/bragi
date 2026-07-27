@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from bragi.persistence.models import (
     ActiveThreadRecord,
@@ -52,36 +52,195 @@ def load_narration_context_snapshot(
     save_id: str,
     details: SaveDetailsRecord | None = None,
     include_context_sources: bool = True,
+    raw_record_limit: int | None = None,
 ) -> NarrationContextSnapshot | None:
     details = details or repositories.load_save_details(save_id)
     if details is None:
         return None
+    scene_snapshot = repositories.get_scene_snapshot(save_id)
+    visibility_character_ids = (
+        set(scene_snapshot.present_character_ids)
+        if raw_record_limit is not None and scene_snapshot is not None
+        else None
+    )
+    if raw_record_limit is not None:
+        details = replace(
+            details,
+            messages=repositories.list_recent_messages_visible_to_characters(
+                save_id,
+                character_ids=visibility_character_ids or set(),
+                limit=len(details.messages),
+            ),
+        )
+    world_state = tuple(
+        repositories.list_world_state(save_id, limit=raw_record_limit)
+    )
+    world_state_for_scope = tuple(
+        repositories.list_world_state_including_archived(
+            save_id,
+            limit=raw_record_limit,
+        )
+    )
+    state_changes = tuple(
+        repositories.list_state_changes(save_id, limit=raw_record_limit)
+    )
+    media_assets = tuple(
+        repositories.list_media_assets(save_id, limit=raw_record_limit)
+    )
+    memories = tuple(
+        repositories.list_memories(save_id, limit=raw_record_limit)
+    )
+    summaries = tuple(
+        repositories.list_summaries(save_id, limit=raw_record_limit)
+    )
+    observations = tuple(
+        repositories.list_context_observations(
+            save_id,
+            limit=raw_record_limit,
+        )
+    )
+    pending_suggestions = tuple(
+        repositories.list_context_update_suggestions(
+            save_id,
+            status="pending",
+            limit=raw_record_limit,
+        )
+    )
+    raw_target_keys = frozenset(
+        {
+            *(("world_state", state.id) for state in world_state),
+            *(("world_state", state.id) for state in world_state_for_scope),
+            *(("memory", memory.id) for memory in memories),
+            *(("summary", summary.id) for summary in summaries),
+        }
+    )
+    active_threads = (
+        tuple(repositories.list_active_threads(save_id))
+        if raw_record_limit is None
+        else tuple(
+            repositories.list_narration_active_threads(
+                save_id,
+                reference_character_ids=visibility_character_ids or set(),
+                visibility_character_ids=visibility_character_ids or set(),
+                limit=raw_record_limit,
+            )
+        )
+    )
+    character_knowledge_edges = (
+        tuple(repositories.list_character_knowledge_edges(save_id))
+        if raw_record_limit is None
+        else tuple(
+            repositories.list_narration_character_knowledge_edges(
+                save_id,
+                target_keys=raw_target_keys,
+                present_character_ids=visibility_character_ids or set(),
+                visibility_character_ids=visibility_character_ids or set(),
+            )
+        )
+    )
+    entity_links = (
+        tuple(repositories.list_entity_links(save_id))
+        if raw_record_limit is None
+        else tuple(
+            repositories.list_narration_entity_links(
+                save_id,
+                target_keys=raw_target_keys,
+                present_character_ids=visibility_character_ids or set(),
+                visibility_character_ids=visibility_character_ids or set(),
+            )
+        )
+    )
+    visibility_message_ids = (
+        {
+            *(message.id for message in details.messages),
+            *(
+                state.source_message_id
+                for state in (*world_state, *world_state_for_scope)
+                if state.source_message_id is not None
+            ),
+            *(
+                change.source_message_id
+                for change in state_changes
+                if change.source_message_id is not None
+            ),
+            *(
+                asset.source_message_id
+                for asset in media_assets
+                if asset.source_message_id is not None
+            ),
+            *(
+                source_id
+                for memory in memories
+                for source_id in memory.source_message_ids
+            ),
+            *(
+                source_id
+                for summary in summaries
+                for source_id in (
+                    summary.covers_message_start_id,
+                    summary.covers_message_end_id,
+                )
+            ),
+            *(
+                source_id
+                for observation in observations
+                for source_id in observation.source_message_ids
+            ),
+            *(
+                source_id
+                for suggestion in pending_suggestions
+                for source_id in suggestion.source_message_ids
+            ),
+            *(
+                source_id
+                for thread in active_threads
+                for source_id in (
+                    thread.source_message_id,
+                    thread.first_seen_message_id,
+                    thread.last_updated_message_id,
+                )
+                if source_id is not None
+            ),
+            *(
+                source_id
+                for edge in character_knowledge_edges
+                for source_id in edge.source_message_ids
+            ),
+            *(
+                link.source_message_id
+                for link in entity_links
+                if link.source_message_id is not None
+            ),
+        }
+        if raw_record_limit is not None
+        else None
+    )
     return NarrationContextSnapshot(
         details=details,
-        scene_snapshot=repositories.get_scene_snapshot(save_id),
+        scene_snapshot=scene_snapshot,
         locations=tuple(repositories.list_locations(save_id)),
         characters=tuple(repositories.list_characters(save_id)),
-        active_threads=tuple(repositories.list_active_threads(save_id)),
-        character_knowledge_edges=tuple(
-            repositories.list_character_knowledge_edges(save_id)
+        active_threads=active_threads,
+        character_knowledge_edges=character_knowledge_edges,
+        message_visibility=tuple(
+            repositories.list_message_visibility(
+                save_id,
+                character_ids=visibility_character_ids,
+                message_ids=visibility_message_ids,
+            )
         ),
-        message_visibility=tuple(repositories.list_message_visibility(save_id)),
-        entity_links=tuple(repositories.list_entity_links(save_id)),
-        world_state=tuple(repositories.list_world_state(save_id)),
-        world_state_for_scope=tuple(
-            repositories.list_world_state_including_archived(save_id)
-        ),
-        state_changes=tuple(repositories.list_state_changes(save_id)),
-        media_assets=tuple(repositories.list_media_assets(save_id)),
-        memories=tuple(repositories.list_memories(save_id)),
-        summaries=tuple(repositories.list_summaries(save_id)),
-        observations=tuple(repositories.list_context_observations(save_id)),
+        entity_links=entity_links,
+        world_state=world_state,
+        world_state_for_scope=world_state_for_scope,
+        state_changes=state_changes,
+        media_assets=media_assets,
+        memories=memories,
+        summaries=summaries,
+        observations=observations,
         context_sources=(
             tuple(repositories.list_context_sources(save_id))
             if include_context_sources
             else ()
         ),
-        pending_context_suggestions=tuple(
-            repositories.list_context_update_suggestions(save_id, status="pending")
-        ),
+        pending_context_suggestions=pending_suggestions,
     )

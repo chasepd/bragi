@@ -227,6 +227,7 @@ class ExtractedSceneSnapshot:
     nearby_objects: tuple[str, ...] | None = None
     hazards: tuple[str, ...] | None = None
     present_character_names: tuple[str, ...] | None = None
+    scene_transition: bool = False
     reason: str = ""
     confidence: float = 1.0
 
@@ -1772,10 +1773,12 @@ def _focused_scene_location_presence_tool_request(
             system=(
                 "You are Bragi's tiny scene location and presence maintainer. "
                 "If the completed turn clearly establishes the current location "
-                "or complete current named character presence, call "
+                "or complete current named character presence, or begins a "
+                "distinct new scene even at the same location, call "
                 "set_scene_location_presence once. Otherwise make no tool calls. "
                 "For present_character_names, only provide a complete current "
-                "list; omit it when unchanged or unclear."
+                "list; omit it when unchanged or unclear. Set scene_transition "
+                "only when the text directly establishes a new scene boundary."
             ),
             user=_focused_scene_request_text(request, include_known_registry=True),
         ),
@@ -2215,6 +2218,7 @@ def _focused_scene_location_presence_tool_schema(
             **_focused_scene_base_tool_properties(messages),
             "current_location_name": {"type": "string"},
             "present_character_names": _present_character_names_schema(),
+            "scene_transition": {"type": "boolean"},
         },
     )
 
@@ -3745,13 +3749,41 @@ def _apply_focused_scene_update(
     if snapshot is None:
         return
     previous_location_id = snapshot.current_location_id
+    generation_before = snapshot.scene_generation
     scene_updates: list[tuple[str, object]] = []
     current_location = _find_location(
         applier.snapshot.locations,
         extracted.current_location_name,
     )
     if current_location is not None:
-        scene_updates.append(("current_location_id", current_location.id))
+        snapshot = applier._apply_scene_field(
+            snapshot=snapshot,
+            field_path="current_location_id",
+            value=current_location.id,
+            reason=extracted.reason,
+            confidence=extracted.confidence,
+            source_message_id=extracted.source_message_id,
+        )
+    if (
+        extracted.scene_transition
+        and snapshot.scene_generation == generation_before
+    ):
+        snapshot = applier.repositories.advance_scene_generation(
+            save_id=applier.save_id,
+            source_message_id=extracted.source_message_id,
+        )
+        applier._record_applied(
+            operation="scene_generation_advanced",
+            entity_type="scene_snapshot",
+            entity_id=snapshot.id,
+            field_path="scene_generation",
+            before=generation_before,
+            after=snapshot.scene_generation,
+            reason=extracted.reason,
+            confidence=extracted.confidence,
+            source_message_ids=[extracted.source_message_id],
+        )
+    applier.scene_snapshot = snapshot
     if extracted.in_world_time.strip():
         scene_updates.append(("in_world_time", extracted.in_world_time.strip()))
     if extracted.weather.strip():
@@ -3770,9 +3802,6 @@ def _apply_focused_scene_update(
     )
     if present_character_ids is not None:
         scene_updates.append(("present_character_ids", present_character_ids))
-    if not scene_updates:
-        return
-
     original_snapshot = snapshot
     for field_path, value in scene_updates:
         snapshot = applier._apply_scene_field(
@@ -3788,6 +3817,7 @@ def _apply_focused_scene_update(
     applier._archive_scene_local_threads_after_scene_change(
         previous_location_id=previous_location_id,
         current_location_id=snapshot.current_location_id,
+        scene_transition=extracted.scene_transition,
         reason=extracted.reason,
         confidence=extracted.confidence,
         source_message_id=extracted.source_message_id,
@@ -4917,17 +4947,40 @@ class _ContextUpdateApplier:
             self.scene_snapshot = snapshot
             return
 
-        snapshot = existing
         next_location_id = current_location.id if current_location is not None else None
-        location_changed = (
-            next_location_id is not None
-            and previous_location_id != next_location_id
-        )
+        generation_before = existing.scene_generation
+        snapshot = existing
+        if next_location_id is not None:
+            snapshot = self._apply_scene_field(
+                snapshot=snapshot,
+                field_path="current_location_id",
+                value=next_location_id,
+                reason=extracted.reason,
+                confidence=extracted.confidence,
+                source_message_id=extracted.source_message_id,
+            )
+        if (
+            extracted.scene_transition
+            and snapshot.scene_generation == generation_before
+        ):
+            existing = self.repositories.advance_scene_generation(
+                save_id=self.save_id,
+                source_message_id=extracted.source_message_id,
+            )
+            snapshot = existing
+            self._record_applied(
+                operation="scene_generation_advanced",
+                entity_type="scene_snapshot",
+                entity_id=snapshot.id,
+                field_path="scene_generation",
+                before=generation_before,
+                after=snapshot.scene_generation,
+                reason=extracted.reason,
+                confidence=extracted.confidence,
+                source_message_ids=[extracted.source_message_id],
+            )
+        location_changed = snapshot.current_location_id != previous_location_id
         scene_updates: list[tuple[str, object]] = [
-            (
-                "current_location_id",
-                next_location_id,
-            ),
             ("situation", extracted.situation.strip()),
             ("objective", extracted.objective.strip()),
             ("in_world_time", normalized_time),
@@ -4961,6 +5014,7 @@ class _ContextUpdateApplier:
         self._archive_scene_local_threads_after_scene_change(
             previous_location_id=previous_location_id,
             current_location_id=snapshot.current_location_id,
+            scene_transition=extracted.scene_transition,
             reason=extracted.reason,
             confidence=extracted.confidence,
             source_message_id=extracted.source_message_id,
@@ -4971,11 +5025,12 @@ class _ContextUpdateApplier:
         *,
         previous_location_id: str | None,
         current_location_id: str | None,
+        scene_transition: bool = False,
         reason: str,
         confidence: float,
         source_message_id: str,
     ) -> None:
-        if previous_location_id == current_location_id:
+        if previous_location_id == current_location_id and not scene_transition:
             return
         for thread in tuple(self.snapshot.active_threads):
             if thread.id not in self.scene_local_thread_ids_before_scene:
@@ -5796,6 +5851,7 @@ def _scene_from_data(value: dict[str, object]) -> ExtractedSceneSnapshot:
             if "present_character_names" in value
             else None
         ),
+        scene_transition=value.get("scene_transition") is True,
         reason=_string(value.get("reason")),
         confidence=_confidence(value.get("confidence")),
     )
@@ -7290,6 +7346,7 @@ def _context_update_tool_schemas(
                 "nearby_objects": scene_nearby_objects_schema,
                 "hazards": scene_hazards_schema,
                 "present_character_names": present_character_names_schema,
+                "scene_transition": {"type": "boolean"},
             },
         ),
         "upsert_location": _tool_schema(

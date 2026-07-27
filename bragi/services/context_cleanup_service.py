@@ -376,7 +376,7 @@ class ContextCleanupService:
                 ):
                     if self.repositories.get_save(save_id) is None:
                         raise ValueError(f"Unknown save id: {save_id}")
-                    self.repositories.begin_transaction()
+                    self.repositories.begin_immediate_transaction()
                     transaction_open = True
                     batch_counts = self._apply_actions(
                         save_id=save_id,
@@ -513,7 +513,7 @@ class ContextCleanupService:
                 ):
                     if self.repositories.get_save(save_id) is None:
                         raise ValueError(f"Unknown save id: {save_id}")
-                    self.repositories.begin_transaction()
+                    self.repositories.begin_immediate_transaction()
                     transaction_open = True
                     batch_counts = self._queue_guided_actions(
                         save_id=save_id,

@@ -4,13 +4,18 @@ import json
 import os
 import sqlite3
 import stat
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
 from bragi.persistence import migrations
 from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION, migrate_database
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
+from bragi.text_search import cjk_lexical_anchors
 
 EXPECTED_MIGRATION_VERSIONS = list(range(1, CURRENT_SCHEMA_VERSION + 1))
 
@@ -346,6 +351,594 @@ def test_migrate_database_is_idempotent_for_current_schema(tmp_path: Path) -> No
         assert connection.execute("SELECT title FROM saves").fetchone()[0] == (
             "Night Watch"
         )
+
+
+def test_migrate_database_rebuilds_incomplete_exact_identifier_index(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        source = repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id="memory-codes",
+            title="Archive codes",
+            body=" ".join(f"ARCHIVE-{index:03d}" for index in range(257)),
+        )
+        connection.execute(
+            """
+            DELETE FROM context_source_search_index_state
+            WHERE key = 'exact_identifiers_complete_v2'
+            """
+        )
+        connection.execute(
+            """
+            DELETE FROM context_source_exact_identifiers
+            WHERE context_source_id = ?
+            """,
+            (source.id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO context_source_exact_identifiers(
+                context_source_id, save_id, identifier
+            )
+            VALUES (?, ?, 'archive-000')
+            """,
+            (source.id, save.id),
+        )
+        connection.execute(
+            """
+            UPDATE context_sources
+            SET archived_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (source.id,),
+        )
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM context_source_exact_identifiers
+            WHERE context_source_id = ?
+            """,
+            (source.id,),
+        ).fetchone()[0] == 0
+        repositories = PersistenceRepositories(connection)
+        repositories.restore_context_sources({source.id})
+        hits = repositories.search_context_sources(
+            save.id,
+            query_terms={"archive", "128"},
+            source_types={"memory"},
+            limit=1,
+            exact_identifiers=("ARCHIVE-128",),
+        )
+        assert [hit.record.id for hit in hits] == [source.id]
+
+
+def test_migrate_database_keeps_outdated_lexical_index_searchable(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    body = "".join(chr(0x4E00 + index) for index in range(220))
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        source = repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id="memory-long-han-run",
+            title="長文",
+            body=body,
+        )
+        connection.execute(
+            """
+            DELETE FROM context_source_search_terms
+            WHERE context_source_id = ?
+            """,
+            (source.id,),
+        )
+        connection.executemany(
+            """
+            INSERT INTO context_source_search_terms(
+                context_source_id, save_id, term
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                (source.id, save.id, body[index : index + 2])
+                for index in range(len(body) - 1)
+            ),
+        )
+        connection.commit()
+
+    query = body[200:203]
+    assert query not in {
+        body[index : index + 2] for index in range(len(body) - 1)
+    }
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        hits = repositories.search_context_sources(
+            save.id,
+            query_terms=set(cjk_lexical_anchors(query)),
+            source_types={"memory"},
+            limit=1,
+            match_all=True,
+        )
+        assert [hit.record.id for hit in hits] == [source.id]
+
+
+def test_migrate_database_preserves_legacy_per_record_normalized_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="custom_note",
+            source_id="legacy-expansion",
+            title="Legacy expansion",
+            body="\ufdfa" * 32,
+        )
+        normalized_bytes = connection.execute(
+            """
+            SELECT normalized_text_bytes
+            FROM context_source_normalized_budget_entries
+            WHERE save_id = ?
+            """,
+            (save.id,),
+        ).fetchone()[0]
+        connection.commit()
+    monkeypatch.setattr(
+        migrations,
+        "_MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD",
+        1,
+    )
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        stored_limit = connection.execute(
+            """
+            SELECT normalized_text_bytes
+            FROM context_source_legacy_record_budget_limits
+            WHERE save_id = ?
+            """,
+            (save.id,),
+        ).fetchone()[0]
+        assert stored_limit == normalized_bytes
+
+
+def test_migrate_database_upgrades_main_schema_71_context_lifecycle(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+        observation = repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="character_fact",
+            claim="Mara likes tea.",
+            evidence_quote="Mara likes tea.",
+            source_message_ids=[],
+            scope="durable",
+            status="accepted",
+            confidence=0.95,
+            tags=["preference"],
+            metadata={
+                "curation": {
+                    "action": "durable_memory",
+                    "memory_body": "Mara Likes Tea!",
+                }
+            },
+        )
+        memory = repositories.add_memory(
+            save_id=save.id,
+            body="Mara Likes Tea!",
+            tags=["preference"],
+            importance=0.4,
+            source_observation_ids=[observation.id],
+        )
+        duplicate_id = "legacy-duplicate-memory"
+        connection.execute(
+            "DROP INDEX idx_memories_save_claim_fingerprint_active"
+        )
+        connection.execute(
+            """
+            INSERT INTO memories(
+                id, save_id, body, tags_json, importance,
+                source_message_ids_json, claim_fingerprint,
+                source_observation_ids_json
+            )
+            VALUES (?, ?, ?, ?, ?, '[]', ?, '[]')
+            """,
+            (
+                duplicate_id,
+                save.id,
+                "mara likes tea",
+                json.dumps(["tea"], separators=(",", ":")),
+                0.9,
+                sha256(b"mara likes tea").hexdigest(),
+            ),
+        )
+        character = repositories.add_character(
+            save_id=save.id,
+            name="Captain Ilyra",
+        )
+        archived_keeper_edge = repositories.add_character_knowledge_edge(
+            save_id=save.id,
+            character_id=character.id,
+            target_type="memory",
+            target_id=memory.id,
+        )
+        repositories.archive_character_knowledge_edge(archived_keeper_edge.id)
+        repositories.add_character_knowledge_edge(
+            save_id=save.id,
+            character_id=character.id,
+            target_type="memory",
+            target_id=duplicate_id,
+        )
+        privacy_character = repositories.add_character(
+            save_id=save.id,
+            name="Archivist Ren",
+        )
+        repositories.add_character_knowledge_edge(
+            save_id=save.id,
+            character_id=privacy_character.id,
+            target_type="memory",
+            target_id=memory.id,
+            knowledge_state="knows",
+            source_message_ids=["keeper-proof"],
+        )
+        repositories.add_character_knowledge_edge(
+            save_id=save.id,
+            character_id=privacy_character.id,
+            target_type="memory",
+            target_id=duplicate_id,
+            knowledge_state="does_not_know",
+            source_message_ids=["duplicate-proof"],
+        )
+        archived_keeper_source = repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=memory.id,
+            title="Archived keeper source",
+            body=memory.body,
+        )
+        repositories.archive_context_source(archived_keeper_source.id)
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=duplicate_id,
+            title="Active duplicate source",
+            body="mara likes tea",
+        )
+        repositories.add_entity_link(
+            save_id=save.id,
+            entity_type="character",
+            entity_id=character.id,
+            target_type="memory",
+            target_id=duplicate_id,
+            relation="recalls",
+        )
+        suggestion = repositories.add_context_update_suggestion(
+            save_id=save.id,
+            update_type="update",
+            entity_type="memory",
+            entity_id=duplicate_id,
+            field_path="tags",
+            proposed_value=["tea"],
+        )
+        audit = repositories.add_context_update_audit(
+            save_id=save.id,
+            operation="legacy-memory-update",
+            entity_type="memory",
+            entity_id=duplicate_id,
+            field_path="tags",
+            before=[],
+            after=["tea"],
+        )
+        connection.execute(
+            "ALTER TABLE memories DROP COLUMN source_observation_ids_json"
+        )
+        connection.execute("ALTER TABLE memories DROP COLUMN claim_fingerprint")
+        connection.execute(
+            "ALTER TABLE context_sources DROP COLUMN expires_after_turn_number"
+        )
+        connection.execute(
+            "ALTER TABLE context_sources DROP COLUMN created_turn_number"
+        )
+        connection.execute("ALTER TABLE context_sources DROP COLUMN scene_generation")
+        connection.execute("ALTER TABLE context_sources DROP COLUMN scene_snapshot_id")
+        connection.execute("ALTER TABLE scene_snapshots DROP COLUMN scene_generation")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 72")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert {
+            "scene_snapshot_id",
+            "scene_generation",
+            "created_turn_number",
+            "expires_after_turn_number",
+        } <= _column_names(connection, "context_sources")
+        assert {
+            "claim_fingerprint",
+            "source_observation_ids_json",
+        } <= _column_names(connection, "memories")
+        assert "scene_generation" in _column_names(connection, "scene_snapshots")
+        expected_fingerprint = sha256(b"mara likes tea").hexdigest()
+        assert connection.execute(
+            """
+            SELECT claim_fingerprint, source_observation_ids_json
+            FROM memories WHERE id = ?
+            """,
+            (memory.id,),
+        ).fetchone() == (
+            expected_fingerprint,
+            json.dumps([observation.id], separators=(",", ":")),
+        )
+        active_memories = connection.execute(
+            """
+            SELECT tags_json, importance
+            FROM memories
+            WHERE save_id = ? AND archived_at IS NULL
+            """,
+            (save.id,),
+        ).fetchall()
+        assert active_memories == [
+            (
+                json.dumps(["preference", "tea"], separators=(",", ":")),
+                0.9,
+            )
+        ]
+        assert connection.execute(
+            """
+            SELECT target_id
+            FROM character_knowledge_edges
+            WHERE character_id = ?
+            """,
+            (character.id,),
+        ).fetchone() == (memory.id,)
+        assert connection.execute(
+            """
+            SELECT knowledge_state, source_message_ids_json
+            FROM character_knowledge_edges
+            WHERE character_id = ? AND archived_at IS NULL
+            """,
+            (privacy_character.id,),
+        ).fetchone() == (
+            "does_not_know",
+            json.dumps(
+                ["keeper-proof", "duplicate-proof"],
+                separators=(",", ":"),
+            ),
+        )
+        assert connection.execute(
+            """
+            SELECT source_id, title
+            FROM context_sources
+            WHERE save_id = ? AND source_type = 'memory'
+              AND archived_at IS NULL
+            """,
+            (save.id,),
+        ).fetchone() == (memory.id, "Active duplicate source")
+        assert connection.execute(
+            """
+            SELECT target_id
+            FROM entity_links
+            WHERE entity_type = 'character' AND entity_id = ?
+            """,
+            (character.id,),
+        ).fetchone() == (memory.id,)
+        assert connection.execute(
+            "SELECT entity_id FROM context_update_suggestions WHERE id = ?",
+            (suggestion.id,),
+        ).fetchone() == (memory.id,)
+        assert connection.execute(
+            "SELECT entity_id FROM context_update_audit WHERE id = ?",
+            (audit.id,),
+        ).fetchone() == (memory.id,)
+        index_row = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'index'
+              AND name = 'idx_memories_save_claim_fingerprint_active'
+            """
+        ).fetchone()
+        assert index_row is not None
+        assert "CREATE UNIQUE INDEX" in index_row[0]
+        assert "WHERE archived_at IS NULL" in index_row[0]
+
+
+def test_current_schema_repairs_nonunique_memory_fingerprint_index(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        keeper = repositories.add_memory(
+            save_id=save.id,
+            body="Mara likes tea.",
+            tags=["preference"],
+        )
+        connection.execute(
+            "DROP INDEX idx_memories_save_claim_fingerprint_active"
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_memories_save_claim_fingerprint_active
+            ON memories(save_id, claim_fingerprint)
+            WHERE archived_at IS NULL AND claim_fingerprint != ''
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO memories(
+                id, save_id, body, tags_json, importance,
+                source_message_ids_json, claim_fingerprint,
+                source_observation_ids_json
+            )
+            VALUES (
+                'duplicate-memory', ?, 'mara likes tea', '["dossier"]', 0.9,
+                '["message-duplicate"]', ?, '[]'
+            )
+            """,
+            (
+                save.id,
+                canonical_claim_fingerprint("mara likes tea"),
+            ),
+        )
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        active_ids = connection.execute(
+            """
+            SELECT id FROM memories
+            WHERE save_id = ? AND archived_at IS NULL
+            """,
+            (save.id,),
+        ).fetchall()
+        assert active_ids == [(keeper.id,)]
+        index_row = next(
+            row
+            for row in connection.execute("PRAGMA index_list('memories')")
+            if row[1] == "idx_memories_save_claim_fingerprint_active"
+        )
+        assert index_row[2] == 1
+
+
+def test_current_schema_repair_bounds_memory_observation_backfill(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        memory = repositories.add_memory(
+            save_id=save.id,
+            body="Mara likes tea.",
+            tags=["preference"],
+        )
+        for index in range(65):
+            repositories.add_context_observation(
+                save_id=save.id,
+                observation_type="character_fact",
+                claim="Mara likes tea.",
+                scope="durable",
+                status="accepted",
+                metadata={
+                    "curation": {
+                        "action": "durable_memory",
+                        "memory_body": "Mara likes tea.",
+                    }
+                },
+                observation_id=f"observation-{index:02d}",
+            )
+        connection.execute(
+            "DROP INDEX idx_memories_save_claim_fingerprint_active"
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_memories_save_claim_fingerprint_active
+            ON memories(save_id, claim_fingerprint)
+            WHERE archived_at IS NULL AND claim_fingerprint != ''
+            """
+        )
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        source_ids_json = connection.execute(
+            """
+            SELECT source_observation_ids_json
+            FROM memories
+            WHERE id = ?
+            """,
+            (memory.id,),
+        ).fetchone()[0]
+        assert len(json.loads(source_ids_json)) == 64
 
 
 def test_migration_rejects_orphaned_pending_review_suggestions(tmp_path: Path) -> None:

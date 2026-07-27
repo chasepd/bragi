@@ -1121,17 +1121,17 @@ class RecordingAgenticPipelineProvider(RecordingChatProvider):
             data = _structured_payload_with_source_ids(self.state_data, request)
         elif schema_name == "context_observation_extraction":
             self.events.append("fact_observation")
-            source_ids = _observation_source_message_ids(request)
+            source_ids = _observation_source_message_ids(request)[:1]
             data = {
                 "observations": [
                     {
-                        "observation_type": "player_preference",
-                        "claim": "Mara likes concise narration.",
+                        "observation_type": "scene_detail",
+                        "claim": "I climb toward the beacon lens.",
                         "evidence_quote": "I climb toward the beacon lens.",
                         "source_message_ids": source_ids,
-                        "scope": "durable",
+                        "scope": "scene",
                         "confidence": 0.9,
-                        "tags": ["tone"],
+                        "tags": ["beacon"],
                     }
                 ]
             }
@@ -1143,12 +1143,12 @@ class RecordingAgenticPipelineProvider(RecordingChatProvider):
                     {
                         "observation_id": observation_id,
                         "action": "durable_memory",
-                        "reason": "Stable narrator preference.",
+                        "reason": "The action may matter later.",
                         "confidence": 0.88,
                         "memory_body": self.curation_memory_body,
                         "context_title": "",
                         "context_body": "",
-                        "tags": ["tone"],
+                        "tags": ["beacon"],
                     }
                 ]
             }
@@ -2014,44 +2014,76 @@ class CountingNarrationPersistenceRepositories(PersistenceRepositories):
         *,
         message_id: str | None = None,
         character_ids: set[str] | frozenset[str] | tuple[str, ...] | None = None,
+        message_ids: set[str] | frozenset[str] | tuple[str, ...] | None = None,
     ) -> list[MessageVisibilityRecord]:
         self._count("message_visibility")
         return super().list_message_visibility(
             save_id,
             message_id=message_id,
             character_ids=character_ids,
+            message_ids=message_ids,
         )
 
     def list_entity_links(self, save_id: str) -> list[EntityLinkRecord]:
         self._count("entity_links")
         return super().list_entity_links(save_id)
 
-    def list_world_state(self, save_id: str) -> list[WorldStateRecord]:
+    def list_world_state(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[WorldStateRecord]:
         self._count("world_state")
-        return super().list_world_state(save_id)
+        return super().list_world_state(save_id, limit=limit)
 
     def list_world_state_including_archived(
         self,
         save_id: str,
+        *,
+        limit: int | None = None,
     ) -> list[WorldStateRecord]:
         self._count("world_state_including_archived")
-        return super().list_world_state_including_archived(save_id)
+        return super().list_world_state_including_archived(
+            save_id,
+            limit=limit,
+        )
 
-    def list_state_changes(self, save_id: str) -> list[StateChangeRecord]:
+    def list_state_changes(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[StateChangeRecord]:
         self._count("state_changes")
-        return super().list_state_changes(save_id)
+        return super().list_state_changes(save_id, limit=limit)
 
-    def list_media_assets(self, save_id: str) -> list[MediaAssetRecord]:
+    def list_media_assets(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[MediaAssetRecord]:
         self._count("media_assets")
-        return super().list_media_assets(save_id)
+        return super().list_media_assets(save_id, limit=limit)
 
-    def list_memories(self, save_id: str) -> list[MemoryRecord]:
+    def list_memories(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[MemoryRecord]:
         self._count("memories")
-        return super().list_memories(save_id)
+        return super().list_memories(save_id, limit=limit)
 
-    def list_summaries(self, save_id: str) -> list[SummaryRecord]:
+    def list_summaries(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[SummaryRecord]:
         self._count("summaries")
-        return super().list_summaries(save_id)
+        return super().list_summaries(save_id, limit=limit)
 
     def list_context_observations(
         self,
@@ -2059,12 +2091,14 @@ class CountingNarrationPersistenceRepositories(PersistenceRepositories):
         *,
         statuses: set[str] | frozenset[str] | tuple[str, ...] | None = None,
         include_archived: bool = False,
+        limit: int | None = None,
     ) -> list[ContextObservationRecord]:
         self._count("context_observations")
         return super().list_context_observations(
             save_id,
             statuses=statuses,
             include_archived=include_archived,
+            limit=limit,
         )
 
     def list_context_sources(
@@ -2081,9 +2115,14 @@ class CountingNarrationPersistenceRepositories(PersistenceRepositories):
         save_id: str,
         *,
         status: str | None = None,
+        limit: int | None = None,
     ) -> list[ContextUpdateSuggestionRecord]:
         self._count("context_update_suggestions")
-        return super().list_context_update_suggestions(save_id, status=status)
+        return super().list_context_update_suggestions(
+            save_id,
+            status=status,
+            limit=limit,
+        )
 
 
 def test_submit_player_turn_persists_messages_and_uses_active_chat_model(
@@ -2143,6 +2182,59 @@ def test_submit_player_turn_persists_messages_and_uses_active_chat_model(
     assert persisted_messages[1].provider == "openrouter"
     assert persisted_messages[1].model == "anthropic/claude-3.5-sonnet"
     assert persisted_messages[1].token_estimate == 34
+
+
+def test_submit_player_turn_rolls_back_input_when_snapshot_capture_fails(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
+    repositories.set_model_preference(
+        task="chat",
+        provider="openrouter",
+        model_id="anthropic/claude-3.5-sonnet",
+    )
+    provider = RecordingChatProvider("openrouter")
+    service = ChatService(
+        repositories=repositories,
+        providers={"openrouter": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    def fail_snapshot_capture(
+        self: TurnSnapshotService,
+        *,
+        save_id: str,
+        message_id: str,
+        reason: str = "message",
+    ) -> object:
+        raise RuntimeError("snapshot unavailable")
+
+    monkeypatch.setattr(
+        TurnSnapshotService,
+        "capture_message_snapshot",
+        fail_snapshot_capture,
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot unavailable"):
+        asyncio.run(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+            )
+        )
+
+    assert repositories.list_messages(save.id) == []
+    assert provider.chat_requests == []
 
 
 @pytest.mark.parametrize(
@@ -9218,7 +9310,9 @@ def test_submit_player_turn_omits_latest_summary_blocked_for_active_npc(
         )
     )
 
-    assert provider.chat_requests[0].summary is None
+    request = provider.chat_requests[0]
+    assert request.summary is None
+    assert summary.body not in request.scenario_instructions
 
 
 def test_submit_player_turn_does_not_include_summary_for_absent_mention(
@@ -9293,7 +9387,9 @@ def test_submit_player_turn_does_not_include_summary_for_absent_mention(
         )
     )
 
-    assert provider.chat_requests[0].summary is None
+    request = provider.chat_requests[0]
+    assert request.summary is None
+    assert summary.body not in request.scenario_instructions
 
 
 @pytest.mark.parametrize(
@@ -9810,7 +9906,7 @@ def test_submit_player_turn_cancels_running_context_search_child_task(
     asyncio.run(submit_and_cancel())
 
     assert [request.schema_name for request in provider.structured_output_requests] == [
-        "context_search_selection"
+        "context_retrieval_expansion"
     ]
     assert provider.chat_requests == []
     persisted_messages = repositories.list_messages(save.id)
@@ -9924,7 +10020,7 @@ def test_submit_player_turn_cancels_context_search_from_another_thread(
     asyncio.run(submit_and_cancel_from_thread())
 
     assert [request.schema_name for request in provider.structured_output_requests] == [
-        "context_search_selection"
+        "context_retrieval_expansion"
     ]
     assert provider.chat_requests == []
     persisted_messages = repositories.list_messages(save.id)
@@ -15426,7 +15522,7 @@ def test_submit_player_turn_uses_degraded_recovered_context(
         )
     )
 
-    assert len(primary.tool_call_requests) == 1
+    assert len(primary.tool_call_requests) == 2
     assert len(fallback.tool_call_requests) == 1
     assert len(primary.chat_requests) == 1
     narrator_request = primary.chat_requests[0]
@@ -15596,6 +15692,15 @@ def test_submit_player_turn_runs_context_search_before_narrator_and_injects_cont
         body="Ash claws at the beacon lens.",
         provider="openrouter",
         model="anthropic/claude-3.5-sonnet",
+    )
+    repositories.add_summary(
+        save_id=save.id,
+        covers_message_start_id=unselected_message.id,
+        covers_message_end_id=selected_message.id,
+        body="The ash storm isolated the keep before dawn.",
+        provider="fake",
+        model="fake-summary",
+        summary_id="summary-ash-storm",
     )
     repositories.set_model_preference(
         task="chat",
@@ -18567,6 +18672,131 @@ def test_submit_player_turn_includes_latest_summary_when_search_selects_none(
     )
 
 
+def test_submit_player_turn_excludes_summary_covering_hidden_message(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    character = repositories.add_character(save_id=save.id, name="Ilyra")
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Ilyra watches the beacon.",
+        present_character_ids=[character.id],
+    )
+    older_player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I checked the outer wall.",
+    )
+    hidden_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="A concealed route leads beneath the wall.",
+        provider="openrouter",
+        model="anthropic/claude-3.5-sonnet",
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_narrator.id,
+        character_id=character.id,
+        visibility="not_visible",
+    )
+    summary = repositories.add_summary(
+        save_id=save.id,
+        covers_message_start_id=older_player.id,
+        covers_message_end_id=hidden_narrator.id,
+        body="Mara found the concealed route beneath the wall.",
+        provider="fake",
+        model="fake-summary",
+    )
+    repositories.add_entity_link(
+        save_id=save.id,
+        entity_type="character",
+        entity_id=character.id,
+        target_type="summary",
+        target_id=summary.id,
+        relation="related",
+    )
+    repositories.add_context_update_suggestion(
+        save_id=save.id,
+        update_type="field_update",
+        entity_type="location",
+        field_path="connections",
+        proposed_value=["concealed route beneath the wall"],
+        confidence=0.95,
+        source_message_ids=[hidden_narrator.id],
+    )
+    hidden_memory = repositories.add_memory(
+        save_id=save.id,
+        body="The concealed route opens behind the west buttress.",
+        tags=["route"],
+        source_message_id=hidden_narrator.id,
+    )
+    hidden_state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="keep.concealed_route",
+        value={"entrance": "west buttress"},
+        source_message_id=hidden_narrator.id,
+    )
+    for target_type, target_id in (
+        ("memory", hidden_memory.id),
+        ("world_state", hidden_state.id),
+    ):
+        repositories.add_entity_link(
+            save_id=save.id,
+            entity_type="character",
+            entity_id=character.id,
+            target_type=target_type,
+            target_id=target_id,
+            relation="related",
+        )
+    repositories.set_model_preference(
+        task="chat",
+        provider="openrouter",
+        model_id="anthropic/claude-3.5-sonnet",
+    )
+    provider = RecordingChatProvider("openrouter")
+    service = ChatService(
+        repositories=repositories,
+        providers={"openrouter": provider},
+        context_search_service=ScriptedContextSearch(
+            ContextSearchResult(
+                selected_summaries=(
+                    SelectedContextItem(
+                        source_type="summary",
+                        source_id=summary.id,
+                        text=summary.body,
+                        relevance_note="The route may be useful.",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I ask Ilyra whether she knows another way out.",
+            speaker_name="Mara",
+        )
+    )
+
+    request = provider.chat_requests[0]
+    assert request.summary is None
+    assert summary.body not in request.scenario_instructions
+    assert hidden_memory.body not in request.scenario_instructions
+    assert hidden_state.key not in request.scenario_instructions
+    assert request.pending_context_suggestions == ()
+
+
 def test_submit_player_turn_summarizes_before_context_search_and_keeps_context_separate(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -18997,7 +19227,7 @@ def test_submit_player_turn_keeps_direct_memory_without_inline_curation(
                 }
             ],
         },
-        curation_memory_body="Mara likes concise, grounded narration.",
+        curation_memory_body="I climb toward the beacon lens.",
     )
     service = ChatService(
         repositories=repositories,
@@ -19156,7 +19386,7 @@ def test_submit_player_turn_queues_agentic_durable_memory_when_confirmation_enab
         "fake",
         events=events,
         state_data={"state_changes": [], "memories": []},
-        curation_memory_body="Mara likes concise, grounded narration.",
+        curation_memory_body="I climb toward the beacon lens.",
     )
     service = ChatService(
         repositories=repositories,

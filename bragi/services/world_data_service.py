@@ -31,7 +31,10 @@ from bragi.persistence.models import (
     SceneSnapshotRecord,
     SummaryRecord,
 )
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.services.character_locks import merge_character_locked_fields
 from bragi.services.character_profile_completion import (
     CHARACTER_STARTERS_CONTENT_KEY,
@@ -889,7 +892,7 @@ class WorldDataService:
                 save_id=save_id,
             )
             _validate_world_state_key_collisions(edits=edits, model=model)
-            self.repositories.begin_transaction()
+            self.repositories.begin_immediate_transaction()
             (
                 scenario_title,
                 scenario_premise,
@@ -1270,7 +1273,7 @@ class WorldDataService:
             )
             raise ValueError(f"Unknown suggestion id: {missing}")
         try:
-            self.repositories.begin_transaction()
+            self.repositories.begin_immediate_transaction()
             _apply_suggestion_batch(
                 repositories=self.repositories,
                 save_id=model.save_id,
@@ -2333,6 +2336,9 @@ def _upsert_scene_snapshot(
         source_message_id=cast(str | None, values["source_message_id"]),
         locked_fields=cast(list[str], values["locked_fields"]),
         snapshot_id=cast(str | None, values["snapshot_id"]),
+        preserve_scene_generation=bool(
+            values.get("preserve_scene_generation", False)
+        ),
         **world_time_kwargs,
     )
     if values.get("world_time_changed"):
@@ -3087,6 +3093,29 @@ def _apply_suggestion_value(
         if field not in kwargs:
             raise ValueError(f"Unsupported scene suggestion field: {field}")
         kwargs[field] = _coerce_scene_value(field, value)
+        if field == "current_location_id":
+            transition_source_message_ids = set(
+                _csv(suggestion.source_message_ids_text)
+            )
+            current_snapshot = repositories.get_scene_snapshot(save_id)
+            audit_entries = repositories.list_context_update_audit(save_id)
+            suggestion_was_queued = any(
+                audit.operation == "queued"
+                and audit.suggestion_id == suggestion.suggestion_id
+                and audit.entity_id == current.snapshot_id
+                and audit.field_path == "current_location_id"
+                for audit in audit_entries
+            )
+            kwargs["preserve_scene_generation"] = suggestion_was_queued and any(
+                audit.operation == "scene_generation_advanced"
+                and audit.entity_id == current.snapshot_id
+                and current_snapshot is not None
+                and audit.after == current_snapshot.scene_generation
+                and bool(
+                    transition_source_message_ids & set(audit.source_message_ids)
+                )
+                for audit in audit_entries
+            )
         if field in SCENE_WORLD_TIME_FIELDS:
             kwargs["world_time_changed"] = True
             kwargs["world_time_changed_fields"] = (field,)
@@ -3163,21 +3192,73 @@ def _apply_suggestion_value(
             raise ValueError("Memory importance must be numeric")
         source_message_id = value.get("source_message_id")
         raw_source_message_ids = value.get("source_message_ids")
+        raw_source_observation_ids = value.get("source_observation_ids")
         memory_source_message_ids = (
             _string_list_value(raw_source_message_ids, "Memory source message IDs")
             if isinstance(raw_source_message_ids, list)
             else None
         )
-        repositories.add_memory(
-            save_id=save_id,
-            body=body,
-            tags=_string_list_value(value.get("tags", []), "Memory tags"),
-            importance=float(importance),
-            source_message_id=(
-                source_message_id if isinstance(source_message_id, str) else None
-            ),
-            source_message_ids=memory_source_message_ids,
+        memory_source_observation_ids = (
+            _string_list_value(
+                raw_source_observation_ids,
+                "Memory source observation IDs",
+            )
+            if isinstance(raw_source_observation_ids, list)
+            else None
         )
+        tags = _string_list_value(value.get("tags", []), "Memory tags")
+        fingerprint = canonical_claim_fingerprint(body)
+        repositories.begin_immediate_transaction()
+        try:
+            existing = next(
+                (
+                    memory
+                    for memory in repositories.list_memories(save_id)
+                    if memory.claim_fingerprint == fingerprint
+                ),
+                None,
+            )
+            if existing is None:
+                repositories.add_memory(
+                    save_id=save_id,
+                    body=body,
+                    tags=tags,
+                    importance=float(importance),
+                    source_message_id=(
+                        source_message_id
+                        if isinstance(source_message_id, str)
+                        else None
+                    ),
+                    source_message_ids=memory_source_message_ids,
+                    source_observation_ids=memory_source_observation_ids,
+                )
+            else:
+                repositories.update_memory(
+                    memory_id=existing.id,
+                    body=existing.body,
+                    tags=list(dict.fromkeys((*existing.tags, *tags))),
+                    importance=max(existing.importance, float(importance)),
+                    source_message_ids=list(
+                        dict.fromkeys(
+                            (
+                                *existing.source_message_ids,
+                                *(memory_source_message_ids or ()),
+                            )
+                        )
+                    ),
+                    source_observation_ids=list(
+                        dict.fromkeys(
+                            (
+                                *existing.source_observation_ids,
+                                *(memory_source_observation_ids or ()),
+                            )
+                        )
+                    ),
+                )
+            repositories.commit_transaction()
+        except Exception:
+            repositories.rollback_transaction()
+            raise
         return
     if suggestion.entity_type == "character" and suggestion.update_type == "create":
         if not isinstance(value, dict):

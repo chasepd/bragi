@@ -30,7 +30,10 @@ from bragi.persistence.models import (
     SummaryRecord,
     WorldStateRecord,
 )
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.providers.contracts import (
     ChatMessage,
     ProviderClient,
@@ -54,6 +57,7 @@ from bragi.services.knowledge_boundary import (
     message_visible_to_present_characters,
     scoped_owner_name,
 )
+from bragi.services.mention_matching import character_name_is_mentioned
 from bragi.services.model_capabilities import (
     MODEL_LACKS_CAPABILITY_REASON,
     MODEL_MISSING_REASON,
@@ -81,13 +85,21 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
-from bragi.services.request_budget import budget_tool_call_request
+from bragi.services.request_budget import (
+    budget_structured_output_request,
+    budget_tool_call_request,
+)
 from bragi.services.tool_call_helpers import (
     CONTEXT_SEARCH_TOOL_RETRY_INSTRUCTION,
     accepted_tool_result,
     invalid_tool_result,
     parse_tool_arguments_json,
     validate_tool_arguments_shape,
+)
+from bragi.text_search import (
+    cjk_lexical_anchors,
+    structured_identifiers,
+    unicode_word_terms,
 )
 
 MAX_CONTEXT_SELECTIONS = 16
@@ -100,13 +112,24 @@ STATE_CHANGE_CANDIDATE_LIMIT = 16
 MEDIA_ASSET_CANDIDATE_LIMIT = 8
 INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT = 80
 PROTECTED_CONTEXT_SOURCE_LIMIT = 32
+MAX_CONTEXT_QUERY_CHARS = 8_000
+MAX_CONTEXT_QUERY_TERMS = 64
+MAX_EXACT_RAW_STRUCTURED_IDENTIFIERS = 16
+MAX_CONTEXT_EXACT_PHRASE_CHARS = 512
+MAX_CONTEXT_EXACT_PHRASES = 4
+CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT = 64
+RAW_CONTEXT_RECORD_LIMIT = 512
+MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
+MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 INDEXED_CONTEXT_SOURCE_TYPES = frozenset(
     {
         "character_text_thread",
         "open_obligation",
         "scenario_section",
+        "state",
         "world_state",
         "memory",
+        "memories",
         "observation",
         "character_voice",
     }
@@ -125,6 +148,7 @@ RELATIVE_PATH_PATTERN = re.compile(
 )
 BASE64_LIKE_TOKEN_PATTERN = re.compile(r"\b(?:[A-Za-z0-9+/]{40,}={0,2}\s*){2,}")
 CONTEXT_SEARCH_SELECTION_TOOL = "select_context_source"
+CONTEXT_RETRIEVAL_EXPANSION_TOOL = "expand_context_retrieval"
 CONTEXT_RETRIEVAL_RECOVERY_PROVIDER_FALLBACK = "provider_fallback"
 CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC = "deterministic_fallback"
 
@@ -272,9 +296,12 @@ class ContextSearchService:
             payload={"scope": "next_turn_context_candidates"},
         )
         try:
-            details = self.repositories.load_save_details(save_id)
+            details = self.repositories.load_save_details(
+                save_id,
+                message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+            )
             if details is not None:
-                ContinuityIndexService(self.repositories).sync_save(save_id)
+                _sync_continuity_index_for_search(self.repositories, save_id)
             initial_fingerprint = self.repositories.context_candidate_revision_token(
                 save_id
             )
@@ -283,6 +310,7 @@ class ContextSearchService:
                 save_id=save_id,
                 details=details,
                 include_context_sources=False,
+                raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
             )
             if snapshot is None:
                 raise ValueError(f"Unknown save id: {save_id}")
@@ -290,6 +318,17 @@ class ContextSearchService:
                 self.repositories,
                 save_id=save_id,
                 latest_player_message="",
+                scene_snapshot=snapshot.scene_snapshot,
+                characters=list(snapshot.characters),
+                character_knowledge_edges=list(snapshot.character_knowledge_edges),
+                entity_links=list(snapshot.entity_links),
+                message_visibility=list(snapshot.message_visibility),
+            )
+            candidate_observations = _observations_with_indexed_sources(
+                self.repositories,
+                save_id=save_id,
+                observations=snapshot.observations,
+                context_sources=retrieved_sources.records,
             )
             candidates = _next_turn_context_candidates(
                 scenario=snapshot.details.scenario,
@@ -304,7 +343,7 @@ class ContextSearchService:
                 media_assets=list(snapshot.media_assets),
                 memories=list(snapshot.memories),
                 summaries=list(snapshot.summaries),
-                observations=list(snapshot.observations),
+                observations=list(candidate_observations),
                 context_sources=list(retrieved_sources.records),
                 recent_messages=snapshot.details.messages,
                 include_missing_raw_candidates=False,
@@ -430,7 +469,10 @@ class ContextSearchService:
         )
         try:
             provider = self.providers[preference.provider]
-            details = self.repositories.load_save_details(save_id)
+            details = self.repositories.load_save_details(
+                save_id,
+                message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+            )
             if details is None:
                 raise ValueError(f"Unknown save id: {save_id}")
             messages = (
@@ -451,20 +493,48 @@ class ContextSearchService:
             continuity_index_synced = False
             narration_snapshot: NarrationContextSnapshot | None = None
             if cache_entry is None:
-                ContinuityIndexService(self.repositories).sync_save(save_id)
+                _sync_continuity_index_for_search(self.repositories, save_id)
                 continuity_index_synced = True
                 narration_snapshot = load_narration_context_snapshot(
                     self.repositories,
                     save_id=save_id,
                     details=details,
                     include_context_sources=False,
+                    raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
                 )
                 if narration_snapshot is None:
                     raise ValueError(f"Unknown save id: {save_id}")
-                retrieved_sources = _indexed_context_source_retrieval(
+                messages = _context_search_visible_messages(
                     self.repositories,
                     save_id=save_id,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    required_messages=tuple(
+                        message
+                        for message in messages
+                        if message.id == player_message_id
+                    ),
+                )
+                retrieved_sources = await _retrieve_indexed_context_sources(
+                    self.repositories,
+                    provider=provider,
+                    provider_name=preference.provider,
+                    model_id=preference.model_id,
+                    save_id=save_id,
                     latest_player_message=player_message,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    characters=list(narration_snapshot.characters),
+                    character_knowledge_edges=list(
+                        narration_snapshot.character_knowledge_edges
+                    ),
+                    entity_links=list(narration_snapshot.entity_links),
+                    recent_messages=messages,
+                    message_visibility=list(narration_snapshot.message_visibility),
+                )
+                candidate_observations = _observations_with_indexed_sources(
+                    self.repositories,
+                    save_id=save_id,
+                    observations=narration_snapshot.observations,
+                    context_sources=retrieved_sources.records,
                 )
                 candidate_set = _context_candidate_set(
                     scenario=scenario,
@@ -483,7 +553,7 @@ class ContextSearchService:
                     media_assets=list(narration_snapshot.media_assets),
                     memories=list(narration_snapshot.memories),
                     summaries=list(narration_snapshot.summaries),
-                    observations=list(narration_snapshot.observations),
+                    observations=list(candidate_observations),
                     context_sources=list(retrieved_sources.records),
                     recent_messages=messages,
                     player_message_id=player_message_id,
@@ -494,21 +564,79 @@ class ContextSearchService:
                 candidate_diagnostics = candidate_set.diagnostics
                 cache_status = "miss"
             else:
+                fresh_pending_suggestions = tuple(
+                    self.repositories.list_context_update_suggestions(
+                        save_id,
+                        status="pending",
+                        limit=RAW_CONTEXT_RECORD_LIMIT,
+                    )
+                )
+                pending_source_message_ids = {
+                    source_id
+                    for suggestion in fresh_pending_suggestions
+                    for source_id in suggestion.source_message_ids
+                }
+                present_character_ids = (
+                    set(cache_entry.snapshot.scene_snapshot.present_character_ids)
+                    if cache_entry.snapshot.scene_snapshot is not None
+                    else set()
+                )
+                refreshed_pending_visibility = tuple(
+                    self.repositories.list_message_visibility(
+                        save_id,
+                        character_ids=present_character_ids,
+                        message_ids=pending_source_message_ids,
+                    )
+                )
                 snapshot = replace(
                     cache_entry.snapshot,
                     details=details,
-                    pending_context_suggestions=tuple(
-                        self.repositories.list_context_update_suggestions(
-                            save_id,
-                            status="pending",
-                        )
+                    pending_context_suggestions=fresh_pending_suggestions,
+                    message_visibility=tuple(
+                        visibility
+                        for visibility in cache_entry.snapshot.message_visibility
+                        if visibility.message_id not in pending_source_message_ids
+                    ),
+                )
+                snapshot = replace(
+                    snapshot,
+                    message_visibility=(
+                        *snapshot.message_visibility,
+                        *refreshed_pending_visibility,
                     ),
                 )
                 narration_snapshot = snapshot
-                retrieved_sources = _indexed_context_source_retrieval(
+                messages = _context_search_visible_messages(
                     self.repositories,
                     save_id=save_id,
+                    scene_snapshot=snapshot.scene_snapshot,
+                    required_messages=tuple(
+                        message
+                        for message in messages
+                        if message.id == player_message_id
+                    ),
+                )
+                retrieved_sources = await _retrieve_indexed_context_sources(
+                    self.repositories,
+                    provider=provider,
+                    provider_name=preference.provider,
+                    model_id=preference.model_id,
+                    save_id=save_id,
                     latest_player_message=player_message,
+                    scene_snapshot=snapshot.scene_snapshot,
+                    characters=list(snapshot.characters),
+                    character_knowledge_edges=list(
+                        snapshot.character_knowledge_edges
+                    ),
+                    entity_links=list(snapshot.entity_links),
+                    recent_messages=messages,
+                    message_visibility=list(snapshot.message_visibility),
+                )
+                candidate_observations = _observations_with_indexed_sources(
+                    self.repositories,
+                    save_id=save_id,
+                    observations=snapshot.observations,
+                    context_sources=retrieved_sources.records,
                 )
                 candidate_set = _context_candidate_set(
                     scenario=scenario,
@@ -525,7 +653,7 @@ class ContextSearchService:
                     media_assets=list(snapshot.media_assets),
                     memories=list(snapshot.memories),
                     summaries=list(snapshot.summaries),
-                    observations=list(snapshot.observations),
+                    observations=list(candidate_observations),
                     context_sources=list(retrieved_sources.records),
                     recent_messages=messages,
                     player_message_id=player_message_id,
@@ -543,6 +671,12 @@ class ContextSearchService:
                 candidate_count=len(candidates),
                 cache_status=cache_status,
                 **_candidate_count_fields(candidates),
+            )
+            preselection_revision = (
+                self.repositories.context_candidate_revision_token(
+                    save_id,
+                    ignored_message_id=player_message_id,
+                )
             )
             requirement_error = _model_requirement_error(
                 repositories=self.repositories,
@@ -704,6 +838,7 @@ class ContextSearchService:
                 focus_message=focus_message,
                 result=result,
                 fallback_snapshot=narration_snapshot,
+                preselection_revision=preselection_revision,
             )
             result = replace(
                 result,
@@ -789,6 +924,17 @@ class ContextSearchService:
         return None
 
 
+def _sync_continuity_index_for_search(
+    repositories: PersistenceRepositories,
+    save_id: str,
+) -> None:
+    result = ContinuityIndexService(repositories).sync_save(save_id)
+    if not result.complete:
+        raise RuntimeError(
+            "Continuity index maintenance backlog is still draining; retry the turn"
+        )
+
+
 def _rehydrate_selected_context(
     *,
     repositories: PersistenceRepositories,
@@ -797,13 +943,22 @@ def _rehydrate_selected_context(
     focus_message: MessageRecord | None,
     result: ContextSearchResult,
     fallback_snapshot: NarrationContextSnapshot | None,
+    preselection_revision: str,
 ) -> tuple[ContextSearchResult, NarrationContextSnapshot | None]:
     selected_items = _selected_context_items(result)
     if not selected_items:
         return result, fallback_snapshot
 
-    ContinuityIndexService(repositories).sync_save(save_id)
-    details = repositories.load_save_details(save_id)
+    current_revision = repositories.context_candidate_revision_token(
+        save_id,
+        ignored_message_id=player_message_id,
+    )
+    if current_revision != preselection_revision:
+        _sync_continuity_index_for_search(repositories, save_id)
+    details = repositories.load_save_details(
+        save_id,
+        message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+    )
     if details is None:
         raise ValueError(f"Unknown save id: {save_id}")
     messages = (
@@ -815,16 +970,117 @@ def _rehydrate_selected_context(
         repositories,
         save_id=save_id,
         details=details,
-        include_context_sources=True,
+        include_context_sources=False,
+        raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
     )
     if snapshot is None:
         raise ValueError(f"Unknown save id: {save_id}")
+    messages = _context_search_visible_messages(
+        repositories,
+        save_id=save_id,
+        scene_snapshot=snapshot.scene_snapshot,
+        required_messages=tuple(
+            message for message in messages if message.id == player_message_id
+        ),
+    )
+    selected_context_sources = tuple(
+        repositories.list_context_sources_by_keys(
+            save_id,
+            {
+                (item.source_type, item.source_id)
+                for item in selected_items
+            },
+        )
+    )
+    selected_target_keys = {
+        (source.source_type, source.source_id)
+        for source in selected_context_sources
+    }
+    present_character_ids = (
+        set(snapshot.scene_snapshot.present_character_ids)
+        if snapshot.scene_snapshot is not None
+        else set()
+    )
+    selected_knowledge_edges = repositories.list_narration_character_knowledge_edges(
+        save_id,
+        target_keys=selected_target_keys,
+        present_character_ids=present_character_ids,
+        visibility_character_ids=present_character_ids,
+    )
+    selected_entity_links = repositories.list_narration_entity_links(
+        save_id,
+        target_keys=selected_target_keys,
+        present_character_ids=present_character_ids,
+        visibility_character_ids=present_character_ids,
+    )
+    snapshot = replace(
+        snapshot,
+        character_knowledge_edges=tuple(
+            {
+                edge.id: edge
+                for edge in (
+                    *snapshot.character_knowledge_edges,
+                    *selected_knowledge_edges,
+                )
+            }.values()
+        ),
+        entity_links=tuple(
+            {
+                link.id: link
+                for link in (
+                    *snapshot.entity_links,
+                    *selected_entity_links,
+                )
+            }.values()
+        ),
+    )
+    selected_source_message_ids = {
+        source_id
+        for source in selected_context_sources
+        for source_id in _context_source_message_ids(source)
+    }
+    selected_source_message_ids.update(
+        source_id
+        for edge in selected_knowledge_edges
+        for source_id in edge.source_message_ids
+    )
+    selected_source_message_ids.update(
+        link.source_message_id
+        for link in selected_entity_links
+        if link.source_message_id
+    )
+    selected_message_visibility = tuple(
+        repositories.list_message_visibility(
+            save_id,
+            character_ids=(
+                set(snapshot.scene_snapshot.present_character_ids)
+                if snapshot.scene_snapshot is not None
+                else set()
+            ),
+            message_ids=selected_source_message_ids,
+        )
+    )
+    candidate_message_visibility = list(
+        {
+            visibility.id: visibility
+            for visibility in (
+                *snapshot.message_visibility,
+                *selected_message_visibility,
+            )
+        }.values()
+    )
+    candidate_observations = _observations_with_indexed_sources(
+        repositories,
+        save_id=save_id,
+        observations=snapshot.observations,
+        context_sources=selected_context_sources,
+    )
     fresh_candidates = _context_candidate_set(
         scenario=details.scenario,
         scene_snapshot=snapshot.scene_snapshot,
         characters=list(snapshot.characters),
         character_knowledge_edges=list(snapshot.character_knowledge_edges),
-        message_visibility=list(snapshot.message_visibility),
+        message_visibility=candidate_message_visibility,
         entity_links=list(snapshot.entity_links),
         world_state=list(snapshot.world_state),
         world_state_for_scope=list(snapshot.world_state_for_scope),
@@ -832,8 +1088,8 @@ def _rehydrate_selected_context(
         media_assets=list(snapshot.media_assets),
         memories=list(snapshot.memories),
         summaries=list(snapshot.summaries),
-        observations=list(snapshot.observations),
-        context_sources=list(snapshot.context_sources),
+        observations=list(candidate_observations),
+        context_sources=list(selected_context_sources),
         recent_messages=messages,
         player_message_id=player_message_id,
         include_missing_raw_candidates=True,
@@ -883,18 +1139,109 @@ def _indexed_context_source_retrieval(
     *,
     save_id: str,
     latest_player_message: str,
+    scene_snapshot: SceneSnapshotRecord | None,
+    characters: list[CharacterRecord],
+    character_knowledge_edges: list[CharacterKnowledgeEdgeRecord],
+    entity_links: list[EntityLinkRecord],
+    message_visibility: list[MessageVisibilityRecord],
+    additional_query_terms: tuple[str, ...] = (),
 ) -> _IndexedContextSourceRetrieval:
     started_at = perf_counter()
-    query_terms = sorted(_meaningful_terms(latest_player_message))
+    query_text = _bounded_context_query_text(
+        " ".join((latest_player_message, *additional_query_terms))
+    )
+    query_terms = list(_bounded_context_query_terms(query_text))
+    exact_phrases = tuple(
+        dict.fromkeys(
+            phrase.strip()[:MAX_CONTEXT_EXACT_PHRASE_CHARS]
+            for phrase in (latest_player_message, *additional_query_terms)
+            if " " in phrase.strip()
+        )
+    )[:MAX_CONTEXT_EXACT_PHRASES]
+    exact_identifiers = _bounded_structured_identifiers(query_text)
+    turn_scope = character_scope_for_turn(
+        scene_snapshot=scene_snapshot,
+        characters=characters,
+        latest_player_message=latest_player_message,
+    )
+    scoped_targets = allowed_character_scoped_targets(
+        scene_snapshot=scene_snapshot,
+        characters=characters,
+        character_knowledge_edges=character_knowledge_edges,
+        entity_links=entity_links,
+        latest_player_message=latest_player_message,
+        message_visibility=message_visibility,
+    )
+    allowed_owner_names = {
+        scoped_owner_name(owner)
+        for owners in scoped_targets.allowed.values()
+        for owner in owners
+    }
+    current_turn_number = repositories.count_active_messages_by_role(
+        save_id,
+        roles=("narrator",),
+    )["narrator"]
+    reference_character_ids = set(turn_scope.reference_character_ids)
+    reference_character_ids.difference_update(
+        character.id for character in characters if character.is_player_character
+    )
+    current_scene_snapshot_id = (
+        scene_snapshot.id if scene_snapshot is not None else None
+    )
+    current_scene_generation = (
+        scene_snapshot.scene_generation if scene_snapshot is not None else None
+    )
+    repositories.archive_stale_scene_scratch(
+        save_id=save_id,
+        current_scene_snapshot_id=current_scene_snapshot_id,
+        current_scene_generation=current_scene_generation,
+        current_turn_number=current_turn_number,
+    )
     protected = repositories.list_protected_context_sources(
         save_id,
         limit=PROTECTED_CONTEXT_SOURCE_LIMIT,
+        allowed_owner_names=allowed_owner_names,
+        reference_character_ids=reference_character_ids,
+        visibility_character_ids=set(turn_scope.present_character_ids),
+        current_scene_snapshot_id=current_scene_snapshot_id,
+        current_scene_generation=current_scene_generation,
+        current_turn_number=current_turn_number,
+        blocked_source_keys=scoped_targets.blocked,
     )
-    hits = repositories.search_context_sources(
+    exact_hits = repositories.search_context_sources(
+        save_id,
+        query_terms=query_terms,
+        source_types=INDEXED_CONTEXT_SOURCE_TYPES,
+        limit=min(24, INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT),
+        allowed_owner_names=allowed_owner_names,
+        reference_character_ids=reference_character_ids,
+        visibility_character_ids=set(turn_scope.present_character_ids),
+        current_scene_snapshot_id=current_scene_snapshot_id,
+        current_scene_generation=current_scene_generation,
+        current_turn_number=current_turn_number,
+        blocked_source_keys=scoped_targets.blocked,
+        match_all=True,
+        exact_phrases=exact_phrases,
+        exact_identifiers=exact_identifiers,
+    )
+    broad_hits = repositories.search_context_sources(
         save_id,
         query_terms=query_terms,
         source_types=INDEXED_CONTEXT_SOURCE_TYPES,
         limit=INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT,
+        allowed_owner_names=allowed_owner_names,
+        reference_character_ids=reference_character_ids,
+        visibility_character_ids=set(turn_scope.present_character_ids),
+        current_scene_snapshot_id=current_scene_snapshot_id,
+        current_scene_generation=current_scene_generation,
+        current_turn_number=current_turn_number,
+        blocked_source_keys=scoped_targets.blocked,
+    )
+    hits = tuple(
+        {
+            hit.record.id: hit
+            for hit in (*exact_hits, *broad_hits)
+        }.values()
     )
     records: list[ContextSourceRecord] = []
     seen_ids: set[str] = set()
@@ -908,6 +1255,23 @@ def _indexed_context_source_retrieval(
             continue
         seen_ids.add(hit.record.id)
         records.append(hit.record)
+    for record in repositories.list_curated_observation_source_markers(
+        save_id,
+        limit=RAW_CONTEXT_RECORD_LIMIT,
+    ):
+        if (
+            record.id in seen_ids
+            or record.metadata.get("curation_action")
+            not in {"save_context", "scene_scratch"}
+        ):
+            continue
+        seen_ids.add(record.id)
+        records.append(
+            replace(
+                record,
+                metadata={**record.metadata, "suppression_only": True},
+            )
+        )
     return _IndexedContextSourceRetrieval(
         records=tuple(records),
         diagnostics={
@@ -918,6 +1282,359 @@ def _indexed_context_source_retrieval(
             "indexed_retrieval_duration_ms": _elapsed_ms(started_at),
             "first_pass_source_type_counts": _context_source_type_counts(records),
         },
+    )
+
+
+async def _retrieve_indexed_context_sources(
+    repositories: PersistenceRepositories,
+    *,
+    provider: ProviderClient,
+    provider_name: str,
+    model_id: str,
+    save_id: str,
+    latest_player_message: str,
+    scene_snapshot: SceneSnapshotRecord | None,
+    characters: list[CharacterRecord],
+    character_knowledge_edges: list[CharacterKnowledgeEdgeRecord],
+    entity_links: list[EntityLinkRecord],
+    recent_messages: list[MessageRecord],
+    message_visibility: list[MessageVisibilityRecord],
+) -> _IndexedContextSourceRetrieval:
+    initial = _indexed_context_source_retrieval(
+        repositories,
+        save_id=save_id,
+        latest_player_message=latest_player_message,
+        scene_snapshot=scene_snapshot,
+        characters=characters,
+        character_knowledge_edges=character_knowledge_edges,
+        entity_links=entity_links,
+        message_visibility=message_visibility,
+    )
+    if not latest_player_message.strip():
+        return initial
+    supports_tools = (
+        isinstance(provider, ToolCallProvider)
+        and _model_supports_tool_calling(
+            repositories=repositories,
+            provider=provider_name,
+            model_id=model_id,
+        )
+    )
+    supports_structured = (
+        isinstance(provider, StructuredOutputProvider)
+        and _model_supports_structured_output(
+            repositories=repositories,
+            provider=provider_name,
+            model_id=model_id,
+        )
+    )
+    if supports_tools:
+        expanded_terms = await _tool_retrieval_expansion(
+            repositories=repositories,
+            provider=cast(ToolCallProvider, provider),
+            provider_name=provider_name,
+            model_id=model_id,
+            save_id=save_id,
+            latest_player_message=latest_player_message,
+            scene_snapshot=scene_snapshot,
+            characters=characters,
+            recent_messages=recent_messages,
+            message_visibility=message_visibility,
+        )
+    elif supports_structured:
+        expanded_terms = await _structured_retrieval_expansion(
+            repositories=repositories,
+            provider=cast(StructuredOutputProvider, provider),
+            provider_name=provider_name,
+            model_id=model_id,
+            save_id=save_id,
+            latest_player_message=latest_player_message,
+            scene_snapshot=scene_snapshot,
+            characters=characters,
+            recent_messages=recent_messages,
+            message_visibility=message_visibility,
+        )
+    else:
+        return initial
+    if not expanded_terms:
+        return initial
+    expanded = _indexed_context_source_retrieval(
+        repositories,
+        save_id=save_id,
+        latest_player_message=latest_player_message,
+        scene_snapshot=scene_snapshot,
+        characters=characters,
+        character_knowledge_edges=character_knowledge_edges,
+        entity_links=entity_links,
+        message_visibility=message_visibility,
+        additional_query_terms=expanded_terms,
+    )
+    return replace(
+        expanded,
+        diagnostics={
+            **expanded.diagnostics,
+            "retrieval_expansion_used": True,
+            "retrieval_expansion_term_count": len(expanded_terms),
+        },
+    )
+
+
+async def _structured_retrieval_expansion(
+    *,
+    repositories: PersistenceRepositories,
+    provider: StructuredOutputProvider,
+    provider_name: str,
+    model_id: str,
+    save_id: str,
+    latest_player_message: str,
+    scene_snapshot: SceneSnapshotRecord | None,
+    characters: list[CharacterRecord],
+    recent_messages: list[MessageRecord],
+    message_visibility: list[MessageVisibilityRecord],
+) -> tuple[str, ...]:
+    present_ids = frozenset(
+        scene_snapshot.present_character_ids if scene_snapshot is not None else ()
+    )
+    visible_recent = _latest_visible_messages(
+        recent_messages,
+        limit=6,
+        present_character_ids=present_ids,
+        message_visibility=message_visibility,
+    )
+    eligible_characters = [
+        character
+        for character in characters
+        if character.id in present_ids
+        or character_name_is_mentioned(
+            name=character.name,
+            aliases=character.aliases,
+            text=" ".join(message.body for message in visible_recent),
+        )
+    ]
+    entity_ids = [character.id for character in eligible_characters]
+    schema: dict[str, object] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "terms": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {"type": "string"},
+            },
+            "phrases": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {"type": "string"},
+            },
+            "entity_ids": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {"type": "string", "enum": entity_ids},
+            },
+        },
+        "required": ["terms", "phrases", "entity_ids"],
+    }
+    entity_text = "\n".join(
+        f"- {character.id}: {character.name}; aliases={', '.join(character.aliases)}"
+        for character in eligible_characters
+    ) or "none"
+    recent_text = "\n".join(
+        f"- {message.speaker_name or message.role}: {message.body}"
+        for message in visible_recent
+    )
+    request = request_with_openrouter_routing(
+        repositories,
+        StructuredOutputRequest(
+            provider=provider_name,
+            model_id=model_id,
+            schema_name="context_retrieval_expansion",
+            schema=schema,
+            messages=(
+                ChatMessage(
+                    role="system",
+                    body=(
+                        "Expand the player's continuity query with short synonymous "
+                        "terms, phrases, and visible entity references. Use only the "
+                        "provided entity IDs and enforced schema."
+                    ),
+                ),
+                ChatMessage(
+                    role="user",
+                    body=(
+                        f"Player query:\n{latest_player_message}\n\n"
+                        f"Visible entities:\n{entity_text}\n\n"
+                        f"Visible recent context:\n{recent_text}"
+                    ),
+                ),
+            ),
+            temperature=0.0,
+        ),
+        task="context_search",
+        save_id=save_id,
+    )
+    try:
+        response = await provider.generate_structured_output(
+            budget_structured_output_request(
+                repositories,
+                request,
+                task="context_search",
+            )
+        )
+    except (ProviderError, ValueError, KeyError, TypeError, AssertionError):
+        return ()
+    data = response.data
+    terms = _string_values(data.get("terms"), limit=12)
+    phrases = _string_values(data.get("phrases"), limit=6)
+    selected_ids = set(_string_values(data.get("entity_ids"), limit=8))
+    entity_terms = tuple(
+        value
+        for character in eligible_characters
+        if character.id in selected_ids
+        for value in (character.name, *character.aliases)
+    )
+    return tuple(dict.fromkeys((*terms, *phrases, *entity_terms)))
+
+
+async def _tool_retrieval_expansion(
+    *,
+    repositories: PersistenceRepositories,
+    provider: ToolCallProvider,
+    provider_name: str,
+    model_id: str,
+    save_id: str,
+    latest_player_message: str,
+    scene_snapshot: SceneSnapshotRecord | None,
+    characters: list[CharacterRecord],
+    recent_messages: list[MessageRecord],
+    message_visibility: list[MessageVisibilityRecord],
+) -> tuple[str, ...]:
+    present_ids = frozenset(
+        scene_snapshot.present_character_ids if scene_snapshot is not None else ()
+    )
+    visible_recent = _latest_visible_messages(
+        recent_messages,
+        limit=6,
+        present_character_ids=present_ids,
+        message_visibility=message_visibility,
+    )
+    eligible_characters = [
+        character
+        for character in characters
+        if character.id in present_ids
+        or character_name_is_mentioned(
+            name=character.name,
+            aliases=character.aliases,
+            text=" ".join(message.body for message in visible_recent),
+        )
+    ]
+    entity_ids = [character.id for character in eligible_characters]
+    parameters: dict[str, object] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "terms": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {"type": "string"},
+            },
+            "phrases": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {"type": "string"},
+            },
+            "entity_ids": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {"type": "string", "enum": entity_ids},
+            },
+        },
+        "required": ["terms", "phrases", "entity_ids"],
+    }
+    entity_text = "\n".join(
+        f"- {character.id}: {character.name}; aliases={', '.join(character.aliases)}"
+        for character in eligible_characters
+    ) or "none"
+    recent_text = "\n".join(
+        f"- {message.speaker_name or message.role}: {message.body}"
+        for message in visible_recent
+    )
+    request = request_with_openrouter_routing(
+        repositories,
+        ToolCallRequest(
+            provider=provider_name,
+            model_id=model_id,
+            messages=(
+                ToolCallMessage(
+                    role="system",
+                    body=(
+                        "Call expand_context_retrieval once with short synonymous "
+                        "terms, phrases, and visible entity references. Use only "
+                        "the provided entity IDs."
+                    ),
+                ),
+                ToolCallMessage(
+                    role="user",
+                    body=(
+                        f"Player query:\n{latest_player_message}\n\n"
+                        f"Visible entities:\n{entity_text}\n\n"
+                        f"Visible recent context:\n{recent_text}"
+                    ),
+                ),
+            ),
+            tools=(
+                ToolDefinition(
+                    name=CONTEXT_RETRIEVAL_EXPANSION_TOOL,
+                    description="Expand a continuity query for local retrieval.",
+                    parameters=parameters,
+                ),
+            ),
+            temperature=0.0,
+        ),
+        task="context_search",
+        save_id=save_id,
+    )
+    try:
+        response = await provider.generate_tool_calls(
+            budget_tool_call_request(
+                repositories,
+                request,
+                task="context_search",
+            )
+        )
+    except (ProviderError, ValueError, KeyError, TypeError):
+        return ()
+    call = next(
+        (
+            item
+            for item in response.tool_calls
+            if item.name == CONTEXT_RETRIEVAL_EXPANSION_TOOL
+        ),
+        None,
+    )
+    if call is None:
+        return ()
+    data, parse_error = parse_tool_arguments_json(call.arguments_json)
+    if data is None or parse_error is not None:
+        return ()
+    terms = _string_values(data.get("terms"), limit=12)
+    phrases = _string_values(data.get("phrases"), limit=6)
+    selected_ids = set(_string_values(data.get("entity_ids"), limit=8))
+    entity_terms = tuple(
+        value
+        for character in eligible_characters
+        if character.id in selected_ids
+        for value in (character.name, *character.aliases)
+    )
+    return tuple(dict.fromkeys((*terms, *phrases, *entity_terms)))
+
+
+def _string_values(value: object, *, limit: int) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        text
+        for item in value[:limit]
+        if (text := str(item).strip())
     )
 
 
@@ -1024,12 +1741,14 @@ def _context_candidate_set(
         character_knowledge_edges=character_knowledge_edges or [],
         entity_links=entity_links or [],
         latest_player_message=latest_player_message,
+        message_visibility=message_visibility or [],
     )
     context_source_records = context_sources or []
     observation_records = observations or []
     accepted_observation_ids = _accepted_observation_ids(observation_records)
     curated_observation_source_ids = _curated_observation_source_ids(
         context_source_records,
+        memories=memories,
         accepted_observation_ids=accepted_observation_ids,
     )
     indexed_candidates = _indexed_context_candidates(
@@ -1037,28 +1756,50 @@ def _context_candidate_set(
         scoped_targets=scoped_targets,
         reference_character_ids=audience_reference_character_ids,
         accepted_observation_ids=accepted_observation_ids,
+        present_character_ids=turn_scope.present_character_ids,
+        message_visibility=message_visibility or [],
+    )
+    raw_state_candidates = _state_candidates(
+        world_state,
+        scoped_targets=scoped_targets,
+        exclude_open_thread_aggregates=bool(indexed_candidates),
+        present_character_ids=turn_scope.present_character_ids,
+        message_visibility=message_visibility or [],
+    )
+    raw_memory_candidates = _memory_candidates(
+        memories,
+        scoped_targets=scoped_targets,
+        present_character_ids=turn_scope.present_character_ids,
+        message_visibility=message_visibility or [],
+        observations_by_id={
+            observation.id: observation for observation in observation_records
+        },
     )
     state_candidates = (
-        _state_candidates(
-            world_state,
-            scoped_targets=scoped_targets,
-            exclude_open_thread_aggregates=bool(indexed_candidates),
-        )
-        if include_missing_raw_candidates
-        else ()
+        raw_state_candidates if include_missing_raw_candidates else ()
     )
     memory_candidates = (
-        _memory_candidates(memories, scoped_targets=scoped_targets)
+        raw_memory_candidates if include_missing_raw_candidates else ()
+    )
+    exact_raw_candidates = (
+        ()
         if include_missing_raw_candidates
-        else ()
+        else _exact_raw_candidates(
+            (*raw_state_candidates, *raw_memory_candidates),
+            indexed_candidates=indexed_candidates,
+            latest_player_message=latest_player_message,
+        )
     )
     observation_candidates = _observation_candidates(
         observation_records,
         excluded_observation_ids=curated_observation_source_ids,
+        present_character_ids=turn_scope.present_character_ids,
+        message_visibility=message_visibility or [],
     )
     if indexed_candidates:
         canonical_candidates = (
             *indexed_candidates,
+            *exact_raw_candidates,
             *(
                 _missing_raw_candidates(
                     state_candidates,
@@ -1076,7 +1817,7 @@ def _context_candidate_set(
             *memory_candidates,
         )
     else:
-        canonical_candidates = ()
+        canonical_candidates = exact_raw_candidates
     candidates = (
         *canonical_candidates,
         *observation_candidates,
@@ -2661,14 +3402,24 @@ def _indexed_context_candidates(
     scoped_targets: ScopedTargets,
     reference_character_ids: frozenset[str],
     accepted_observation_ids: frozenset[str],
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
     candidates: list[_ContextCandidate] = []
     for record in records:
+        if record.metadata.get("suppression_only") is True:
+            continue
         source_type = _indexed_candidate_source_type(
             record,
             accepted_observation_ids=accepted_observation_ids,
         )
         if source_type is None:
+            continue
+        if not _metadata_provenance_visible_to_present_characters(
+            record.metadata,
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility,
+        ):
             continue
         if _audience_candidate_blocked(record, reference_character_ids):
             continue
@@ -2713,6 +3464,94 @@ def _missing_raw_candidates(
     )
 
 
+def _exact_raw_candidates(
+    candidates: tuple[_ContextCandidate, ...],
+    *,
+    indexed_candidates: tuple[_ContextCandidate, ...],
+    latest_player_message: str,
+    limit: int = 24,
+) -> tuple[_ContextCandidate, ...]:
+    query_terms = set(_bounded_context_query_terms(latest_player_message))
+    if not query_terms or limit <= 0:
+        return ()
+    structured_identifiers = _bounded_structured_identifiers(latest_player_message)
+    indexed_keys = {
+        (candidate.source_type, candidate.source_id)
+        for candidate in indexed_candidates
+    }
+    ranked: list[tuple[float, _ContextCandidate]] = []
+    ordinary_query_terms = {
+        "about",
+        "could",
+        "did",
+        "does",
+        "from",
+        "have",
+        "learn",
+        "remember",
+        "tell",
+        "that",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "would",
+    }
+    for candidate in candidates:
+        if (candidate.source_type, candidate.source_id) in indexed_keys:
+            continue
+        candidate_text = (candidate.selection_text or candidate.text).casefold()
+        candidate_terms = set(
+            _bounded_context_query_terms(candidate_text)
+        )
+        overlap_terms = query_terms & candidate_terms
+        overlap_count = len(overlap_terms)
+        distinctive_identifier_match = any(
+            len(term) >= 6 and term not in ordinary_query_terms
+            for term in overlap_terms
+        ) or any(
+            identifier in candidate_text
+            for identifier in structured_identifiers
+        )
+        if (
+            overlap_count < min(2, len(query_terms))
+            and not distinctive_identifier_match
+        ):
+            continue
+        coverage = overlap_count / len(candidate_terms)
+        short_identifier_match = (
+            len(query_terms) <= 2 and overlap_count == len(query_terms)
+        )
+        if (
+            coverage < 0.5
+            and not short_identifier_match
+            and not distinctive_identifier_match
+        ):
+            continue
+        ranked.append((coverage + overlap_count, candidate))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return tuple(candidate for _score, candidate in ranked[:limit])
+
+
+def _bounded_structured_identifiers(text: str) -> tuple[str, ...]:
+    ordered = tuple(
+        dict.fromkeys(
+            structured_identifiers(
+                _bounded_context_query_text(text),
+                max_input_chars=MAX_CONTEXT_QUERY_CHARS,
+                max_identifiers=MAX_CONTEXT_QUERY_CHARS // 2,
+            )
+        )
+    )
+    if len(ordered) <= MAX_EXACT_RAW_STRUCTURED_IDENTIFIERS:
+        return ordered
+    edge_count = MAX_EXACT_RAW_STRUCTURED_IDENTIFIERS // 2
+    return tuple(
+        dict.fromkeys((*ordered[:edge_count], *ordered[-edge_count:]))
+    )
+
+
 def _known_by_candidate_blocked(
     record: ContextSourceRecord,
     scoped_targets: ScopedTargets,
@@ -2725,7 +3564,8 @@ def _known_by_candidate_blocked(
         return False
     allowed_owners = {
         scoped_owner_name(owner).casefold()
-        for owner in scoped_targets.allowed.values()
+        for owners in scoped_targets.allowed.values()
+        for owner in owners
     }
     normalized_known_by = {str(item).casefold() for item in known_by}
     return not bool(normalized_known_by & allowed_owners)
@@ -2736,8 +3576,9 @@ def _audience_candidate_blocked(
     reference_character_ids: frozenset[str],
 ) -> bool:
     audience_character_ids = record.metadata.get("audience_character_ids")
+    requires_audience = record.metadata.get("requires_audience") is True
     if not isinstance(audience_character_ids, list) or not audience_character_ids:
-        return False
+        return requires_audience
     normalized_audience = {
         str(character_id)
         for character_id in audience_character_ids
@@ -2761,7 +3602,12 @@ def _indexed_candidate_source_type(
         ):
             return "observation"
         return None
-    if record.source_type in {
+    normalized_source_type = (
+        "memory" if record.source_type == "memories" else record.source_type
+    )
+    if normalized_source_type == "state":
+        normalized_source_type = "world_state"
+    if normalized_source_type in {
         "character_text_thread",
         "open_obligation",
         "scenario_section",
@@ -2769,7 +3615,7 @@ def _indexed_candidate_source_type(
         "memory",
         "character_voice",
     }:
-        return record.source_type
+        return normalized_source_type
     return None
 
 
@@ -2817,12 +3663,60 @@ def _accepted_observation_ids(
     return frozenset(record.id for record in records if record.status == "accepted")
 
 
+def _observations_with_indexed_sources(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    observations: tuple[ContextObservationRecord, ...],
+    context_sources: tuple[ContextSourceRecord, ...],
+) -> tuple[ContextObservationRecord, ...]:
+    existing_ids = {observation.id for observation in observations}
+    missing_ids = {
+        source.source_id
+        for source in context_sources
+        if source.source_type == "observation"
+        and source.source_id not in existing_ids
+    }
+    if not missing_ids:
+        return observations
+    return (
+        *observations,
+        *repositories.list_context_observations_by_ids(save_id, missing_ids),
+    )
+
+
+def _context_source_message_ids(
+    source: ContextSourceRecord,
+) -> frozenset[str]:
+    source_ids: set[str] = set()
+    for metadata_field in ("source_message_id", "last_seen_message_id"):
+        value = source.metadata.get(metadata_field)
+        if isinstance(value, str) and value:
+            source_ids.add(value)
+    raw_ids = source.metadata.get("source_message_ids")
+    if isinstance(raw_ids, list):
+        source_ids.update(
+            value for value in raw_ids if isinstance(value, str) and value
+        )
+    raw_groups = source.metadata.get("source_provenance_groups")
+    if isinstance(raw_groups, list):
+        source_ids.update(
+            value
+            for group in raw_groups
+            if isinstance(group, list)
+            for value in group
+            if isinstance(value, str) and value
+        )
+    return frozenset(source_ids)
+
+
 def _curated_observation_source_ids(
     records: list[ContextSourceRecord],
     *,
+    memories: list[MemoryRecord],
     accepted_observation_ids: frozenset[str],
 ) -> frozenset[str]:
-    return frozenset(
+    context_observation_ids = frozenset(
         observation_id
         for record in records
         if (
@@ -2833,6 +3727,13 @@ def _curated_observation_source_ids(
         )
         is not None
     )
+    memory_observation_ids = frozenset(
+        observation_id
+        for memory in memories
+        for observation_id in memory.source_observation_ids
+        if observation_id in accepted_observation_ids
+    )
+    return context_observation_ids | memory_observation_ids
 
 
 def _curated_observation_source_id(
@@ -2875,10 +3776,31 @@ def _narrow_context_candidates(
             item[0],
         ),
     )
-    selected = sorted(
-        ranked[:MAX_CONTEXT_CANDIDATE_POOL],
-        key=lambda item: item[0],
-    )
+    selected_indexes: set[int] = set()
+    selected_type_counts: Counter[str] = Counter()
+    for source_type in dict.fromkeys(
+        candidate.source_type for candidate in candidates
+    ):
+        reserved = [
+            item for item in ranked if item[1].source_type == source_type
+        ][:4]
+        for index, candidate in reserved:
+            selected_indexes.add(index)
+            selected_type_counts[candidate.source_type] += 1
+    for index, candidate in ranked:
+        if len(selected_indexes) >= MAX_CONTEXT_CANDIDATE_POOL:
+            break
+        if index in selected_indexes:
+            continue
+        if selected_type_counts[candidate.source_type] >= 24:
+            continue
+        selected_indexes.add(index)
+        selected_type_counts[candidate.source_type] += 1
+    selected = [
+        (index, candidate)
+        for index, candidate in enumerate(candidates)
+        if index in selected_indexes
+    ]
     return tuple(candidate for _index, candidate in selected)
 
 
@@ -2917,21 +3839,101 @@ def _candidate_rank(
 
 
 def _meaningful_terms(text: str) -> set[str]:
-    return {
+    return set(_ordered_meaningful_query_terms(text))
+
+
+def _ordered_meaningful_query_terms(text: str) -> tuple[str, ...]:
+    terms = (*unicode_word_terms(text), *cjk_lexical_anchors(text))
+    return tuple(
+        dict.fromkeys(
+            term
+            for term in terms
+            if term
+            and term
+            not in {
+                "and",
+                "for",
+                "i",
+                "the",
+                "that",
+                "this",
+                "with",
+                "you",
+                "your",
+            }
+        )
+    )
+
+
+def _bounded_context_query_text(text: str) -> str:
+    if len(text) <= MAX_CONTEXT_QUERY_CHARS:
+        return text
+    head_chars = MAX_CONTEXT_QUERY_CHARS // 2
+    tail_chars = MAX_CONTEXT_QUERY_CHARS - head_chars - 1
+    return f"{text[:head_chars]} {text[-tail_chars:]}"
+
+
+def _bounded_context_query_terms(text: str) -> tuple[str, ...]:
+    ordered = _ordered_meaningful_query_terms(_bounded_context_query_text(text))
+    if len(ordered) <= MAX_CONTEXT_QUERY_TERMS:
+        return _balanced_script_terms(
+            set(ordered),
+            limit=MAX_CONTEXT_QUERY_TERMS,
+        )
+    edge_reserve = MAX_CONTEXT_QUERY_TERMS // 4
+    identifier_reserve = MAX_CONTEXT_QUERY_TERMS // 8
+    identifier_terms = tuple(
         term
-        for term in re.findall(r"[a-z0-9']{3,}", text.casefold())
-        if term
-        not in {
-            "and",
-            "for",
-            "the",
-            "that",
-            "this",
-            "with",
-            "you",
-            "your",
-        }
-    }
+        for term in ordered
+        if len(term) <= 2
+        and term.isascii()
+        and term.isalnum()
+    )[:identifier_reserve]
+    selected = list(
+        dict.fromkeys(
+            (
+                *identifier_terms,
+                *ordered[:edge_reserve],
+                *ordered[-edge_reserve:],
+            )
+        )
+    )
+    remaining = set(ordered) - set(selected)
+    selected.extend(
+        _balanced_script_terms(
+            remaining,
+            limit=MAX_CONTEXT_QUERY_TERMS - len(selected),
+        )
+    )
+    return tuple(selected[:MAX_CONTEXT_QUERY_TERMS])
+
+
+def _balanced_script_terms(
+    terms: set[str] | frozenset[str],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    if limit <= 0:
+        return ()
+    ordered = sorted(terms, key=lambda term: (-len(term), term))
+    non_ascii = [
+        term
+        for term in ordered
+        if any(ord(character) > 127 for character in term)
+    ]
+    non_ascii_set = set(non_ascii)
+    ascii_terms = [term for term in ordered if term not in non_ascii_set]
+    if not non_ascii or not ascii_terms:
+        return tuple(ordered[:limit])
+    reserve = limit // 2
+    selected = [*non_ascii[:reserve], *ascii_terms[:reserve]]
+    selected_set = set(selected)
+    selected.extend(
+        term
+        for term in ordered
+        if term not in selected_set
+    )
+    return tuple(selected[:limit])
 
 
 def _state_candidates(
@@ -2939,10 +3941,20 @@ def _state_candidates(
     *,
     scoped_targets: ScopedTargets,
     exclude_open_thread_aggregates: bool = False,
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
     candidates: list[_ContextCandidate] = []
     for record in records:
         if exclude_open_thread_aggregates and is_open_threads_aggregate_key(record.key):
+            continue
+        if record.source_message_id and not (
+            _source_messages_visible_to_present_characters(
+                (record.source_message_id,),
+                present_character_ids=present_character_ids,
+                message_visibility=message_visibility,
+            )
+        ):
             continue
         text = _scoped_candidate_text(
             source_type="world_state",
@@ -3055,9 +4067,9 @@ def _scoped_candidate_text(
     scoped_targets: ScopedTargets,
 ) -> str | None:
     key = (source_type, source_id)
-    owner = scoped_targets.allowed.get(key)
-    if owner:
-        return f"Character-scoped knowledge ({owner}): {text}"
+    owners = scoped_targets.allowed.get(key)
+    if owners:
+        return f"Character-scoped knowledge ({', '.join(owners)}): {text}"
     if key in scoped_targets.blocked:
         return None
     return text
@@ -3081,9 +4093,28 @@ def _memory_candidates(
     records: list[MemoryRecord],
     *,
     scoped_targets: ScopedTargets,
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
+    observations_by_id: dict[str, ContextObservationRecord],
 ) -> tuple[_ContextCandidate, ...]:
     candidates: list[_ContextCandidate] = []
     for record in records:
+        source_message_ids = tuple(
+            dict.fromkeys(
+                (
+                    *record.source_message_ids,
+                    *((record.source_message_id,) if record.source_message_id else ()),
+                )
+            )
+        )
+        if not _memory_provenance_visible_to_present_characters(
+            record,
+            source_message_ids=source_message_ids,
+            observations_by_id=observations_by_id,
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility,
+        ):
+            continue
         text = _scoped_candidate_text(
             source_type="memory",
             source_id=record.id,
@@ -3103,16 +4134,80 @@ def _memory_candidates(
     return tuple(candidates)
 
 
+def _memory_provenance_visible_to_present_characters(
+    memory: MemoryRecord,
+    *,
+    source_message_ids: tuple[str, ...],
+    observations_by_id: dict[str, ContextObservationRecord],
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
+) -> bool:
+    groups: list[tuple[str, ...]] = []
+    memory_fingerprint = (
+        memory.claim_fingerprint or canonical_claim_fingerprint(memory.body)
+    )
+    provenance_mode = "any"
+    grouped_source_ids: set[str] = set()
+    for observation_id in memory.source_observation_ids:
+        observation = observations_by_id.get(observation_id)
+        if observation is None:
+            provenance_mode = "all"
+            continue
+        group = tuple(dict.fromkeys(observation.source_message_ids))
+        if group:
+            groups.append(group)
+            grouped_source_ids.update(group)
+        curation = observation.metadata.get("curation")
+        curated_body = (
+            curation.get("memory_body")
+            if isinstance(curation, dict)
+            else None
+        )
+        supporting_body = (
+            curated_body.strip()
+            if isinstance(curated_body, str) and curated_body.strip()
+            else observation.claim
+        )
+        if canonical_claim_fingerprint(supporting_body) != memory_fingerprint:
+            provenance_mode = "all"
+    ungrouped = tuple(
+        source_id
+        for source_id in source_message_ids
+        if source_id not in grouped_source_ids
+    )
+    if ungrouped:
+        groups.append(ungrouped)
+    if not groups:
+        groups.append(source_message_ids)
+    visible_groups = (
+        _source_messages_visible_to_present_characters(
+            group,
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility,
+        )
+        for group in groups
+    )
+    return all(visible_groups) if provenance_mode == "all" else any(visible_groups)
+
+
 def _observation_candidates(
     records: list[ContextObservationRecord],
     *,
     excluded_observation_ids: frozenset[str],
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
     candidates: list[_ContextCandidate] = []
     for record in records:
         if record.status != "accepted":
             continue
         if record.id in excluded_observation_ids:
+            continue
+        if not _source_messages_visible_to_present_characters(
+            tuple(record.source_message_ids),
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility,
+        ):
             continue
         text = (
             f"{record.claim} Evidence: {record.evidence_quote or 'not quoted'}; "
@@ -3133,6 +4228,104 @@ def _observation_candidates(
     return tuple(candidates)
 
 
+def _metadata_source_message_ids(
+    metadata: Mapping[str, object],
+) -> tuple[str, ...]:
+    raw_ids = metadata.get("source_message_ids")
+    values = (
+        [
+            str(item)
+            for item in raw_ids
+            if isinstance(item, str) and item.strip()
+        ]
+        if isinstance(raw_ids, list)
+        else []
+    )
+    for field_name in ("source_message_id", "last_seen_message_id"):
+        value = metadata.get(field_name)
+        if isinstance(value, str) and value.strip():
+            values.append(value)
+    return tuple(dict.fromkeys(values))
+
+
+def _metadata_provenance_visible_to_present_characters(
+    metadata: Mapping[str, object],
+    *,
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
+) -> bool:
+    raw_groups = metadata.get("source_provenance_groups")
+    mode = metadata.get("source_provenance_mode")
+    if mode is not None and mode not in {"all", "any"}:
+        return False
+    if raw_groups is not None and (
+        not isinstance(raw_groups, list)
+        or len(raw_groups) > MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS
+        or not all(
+            isinstance(group, list)
+            and bool(group)
+            and len(group) <= MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS
+            and all(isinstance(source_id, str) and source_id for source_id in group)
+            for group in raw_groups
+        )
+    ):
+        return False
+    groups = (
+        tuple(
+            tuple(
+                str(source_id)
+                for source_id in group
+                if isinstance(source_id, str) and source_id.strip()
+            )
+            for group in raw_groups
+            if isinstance(group, list)
+        )
+        if isinstance(raw_groups, list)
+        else ()
+    )
+    nonempty_groups = tuple(group for group in groups if group)
+    if nonempty_groups:
+        grouped_source_ids = {
+            source_id for group in nonempty_groups for source_id in group
+        }
+        if not set(_metadata_source_message_ids(metadata)).issubset(
+            grouped_source_ids
+        ):
+            return False
+        group_visibility = (
+            _source_messages_visible_to_present_characters(
+                group,
+                present_character_ids=present_character_ids,
+                message_visibility=message_visibility,
+            )
+            for group in nonempty_groups
+        )
+        if mode == "all":
+            return all(group_visibility)
+        return any(group_visibility)
+    return _source_messages_visible_to_present_characters(
+        _metadata_source_message_ids(metadata),
+        present_character_ids=present_character_ids,
+        message_visibility=message_visibility,
+    )
+
+
+def _source_messages_visible_to_present_characters(
+    source_message_ids: tuple[str, ...],
+    *,
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
+) -> bool:
+    return all(
+        message_visible_to_present_characters(
+            message_id=message_id,
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility,
+        )
+        for message_id in source_message_ids
+    )
+
+
 def _message_candidates(
     records: list[MessageRecord],
     player_message_id: str,
@@ -3140,20 +4333,48 @@ def _message_candidates(
     present_character_ids: frozenset[str],
     message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
+    visible_records = _latest_visible_messages(
+        records,
+        limit=RECENT_MESSAGE_CANDIDATE_LIMIT,
+        present_character_ids=present_character_ids,
+        message_visibility=message_visibility,
+        excluded_message_id=player_message_id,
+    )
     return tuple(
         _ContextCandidate(
             source_type="message",
             source_id=record.id,
             text=f"{record.speaker_name or record.role}: {record.body}",
         )
-        for record in records[-RECENT_MESSAGE_CANDIDATE_LIMIT:]
-        if record.id != player_message_id
-        if message_visible_to_present_characters(
-            message_id=record.id,
-            present_character_ids=present_character_ids,
-            message_visibility=message_visibility,
-        )
+        for record in visible_records
     )
+
+
+def _latest_visible_messages(
+    records: list[MessageRecord],
+    *,
+    limit: int,
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
+    excluded_message_id: str | None = None,
+) -> list[MessageRecord]:
+    if limit <= 0:
+        return []
+    hidden_message_ids = {
+        record.message_id
+        for record in message_visibility
+        if record.character_id in present_character_ids
+        and record.visibility == "not_visible"
+    }
+    selected: list[MessageRecord] = []
+    for record in reversed(records):
+        if record.id == excluded_message_id or record.id in hidden_message_ids:
+            continue
+        selected.append(record)
+        if len(selected) >= limit:
+            break
+    selected.reverse()
+    return selected
 
 
 def _memory_selection_text(record: MemoryRecord, *, text: str | None = None) -> str:
@@ -3273,6 +4494,29 @@ def _message_body(messages: list[MessageRecord], message_id: str) -> str:
         if message.id == message_id:
             return message.body
     return ""
+
+
+def _context_search_visible_messages(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    scene_snapshot: SceneSnapshotRecord | None,
+    required_messages: tuple[MessageRecord, ...] = (),
+) -> list[MessageRecord]:
+    visible_messages = repositories.list_recent_messages_visible_to_characters(
+        save_id,
+        character_ids=(
+            set(scene_snapshot.present_character_ids)
+            if scene_snapshot is not None
+            else set()
+        ),
+        limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+    )
+    visible_ids = {message.id for message in visible_messages}
+    visible_messages.extend(
+        message for message in required_messages if message.id not in visible_ids
+    )
+    return visible_messages
 
 
 def _result_json(

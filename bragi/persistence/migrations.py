@@ -5,14 +5,30 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import unicodedata
 from contextvars import ContextVar
+from hashlib import sha256
 from pathlib import Path
 
 from bragi.model_tasks import is_retired_model_task
 from bragi.observation_types import normalize_observation_type
+from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.private_files import ensure_private_file
+from bragi.text_search import (
+    MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS,
+    cjk_lexical_anchors,
+    structured_identifiers,
+    structured_identifiers_from_edges,
+    unicode_word_terms,
+)
 
-CURRENT_SCHEMA_VERSION = 71
+CURRENT_SCHEMA_VERSION = 72
+_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
+_MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
+_MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
+_MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD = 4 * 1024 * 1024
+_MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
+_MAX_MEMORY_PROVENANCE_IDS = 64
 
 _PRESERVE_SCHEMA_SCRIPT_TRANSACTION: ContextVar[bool] = ContextVar(
     "_PRESERVE_SCHEMA_SCRIPT_TRANSACTION",
@@ -153,6 +169,10 @@ CREATE TABLE IF NOT EXISTS context_sources (
     body TEXT NOT NULL DEFAULT '',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     token_estimate INTEGER,
+    scene_snapshot_id TEXT REFERENCES scene_snapshots(id) ON DELETE SET NULL,
+    scene_generation INTEGER,
+    created_turn_number INTEGER,
+    expires_after_turn_number INTEGER,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     archived_at TEXT,
@@ -228,6 +248,7 @@ CREATE TABLE IF NOT EXISTS scene_snapshots (
     locked_fields_json TEXT NOT NULL DEFAULT '[]',
     first_seen_message_id TEXT REFERENCES messages(id),
     last_updated_message_id TEXT REFERENCES messages(id),
+    scene_generation INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(save_id, current_location_id) REFERENCES locations(save_id, id)
@@ -395,6 +416,8 @@ CREATE TABLE IF NOT EXISTS memories (
     importance INTEGER NOT NULL DEFAULT 1,
     source_message_id TEXT REFERENCES messages(id),
     source_message_ids_json TEXT NOT NULL DEFAULT '[]',
+    claim_fingerprint TEXT NOT NULL DEFAULT '',
+    source_observation_ids_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     archived_at TEXT
@@ -639,23 +662,30 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 70:
+            if current == 71:
+                _migrate_schema_71_to_72(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 70:
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 69:
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 68:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 67:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 66:
                 _migrate_schema_66_to_67(connection)
@@ -663,6 +693,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 65:
                 _migrate_schema_65_to_66(connection)
@@ -671,6 +702,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 64:
                 _migrate_schema_64_to_65(connection)
@@ -680,6 +712,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 63:
                 _migrate_schema_63_to_64(connection)
@@ -690,6 +723,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 62:
                 _migrate_schema_62_to_63(connection)
@@ -701,6 +735,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 61:
                 _migrate_schema_61_to_62(connection)
@@ -713,6 +748,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             else:
                 raise RuntimeError(
@@ -734,6 +770,8 @@ def migrate_database(database_path: Path | str) -> None:
                 f"{current} is newer than this Bragi build supports "
                 f"({CURRENT_SCHEMA_VERSION}). Upgrade Bragi before starting."
             )
+        if not _memory_claim_fingerprint_index_is_unique(connection):
+            _migrate_schema_71_to_72(connection)
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
         _ensure_context_observation_curation_schema(connection)
@@ -742,6 +780,8 @@ def migrate_database(database_path: Path | str) -> None:
         _ensure_character_text_activity_schema(connection)
         _ensure_scene_world_time_schema(connection)
         _ensure_hot_narration_query_indexes(connection)
+        _ensure_continuity_index_revision_schema(connection)
+        _ensure_context_source_search_terms_schema(connection)
         connection.commit()
 
 
@@ -757,6 +797,7 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         )
         _ensure_character_knowledge_schema(connection)
         _ensure_context_revision_schema(connection)
+        _ensure_continuity_index_revision_schema(connection)
         _ensure_scheduled_tasks_schema(connection)
         _ensure_auth_schema(connection)
         _ensure_save_access_schema(connection)
@@ -766,6 +807,7 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         _ensure_provider_catalog_schema(connection)
         _ensure_hot_narration_query_indexes(connection)
         _ensure_context_source_fts_schema(connection)
+        _ensure_context_source_search_terms_schema(connection)
         _ensure_message_scene_presence_schema(connection)
         _ensure_message_action_choices_schema(connection)
         _normalize_legacy_action_choice_scenarios(connection)
@@ -781,6 +823,7 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         _ensure_character_text_message_attachment_schema(connection)
         _ensure_turn_snapshot_schema(connection)
         _ensure_context_revision_schema(connection)
+        _ensure_continuity_index_revision_schema(connection)
         _ensure_character_contact_name_schema(connection)
         _ensure_character_texting_style_schema(connection)
         _ensure_character_current_clothing_schema(connection)
@@ -1220,6 +1263,50 @@ def _ensure_hot_narration_query_indexes(connection: sqlite3.Connection) -> None:
     )
     _create_index_if_columns_exist(
         connection,
+        "character_knowledge_edges",
+        {
+            "save_id",
+            "target_type",
+            "target_id",
+            "archived_at",
+            "character_id",
+        },
+        """
+        CREATE INDEX IF NOT EXISTS idx_knowledge_edges_save_target_character
+        ON character_knowledge_edges(
+            save_id,
+            target_type,
+            target_id,
+            archived_at,
+            character_id
+        )
+        """,
+    )
+    _create_index_if_columns_exist(
+        connection,
+        "entity_links",
+        {
+            "save_id",
+            "target_type",
+            "target_id",
+            "relation",
+            "entity_type",
+            "entity_id",
+        },
+        """
+        CREATE INDEX IF NOT EXISTS idx_entity_links_save_target_relation_entity
+        ON entity_links(
+            save_id,
+            target_type,
+            target_id,
+            relation,
+            entity_type,
+            entity_id
+        )
+        """,
+    )
+    _create_index_if_columns_exist(
+        connection,
         "locations",
         {"save_id", "name", "created_at", "archived_at"},
         """
@@ -1275,6 +1362,17 @@ def _ensure_hot_narration_query_indexes(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_memories_save_active_created
         ON memories(save_id, created_at)
         WHERE archived_at IS NULL
+        """,
+    )
+    _create_index_if_columns_exist(
+        connection,
+        "memories",
+        {"save_id", "claim_fingerprint", "archived_at"},
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_memories_save_claim_fingerprint_active
+        ON memories(save_id, claim_fingerprint)
+        WHERE archived_at IS NULL AND claim_fingerprint != ''
         """,
     )
     _create_index_if_columns_exist(
@@ -1738,6 +1836,648 @@ def _migrate_schema_70_to_71(connection: sqlite3.Connection) -> None:
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (71)")
 
 
+def _migrate_schema_71_to_72(connection: sqlite3.Connection) -> None:
+    _add_column_if_missing(
+        connection,
+        "scene_snapshots",
+        "scene_generation",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+    for column_name, definition in (
+        (
+            "scene_snapshot_id",
+            "TEXT REFERENCES scene_snapshots(id) ON DELETE SET NULL",
+        ),
+        ("scene_generation", "INTEGER"),
+        ("created_turn_number", "INTEGER"),
+        ("expires_after_turn_number", "INTEGER"),
+    ):
+        _add_column_if_missing(connection, "context_sources", column_name, definition)
+    _add_column_if_missing(
+        connection,
+        "memories",
+        "claim_fingerprint",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    _add_column_if_missing(
+        connection,
+        "memories",
+        "source_observation_ids_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    if _table_exists(connection, "memories"):
+        rows = connection.execute(
+            "SELECT id, body FROM memories WHERE claim_fingerprint = ''"
+        ).fetchall()
+        for memory_id, body in rows:
+            connection.execute(
+                "UPDATE memories SET claim_fingerprint = ? WHERE id = ?",
+                (_migration_claim_fingerprint(body), memory_id),
+            )
+        if _table_exists(connection, "context_observations"):
+            observations_by_claim: dict[tuple[str, str], list[str]] = {}
+            observation_rows = connection.execute(
+                """
+                SELECT id, save_id, claim, metadata_json
+                FROM context_observations
+                WHERE archived_at IS NULL AND status = 'accepted'
+                ORDER BY created_at, rowid
+                """
+            ).fetchall()
+            for observation_id, save_id, claim, metadata_json in observation_rows:
+                try:
+                    metadata = json.loads(metadata_json)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(metadata, dict):
+                    continue
+                curation = metadata.get("curation")
+                if (
+                    not isinstance(curation, dict)
+                    or curation.get("action") != "durable_memory"
+                ):
+                    continue
+                memory_body = curation.get("memory_body")
+                body = (
+                    memory_body.strip()
+                    if isinstance(memory_body, str) and memory_body.strip()
+                    else str(claim)
+                )
+                fingerprint = _migration_claim_fingerprint(body)
+                if fingerprint:
+                    observations_by_claim.setdefault(
+                        (str(save_id), fingerprint),
+                        [],
+                    ).append(str(observation_id))
+            memory_rows = connection.execute(
+                """
+                SELECT id, save_id, claim_fingerprint,
+                       source_observation_ids_json
+                FROM memories
+                WHERE archived_at IS NULL
+                """
+            ).fetchall()
+            for memory_id, save_id, fingerprint, existing_json in memory_rows:
+                matching_ids = observations_by_claim.get(
+                    (str(save_id), str(fingerprint)),
+                    [],
+                )
+                if not matching_ids:
+                    continue
+                try:
+                    existing = json.loads(existing_json)
+                except (json.JSONDecodeError, TypeError):
+                    existing = []
+                existing_ids = (
+                    [str(item) for item in existing if isinstance(item, str)]
+                    if isinstance(existing, list)
+                    else []
+                )
+                merged_ids = list(
+                    dict.fromkeys((*existing_ids, *matching_ids))
+                )[:_MAX_MEMORY_PROVENANCE_IDS]
+                connection.execute(
+                    """
+                    UPDATE memories
+                    SET source_observation_ids_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(merged_ids, separators=(",", ":")),
+                        memory_id,
+                    ),
+                )
+        duplicate_rows = connection.execute(
+            """
+            SELECT id, save_id, tags_json, importance, source_message_id,
+                   source_message_ids_json, claim_fingerprint,
+                   source_observation_ids_json
+            FROM memories
+            WHERE archived_at IS NULL AND claim_fingerprint != ''
+            ORDER BY created_at, rowid
+            """
+        ).fetchall()
+        grouped_rows: dict[tuple[str, str], list[tuple[object, ...]]] = {}
+        for row in duplicate_rows:
+            grouped_rows.setdefault(
+                (str(row[1]), str(row[6])),
+                [],
+            ).append(row)
+        for (save_id, _fingerprint), group in grouped_rows.items():
+            if len(group) < 2:
+                continue
+            keeper = group[0]
+            tags: list[str] = []
+            source_message_ids: list[str] = []
+            source_observation_ids: list[str] = []
+            source_message_id: str | None = None
+            importance = 0.0
+            for row in group:
+                importance = max(importance, float(str(row[3])))
+                if source_message_id is None and row[4]:
+                    source_message_id = str(row[4])
+                for raw_json, target in (
+                    (row[2], tags),
+                    (row[5], source_message_ids),
+                    (row[7], source_observation_ids),
+                ):
+                    try:
+                        values = json.loads(str(raw_json))
+                    except (json.JSONDecodeError, TypeError):
+                        values = []
+                    if isinstance(values, list):
+                        target.extend(
+                            str(value)
+                            for value in values
+                            if isinstance(value, str) and value
+                        )
+                if row[4]:
+                    source_message_ids.append(str(row[4]))
+            connection.execute(
+                """
+                UPDATE memories
+                SET tags_json = ?, importance = ?, source_message_id = ?,
+                    source_message_ids_json = ?,
+                    source_observation_ids_json = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND save_id = ?
+                """,
+                (
+                    json.dumps(list(dict.fromkeys(tags)), separators=(",", ":")),
+                    importance,
+                    source_message_id,
+                    json.dumps(
+                        list(dict.fromkeys(source_message_ids))[
+                            :_MAX_MEMORY_PROVENANCE_IDS
+                        ],
+                        separators=(",", ":"),
+                    ),
+                    json.dumps(
+                        list(dict.fromkeys(source_observation_ids))[
+                            :_MAX_MEMORY_PROVENANCE_IDS
+                        ],
+                        separators=(",", ":"),
+                    ),
+                    keeper[0],
+                    save_id,
+                ),
+            )
+            duplicate_ids = [str(row[0]) for row in group[1:]]
+            for duplicate_id in duplicate_ids:
+                _remap_migrated_memory_references(
+                    connection,
+                    save_id=save_id,
+                    duplicate_id=duplicate_id,
+                    keeper_id=str(keeper[0]),
+                )
+            connection.execute(
+                f"""
+                UPDATE memories
+                SET archived_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE save_id = ?
+                  AND id IN ({_migration_placeholders(len(duplicate_ids))})
+                """,
+                (save_id, *duplicate_ids),
+            )
+            if _table_exists(connection, "context_sources"):
+                connection.execute(
+                    f"""
+                    UPDATE context_sources
+                    SET archived_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE save_id = ?
+                      AND source_type = 'memory'
+                      AND source_id IN ({_migration_placeholders(len(duplicate_ids))})
+                    """,
+                    (save_id, *duplicate_ids),
+                )
+        connection.execute(
+            "DROP INDEX IF EXISTS idx_memories_save_claim_fingerprint_active"
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_memories_save_claim_fingerprint_active
+            ON memories(save_id, claim_fingerprint)
+            WHERE archived_at IS NULL AND claim_fingerprint != ''
+            """
+        )
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (72)")
+
+
+def _remap_migrated_memory_references(
+    connection: sqlite3.Connection,
+    *,
+    save_id: str,
+    duplicate_id: str,
+    keeper_id: str,
+) -> None:
+    if _table_exists(connection, "character_knowledge_edges"):
+        _merge_migrated_memory_knowledge_edge_conflicts(
+            connection,
+            save_id=save_id,
+            duplicate_id=duplicate_id,
+            keeper_id=keeper_id,
+        )
+        connection.execute(
+            """
+            DELETE FROM character_knowledge_edges AS keeper_edge
+            WHERE keeper_edge.save_id = ?
+              AND keeper_edge.target_type IN ('memory', 'memories')
+              AND keeper_edge.target_id = ?
+              AND keeper_edge.archived_at IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM character_knowledge_edges AS duplicate_edge
+                  WHERE duplicate_edge.save_id = keeper_edge.save_id
+                    AND duplicate_edge.character_id = keeper_edge.character_id
+                    AND duplicate_edge.target_type = keeper_edge.target_type
+                    AND duplicate_edge.target_id = ?
+                    AND duplicate_edge.archived_at IS NULL
+              )
+            """,
+            (save_id, keeper_id, duplicate_id),
+        )
+        connection.execute(
+            """
+            UPDATE OR IGNORE character_knowledge_edges
+            SET target_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE save_id = ?
+              AND target_type IN ('memory', 'memories')
+              AND target_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM character_knowledge_edges
+            WHERE save_id = ?
+              AND target_type IN ('memory', 'memories')
+              AND target_id = ?
+            """,
+            (save_id, duplicate_id),
+        )
+    if _table_exists(connection, "context_sources"):
+        source_rows = connection.execute(
+            """
+            SELECT source_id, metadata_json, token_estimate, title, body,
+                   scene_snapshot_id, scene_generation,
+                   created_turn_number, expires_after_turn_number
+            FROM context_sources
+            WHERE save_id = ? AND source_type = 'memory'
+              AND source_id IN (?, ?) AND archived_at IS NULL
+            """,
+            (save_id, keeper_id, duplicate_id),
+        ).fetchall()
+        sources_by_id = {str(row[0]): row for row in source_rows}
+        keeper_source = sources_by_id.get(keeper_id)
+        duplicate_source = sources_by_id.get(duplicate_id)
+        if (
+            keeper_source is not None
+            and duplicate_source is not None
+            and keeper_source[3:] == duplicate_source[3:]
+        ):
+            merged_metadata = merge_context_source_metadata(
+                keeper_source[1],
+                duplicate_source[1],
+            )
+            connection.execute(
+                """
+                UPDATE context_sources
+                SET metadata_json = ?, token_estimate = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE save_id = ? AND source_type = 'memory'
+                  AND source_id = ? AND archived_at IS NULL
+                """,
+                (
+                    json.dumps(
+                        merged_metadata,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    max(
+                        int(keeper_source[2] or 0),
+                        int(duplicate_source[2] or 0),
+                    ),
+                    save_id,
+                    keeper_id,
+                ),
+            )
+        connection.execute(
+            """
+            DELETE FROM context_sources AS keeper_source
+            WHERE keeper_source.save_id = ?
+              AND keeper_source.source_type = 'memory'
+              AND keeper_source.source_id = ?
+              AND keeper_source.archived_at IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM context_sources AS duplicate_source
+                  WHERE duplicate_source.save_id = keeper_source.save_id
+                    AND duplicate_source.source_type = 'memory'
+                    AND duplicate_source.source_id = ?
+                    AND duplicate_source.archived_at IS NULL
+              )
+            """,
+            (save_id, keeper_id, duplicate_id),
+        )
+        connection.execute(
+            """
+            UPDATE OR IGNORE context_sources
+            SET source_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE save_id = ?
+              AND source_type = 'memory'
+              AND source_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
+        )
+    if _table_exists(connection, "entity_links"):
+        connection.execute(
+            """
+            UPDATE OR IGNORE entity_links
+            SET entity_id = ?
+            WHERE save_id = ?
+              AND entity_type IN ('memory', 'memories')
+              AND entity_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM entity_links
+            WHERE save_id = ?
+              AND entity_type IN ('memory', 'memories')
+              AND entity_id = ?
+            """,
+            (save_id, duplicate_id),
+        )
+        connection.execute(
+            """
+            UPDATE OR IGNORE entity_links
+            SET target_id = ?
+            WHERE save_id = ?
+              AND target_type IN ('memory', 'memories')
+              AND target_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM entity_links
+            WHERE save_id = ?
+              AND target_type IN ('memory', 'memories')
+              AND target_id = ?
+            """,
+            (save_id, duplicate_id),
+        )
+    for table_name in ("context_update_suggestions", "context_update_audit"):
+        if not _table_exists(connection, table_name):
+            continue
+        connection.execute(
+            f"""
+            UPDATE {table_name}
+            SET entity_id = ?
+            WHERE save_id = ?
+              AND entity_type = 'memory'
+              AND entity_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
+        )
+    if _table_exists(connection, "character_text_provenance"):
+        connection.execute(
+            """
+            UPDATE character_text_provenance
+            SET target_id = ?
+            WHERE save_id = ?
+              AND target_type IN ('memory', 'memories')
+              AND target_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
+        )
+    _remap_migrated_memory_proactive_triggers(
+        connection,
+        save_id=save_id,
+        duplicate_id=duplicate_id,
+        keeper_id=keeper_id,
+    )
+
+
+def _remap_migrated_memory_proactive_triggers(
+    connection: sqlite3.Connection,
+    *,
+    save_id: str,
+    duplicate_id: str,
+    keeper_id: str,
+) -> None:
+    if not _table_exists(connection, "character_text_proactive_triggers"):
+        return
+    rows = connection.execute(
+        """
+        SELECT id, character_id, trigger_key, thread_id, text_message_id,
+               source_type, source_id, source_message_id, reason
+        FROM character_text_proactive_triggers
+        WHERE save_id = ?
+          AND (
+                (
+                    source_type IN ('memory', 'memories')
+                    AND source_id = ?
+                )
+                OR trigger_key = 'memory:' || ?
+                OR instr(trigger_key, 'memory:' || ? || ':') = 1
+                OR trigger_key = 'memories:' || ?
+                OR instr(trigger_key, 'memories:' || ? || ':') = 1
+              )
+        ORDER BY rowid
+        """,
+        (
+            save_id,
+            duplicate_id,
+            duplicate_id,
+            duplicate_id,
+            duplicate_id,
+            duplicate_id,
+        ),
+    ).fetchall()
+    for row in rows:
+        (
+            trigger_id,
+            character_id,
+            trigger_key,
+            thread_id,
+            text_message_id,
+            source_type,
+            source_id,
+            source_message_id,
+            reason,
+        ) = row
+        key_parts = str(trigger_key).split(":")
+        if (
+            len(key_parts) >= 2
+            and key_parts[0] in {"memory", "memories"}
+            and key_parts[1] == duplicate_id
+        ):
+            key_parts[1] = keeper_id
+        remapped_key = ":".join(key_parts)
+        remapped_source_id = (
+            keeper_id
+            if source_type in {"memory", "memories"}
+            and source_id == duplicate_id
+            else source_id
+        )
+        existing = connection.execute(
+            """
+            SELECT id, thread_id, text_message_id, source_type, source_id,
+                   source_message_id, reason
+            FROM character_text_proactive_triggers
+            WHERE save_id = ? AND character_id = ? AND trigger_key = ?
+              AND id != ?
+            LIMIT 1
+            """,
+            (save_id, character_id, remapped_key, trigger_id),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                """
+                UPDATE character_text_proactive_triggers
+                SET trigger_key = ?, source_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (remapped_key, remapped_source_id, trigger_id),
+            )
+            continue
+        connection.execute(
+            """
+            UPDATE character_text_proactive_triggers
+            SET thread_id = COALESCE(?, thread_id),
+                text_message_id = COALESCE(?, text_message_id),
+                source_type = COALESCE(NULLIF(?, ''), source_type),
+                source_id = COALESCE(NULLIF(?, ''), source_id),
+                source_message_id = COALESCE(?, source_message_id),
+                reason = COALESCE(NULLIF(?, ''), reason),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                thread_id,
+                text_message_id,
+                source_type,
+                remapped_source_id,
+                source_message_id,
+                reason,
+                existing[0],
+            ),
+        )
+        connection.execute(
+            "DELETE FROM character_text_proactive_triggers WHERE id = ?",
+            (trigger_id,),
+        )
+
+
+def _merge_migrated_memory_knowledge_edge_conflicts(
+    connection: sqlite3.Connection,
+    *,
+    save_id: str,
+    duplicate_id: str,
+    keeper_id: str,
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT
+            keeper_edge.id, keeper_edge.knowledge_state,
+            keeper_edge.acquisition_method, keeper_edge.confidence,
+            keeper_edge.source_message_id,
+            keeper_edge.source_message_ids_json, keeper_edge.evidence_quote,
+            duplicate_edge.id, duplicate_edge.knowledge_state,
+            duplicate_edge.acquisition_method, duplicate_edge.confidence,
+            duplicate_edge.source_message_id,
+            duplicate_edge.source_message_ids_json,
+            duplicate_edge.evidence_quote
+        FROM character_knowledge_edges AS keeper_edge
+        JOIN character_knowledge_edges AS duplicate_edge
+          ON duplicate_edge.save_id = keeper_edge.save_id
+         AND duplicate_edge.character_id = keeper_edge.character_id
+         AND duplicate_edge.target_type = keeper_edge.target_type
+        WHERE keeper_edge.save_id = ?
+          AND keeper_edge.target_type IN ('memory', 'memories')
+          AND keeper_edge.target_id = ?
+          AND duplicate_edge.target_id = ?
+          AND keeper_edge.archived_at IS NULL
+          AND duplicate_edge.archived_at IS NULL
+        """,
+        (save_id, keeper_id, duplicate_id),
+    ).fetchall()
+    state_rank = {"knows": 0, "may_know": 1, "does_not_know": 2}
+    for row in rows:
+        duplicate_dominates = state_rank.get(str(row[8]), 1) > state_rank.get(
+            str(row[1]),
+            1,
+        )
+        dominant_offset = 7 if duplicate_dominates else 0
+        source_ids: list[str] = []
+        for raw_json in (row[5], row[12]):
+            try:
+                values = json.loads(str(raw_json))
+            except (json.JSONDecodeError, TypeError):
+                values = []
+            if isinstance(values, list):
+                source_ids.extend(
+                    str(value)
+                    for value in values
+                    if isinstance(value, str) and value
+                )
+        source_ids = list(dict.fromkeys(source_ids))
+        provenance_overflow = (
+            len(source_ids) > _MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS
+        )
+        connection.execute(
+            """
+            UPDATE character_knowledge_edges
+            SET knowledge_state = ?, acquisition_method = ?,
+                confidence = ?, source_message_id = ?,
+                source_message_ids_json = ?, evidence_quote = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                (
+                    "does_not_know"
+                    if provenance_overflow
+                    else row[dominant_offset + 1]
+                ),
+                "unknown" if provenance_overflow else row[dominant_offset + 2],
+                max(float(str(row[3])), float(str(row[10]))),
+                None if provenance_overflow else row[dominant_offset + 4],
+                json.dumps(
+                    [] if provenance_overflow else source_ids,
+                    separators=(",", ":"),
+                ),
+                (
+                    "Provenance exceeded the safe bound."
+                    if provenance_overflow
+                    else row[dominant_offset + 6]
+                ),
+                row[0],
+            ),
+        )
+        connection.execute(
+            "DELETE FROM character_knowledge_edges WHERE id = ?",
+            (row[7],),
+        )
+
+
+def _migration_claim_fingerprint(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value)).casefold()
+    canonical = "".join(
+        character if character.isalnum() else " "
+        for character in text
+    )
+    canonical = " ".join(canonical.split())
+    return sha256(canonical.encode("utf-8")).hexdigest() if canonical else ""
+
+
+def _migration_placeholders(count: int) -> str:
+    return ", ".join("?" for _ in range(count))
 def _remove_retired_model_preferences(connection: sqlite3.Connection) -> None:
     if not _table_exists(connection, "model_preferences"):
         return
@@ -3324,6 +4064,776 @@ def _ensure_context_revision_schema(connection: sqlite3.Connection) -> None:
     _ensure_message_context_revision_triggers(connection)
 
 
+def _ensure_continuity_index_revision_schema(connection: sqlite3.Connection) -> None:
+    if not _table_exists(connection, "saves"):
+        return
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS save_continuity_index_revisions (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL DEFAULT 0,
+            indexed_revision INTEGER NOT NULL DEFAULT -1,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS continuity_index_dirty_sources (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            source_kind TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            dirty_generation INTEGER NOT NULL DEFAULT 1,
+            queued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(save_id, source_kind, source_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_continuity_dirty_save_queue
+        ON continuity_index_dirty_sources(
+            save_id,
+            queued_at,
+            source_kind,
+            source_id
+        );
+
+        INSERT OR IGNORE INTO save_continuity_index_revisions(
+            save_id,
+            revision,
+            indexed_revision
+        )
+        SELECT id, 0, -1 FROM saves;
+
+        CREATE TRIGGER IF NOT EXISTS init_continuity_revision_after_save_insert
+        AFTER INSERT ON saves
+        BEGIN
+            INSERT OR IGNORE INTO save_continuity_index_revisions(
+                save_id,
+                revision,
+                indexed_revision
+            )
+            VALUES (NEW.id, 0, -1);
+        END;
+        """,
+    )
+    source_mappings = {
+        "world_state": ("world_state", "id"),
+        "memories": ("memory", "id"),
+        "summaries": ("summary", "id"),
+        "active_threads": ("active_thread", "id"),
+        "locations": ("location", "id"),
+        "characters": ("character", "id"),
+        "save_scenario_updates": ("scenario", None),
+        "character_text_threads": ("character_text_thread", "id"),
+        "character_text_messages": ("character_text_thread", "thread_id"),
+    }
+    for table_name in source_mappings:
+        if not _table_exists(connection, table_name):
+            continue
+        for event in ("INSERT", "UPDATE", "DELETE"):
+            row_ref = "OLD" if event == "DELETE" else "NEW"
+            trigger_name = (
+                f"bump_{table_name}_continuity_revision_after_{event.lower()}"
+            )
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            source_kind, source_column = source_mappings[table_name]
+            source_id_sql = (
+                "'scenario'"
+                if source_column is None
+                else f"{row_ref}.{source_column}"
+            )
+            _execute_schema_script(
+                connection,
+                f"""
+                CREATE TRIGGER {trigger_name}
+                AFTER {event} ON {table_name}
+                BEGIN
+                    INSERT INTO save_continuity_index_revisions(
+                        save_id,
+                        revision,
+                        indexed_revision,
+                        updated_at
+                    )
+                    VALUES ({row_ref}.save_id, 1, -1, CURRENT_TIMESTAMP)
+                    ON CONFLICT(save_id) DO UPDATE SET
+                        revision = revision + 1,
+                        updated_at = CURRENT_TIMESTAMP;
+
+                    INSERT INTO continuity_index_dirty_sources(
+                        save_id,
+                        source_kind,
+                        source_id,
+                        dirty_generation,
+                        queued_at
+                    )
+                    VALUES (
+                        {row_ref}.save_id,
+                        '{source_kind}',
+                        {source_id_sql},
+                        1,
+                        CURRENT_TIMESTAMP
+                    )
+                    ON CONFLICT(save_id, source_kind, source_id) DO UPDATE SET
+                        dirty_generation = dirty_generation + 1,
+                        queued_at = CURRENT_TIMESTAMP;
+                END;
+                """,
+            )
+    _ensure_scene_snapshot_continuity_triggers(connection)
+    _ensure_scenario_continuity_triggers(connection)
+
+
+def _ensure_scene_snapshot_continuity_triggers(
+    connection: sqlite3.Connection,
+) -> None:
+    if not _table_exists(connection, "scene_snapshots"):
+        return
+    for event, references in (
+        ("INSERT", ("NEW",)),
+        ("UPDATE", ("OLD", "NEW")),
+        ("DELETE", ("OLD",)),
+    ):
+        trigger_name = (
+            f"bump_scene_snapshots_continuity_revision_after_{event.lower()}"
+        )
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+        row_ref = "OLD" if event == "DELETE" else "NEW"
+        location_queries = " UNION ".join(
+            f"SELECT {reference}.current_location_id AS source_id"
+            for reference in references
+        )
+        character_queries = " UNION ".join(
+            (
+                "SELECT CAST(value AS TEXT) AS source_id "
+                f"FROM json_each(COALESCE({reference}."
+                "present_character_ids_json, '[]'))"
+            )
+            for reference in references
+        )
+        _execute_schema_script(
+            connection,
+            f"""
+            CREATE TRIGGER {trigger_name}
+            AFTER {event} ON scene_snapshots
+            BEGIN
+                INSERT INTO save_continuity_index_revisions(
+                    save_id, revision, indexed_revision, updated_at
+                )
+                VALUES ({row_ref}.save_id, 1, -1, CURRENT_TIMESTAMP)
+                ON CONFLICT(save_id) DO UPDATE SET
+                    revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP;
+
+                INSERT INTO continuity_index_dirty_sources(
+                    save_id, source_kind, source_id, dirty_generation, queued_at
+                )
+                SELECT {row_ref}.save_id, 'location', source_id, 1,
+                       CURRENT_TIMESTAMP
+                FROM ({location_queries})
+                WHERE source_id IS NOT NULL AND source_id != ''
+                ON CONFLICT(save_id, source_kind, source_id) DO UPDATE SET
+                    dirty_generation = dirty_generation + 1,
+                    queued_at = CURRENT_TIMESTAMP;
+
+                INSERT INTO continuity_index_dirty_sources(
+                    save_id, source_kind, source_id, dirty_generation, queued_at
+                )
+                SELECT {row_ref}.save_id, 'character', source_id, 1,
+                       CURRENT_TIMESTAMP
+                FROM ({character_queries})
+                WHERE source_id IS NOT NULL AND source_id != ''
+                ON CONFLICT(save_id, source_kind, source_id) DO UPDATE SET
+                    dirty_generation = dirty_generation + 1,
+                    queued_at = CURRENT_TIMESTAMP;
+            END;
+            """,
+        )
+
+
+def _ensure_scenario_continuity_triggers(connection: sqlite3.Connection) -> None:
+    if not _table_exists(connection, "scenarios"):
+        return
+    trigger_name = "bump_scenarios_continuity_revision_after_update"
+    connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+    _execute_schema_script(
+        connection,
+        f"""
+        CREATE TRIGGER {trigger_name}
+        AFTER UPDATE ON scenarios
+        BEGIN
+            INSERT INTO save_continuity_index_revisions(
+                save_id, revision, indexed_revision, updated_at
+            )
+            SELECT saves.id, 1, -1, CURRENT_TIMESTAMP
+            FROM saves
+            WHERE saves.scenario_id = NEW.id
+            ON CONFLICT(save_id) DO UPDATE SET
+                revision = revision + 1,
+                updated_at = CURRENT_TIMESTAMP;
+
+            INSERT INTO continuity_index_dirty_sources(
+                save_id, source_kind, source_id, dirty_generation, queued_at
+            )
+            SELECT saves.id, 'scenario', 'scenario', 1, CURRENT_TIMESTAMP
+            FROM saves
+            WHERE saves.scenario_id = NEW.id
+            ON CONFLICT(save_id, source_kind, source_id) DO UPDATE SET
+                dirty_generation = dirty_generation + 1,
+                queued_at = CURRENT_TIMESTAMP;
+        END;
+        """,
+    )
+
+
+def _ensure_context_source_search_terms_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    if not _table_exists(connection, "context_sources"):
+        return
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS context_source_search_terms (
+            context_source_id TEXT NOT NULL
+                REFERENCES context_sources(id) ON DELETE CASCADE,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            term TEXT NOT NULL,
+            PRIMARY KEY(context_source_id, term)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_source_terms_save_term
+        ON context_source_search_terms(save_id, term, context_source_id);
+
+        CREATE TABLE IF NOT EXISTS context_source_exact_identifiers (
+            context_source_id TEXT NOT NULL
+                REFERENCES context_sources(id) ON DELETE CASCADE,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            identifier TEXT NOT NULL,
+            PRIMARY KEY(context_source_id, identifier)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_source_identifiers_save_value
+        ON context_source_exact_identifiers(
+            save_id,
+            identifier,
+            context_source_id
+        );
+
+        CREATE TABLE IF NOT EXISTS context_source_exact_identifier_filters (
+            context_source_id TEXT PRIMARY KEY
+                REFERENCES context_sources(id) ON DELETE CASCADE,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            identifiers_blob BLOB NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_source_identifier_filters_save
+        ON context_source_exact_identifier_filters(save_id, context_source_id);
+
+        CREATE TABLE IF NOT EXISTS context_source_search_index_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        DROP TRIGGER IF EXISTS trg_context_source_budget_insert;
+        DROP TRIGGER IF EXISTS trg_context_source_budget_delete;
+        DROP TRIGGER IF EXISTS trg_context_source_budget_update;
+        DROP TRIGGER IF EXISTS trg_context_source_term_budget_insert;
+        DROP TRIGGER IF EXISTS trg_context_source_term_budget_delete;
+        DROP TRIGGER IF EXISTS trg_context_source_identifier_budget_insert;
+        DROP TRIGGER IF EXISTS trg_context_source_identifier_budget_delete;
+        DROP TRIGGER IF EXISTS trg_context_source_normalized_budget_insert;
+        DROP TRIGGER IF EXISTS trg_context_source_normalized_budget_delete;
+        DROP TRIGGER IF EXISTS trg_context_source_archive_index_cleanup;
+
+        DROP TABLE IF EXISTS context_source_normalized_budget_entries;
+        DROP TABLE IF EXISTS context_source_index_budget_state;
+
+        CREATE TABLE context_source_index_budget_state (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            source_text_bytes INTEGER NOT NULL DEFAULT 0,
+            normalized_text_bytes INTEGER NOT NULL DEFAULT 0,
+            index_rows INTEGER NOT NULL DEFAULT 0,
+            index_bytes INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS context_source_legacy_budget_limits (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            normalized_text_bytes INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS context_source_legacy_record_budget_limits (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            normalized_text_bytes INTEGER NOT NULL
+        );
+
+        CREATE TABLE context_source_normalized_budget_entries (
+            context_source_id TEXT PRIMARY KEY
+                REFERENCES context_sources(id) ON DELETE CASCADE,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            normalized_text_bytes INTEGER NOT NULL
+        );
+
+        DELETE FROM context_source_search_terms
+        WHERE context_source_id NOT IN (SELECT id FROM context_sources);
+
+        DELETE FROM context_source_exact_identifiers
+        WHERE context_source_id NOT IN (SELECT id FROM context_sources);
+
+        DELETE FROM context_source_exact_identifier_filters
+        WHERE context_source_id NOT IN (SELECT id FROM context_sources);
+
+        DELETE FROM context_source_search_terms
+        WHERE context_source_id IN (
+            SELECT id FROM context_sources WHERE archived_at IS NOT NULL
+        );
+
+        DELETE FROM context_source_exact_identifiers
+        WHERE context_source_id IN (
+            SELECT id FROM context_sources WHERE archived_at IS NOT NULL
+        );
+
+        DELETE FROM context_source_index_budget_state;
+
+        INSERT INTO context_source_index_budget_state(
+            save_id, source_text_bytes, normalized_text_bytes,
+            index_rows, index_bytes
+        )
+        SELECT
+            save_id,
+            SUM(
+                LENGTH(CAST(substr(title, 1, 65536) AS BLOB))
+                + LENGTH(CAST(substr(body, 1, 65536) AS BLOB))
+            ),
+            0,
+            0,
+            0
+        FROM context_sources
+        WHERE archived_at IS NULL
+        GROUP BY save_id;
+
+        INSERT INTO context_source_index_budget_state(
+            save_id, source_text_bytes, normalized_text_bytes,
+            index_rows, index_bytes
+        )
+        SELECT save_id, 0, 0, COUNT(*), SUM(LENGTH(CAST(value AS BLOB)))
+        FROM (
+            SELECT save_id, term AS value FROM context_source_search_terms
+            UNION ALL
+            SELECT save_id, identifier AS value
+            FROM context_source_exact_identifiers
+        )
+        GROUP BY save_id
+        ON CONFLICT(save_id) DO UPDATE SET
+            index_rows = excluded.index_rows,
+            index_bytes = excluded.index_bytes;
+
+        CREATE TRIGGER trg_context_source_budget_insert
+        AFTER INSERT ON context_sources
+        WHEN NEW.archived_at IS NULL
+        BEGIN
+            INSERT INTO context_source_index_budget_state(
+                save_id, source_text_bytes, normalized_text_bytes,
+                index_rows, index_bytes
+            )
+            VALUES (
+                NEW.save_id,
+                LENGTH(CAST(substr(NEW.title, 1, 65536) AS BLOB))
+                    + LENGTH(CAST(substr(NEW.body, 1, 65536) AS BLOB)),
+                0,
+                0,
+                0
+            )
+            ON CONFLICT(save_id) DO UPDATE SET
+                source_text_bytes = source_text_bytes
+                    + excluded.source_text_bytes;
+        END;
+
+        CREATE TRIGGER trg_context_source_budget_delete
+        AFTER DELETE ON context_sources
+        WHEN OLD.archived_at IS NULL
+        BEGIN
+            UPDATE context_source_index_budget_state
+            SET source_text_bytes = MAX(
+                0,
+                source_text_bytes
+                    - LENGTH(CAST(substr(OLD.title, 1, 65536) AS BLOB))
+                    - LENGTH(CAST(substr(OLD.body, 1, 65536) AS BLOB))
+            )
+            WHERE save_id = OLD.save_id;
+        END;
+
+        CREATE TRIGGER trg_context_source_budget_update
+        AFTER UPDATE OF save_id, title, body, archived_at ON context_sources
+        BEGIN
+            UPDATE context_source_index_budget_state
+            SET source_text_bytes = MAX(
+                0,
+                source_text_bytes
+                    - CASE WHEN OLD.archived_at IS NULL THEN
+                        LENGTH(CAST(substr(OLD.title, 1, 65536) AS BLOB))
+                        + LENGTH(CAST(substr(OLD.body, 1, 65536) AS BLOB))
+                      ELSE 0 END
+            )
+            WHERE save_id = OLD.save_id;
+
+            INSERT INTO context_source_index_budget_state(
+                save_id, source_text_bytes, normalized_text_bytes,
+                index_rows, index_bytes
+            )
+            SELECT
+                NEW.save_id,
+                LENGTH(CAST(substr(NEW.title, 1, 65536) AS BLOB))
+                    + LENGTH(CAST(substr(NEW.body, 1, 65536) AS BLOB)),
+                0,
+                0,
+                0
+            WHERE NEW.archived_at IS NULL
+            ON CONFLICT(save_id) DO UPDATE SET
+                source_text_bytes = source_text_bytes
+                    + excluded.source_text_bytes;
+        END;
+
+        CREATE TRIGGER trg_context_source_term_budget_insert
+        AFTER INSERT ON context_source_search_terms
+        BEGIN
+            INSERT INTO context_source_index_budget_state(
+                save_id, source_text_bytes, normalized_text_bytes,
+                index_rows, index_bytes
+            )
+            VALUES (
+                NEW.save_id, 0, 0, 1, LENGTH(CAST(NEW.term AS BLOB))
+            )
+            ON CONFLICT(save_id) DO UPDATE SET
+                index_rows = index_rows + 1,
+                index_bytes = index_bytes + excluded.index_bytes;
+        END;
+
+        CREATE TRIGGER trg_context_source_term_budget_delete
+        AFTER DELETE ON context_source_search_terms
+        BEGIN
+            UPDATE context_source_index_budget_state
+            SET
+                index_rows = MAX(0, index_rows - 1),
+                index_bytes = MAX(
+                    0,
+                    index_bytes - LENGTH(CAST(OLD.term AS BLOB))
+                )
+            WHERE save_id = OLD.save_id;
+        END;
+
+        CREATE TRIGGER trg_context_source_identifier_budget_insert
+        AFTER INSERT ON context_source_exact_identifiers
+        BEGIN
+            INSERT INTO context_source_index_budget_state(
+                save_id, source_text_bytes, normalized_text_bytes,
+                index_rows, index_bytes
+            )
+            VALUES (
+                NEW.save_id, 0, 0, 1, LENGTH(CAST(NEW.identifier AS BLOB))
+            )
+            ON CONFLICT(save_id) DO UPDATE SET
+                index_rows = index_rows + 1,
+                index_bytes = index_bytes + excluded.index_bytes;
+        END;
+
+        CREATE TRIGGER trg_context_source_identifier_budget_delete
+        AFTER DELETE ON context_source_exact_identifiers
+        BEGIN
+            UPDATE context_source_index_budget_state
+            SET
+                index_rows = MAX(0, index_rows - 1),
+                index_bytes = MAX(
+                    0,
+                    index_bytes - LENGTH(CAST(OLD.identifier AS BLOB))
+                )
+            WHERE save_id = OLD.save_id;
+        END;
+
+        CREATE TRIGGER trg_context_source_normalized_budget_insert
+        AFTER INSERT ON context_source_normalized_budget_entries
+        BEGIN
+            INSERT INTO context_source_index_budget_state(
+                save_id, source_text_bytes, normalized_text_bytes,
+                index_rows, index_bytes
+            )
+            VALUES (NEW.save_id, 0, NEW.normalized_text_bytes, 0, 0)
+            ON CONFLICT(save_id) DO UPDATE SET
+                normalized_text_bytes = normalized_text_bytes
+                    + excluded.normalized_text_bytes;
+        END;
+
+        CREATE TRIGGER trg_context_source_normalized_budget_delete
+        AFTER DELETE ON context_source_normalized_budget_entries
+        BEGIN
+            UPDATE context_source_index_budget_state
+            SET normalized_text_bytes = MAX(
+                0,
+                normalized_text_bytes - OLD.normalized_text_bytes
+            )
+            WHERE save_id = OLD.save_id;
+        END;
+
+        CREATE TRIGGER trg_context_source_archive_index_cleanup
+        AFTER UPDATE OF archived_at ON context_sources
+        WHEN OLD.archived_at IS NULL AND NEW.archived_at IS NOT NULL
+        BEGIN
+            DELETE FROM context_source_search_terms
+            WHERE context_source_id = NEW.id;
+            DELETE FROM context_source_exact_identifiers
+            WHERE context_source_id = NEW.id;
+            DELETE FROM context_source_normalized_budget_entries
+            WHERE context_source_id = NEW.id;
+        END;
+        """,
+    )
+    normalized_budget_rows = connection.execute(
+        """
+        SELECT id, save_id, substr(title, 1, 65536), substr(body, 1, 65536)
+        FROM context_sources
+        WHERE archived_at IS NULL
+        ORDER BY rowid
+        """
+    )
+    for source_id, save_id, title, body in normalized_budget_rows:
+        normalized_bytes = sum(
+            len(
+                unicodedata.normalize("NFKC", str(value or ""))
+                .casefold()
+                .encode("utf-8")
+            )
+            for value in (title, body)
+        )
+        connection.execute(
+            """
+            INSERT INTO context_source_normalized_budget_entries(
+                context_source_id, save_id, normalized_text_bytes
+            )
+            VALUES (?, ?, ?)
+            """,
+            (str(source_id), str(save_id), normalized_bytes),
+        )
+    connection.execute(
+        """
+        INSERT INTO context_source_legacy_budget_limits(
+            save_id, normalized_text_bytes
+        )
+        SELECT save_id, normalized_text_bytes
+        FROM context_source_index_budget_state
+        WHERE normalized_text_bytes > 33554432
+        ON CONFLICT(save_id) DO UPDATE SET
+            normalized_text_bytes = MAX(
+                normalized_text_bytes,
+                excluded.normalized_text_bytes
+            )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO context_source_legacy_record_budget_limits(
+            save_id, normalized_text_bytes
+        )
+        SELECT save_id, MAX(normalized_text_bytes)
+        FROM context_source_normalized_budget_entries
+        GROUP BY save_id
+        HAVING MAX(normalized_text_bytes) > ?
+        ON CONFLICT(save_id) DO UPDATE SET
+            normalized_text_bytes = MAX(
+                normalized_text_bytes,
+                excluded.normalized_text_bytes
+            )
+        """,
+        (_MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD,),
+    )
+    exact_identifier_index_complete = connection.execute(
+        """
+        SELECT 1
+        FROM context_source_search_index_state
+        WHERE key = 'exact_identifiers_complete_v2'
+        """
+    ).fetchone()
+    missing_rows = connection.execute(
+        """
+        SELECT source.id, source.save_id,
+               substr(source.title, 1, 65536),
+               substr(source.body, 1, 65536)
+        FROM context_sources source
+        WHERE source.archived_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM context_source_search_terms term
+              WHERE term.context_source_id = source.id
+          )
+        ORDER BY source.rowid
+        """
+    )
+    for source_id, save_id, title, body in missing_rows:
+        terms = _migration_context_source_search_terms(
+            str(title or ""),
+            str(body or ""),
+        )
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO context_source_search_terms(
+                context_source_id,
+                save_id,
+                term
+            )
+            VALUES (?, ?, ?)
+            """,
+            ((str(source_id), str(save_id), term) for term in terms),
+        )
+    missing_identifier_rows = connection.execute(
+        f"""
+        SELECT source.id, source.save_id,
+               substr(
+                   source.title, 1,
+                   {MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+               ),
+               substr(
+                   source.title,
+                   -{MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+               ),
+               length(source.title),
+               substr(
+                   source.body, 1,
+                   {MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+               ),
+               substr(
+                   source.body,
+                   -{MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+               ),
+               length(source.body)
+        FROM context_sources source
+        WHERE source.archived_at IS NULL
+          AND (
+            ? = 1
+            OR NOT EXISTS (
+                SELECT 1
+                FROM context_source_exact_identifiers identifier
+                WHERE identifier.context_source_id = source.id
+            )
+          )
+        ORDER BY source.rowid
+        """,
+        (int(exact_identifier_index_complete is None),),
+    )
+    for (
+        source_id,
+        save_id,
+        title_prefix,
+        title_suffix,
+        title_chars,
+        body_prefix,
+        body_suffix,
+        body_chars,
+    ) in missing_identifier_rows:
+        identifiers = _migration_context_source_exact_identifiers_from_edges(
+            title_prefix=str(title_prefix or ""),
+            title_suffix=str(title_suffix or ""),
+            title_chars=int(title_chars),
+            body_prefix=str(body_prefix or ""),
+            body_suffix=str(body_suffix or ""),
+            body_chars=int(body_chars),
+        )
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO context_source_exact_identifiers(
+                context_source_id,
+                save_id,
+                identifier
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                (str(source_id), str(save_id), identifier)
+                for identifier in identifiers or ("",)
+            ),
+        )
+    connection.execute(
+        """
+        INSERT OR REPLACE INTO context_source_search_index_state(key, value)
+        VALUES ('exact_identifiers_complete_v2', '1')
+        """
+    )
+
+
+def _migration_context_source_search_terms(
+    title: str,
+    body: str,
+) -> tuple[str, ...]:
+    bounded_title = title[:_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
+    bounded_body = body[:_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
+    terms = (
+        *cjk_lexical_anchors(bounded_title),
+        *cjk_lexical_anchors(bounded_body),
+        *unicode_word_terms(bounded_title),
+        *unicode_word_terms(bounded_body),
+    )
+    return tuple(dict.fromkeys(terms))[:_MAX_CONTEXT_SOURCE_INDEX_TERMS]
+
+
+def _migration_context_source_exact_identifiers(
+    title: str,
+    body: str,
+) -> tuple[str, ...]:
+    identifiers = tuple(
+        dict.fromkeys(
+            (
+                *structured_identifiers(
+                    title,
+                    max_input_chars=_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS,
+                    max_identifiers=_MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS,
+                ),
+                *structured_identifiers(
+                    body,
+                    max_input_chars=_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS,
+                    max_identifiers=_MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS,
+                ),
+            )
+        )
+    )
+    if len(identifiers) <= _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS:
+        return identifiers
+    edge_count = _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS // 2
+    return (
+        *identifiers[:edge_count],
+        *identifiers[-edge_count:],
+    )
+
+
+def _migration_context_source_exact_identifiers_from_edges(
+    *,
+    title_prefix: str,
+    title_suffix: str,
+    title_chars: int,
+    body_prefix: str,
+    body_suffix: str,
+    body_chars: int,
+) -> tuple[str, ...]:
+    identifiers = tuple(
+        dict.fromkeys(
+            (
+                *structured_identifiers_from_edges(
+                    title_prefix,
+                    title_suffix,
+                    total_chars=title_chars,
+                    max_identifiers=_MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS,
+                ),
+                *structured_identifiers_from_edges(
+                    body_prefix,
+                    body_suffix,
+                    total_chars=body_chars,
+                    max_identifiers=_MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS,
+                ),
+            )
+        )
+    )
+    if len(identifiers) <= _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS:
+        return identifiers
+    edge_count = _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS // 2
+    return (
+        *identifiers[:edge_count],
+        *identifiers[-edge_count:],
+    )
+
+
 def _ensure_message_context_revision_schema(connection: sqlite3.Connection) -> None:
     if not _table_exists(connection, "messages"):
         return
@@ -3590,6 +5100,18 @@ def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
             (table_name,),
         ).fetchone()
         is not None
+    )
+
+
+def _memory_claim_fingerprint_index_is_unique(
+    connection: sqlite3.Connection,
+) -> bool:
+    if not _table_exists(connection, "memories"):
+        return True
+    return any(
+        str(row[1]) == "idx_memories_save_claim_fingerprint_active"
+        and bool(row[2])
+        for row in connection.execute("PRAGMA index_list('memories')").fetchall()
     )
 
 

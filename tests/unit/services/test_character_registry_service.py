@@ -49,17 +49,32 @@ class CountingPersistenceRepositories(PersistenceRepositories):
         self.list_counts["locations"] = self.list_counts.get("locations", 0) + 1
         return super().list_locations(save_id)
 
-    def list_memories(self, save_id: str) -> list[MemoryRecord]:
+    def list_memories(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[MemoryRecord]:
         self.list_counts["memories"] = self.list_counts.get("memories", 0) + 1
-        return super().list_memories(save_id)
+        return super().list_memories(save_id, limit=limit)
 
-    def list_world_state(self, save_id: str) -> list[WorldStateRecord]:
+    def list_world_state(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[WorldStateRecord]:
         self.list_counts["world_state"] = self.list_counts.get("world_state", 0) + 1
-        return super().list_world_state(save_id)
+        return super().list_world_state(save_id, limit=limit)
 
-    def list_summaries(self, save_id: str) -> list[SummaryRecord]:
+    def list_summaries(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[SummaryRecord]:
         self.list_counts["summaries"] = self.list_counts.get("summaries", 0) + 1
-        return super().list_summaries(save_id)
+        return super().list_summaries(save_id, limit=limit)
 
     def list_entity_links(self, save_id: str) -> list[EntityLinkRecord]:
         self.list_counts["entity_links"] = self.list_counts.get("entity_links", 0) + 1

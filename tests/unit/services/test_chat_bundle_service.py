@@ -11,9 +11,21 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
+from bragi.persistence import repositories as repositories_module
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import SaveRecord
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
+from bragi.services import chat_bundle_service as chat_bundle_module
+from bragi.services.chat_bundle_service import (
+    _coalesce_import_context_sources,
+    _coalesce_import_entity_links,
+    _coalesce_import_knowledge_edges,
+    _coalesce_import_proactive_triggers,
+    _remapped_character_text_trigger_key,
+)
 from bragi.services.director_pressure_service import DIRECTOR_PRESSURE_STATE_KEY
 from bragi.services.generation_settings import MODEL_THINKING_PREFERENCES_SETTING
 from bragi.services.image_style_settings import (
@@ -57,6 +69,338 @@ def repositories(tmp_path: Path) -> Iterator[PersistenceRepositories]:
 
     with sqlite3.connect(database_path) as connection:
         yield PersistenceRepositories(connection)
+
+
+def test_legacy_import_rows_coalesce_after_memory_id_remapping() -> None:
+    active_source: dict[str, object] = {
+        "id": "source-active",
+        "save_id": "target-save",
+        "source_type": "memory",
+        "source_id": "merged-memory",
+        "archived_at": None,
+    }
+    sources = _coalesce_import_context_sources(
+        [
+            {
+                **active_source,
+                "id": "source-archived",
+                "archived_at": "2026-01-01",
+            },
+            active_source,
+        ]
+    )
+    links = _coalesce_import_entity_links(
+        [
+            {
+                "id": "link-one",
+                "save_id": "target-save",
+                "entity_type": "character",
+                "entity_id": "character-one",
+                "target_type": "memory",
+                "target_id": "merged-memory",
+                "relation": "recalls",
+                "source_message_id": None,
+            },
+            {
+                "id": "link-two",
+                "save_id": "target-save",
+                "entity_type": "character",
+                "entity_id": "character-one",
+                "target_type": "memory",
+                "target_id": "merged-memory",
+                "relation": "recalls",
+                "source_message_id": "message-two",
+            },
+        ]
+    )
+    edges = _coalesce_import_knowledge_edges(
+        [
+            {
+                "id": "edge-knows",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "memory",
+                "target_id": "merged-memory",
+                "knowledge_state": "knows",
+                "confidence": 0.9,
+                "source_message_ids_json": '["message-one"]',
+                "archived_at": None,
+            },
+            {
+                "id": "edge-denial",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "memory",
+                "target_id": "merged-memory",
+                "knowledge_state": "does_not_know",
+                "confidence": 0.7,
+                "source_message_ids_json": '["message-two"]',
+                "archived_at": None,
+            },
+        ]
+    )
+
+    assert sources == [active_source]
+    assert len(links) == 1
+    assert links[0]["source_message_id"] == "message-two"
+    assert len(edges) == 1
+    assert edges[0]["knowledge_state"] == "does_not_know"
+    assert edges[0]["confidence"] == 0.9
+    assert json.loads(cast(str, edges[0]["source_message_ids_json"])) == [
+        "message-one",
+        "message-two",
+    ]
+
+
+def test_bundle_validation_rejects_table_row_bomb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(chat_bundle_module, "_MAX_BUNDLE_TABLE_ROWS", 1)
+
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="table has too many rows",
+    ):
+        chat_bundle_module._validate_bundle_data(
+            {},
+            {"message_action_choices": [{}, {}]},
+        )
+
+
+def test_bundle_json_decode_stops_at_object_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(chat_bundle_module, "_MAX_BUNDLE_JSON_OBJECTS", 1)
+
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="contains too many objects",
+    ):
+        chat_bundle_module._json_object_from_bytes(
+            b'{"rows":[{},{}]}',
+            "data.json",
+        )
+
+
+def test_bundle_json_decode_stops_at_primitive_value_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(chat_bundle_module, "_MAX_BUNDLE_JSON_NODES", 4)
+
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="too many values",
+    ):
+        chat_bundle_module._json_object_from_bytes(
+            b'{"rows":[0,0,0,0]}',
+            "data.json",
+        )
+
+
+def test_bundle_validation_stops_at_nested_json_value_budget() -> None:
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="nested JSON",
+    ):
+        chat_bundle_module._validate_bundle_nested_json(
+            {
+                "state_changes": [
+                    {"before_json": json.dumps([0] * 20)}
+                ]
+            },
+            json_node_budget=[10],
+        )
+
+
+def test_import_context_sources_keep_legacy_provenance_alternatives() -> None:
+    [source] = _coalesce_import_context_sources(
+        [
+            {
+                "id": "source-one",
+                "save_id": "target-save",
+                "source_type": "memory",
+                "source_id": "merged-memory",
+                "metadata_json": '{"source_message_ids":["message-hidden"]}',
+                "token_estimate": 3,
+                "archived_at": None,
+            },
+            {
+                "id": "source-two",
+                "save_id": "target-save",
+                "source_type": "memory",
+                "source_id": "merged-memory",
+                "metadata_json": '{"source_message_ids":["message-visible"]}',
+                "token_estimate": 4,
+                "archived_at": None,
+            },
+        ]
+    )
+
+    metadata = json.loads(cast(str, source["metadata_json"]))
+    assert metadata["source_provenance_groups"] == [
+        ["message-hidden"],
+        ["message-visible"],
+    ]
+
+
+def test_import_context_sources_reject_conflicting_body_provenance() -> None:
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="Conflicting context sources",
+    ):
+        _coalesce_import_context_sources(
+            [
+                {
+                    "id": "source-hidden",
+                    "save_id": "target-save",
+                    "source_type": "memory",
+                    "source_id": "merged-memory",
+                    "title": "Secret",
+                    "body": "The hidden vault code is AMBER-77.",
+                    "metadata_json": (
+                        '{"source_message_ids":["message-hidden"]}'
+                    ),
+                    "archived_at": None,
+                },
+                {
+                    "id": "source-visible",
+                    "save_id": "target-save",
+                    "source_type": "memory",
+                    "source_id": "merged-memory",
+                    "title": "Harmless",
+                    "body": "The lamps are lit.",
+                    "metadata_json": (
+                        '{"source_message_ids":["message-visible"]}'
+                    ),
+                    "archived_at": None,
+                },
+            ]
+        )
+
+
+def test_import_proactive_triggers_coalesce_and_remap_schema_keys() -> None:
+    mappings = {
+        "message": {"message-old": "message-new"},
+        "character": {"character-old": "character-new"},
+        "memory": {
+            "memory-one": "memory-merged",
+            "memory-two": "memory-merged",
+        },
+    }
+    assert _remapped_character_text_trigger_key(
+        "ambient_random:message-old:character-old",
+        mappings,
+    ) == "ambient_random:message-new:character-new"
+    assert _remapped_character_text_trigger_key(
+        "character_intent:memory-one:basis",
+        mappings,
+    ) == "character_intent:memory-one:basis"
+
+    rows = _coalesce_import_proactive_triggers(
+        [
+            {
+                "id": "trigger-one",
+                "save_id": "target-save",
+                "character_id": "character-new",
+                "trigger_key": "memory:memory-merged",
+                "trigger_type": "memory_changed",
+                "source_type": "memory",
+                "source_id": "memory-merged",
+                "reason": "Original reason",
+            },
+            {
+                "id": "trigger-two",
+                "save_id": "target-save",
+                "character_id": "character-new",
+                "trigger_key": "memory:memory-merged",
+                "trigger_type": "memory_changed",
+                "source_type": "memory",
+                "source_id": "memory-merged",
+                "reason": "Replacement reason",
+            },
+        ]
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "Replacement reason"
+
+
+def test_import_knowledge_edges_fail_closed_on_provenance_overflow() -> None:
+    [edge] = _coalesce_import_knowledge_edges(
+        [
+            {
+                "id": "edge-one",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "memory",
+                "target_id": "memory-one",
+                "knowledge_state": "knows",
+                "acquisition_method": "observed",
+                "confidence": 0.8,
+                "source_message_ids_json": json.dumps(
+                    [f"message-{index:02d}" for index in range(40)]
+                ),
+                "archived_at": None,
+            },
+            {
+                "id": "edge-two",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "memory",
+                "target_id": "memory-one",
+                "knowledge_state": "knows",
+                "acquisition_method": "told",
+                "confidence": 0.9,
+                "source_message_ids_json": json.dumps(
+                    [f"message-{index:02d}" for index in range(40, 80)]
+                ),
+                "archived_at": None,
+            },
+        ]
+    )
+
+    assert edge["knowledge_state"] == "does_not_know"
+    assert edge["acquisition_method"] == "unknown"
+    assert edge["source_message_ids_json"] == "[]"
+
+
+def test_import_knowledge_edges_coalesce_target_aliases_and_scalar_provenance() -> None:
+    edges = _coalesce_import_knowledge_edges(
+        [
+            {
+                "id": "edge-knows",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "state",
+                "target_id": "state-secret",
+                "knowledge_state": "knows",
+                "confidence": 0.9,
+                "source_message_id": "message-visible",
+                "source_message_ids_json": "[]",
+                "archived_at": None,
+            },
+            {
+                "id": "edge-denial",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "world_state",
+                "target_id": "state-secret",
+                "knowledge_state": "does_not_know",
+                "confidence": 0.7,
+                "source_message_id": "message-hidden",
+                "source_message_ids_json": "[]",
+                "archived_at": None,
+            },
+        ]
+    )
+
+    assert len(edges) == 1
+    assert edges[0]["target_type"] == "world_state"
+    assert edges[0]["knowledge_state"] == "does_not_know"
+    assert json.loads(cast(str, edges[0]["source_message_ids_json"])) == [
+        "message-visible",
+        "message-hidden",
+    ]
 
 
 def test_export_save_writes_manifest_data_and_referenced_media(
@@ -154,6 +498,248 @@ def test_export_save_writes_manifest_data_and_referenced_media(
         assert curation_state["terminal_outcome"] == "accepted"
         assert curation_state["lease_token"] is None
         assert curation_state["lease_until"] is None
+
+
+def test_export_rejects_snapshot_that_cannot_be_imported(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    bundle_path = tmp_path / "exports" / "oversized.bragi-chat"
+
+    def reject_snapshot_rows(**_kwargs: object) -> None:
+        raise ValueError("Snapshot manifest contains too many entries")
+
+    monkeypatch.setattr(
+        TurnSnapshotService,
+        "validate_exported_snapshot_rows",
+        staticmethod(reject_snapshot_rows),
+    )
+
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="too many entries",
+    ):
+        _chat_bundle_service(repositories, media_dir).export_save(
+            save.id,
+            bundle_path,
+        )
+
+    assert not bundle_path.exists()
+
+
+def test_import_preserves_exported_legacy_normalized_budget_allowance(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="custom_note",
+        source_id="legacy-budget-note",
+        title="Legacy note",
+        body="The moonstone opens the archive.",
+    )
+    normalized_text_bytes = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_index_budget_state
+        WHERE save_id = ?
+        """,
+        (save.id,),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD",
+        1,
+    )
+    repositories.ensure_context_source_legacy_budget_limit(
+        save_id=save.id,
+        normalized_text_bytes=normalized_text_bytes,
+    )
+    repositories.commit()
+    bundle_path = tmp_path / "exports" / "legacy-budget.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+
+    imported_save_id = _imported_save_id(imported)
+    imported_limit = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_legacy_budget_limits
+        WHERE save_id = ?
+        """,
+        (imported_save_id,),
+    ).fetchone()[0]
+    assert imported_limit == normalized_text_bytes
+
+
+def test_import_preserves_snapshot_legacy_normalized_budget_allowance(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    source = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="custom_note",
+        source_id="snapshot-legacy-budget-note",
+        title="Legacy note",
+        body="The moonstone opens the archive.",
+    )
+    normalized_text_bytes = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_index_budget_state
+        WHERE save_id = ?
+        """,
+        (save.id,),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD",
+        1,
+    )
+    repositories.ensure_context_source_legacy_budget_limit(
+        save_id=save.id,
+        normalized_text_bytes=normalized_text_bytes,
+    )
+    repositories.commit()
+    TurnSnapshotService(repositories).capture_baseline_snapshot(save.id)
+    repositories.archive_context_source(source.id)
+    repositories.connection.execute(
+        """
+        DELETE FROM context_source_legacy_budget_limits
+        WHERE save_id = ?
+        """,
+        (save.id,),
+    )
+    repositories.commit()
+    bundle_path = tmp_path / "exports" / "snapshot-legacy-budget.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+
+    imported_save_id = _imported_save_id(imported)
+    imported_limit = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_legacy_budget_limits
+        WHERE save_id = ?
+        """,
+        (imported_save_id,),
+    ).fetchone()[0]
+    snapshot_id = repositories.connection.execute(
+        """
+        SELECT id
+        FROM save_turn_snapshots
+        WHERE save_id = ?
+        """,
+        (imported_save_id,),
+    ).fetchone()[0]
+    TurnSnapshotService(repositories).restore_save_to_snapshot(
+        save_id=imported_save_id,
+        snapshot_id=snapshot_id,
+    )
+    assert imported_limit == normalized_text_bytes
+    assert [
+        restored.source_id
+        for restored in repositories.list_context_sources(imported_save_id)
+    ] == ["snapshot-legacy-budget-note"]
+
+
+def test_native_export_storage_satisfies_import_compression_guard(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _chat_bundle_module()
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    bundle_path = tmp_path / "exports" / "import-safe-storage.bragi-chat"
+    monkeypatch.setattr(module, "_MIN_BUNDLE_COMPRESSION_RATIO_CHECK_BYTES", 1)
+    monkeypatch.setattr(module, "_MAX_BUNDLE_COMPRESSION_RATIO", 1.0)
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+
+    with zipfile.ZipFile(bundle_path) as bundle:
+        assert all(
+            info.compress_type == zipfile.ZIP_STORED
+            for info in bundle.infolist()
+        )
+    service.import_save(bundle_path)
+
+
+def test_import_rejects_uncovered_snapshot_media_object(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    TurnSnapshotService(repositories).capture_baseline_snapshot(save.id)
+    exported_path = tmp_path / "covered-snapshot-media.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, exported_path)
+    with zipfile.ZipFile(exported_path) as bundle:
+        manifest = json.loads(bundle.read("manifest.json"))
+        data = json.loads(bundle.read("data.json"))
+    _move_media_asset_to_snapshot_only(
+        manifest,
+        data,
+        media_asset_id=MEDIA_ASSET_ID,
+    )
+    data["snapshot_media_assets"] = []
+    bundle_path = tmp_path / "uncovered-snapshot-media.bragi-chat"
+    _write_bundle(bundle_path, manifest=manifest, data=data)
+
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="do not cover",
+    ):
+        service.import_save(bundle_path)
+
+
+def test_export_import_preserves_exact_identifier_after_long_token(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="custom_note",
+        source_id="long-token-tail",
+        title="Archive codes",
+        body="KEEP-1 " + ("A" * 70_000) + " TAIL-2",
+    )
+    bundle_path = tmp_path / "long-token-tail.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+
+    imported_save_id = _imported_save_id(imported)
+    identifiers = {
+        row[0]
+        for row in repositories.connection.execute(
+            """
+            SELECT identifier
+            FROM context_source_exact_identifiers
+            WHERE save_id = ?
+            """,
+            (imported_save_id,),
+        )
+    }
+    assert {"keep-1", "tail-2"} <= identifiers
 
 
 def test_export_save_refunds_live_curation_attempt_when_clearing_lease(
@@ -1182,6 +1768,22 @@ def test_export_save_drops_context_sources_with_stale_metadata_message_refs(
     )
     repositories.upsert_context_source(
         save_id=save.id,
+        source_type="world_state",
+        source_id="stale-provenance-context",
+        title="Stale provenance context",
+        body="This row has an inaccessible provenance alternative.",
+        metadata={
+            "source_message_ids": [NARRATOR_MESSAGE_ID],
+            "source_provenance_groups": [
+                [NARRATOR_MESSAGE_ID],
+                [deleted_message.id],
+            ],
+            "source_provenance_mode": "all",
+        },
+        context_source_id="ctx-stale-provenance",
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
         source_type="message",
         source_id=f"{NARRATOR_MESSAGE_ID},{deleted_message.id}",
         title="Stale message context",
@@ -1199,6 +1801,7 @@ def test_export_save_drops_context_sources_with_stale_metadata_message_refs(
     context_source_ids = [row["id"] for row in data["context_sources"]]
     assert "ctx-portable" in context_source_ids
     assert "ctx-stale-metadata" not in context_source_ids
+    assert "ctx-stale-provenance" not in context_source_ids
     assert "ctx-stale-source-id" not in context_source_ids
 
 
@@ -1605,6 +2208,43 @@ def test_import_save_remaps_context_source_row_id_source(
     assert imported_source.source_id == imported_summary.id
 
 
+def test_import_save_remaps_plural_comma_joined_message_context_source(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="messages",
+        source_id=f"{PLAYER_MESSAGE_ID},{NARRATOR_MESSAGE_ID}",
+        title="Two-message context",
+        body="The warning develops across two messages.",
+        metadata={
+            "source_message_ids": [PLAYER_MESSAGE_ID, NARRATOR_MESSAGE_ID],
+        },
+        context_source_id="ctx-plural-message-source",
+    )
+    bundle_path = tmp_path / "exports" / "plural-message-source.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+    imported = service.import_save(bundle_path)
+
+    imported_save_id = _imported_save_id(imported)
+    imported_message_ids = {
+        message.id for message in repositories.list_messages(imported_save_id)
+    }
+    [imported_source] = repositories.list_context_sources(
+        imported_save_id,
+        source_type="messages",
+    )
+    remapped_source_ids = set(imported_source.source_id.split(","))
+    assert remapped_source_ids <= imported_message_ids
+    assert PLAYER_MESSAGE_ID not in remapped_source_ids
+    assert NARRATOR_MESSAGE_ID not in remapped_source_ids
+
+
 def test_import_save_repairs_world_state_context_source_ids(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -1837,6 +2477,124 @@ def test_import_save_remaps_observation_context_source_metadata_id(
     assert imported_observation.id != OBSERVATION_ID
     assert imported_source.source_id == imported_observation.id
     assert imported_source.metadata["observation_id"] == imported_observation.id
+
+
+def test_import_save_preserves_memory_and_scene_scratch_provenance(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    [memory] = repositories.list_memories(save.id)
+    repositories.update_memory(
+        memory_id=memory.id,
+        body=memory.body,
+        tags=memory.tags,
+        importance=memory.importance,
+        source_message_ids=memory.source_message_ids,
+        source_observation_ids=[OBSERVATION_ID],
+        claim_fingerprint="forged-imported-fingerprint",
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id=memory.id,
+        title="Beacon memory",
+        body=memory.body,
+        metadata={
+            "source_message_ids": [PLAYER_MESSAGE_ID, NARRATOR_MESSAGE_ID],
+            "source_provenance_groups": [
+                [PLAYER_MESSAGE_ID],
+                [NARRATOR_MESSAGE_ID],
+            ],
+            "source_provenance_mode": "any",
+        },
+    )
+    location = repositories.add_location(
+        save_id=save.id,
+        name="Beacon gallery",
+        source_message_id=NARRATOR_MESSAGE_ID,
+    )
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=location.id,
+        situation="The lens is still warm.",
+        source_message_id=NARRATOR_MESSAGE_ID,
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="observation",
+        source_id=OBSERVATION_ID,
+        title="Warm lens",
+        body="The beacon lens remains warm.",
+        metadata={
+            "observation_id": OBSERVATION_ID,
+            "curation_action": "scene_scratch",
+        },
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=1,
+        expires_after_turn_number=13,
+    )
+    bundle_path = tmp_path / "exports" / "night-watch-scratch.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+    imported_save_id = _imported_save_id(imported)
+
+    [imported_observation] = repositories.list_context_observations(imported_save_id)
+    [imported_memory] = repositories.list_memories(imported_save_id)
+    [imported_scratch] = repositories.list_context_sources(
+        imported_save_id,
+        source_type="observation",
+    )
+    imported_scene = repositories.get_scene_snapshot(imported_save_id)
+    [imported_memory_source] = repositories.list_context_sources(
+        imported_save_id,
+        source_type="memory",
+    )
+    imported_messages = repositories.list_messages(imported_save_id)
+    assert imported_scene is not None
+    assert imported_memory.claim_fingerprint == canonical_claim_fingerprint(
+        imported_memory.body
+    )
+    assert imported_memory.source_observation_ids == [imported_observation.id]
+    assert imported_memory_source.source_id == imported_memory.id
+    assert imported_memory_source.metadata["source_provenance_groups"] == [
+        [imported_messages[0].id],
+        [imported_messages[1].id],
+    ]
+    assert imported_scratch.source_id == imported_observation.id
+    assert imported_scratch.scene_snapshot_id == imported_scene.id
+    assert imported_scratch.scene_generation == scene.scene_generation
+    assert imported_scratch.created_turn_number == 1
+    assert imported_scratch.expires_after_turn_number == 13
+
+
+def test_import_save_accepts_legacy_memories_without_observation_provenance(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    bundle_path = tmp_path / "exports" / "night-watch-schema-70.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    def remove_v71_memory_fields(data: dict[str, object]) -> None:
+        rows = data["memories"]
+        assert isinstance(rows, list)
+        for row in rows:
+            assert isinstance(row, dict)
+            row.pop("source_observation_ids_json", None)
+
+    _rewrite_bundle_data(bundle_path, remove_v71_memory_fields)
+
+    imported = service.import_save(bundle_path)
+    [imported_memory] = repositories.list_memories(_imported_save_id(imported))
+
+    assert imported_memory.source_observation_ids == []
 
 
 def test_import_save_ignores_historical_job_diagnostics(
@@ -2864,6 +3622,52 @@ def test_import_save_repairs_live_graph_media_refs_when_asset_is_snapshot_only(
         for link in repositories.list_entity_links(imported_save_id)
         if link.relation == "visual_context"
     ] == []
+
+
+def test_import_save_rejects_unreferenced_snapshot_media_payload(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    module = _chat_bundle_module()
+    service, manifest, data, bundle_media_path = _export_bundle_payloads(
+        repositories,
+        tmp_path,
+    )
+    metadata = _media_file_metadata(data)
+    media_assets = data["media_assets"]
+    assert isinstance(media_assets, list)
+    snapshot_media = dict(_media_asset_by_id(media_assets, MEDIA_ASSET_ID))
+    snapshot_media["id"] = "media-unreferenced-snapshot"
+    snapshot_media["path"] = "save-night-watch/images/unreferenced.png"
+    snapshot_media["thumbnail_path"] = None
+    snapshot_media["source_message_id"] = None
+    snapshot_media["source_media_asset_id"] = None
+    snapshot_media["files"] = {
+        "path": {
+            "bundle_path": "media/unreferenced.png",
+            "sha256": metadata["sha256"],
+            "byte_count": len(MEDIA_BYTES),
+        }
+    }
+    snapshot_media_assets = data.setdefault("snapshot_media_assets", [])
+    assert isinstance(snapshot_media_assets, list)
+    snapshot_media_assets.append(snapshot_media)
+    bundle_path = tmp_path / "night-watch-unreferenced-snapshot-media.bragi-chat"
+    _write_bundle_with_members(
+        bundle_path,
+        manifest=manifest,
+        data=data,
+        members={
+            bundle_media_path: MEDIA_BYTES,
+            "media/unreferenced.png": MEDIA_BYTES,
+        },
+    )
+    save_ids = [save.id for save in repositories.list_saves()]
+
+    with pytest.raises(module.ChatBundleError, match="unreferenced snapshot media"):
+        service.import_save(bundle_path)
+
+    assert [save.id for save in repositories.list_saves()] == save_ids
 
 
 def test_import_save_assigns_owner_from_import_context(
@@ -4600,6 +5404,11 @@ def test_import_save_repairs_context_update_suggestion_proposed_sources(
                         NARRATOR_MESSAGE_ID,
                         "message-not-exported",
                     ],
+                    "source_observation_id": OBSERVATION_ID,
+                    "source_observation_ids": [
+                        OBSERVATION_ID,
+                        "observation-not-exported",
+                    ],
                 }
             ),
             "status": "pending",
@@ -4640,6 +5449,15 @@ def test_import_save_repairs_context_update_suggestion_proposed_sources(
     assert suggestion.proposed_value["source_message_ids"] == [
         imported_messages[0].id,
         imported_messages[1].id,
+    ]
+    [imported_observation] = repositories.list_context_observations(
+        imported_save_id
+    )
+    assert suggestion.proposed_value["source_observation_id"] == (
+        imported_observation.id
+    )
+    assert suggestion.proposed_value["source_observation_ids"] == [
+        imported_observation.id
     ]
 
 
@@ -4827,7 +5645,7 @@ def test_import_save_remaps_context_update_suggestion_scalar_location_ids(
     assert suggestions["Move Iris to a missing location."].proposed_value is None
 
 
-def test_import_save_repairs_unknown_context_source_metadata_refs(
+def test_import_save_drops_unknown_context_source_metadata_refs(
     repositories: PersistenceRepositories,
     tmp_path: Path,
 ) -> None:
@@ -4858,6 +5676,30 @@ def test_import_save_repairs_unknown_context_source_metadata_refs(
             "archived_at": None,
         }
     )
+    context_sources.append(
+        {
+            "id": "ctx-unsafe-provenance",
+            "save_id": SAVE_ID,
+            "source_type": "world_state",
+            "source_id": "beacon_lens",
+            "title": "Unsafe provenance",
+            "body": "This row must be omitted instead of weakening provenance.",
+            "metadata_json": json.dumps(
+                {
+                    "source_message_ids": [PLAYER_MESSAGE_ID],
+                    "source_provenance_groups": [
+                        [PLAYER_MESSAGE_ID],
+                        ["message-not-exported"],
+                    ],
+                    "source_provenance_mode": "all",
+                }
+            ),
+            "token_estimate": 8,
+            "created_at": "2026-07-01T12:00:00+00:00",
+            "updated_at": "2026-07-01T12:00:00+00:00",
+            "archived_at": None,
+        }
+    )
     broken_bundle_path = (
         tmp_path / "night-watch-unknown-context-source-metadata.bragi-chat"
     )
@@ -4873,39 +5715,11 @@ def test_import_save_repairs_unknown_context_source_metadata_refs(
     imported_save_id = _imported_save_id(imported)
 
     imported_messages = repositories.list_messages(imported_save_id)
-    repaired_context = next(
-        source
+    assert all(
+        source.title not in {"Unknown metadata", "Unsafe provenance"}
         for source in repositories.list_context_sources(imported_save_id)
-        if source.title == "Unknown metadata"
     )
-    assert repaired_context.metadata["source_message_id"] is None
-    assert repaired_context.metadata["source_message_ids"] == [imported_messages[0].id]
-    assert repaired_context.metadata["last_seen_message_id"] == imported_messages[1].id
-
-    reexport_path = tmp_path / "night-watch-reexported-repaired-context.bragi-chat"
-    service.export_save(imported_save_id, reexport_path)
-
-    with zipfile.ZipFile(reexport_path) as bundle:
-        reexported_data = json.loads(bundle.read("data.json"))
-    reexported_sources = reexported_data["context_sources"]
-    assert isinstance(reexported_sources, list)
-    reexported_context = next(
-        source
-        for source in reexported_sources
-        if isinstance(source, dict) and source.get("title") == "Unknown metadata"
-    )
-    reexported_metadata = json.loads(str(reexported_context["metadata_json"]))
-    assert reexported_metadata["source_message_id"] is None
-    assert reexported_metadata["source_message_ids"] == [imported_messages[0].id]
-
-    reimported = service.import_save(reexport_path)
-    reimported_save_id = _imported_save_id(reimported)
-    reimported_context = next(
-        source
-        for source in repositories.list_context_sources(reimported_save_id)
-        if source.title == "Unknown metadata"
-    )
-    assert reimported_context.metadata["source_message_id"] is None
+    assert imported_messages
 
 
 @pytest.mark.parametrize(

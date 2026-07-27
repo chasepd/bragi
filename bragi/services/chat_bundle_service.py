@@ -18,8 +18,16 @@ from uuid import uuid4
 
 from bragi import __version__
 from bragi.app_logging import log_event
+from bragi.json_safety import JsonSafetyError, validate_json_structure
+from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD,
+    MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD,
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+    validate_context_source_index_budget,
+)
 from bragi.private_files import write_private_bytes
 from bragi.services.action_choice_flags import normalize_legacy_action_choice_scenario
 from bragi.services.character_text_world_update_service import (
@@ -44,6 +52,7 @@ from bragi.services.image_style_settings import (
     IMAGE_STYLE_PRESET_SETTING,
     sanitize_image_style_preset,
 )
+from bragi.services.knowledge_boundary import normalized_knowledge_target_type
 from bragi.services.model_preferences import (
     SAVE_MODEL_OVERRIDES_SETTING,
     sanitize_save_model_overrides,
@@ -68,6 +77,7 @@ from bragi.world_time_model import (
     canonical_world_time_from_values,
     legacy_world_time_fields,
 )
+from bragi.zip_safety import ZipSafetyError, validate_zip_directory
 from bragi_common.media_mime import imported_media_mime_type
 
 BUNDLE_FORMAT = "bragi-chat-bundle"
@@ -78,6 +88,13 @@ _MAX_BUNDLE_MEDIA_FILE_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_BUNDLE_MEDIA_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_BUNDLE_MANIFEST_JSON_BYTES = 1024 * 1024
 _MAX_BUNDLE_DATA_JSON_BYTES = 128 * 1024 * 1024
+_MAX_BUNDLE_TABLE_ROWS = 20_000
+_MAX_BUNDLE_MESSAGE_ROWS = 5_000
+_MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES = 48 * 1024 * 1024
+_MAX_BUNDLE_TOTAL_ROWS = 50_000
+_MAX_BUNDLE_JSON_OBJECTS = 150_000
+_MAX_BUNDLE_JSON_NODES = 2_000_000
+_MAX_BUNDLE_JSON_DEPTH = 128
 _MAX_BUNDLE_JSON_TOTAL_BYTES = (
     _MAX_BUNDLE_MANIFEST_JSON_BYTES + _MAX_BUNDLE_DATA_JSON_BYTES
 )
@@ -93,6 +110,8 @@ _CONTEXT_SOURCE_METADATA_MESSAGE_ID_FIELDS = (
     "last_seen_message_id",
 )
 _CONTEXT_SOURCE_METADATA_MESSAGE_ID_LIST_FIELDS = ("source_message_ids",)
+_MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
+_MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 
 
 class ChatBundleError(ValueError):
@@ -249,6 +268,33 @@ class ChatBundleService:
             },
         }
         manifest = _manifest_from_payload(manifest_payload)
+        export_json_node_budget = _validate_export_json_budget(
+            manifest_payload,
+            data,
+        )
+        _validate_bundle_data(
+            manifest_payload,
+            data,
+            json_node_budget=export_json_node_budget,
+            allow_retired_scenario=True,
+        )
+        _validate_bundle_context_source_index_budget(
+            data,
+            max_normalized_text_bytes=(
+                min(
+                    self.repositories.context_source_normalized_budget_limit(
+                        save_id
+                    ),
+                    _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES,
+                )
+            ),
+            max_normalized_record_bytes=min(
+                self.repositories.context_source_normalized_record_budget_limit(
+                    save_id
+                ),
+                _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES,
+            ),
+        )
 
         _write_bundle_atomically(
             bundle_path=bundle_path,
@@ -391,8 +437,9 @@ class ChatBundleService:
             "memories": self._rows(
                 """
                 SELECT id, save_id, body, tags_json, importance,
-                       source_message_id, source_message_ids_json, created_at,
-                       updated_at, archived_at
+                       source_message_id, source_message_ids_json,
+                       claim_fingerprint, source_observation_ids_json,
+                       created_at, updated_at, archived_at
                 FROM memories
                 WHERE save_id = ? AND archived_at IS NULL
                 ORDER BY created_at, rowid
@@ -460,8 +507,9 @@ class ChatBundleService:
             "context_sources": self._rows(
                 """
                 SELECT id, save_id, source_type, source_id, title, body,
-                       metadata_json, token_estimate, created_at, updated_at,
-                       archived_at
+                       metadata_json, token_estimate, scene_snapshot_id,
+                       scene_generation, created_turn_number,
+                       expires_after_turn_number, created_at, updated_at, archived_at
                 FROM context_sources
                 WHERE save_id = ? AND archived_at IS NULL
                 ORDER BY source_type, source_id, rowid
@@ -507,7 +555,8 @@ class ChatBundleService:
                        nearby_objects_json, hazards_json,
                        present_character_ids_json, source_message_id,
                        locked_fields_json, first_seen_message_id,
-                       last_updated_message_id, created_at, updated_at
+                       last_updated_message_id, scene_generation,
+                       created_at, updated_at
                 FROM scene_snapshots
                 WHERE save_id = ?
                 ORDER BY rowid
@@ -968,6 +1017,32 @@ class ChatBundleService:
         )
         data["turn_snapshots"] = snapshot_rows
         data["snapshot_objects"] = snapshot_objects
+        (
+            snapshot_normalized_budget,
+            snapshot_normalized_record_budget,
+        ) = _snapshot_context_source_budget(data)
+        normalized_budget = max(
+            self.repositories.context_source_normalized_budget_limit(save_id),
+            snapshot_normalized_budget,
+        )
+        normalized_record_budget = max(
+            self.repositories.context_source_normalized_record_budget_limit(
+                save_id
+            ),
+            snapshot_normalized_record_budget,
+        )
+        if (
+            normalized_budget > _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+            or normalized_record_budget
+            > _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+        ):
+            raise ChatBundleError(
+                "Legacy context source budget is too large to export"
+            )
+        data["context_source_budget"] = {
+            "normalized_text_bytes": normalized_budget,
+            "normalized_record_bytes": normalized_record_budget,
+        }
         return (
             data,
             cast(dict[str, object], data["save"]),
@@ -998,11 +1073,33 @@ class ChatBundleService:
     ) -> ImportedChatBundle:
         manifest_payload, data = self._read_bundle(bundle_path)
         _manifest_from_payload(manifest_payload)
+        (
+            declared_normalized_text_bytes,
+            declared_normalized_record_bytes,
+        ) = _bundle_context_source_budget(data)
+        (
+            snapshot_normalized_text_bytes,
+            snapshot_normalized_record_bytes,
+        ) = _snapshot_context_source_budget(data)
+        (
+            imported_normalized_text_bytes,
+            imported_normalized_record_bytes,
+        ) = (
+            _validate_bundle_context_source_index_budget(
+                data,
+                max_normalized_text_bytes=(
+                    _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+                ),
+                max_normalized_record_bytes=(
+                    _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+                ),
+            )
+        )
         media_members = _load_media_members(bundle_path, data)
         media_backups: dict[Path, bytes | None] = {}
         repair_tracker = _BundleImportRepairTracker()
         try:
-            self.repositories.begin_transaction()
+            self.repositories.begin_immediate_transaction()
             imported = self._import_data(
                 data,
                 bundle_path,
@@ -1011,6 +1108,20 @@ class ChatBundleService:
                 owner_user_id=owner_user_id,
                 repair_tracker=repair_tracker,
             )
+            self.repositories.ensure_context_source_legacy_budget_limit(
+                save_id=imported.save_id,
+                normalized_text_bytes=max(
+                    imported_normalized_text_bytes,
+                    declared_normalized_text_bytes,
+                    snapshot_normalized_text_bytes,
+                ),
+                normalized_record_bytes=max(
+                    imported_normalized_record_bytes,
+                    declared_normalized_record_bytes,
+                    snapshot_normalized_record_bytes,
+                ),
+            )
+            self.repositories.rebuild_context_source_search_terms(imported.save_id)
             self.repositories.commit_transaction()
         except Exception:
             self.repositories.rollback_transaction()
@@ -1261,6 +1372,7 @@ class ChatBundleService:
                     message_order=message_order,
                     repair_tracker=repair_tracker,
                 ),
+                claim_fingerprint=canonical_claim_fingerprint(_text(row, "body")),
             )
             memory_id_map[original_id] = memory.id
         imported_id_maps["memory"] = memory_id_map
@@ -1353,6 +1465,48 @@ class ChatBundleService:
             observation_id_map[original_id] = observation.id
         imported_id_maps["observation"] = observation_id_map
         imported_id_maps["context_observations"] = observation_id_map
+        imported_memories = {
+            memory.id: memory for memory in self.repositories.list_memories(save.id)
+        }
+        for row in _list_of_objects(data.get("memories"), "memories"):
+            memory_id = memory_id_map.get(_text(row, "id"))
+            imported_memory = imported_memories.get(memory_id or "")
+            if imported_memory is None:
+                continue
+            source_observation_ids = [
+                observation_id_map[original_id]
+                for original_id in (
+                    _json_string_list(row, "source_observation_ids_json")
+                    if "source_observation_ids_json" in row
+                    else []
+                )
+                if original_id in observation_id_map
+            ]
+            if not source_observation_ids:
+                continue
+            current_memory = self.repositories.get_memory_by_claim_fingerprint(
+                save_id=save.id,
+                claim_fingerprint=imported_memory.claim_fingerprint,
+            )
+            if current_memory is None:
+                continue
+            self.repositories.update_memory(
+                memory_id=current_memory.id,
+                body=current_memory.body,
+                tags=current_memory.tags,
+                importance=current_memory.importance,
+                source_message_ids=current_memory.source_message_ids,
+                source_observation_ids=list(
+                    dict.fromkeys(
+                        (
+                            *current_memory.source_observation_ids,
+                            *source_observation_ids,
+                        )
+                    )
+                ),
+                claim_fingerprint=current_memory.claim_fingerprint,
+            )
+        self.repositories.consolidate_active_memory_duplicates(save_id=save.id)
 
         for row in _list_of_objects(
             data.get("context_observation_curation_states"),
@@ -1543,7 +1697,7 @@ class ChatBundleService:
             media_asset_id_map.setdefault(_text(row, "id"), uuid4().hex)
         imported_id_maps["media_asset"] = media_asset_id_map
         imported_id_maps["media_assets"] = media_asset_id_map
-        media_path_map: dict[tuple[str, str], str] = {}
+        media_path_map: dict[tuple[str, str], str | None] = {}
         for row in media_rows:
             original_media_asset_id = _text(row, "id")
             asset_id = live_media_asset_id_map[original_media_asset_id]
@@ -1582,6 +1736,8 @@ class ChatBundleService:
                 media_path_map[
                     (original_media_asset_id, "thumbnail_path")
                 ] = thumbnail_relative_path
+            else:
+                media_path_map[(original_media_asset_id, "thumbnail_path")] = None
 
             self.repositories.create_media_asset(
                 save_id=save.id,
@@ -1652,6 +1808,8 @@ class ChatBundleService:
                 media_path_map[
                     (original_media_asset_id, "thumbnail_path")
                 ] = thumbnail_relative_path
+            else:
+                media_path_map[(original_media_asset_id, "thumbnail_path")] = None
 
         self._import_context_graph(
             data,
@@ -1672,6 +1830,7 @@ class ChatBundleService:
                 message_id_map=message_id_map,
                 id_maps=imported_id_maps,
                 media_path_map=media_path_map,
+                require_verified_media_paths=True,
             )
         except ValueError as exc:
             raise ChatBundleError(str(exc)) from exc
@@ -1896,36 +2055,6 @@ class ChatBundleService:
             character_text_message_id_map=character_text_message_id_map,
         )
 
-        context_sources: list[dict[str, object]] = []
-        for row in _list_of_objects(data.get("context_sources"), "context_sources"):
-            copied = _copy_row_for_save(
-                row,
-                save_id,
-                new_id=context_source_id_map[_text(row, "id")],
-            )
-            source_type = _text(copied, "source_type")
-            source_id = _text(copied, "source_id")
-            mapped_source_id = _mapped_context_source_id(
-                entity_id_maps,
-                source_type,
-                source_id,
-                repair_tracker=repair_tracker,
-            )
-            if mapped_source_id is None:
-                continue
-            copied["source_id"] = mapped_source_id
-            copied["metadata_json"] = _remapped_context_source_metadata_json(
-                copied,
-                message_id_map,
-                character_text_message_id_map,
-                observation_id_map=entity_id_maps.get("observation", {}),
-                scenario_id_map=entity_id_maps.get("scenario", {}),
-                entity_id_maps=entity_id_maps,
-                repair_tracker=repair_tracker,
-            )
-            context_sources.append(copied)
-        _insert_rows(connection, "context_sources", context_sources)
-
         locations: list[dict[str, object]] = []
         for row in _list_of_objects(data.get("locations"), "locations"):
             original_id = _text(row, "id")
@@ -2014,6 +2143,50 @@ class ChatBundleService:
             scene_snapshots.append(copied)
         _insert_rows(connection, "scene_snapshots", scene_snapshots)
         _backfill_imported_scene_world_time(connection, save_id)
+
+        context_sources: list[dict[str, object]] = []
+        for row in _list_of_objects(data.get("context_sources"), "context_sources"):
+            copied = _copy_row_for_save(
+                row,
+                save_id,
+                new_id=context_source_id_map[_text(row, "id")],
+            )
+            source_type = _text(copied, "source_type")
+            source_id = _text(copied, "source_id")
+            mapped_source_id = _mapped_context_source_id(
+                entity_id_maps,
+                source_type,
+                source_id,
+                repair_tracker=repair_tracker,
+            )
+            if mapped_source_id is None:
+                continue
+            copied["source_id"] = mapped_source_id
+            copied["scene_snapshot_id"] = _mapped_optional_value(
+                entity_id_maps.get("scene_snapshot", {}),
+                _optional_text(row, "scene_snapshot_id"),
+                field_name="context_sources.scene_snapshot_id",
+                repair_tracker=repair_tracker,
+            )
+            remapped_metadata_json = _remapped_context_source_metadata_json(
+                copied,
+                message_id_map,
+                character_text_message_id_map,
+                observation_id_map=entity_id_maps.get("observation", {}),
+                scenario_id_map=entity_id_maps.get("scenario", {}),
+                entity_id_maps=entity_id_maps,
+                repair_tracker=repair_tracker,
+            )
+            if remapped_metadata_json is None:
+                context_source_id_map.pop(_text(row, "id"), None)
+                continue
+            copied["metadata_json"] = remapped_metadata_json
+            context_sources.append(copied)
+        _insert_rows(
+            connection,
+            "context_sources",
+            _coalesce_import_context_sources(context_sources),
+        )
 
         characters: list[dict[str, object]] = []
         for row in _list_of_objects(data.get("characters"), "characters"):
@@ -2387,7 +2560,9 @@ class ChatBundleService:
         _insert_rows(
             connection,
             "character_text_proactive_triggers",
-            character_text_proactive_triggers,
+            _coalesce_import_proactive_triggers(
+                character_text_proactive_triggers
+            ),
         )
 
         character_contact_states: list[dict[str, object]] = []
@@ -2507,7 +2682,11 @@ class ChatBundleService:
                 existing_links=links,
             )
         )
-        _insert_rows(connection, "entity_links", links)
+        _insert_rows(
+            connection,
+            "entity_links",
+            _coalesce_import_entity_links(links),
+        )
 
         knowledge_edges: list[dict[str, object]] = []
         for row in _list_of_objects(
@@ -2549,7 +2728,11 @@ class ChatBundleService:
                 repair_tracker,
             )
             knowledge_edges.append(copied)
-        _insert_rows(connection, "character_knowledge_edges", knowledge_edges)
+        _insert_rows(
+            connection,
+            "character_knowledge_edges",
+            _coalesce_import_knowledge_edges(knowledge_edges),
+        )
 
         message_visibility: list[dict[str, object]] = []
         for row in _list_of_objects(
@@ -2680,7 +2863,9 @@ class ChatBundleService:
         read_data: bool = True,
     ) -> tuple[dict[str, object], dict[str, object]]:
         try:
+            validate_zip_directory(bundle_path)
             with zipfile.ZipFile(bundle_path) as bundle:
+                json_node_budget = [_MAX_BUNDLE_JSON_NODES]
                 _validate_no_duplicate_bundle_members(bundle)
                 manifest = _json_object_from_bytes(
                     _read_limited_member(
@@ -2689,6 +2874,7 @@ class ChatBundleService:
                         max_bytes=_MAX_BUNDLE_MANIFEST_JSON_BYTES,
                     ),
                     MANIFEST_NAME,
+                    json_node_budget=json_node_budget,
                 )
                 _validate_manifest_payload(manifest)
                 if not read_data:
@@ -2700,11 +2886,22 @@ class ChatBundleService:
                         max_bytes=_MAX_BUNDLE_DATA_JSON_BYTES,
                     ),
                     DATA_NAME,
+                    json_node_budget=json_node_budget,
                 )
-                _validate_bundle_data(manifest, data)
+                _validate_bundle_data(
+                    manifest,
+                    data,
+                    json_node_budget=json_node_budget,
+                )
                 _validate_bundle_members(bundle, data)
                 return manifest, data
-        except (OSError, KeyError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        except (
+            OSError,
+            KeyError,
+            ZipSafetyError,
+            zipfile.BadZipFile,
+            json.JSONDecodeError,
+        ) as exc:
             raise ChatBundleError("Invalid Bragi chat bundle") from exc
 
     def _rows(self, query: str, params: tuple[object, ...]) -> list[dict[str, object]]:
@@ -3049,6 +3246,24 @@ def _export_context_source_message_ids(
             if not isinstance(item, str) or not item:
                 return None
             source_ids.append(item)
+    raw_groups = metadata.get("source_provenance_groups")
+    if raw_groups is not None:
+        if (
+            not isinstance(raw_groups, list)
+            or len(raw_groups) > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS
+        ):
+            return None
+        for group in raw_groups:
+            if (
+                not isinstance(group, list)
+                or not group
+                or len(group) > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS
+            ):
+                return None
+            for item in group:
+                if not isinstance(item, str) or not item:
+                    return None
+                source_ids.append(item)
     return tuple(dict.fromkeys(source_ids))
 
 
@@ -3547,7 +3762,7 @@ def _write_bundle_atomically(
         with zipfile.ZipFile(
             temporary_path,
             mode="w",
-            compression=zipfile.ZIP_DEFLATED,
+            compression=zipfile.ZIP_STORED,
         ) as bundle:
             bundle.writestr(MANIFEST_NAME, _dump_json_pretty(manifest_payload))
             bundle.writestr(DATA_NAME, _dump_json_pretty(data))
@@ -3829,10 +4044,167 @@ def _validate_bundle_members(
             raise ChatBundleError(f"Unexpected chat bundle member: {info.filename}")
 
 
+def _validate_bundle_nested_json(
+    data: Mapping[str, object],
+    *,
+    json_node_budget: list[int],
+) -> None:
+    containers: list[Mapping[str, object]] = []
+    for value in data.values():
+        if isinstance(value, Mapping):
+            containers.append(value)
+        elif isinstance(value, list):
+            containers.extend(
+                item for item in value if isinstance(item, Mapping)
+            )
+    for row in containers:
+        for field, value in row.items():
+            if not field.endswith("_json") or not isinstance(value, str):
+                continue
+            if json_node_budget[0] <= 0:
+                raise ChatBundleError("Chat bundle JSON contains too many values")
+            try:
+                node_count = validate_json_structure(
+                    value.encode("utf-8"),
+                    max_nodes=json_node_budget[0],
+                    max_depth=_MAX_BUNDLE_JSON_DEPTH,
+                )
+            except JsonSafetyError as exc:
+                raise ChatBundleError(
+                    f"Chat bundle nested JSON {field} {exc}"
+                ) from exc
+            json_node_budget[0] -= node_count
+
+
+def _validate_bundle_context_source_index_budget(
+    data: Mapping[str, object],
+    *,
+    max_normalized_text_bytes: int | None = None,
+    max_normalized_record_bytes: int | None = None,
+) -> tuple[int, int]:
+    try:
+        rows = _list_of_objects(
+            data.get("context_sources"),
+            "context_sources",
+        )
+        if (
+            max_normalized_text_bytes is None
+            and max_normalized_record_bytes is None
+        ):
+            return validate_context_source_index_budget(rows)
+        return validate_context_source_index_budget(
+            rows,
+            max_normalized_text_bytes=(
+                max_normalized_text_bytes
+                if max_normalized_text_bytes is not None
+                else MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
+            ),
+            max_normalized_record_bytes=(
+                max_normalized_record_bytes
+                if max_normalized_record_bytes is not None
+                else MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD
+            ),
+        )
+    except ValueError as exc:
+        raise ChatBundleError(str(exc)) from exc
+
+
+def _bundle_context_source_budget(
+    data: Mapping[str, object],
+) -> tuple[int, int]:
+    value = data.get("context_source_budget")
+    if value is None:
+        return 0, 0
+    if not isinstance(value, Mapping):
+        raise ChatBundleError("Chat bundle context source budget is invalid")
+    limits: list[int] = []
+    for field in ("normalized_text_bytes", "normalized_record_bytes"):
+        raw_limit = value.get(field)
+        if (
+            not isinstance(raw_limit, int)
+            or isinstance(raw_limit, bool)
+            or raw_limit < 0
+            or raw_limit > _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+        ):
+            raise ChatBundleError("Chat bundle context source budget is invalid")
+        limits.append(raw_limit)
+    return limits[0], limits[1]
+
+
+def _snapshot_context_source_budget(
+    data: Mapping[str, object],
+) -> tuple[int, int]:
+    try:
+        return TurnSnapshotService.context_source_budget_from_snapshot_objects(
+            snapshot_rows=_list_of_objects(
+                data.get("turn_snapshots"),
+                "turn_snapshots",
+            ),
+            object_rows=_list_of_objects(
+                data.get("snapshot_objects"),
+                "snapshot_objects",
+            ),
+            max_normalized_text_bytes=(
+                _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+            ),
+            max_normalized_record_bytes=(
+                _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+            ),
+        )
+    except ValueError as exc:
+        raise ChatBundleError(str(exc)) from exc
+
+
+def _validate_export_json_budget(
+    manifest: Mapping[str, object],
+    data: Mapping[str, object],
+) -> list[int]:
+    manifest_payload = _dump_json_pretty(manifest).encode("utf-8")
+    data_payload = _dump_json_pretty(data).encode("utf-8")
+    _validate_total_json_size(len(manifest_payload) + len(data_payload))
+    budget = [_MAX_BUNDLE_JSON_NODES]
+    try:
+        for payload in (manifest_payload, data_payload):
+            node_count = validate_json_structure(
+                payload,
+                max_nodes=budget[0],
+                max_depth=_MAX_BUNDLE_JSON_DEPTH,
+            )
+            budget[0] -= node_count
+    except JsonSafetyError as exc:
+        raise ChatBundleError(f"Exported chat bundle JSON {exc}") from exc
+    return budget
+
+
 def _validate_bundle_data(
     manifest: dict[str, object],
     data: dict[str, object],
+    *,
+    json_node_budget: list[int] | None = None,
+    allow_retired_scenario: bool = False,
 ) -> None:
+    _validate_bundle_nested_json(
+        data,
+        json_node_budget=(
+            json_node_budget
+            if json_node_budget is not None
+            else [_MAX_BUNDLE_JSON_NODES]
+        ),
+    )
+    total_rows = 0
+    for table_name, value in data.items():
+        if not isinstance(value, list):
+            continue
+        row_count = len(value)
+        if table_name == "messages" and row_count > _MAX_BUNDLE_MESSAGE_ROWS:
+            raise ChatBundleError("Chat bundle contains too many messages")
+        if row_count > _MAX_BUNDLE_TABLE_ROWS:
+            raise ChatBundleError(
+                f"Chat bundle table has too many rows: {table_name}"
+            )
+        total_rows += row_count
+        if total_rows > _MAX_BUNDLE_TOTAL_ROWS:
+            raise ChatBundleError("Chat bundle contains too many rows")
     save = _object(data.get("save"), "save")
     scenario = _object(data.get("scenario"), "scenario")
     messages = _list_of_objects(data.get("messages"), "messages")
@@ -3858,7 +4230,10 @@ def _validate_bundle_data(
     manifest_counts = _object(manifest.get("counts"), "manifest counts")
     scenario_type = _text(scenario, "type")
     scenario_content = _json_object(scenario, "content_json")
-    if scenario_record_is_retired(scenario_type, scenario_content):
+    if (
+        not allow_retired_scenario
+        and scenario_record_is_retired(scenario_type, scenario_content)
+    ):
         raise ChatBundleError(RETIRED_SCENARIO_REASON)
     if _text(save, "id") != _text(manifest_save, "id"):
         raise ChatBundleError("Chat bundle manifest does not match save data")
@@ -3887,12 +4262,85 @@ def _validate_bundle_data(
     )
     _validate_unique_ids(snapshot_media_assets, "snapshot_media_assets")
     active_media_asset_ids = {_text(row, "id") for row in media_assets}
+    snapshot_object_media_ids = {
+        _text(row, "id")
+        for row in TurnSnapshotService.media_asset_rows_from_snapshot_objects(
+            snapshot_objects
+        )
+    }
+    expected_snapshot_media_ids = (
+        snapshot_object_media_ids - active_media_asset_ids
+    )
+    repair_snapshot_media_ids = _referenced_snapshot_only_media_asset_ids(
+        data,
+        active_media_asset_ids=active_media_asset_ids,
+    )
+    provided_snapshot_media_ids = {
+        _text(row, "id") for row in snapshot_media_assets
+    }
+    allowed_snapshot_media_ids = expected_snapshot_media_ids | repair_snapshot_media_ids
+    if not expected_snapshot_media_ids.issubset(provided_snapshot_media_ids):
+        raise ChatBundleError(
+            "Snapshot media assets do not cover snapshot media objects"
+        )
+    unreferenced_snapshot_media_ids = (
+        provided_snapshot_media_ids - allowed_snapshot_media_ids
+    )
+    if unreferenced_snapshot_media_ids:
+        raise ChatBundleError("Chat bundle contains unreferenced snapshot media assets")
     for row in snapshot_media_assets:
         if _text(row, "id") in active_media_asset_ids:
             raise ChatBundleError(
                 "Snapshot media asset duplicates active media asset id: "
                 f"{_text(row, 'id')}"
             )
+
+
+def _referenced_snapshot_only_media_asset_ids(
+    data: dict[str, object],
+    *,
+    active_media_asset_ids: set[str],
+) -> set[str]:
+    referenced_ids: set[str] = set()
+
+    def add_media_id(value: object) -> None:
+        if isinstance(value, str) and value and value not in active_media_asset_ids:
+            referenced_ids.add(value)
+
+    def add_media_id_list(value: object) -> None:
+        if not isinstance(value, list):
+            return
+        for item in value:
+            add_media_id(item)
+
+    def add_media_source_metadata_refs(row: dict[str, object]) -> None:
+        metadata = _optional_json_object(row, "metadata_json") or {}
+        for field in _MEDIA_METADATA_SOURCE_ID_FIELDS:
+            add_media_id(metadata.get(field))
+        for field in _MEDIA_METADATA_SOURCE_ID_LIST_FIELDS:
+            add_media_id_list(metadata.get(field))
+
+    for row in _list_of_objects(data.get("media_assets"), "media_assets"):
+        add_media_id(_optional_text(row, "source_media_asset_id"))
+        add_media_source_metadata_refs(row)
+    for row in _list_of_objects(data.get("characters"), "characters"):
+        add_media_id(_optional_text(row, "reference_image_asset_id"))
+    for row in _list_of_objects(
+        data.get("character_text_message_attachments"),
+        "character_text_message_attachments",
+    ):
+        add_media_id(_optional_text(row, "media_asset_id"))
+    for row in _list_of_objects(data.get("entity_links"), "entity_links"):
+        if _text(row, "entity_type") == "media_asset":
+            add_media_id(_text(row, "entity_id"))
+        if _text(row, "target_type") == "media_asset":
+            add_media_id(_text(row, "target_id"))
+    for row in _list_of_objects(data.get("context_sources"), "context_sources"):
+        if _text(row, "source_type") != "media_asset":
+            continue
+        for source_id in _text(row, "source_id").split(","):
+            add_media_id(source_id.strip())
+    return referenced_ids
 
 
 def _validate_unique_ids(rows: list[dict[str, object]], label: str) -> None:
@@ -3970,10 +4418,41 @@ def _validate_manifest_payload(payload: dict[str, object]) -> None:
         )
 
 
-def _json_object_from_bytes(payload: bytes, name: str) -> dict[str, object]:
-    loaded = json.loads(payload.decode("utf-8"))
+def _json_object_from_bytes(
+    payload: bytes,
+    name: str,
+    *,
+    json_node_budget: list[int] | None = None,
+) -> dict[str, object]:
+    try:
+        node_count = validate_json_structure(
+            payload,
+            max_nodes=(
+                json_node_budget[0]
+                if json_node_budget is not None
+                else _MAX_BUNDLE_JSON_NODES
+            ),
+            max_depth=_MAX_BUNDLE_JSON_DEPTH,
+        )
+    except JsonSafetyError as exc:
+        raise ChatBundleError(f"{name} {exc}") from exc
+    object_count = 0
+
+    def bounded_object(value: dict[str, object]) -> dict[str, object]:
+        nonlocal object_count
+        object_count += 1
+        if object_count > _MAX_BUNDLE_JSON_OBJECTS:
+            raise ChatBundleError(f"{name} contains too many objects")
+        return value
+
+    loaded = json.loads(
+        payload.decode("utf-8"),
+        object_hook=bounded_object,
+    )
     if not isinstance(loaded, dict):
         raise ChatBundleError(f"{name} must contain a JSON object")
+    if json_node_budget is not None:
+        json_node_budget[0] -= node_count
     return cast(dict[str, object], loaded)
 
 
@@ -4355,20 +4834,25 @@ def _remapped_character_text_trigger_key(
 ) -> str:
     parts = trigger_key.split(":")
     if len(parts) < 2:
-        return _remapped_imported_id_fragment(trigger_key, mappings)
+        return trigger_key
+    if parts[0] == "ambient_random" and len(parts) >= 3:
+        remapped = list(parts)
+        remapped[1] = _mapped_entity_id(mappings, "message", remapped[1])
+        remapped[2] = _mapped_entity_id(mappings, "character", remapped[2])
+        return ":".join(remapped)
     source_type = {
         "active_thread": "active_thread",
         "dating_route": "dating_route_state",
         "character_intent": "character",
+        "memory": "memory",
+        "memories": "memory",
     }.get(parts[0])
     if source_type is None:
-        return _remapped_imported_id_fragment(trigger_key, mappings)
+        return trigger_key
     remapped = list(parts)
     remapped[1] = _mapped_entity_id(mappings, source_type, remapped[1])
-    remapped[2:] = [
-        _remapped_imported_id_fragment(part, mappings) if part else part
-        for part in remapped[2:]
-    ]
+    if parts[0] in {"active_thread", "character_intent"} and len(parts) >= 3:
+        remapped[2] = _mapped_entity_id(mappings, "message", remapped[2])
     return ":".join(remapped)
 
 
@@ -4393,7 +4877,7 @@ def _mapped_context_source_id(
     *,
     repair_tracker: _BundleImportRepairTracker | None = None,
 ) -> str | None:
-    if source_type == "message":
+    if source_type in {"message", "messages"}:
         mapped_items: list[str] = []
         for item in source_id.split(","):
             item = item.strip()
@@ -4634,7 +5118,7 @@ def _remapped_context_source_metadata_json(
     scenario_id_map: dict[str, str],
     entity_id_maps: dict[str, dict[str, str]],
     repair_tracker: _BundleImportRepairTracker | None = None,
-) -> str:
+) -> str | None:
     metadata = _optional_json_object(row, "metadata_json") or {}
     remapped = dict(metadata)
     source_type = _text(row, "source_type")
@@ -4671,11 +5155,22 @@ def _remapped_context_source_metadata_json(
                 repair_tracker=repair_tracker,
             )
     if "audience_character_ids" in remapped:
-        remapped["audience_character_ids"] = _mapped_context_source_metadata_id_list(
-            remapped["audience_character_ids"],
+        raw_audience = remapped["audience_character_ids"]
+        mapped_audience = _mapped_context_source_metadata_id_list(
+            raw_audience,
             entity_id_maps.get("character", {}),
             field_name="context_sources.metadata_json.audience_character_ids",
             repair_tracker=repair_tracker,
+        )
+        if isinstance(raw_audience, list) and raw_audience and not mapped_audience:
+            return None
+        remapped["audience_character_ids"] = mapped_audience
+    if "source_provenance_mode" in remapped and remapped[
+        "source_provenance_mode"
+    ] not in {"all", "any"}:
+        raise ChatBundleError(
+            "Bundle context_sources.metadata_json.source_provenance_mode "
+            "must be 'all' or 'any'"
         )
     if source_type == "character_text_thread" and "thread_id" in remapped:
         thread_id = remapped["thread_id"]
@@ -4711,13 +5206,16 @@ def _remapped_context_source_metadata_json(
                 f"Bundle context_sources.metadata_json.{field} "
                 "must be a message id"
             )
-        remapped[field] = _mapped_optional_source_ref(
+        mapped = _mapped_optional_source_ref(
             value,
             message_id_map,
             character_text_message_id_map,
             f"context_sources.metadata_json.{field}",
             repair_tracker,
         )
+        if mapped is None:
+            return None
+        remapped[field] = mapped
     for field in _CONTEXT_SOURCE_METADATA_MESSAGE_ID_LIST_FIELDS:
         if field not in remapped:
             continue
@@ -4729,6 +5227,8 @@ def _remapped_context_source_metadata_json(
                 f"Bundle context_sources.metadata_json.{field} "
                 "must be a list of message ids"
             )
+        if len(value) > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS:
+            return None
         mapped_items: list[str] = []
         for item in value:
             mapped = _mapped_optional_source_ref(
@@ -4738,9 +5238,62 @@ def _remapped_context_source_metadata_json(
                 f"context_sources.metadata_json.{field}",
                 repair_tracker,
             )
-            if mapped is not None:
-                mapped_items.append(mapped)
+            if mapped is None:
+                return None
+            mapped_items.append(mapped)
         remapped[field] = mapped_items
+    if "source_provenance_groups" in remapped:
+        raw_groups = remapped["source_provenance_groups"]
+        if (
+            not isinstance(raw_groups, list)
+            or len(raw_groups) > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS
+            or not all(
+                isinstance(group, list)
+                and bool(group)
+                and len(group) <= _MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS
+                and all(isinstance(item, str) and item for item in group)
+                for group in raw_groups
+            )
+        ):
+            raise ChatBundleError(
+                "Bundle context_sources.metadata_json."
+                "source_provenance_groups must be a list of message-id lists"
+            )
+        mapped_groups: list[list[str]] = []
+        for group in raw_groups:
+            mapped_group: list[str] = []
+            for item in group:
+                mapped = _mapped_optional_source_ref(
+                    item,
+                    message_id_map,
+                    character_text_message_id_map,
+                    (
+                        "context_sources.metadata_json."
+                        "source_provenance_groups"
+                    ),
+                    repair_tracker,
+                )
+                if mapped is None:
+                    return None
+                mapped_group.append(mapped)
+            mapped_groups.append(mapped_group)
+        remapped["source_provenance_groups"] = mapped_groups
+        scalar_source_ids = {
+            source_id
+            for field in _CONTEXT_SOURCE_METADATA_MESSAGE_ID_FIELDS
+            if isinstance((source_id := remapped.get(field)), str)
+        }
+        for field in _CONTEXT_SOURCE_METADATA_MESSAGE_ID_LIST_FIELDS:
+            value = remapped.get(field)
+            if isinstance(value, list):
+                scalar_source_ids.update(
+                    item for item in value if isinstance(item, str)
+                )
+        grouped_source_ids = {
+            source_id for group in mapped_groups for source_id in group
+        }
+        if not scalar_source_ids.issubset(grouped_source_ids):
+            return None
     return _dump_json_compact(remapped)
 
 
@@ -4970,6 +5523,39 @@ def _remapped_context_update_suggestion_proposed_value_json(
             if mapped is not None:
                 mapped_items.append(mapped)
         remapped["source_message_ids"] = mapped_items
+    observation_id_map = entity_id_maps.get("observation", {})
+    if "source_observation_id" in remapped:
+        source_observation_id = remapped["source_observation_id"]
+        if source_observation_id is None or source_observation_id == "":
+            remapped["source_observation_id"] = None
+        elif not isinstance(source_observation_id, str):
+            raise ChatBundleError(
+                "Bundle context_update_suggestions.proposed_value_json."
+                "source_observation_id must be an observation id"
+            )
+        else:
+            remapped["source_observation_id"] = _mapped_optional_id(
+                observation_id_map,
+                source_observation_id,
+                field_name=(
+                    "context_update_suggestions.proposed_value_json."
+                    "source_observation_id"
+                ),
+                repair_tracker=repair_tracker,
+            )
+    if "source_observation_ids" in remapped:
+        source_observation_ids = remapped["source_observation_ids"]
+        remapped["source_observation_ids"] = (
+            _mapped_context_source_metadata_id_list(
+                source_observation_ids,
+                observation_id_map,
+                field_name=(
+                    "context_update_suggestions.proposed_value_json."
+                    "source_observation_ids"
+                ),
+                repair_tracker=repair_tracker,
+            )
+        )
     if "location_id" in remapped:
         location_id = remapped["location_id"]
         if location_id is None or location_id == "":
@@ -5627,6 +6213,223 @@ def _insert_rows(
         f"INSERT INTO {table_name}({column_sql}) VALUES ({placeholders})",
         values,
     )
+
+
+def _coalesce_import_context_sources(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    coalesced: dict[tuple[object, object, object], dict[str, object]] = {}
+    for row in rows:
+        key = (row.get("save_id"), row.get("source_type"), row.get("source_id"))
+        existing = coalesced.get(key)
+        if existing is None:
+            coalesced[key] = row
+        elif (
+            existing.get("archived_at") is not None
+            and row.get("archived_at") is None
+        ):
+            coalesced[key] = row
+        elif (existing.get("archived_at") is None) == (
+            row.get("archived_at") is None
+        ):
+            if not _context_source_rows_have_same_content(existing, row):
+                raise ChatBundleError(
+                    "Conflicting context sources share one imported identity"
+                )
+            existing["metadata_json"] = _merged_import_context_source_metadata_json(
+                existing.get("metadata_json"),
+                row.get("metadata_json"),
+            )
+            existing["token_estimate"] = max(
+                int(_numeric_import_value(existing.get("token_estimate"))),
+                int(_numeric_import_value(row.get("token_estimate"))),
+            )
+    return list(coalesced.values())
+
+
+def _context_source_rows_have_same_content(
+    first: Mapping[str, object],
+    second: Mapping[str, object],
+) -> bool:
+    return all(
+        first.get(field) == second.get(field)
+        for field in (
+            "title",
+            "body",
+            "scene_snapshot_id",
+            "scene_generation",
+            "created_turn_number",
+            "expires_after_turn_number",
+        )
+    )
+
+
+def _coalesce_import_proactive_triggers(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    coalesced: dict[tuple[object, object, object], dict[str, object]] = {}
+    for row in rows:
+        key = (
+            row.get("save_id"),
+            row.get("character_id"),
+            row.get("trigger_key"),
+        )
+        existing = coalesced.get(key)
+        if existing is None:
+            coalesced[key] = row
+            continue
+        for field in (
+            "thread_id",
+            "text_message_id",
+            "source_message_id",
+        ):
+            if row.get(field) is not None:
+                existing[field] = row[field]
+        for field in (
+            "trigger_type",
+            "source_type",
+            "source_id",
+            "reason",
+        ):
+            value = row.get(field)
+            if isinstance(value, str) and value:
+                existing[field] = value
+        if row.get("updated_at") is not None:
+            existing["updated_at"] = row["updated_at"]
+    return list(coalesced.values())
+
+
+def _merged_import_context_source_metadata_json(
+    first: object,
+    second: object,
+) -> str:
+    try:
+        metadata = merge_context_source_metadata(first, second)
+    except ValueError as exc:
+        raise ChatBundleError(str(exc)) from exc
+    return _dump_json_compact(metadata)
+
+
+def _coalesce_import_entity_links(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    coalesced: dict[tuple[object, ...], dict[str, object]] = {}
+    for row in rows:
+        key = (
+            row.get("save_id"),
+            row.get("entity_type"),
+            row.get("entity_id"),
+            row.get("target_type"),
+            row.get("target_id"),
+            row.get("relation"),
+        )
+        existing = coalesced.get(key)
+        if existing is None:
+            coalesced[key] = row
+        elif existing.get("source_message_id") is None:
+            existing["source_message_id"] = row.get("source_message_id")
+    return list(coalesced.values())
+
+
+def _coalesce_import_knowledge_edges(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    coalesced: dict[tuple[object, ...], dict[str, object]] = {}
+    state_rank = {"knows": 0, "may_know": 1, "does_not_know": 2}
+    for row in rows:
+        row["target_type"] = normalized_knowledge_target_type(
+            str(row.get("target_type", ""))
+        )
+        row["source_message_ids_json"] = _merge_json_string_lists(
+            row.get("source_message_ids_json"),
+            "[]",
+            limit=_MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS,
+            extra_values=(row.get("source_message_id"),),
+        )
+        key = (
+            row.get("save_id"),
+            row.get("character_id"),
+            row.get("target_type"),
+            row.get("target_id"),
+        )
+        existing = coalesced.get(key)
+        if existing is None:
+            coalesced[key] = row
+            continue
+        existing_active = existing.get("archived_at") is None
+        row_active = row.get("archived_at") is None
+        if row_active and not existing_active:
+            coalesced[key] = row
+            continue
+        if existing_active and not row_active:
+            continue
+        source_message_ids = (
+            existing.get("source_message_id"),
+            row.get("source_message_id"),
+        )
+        if state_rank.get(str(row.get("knowledge_state")), 1) > state_rank.get(
+            str(existing.get("knowledge_state")),
+            1,
+        ):
+            for field in (
+                "knowledge_state",
+                "acquisition_method",
+                "source_message_id",
+                "evidence_quote",
+            ):
+                existing[field] = row.get(field)
+        existing["confidence"] = max(
+            _numeric_import_value(existing.get("confidence")),
+            _numeric_import_value(row.get("confidence")),
+        )
+        try:
+            existing["source_message_ids_json"] = _merge_json_string_lists(
+                existing.get("source_message_ids_json"),
+                row.get("source_message_ids_json"),
+                limit=_MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS,
+                extra_values=source_message_ids,
+            )
+        except ChatBundleError:
+            existing["knowledge_state"] = "does_not_know"
+            existing["acquisition_method"] = "unknown"
+            existing["source_message_id"] = None
+            existing["source_message_ids_json"] = "[]"
+            existing["evidence_quote"] = None
+    return list(coalesced.values())
+
+
+def _merge_json_string_lists(
+    first: object,
+    second: object,
+    *,
+    limit: int | None = None,
+    extra_values: Iterable[object] = (),
+) -> str:
+    values: list[str] = []
+    for raw in (first, second):
+        try:
+            loaded = json.loads(str(raw))
+        except (json.JSONDecodeError, TypeError):
+            loaded = []
+        if isinstance(loaded, list):
+            values.extend(
+                str(value)
+                for value in loaded
+                if isinstance(value, str) and value
+            )
+    values.extend(
+        str(value) for value in extra_values if isinstance(value, str) and value
+    )
+    merged = list(dict.fromkeys(values))
+    if limit is not None and len(merged) > limit:
+        raise ChatBundleError("Merged provenance is too large")
+    return _dump_json_compact(merged)
+
+
+def _numeric_import_value(value: object) -> float:
+    if isinstance(value, int | float):
+        return float(value)
+    return 0.0
 
 
 def _backfill_imported_character_contact_states(connection: Any, save_id: str) -> None:

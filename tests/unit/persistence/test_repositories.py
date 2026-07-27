@@ -12,12 +12,18 @@ from typing import cast
 
 import pytest
 
-from bragi.persistence.repositories import BragiRepository, PersistenceRepositories
+from bragi.persistence import repositories as repositories_module
+from bragi.persistence.repositories import (
+    BragiRepository,
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.services.image_style_settings import save_image_style_preset_setting_key
 from bragi.services.scenario_evolution_policy import (
     save_scenario_evolution_turn_interval_setting_key,
     scenario_template_evolution_turn_interval_setting_key,
 )
+from bragi.text_search import cjk_lexical_anchors
 
 
 @pytest.fixture
@@ -2096,6 +2102,66 @@ def test_context_observation_claims_are_exclusive_across_connections(
             connection.close()
 
 
+def test_memory_dedup_is_atomic_across_connections(
+    tmp_path: Path,
+    migrated_database_template: Path,
+) -> None:
+    database_path = tmp_path / "memory-dedup.sqlite3"
+    shutil.copy2(migrated_database_template, database_path)
+    connections = [
+        sqlite3.connect(database_path, timeout=5, check_same_thread=False)
+        for _ in range(2)
+    ]
+    repositories = [PersistenceRepositories(connection) for connection in connections]
+    try:
+        scenario = repositories[0].create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A border keep is cut off by ash storms.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories[0].create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        barrier = threading.Barrier(2)
+        created_ids: list[str | None] = [None, None]
+        errors: list[BaseException] = []
+
+        def add_memory(worker_index: int) -> None:
+            try:
+                barrier.wait()
+                record = repositories[worker_index].add_memory(
+                    save_id=save.id,
+                    body="The moonstone opens the eastern vault.",
+                    tags=[f"worker-{worker_index}"],
+                    source_message_ids=[f"message-{worker_index}"],
+                )
+                created_ids[worker_index] = record.id
+            except BaseException as exc:  # pragma: no cover - asserted in parent
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=add_memory, args=(worker_index,))
+            for worker_index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert created_ids[0] == created_ids[1]
+        [memory] = repositories[0].list_memories(save.id)
+        assert set(memory.tags) == {"worker-0", "worker-1"}
+        assert set(memory.source_message_ids) == {"message-0", "message-1"}
+    finally:
+        for connection in connections:
+            connection.close()
+
+
 def test_expired_context_observation_lease_cannot_complete_or_defer(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -2923,6 +2989,291 @@ def test_repositories_count_active_memories(
     assert repositories.list_memories(save_id) == [kept]
 
 
+def test_update_memory_atomically_merges_canonical_collision(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    repositories.add_memory(
+        save_id=save_id,
+        body="Mara likes tea.",
+        tags=["preference"],
+        importance=0.7,
+        source_message_ids=["message-keeper"],
+    )
+    duplicate = repositories.add_memory(
+        save_id=save_id,
+        body="Mara prefers tea.",
+        tags=["dossier"],
+        importance=0.9,
+        source_message_ids=["message-duplicate"],
+    )
+
+    merged = repositories.update_memory(
+        memory_id=duplicate.id,
+        body="mara likes tea",
+        tags=["dossier"],
+        importance=0.9,
+        source_message_ids=["message-duplicate"],
+    )
+
+    assert merged.id == duplicate.id
+    assert set(merged.tags) == {"preference", "dossier"}
+    assert merged.importance == 0.9
+    assert set(merged.source_message_ids) == {
+        "message-keeper",
+        "message-duplicate",
+    }
+    assert repositories.list_memories(save_id) == [merged]
+
+
+def test_repositories_consolidate_duplicates_without_losing_active_references(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    keeper = repositories.add_memory(
+        save_id=save_id,
+        body="Mara likes tea.",
+        tags=["preference"],
+    )
+    duplicate_id = "legacy-memory-duplicate"
+    repositories.connection.execute(
+        "DROP INDEX idx_memories_save_claim_fingerprint_active"
+    )
+    repositories.connection.execute(
+        """
+        INSERT INTO memories(
+            id, save_id, body, tags_json, importance,
+            source_message_ids_json, claim_fingerprint,
+            source_observation_ids_json
+        )
+        VALUES (?, ?, ?, '["tea"]', 0.9, '[]', ?, '[]')
+        """,
+        (
+            duplicate_id,
+            save_id,
+            "mara likes tea",
+            canonical_claim_fingerprint("mara likes tea"),
+        ),
+    )
+    repositories.commit()
+    character = repositories.add_character(save_id=save_id, name="Captain Ilyra")
+    archived_keeper_edge = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="memory",
+        target_id=keeper.id,
+    )
+    repositories.archive_character_knowledge_edge(archived_keeper_edge.id)
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="memory",
+        target_id=duplicate_id,
+    )
+    privacy_character = repositories.add_character(
+        save_id=save_id,
+        name="Archivist Ren",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=privacy_character.id,
+        target_type="memory",
+        target_id=keeper.id,
+        knowledge_state="knows",
+        confidence=0.9,
+        source_message_ids=["keeper-proof"],
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=privacy_character.id,
+        target_type="memory",
+        target_id=duplicate_id,
+        knowledge_state="does_not_know",
+        confidence=0.7,
+        source_message_ids=["duplicate-proof"],
+    )
+    archived_keeper_source = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=keeper.id,
+        title="Archived keeper source",
+        body=keeper.body,
+    )
+    repositories.archive_context_source(archived_keeper_source.id)
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=duplicate_id,
+        title="Active duplicate source",
+        body="mara likes tea",
+    )
+
+    remapped = repositories.consolidate_active_memory_duplicates(save_id=save_id)
+
+    assert remapped == {duplicate_id: keeper.id}
+    assert [memory.id for memory in repositories.list_memories(save_id)] == [keeper.id]
+    edges = repositories.list_character_knowledge_edges(save_id)
+    assert {edge.target_id for edge in edges} == {keeper.id}
+    privacy_edge = next(
+        edge for edge in edges if edge.character_id == privacy_character.id
+    )
+    assert privacy_edge.knowledge_state == "does_not_know"
+    assert privacy_edge.confidence == 0.9
+    assert privacy_edge.source_message_ids == ["keeper-proof", "duplicate-proof"]
+    [source] = repositories.list_context_sources(save_id, source_type="memory")
+    assert source.source_id == keeper.id
+    assert source.title == "Active duplicate source"
+
+
+def test_repositories_consolidate_duplicates_keeps_body_provenance_atomic(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, hidden_message_id = _persist_repository_save(repositories)
+    visible_message = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        body="The lamps are lit.",
+    )
+    keeper = repositories.add_memory(
+        save_id=save_id,
+        body="Mara likes tea.",
+        tags=["preference"],
+    )
+    duplicate_id = "legacy-memory-duplicate"
+    repositories.connection.execute(
+        "DROP INDEX idx_memories_save_claim_fingerprint_active"
+    )
+    repositories.connection.execute(
+        """
+        INSERT INTO memories(
+            id, save_id, body, tags_json, importance,
+            source_message_ids_json, claim_fingerprint,
+            source_observation_ids_json
+        )
+        VALUES (?, ?, 'mara likes tea', '[]', 0.5, '[]', ?, '[]')
+        """,
+        (
+            duplicate_id,
+            save_id,
+            canonical_claim_fingerprint("mara likes tea"),
+        ),
+    )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=keeper.id,
+        title="Hidden keeper",
+        body="The hidden vault code is AMBER-77.",
+        metadata={"source_message_ids": [hidden_message_id]},
+    )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=duplicate_id,
+        title="Harmless duplicate",
+        body="The lamps are lit.",
+        metadata={"source_message_ids": [visible_message.id]},
+    )
+    repositories.commit()
+
+    repositories.consolidate_active_memory_duplicates(save_id=save_id)
+
+    [source] = repositories.list_context_sources(
+        save_id,
+        source_type="memory",
+    )
+    assert source.source_id == keeper.id
+    assert source.body == "The hidden vault code is AMBER-77."
+    assert source.metadata["source_message_ids"] == [hidden_message_id]
+    assert visible_message.id not in source.metadata["source_message_ids"]
+
+
+def test_restore_memories_merges_active_fingerprint_collision(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    visible_message = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Mara confirms the tea preference.",
+    )
+    archived = repositories.add_memory(
+        save_id=save_id,
+        body="Mara likes tea.",
+        tags=["mara"],
+        importance=0.4,
+        source_message_id=message_id,
+    )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=archived.id,
+        title="Archived preference",
+        body=archived.body,
+        metadata={"source_message_ids": [message_id]},
+    )
+    repositories.archive_memory(archived.id)
+    active = repositories.add_memory(
+        save_id=save_id,
+        body="mara likes tea",
+        tags=["tea"],
+        importance=0.9,
+    )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=active.id,
+        title="Replacement preference",
+        body=active.body,
+        metadata={"source_message_ids": [visible_message.id]},
+    )
+    character = repositories.add_character(
+        save_id=save_id,
+        name="Mara",
+    )
+    repositories.add_character_text_proactive_trigger(
+        save_id=save_id,
+        character_id=character.id,
+        trigger_key=f"memory:{archived.id}",
+        trigger_type="memory_changed",
+        source_type="memory",
+        source_id=archived.id,
+        reason="Original preference",
+    )
+    repositories.add_character_text_proactive_trigger(
+        save_id=save_id,
+        character_id=character.id,
+        trigger_key=f"memory:{active.id}",
+        trigger_type="memory_changed",
+        source_type="memory",
+        source_id=active.id,
+        reason="Replacement preference",
+    )
+
+    repositories.restore_memories(frozenset({archived.id}))
+
+    [restored] = repositories.list_memories(save_id)
+    assert restored.id == archived.id
+    assert restored.tags == ["mara", "tea"]
+    assert restored.importance == 0.9
+    assert restored.source_message_ids == [message_id]
+    assert repositories.get_memory(save_id, active.id) is None
+    [source] = repositories.list_context_sources(
+        save_id,
+        source_type="memory",
+    )
+    assert source.source_id == archived.id
+    assert source.title == "Archived preference"
+    assert source.body == "Mara likes tea."
+    assert source.metadata["source_message_ids"] == [message_id]
+    assert visible_message.id not in source.metadata["source_message_ids"]
+    [trigger] = repositories.list_character_text_proactive_triggers(save_id)
+    assert trigger.trigger_key == f"memory:{archived.id}"
+    assert trigger.source_id == archived.id
+    assert trigger.reason == "Replacement preference"
+
+
 def test_repositories_check_unprotected_character_existence(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3353,6 +3704,59 @@ def test_repositories_persist_character_knowledge_graph_rows(
         save_id,
         include_archived=True,
     )[0].archived_at is not None
+
+
+def test_character_knowledge_updates_are_scoped_by_owner_and_target(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    mara = repositories.add_character(
+        save_id=save_id,
+        name="Mara",
+        source_message_id=message_id,
+    )
+    lio = repositories.add_character(
+        save_id=save_id,
+        name="Lio",
+        source_message_id=message_id,
+    )
+    memory = repositories.add_memory(
+        save_id=save_id,
+        body="The western archive uses a moonstone key.",
+        tags=["archive"],
+        source_message_id=message_id,
+    )
+    mara_edge = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=mara.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="may_know",
+    )
+    lio_edge = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=lio.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="knows",
+    )
+
+    updated_mara = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=mara.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="does_not_know",
+    )
+    edges = {
+        edge.character_id: edge
+        for edge in repositories.list_character_knowledge_edges(save_id)
+    }
+
+    assert updated_mara.id == mara_edge.id
+    assert edges[mara.id].knowledge_state == "does_not_know"
+    assert edges[lio.id].id == lio_edge.id
+    assert edges[lio.id].knowledge_state == "knows"
 
 
 def test_repositories_replace_and_list_message_scene_presence(
@@ -3972,6 +4376,1417 @@ def test_repositories_search_context_sources_with_fts(
     assert [hit.record.source_id for hit in hits] == ["memory-moonstone"]
     assert hits[0].record == target
     assert isinstance(hits[0].bm25_rank, float)
+
+
+def test_context_source_search_enforces_graph_scope_outside_raw_candidates(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Archive",
+        premise="An archive holds unevenly shared secrets.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Index")
+    present = repositories.add_character(save_id=save.id, name="Nira", met=True)
+    absent = repositories.add_character(save_id=save.id, name="Lio", met=True)
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["moonstone"],
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id=memory.id,
+        title="moonstone",
+        body=memory.body,
+        metadata={"indexed_by": "continuity_index"},
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=absent.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="knows",
+        acquisition_method="told",
+    )
+
+    blocked = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=1,
+        visibility_character_ids={present.id},
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=present.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="knows",
+        acquisition_method="told",
+    )
+    allowed = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=1,
+        visibility_character_ids={present.id},
+    )
+
+    assert blocked == []
+    assert [hit.record.source_id for hit in allowed] == [memory.id]
+
+
+def test_context_source_search_blocks_legacy_plural_memory_edges(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Archive",
+        premise="An archive holds unevenly shared secrets.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Index")
+    present = repositories.add_character(save_id=save.id, name="Nira", met=True)
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["moonstone"],
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id=memory.id,
+        title="moonstone",
+        body=memory.body,
+        metadata={"indexed_by": "continuity_index"},
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=present.id,
+        target_type="memories",
+        target_id=memory.id,
+        knowledge_state="does_not_know",
+        acquisition_method="told",
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=1,
+        visibility_character_ids={present.id},
+    )
+
+    assert hits == []
+
+
+def test_context_source_search_blocks_legacy_plural_memory_source_type(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Archive",
+        premise="An archive holds unevenly shared secrets.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Index")
+    present = repositories.add_character(save_id=save.id, name="Nira", met=True)
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["moonstone"],
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memories",
+        source_id=memory.id,
+        title="moonstone",
+        body=memory.body,
+        metadata={"indexed_by": "continuity_index"},
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=present.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="does_not_know",
+        acquisition_method="told",
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memories"},
+        limit=1,
+        visibility_character_ids={present.id},
+    )
+
+    assert hits == []
+
+
+def test_repositories_search_context_sources_with_unicode_terms(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    cyrillic = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-cyrillic",
+        title="Северный маяк",
+        body="Северный маяк открывается медным ключом.",
+    )
+    cjk = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-cjk",
+        title="月石羅針盤",
+        body="月石羅針盤は東の書庫を開く。",
+    )
+
+    cyrillic_hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"маяк"},
+        source_types={"memory"},
+        limit=8,
+    )
+    cjk_hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"月石羅針盤はどこ"},
+        source_types={"memory"},
+        limit=8,
+    )
+
+    assert [hit.record for hit in cyrillic_hits] == [cyrillic]
+    assert [hit.record for hit in cjk_hits] == [cjk]
+
+
+def test_repositories_unicode_match_all_cannot_be_starved_by_partial_matches(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-target",
+        title="秘密の地図",
+        body="秘密の地図は古い書庫にある。",
+    )
+    for index in range(90):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=f"memory-noise-{index:02d}",
+            title=f"秘密 {index:02d}",
+            body="秘密だけを記録した新しいメモ。",
+        )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"秘密", "地図"},
+        source_types={"memory"},
+        limit=1,
+        match_all=True,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_indexes_middle_han_bigram_before_term_cap(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    body = "".join(chr(0x4E00 + index) for index in range(220))
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-long-han-run",
+        title="長文",
+        body=body,
+    )
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms={body[200:202]},
+        source_types={"memory"},
+        limit=1,
+        match_all=True,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_matches_middle_han_trigram_via_bigrams(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    body = "".join(chr(0x4E00 + index) for index in range(1_000))
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-long-han-trigram",
+        title="長文",
+        body=body,
+    )
+    query = body[700:703]
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms={*cjk_lexical_anchors(query), "where", "is"},
+        source_types={"memory"},
+        limit=1,
+        match_all=True,
+    )
+    broad_hits = repositories.search_context_sources(
+        save_id,
+        query_terms={*cjk_lexical_anchors(query), "where", "is"},
+        source_types={"memory"},
+        limit=1,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+    assert [hit.record for hit in broad_hits] == [target]
+
+
+def test_repositories_exact_phrase_supports_short_ascii_identifiers(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-short-code",
+        title="Vault code",
+        body="Only A 7 opens the vault.",
+    )
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms=set(),
+        source_types={"memory"},
+        limit=8,
+        exact_phrases=("A 7",),
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_exact_identifier_cannot_be_starved_by_split_matches(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-a7-target",
+        title="Vault identifier",
+        body="Only A-7 opens the old river vault.",
+    )
+    for index in range(90):
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id=f"memory-a7-noise-{index:02d}",
+            title=f"Split tokens {index:02d}",
+            body=f"A 7 appears in newer record {index:02d}.",
+        )
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id=f"memory-a7-longer-{index:02d}",
+            title=f"Longer identifier {index:02d}",
+            body=f"Only A-7.{index:02d} opens the newer vault.",
+        )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-a70-near-match",
+        title="Nearby identifier",
+        body="Only A-70 opens the upper vault.",
+    )
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms={"a", "7"},
+        source_types={"memory"},
+        limit=1,
+        exact_identifiers=("A-7",),
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_exact_identifier_lookup_does_not_scan_filter_udf(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    for index in range(200):
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id=f"memory-hidden-{index:02d}",
+            title=f"Hidden split code {index:02d}",
+            body="A 7 appears in a private maintenance record.",
+        )
+    calls = 0
+
+    def count_identifier_checks(_value: object, _identifier: object) -> int:
+        nonlocal calls
+        calls += 1
+        return 0
+
+    repositories.connection.create_function(
+        "bragi_identifier_filter_matches",
+        2,
+        count_identifier_checks,
+        deterministic=True,
+    )
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms=set(),
+        source_types={"memory"},
+        limit=1,
+        exact_identifiers=("A-7",),
+    )
+
+    assert hits == []
+    assert calls == 0
+
+
+def test_repositories_indexes_exact_identifier_at_source_tail(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-tail-code",
+        title="Archive codes",
+        body=(
+            " ".join(f"ARCHIVE-{index:03d}" for index in range(129))
+            + " TARGET-9999 "
+            + " ".join(f"LATER-{index:03d}" for index in range(129))
+        ),
+    )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-split-code",
+        title="Nearby split code",
+        body="TARGET 9999 is written without the separator.",
+    )
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms={"target", "9999"},
+        source_types={"memory"},
+        limit=1,
+        exact_identifiers=("TARGET-9999",),
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_rebuild_preserves_exact_identifier_after_long_token(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-long-token-tail",
+        title="Archive codes",
+        body="KEEP-1 " + ("A" * 70_000) + " TAIL-2",
+    )
+
+    repositories.rebuild_context_source_search_terms(save_id)
+
+    identifiers = {
+        row[0]
+        for row in repositories.connection.execute(
+            """
+            SELECT identifier
+            FROM context_source_exact_identifiers
+            WHERE context_source_id = ?
+            """,
+            (target.id,),
+        )
+    }
+    assert identifiers == {"keep-1", "tail-2"}
+
+
+def test_repositories_rebuild_preserves_identifier_in_overlapping_edge_samples(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-overlap-sample",
+        title="Archive codes",
+        body=(" " * 40_000) + "MIDDLE-7" + (" " * 10_000),
+    )
+
+    repositories.rebuild_context_source_search_terms(save_id)
+
+    identifiers = {
+        row[0]
+        for row in repositories.connection.execute(
+            """
+            SELECT identifier
+            FROM context_source_exact_identifiers
+            WHERE context_source_id = ?
+            """,
+            (target.id,),
+        )
+    }
+    assert identifiers == {"middle-7"}
+
+
+def test_repositories_restore_rebuilds_archived_exact_identifier_index(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-restored-code",
+        title="Restored vault identifier",
+        body="Only SECRET-42 opens the restored vault.",
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_sources
+        SET archived_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (target.id,),
+    )
+    repositories.connection.execute(
+        "DELETE FROM context_source_exact_identifiers WHERE context_source_id = ?",
+        (target.id,),
+    )
+    repositories.commit()
+
+    repositories.restore_context_sources({target.id})
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms={"secret", "42"},
+        source_types={"memory"},
+        limit=1,
+        exact_identifiers=("SECRET-42",),
+    )
+
+    assert [hit.record.id for hit in hits] == [target.id]
+
+
+def test_repositories_restore_preserves_legacy_normalized_budget_allowance(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    source = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-legacy-budget",
+        title="Legacy expansion",
+        body="\ufdfa" * 32,
+    )
+    normalized_bytes = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_index_budget_state
+        WHERE save_id = ?
+        """,
+        (save_id,),
+    ).fetchone()[0]
+    repositories.connection.execute(
+        """
+        INSERT INTO context_source_legacy_budget_limits(
+            save_id, normalized_text_bytes
+        )
+        VALUES (?, ?)
+        """,
+        (save_id, normalized_bytes),
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_sources
+        SET archived_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (source.id,),
+    )
+    repositories.commit()
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD",
+        1,
+    )
+
+    repositories.restore_context_sources({source.id})
+
+    assert repositories.connection.execute(
+        "SELECT archived_at FROM context_sources WHERE id = ?",
+        (source.id,),
+    ).fetchone()[0] is None
+
+
+def test_repositories_restore_preserves_legacy_record_budget_allowance(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    source = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="custom_note",
+        source_id="legacy-record-budget",
+        title="Legacy expansion",
+        body="\ufdfa" * 32,
+    )
+    normalized_bytes = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_normalized_budget_entries
+        WHERE context_source_id = ?
+        """,
+        (source.id,),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD",
+        1,
+    )
+    repositories.ensure_context_source_legacy_budget_limit(
+        save_id=save_id,
+        normalized_text_bytes=normalized_bytes,
+        normalized_record_bytes=normalized_bytes,
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_sources
+        SET archived_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (source.id,),
+    )
+    repositories.commit()
+
+    repositories.restore_context_sources({source.id})
+
+    assert repositories.connection.execute(
+        "SELECT archived_at FROM context_sources WHERE id = ?",
+        (source.id,),
+    ).fetchone()[0] is None
+
+
+def test_repositories_rejects_index_budget_before_persisting_source(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-existing",
+        title="Existing marker",
+        body="Existing marker code EXISTING-1.",
+    )
+    existing_index_rows = repositories.connection.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM context_source_search_terms WHERE save_id = ?)
+            + (
+                SELECT COUNT(*)
+                FROM context_source_exact_identifiers
+                WHERE save_id = ?
+            )
+        """,
+        (save_id, save_id),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_INDEX_ROWS_PER_REBUILD",
+        existing_index_rows,
+    )
+
+    with pytest.raises(ValueError, match="too large to rebuild"):
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id="memory-rejected",
+            title="Rejected marker",
+            body="Rejected marker code REJECTED-2.",
+        )
+
+    assert (
+        repositories.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM context_sources
+            WHERE save_id = ? AND source_id = 'memory-rejected'
+            """,
+            (save_id,),
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_repositories_rejects_source_text_budget_before_persisting_source(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_TEXT_BYTES_PER_REBUILD",
+        16,
+    )
+
+    with pytest.raises(ValueError, match="source text is too large"):
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id="memory-rejected",
+            title="Rejected marker",
+            body="This body exceeds the test budget.",
+        )
+
+    assert (
+        repositories.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM context_sources
+            WHERE save_id = ? AND source_id = 'memory-rejected'
+            """,
+            (save_id,),
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_repositories_rejects_aggregate_normalized_budget_before_persisting_source(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-existing",
+        title="Existing",
+        body="\ufdfa" * 32,
+    )
+    normalized_bytes = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_index_budget_state
+        WHERE save_id = ?
+        """,
+        (save_id,),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD",
+        normalized_bytes,
+    )
+
+    with pytest.raises(ValueError, match="Normalized context source text"):
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id="memory-rejected",
+            title="Rejected",
+            body="\ufdfa",
+        )
+
+    assert (
+        repositories.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM context_sources
+            WHERE save_id = ? AND source_id = 'memory-rejected'
+            """,
+            (save_id,),
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_repositories_bounds_index_rebuild_before_writing(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    first = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-first",
+        title="First memory",
+        body="The amber marker opens archive seven.",
+    )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-second",
+        title="Second memory",
+        body="The cobalt marker opens archive eight.",
+    )
+    repositories.connection.execute(
+        "DELETE FROM context_source_search_terms WHERE context_source_id = ?",
+        (first.id,),
+    )
+    repositories.commit()
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_INDEX_ROWS_PER_REBUILD",
+        1,
+    )
+
+    with pytest.raises(ValueError, match="too large to rebuild"):
+        repositories.rebuild_context_source_search_terms(save_id)
+
+    assert repositories.connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM context_source_search_terms
+        WHERE context_source_id = ?
+        """,
+        (first.id,),
+    ).fetchone()[0] == 0
+
+
+def test_repositories_mixed_unicode_match_all_requires_ascii_terms(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-target",
+        title="秘密 vault marker",
+        body="The mixed-script marker identifies the old vault.",
+    )
+    for index in range(40):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=f"memory-noise-{index:02d}",
+            title=f"秘密 {index:02d}",
+            body="秘密だけを記録した新しいメモ。",
+        )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"秘密", "vault"},
+        source_types={"memory"},
+        limit=1,
+        match_all=True,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_mixed_cjk_trigram_match_all_requires_ascii_terms(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-target",
+        title="秘密地図 vault marker",
+        body="The mixed-script marker identifies the old vault.",
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-newer-cjk-only",
+        title="秘密地図 only",
+        body="秘密地図だけを記録した新しいメモ。",
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"秘密地図", "vault"},
+        source_types={"memory"},
+        limit=1,
+        match_all=True,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_bound_large_mixed_script_query(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-large-mixed-query",
+        title="古い秘密の扉",
+        body="古い秘密の扉は月石で開く。",
+    )
+    query_terms = {f"unrelatedterm{index:04d}" for index in range(1_100)}
+    query_terms.add("秘密")
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms=query_terms,
+        source_types={"memory"},
+        limit=8,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_exact_phrase_precedes_bounded_all_term_matches(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-exact-phrase",
+        title="Old mechanism",
+        body="The copper notch under the western stair opens the vault.",
+    )
+    for index in range(40):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=f"memory-all-terms-{index:02d}",
+            title=f"New mechanism {index:02d}",
+            body=(
+                "Western stair records say the notch inspection found copper "
+                f"under shelving {index:02d}."
+            ),
+        )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"copper", "notch", "western", "stair"},
+        source_types={"memory"},
+        limit=24,
+        match_all=True,
+        exact_phrases=("copper notch under the western stair",),
+    )
+
+    assert hits[0].record == target
+
+
+def test_repositories_prioritize_specific_phrase_over_generic_expansion(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-specific",
+        title="Old mechanism",
+        body="The copper notch under the western stair opens the vault.",
+    )
+    for index in range(40):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=f"memory-generic-{index:02d}",
+            title=f"Archive note {index:02d}",
+            body="A generic archive record.",
+        )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"copper", "notch", "archive"},
+        source_types={"memory"},
+        limit=24,
+        exact_phrases=(
+            "copper notch under the western stair",
+            "archive",
+        ),
+    )
+
+    assert hits[0].record == target
+
+
+def test_repositories_exact_phrase_uses_unicode_normalization_and_casefold(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-accented",
+        title="Old signal",
+        body="The CAFÉ beacon marks the eastern bridge.",
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"café", "beacon"},
+        source_types={"memory"},
+        limit=1,
+        exact_phrases=("cafe\u0301 beacon",),
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_apply_context_visibility_before_search_limit(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    for index in range(12):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=f"hidden-{index:02d}",
+            title=f"moonstone hidden {index:02d}",
+            body="The moonstone opens the hidden archive.",
+            metadata={"known_by": ["Lio"]},
+        )
+    accessible = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="accessible",
+        title="moonstone public",
+        body="The moonstone opens the public archive.",
+        metadata={"known_by": ["mara"]},
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=1,
+        allowed_owner_names={"Mara"},
+    )
+
+    assert [hit.record for hit in hits] == [accessible]
+
+
+def test_repositories_apply_message_visibility_before_search_limit(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    hidden_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="A hidden moonstone rumor circulates.",
+    )
+    visible_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The public moonstone archive opens.",
+    )
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_message.id,
+        character_id=character.id,
+        visibility="not_visible",
+    )
+    for index in range(90):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="observation",
+            source_id=f"hidden-observation-{index:02d}",
+            title=f"moonstone hidden {index:02d}",
+            body="The moonstone opens the hidden archive.",
+            metadata={"source_message_ids": [hidden_message.id]},
+        )
+    accessible = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="observation",
+        source_id="accessible-observation",
+        title="moonstone public",
+        body="The moonstone opens the public archive.",
+        metadata={"source_message_ids": [visible_message.id]},
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"observation"},
+        limit=1,
+        visibility_character_ids={character.id},
+    )
+
+    assert [hit.record for hit in hits] == [accessible]
+
+
+def test_repositories_filter_singular_message_provenance_and_allow_visible_group(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    hidden_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="A hidden moonstone rumor circulates.",
+    )
+    visible_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="A public witness independently confirms the moonstone.",
+    )
+    character = repositories.add_character(save_id=save.id, name="Captain Ilyra")
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_message.id,
+        character_id=character.id,
+        visibility="not_visible",
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="singular-hidden",
+        title="moonstone singular",
+        body="The moonstone opens the archive.",
+        metadata={"source_message_id": hidden_message.id},
+    )
+    accessible = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="alternative-grounding",
+        title="moonstone confirmed",
+        body="The moonstone opens the archive.",
+        metadata={
+            "source_message_ids": [hidden_message.id, visible_message.id],
+            "source_provenance_groups": [
+                [hidden_message.id],
+                [visible_message.id],
+            ],
+        },
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="conjunctive-grounding",
+        title="moonstone and vault code",
+        body="The moonstone opens the archive and reveals the hidden vault code.",
+        metadata={
+            "source_message_ids": [hidden_message.id, visible_message.id],
+            "source_provenance_groups": [
+                [hidden_message.id],
+                [visible_message.id],
+            ],
+            "source_provenance_mode": "all",
+        },
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=8,
+        visibility_character_ids={character.id},
+    )
+
+    assert [hit.record for hit in hits] == [accessible]
+
+
+def test_repositories_apply_blocked_scoped_targets_before_search_limit(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    blocked: set[tuple[str, str]] = set()
+    for index in range(12):
+        source_id = f"hidden-{index:02d}"
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=source_id,
+            title=f"moonstone secret {index:02d}",
+            body="The moonstone opens the concealed archive.",
+        )
+        blocked.add(("memory", source_id))
+    blocked.update(
+        ("memory", f"nonexistent-hidden-{index:04d}")
+        for index in range(1_100)
+    )
+    accessible = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="accessible",
+        title="moonstone public",
+        body="The moonstone opens the public archive.",
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=1,
+        blocked_source_keys=blocked,
+    )
+
+    assert [hit.record for hit in hits] == [accessible]
+
+
+def test_repositories_expire_scene_scratch_on_generation_change(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    first_location = repositories.add_location(
+        save_id=save_id,
+        name="Beacon",
+        source_message_id=message_id,
+    )
+    second_location = repositories.add_location(
+        save_id=save_id,
+        name="Archive",
+        source_message_id=message_id,
+    )
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        current_location_id=first_location.id,
+        source_message_id=message_id,
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="observation",
+        source_id="scratch-observation",
+        title="Temporary lens state",
+        body="The lens is warm.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=1,
+        expires_after_turn_number=13,
+    )
+
+    same_scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        current_location_id=first_location.id,
+        source_message_id=message_id,
+    )
+    assert same_scene.scene_generation == scene.scene_generation
+    assert repositories.get_context_source(scratch.id) is not None
+
+    advanced_scene = repositories.advance_scene_generation(
+        save_id=save_id,
+        source_message_id=message_id,
+    )
+    same_location_next_scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        current_location_id=first_location.id,
+        situation="A new confrontation begins.",
+        source_message_id=message_id,
+    )
+    assert same_location_next_scene.scene_generation == advanced_scene.scene_generation
+    assert same_location_next_scene.scene_generation == scene.scene_generation + 1
+    assert repositories.get_context_source(scratch.id) is None
+
+    next_scratch = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="observation",
+        source_id="next-scratch-observation",
+        title="Temporary archive state",
+        body="The confrontation remains unresolved.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=same_location_next_scene.id,
+        scene_generation=same_location_next_scene.scene_generation,
+        created_turn_number=2,
+        expires_after_turn_number=14,
+    )
+    next_scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        current_location_id=second_location.id,
+        source_message_id=message_id,
+    )
+
+    assert next_scene.scene_generation == scene.scene_generation + 2
+    assert repositories.get_context_source(next_scratch.id) is None
+
+
+def test_repositories_archive_scene_scratch_after_turn_ttl(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        situation="The beacon lens is warm.",
+        source_message_id=message_id,
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="observation",
+        source_id="scratch-observation",
+        title="Temporary lens state",
+        body="The lens is warm.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=1,
+        expires_after_turn_number=13,
+    )
+
+    archived_ids = repositories.archive_stale_scene_scratch(
+        save_id=save_id,
+        current_scene_snapshot_id=scene.id,
+        current_scene_generation=scene.scene_generation,
+        current_turn_number=13,
+    )
+
+    assert archived_ids == frozenset({scratch.id})
+    assert repositories.get_context_source(scratch.id) is None
+    assert [
+        marker.id
+        for marker in repositories.list_curated_observation_source_markers(save_id)
+    ] == [scratch.id]
+
+
+def test_repositories_hide_expired_scene_scratch_from_ordinary_reads(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        situation="The beacon lens is warm.",
+        source_message_id=message_id,
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="observation",
+        source_id="scratch-observation",
+        title="Temporary lens state",
+        body="The lens is warm.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=0,
+        expires_after_turn_number=1,
+    )
+
+    repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        body="The scene advances.",
+    )
+
+    assert repositories.get_context_source(scratch.id) is None
+    assert repositories.list_context_sources(save_id) == []
+
+
+def test_repositories_delete_scene_snapshot_archives_bound_scratch(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        situation="The beacon lens is warm.",
+        source_message_id=message_id,
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="observation",
+        source_id="scratch-observation",
+        title="Temporary lens state",
+        body="The lens is warm.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+    )
+
+    deleted_id = repositories.delete_scene_snapshot(save_id)
+
+    assert deleted_id == scene.id
+    assert repositories.get_scene_snapshot(save_id) is None
+    assert repositories.get_context_source(scratch.id) is None
 
 
 def test_repositories_list_protected_context_sources(
@@ -6707,6 +8522,168 @@ def test_repository_updates_message_body_and_records_revisions(
     assert revisions[-1].reconciliation_status == "failed"
     assert revisions[-1].reconciliation_error == "structured backend failed"
     assert revisions[-1].reconciled_at is not None
+
+
+def test_narration_graph_normalizes_state_alias_and_bounds_owner_rows(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    state = repositories.upsert_world_state(
+        save_id=save_id,
+        key="vault.code",
+        value={"phrase": "ember dawn"},
+        source_message_id=message_id,
+    )
+    characters = [
+        repositories.add_character(
+            save_id=save_id,
+            name=f"Warden {index:02d}",
+            character_id=f"character-{index:02d}",
+        )
+        for index in range(20)
+    ]
+    threshold_edge = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=characters[0].id,
+        target_type="state",
+        target_id=state.id,
+        knowledge_state="may_know",
+        confidence=0.72,
+    )
+    for character in characters[1:]:
+        repositories.add_character_knowledge_edge(
+            save_id=save_id,
+            character_id=character.id,
+            target_type="state",
+            target_id=state.id,
+            knowledge_state="knows",
+        )
+
+    edges = repositories.list_narration_character_knowledge_edges(
+        save_id,
+        target_keys={("world_state", state.id)},
+        present_character_ids={character.id for character in characters},
+        visibility_character_ids={character.id for character in characters},
+    )
+
+    assert threshold_edge.id in {edge.id for edge in edges}
+    assert len(edges) == 8
+
+
+def test_narration_graph_keeps_present_owner_restrictions_across_aliases(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    state = repositories.upsert_world_state(
+        save_id=save_id,
+        key="vault.code",
+        value={"phrase": "ember dawn"},
+        source_message_id=message_id,
+    )
+    first = repositories.add_character(
+        save_id=save_id,
+        name="First Warden",
+    )
+    second = repositories.add_character(
+        save_id=save_id,
+        name="Second Warden",
+    )
+    first_denial = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=first.id,
+        target_type="world_state",
+        target_id=state.id,
+        knowledge_state="does_not_know",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=first.id,
+        target_type="state",
+        target_id=state.id,
+        knowledge_state="knows",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=second.id,
+        target_type="world_state",
+        target_id=state.id,
+        knowledge_state="does_not_know",
+    )
+
+    edges = repositories.list_narration_character_knowledge_edges(
+        save_id,
+        target_keys={("world_state", state.id)},
+        present_character_ids={first.id, second.id},
+        visibility_character_ids={first.id, second.id},
+    )
+
+    assert first_denial.id in {edge.id for edge in edges}
+
+
+def test_narration_graph_normalizes_legacy_plural_memory_edges(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    memory = repositories.add_memory(
+        save_id=save_id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["moonstone"],
+        source_message_id=message_id,
+    )
+    character = repositories.add_character(save_id=save_id, name="Nira")
+    denial = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="memories",
+        target_id=memory.id,
+        knowledge_state="does_not_know",
+    )
+
+    edges = repositories.list_narration_character_knowledge_edges(
+        save_id,
+        target_keys={("memory", memory.id)},
+        present_character_ids={character.id},
+        visibility_character_ids={character.id},
+    )
+
+    assert [edge.id for edge in edges] == [denial.id]
+
+
+def test_narration_graph_legacy_plural_memory_edge_overrides_link(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    memory = repositories.add_memory(
+        save_id=save_id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["moonstone"],
+        source_message_id=message_id,
+    )
+    character = repositories.add_character(save_id=save_id, name="Nira")
+    repositories.add_entity_link(
+        save_id=save_id,
+        entity_type="character",
+        entity_id=character.id,
+        target_type="memory",
+        target_id=memory.id,
+        relation="knows",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="memories",
+        target_id=memory.id,
+        knowledge_state="does_not_know",
+    )
+
+    links = repositories.list_narration_entity_links(
+        save_id,
+        target_keys={("memory", memory.id)},
+        present_character_ids={character.id},
+        visibility_character_ids={character.id},
+    )
+
+    assert links == []
 
 
 def _persist_repository_save(

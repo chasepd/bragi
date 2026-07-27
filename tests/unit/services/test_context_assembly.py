@@ -1315,6 +1315,180 @@ def test_character_knowledge_edges_are_attributed_as_character_scoped(
     assert "Tarin knows Avery made the archive-code joke" not in linked_text
 
 
+def test_character_knowledge_edges_hidden_from_present_scene_are_not_linked_facts(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, current_location = _create_context_save(
+        repositories,
+        scenario_id="scenario-hidden-knowledge-edge-linked-facts",
+        save_id="save-hidden-knowledge-edge-linked-facts",
+    )
+    present = repositories.add_character(
+        save_id=save.id,
+        name="Nira",
+        role="Archive guide",
+        location_id=current_location.id,
+        met=True,
+        character_id="character-hidden-knowledge-nira",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=current_location.id,
+        situation="Nira has just arrived.",
+        present_character_ids=[present.id],
+        snapshot_id="snapshot-hidden-knowledge-edge",
+    )
+    hidden_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Tarin whispered that the moonstone opens the cobalt ledger.",
+        message_id="message-hidden-knowledge-edge",
+    )
+    hidden_memory = repositories.add_memory(
+        save_id=save.id,
+        body="Tarin knows the moonstone opens the cobalt ledger.",
+        tags=["tarin"],
+        memory_id="memory-hidden-knowledge-edge",
+        source_message_id=hidden_message.id,
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_message.id,
+        character_id=present.id,
+        visibility="not_visible",
+        source="scene_presence",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=present.id,
+        target_type="memory",
+        target_id=hidden_memory.id,
+        knowledge_state="knows",
+        acquisition_method="witnessed",
+        source_message_id=hidden_message.id,
+    )
+
+    sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
+
+    linked_text = "\n".join(
+        source.text for source in sources if source.tier == "active_linked_facts"
+    )
+    assert "Tarin knows the moonstone opens the cobalt ledger" not in linked_text
+
+
+def test_source_less_character_link_does_not_hydrate_hidden_source_memory(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, current_location = _create_context_save(
+        repositories,
+        scenario_id="scenario-hidden-link-target",
+        save_id="save-hidden-link-target",
+    )
+    present = repositories.add_character(
+        save_id=save.id,
+        name="Nira",
+        role="Archive guide",
+        location_id=current_location.id,
+        met=True,
+        character_id="character-hidden-link-nira",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=current_location.id,
+        situation="Nira has just arrived.",
+        present_character_ids=[present.id],
+        snapshot_id="snapshot-hidden-link-target",
+    )
+    hidden_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Tarin whispered that the moonstone opens the cobalt ledger.",
+        message_id="message-hidden-link-target",
+    )
+    hidden_memory = repositories.add_memory(
+        save_id=save.id,
+        body="Tarin knows the moonstone opens the cobalt ledger.",
+        tags=["tarin"],
+        memory_id="memory-hidden-link-target",
+        source_message_id=hidden_message.id,
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_message.id,
+        character_id=present.id,
+        visibility="not_visible",
+        source="scene_presence",
+    )
+    repositories.add_entity_link(
+        save_id=save.id,
+        entity_type="character",
+        entity_id=present.id,
+        target_type="memories",
+        target_id=hidden_memory.id,
+        relation="knows",
+    )
+
+    sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
+
+    linked_text = "\n".join(
+        source.text for source in sources if source.tier == "active_linked_facts"
+    )
+    assert "Tarin knows the moonstone opens the cobalt ledger" not in linked_text
+
+
+def test_active_thread_hidden_from_present_scene_is_omitted(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, current_location = _create_context_save(
+        repositories,
+        scenario_id="scenario-hidden-thread-source",
+        save_id="save-hidden-thread-source",
+    )
+    present = repositories.add_character(
+        save_id=save.id,
+        name="Nira",
+        role="Archive guide",
+        location_id=current_location.id,
+        met=True,
+        character_id="character-hidden-thread-nira",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=current_location.id,
+        situation="Nira has just arrived.",
+        present_character_ids=[present.id],
+        snapshot_id="snapshot-hidden-thread-source",
+    )
+    hidden_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The hidden thread is to retrieve Tarin's cobalt ledger.",
+        message_id="message-hidden-thread-source",
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_message.id,
+        character_id=present.id,
+        visibility="not_visible",
+        source="scene_presence",
+    )
+    repositories.add_active_thread(
+        save_id=save.id,
+        title="Retrieve Tarin's cobalt ledger",
+        description="The hidden thread description should not enter context.",
+        status="active",
+        priority=9,
+        source_message_id=hidden_message.id,
+    )
+
+    sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
+
+    active_thread_text = "\n".join(
+        source.text for source in sources if source.tier == "active_threads"
+    )
+    assert "Retrieve Tarin's cobalt ledger" not in active_thread_text
+
+
 def test_private_active_threads_are_limited_to_turn_audience(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -1534,6 +1708,59 @@ def test_active_participant_relationship_state_is_deterministic_context(
     )
     assert "Lio heard only rumors" not in current_scene_text
     assert "Unrelated crypt cataloging" not in current_scene_text
+
+
+def test_active_participant_state_hidden_from_present_scene_is_omitted(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, current_location = _create_context_save(
+        repositories,
+        scenario_id="scenario-hidden-participant-state",
+        save_id="save-hidden-participant-state",
+    )
+    present = repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        aliases=["Ilyra"],
+        role="Watch captain",
+        character_id="character-hidden-participant-ilyra",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=current_location.id,
+        situation="Ilyra watches the bridge.",
+        present_character_ids=[present.id],
+        snapshot_id="snapshot-hidden-participant-state",
+    )
+    hidden_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Ilyra privately learned that Mara betrayed the bridge watch.",
+        message_id="message-hidden-participant-state",
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_message.id,
+        character_id=present.id,
+        visibility="not_visible",
+        source="scene_presence",
+    )
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="character.captain_ilyra.revealed_traits.about_mara",
+        value={"knows": "Ilyra knows Mara betrayed the bridge watch."},
+        category="relationship",
+        source_message_id=hidden_message.id,
+    )
+
+    sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
+
+    participant_text = "\n".join(
+        source.text
+        for source in sources
+        if source.tier == "active_participant_facts"
+    )
+    assert "Ilyra knows Mara betrayed the bridge watch" not in participant_text
 
 
 def test_narrator_context_does_not_render_player_agency_as_npc_guidance(

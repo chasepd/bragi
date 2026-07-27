@@ -784,6 +784,34 @@ def test_delete_text_messages_from_here_reconciles_text_world_state(
     assert repositories.list_character_text_proactive_triggers(save_id) == []
 
 
+def test_reconciliation_does_not_mutate_character_from_another_save(
+    repositories: PersistenceRepositories,
+) -> None:
+    victim_save_id, _thread_id, _player_message_id, _reply_id = _seed_text_thread(
+        repositories,
+        create_contact_state=False,
+    )
+    attacker_save_id, _thread_id, _player_message_id, _reply_id = _seed_text_thread(
+        repositories,
+        create_contact_state=False,
+    )
+    _player, victim = _player_and_npc(repositories, victim_save_id)
+    original_known_state = victim.known_state
+
+    CharacterTextRevisionService(
+        repositories=repositories,
+        providers={},
+    )._apply_reconciled_character(
+        save_id=attacker_save_id,
+        target_id=victim.id,
+        value={"known_state": "attacker-controlled"},
+    )
+
+    unchanged = repositories.get_character(victim.id)
+    assert unchanged is not None
+    assert unchanged.known_state == original_known_state
+
+
 def test_delete_text_messages_from_here_restores_existing_contact_state(
     repositories: PersistenceRepositories,
 ) -> None:

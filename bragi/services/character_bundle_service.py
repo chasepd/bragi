@@ -19,6 +19,7 @@ from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.private_files import write_private_bytes
 from bragi.services.character_locks import normalize_character_locked_fields
+from bragi.zip_safety import ZipSafetyError, validate_zip_directory
 from bragi_common.media_mime import imported_media_mime_type
 
 CHARACTER_BUNDLE_FORMAT = "bragi-character-bundle"
@@ -432,6 +433,7 @@ class CharacterBundleService:
         bundle_path: Path,
     ) -> tuple[dict[str, object], dict[str, object]]:
         try:
+            validate_zip_directory(bundle_path)
             with zipfile.ZipFile(bundle_path) as bundle:
                 manifest = _json_object_from_bytes(
                     _read_limited_member(bundle, MANIFEST_NAME),
@@ -445,7 +447,13 @@ class CharacterBundleService:
                 _validate_bundle_data(manifest, data)
                 _validate_bundle_members(bundle, data)
                 return manifest, data
-        except (OSError, KeyError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        except (
+            OSError,
+            KeyError,
+            ZipSafetyError,
+            zipfile.BadZipFile,
+            json.JSONDecodeError,
+        ) as exc:
             raise CharacterBundleError("Invalid Bragi character bundle") from exc
 
     def _reference_media_rows(

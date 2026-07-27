@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass, field, replace
@@ -15,9 +16,14 @@ from bragi.observation_types import OBSERVATION_TYPES, normalize_observation_typ
 from bragi.persistence.models import (
     CharacterRecord,
     ContextObservationRecord,
+    ContextUpdateSuggestionRecord,
+    MemoryRecord,
     MessageRecord,
 )
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.providers.chat_rendering import rendered_chat_request_text
 from bragi.providers.contracts import (
     ChatMessage,
@@ -60,6 +66,7 @@ RESPONSE_VERIFICATION_MODES = frozenset(
 )
 
 OBSERVATION_STATUSES_FOR_CURATION = ("pending",)
+SCENE_SCRATCH_TTL_TURNS = 12
 OBSERVATION_EXTRACTION_MAX_ITEMS = 12
 OBSERVATION_CONFIDENCE_TIERS = (0.4, 0.7, 0.9)
 CURATION_BATCH_ITEM_LIMIT = 32
@@ -102,6 +109,9 @@ class CurationDecision:
     context_title: str = ""
     context_body: str = ""
     tags: tuple[str, ...] = ()
+    grounding_status: str = ""
+    supporting_evidence_quote: str = ""
+    supporting_source_message_ids: tuple[str, ...] = ()
     script_policy_violations: tuple[ScriptPolicyViolation, ...] = ()
 
 
@@ -409,31 +419,51 @@ class ObservationService:
                 safety_transition=message.safety_transition,
             )
         )
-        records = tuple(
-            self.repositories.add_context_observation(
-                save_id=save_id,
-                observation_type=observation.observation_type,
-                claim=observation.claim,
-                evidence_quote=observation.evidence_quote,
-                source_message_ids=observation.source_message_ids,
-                scope=observation.scope,
-                confidence=observation.confidence,
-                tags=observation.tags,
-                metadata={"observer": "structured_output"},
-            )
-            for observation in extracted
-            if observation.claim.strip()
-            and _observation_evidence_is_grounded(
-                observation,
-                messages_by_id=messages_by_id,
-            )
-            and not _observation_script_policy_violations(
-                observation,
-                messages_by_id=messages_by_id,
-                mode=mode,
-            )
-            and not blocked_source_ids.intersection(observation.source_message_ids)
+        eligible = tuple(
+            {
+                (
+                    observation.observation_type,
+                    canonical_claim_fingerprint(observation.claim),
+                    tuple(observation.source_message_ids),
+                ): observation
+                for observation in extracted[:64]
+                if observation.claim.strip()
+                and _observation_evidence_is_grounded(
+                    observation,
+                    messages_by_id=messages_by_id,
+                )
+                and not _observation_script_policy_violations(
+                    observation,
+                    messages_by_id=messages_by_id,
+                    mode=mode,
+                )
+                and not blocked_source_ids.intersection(
+                    observation.source_message_ids
+                )
+            }.values()
         )
+        records: tuple[ContextObservationRecord, ...] = ()
+        if eligible:
+            self.repositories.begin_transaction()
+            try:
+                records = tuple(
+                    self.repositories.add_context_observation(
+                        save_id=save_id,
+                        observation_type=observation.observation_type,
+                        claim=observation.claim,
+                        evidence_quote=observation.evidence_quote,
+                        source_message_ids=observation.source_message_ids,
+                        scope=observation.scope,
+                        confidence=observation.confidence,
+                        tags=observation.tags,
+                        metadata={"observer": "structured_output"},
+                    )
+                    for observation in eligible
+                )
+                self.repositories.commit_transaction()
+            except Exception:
+                self.repositories.rollback_transaction()
+                raise
         return ObservationResult(
             save_id=save_id,
             observed_count=len(records),
@@ -993,16 +1023,77 @@ class ContextCurationService:
             body = decision.memory_body.strip() or observation.claim
             source_message_ids = tuple(observation.source_message_ids)
             tags = tuple(decision.tags or observation.tags)
-            if _curated_memory_exists(
+            if not _curated_decision_is_grounded(
+                decision,
+                observation=observation,
+                source_texts=current_source_texts.get(observation.id, ()),
+            ):
+                self._queue_grounding_confirmation(
+                    save_id=save_id,
+                    observation=observation,
+                    decision=decision,
+                    proposed_body=body,
+                    lease_token=lease_token,
+                )
+                return (0, 0, 1, 0, 0)
+            fingerprint = canonical_claim_fingerprint(body)
+            existing_memory = _memory_with_fingerprint(
                 self.repositories,
                 save_id=save_id,
-                body=body,
-                source_message_ids=source_message_ids,
-            ):
+                fingerprint=fingerprint,
+            )
+            if existing_memory is not None:
+                self.repositories.update_memory(
+                    memory_id=existing_memory.id,
+                    body=existing_memory.body,
+                    tags=list(dict.fromkeys((*existing_memory.tags, *tags))),
+                    importance=max(
+                        existing_memory.importance,
+                        decision.confidence,
+                    ),
+                    source_message_ids=list(
+                        dict.fromkeys(
+                            (
+                                *existing_memory.source_message_ids,
+                                *source_message_ids,
+                            )
+                        )
+                    ),
+                    source_observation_ids=list(
+                        dict.fromkeys(
+                            (
+                                *existing_memory.source_observation_ids,
+                                observation.id,
+                            )
+                        )
+                    ),
+                    claim_fingerprint=fingerprint,
+                )
                 self._mark_observation(
                     observation,
                     decision,
                     "accepted",
+                    lease_token=lease_token,
+                )
+                return (0, 0, 0, 0, 0)
+            pending_suggestion = _pending_memory_suggestion_with_fingerprint(
+                self.repositories,
+                save_id=save_id,
+                fingerprint=fingerprint,
+            )
+            if pending_suggestion is not None:
+                _merge_pending_memory_suggestion(
+                    self.repositories,
+                    suggestion=pending_suggestion,
+                    observation=observation,
+                    tags=tags,
+                    confidence=decision.confidence,
+                    fingerprint=fingerprint,
+                )
+                self._mark_observation(
+                    observation,
+                    decision,
+                    "needs_confirmation",
                     lease_token=lease_token,
                 )
                 return (0, 0, 0, 0, 0)
@@ -1036,6 +1127,8 @@ class ContextCurationService:
                     else None
                 ),
                 source_message_ids=source_message_ids,
+                source_observation_ids=(observation.id,),
+                claim_fingerprint=fingerprint,
             )
             self._mark_observation(
                 observation,
@@ -1046,11 +1139,52 @@ class ContextCurationService:
             return (1, 0, 0, 0, 0)
         if decision.action in {"save_context", "scene_scratch"}:
             body = decision.context_body.strip() or observation.claim
+            if not _curated_decision_is_grounded(
+                decision,
+                observation=observation,
+                source_texts=current_source_texts.get(observation.id, ()),
+            ):
+                self._queue_grounding_confirmation(
+                    save_id=save_id,
+                    observation=observation,
+                    decision=decision,
+                    proposed_body=body,
+                    lease_token=lease_token,
+                )
+                return (0, 0, 1, 0, 0)
+            scene_snapshot_id: str | None = None
+            scene_generation: int | None = None
+            created_turn_number: int | None = None
+            expires_after_turn_number: int | None = None
+            if decision.action == "scene_scratch":
+                scene = self.repositories.get_scene_snapshot(save_id)
+                if scene is None:
+                    self._queue_grounding_confirmation(
+                        save_id=save_id,
+                        observation=observation,
+                        decision=decision,
+                        proposed_body=body,
+                        reason="Scene scratch requires an active scene snapshot.",
+                        lease_token=lease_token,
+                    )
+                    return (0, 0, 1, 0, 0)
+                narrator_turn = self.repositories.count_active_messages_by_role(
+                    save_id,
+                    roles=("narrator",),
+                )["narrator"]
+                scene_snapshot_id = scene.id
+                scene_generation = scene.scene_generation
+                created_turn_number = narrator_turn
+                expires_after_turn_number = narrator_turn + SCENE_SCRATCH_TTL_TURNS
             self.repositories.upsert_context_source(
                 save_id=save_id,
                 source_type="observation",
                 source_id=observation.id,
-                title=decision.context_title.strip() or observation.claim,
+                title=(
+                    "Scene scratch"
+                    if decision.action == "scene_scratch"
+                    else "Saved context"
+                ),
                 body=body,
                 metadata={
                     "observation_id": observation.id,
@@ -1062,6 +1196,10 @@ class ContextCurationService:
                     "curation_action": decision.action,
                     "importance": decision.confidence,
                 },
+                scene_snapshot_id=scene_snapshot_id,
+                scene_generation=scene_generation,
+                created_turn_number=created_turn_number,
+                expires_after_turn_number=expires_after_turn_number,
             )
             self._mark_observation(
                 observation,
@@ -1118,6 +1256,70 @@ class ContextCurationService:
             status=status,
             terminal_outcome=status,
             metadata={"curation": _decision_metadata(decision)},
+        )
+        if completed is None:
+            raise RuntimeError("Observation curation lease was lost")
+
+    def _queue_grounding_confirmation(
+        self,
+        *,
+        save_id: str,
+        observation: ContextObservationRecord,
+        decision: CurationDecision,
+        proposed_body: str,
+        reason: str = "",
+        lease_token: str,
+    ) -> None:
+        diagnostic_reason = reason or (
+            "Curated prose was not entailed by its cited observation evidence."
+        )
+        if decision.action == "durable_memory":
+            update_type = "create"
+            entity_type = "memory"
+            entity_id = None
+            field_path = "*"
+            proposed_value = _curated_memory_proposed_value(
+                body=proposed_body,
+                tags=tuple(decision.tags or observation.tags),
+                importance=decision.confidence,
+                source_message_ids=tuple(observation.source_message_ids),
+                source_observation_id=observation.id,
+            ) | {
+                "grounding_review": _decision_metadata(decision),
+            }
+        else:
+            update_type = "review"
+            entity_type = "observation"
+            entity_id = observation.id
+            field_path = decision.action
+            proposed_value = {
+                **_decision_metadata(decision),
+                "body": proposed_body,
+                "source_observation_ids": [observation.id],
+            }
+        self.repositories.add_context_update_suggestion(
+            save_id=save_id,
+            update_type=update_type,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            field_path=field_path,
+            proposed_value=proposed_value,
+            reason=diagnostic_reason,
+            confidence=decision.confidence,
+            source_message_ids=observation.source_message_ids,
+        )
+        completed = self.repositories.complete_context_observation_curation(
+            observation.id,
+            lease_token=lease_token,
+            status="needs_confirmation",
+            terminal_outcome="needs_confirmation",
+            metadata={
+                "grounding_rejected": {
+                    "reason": diagnostic_reason,
+                    "action": decision.action,
+                },
+                "curation": _decision_metadata(decision),
+            },
         )
         if completed is None:
             raise RuntimeError("Observation curation lease was lost")
@@ -1609,10 +1811,12 @@ def _observation_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object
                             "type": "string",
                             "enum": list(OBSERVATION_TYPES),
                         },
-                        "claim": {"type": "string"},
-                        "evidence_quote": {"type": "string"},
+                        "claim": {"type": "string", "maxLength": 2000},
+                        "evidence_quote": {"type": "string", "maxLength": 1000},
                         "source_message_ids": {
                             "type": "array",
+                            "maxItems": 8,
+                            "uniqueItems": True,
                             "items": source_schema,
                         },
                         "scope": {
@@ -1623,7 +1827,12 @@ def _observation_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object
                             "type": "number",
                             "enum": list(OBSERVATION_CONFIDENCE_TIERS),
                         },
-                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "tags": {
+                            "type": "array",
+                            "maxItems": 16,
+                            "uniqueItems": True,
+                            "items": {"type": "string", "maxLength": 64},
+                        },
                     },
                     "required": [
                         "observation_type",
@@ -1680,8 +1889,8 @@ def _observations_from_data(
             for source_id in _string_tuple(raw.get("source_message_ids"))
             if source_id in allowed_ids
         )
-        claim = _string(raw.get("claim"))
-        evidence_quote = _string(raw.get("evidence_quote"))
+        claim = _string(raw.get("claim"))[:2000]
+        evidence_quote = _string(raw.get("evidence_quote"))[:1000]
         if not claim or not evidence_quote or not source_ids:
             continue
         if not any(
@@ -1710,15 +1919,50 @@ def _observation_evidence_is_grounded(
     *,
     messages_by_id: dict[str, str],
 ) -> bool:
-    if not observation.evidence_quote.strip():
+    if not _meaningful_evidence_span(observation.evidence_quote):
         return False
-    return any(
-        source_body is not None
-        and quote_matches_source(observation.evidence_quote, source_body)
-        for source_body in (
-            messages_by_id.get(source_id)
-            for source_id in observation.source_message_ids
+    source_contexts = tuple(
+        context
+        for source_id in observation.source_message_ids
+        if (source_body := messages_by_id.get(source_id)) is not None
+        if (
+            context := _source_context_for_evidence_quote(
+                observation.evidence_quote,
+                source_body,
+            )
         )
+    )
+    if not source_contexts:
+        return False
+    if _grounding_negation_conflicts(
+        observation.claim,
+        observation.evidence_quote,
+    ):
+        return False
+    if _grounding_denial_conflicts(
+        observation.claim,
+        observation.evidence_quote,
+    ):
+        return False
+    if any(
+        _grounding_negation_conflicts(observation.claim, context)
+        or _grounding_denial_conflicts(observation.claim, context)
+        or _grounding_modality_conflicts(observation.claim, context)
+        or not _grounding_context_preserves_claim_boundary(
+            observation.claim,
+            context,
+        )
+        for context in source_contexts
+    ):
+        return False
+    if _grounding_anchor_conflicts(
+        observation.claim,
+        observation.evidence_quote,
+    ):
+        return False
+    return _grounding_order_is_preserved(
+        observation.claim,
+        observation.evidence_quote,
     )
 
 
@@ -1752,9 +1996,18 @@ def _curation_schema(
                         "reason": {"type": "string"},
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         "memory_body": {"type": "string"},
-                        "context_title": {"type": "string"},
+                        "context_title": {"type": "string", "maxLength": 256},
                         "context_body": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
+                        "grounding_status": {
+                            "type": "string",
+                            "enum": ["entailed", "unsupported", "contradicted"],
+                        },
+                        "supporting_evidence_quote": {"type": "string"},
+                        "supporting_source_message_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
                     },
                     "required": [
                         "observation_id",
@@ -1765,6 +2018,9 @@ def _curation_schema(
                         "context_title",
                         "context_body",
                         "tags",
+                        "grounding_status",
+                        "supporting_evidence_quote",
+                        "supporting_source_message_ids",
                     ],
                 },
             }
@@ -1783,7 +2039,9 @@ def _curation_messages(
                 "Curate candidate Bragi observations into durable memory, save "
                 "context, scene scratchpad, discard, or needs confirmation. Use "
                 "the enforced schema. Preserve provenance and do not treat "
-                "importance as permanent when the observation may be future-dependent."
+                "importance as permanent when the observation may be future-dependent. "
+                "Mark grounding_status entailed only when the proposed prose is "
+                "supported by a verbatim quote from the cited source messages."
             ),
         ),
         ChatMessage(role="user", body=_observations_text(observations)),
@@ -1831,7 +2089,10 @@ def _curation_decisions_from_data(
     raw_items = data.get("decisions", [])
     if not isinstance(raw_items, list):
         raise ValueError("Curation decisions must be a list")
-    allowed_ids = {observation.id for observation in observations}
+    observations_by_id = {
+        observation.id: observation for observation in observations
+    }
+    allowed_ids = set(observations_by_id)
     decisions: list[CurationDecision] = []
     for raw in raw_items:
         if not isinstance(raw, dict):
@@ -1839,6 +2100,7 @@ def _curation_decisions_from_data(
         observation_id = _string(raw.get("observation_id"))
         if observation_id not in allowed_ids:
             continue
+        observation = observations_by_id[observation_id]
         decisions.append(
             CurationDecision(
                 observation_id=observation_id,
@@ -1849,6 +2111,17 @@ def _curation_decisions_from_data(
                 context_title=_string(raw.get("context_title")),
                 context_body=_string(raw.get("context_body")),
                 tags=_string_tuple(raw.get("tags")),
+                grounding_status=(
+                    _string(raw.get("grounding_status")) or "entailed"
+                ),
+                supporting_evidence_quote=(
+                    _string(raw.get("supporting_evidence_quote"))
+                    or observation.evidence_quote
+                ),
+                supporting_source_message_ids=(
+                    _string_tuple(raw.get("supporting_source_message_ids"))
+                    or tuple(observation.source_message_ids)
+                ),
             )
         )
     return tuple(decisions)
@@ -2036,12 +2309,129 @@ def _context_observation_evidence_is_grounded(
     *,
     source_texts_by_observation: dict[str, tuple[str, ...]],
 ) -> bool:
-    if not observation.evidence_quote.strip() or not observation.source_message_ids:
+    if (
+        not _meaningful_evidence_span(observation.evidence_quote)
+        or not observation.source_message_ids
+    ):
         return False
-    return any(
-        quote_matches_source(observation.evidence_quote, source_text)
+    source_contexts = tuple(
+        context
         for source_text in source_texts_by_observation.get(observation.id, ())
+        if (
+            context := _source_context_for_evidence_quote(
+                observation.evidence_quote,
+                source_text,
+            )
+        )
     )
+    return (
+        bool(source_contexts)
+        and not _grounding_negation_conflicts(
+            observation.claim,
+            observation.evidence_quote,
+        )
+        and not _grounding_denial_conflicts(
+            observation.claim,
+            observation.evidence_quote,
+        )
+        and not any(
+            _grounding_negation_conflicts(observation.claim, context)
+            or _grounding_denial_conflicts(observation.claim, context)
+            or _grounding_modality_conflicts(observation.claim, context)
+            or not _grounding_context_preserves_claim_boundary(
+                observation.claim,
+                context,
+            )
+            for context in source_contexts
+        )
+        and not _grounding_anchor_conflicts(
+            observation.claim,
+            observation.evidence_quote,
+        )
+        and _grounding_order_is_preserved(
+            observation.claim,
+            observation.evidence_quote,
+        )
+    )
+
+
+def _source_context_for_evidence_quote(
+    evidence_quote: str,
+    source_body: str,
+) -> str:
+    if not quote_matches_source(evidence_quote, source_body):
+        return ""
+    searchable_source = _compact_grounding_padding(source_body)
+    searchable_quote = _compact_grounding_padding(evidence_quote)
+    quote_start = searchable_source.casefold().find(searchable_quote.casefold())
+    if quote_start < 0:
+        return searchable_source
+    quote_end = quote_start + len(searchable_quote)
+    boundaries = [
+        index
+        for index, character in enumerate(searchable_source)
+        if _grounding_sentence_boundary(character)
+    ]
+    preceding_boundaries = [
+        index for index in boundaries if index < quote_start
+    ]
+    following_boundaries = [
+        index
+        for index in boundaries
+        if index >= max(quote_start, quote_end - 1)
+    ]
+    context_start = (
+        preceding_boundaries[-1] + 1 if preceding_boundaries else 0
+    )
+    context_end = (
+        following_boundaries[0] + 1
+        if following_boundaries
+        else len(searchable_source)
+    )
+    return searchable_source[context_start:context_end]
+
+
+def _grounding_sentence_boundary(character: str) -> bool:
+    name = unicodedata.name(character, "")
+    return (
+        character in {".", "!", "?", "\n"}
+        or "FULL STOP" in name
+        or "QUESTION" in name
+        or "EXCLAMATION" in name
+        or "INTERROBANG" in name
+        or name.endswith("DANDA")
+    )
+
+
+def _compact_grounding_padding(value: str) -> str:
+    compacted: list[str] = []
+    in_padding_run = False
+    for character in unicodedata.normalize("NFKC", value):
+        name = unicodedata.name(character, "")
+        semantic_punctuation = (
+            unicodedata.category(character).startswith(("P", "S"))
+            or "FULL STOP" in name
+            or "QUESTION" in name
+            or "EXCLAMATION" in name
+            or "INTERROBANG" in name
+            or name.endswith("DANDA")
+            or "NOT SIGN" in name
+            or "NEGATION" in name
+            or "CROSS MARK" in name
+        )
+        if character == "\n":
+            compacted.append(character)
+            in_padding_run = False
+        elif character.isalnum() or character in {"'", "’"}:
+            compacted.append(character)
+            in_padding_run = False
+        elif semantic_punctuation:
+            compacted.append(character)
+            in_padding_run = False
+        elif not in_padding_run:
+            compacted.append(" ")
+            in_padding_run = True
+    return "".join(compacted)
 
 
 def _structured_request_with_script_policy_feedback(
@@ -3331,43 +3721,389 @@ def _decision_metadata(decision: CurationDecision) -> dict[str, object]:
         "reason": decision.reason,
         "confidence": decision.confidence,
         "memory_body": decision.memory_body,
-        "context_title": decision.context_title,
         "context_body": decision.context_body,
         "tags": list(decision.tags),
+        "grounding_status": decision.grounding_status,
+        "supporting_evidence_quote": decision.supporting_evidence_quote,
+        "supporting_source_message_ids": list(
+            decision.supporting_source_message_ids
+        ),
     }
 
 
-def _curated_memory_exists(
+def _memory_with_fingerprint(
     repositories: PersistenceRepositories,
     *,
     save_id: str,
-    body: str,
-    source_message_ids: tuple[str, ...],
-) -> bool:
-    normalized_body = _normalize_memory_body(body)
-    normalized_sources = frozenset(source_message_ids)
-    for memory in repositories.list_memories(save_id):
-        if (
-            _normalize_memory_body(memory.body) == normalized_body
-            and frozenset(memory.source_message_ids) == normalized_sources
-        ):
-            return True
+    fingerprint: str,
+) -> MemoryRecord | None:
+    return repositories.get_memory_by_claim_fingerprint(
+        save_id=save_id,
+        claim_fingerprint=fingerprint,
+    )
+
+
+def _pending_memory_suggestion_with_fingerprint(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    fingerprint: str,
+) -> ContextUpdateSuggestionRecord | None:
     for suggestion in repositories.list_context_update_suggestions(
         save_id,
         status="pending",
     ):
         if suggestion.entity_type != "memory" or suggestion.update_type != "create":
             continue
-        proposed_value = suggestion.proposed_value
-        if not isinstance(proposed_value, dict):
+        proposed = suggestion.proposed_value
+        if not isinstance(proposed, dict):
             continue
+        proposed_fingerprint = _string(proposed.get("claim_fingerprint"))
+        if not proposed_fingerprint:
+            proposed_fingerprint = canonical_claim_fingerprint(proposed.get("body"))
+        if proposed_fingerprint == fingerprint:
+            return suggestion
+    return None
+
+
+def _merge_pending_memory_suggestion(
+    repositories: PersistenceRepositories,
+    *,
+    suggestion: ContextUpdateSuggestionRecord,
+    observation: ContextObservationRecord,
+    tags: tuple[str, ...],
+    confidence: float,
+    fingerprint: str,
+) -> None:
+    proposed = (
+        dict(suggestion.proposed_value)
+        if isinstance(suggestion.proposed_value, dict)
+        else {}
+    )
+    source_message_ids = list(
+        dict.fromkeys(
+            (
+                *_string_tuple(proposed.get("source_message_ids")),
+                *observation.source_message_ids,
+            )
+        )
+    )
+    observation_ids = list(
+        dict.fromkeys(
+            (
+                *_string_tuple(proposed.get("source_observation_ids")),
+                observation.id,
+            )
+        )
+    )
+    merged_tags = list(
+        dict.fromkeys((*_string_tuple(proposed.get("tags")), *tags))
+    )
+    proposed.update(
+        {
+            "tags": merged_tags,
+            "importance": max(_float(proposed.get("importance")), confidence),
+            "source_message_ids": source_message_ids,
+            "source_observation_ids": observation_ids,
+            "claim_fingerprint": fingerprint,
+        }
+    )
+    repositories.update_context_update_suggestion_content(
+        suggestion.id,
+        proposed_value=proposed,
+        confidence=max(suggestion.confidence, confidence),
+        source_message_ids=source_message_ids,
+    )
+
+
+def _curated_decision_is_grounded(
+    decision: CurationDecision,
+    *,
+    observation: ContextObservationRecord,
+    source_texts: tuple[str, ...],
+) -> bool:
+    if decision.grounding_status != "entailed":
+        return False
+    if not decision.supporting_source_message_ids:
+        return False
+    if not set(decision.supporting_source_message_ids).issubset(
+        observation.source_message_ids
+    ):
+        return False
+    if not _meaningful_evidence_span(decision.supporting_evidence_quote):
+        return False
+    if len(source_texts) != len(observation.source_message_ids):
+        return False
+    supporting_texts = tuple(
+        source_text
+        for source_message_id, source_text in zip(
+            observation.source_message_ids,
+            source_texts,
+            strict=True,
+        )
+        if source_message_id in decision.supporting_source_message_ids
+    )
+    if not supporting_texts or not any(
+        quote_matches_source(decision.supporting_evidence_quote, source_text)
+        for source_text in supporting_texts
+    ):
+        return False
+    proposed = (
+        decision.memory_body.strip() or observation.claim
+        if decision.action == "durable_memory"
+        else (decision.context_body.strip() or observation.claim)
+    )
+    if canonical_claim_fingerprint(proposed) != canonical_claim_fingerprint(
+        observation.claim
+    ):
+        return False
+    return any(
+        _grounding_source_is_losslessly_equivalent(proposed, source_text)
+        for source_text in supporting_texts
+    )
+
+
+def _grounding_terms(value: str) -> set[str]:
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "is",
+        "of",
+        "on",
+        "that",
+        "the",
+        "this",
+        "to",
+        "was",
+        "with",
+    }
+    terms = {
+        term
+        for term in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
+        if term and term not in stopwords
+    }
+    terms.update(
+        term
+        for term in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
+        if term in {"no", "not", "never", "none", "without"}
+    )
+    return terms
+
+
+def _grounding_negation_conflicts(proposed: str, observation_claim: str) -> bool:
+    negations = {"no", "not", "never", "none", "without"}
+    proposed_negated = bool(_grounding_terms(proposed) & negations)
+    observation_negated = bool(_grounding_terms(observation_claim) & negations)
+    return proposed_negated != observation_negated
+
+
+def _grounding_denial_conflicts(claim: str, evidence: str) -> bool:
+    denial_terms = {
+        "denied",
+        "denies",
+        "false",
+        "falsely",
+        "incorrect",
+        "refuted",
+        "refutes",
+        "untrue",
+    }
+    claim_terms = set(_ordered_grounding_terms(claim))
+    evidence_terms = set(_ordered_grounding_terms(evidence))
+    if (evidence_terms & denial_terms) - claim_terms:
+        return True
+    normalized_evidence = " ".join(evidence.casefold().split())
+    normalized_claim = " ".join(claim.casefold().split())
+    denial_phrases = (
+        "did not happen",
+        "never happened",
+        "not actually true",
+        "not true",
+    )
+    return any(
+        phrase in normalized_evidence and phrase not in normalized_claim
+        for phrase in denial_phrases
+    )
+
+
+def _grounding_modality_conflicts(claim: str, evidence: str) -> bool:
+    reporting_terms = {
+        "according",
+        "alleged",
+        "allegedly",
+        "claim",
+        "claimed",
+        "claims",
+        "heard",
+        "hearsay",
+        "reported",
+        "reports",
+        "rumor",
+        "rumored",
+        "rumour",
+        "rumoured",
+        "said",
+        "says",
+    }
+    uncertainty_terms = {
+        "apparently",
+        "could",
+        "maybe",
+        "may",
+        "might",
+        "perhaps",
+        "possibly",
+        "suspected",
+        "uncertain",
+    }
+    claim_terms = set(_ordered_grounding_terms(claim))
+    evidence_terms = set(_ordered_grounding_terms(evidence))
+    modal_terms = reporting_terms | uncertainty_terms
+    return bool((evidence_terms & modal_terms) - claim_terms)
+
+
+def _grounding_context_preserves_claim_boundary(
+    claim: str,
+    context: str,
+) -> bool:
+    if "~~" in context:
+        return False
+    if _grounding_critical_markers(claim) != _grounding_critical_markers(context):
+        return False
+    claim_terms = _grounding_boundary_terms(claim)
+    context_terms = _grounding_boundary_terms(context)
+    return bool(claim_terms) and context_terms == claim_terms
+
+
+def _grounding_source_is_losslessly_equivalent(
+    claim: str,
+    source_text: str,
+) -> bool:
+    return bool(
+        not _grounding_negation_conflicts(claim, source_text)
+        and not _grounding_denial_conflicts(claim, source_text)
+        and not _grounding_modality_conflicts(claim, source_text)
+        and _grounding_context_preserves_claim_boundary(claim, source_text)
+        and _grounding_semantic_markers(claim)
+        == _grounding_semantic_markers(source_text)
+        and _grounding_order_is_preserved(claim, source_text)
+    )
+
+
+def _grounding_semantic_markers(value: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", value).rstrip()
+    if normalized and _grounding_benign_terminal_mark(normalized[-1]):
+        normalized = normalized[:-1]
+    return tuple(
+        character
+        for character in normalized
         if (
-            _normalize_memory_body(proposed_value.get("body")) == normalized_body
-            and frozenset(_string_tuple(proposed_value.get("source_message_ids")))
-            == normalized_sources
-        ):
-            return True
-    return False
+            character not in {
+                "'",
+                "’",
+                ",",
+                "-",
+                "_",
+                ":",
+                ";",
+                "–",
+                "—",
+            }
+            and unicodedata.category(character).startswith(("M", "P", "S"))
+        )
+    )
+
+
+def _grounding_critical_markers(value: str) -> tuple[str, ...]:
+    return tuple(
+        character
+        for character in unicodedata.normalize("NFKC", value)
+        if (
+            character in {"?", "~"}
+            or "QUESTION" in unicodedata.name(character, "")
+            or "INTERROBANG" in unicodedata.name(character, "")
+            or "NOT SIGN" in unicodedata.name(character, "")
+            or "NEGATION" in unicodedata.name(character, "")
+            or "CROSS MARK" in unicodedata.name(character, "")
+        )
+    )
+
+
+def _grounding_benign_terminal_mark(character: str) -> bool:
+    name = unicodedata.name(character, "")
+    return bool(
+        character in {".", "!"}
+        or "FULL STOP" in name
+        or "EXCLAMATION" in name
+        or name.endswith("DANDA")
+    )
+
+
+def _grounding_anchor_conflicts(proposed: str, observation_claim: str) -> bool:
+    proposed_terms = tuple(_ordered_grounding_terms(proposed))
+    observation_terms = tuple(_ordered_grounding_terms(observation_claim))
+    return bool(
+        proposed_terms
+        and observation_terms
+        and proposed_terms[0] != observation_terms[0]
+    )
+
+
+def _grounding_order_is_preserved(claim: str, evidence: str) -> bool:
+    claim_terms = _ordered_grounding_terms(claim)
+    evidence_terms = _ordered_grounding_terms(evidence)
+    if not claim_terms:
+        return False
+    claim_length = len(claim_terms)
+    return any(
+        evidence_terms[index : index + claim_length] == claim_terms
+        for index in range(len(evidence_terms) - claim_length + 1)
+    )
+
+
+def _grounding_boundary_terms(value: str) -> list[str]:
+    return re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
+
+
+_GROUNDING_IGNORED_TERMS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "is",
+        "of",
+        "on",
+        "that",
+        "the",
+        "this",
+        "to",
+        "was",
+        "with",
+    }
+)
+
+
+def _ordered_grounding_terms(value: str) -> list[str]:
+    return [
+        term
+        for term in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
+        if term not in _GROUNDING_IGNORED_TERMS
+    ]
 
 
 def _curated_memory_proposed_value(
@@ -3386,11 +4122,20 @@ def _curated_memory_proposed_value(
         "source_message_id": source_message_id,
         "source_message_ids": list(source_message_ids),
         "source_observation_id": source_observation_id,
+        "source_observation_ids": [source_observation_id],
+        "claim_fingerprint": canonical_claim_fingerprint(body),
     }
 
 
 def _normalize_memory_body(value: object) -> str:
     return " ".join(value.strip().casefold().split()) if isinstance(value, str) else ""
+
+
+def _meaningful_evidence_span(value: str) -> bool:
+    compact = "".join(character for character in value if not character.isspace())
+    tokens = re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
+    unsegmented_script = len(tokens) == 1 and len(compact) >= 6
+    return len(compact) >= 12 or len(tokens) >= 3 or unsegmented_script
 
 
 def _string(value: object) -> str:

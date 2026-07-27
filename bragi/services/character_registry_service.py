@@ -346,7 +346,7 @@ class CharacterRegistryService:
         created_character_ids: list[str] = []
         archived_ids: set[str] = set()
         merged_ids: set[str] = set()
-        self.repositories.begin_transaction()
+        self.repositories.begin_immediate_transaction()
         try:
             saved_rows: list[CharacterRegistryRow] = []
             merge_rows: list[CharacterRegistryRow] = []
@@ -551,7 +551,7 @@ class CharacterRegistryService:
         updated_count = 0
         archived_count = 0
 
-        self.repositories.begin_transaction()
+        self.repositories.begin_immediate_transaction()
         try:
             for action in actions:
                 kind = action.action.strip()
