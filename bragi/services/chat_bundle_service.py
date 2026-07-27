@@ -1011,7 +1011,7 @@ class ChatBundleService:
         media_backups: dict[Path, bytes | None] = {}
         repair_tracker = _BundleImportRepairTracker()
         try:
-            self.repositories.begin_transaction()
+            self.repositories.begin_immediate_transaction()
             imported = self._import_data(
                 data,
                 bundle_path,

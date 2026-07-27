@@ -675,6 +675,70 @@ def test_current_schema_repairs_nonunique_memory_fingerprint_index(
         assert index_row[2] == 1
 
 
+def test_current_schema_repair_bounds_memory_observation_backfill(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        memory = repositories.add_memory(
+            save_id=save.id,
+            body="Mara likes tea.",
+            tags=["preference"],
+        )
+        for index in range(65):
+            repositories.add_context_observation(
+                save_id=save.id,
+                observation_type="character_fact",
+                claim="Mara likes tea.",
+                scope="durable",
+                status="accepted",
+                metadata={
+                    "curation": {
+                        "action": "durable_memory",
+                        "memory_body": "Mara likes tea.",
+                    }
+                },
+                observation_id=f"observation-{index:02d}",
+            )
+        connection.execute(
+            "DROP INDEX idx_memories_save_claim_fingerprint_active"
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_memories_save_claim_fingerprint_active
+            ON memories(save_id, claim_fingerprint)
+            WHERE archived_at IS NULL AND claim_fingerprint != ''
+            """
+        )
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        source_ids_json = connection.execute(
+            """
+            SELECT source_observation_ids_json
+            FROM memories
+            WHERE id = ?
+            """,
+            (memory.id,),
+        ).fetchone()[0]
+        assert len(json.loads(source_ids_json)) == 64
+
+
 def test_migration_rejects_orphaned_pending_review_suggestions(tmp_path: Path) -> None:
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)

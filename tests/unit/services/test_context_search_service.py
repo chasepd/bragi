@@ -479,6 +479,7 @@ class CountingPersistenceRepositories(PersistenceRepositories):
         | None = None,
         match_all: bool = False,
         exact_phrases: tuple[str, ...] = (),
+        exact_identifiers: tuple[str, ...] = (),
     ) -> list[ContextSourceSearchHit]:
         self.list_counts["context_source_searches"] = (
             self.list_counts.get("context_source_searches", 0) + 1
@@ -497,6 +498,7 @@ class CountingPersistenceRepositories(PersistenceRepositories):
             blocked_source_keys=blocked_source_keys,
             match_all=match_all,
             exact_phrases=exact_phrases,
+            exact_identifiers=exact_identifiers,
         )
 
     def list_protected_context_sources(
@@ -4536,6 +4538,62 @@ def test_context_search_indexes_exact_memory_beyond_previous_default_bound(
                     "source_type": "memory",
                     "source_id": target.id,
                     "relevance_note": "The exact old fact answers the action.",
+                }
+            ]
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    prompt = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert target.body in prompt
+    assert [item.source_id for item in result.selected_memories] == [target.id]
+
+
+def test_context_search_retrieves_short_code_memory_beyond_raw_bound(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    source_message = next(
+        message
+        for message in repositories.list_messages(save.id)
+        if message.role == "narrator"
+    )
+    target = repositories.add_memory(
+        save_id=save.id,
+        body="Only A-7 opens the old river vault.",
+        tags=["vault"],
+        importance=0.1,
+        source_message_id=source_message.id,
+    )
+    for index in range(520):
+        repositories.add_memory(
+            save_id=save.id,
+            body=f"A 7 appears in newer maintenance record {index:03d}.",
+            tags=["routine"],
+            importance=1.0,
+            source_message_id=source_message.id,
+        )
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="Where did we learn about A-7?",
+    )
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": target.id,
+                    "relevance_note": "The exact code answers the question.",
                 }
             ]
         }

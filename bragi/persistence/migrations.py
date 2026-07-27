@@ -1923,7 +1923,9 @@ def _migrate_schema_71_to_72(connection: sqlite3.Connection) -> None:
                     if isinstance(existing, list)
                     else []
                 )
-                merged_ids = list(dict.fromkeys((*existing_ids, *matching_ids)))
+                merged_ids = list(
+                    dict.fromkeys((*existing_ids, *matching_ids))
+                )[:_MAX_MEMORY_PROVENANCE_IDS]
                 connection.execute(
                     """
                     UPDATE memories
@@ -2197,6 +2199,110 @@ def _remap_migrated_memory_references(
               AND target_id = ?
             """,
             (keeper_id, save_id, duplicate_id),
+        )
+    _remap_migrated_memory_proactive_triggers(
+        connection,
+        save_id=save_id,
+        duplicate_id=duplicate_id,
+        keeper_id=keeper_id,
+    )
+
+
+def _remap_migrated_memory_proactive_triggers(
+    connection: sqlite3.Connection,
+    *,
+    save_id: str,
+    duplicate_id: str,
+    keeper_id: str,
+) -> None:
+    if not _table_exists(connection, "character_text_proactive_triggers"):
+        return
+    rows = connection.execute(
+        """
+        SELECT id, character_id, trigger_key, thread_id, text_message_id,
+               source_type, source_id, source_message_id, reason
+        FROM character_text_proactive_triggers
+        WHERE save_id = ?
+          AND (
+                (
+                    source_type IN ('memory', 'memories')
+                    AND source_id = ?
+                )
+                OR trigger_key = ?
+                OR instr(':' || trigger_key || ':', ':' || ? || ':') > 0
+              )
+        ORDER BY rowid
+        """,
+        (save_id, duplicate_id, duplicate_id, duplicate_id),
+    ).fetchall()
+    for row in rows:
+        (
+            trigger_id,
+            character_id,
+            trigger_key,
+            thread_id,
+            text_message_id,
+            source_type,
+            source_id,
+            source_message_id,
+            reason,
+        ) = row
+        remapped_key = ":".join(
+            keeper_id if part == duplicate_id else part
+            for part in str(trigger_key).split(":")
+        )
+        remapped_source_id = (
+            keeper_id
+            if source_type in {"memory", "memories"}
+            and source_id == duplicate_id
+            else source_id
+        )
+        existing = connection.execute(
+            """
+            SELECT id, thread_id, text_message_id, source_type, source_id,
+                   source_message_id, reason
+            FROM character_text_proactive_triggers
+            WHERE save_id = ? AND character_id = ? AND trigger_key = ?
+              AND id != ?
+            LIMIT 1
+            """,
+            (save_id, character_id, remapped_key, trigger_id),
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                """
+                UPDATE character_text_proactive_triggers
+                SET trigger_key = ?, source_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (remapped_key, remapped_source_id, trigger_id),
+            )
+            continue
+        connection.execute(
+            """
+            UPDATE character_text_proactive_triggers
+            SET thread_id = COALESCE(?, thread_id),
+                text_message_id = COALESCE(?, text_message_id),
+                source_type = COALESCE(NULLIF(?, ''), source_type),
+                source_id = COALESCE(NULLIF(?, ''), source_id),
+                source_message_id = COALESCE(?, source_message_id),
+                reason = COALESCE(NULLIF(?, ''), reason),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                thread_id,
+                text_message_id,
+                source_type,
+                remapped_source_id,
+                source_message_id,
+                reason,
+                existing[0],
+            ),
+        )
+        connection.execute(
+            "DELETE FROM character_text_proactive_triggers WHERE id = ?",
+            (trigger_id,),
         )
 
 

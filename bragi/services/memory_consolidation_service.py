@@ -163,7 +163,7 @@ class MemoryConsolidationService:
                 )
             async with _apply_guard_context(apply_guard):
                 batch_results: list[MemoryConsolidationResult] = []
-                self.repositories.begin_transaction()
+                self.repositories.begin_immediate_transaction()
                 transaction_started = True
                 for batch, clusters in batch_clusters:
                     batch_results.append(

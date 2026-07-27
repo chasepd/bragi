@@ -892,7 +892,7 @@ class WorldDataService:
                 save_id=save_id,
             )
             _validate_world_state_key_collisions(edits=edits, model=model)
-            self.repositories.begin_transaction()
+            self.repositories.begin_immediate_transaction()
             (
                 scenario_title,
                 scenario_premise,
@@ -1273,7 +1273,7 @@ class WorldDataService:
             )
             raise ValueError(f"Unknown suggestion id: {missing}")
         try:
-            self.repositories.begin_transaction()
+            self.repositories.begin_immediate_transaction()
             _apply_suggestion_batch(
                 repositories=self.repositories,
                 save_id=model.save_id,

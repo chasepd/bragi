@@ -2853,17 +2853,24 @@ def _remap_snapshot_memory_reference(
                 trigger_key,
                 memory_id_map,
             )
-    for column in _JSON_COLUMNS_BY_TABLE.get(table_name, frozenset()):
-        value = row.get(column)
-        if not isinstance(value, str):
-            continue
+    if table_name == "active_threads":
+        raw_related_entities = row.get("related_entities_json")
+        if not isinstance(raw_related_entities, str):
+            return
         try:
-            loaded = json.loads(value)
+            related_entities = json.loads(raw_related_entities)
         except json.JSONDecodeError:
-            continue
-        row[column] = _compact_json(
-            _remap_snapshot_memory_json_value(loaded, memory_id_map)
-        )
+            return
+        if isinstance(related_entities, list):
+            row["related_entities_json"] = _compact_json(
+                [
+                    _remap_snapshot_typed_memory_reference(
+                        value,
+                        memory_id_map,
+                    )
+                    for value in related_entities
+                ]
+            )
 
 
 def _remap_snapshot_row_id(
@@ -2886,22 +2893,15 @@ def _remap_snapshot_memory_text(
     return ":".join(memory_id_map.get(part, part) for part in value.split(":"))
 
 
-def _remap_snapshot_memory_json_value(
+def _remap_snapshot_typed_memory_reference(
     value: object,
     memory_id_map: Mapping[str, str],
 ) -> object:
-    if isinstance(value, str):
-        return _remap_snapshot_memory_text(value, memory_id_map)
-    if isinstance(value, list):
-        return [
-            _remap_snapshot_memory_json_value(item, memory_id_map)
-            for item in value
-        ]
-    if isinstance(value, dict):
-        return {
-            key: _remap_snapshot_memory_json_value(item, memory_id_map)
-            for key, item in value.items()
-        }
+    if not isinstance(value, str):
+        return value
+    entity_type, separator, entity_id = value.partition(":")
+    if separator and entity_type in {"memory", "memories"}:
+        return f"{entity_type}:{memory_id_map.get(entity_id, entity_id)}"
     return value
 
 
@@ -2969,6 +2969,12 @@ def _merge_snapshot_memory_rows(
                 if field == "source_message_ids_json"
                 else ()
             ),
+            overflow_fallback_values=(
+                (existing.get("source_message_id"),)
+                if field == "source_message_ids_json"
+                else ()
+            ),
+            preserve_first_on_overflow=field != "tags_json",
         )
     existing["importance"] = max(
         _snapshot_numeric_value(existing.get("importance")),
@@ -3066,44 +3072,47 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
     groups: list[list[str]] = []
     for item in loaded_metadata:
         raw_groups = item.get("source_provenance_groups")
-        if not isinstance(raw_groups, list):
-            continue
-        for raw_group in raw_groups:
-            if not isinstance(raw_group, list):
-                continue
-            group = [
-                str(value)
-                for value in raw_group
-                if isinstance(value, str) and value
-            ]
-            if group and group not in groups:
+        item_groups: list[list[str]] = []
+        if isinstance(raw_groups, list):
+            for raw_group in raw_groups:
+                if not isinstance(raw_group, list):
+                    continue
+                group = [
+                    str(value)
+                    for value in raw_group
+                    if isinstance(value, str) and value
+                ]
+                if group and group not in item_groups:
+                    item_groups.append(group)
+        raw_item_source_ids = item.get("source_message_ids")
+        item_source_ids = [
+            str(value)
+            for value in (
+                raw_item_source_ids
+                if isinstance(raw_item_source_ids, list)
+                else []
+            )
+            if isinstance(value, str) and value
+        ]
+        for field in ("source_message_id", "last_seen_message_id"):
+            value = item.get(field)
+            if isinstance(value, str) and value:
+                item_source_ids.append(value)
+        grouped_item_ids = {
+            source_id
+            for group in item_groups
+            for source_id in group
+        }
+        ungrouped_item_ids = [
+            source_id
+            for source_id in dict.fromkeys(item_source_ids)
+            if source_id not in grouped_item_ids
+        ]
+        if ungrouped_item_ids:
+            item_groups.append(ungrouped_item_ids)
+        for group in item_groups:
+            if group not in groups:
                 groups.append(group)
-                if len(groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS:
-                    raise ValueError("Merged snapshot provenance is too large")
-    grouped_source_ids = {
-        source_id
-        for group in groups
-        for source_id in group
-    }
-    raw_source_message_ids = metadata.get("source_message_ids")
-    source_message_ids = (
-        raw_source_message_ids
-        if isinstance(raw_source_message_ids, list)
-        else []
-    )
-    ungrouped_source_ids = [
-        source_id
-        for source_id in (
-            *source_message_ids,
-            metadata.get("source_message_id"),
-            metadata.get("last_seen_message_id"),
-        )
-        if isinstance(source_id, str)
-        and source_id
-        and source_id not in grouped_source_ids
-    ]
-    for source_id in dict.fromkeys(ungrouped_source_ids):
-        groups.append([source_id])
         if len(groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS:
             raise ValueError("Merged snapshot provenance is too large")
     metadata["source_provenance_groups"] = groups
@@ -3167,24 +3176,40 @@ def _merged_snapshot_json_string_lists(
     *,
     limit: int | None = None,
     extra_values: Iterable[object] = (),
+    overflow_fallback_values: Iterable[object] = (),
+    preserve_first_on_overflow: bool = False,
 ) -> str:
-    values: list[str] = []
+    values = [
+        str(value)
+        for value in extra_values
+        if isinstance(value, str) and value
+    ]
+    loaded_lists: list[list[str]] = []
     for raw in (first, second):
         try:
             loaded = json.loads(str(raw))
         except (json.JSONDecodeError, TypeError):
             loaded = []
         if isinstance(loaded, list):
-            values.extend(
+            loaded_values = [
                 str(value)
                 for value in loaded
                 if isinstance(value, str) and value
-            )
-    values.extend(
-        str(value) for value in extra_values if isinstance(value, str) and value
-    )
+            ]
+            loaded_lists.append(loaded_values)
+            values.extend(loaded_values)
+        else:
+            loaded_lists.append([])
     merged = list(dict.fromkeys(values))
     if limit is not None and len(merged) > limit:
+        if preserve_first_on_overflow:
+            fallback = [
+                str(value)
+                for value in overflow_fallback_values
+                if isinstance(value, str) and value
+            ]
+            fallback.extend(loaded_lists[0])
+            return _compact_json(list(dict.fromkeys(fallback))[:limit])
         raise ValueError("Merged snapshot provenance is too large")
     return _compact_json(merged)
 

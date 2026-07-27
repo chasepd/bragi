@@ -75,6 +75,124 @@ def test_snapshot_import_coalesces_many_to_one_memory_remaps() -> None:
     ]
 
 
+def test_legacy_memory_normalization_preserves_other_id_namespaces() -> None:
+    rows = turn_snapshot_module._normalize_legacy_snapshot_memories(
+        {
+            "memories": (
+                {
+                    "id": "memory-keeper",
+                    "body": "Mara likes tea.",
+                    "tags_json": "[]",
+                    "importance": 0.4,
+                    "source_message_ids_json": "[]",
+                    "source_observation_ids_json": "[]",
+                    "archived_at": None,
+                },
+                {
+                    "id": "memory-duplicate",
+                    "body": "mara likes tea",
+                    "tags_json": '["memory-duplicate"]',
+                    "importance": 0.9,
+                    "source_message_ids_json": '["memory-duplicate"]',
+                    "source_observation_ids_json": '["memory-duplicate"]',
+                    "archived_at": None,
+                },
+            ),
+            "context_observations": (
+                {
+                    "id": "observation-one",
+                    "source_message_ids_json": '["memory-duplicate"]',
+                },
+            ),
+            "active_threads": (
+                {
+                    "id": "thread-one",
+                    "related_entities_json": (
+                        '["memory:memory-duplicate",'
+                        '"character:memory-duplicate"]'
+                    ),
+                },
+            ),
+        }
+    )
+
+    [memory] = rows["memories"]
+    assert json.loads(str(memory["tags_json"])) == ["memory-duplicate"]
+    assert json.loads(str(memory["source_message_ids_json"])) == [
+        "memory-duplicate"
+    ]
+    assert json.loads(str(memory["source_observation_ids_json"])) == [
+        "memory-duplicate"
+    ]
+    [observation] = rows["context_observations"]
+    assert observation["source_message_ids_json"] == '["memory-duplicate"]'
+    [thread] = rows["active_threads"]
+    assert json.loads(str(thread["related_entities_json"])) == [
+        "memory:memory-keeper",
+        "character:memory-duplicate",
+    ]
+
+
+def test_legacy_memory_normalization_bounds_merged_provenance() -> None:
+    rows = turn_snapshot_module._normalize_legacy_snapshot_memories(
+        {
+            "memories": (
+                {
+                    "id": "memory-keeper",
+                    "body": "Mara likes tea.",
+                    "tags_json": "[]",
+                    "importance": 0.4,
+                    "source_message_ids_json": json.dumps(
+                        [f"message-{index:02d}" for index in range(40)]
+                    ),
+                    "source_observation_ids_json": json.dumps(
+                        [f"observation-{index:02d}" for index in range(40)]
+                    ),
+                    "archived_at": None,
+                },
+                {
+                    "id": "memory-duplicate",
+                    "body": "mara likes tea",
+                    "tags_json": "[]",
+                    "importance": 0.9,
+                    "source_message_ids_json": json.dumps(
+                        [f"message-{index:02d}" for index in range(40, 80)]
+                    ),
+                    "source_observation_ids_json": json.dumps(
+                        [f"observation-{index:02d}" for index in range(40, 80)]
+                    ),
+                    "archived_at": None,
+                },
+            )
+        }
+    )
+
+    [memory] = rows["memories"]
+    assert len(json.loads(str(memory["source_message_ids_json"]))) == 40
+    assert len(json.loads(str(memory["source_observation_ids_json"]))) == 40
+
+
+def test_snapshot_context_source_merge_keeps_legacy_sources_in_one_group() -> None:
+    merged = json.loads(
+        turn_snapshot_module._merged_context_source_metadata_json(
+            json.dumps(
+                {
+                    "source_message_ids": [
+                        "message-visible",
+                        "message-hidden",
+                    ]
+                }
+            ),
+            "{}",
+        )
+    )
+
+    assert merged["source_provenance_groups"] == [
+        ["message-visible", "message-hidden"]
+    ]
+    assert merged["source_provenance_mode"] == "any"
+
+
 def test_legacy_duplicate_memories_restore_and_fork_after_unique_index_repair(
     repositories: PersistenceRepositories,
     tmp_path: Path,

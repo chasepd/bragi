@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from bragi.observation_types import normalize_observation_type
 from bragi.persistence.migrations import (
+    _remap_migrated_memory_proactive_triggers,
     _remap_migrated_memory_references,
     migrate_database,
 )
@@ -235,6 +236,12 @@ class PersistenceRepositories:
             "bragi_normalize_text",
             1,
             _normalized_search_text,
+            deterministic=True,
+        )
+        self.connection.create_function(
+            "bragi_contains_exact_identifier",
+            2,
+            _contains_exact_structured_identifier,
             deterministic=True,
         )
         self._transaction_depth = 0
@@ -3615,6 +3622,7 @@ class PersistenceRepositories:
         | None = None,
         match_all: bool = False,
         exact_phrases: tuple[str, ...] = (),
+        exact_identifiers: tuple[str, ...] = (),
     ) -> list[ContextSourceSearchHit]:
         if limit <= 0:
             return []
@@ -3631,7 +3639,18 @@ class PersistenceRepositories:
             match_all=match_all,
         )
         phrase_match_query = _fts_query_from_exact_phrases(exact_phrases)
-        if not match_query and not phrase_match_query:
+        bounded_exact_identifiers = tuple(
+            dict.fromkeys(
+                identifier
+                for identifier in exact_identifiers[:16]
+                if identifier.strip()
+            )
+        )
+        if (
+            not match_query
+            and not phrase_match_query
+            and not bounded_exact_identifiers
+        ):
             return []
         source_type_values = tuple(dict.fromkeys(str(item) for item in source_types))
         if not source_type_values:
@@ -3716,6 +3735,57 @@ class PersistenceRepositories:
                     limit,
                 ),
             )
+        exact_identifier_rows = (
+            self._fetch_all(
+                f"""
+                SELECT
+                    context_sources.id,
+                    context_sources.save_id,
+                    context_sources.source_type,
+                    context_sources.source_id,
+                    context_sources.title,
+                    context_sources.body,
+                    context_sources.metadata_json,
+                    context_sources.token_estimate,
+                    context_sources.scene_snapshot_id,
+                    context_sources.scene_generation,
+                    context_sources.created_turn_number,
+                    context_sources.expires_after_turn_number,
+                    -1000.0 AS bm25_rank
+                FROM context_sources
+                WHERE context_sources.save_id = ?
+                  AND context_sources.archived_at IS NULL
+                  AND context_sources.source_type IN (
+                      {_placeholders(len(source_type_values))}
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM json_each(?) identifier
+                      WHERE bragi_contains_exact_identifier(
+                                context_sources.title,
+                                CAST(identifier.value AS TEXT)
+                            ) = 1
+                         OR bragi_contains_exact_identifier(
+                                context_sources.body,
+                                CAST(identifier.value AS TEXT)
+                            ) = 1
+                  )
+                  {eligibility_sql}
+                ORDER BY context_sources.created_at DESC,
+                         context_sources.rowid DESC
+                LIMIT ?
+                """,
+                (
+                    save_id,
+                    *source_type_values,
+                    _dump_json(bounded_exact_identifiers),
+                    *eligibility_params,
+                    limit,
+                ),
+            )
+            if bounded_exact_identifiers
+            else []
+        )
         exact_phrase_rows = (
             self._fetch_all(
                 f"""
@@ -3801,6 +3871,8 @@ class PersistenceRepositories:
             else []
         )
         rows_by_id: dict[str, sqlite3.Row] = {}
+        for row in exact_identifier_rows:
+            rows_by_id.setdefault(str(row["id"]), row)
         for row in exact_phrase_rows:
             rows_by_id.setdefault(str(row["id"]), row)
         for index in range(max(len(term_rows), len(fts_rows))):
@@ -10095,6 +10167,16 @@ class PersistenceRepositories:
                     duplicate_id=collision.id,
                     keeper_id=memory_id,
                 )
+                self.connection.execute(
+                    """
+                    UPDATE context_sources
+                    SET archived_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE save_id = ? AND source_type = 'memory'
+                      AND source_id = ?
+                    """,
+                    (save_id, collision.id),
+                )
             self.commit_transaction()
         except BaseException:
             self.rollback_transaction()
@@ -10380,7 +10462,7 @@ class PersistenceRepositories:
             if fingerprint:
                 groups.setdefault(fingerprint, []).append(memory)
         remapped_ids: dict[str, str] = {}
-        self.begin_transaction()
+        self.begin_immediate_transaction()
         try:
             for fingerprint, group in groups.items():
                 if len(group) < 2:
@@ -10591,6 +10673,12 @@ class PersistenceRepositories:
                           AND source_id = ?
                         """,
                         (save_id, duplicate.id),
+                    )
+                    _remap_migrated_memory_proactive_triggers(
+                        self.connection,
+                        save_id=save_id,
+                        duplicate_id=duplicate.id,
+                        keeper_id=keeper.id,
                     )
                     self.archive_memory(duplicate.id)
             self.commit_transaction()
@@ -13151,6 +13239,33 @@ def _bounded_repository_search_terms(
 
 def _normalized_search_text(value: object) -> str:
     return unicodedata.normalize("NFKC", str(value)).casefold()
+
+
+def _contains_exact_structured_identifier(
+    value: object,
+    identifier: object,
+) -> int:
+    text = _normalized_search_text(value)[
+        :MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS
+    ]
+    needle = _normalized_search_text(identifier).strip()
+    if not needle:
+        return 0
+    start = 0
+    while True:
+        index = text.find(needle, start)
+        if index < 0:
+            return 0
+        end = index + len(needle)
+        before_is_word = index > 0 and (
+            text[index - 1].isalnum() or text[index - 1] == "_"
+        )
+        after_is_word = end < len(text) and (
+            text[end].isalnum() or text[end] == "_"
+        )
+        if not before_is_word and not after_is_word:
+            return 1
+        start = index + 1
 
 
 def _context_source_search_terms(title: str, body: str) -> tuple[str, ...]:

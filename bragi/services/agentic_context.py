@@ -3915,13 +3915,45 @@ def _grounding_context_preserves_claim_boundary(
     claim: str,
     context: str,
 ) -> bool:
-    if not _grounding_order_is_preserved(claim, context):
+    assertion_context = context.rstrip().rstrip("'\"”’)]}")
+    if assertion_context.endswith(("?", "？")):
         return False
     claim_terms = _ordered_grounding_terms(claim)
     context_terms = _ordered_grounding_terms(context)
-    if context_terms[: len(claim_terms)] == claim_terms:
+    if not claim_terms:
+        return False
+    if context_terms[: len(claim_terms)] != claim_terms:
+        return False
+    context_tokens = re.findall(
+        r"[^\W_]+",
+        context.casefold(),
+        flags=re.UNICODE,
+    )
+    significant_indexes = [
+        index
+        for index, term in enumerate(context_tokens)
+        if term not in _GROUNDING_IGNORED_TERMS
+    ]
+    if len(significant_indexes) < len(claim_terms):
+        return False
+    suffix_terms = context_tokens[
+        significant_indexes[len(claim_terms) - 1] + 1 :
+    ]
+    if not suffix_terms:
         return True
-    return False
+    if suffix_terms[0] not in {"and", "while"}:
+        return False
+    unsafe_suffix_terms = {
+        "believe",
+        "believed",
+        "believes",
+        "honest",
+        "if",
+        "or",
+        "supposedly",
+        "unless",
+    }
+    return not bool(set(suffix_terms) & unsafe_suffix_terms)
 
 
 def _grounding_anchor_conflicts(proposed: str, observation_claim: str) -> bool:
@@ -3946,8 +3978,8 @@ def _grounding_order_is_preserved(claim: str, evidence: str) -> bool:
     )
 
 
-def _ordered_grounding_terms(value: str) -> list[str]:
-    ignored = {
+_GROUNDING_IGNORED_TERMS = frozenset(
+    {
         "a",
         "an",
         "and",
@@ -3968,10 +4000,14 @@ def _ordered_grounding_terms(value: str) -> list[str]:
         "was",
         "with",
     }
+)
+
+
+def _ordered_grounding_terms(value: str) -> list[str]:
     return [
         term
         for term in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
-        if term not in ignored
+        if term not in _GROUNDING_IGNORED_TERMS
     ]
 
 

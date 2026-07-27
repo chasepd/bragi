@@ -1100,6 +1100,7 @@ def _indexed_context_source_retrieval(
             if " " in phrase.strip()
         )
     )[:MAX_CONTEXT_EXACT_PHRASES]
+    exact_identifiers = _bounded_structured_identifiers(query_text)
     turn_scope = character_scope_for_turn(
         scene_snapshot=scene_snapshot,
         characters=characters,
@@ -1163,6 +1164,7 @@ def _indexed_context_source_retrieval(
         blocked_source_keys=scoped_targets.blocked,
         match_all=True,
         exact_phrases=exact_phrases,
+        exact_identifiers=exact_identifiers,
     )
     broad_hits = repositories.search_context_sources(
         save_id,
@@ -1176,6 +1178,7 @@ def _indexed_context_source_retrieval(
         current_scene_generation=current_scene_generation,
         current_turn_number=current_turn_number,
         blocked_source_keys=scoped_targets.blocked,
+        exact_identifiers=exact_identifiers,
     )
     hits = tuple(
         {

@@ -218,13 +218,25 @@ def test_consolidation_uses_apply_guard_only_for_repository_writes(
             events.append("exit")
 
     original_update_memory = repositories.update_memory
+    original_begin_immediate_transaction = (
+        repositories.begin_immediate_transaction
+    )
 
     def update_memory_guarded(*args: Any, **kwargs: Any) -> Any:
         assert inside_guard
         events.append("write")
         return original_update_memory(*args, **kwargs)
 
+    def begin_immediate_transaction() -> None:
+        events.append(f"begin_immediate:{repositories._transaction_depth}")
+        original_begin_immediate_transaction()
+
     monkeypatch.setattr(repositories, "update_memory", update_memory_guarded)
+    monkeypatch.setattr(
+        repositories,
+        "begin_immediate_transaction",
+        begin_immediate_transaction,
+    )
     provider = GuardAwareProvider(
         {
             "clusters": [
@@ -257,7 +269,14 @@ def test_consolidation_uses_apply_guard_only_for_repository_writes(
 
     assert result.rewritten_count == 1
     assert result.archived_count == 1
-    assert events == ["provider", "enter", "write", "exit"]
+    assert events == [
+        "provider",
+        "enter",
+        "begin_immediate:0",
+        "write",
+        "begin_immediate:1",
+        "exit",
+    ]
 
 
 def test_consolidation_rejects_unexpected_generated_script(

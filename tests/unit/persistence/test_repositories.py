@@ -3134,12 +3134,48 @@ def test_restore_memories_merges_active_fingerprint_collision(
         importance=0.4,
         source_message_id=message_id,
     )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=archived.id,
+        title="Archived preference",
+        body=archived.body,
+    )
     repositories.archive_memory(archived.id)
     active = repositories.add_memory(
         save_id=save_id,
         body="mara likes tea",
         tags=["tea"],
         importance=0.9,
+    )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id=active.id,
+        title="Replacement preference",
+        body=active.body,
+    )
+    character = repositories.add_character(
+        save_id=save_id,
+        name="Mara",
+    )
+    repositories.add_character_text_proactive_trigger(
+        save_id=save_id,
+        character_id=character.id,
+        trigger_key=f"memory:{archived.id}",
+        trigger_type="memory_changed",
+        source_type="memory",
+        source_id=archived.id,
+        reason="Original preference",
+    )
+    repositories.add_character_text_proactive_trigger(
+        save_id=save_id,
+        character_id=character.id,
+        trigger_key=f"memory:{active.id}",
+        trigger_type="memory_changed",
+        source_type="memory",
+        source_id=active.id,
+        reason="Replacement preference",
     )
 
     repositories.restore_memories(frozenset({archived.id}))
@@ -3150,6 +3186,15 @@ def test_restore_memories_merges_active_fingerprint_collision(
     assert restored.importance == 0.9
     assert restored.source_message_ids == [message_id]
     assert repositories.get_memory(save_id, active.id) is None
+    [source] = repositories.list_context_sources(
+        save_id,
+        source_type="memory",
+    )
+    assert source.source_id == archived.id
+    [trigger] = repositories.list_character_text_proactive_triggers(save_id)
+    assert trigger.trigger_key == f"memory:{archived.id}"
+    assert trigger.source_id == archived.id
+    assert trigger.reason == "Replacement preference"
 
 
 def test_repositories_check_unprotected_character_existence(
@@ -4417,6 +4462,44 @@ def test_repositories_exact_phrase_supports_short_ascii_identifiers(
         source_types={"memory"},
         limit=8,
         exact_phrases=("A 7",),
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_exact_identifier_cannot_be_starved_by_split_matches(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-a7-target",
+        title="Vault identifier",
+        body="Only A-7 opens the old river vault.",
+    )
+    for index in range(90):
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id=f"memory-a7-noise-{index:02d}",
+            title=f"Split tokens {index:02d}",
+            body=f"A 7 appears in newer record {index:02d}.",
+        )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-a70-near-match",
+        title="Nearby identifier",
+        body="Only A-70 opens the upper vault.",
+    )
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms={"a", "7"},
+        source_types={"memory"},
+        limit=1,
+        exact_identifiers=("A-7",),
     )
 
     assert [hit.record for hit in hits] == [target]
