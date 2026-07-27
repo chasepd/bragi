@@ -3890,6 +3890,8 @@ class ChatService:
                         source_message_ids=(player_message_id, narrator_message_id),
                         reason="provider_pressure_deferred",
                         pressure=current_pressure,
+                        inference_mode=inference_mode,
+                        verified_coverage=verified_coverage,
                     )
                     step_results[name] = {
                         "deferred": True,
@@ -3949,6 +3951,8 @@ class ChatService:
                     save_id=save_id,
                     source_message_ids=(player_message_id, narrator_message_id),
                     reason="post_turn_context_update_timeout",
+                    inference_mode=inference_mode,
+                    verified_coverage=verified_coverage,
                 )
                 step_results[name] = {
                     "deferred": True,
@@ -4540,11 +4544,31 @@ class ChatService:
                     error="No configured context update service for retry",
                 )
                 continue
-            try:
-                update_result = await service.update_after_turn(
-                    save_id=retry_save_id,
+            inference_mode = _context_retry_inference_mode(payload)
+            verified_coverage = verified_post_turn_coverage_from_mapping(
+                payload.get("verified_plan_coverage")
+            )
+            if not verified_coverage.source_message_ids:
+                verified_coverage = replace(
+                    verified_coverage,
                     source_message_ids=source_message_ids,
                 )
+            try:
+                update_result: object
+                if (
+                    isinstance(service, ContextUpdateService)
+                    and inference_mode == POST_TURN_INFERENCE_MODE_HYBRID
+                ):
+                    update_result = await service.update_after_turn(
+                        save_id=retry_save_id,
+                        source_message_ids=source_message_ids,
+                        verified_coverage=verified_coverage,
+                    )
+                else:
+                    update_result = await service.update_after_turn(
+                        save_id=retry_save_id,
+                        source_message_ids=source_message_ids,
+                    )
             except asyncio.CancelledError:
                 self.jobs.cancel(
                     running.id,
@@ -6446,6 +6470,8 @@ class ChatService:
                 provider=preference.provider if preference is not None else None,
                 model=preference.model_id if preference is not None else None,
                 pressure=pressure,
+                inference_mode=inference_mode,
+                verified_coverage=verified_coverage,
             )
             log_error_event(
                 "chat.context_update_failed",
