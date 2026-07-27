@@ -4648,6 +4648,11 @@ def test_import_save_repairs_context_update_suggestion_proposed_sources(
                         NARRATOR_MESSAGE_ID,
                         "message-not-exported",
                     ],
+                    "source_observation_id": OBSERVATION_ID,
+                    "source_observation_ids": [
+                        OBSERVATION_ID,
+                        "observation-not-exported",
+                    ],
                 }
             ),
             "status": "pending",
@@ -4688,6 +4693,15 @@ def test_import_save_repairs_context_update_suggestion_proposed_sources(
     assert suggestion.proposed_value["source_message_ids"] == [
         imported_messages[0].id,
         imported_messages[1].id,
+    ]
+    [imported_observation] = repositories.list_context_observations(
+        imported_save_id
+    )
+    assert suggestion.proposed_value["source_observation_id"] == (
+        imported_observation.id
+    )
+    assert suggestion.proposed_value["source_observation_ids"] == [
+        imported_observation.id
     ]
 
 

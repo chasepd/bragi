@@ -77,7 +77,7 @@ def test_scoped_targets_only_unlock_for_present_characters() -> None:
     )
 
     assert targets.allowed == {
-        ("memory", present_memory_id): "Sienna knows",
+        ("memory", present_memory_id): ("Sienna knows",),
     }
     assert ("memory", absent_memory_id) in targets.blocked
     assert ("world_state", "state-ren-ledger") in targets.blocked

@@ -3748,18 +3748,22 @@ def _apply_focused_scene_update(
     snapshot = applier.repositories.get_scene_snapshot(applier.save_id)
     if snapshot is None:
         return
-    if extracted.scene_transition:
-        snapshot = applier.repositories.advance_scene_generation(
-            save_id=applier.save_id,
-            source_message_id=extracted.source_message_id,
-        )
-        applier.scene_snapshot = snapshot
     previous_location_id = snapshot.current_location_id
     scene_updates: list[tuple[str, object]] = []
     current_location = _find_location(
         applier.snapshot.locations,
         extracted.current_location_name,
     )
+    location_changed = (
+        current_location is not None
+        and current_location.id != previous_location_id
+    )
+    if extracted.scene_transition and not location_changed:
+        snapshot = applier.repositories.advance_scene_generation(
+            save_id=applier.save_id,
+            source_message_id=extracted.source_message_id,
+        )
+        applier.scene_snapshot = snapshot
     if current_location is not None:
         scene_updates.append(("current_location_id", current_location.id))
     if extracted.in_world_time.strip():
@@ -4927,17 +4931,17 @@ class _ContextUpdateApplier:
             self.scene_snapshot = snapshot
             return
 
-        if extracted.scene_transition:
-            existing = self.repositories.advance_scene_generation(
-                save_id=self.save_id,
-                source_message_id=extracted.source_message_id,
-            )
-        snapshot = existing
         next_location_id = current_location.id if current_location is not None else None
         location_changed = (
             next_location_id is not None
             and previous_location_id != next_location_id
         )
+        if extracted.scene_transition and not location_changed:
+            existing = self.repositories.advance_scene_generation(
+                save_id=self.save_id,
+                source_message_id=extracted.source_message_id,
+            )
+        snapshot = existing
         scene_updates: list[tuple[str, object]] = [
             (
                 "current_location_id",

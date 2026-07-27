@@ -19,7 +19,7 @@ CHARACTER_TEXT_SOURCE_PREFIX = "character_text_message:"
 
 @dataclass(frozen=True)
 class ScopedTargets:
-    allowed: dict[tuple[str, str], str]
+    allowed: dict[tuple[str, str], tuple[str, ...]]
     blocked: set[tuple[str, str]]
 
 
@@ -72,7 +72,7 @@ def allowed_character_scoped_targets(
         characters=characters,
         latest_player_message=latest_player_message,
     ).present_character_ids
-    allowed: dict[tuple[str, str], str] = {}
+    allowed: dict[tuple[str, str], tuple[str, ...]] = {}
     blocked: set[tuple[str, str]] = set()
     graph_targets: set[tuple[str, str]] = set()
     for edge in character_knowledge_edges:
@@ -96,7 +96,10 @@ def allowed_character_scoped_targets(
             blocked.add(target)
             continue
         if character is not None:
-            allowed[target] = knowledge_edge_scope_label(edge, character)
+            allowed[target] = _append_scope_label(
+                allowed.get(target, ()),
+                knowledge_edge_scope_label(edge, character),
+            )
     for link in entity_links:
         if link.entity_type != "character" or link.relation != "knows":
             continue
@@ -108,10 +111,17 @@ def allowed_character_scoped_targets(
             continue
         character = characters_by_id.get(link.entity_id)
         if character is not None and link.entity_id in present_ids:
-            allowed[target] = f"{character.name} knows"
+            allowed[target] = _append_scope_label(
+                allowed.get(target, ()),
+                f"{character.name} knows",
+            )
         else:
             blocked.add(target)
     return ScopedTargets(allowed=allowed, blocked=blocked - set(allowed))
+
+
+def _append_scope_label(existing: tuple[str, ...], label: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys((*existing, label)))
 
 
 def message_visible_to_present_characters(

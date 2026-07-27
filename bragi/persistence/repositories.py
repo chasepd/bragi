@@ -209,6 +209,12 @@ class PersistenceRepositories:
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.create_function(
+            "bragi_normalize_text",
+            1,
+            _normalized_search_text,
+            deterministic=True,
+        )
         self._transaction_depth = 0
 
     def commit(self) -> None:
@@ -3179,13 +3185,20 @@ class PersistenceRepositories:
             current_turn_number=current_turn_number,
             blocked_source_keys=blocked_source_keys,
         )
-        substring_terms = tuple(
+        normalized_query_terms = tuple(
             dict.fromkeys(
                 term
                 for value in query_terms
                 for term in _unicode_search_terms(str(value))
-                if any(ord(character) > 127 for character in term)
             )
+        )
+        substring_terms = (
+            normalized_query_terms
+            if any(
+                any(ord(character) > 127 for character in term)
+                for term in normalized_query_terms
+            )
+            else ()
         )
         substring_rows: list[sqlite3.Row] = []
         phrase_values = tuple(
@@ -3196,18 +3209,11 @@ class PersistenceRepositories:
             )
         )
         phrase_rows: list[sqlite3.Row] = []
-        if phrase_values:
-            phrase_clauses = " OR ".join(
-                "(instr(lower(context_sources.title), lower(?)) > 0 "
-                "OR instr(lower(context_sources.body), lower(?)) > 0)"
-                for _phrase in phrase_values
-            )
-            phrase_params = tuple(
-                value
-                for phrase in phrase_values
-                for value in (phrase, phrase)
-            )
-            phrase_rows = self._fetch_all(
+        for phrase in phrase_values:
+            normalized_phrase = _normalized_search_text(phrase)
+            if not normalized_phrase:
+                continue
+            matching_rows = self._fetch_all(
                 f"""
                 SELECT
                     context_sources.id,
@@ -3229,7 +3235,16 @@ class PersistenceRepositories:
                   AND context_sources.source_type IN (
                       {_placeholders(len(source_type_values))}
                   )
-                  AND ({phrase_clauses})
+                  AND (
+                    instr(
+                        bragi_normalize_text(context_sources.title),
+                        ?
+                    ) > 0
+                    OR instr(
+                        bragi_normalize_text(context_sources.body),
+                        ?
+                    ) > 0
+                  )
                   {eligibility_sql}
                 ORDER BY context_sources.created_at DESC,
                          context_sources.rowid DESC
@@ -3238,16 +3253,26 @@ class PersistenceRepositories:
                 (
                     save_id,
                     *source_type_values,
-                    *phrase_params,
+                    normalized_phrase,
+                    normalized_phrase,
                     *eligibility_params,
                     limit,
                 ),
             )
+            seen_phrase_ids = {str(row["id"]) for row in phrase_rows}
+            phrase_rows.extend(
+                row
+                for row in matching_rows
+                if str(row["id"]) not in seen_phrase_ids
+            )
+            if len(phrase_rows) >= limit:
+                phrase_rows = phrase_rows[:limit]
+                break
         if substring_terms:
             substring_joiner = " AND " if match_all else " OR "
             substring_clauses = substring_joiner.join(
-                "(instr(context_sources.title, ?) > 0 "
-                "OR instr(context_sources.body, ?) > 0)"
+                "(instr(bragi_normalize_text(context_sources.title), ?) > 0 "
+                "OR instr(bragi_normalize_text(context_sources.body), ?) > 0)"
                 for _term in substring_terms
             )
             substring_params = tuple(
@@ -3466,17 +3491,19 @@ class PersistenceRepositories:
             f"""
             UPDATE context_sources
             SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-            WHERE id IN ({_placeholders(len(stale_ids))})
+            WHERE save_id = ?
+              AND id IN ({_placeholders(len(stale_ids))})
             """,
-            tuple(stale_ids),
+            (save_id, *stale_ids),
         )
         self.connection.execute(
             f"""
             UPDATE context_observations
             SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-            WHERE id IN ({_placeholders(len(stale_observation_ids))})
+            WHERE save_id = ?
+              AND id IN ({_placeholders(len(stale_observation_ids))})
             """,
-            tuple(stale_observation_ids),
+            (save_id, *stale_observation_ids),
         )
         self.commit()
         return stale_ids
@@ -10694,7 +10721,7 @@ def _fts_query_from_terms(
 
 
 def _unicode_search_terms(value: str) -> tuple[str, ...]:
-    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = _normalized_search_text(value)
     terms: list[str] = []
     current: list[str] = []
     for character in normalized:
@@ -10711,6 +10738,10 @@ def _unicode_search_terms(value: str) -> tuple[str, ...]:
         if len(term) >= 2 or any(ord(character) > 127 for character in term):
             terms.append(term)
     return tuple(terms)
+
+
+def _normalized_search_text(value: object) -> str:
+    return unicodedata.normalize("NFKC", str(value)).casefold()
 
 
 def _context_source_eligibility_sql(
@@ -10730,9 +10761,15 @@ def _context_source_eligibility_sql(
     visibility_ids = tuple(sorted(visibility_character_ids or ()))
     if visibility_ids:
         clauses.append(
-            "NOT EXISTS ("
+            "("
+            "("
+            f"json_array_length(json_extract({alias}.metadata_json, "
+            "'$.source_provenance_groups')) > 0 "
+            "AND EXISTS ("
             f"SELECT 1 FROM json_each({alias}.metadata_json, "
-            "'$.source_message_ids') source_message "
+            "'$.source_provenance_groups') provenance_group "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM json_each(provenance_group.value) source_message "
             "JOIN message_visibility visibility "
             f"ON visibility.save_id = {alias}.save_id "
             "AND visibility.message_id = CAST(source_message.value AS TEXT) "
@@ -10740,7 +10777,37 @@ def _context_source_eligibility_sql(
             f"AND visibility.character_id IN "
             f"({_placeholders(len(visibility_ids))})"
             ")"
+            ")"
+            ")"
+            " OR "
+            "("
+            f"COALESCE(json_array_length(json_extract({alias}.metadata_json, "
+            "'$.source_provenance_groups')), 0) = 0 "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM message_visibility visibility "
+            f"WHERE visibility.save_id = {alias}.save_id "
+            "AND visibility.visibility = 'not_visible' "
+            f"AND visibility.character_id IN "
+            f"({_placeholders(len(visibility_ids))}) "
+            "AND visibility.message_id IN ("
+            f"SELECT CAST(value AS TEXT) FROM json_each({alias}.metadata_json, "
+            "'$.source_message_ids') "
+            "UNION "
+            f"SELECT CAST(json_extract({alias}.metadata_json, "
+            "'$.source_message_id') AS TEXT) "
+            f"WHERE json_extract({alias}.metadata_json, "
+            "'$.source_message_id') IS NOT NULL "
+            "UNION "
+            f"SELECT CAST(json_extract({alias}.metadata_json, "
+            "'$.last_seen_message_id') AS TEXT) "
+            f"WHERE json_extract({alias}.metadata_json, "
+            "'$.last_seen_message_id') IS NOT NULL"
+            ")"
+            ")"
+            ")"
+            ")"
         )
+        params.extend(visibility_ids)
         params.extend(visibility_ids)
     if allowed_owner_names is not None or reference_character_ids is not None:
         owners = tuple(sorted(allowed_owner_names or ()))

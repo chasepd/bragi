@@ -4975,6 +4975,39 @@ def _remapped_context_update_suggestion_proposed_value_json(
             if mapped is not None:
                 mapped_items.append(mapped)
         remapped["source_message_ids"] = mapped_items
+    observation_id_map = entity_id_maps.get("observation", {})
+    if "source_observation_id" in remapped:
+        source_observation_id = remapped["source_observation_id"]
+        if source_observation_id is None or source_observation_id == "":
+            remapped["source_observation_id"] = None
+        elif not isinstance(source_observation_id, str):
+            raise ChatBundleError(
+                "Bundle context_update_suggestions.proposed_value_json."
+                "source_observation_id must be an observation id"
+            )
+        else:
+            remapped["source_observation_id"] = _mapped_optional_id(
+                observation_id_map,
+                source_observation_id,
+                field_name=(
+                    "context_update_suggestions.proposed_value_json."
+                    "source_observation_id"
+                ),
+                repair_tracker=repair_tracker,
+            )
+    if "source_observation_ids" in remapped:
+        source_observation_ids = remapped["source_observation_ids"]
+        remapped["source_observation_ids"] = (
+            _mapped_context_source_metadata_id_list(
+                source_observation_ids,
+                observation_id_map,
+                field_name=(
+                    "context_update_suggestions.proposed_value_json."
+                    "source_observation_ids"
+                ),
+                repair_tracker=repair_tracker,
+            )
+        )
     if "location_id" in remapped:
         location_id = remapped["location_id"]
         if location_id is None or location_id == "":

@@ -49,10 +49,10 @@ HIGH_VALUE_FACT_TYPES = frozenset(
     }
 )
 
-DEFAULT_WORLD_STATE_INDEX_LIMIT: int | None = None
-DEFAULT_MEMORY_INDEX_LIMIT: int | None = None
-DEFAULT_SUMMARY_INDEX_LIMIT: int | None = None
-DEFAULT_ACTIVE_THREAD_INDEX_LIMIT: int | None = None
+DEFAULT_WORLD_STATE_INDEX_LIMIT = 250
+DEFAULT_MEMORY_INDEX_LIMIT = 250
+DEFAULT_SUMMARY_INDEX_LIMIT = 80
+DEFAULT_ACTIVE_THREAD_INDEX_LIMIT = 512
 CHARACTER_PROFILE_DETAIL_MAX_CHARS = 320
 CHARACTER_TEXT_THREAD_RECENT_MESSAGE_LIMIT = 4
 CHARACTER_TEXT_THREAD_LINE_MAX_CHARS = 220
@@ -206,6 +206,10 @@ class ContinuityIndexService:
     def _sync_memories(self, save_id: str) -> tuple[list[ContextSourceRecord], int]:
         records: list[ContextSourceRecord] = []
         active_memories = tuple(self.repositories.list_memories(save_id))
+        observations_by_id = {
+            observation.id: observation
+            for observation in self.repositories.list_context_observations(save_id)
+        }
         indexed_memories = _bounded_records(
             active_memories,
             self.memory_limit,
@@ -214,6 +218,25 @@ class ContinuityIndexService:
         )
         for memory in indexed_memories:
             fact_type = _memory_fact_type(memory)
+            source_message_ids = tuple(_memory_source_message_ids(memory))
+            provenance_groups: list[list[str]] = []
+            grouped_source_ids: set[str] = set()
+            for observation_id in memory.source_observation_ids:
+                observation = observations_by_id.get(observation_id)
+                if observation is None or not observation.source_message_ids:
+                    continue
+                group = list(dict.fromkeys(observation.source_message_ids))
+                provenance_groups.append(group)
+                grouped_source_ids.update(group)
+            ungrouped_source_ids = [
+                source_id
+                for source_id in source_message_ids
+                if source_id not in grouped_source_ids
+            ]
+            if ungrouped_source_ids:
+                provenance_groups.append(ungrouped_source_ids)
+            elif not provenance_groups and source_message_ids:
+                provenance_groups.append(list(source_message_ids))
             records.append(
                 self.repositories.upsert_context_source(
                     save_id=save_id,
@@ -223,7 +246,7 @@ class ContinuityIndexService:
                     body=memory.body,
                     metadata=_metadata(
                         fact_type=fact_type,
-                        source_message_ids=tuple(_memory_source_message_ids(memory)),
+                        source_message_ids=source_message_ids,
                         importance=max(
                             memory.importance,
                             _fact_type_importance(fact_type),
@@ -232,7 +255,10 @@ class ContinuityIndexService:
                         entity_ids=(),
                         last_seen_message_id=memory.source_message_id,
                     )
-                    | {"tags": list(memory.tags)},
+                    | {
+                        "tags": list(memory.tags),
+                        "source_provenance_groups": provenance_groups,
+                    },
                     token_estimate=_estimate_tokens(memory.body),
                 )
             )

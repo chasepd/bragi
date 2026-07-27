@@ -482,7 +482,7 @@ def test_context_curation_service_applies_memory_and_context_decisions(
                         "confidence": 0.81,
                         "memory_body": "",
                         "context_title": "Red lens warning",
-                        "context_body": "The red lens showed riders in the ash.",
+                        "context_body": "The red lens warning may return.",
                         "tags": ["beacon"],
                     },
                 ]
@@ -1039,6 +1039,67 @@ def test_context_curation_rejects_high_overlap_relation_reversal(
     )
 
     result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 0
+    assert result.confirmation_count == 1
+    assert repositories.list_memories(save.id) == []
+
+
+def test_context_curation_rejects_unsupported_location_substitution(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    source = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara hid the red vault key in the bedroom.",
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="world_fact",
+        claim="Mara hid the red vault key in the bedroom.",
+        evidence_quote="Mara hid the red vault key in the bedroom",
+        source_message_ids=[source.id],
+        scope="durable",
+        confidence=0.95,
+        tags=["vault"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "Vault key location.",
+                        "confidence": 0.95,
+                        "memory_body": (
+                            "Mara hid the red vault key in the kitchen."
+                        ),
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["vault"],
+                        "grounding_status": "entailed",
+                        "supporting_evidence_quote": (
+                            "Mara hid the red vault key in the bedroom"
+                        ),
+                        "supporting_source_message_ids": [source.id],
+                    }
+                ]
+            }
+        }
+    )
+
+    result = asyncio.run(
+        ContextCurationService(
+            repositories=repositories,
+            curator=StructuredProviderContextCurator(
+                provider=provider,
+                provider_name=provider.provider_name,
+                model_id="curator",
+            ),
+        ).curate_pending(save.id)
+    )
 
     assert result.accepted_count == 0
     assert result.confirmation_count == 1

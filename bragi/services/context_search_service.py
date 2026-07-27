@@ -961,7 +961,8 @@ def _indexed_context_source_retrieval(
     )
     allowed_owner_names = {
         scoped_owner_name(owner)
-        for owner in scoped_targets.allowed.values()
+        for owners in scoped_targets.allowed.values()
+        for owner in owners
     }
     current_turn_number = repositories.count_active_messages_by_role(
         save_id,
@@ -1544,26 +1545,33 @@ def _context_candidate_set(
         present_character_ids=turn_scope.present_character_ids,
         message_visibility=message_visibility or [],
     )
+    raw_state_candidates = _state_candidates(
+        world_state,
+        scoped_targets=scoped_targets,
+        exclude_open_thread_aggregates=bool(indexed_candidates),
+        present_character_ids=turn_scope.present_character_ids,
+        message_visibility=message_visibility or [],
+    )
+    raw_memory_candidates = _memory_candidates(
+        memories,
+        scoped_targets=scoped_targets,
+        present_character_ids=turn_scope.present_character_ids,
+        message_visibility=message_visibility or [],
+    )
     state_candidates = (
-        _state_candidates(
-            world_state,
-            scoped_targets=scoped_targets,
-            exclude_open_thread_aggregates=bool(indexed_candidates),
-            present_character_ids=turn_scope.present_character_ids,
-            message_visibility=message_visibility or [],
-        )
-        if include_missing_raw_candidates
-        else ()
+        raw_state_candidates if include_missing_raw_candidates else ()
     )
     memory_candidates = (
-        _memory_candidates(
-            memories,
-            scoped_targets=scoped_targets,
-            present_character_ids=turn_scope.present_character_ids,
-            message_visibility=message_visibility or [],
-        )
+        raw_memory_candidates if include_missing_raw_candidates else ()
+    )
+    exact_raw_candidates = (
+        ()
         if include_missing_raw_candidates
-        else ()
+        else _exact_raw_candidates(
+            (*raw_state_candidates, *raw_memory_candidates),
+            indexed_candidates=indexed_candidates,
+            latest_player_message=latest_player_message,
+        )
     )
     observation_candidates = _observation_candidates(
         observation_records,
@@ -1574,6 +1582,7 @@ def _context_candidate_set(
     if indexed_candidates:
         canonical_candidates = (
             *indexed_candidates,
+            *exact_raw_candidates,
             *(
                 _missing_raw_candidates(
                     state_candidates,
@@ -1591,7 +1600,7 @@ def _context_candidate_set(
             *memory_candidates,
         )
     else:
-        canonical_candidates = ()
+        canonical_candidates = exact_raw_candidates
     candidates = (
         *canonical_candidates,
         *observation_candidates,
@@ -3230,12 +3239,10 @@ def _indexed_context_candidates(
         )
         if source_type is None:
             continue
-        if source_type in {"memory", "observation"} and not (
-            _source_messages_visible_to_present_characters(
-                _metadata_source_message_ids(record.metadata),
-                present_character_ids=present_character_ids,
-                message_visibility=message_visibility,
-            )
+        if not _metadata_provenance_visible_to_present_characters(
+            record.metadata,
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility,
         ):
             continue
         if _audience_candidate_blocked(record, reference_character_ids):
@@ -3281,6 +3288,38 @@ def _missing_raw_candidates(
     )
 
 
+def _exact_raw_candidates(
+    candidates: tuple[_ContextCandidate, ...],
+    *,
+    indexed_candidates: tuple[_ContextCandidate, ...],
+    latest_player_message: str,
+    limit: int = 24,
+) -> tuple[_ContextCandidate, ...]:
+    query_terms = _meaningful_terms(latest_player_message)
+    if not query_terms or limit <= 0:
+        return ()
+    indexed_keys = {
+        (candidate.source_type, candidate.source_id)
+        for candidate in indexed_candidates
+    }
+    ranked: list[tuple[float, _ContextCandidate]] = []
+    for candidate in candidates:
+        if (candidate.source_type, candidate.source_id) in indexed_keys:
+            continue
+        candidate_terms = _meaningful_terms(
+            candidate.selection_text or candidate.text
+        )
+        overlap_count = len(query_terms & candidate_terms)
+        if overlap_count < min(2, len(query_terms)):
+            continue
+        coverage = overlap_count / len(query_terms)
+        if coverage < 0.5:
+            continue
+        ranked.append((coverage + overlap_count, candidate))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return tuple(candidate for _score, candidate in ranked[:limit])
+
+
 def _known_by_candidate_blocked(
     record: ContextSourceRecord,
     scoped_targets: ScopedTargets,
@@ -3293,7 +3332,8 @@ def _known_by_candidate_blocked(
         return False
     allowed_owners = {
         scoped_owner_name(owner).casefold()
-        for owner in scoped_targets.allowed.values()
+        for owners in scoped_targets.allowed.values()
+        for owner in owners
     }
     normalized_known_by = {str(item).casefold() for item in known_by}
     return not bool(normalized_known_by & allowed_owners)
@@ -3530,7 +3570,7 @@ def _meaningful_terms(text: str) -> set[str]:
     return {
         term
         for term in terms
-        if len(term) >= 2
+        if (len(term) >= 2 or any(ord(character) > 127 for character in term))
         and term
         not in {
             "and",
@@ -3676,9 +3716,9 @@ def _scoped_candidate_text(
     scoped_targets: ScopedTargets,
 ) -> str | None:
     key = (source_type, source_id)
-    owner = scoped_targets.allowed.get(key)
-    if owner:
-        return f"Character-scoped knowledge ({owner}): {text}"
+    owners = scoped_targets.allowed.get(key)
+    if owners:
+        return f"Character-scoped knowledge ({', '.join(owners)}): {text}"
     if key in scoped_targets.blocked:
         return None
     return text
@@ -3782,14 +3822,56 @@ def _metadata_source_message_ids(
     metadata: Mapping[str, object],
 ) -> tuple[str, ...]:
     raw_ids = metadata.get("source_message_ids")
-    if not isinstance(raw_ids, list):
-        return ()
-    return tuple(
-        dict.fromkeys(
+    values = (
+        [
             str(item)
             for item in raw_ids
             if isinstance(item, str) and item.strip()
+        ]
+        if isinstance(raw_ids, list)
+        else []
+    )
+    for field_name in ("source_message_id", "last_seen_message_id"):
+        value = metadata.get(field_name)
+        if isinstance(value, str) and value.strip():
+            values.append(value)
+    return tuple(dict.fromkeys(values))
+
+
+def _metadata_provenance_visible_to_present_characters(
+    metadata: Mapping[str, object],
+    *,
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
+) -> bool:
+    raw_groups = metadata.get("source_provenance_groups")
+    groups = (
+        tuple(
+            tuple(
+                str(source_id)
+                for source_id in group
+                if isinstance(source_id, str) and source_id.strip()
+            )
+            for group in raw_groups
+            if isinstance(group, list)
         )
+        if isinstance(raw_groups, list)
+        else ()
+    )
+    nonempty_groups = tuple(group for group in groups if group)
+    if nonempty_groups:
+        return any(
+            _source_messages_visible_to_present_characters(
+                group,
+                present_character_ids=present_character_ids,
+                message_visibility=message_visibility,
+            )
+            for group in nonempty_groups
+        )
+    return _source_messages_visible_to_present_characters(
+        _metadata_source_message_ids(metadata),
+        present_character_ids=present_character_ids,
+        message_visibility=message_visibility,
     )
 
 

@@ -1765,6 +1765,100 @@ def _migrate_schema_70_to_71(connection: sqlite3.Connection) -> None:
                         memory_id,
                     ),
                 )
+        duplicate_rows = connection.execute(
+            """
+            SELECT id, save_id, tags_json, importance, source_message_id,
+                   source_message_ids_json, claim_fingerprint,
+                   source_observation_ids_json
+            FROM memories
+            WHERE archived_at IS NULL AND claim_fingerprint != ''
+            ORDER BY created_at, rowid
+            """
+        ).fetchall()
+        grouped_rows: dict[tuple[str, str], list[tuple[object, ...]]] = {}
+        for row in duplicate_rows:
+            grouped_rows.setdefault(
+                (str(row[1]), str(row[6])),
+                [],
+            ).append(row)
+        for (save_id, _fingerprint), group in grouped_rows.items():
+            if len(group) < 2:
+                continue
+            keeper = group[0]
+            tags: list[str] = []
+            source_message_ids: list[str] = []
+            source_observation_ids: list[str] = []
+            source_message_id: str | None = None
+            importance = 0.0
+            for row in group:
+                importance = max(importance, float(str(row[3])))
+                if source_message_id is None and row[4]:
+                    source_message_id = str(row[4])
+                for raw_json, target in (
+                    (row[2], tags),
+                    (row[5], source_message_ids),
+                    (row[7], source_observation_ids),
+                ):
+                    try:
+                        values = json.loads(str(raw_json))
+                    except (json.JSONDecodeError, TypeError):
+                        values = []
+                    if isinstance(values, list):
+                        target.extend(
+                            str(value)
+                            for value in values
+                            if isinstance(value, str) and value
+                        )
+                if row[4]:
+                    source_message_ids.append(str(row[4]))
+            connection.execute(
+                """
+                UPDATE memories
+                SET tags_json = ?, importance = ?, source_message_id = ?,
+                    source_message_ids_json = ?,
+                    source_observation_ids_json = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND save_id = ?
+                """,
+                (
+                    json.dumps(list(dict.fromkeys(tags)), separators=(",", ":")),
+                    importance,
+                    source_message_id,
+                    json.dumps(
+                        list(dict.fromkeys(source_message_ids)),
+                        separators=(",", ":"),
+                    ),
+                    json.dumps(
+                        list(dict.fromkeys(source_observation_ids)),
+                        separators=(",", ":"),
+                    ),
+                    keeper[0],
+                    save_id,
+                ),
+            )
+            duplicate_ids = [str(row[0]) for row in group[1:]]
+            connection.execute(
+                f"""
+                UPDATE memories
+                SET archived_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE save_id = ?
+                  AND id IN ({_migration_placeholders(len(duplicate_ids))})
+                """,
+                (save_id, *duplicate_ids),
+            )
+            if _table_exists(connection, "context_sources"):
+                connection.execute(
+                    f"""
+                    UPDATE context_sources
+                    SET archived_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE save_id = ?
+                      AND source_type = 'memory'
+                      AND source_id IN ({_migration_placeholders(len(duplicate_ids))})
+                    """,
+                    (save_id, *duplicate_ids),
+                )
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_memories_save_claim_fingerprint_active
@@ -1783,6 +1877,10 @@ def _migration_claim_fingerprint(value: object) -> str:
     )
     canonical = " ".join(canonical.split())
     return sha256(canonical.encode("utf-8")).hexdigest() if canonical else ""
+
+
+def _migration_placeholders(count: int) -> str:
+    return ", ".join("?" for _ in range(count))
 
 
 def _remove_retired_model_preferences(connection: sqlite3.Connection) -> None:

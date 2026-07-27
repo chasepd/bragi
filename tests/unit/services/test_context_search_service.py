@@ -43,6 +43,7 @@ from bragi.services.context_search_service import (
     ContextSearchResult,
     ContextSearchService,
     _context_selection_instruction,
+    _meaningful_terms,
 )
 from bragi.services.continuity_index_service import ContinuityIndexService
 
@@ -514,6 +515,11 @@ def test_context_selection_instruction_prioritizes_mystery_context() -> None:
     assert "case status" in lowered
     assert "hidden truth" in lowered
     assert "do not reveal hidden truth as player knowledge" in lowered
+
+
+def test_meaningful_terms_preserve_single_character_cjk_entities() -> None:
+    assert _meaningful_terms("李は東門にいる") == {"李は東門にいる"}
+    assert _meaningful_terms("ask 李 now") == {"ask", "李", "now"}
 
 
 def test_retired_character_interaction_type_has_no_context_specialization() -> None:
@@ -1621,10 +1627,17 @@ def test_context_search_filters_character_scoped_knowledge_by_present_character(
         met=True,
         character_id="character-lio-context-search",
     )
+    second_present = repositories.add_character(
+        save_id=save.id,
+        name="Warden Rowan",
+        aliases=["Rowan"],
+        met=True,
+        character_id="character-rowan-context-search",
+    )
     repositories.upsert_scene_snapshot(
         save_id=save.id,
         situation="Ilyra waits beside the beacon lens.",
-        present_character_ids=[present.id],
+        present_character_ids=[present.id, second_present.id],
     )
     visible_memory = repositories.add_memory(
         save_id=save.id,
@@ -1641,6 +1654,12 @@ def test_context_search_filters_character_scoped_knowledge_by_present_character(
     public_memory = repositories.add_memory(
         save_id=save.id,
         body="The beacon lens cracks faster when ash enters the gallery.",
+        tags=["beacon"],
+        source_message_id=older_message.id,
+    )
+    shared_memory = repositories.add_memory(
+        save_id=save.id,
+        body="Ilyra and Rowan know the shared lens watchword.",
         tags=["beacon"],
         source_message_id=older_message.id,
     )
@@ -1699,6 +1718,15 @@ def test_context_search_filters_character_scoped_knowledge_by_present_character(
                 target_id=target_id,
                 relation="knows",
             )
+    for character in (present, second_present):
+        repositories.add_entity_link(
+            save_id=save.id,
+            entity_type="character",
+            entity_id=character.id,
+            target_type="memory",
+            target_id=shared_memory.id,
+            relation="knows",
+        )
     repositories.set_model_preference(
         task="context_search",
         provider="fake",
@@ -1731,6 +1759,11 @@ def test_context_search_filters_character_scoped_knowledge_by_present_character(
     ) in prompt
     assert visible_summary.body not in prompt
     assert public_memory.body in prompt
+    assert (
+        "Character-scoped knowledge "
+        "(Captain Ilyra knows, Warden Rowan knows): "
+        "Ilyra and Rowan know the shared lens watchword."
+    ) in prompt
     assert hidden_memory.body not in prompt
     assert "crypt.map" not in prompt
     assert hidden_summary.body not in prompt

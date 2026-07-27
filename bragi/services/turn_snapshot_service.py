@@ -17,7 +17,10 @@ from uuid import uuid4
 
 from bragi.app_logging import log_event
 from bragi.persistence.models import MediaAssetRecord, MessageRecord, SaveRecord
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.safety import (
     CONTENT_FILTER_TRANSITION,
     CONTENT_FILTER_TRANSITION_KIND,
@@ -512,6 +515,7 @@ class TurnSnapshotService:
                     rows = _media_rows_parent_first(rows)
                 for row in rows:
                     self._insert_row(table_name, row)
+            self._normalize_memory_fingerprints(save_id)
             _remove_snapshot_safety_transition_records(
                 self.repositories.connection,
                 save_id=save_id,
@@ -592,6 +596,7 @@ class TurnSnapshotService:
                             copied_paths=copied_paths,
                         )
                     self._insert_row(table_name, remapped)
+            self._normalize_memory_fingerprints(fork_save.id)
             _remove_snapshot_safety_transition_records(
                 self.repositories.connection,
                 save_id=fork_save.id,
@@ -1217,6 +1222,31 @@ class TurnSnapshotService:
             """,
             tuple(row[column] for column in columns),
         )
+
+    def _normalize_memory_fingerprints(self, save_id: str) -> None:
+        rows = self.repositories.connection.execute(
+            """
+            SELECT id, body
+            FROM memories
+            WHERE save_id = ?
+              AND archived_at IS NULL
+              AND (claim_fingerprint IS NULL OR claim_fingerprint = '')
+            """,
+            (save_id,),
+        ).fetchall()
+        for row in rows:
+            self.repositories.connection.execute(
+                """
+                UPDATE memories
+                SET claim_fingerprint = ?
+                WHERE save_id = ? AND id = ?
+                """,
+                (
+                    canonical_claim_fingerprint(row["body"]),
+                    save_id,
+                    row["id"],
+                ),
+            )
 
     def _upsert_row(self, table_name: str, row: Mapping[str, object]) -> None:
         columns = [

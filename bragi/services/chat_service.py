@@ -6428,11 +6428,10 @@ class ChatService:
                         ),
                     )
                 )
-            await asyncio.sleep(0)
+            update_result = await update_task
             curation_task = asyncio.create_task(
                 self._curate_if_configured(save_id=save_id)
             )
-            update_result = await update_task
             curation_result = await curation_task
             if agentic_result is not None and curation_result is not None:
                 agentic_result.update(curation_result)
@@ -6462,6 +6461,8 @@ class ChatService:
                     agentic_result.update(curation_result)
                 elif curation_result is not None:
                     agentic_result = curation_result
+            else:
+                await merge_curation_result()
             pressure = provider_pressure_from_exception(exc)
             retry_job = self._ensure_context_update_retry_job(
                 save_id=save_id,
@@ -10157,10 +10158,11 @@ def _latest_summary_text(
     scoped_targets: ScopedTargets,
 ) -> str | None:
     key = ("summary", summary_id)
-    owner = scoped_targets.allowed.get(key)
-    if owner:
+    owners = scoped_targets.allowed.get(key)
+    if owners:
         return (
-            f"Character-scoped knowledge ({owner}): summary: {summary_body} "
+            f"Character-scoped knowledge ({', '.join(owners)}): "
+            f"summary: {summary_body} "
             "(relevance: latest rolling summary.)"
         )
     if key in scoped_targets.blocked:

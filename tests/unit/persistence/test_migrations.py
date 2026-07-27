@@ -383,8 +383,15 @@ def test_migrate_database_upgrades_schema_70_context_lifecycle(
         memory = repositories.add_memory(
             save_id=save.id,
             body="Mara Likes Tea!",
-            tags=[],
+            tags=["preference"],
+            importance=0.4,
             source_observation_ids=[observation.id],
+        )
+        repositories.add_memory(
+            save_id=save.id,
+            body="mara likes tea",
+            tags=["tea"],
+            importance=0.9,
         )
         connection.execute("DROP INDEX idx_memories_save_claim_fingerprint_active")
         connection.execute(
@@ -428,6 +435,20 @@ def test_migrate_database_upgrades_schema_70_context_lifecycle(
             expected_fingerprint,
             json.dumps([observation.id], separators=(",", ":")),
         )
+        active_memories = connection.execute(
+            """
+            SELECT tags_json, importance
+            FROM memories
+            WHERE save_id = ? AND archived_at IS NULL
+            """,
+            (save.id,),
+        ).fetchall()
+        assert active_memories == [
+            (
+                json.dumps(["preference", "tea"], separators=(",", ":")),
+                0.9,
+            )
+        ]
         index_row = connection.execute(
             """
             SELECT sql FROM sqlite_master

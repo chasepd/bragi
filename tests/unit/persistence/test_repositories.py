@@ -3748,6 +3748,44 @@ def test_repositories_unicode_match_all_cannot_be_starved_by_partial_matches(
     assert [hit.record for hit in hits] == [target]
 
 
+def test_repositories_mixed_unicode_match_all_requires_ascii_terms(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-target",
+        title="秘密 vault marker",
+        body="The mixed-script marker identifies the old vault.",
+    )
+    for index in range(40):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=f"memory-noise-{index:02d}",
+            title=f"秘密 {index:02d}",
+            body="秘密だけを記録した新しいメモ。",
+        )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"秘密", "vault"},
+        source_types={"memory"},
+        limit=1,
+        match_all=True,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
 def test_repositories_exact_phrase_precedes_bounded_all_term_matches(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3788,6 +3826,77 @@ def test_repositories_exact_phrase_precedes_bounded_all_term_matches(
     )
 
     assert hits[0].record == target
+
+
+def test_repositories_prioritize_specific_phrase_over_generic_expansion(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-specific",
+        title="Old mechanism",
+        body="The copper notch under the western stair opens the vault.",
+    )
+    for index in range(40):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=f"memory-generic-{index:02d}",
+            title=f"Archive note {index:02d}",
+            body="A generic archive record.",
+        )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"copper", "notch", "archive"},
+        source_types={"memory"},
+        limit=24,
+        exact_phrases=(
+            "copper notch under the western stair",
+            "archive",
+        ),
+    )
+
+    assert hits[0].record == target
+
+
+def test_repositories_exact_phrase_uses_unicode_normalization_and_casefold(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-accented",
+        title="Old signal",
+        body="The CAFÉ beacon marks the eastern bridge.",
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"café", "beacon"},
+        source_types={"memory"},
+        limit=1,
+        exact_phrases=("cafe\u0301 beacon",),
+    )
+
+    assert [hit.record for hit in hits] == [target]
 
 
 def test_repositories_apply_context_visibility_before_search_limit(
@@ -3884,6 +3993,68 @@ def test_repositories_apply_message_visibility_before_search_limit(
         query_terms={"moonstone"},
         source_types={"observation"},
         limit=1,
+        visibility_character_ids={character.id},
+    )
+
+    assert [hit.record for hit in hits] == [accessible]
+
+
+def test_repositories_filter_singular_message_provenance_and_allow_visible_group(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    hidden_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="A hidden moonstone rumor circulates.",
+    )
+    visible_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="A public witness independently confirms the moonstone.",
+    )
+    character = repositories.add_character(save_id=save.id, name="Captain Ilyra")
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_message.id,
+        character_id=character.id,
+        visibility="not_visible",
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="singular-hidden",
+        title="moonstone singular",
+        body="The moonstone opens the archive.",
+        metadata={"source_message_id": hidden_message.id},
+    )
+    accessible = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="alternative-grounding",
+        title="moonstone confirmed",
+        body="The moonstone opens the archive.",
+        metadata={
+            "source_message_ids": [hidden_message.id, visible_message.id],
+            "source_provenance_groups": [
+                [hidden_message.id],
+                [visible_message.id],
+            ],
+        },
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=8,
         visibility_character_ids={character.id},
     )
 

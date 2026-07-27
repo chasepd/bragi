@@ -1503,7 +1503,7 @@ def _observation_evidence_is_grounded(
     evidence_terms = _grounding_terms(observation.evidence_quote)
     return bool(
         claim_terms
-        and len(claim_terms & evidence_terms) / len(claim_terms) >= 0.8
+        and claim_terms <= evidence_terms
     )
 
 
@@ -3234,14 +3234,7 @@ def _curated_decision_is_grounded(
     proposed = (
         decision.memory_body.strip() or observation.claim
         if decision.action == "durable_memory"
-        else " ".join(
-            part
-            for part in (
-                decision.context_title.strip(),
-                decision.context_body.strip() or observation.claim,
-            )
-            if part
-        )
+        else (decision.context_body.strip() or observation.claim)
     )
     grounding_text = " ".join(
         (
@@ -3261,8 +3254,7 @@ def _curated_decision_is_grounded(
     grounding_terms = _grounding_terms(grounding_text)
     if not proposed_terms:
         return False
-    overlap = proposed_terms & grounding_terms
-    return len(overlap) / len(proposed_terms) >= 0.8
+    return proposed_terms <= grounding_terms
 
 
 def _grounding_terms(value: str) -> set[str]:
@@ -3278,7 +3270,7 @@ def _grounding_terms(value: str) -> set[str]:
         "with",
     }
     terms = {
-        term if len(term) <= 6 else term[:5]
+        term
         for term in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
         if len(term) >= 3 and term not in stopwords
     }
@@ -3322,7 +3314,7 @@ def _ordered_grounding_terms(value: str) -> list[str]:
         "with",
     }
     return [
-        term if len(term) <= 6 else term[:5]
+        term
         for term in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
         if term not in ignored
     ]
