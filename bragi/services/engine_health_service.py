@@ -246,7 +246,7 @@ def _warnings(
             EngineHealthWarning(
                 code="observation_curation_terminal_failures",
                 severity="critical",
-                message="Observation curation exhausted its retry budget.",
+                message="Observation curation has terminal failures.",
                 count=observation_curation.terminal_failure_count,
             )
         )

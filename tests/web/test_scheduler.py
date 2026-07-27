@@ -754,6 +754,55 @@ def test_scheduler_drains_observation_curation_for_inactive_save(
     assert task.payload["active_save_only"] is False
 
 
+def test_scheduler_persists_only_metadata_for_curation_failures(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_id = _save(repositories, title="Private Backlog")
+    repositories.add_context_observation(
+        save_id=save_id,
+        observation_type="event",
+        claim="A private chronicle detail.",
+        evidence_quote="A private chronicle detail.",
+        source_message_ids=[],
+        scope="durable",
+        confidence=0.9,
+    )
+    set_save_model_override_preference(
+        repositories,
+        save_id=save_id,
+        task="memory_curation",
+        provider="fake",
+        model_id="fake-curator",
+    )
+    runtime = _CurationErrorRuntime(active_save_id=save_id)
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    task = repositories.get_scheduled_task(
+        task_type=OBSERVATION_CURATION_DRAIN_TASK,
+        save_id=save_id,
+    )
+    assert task is not None
+    assert task.error == "observation_curation_failed"
+    assert task.result == {
+        "active_save_id": save_id,
+        "error_present": True,
+        "status": None,
+    }
+    assert "private chronicle" not in json.dumps(task.result).lower()
+
+
 def test_scheduler_skips_unconfigured_curation_backlogs_without_starvation(
     tmp_path: Path,
 ) -> None:
@@ -1503,6 +1552,16 @@ class _ErrorResultRuntime(_ReviewRuntime):
         return {
             "active_save_id": active_save_id,
             "error": "review exploded",
+            "status": None,
+        }
+
+
+class _CurationErrorRuntime(_ReviewRuntime):
+    async def run_observation_curation(self, *, active_save_id: str) -> object:
+        self.observation_curation_calls.append(active_save_id)
+        return {
+            "active_save_id": active_save_id,
+            "error": "Private chronicle detail escaped from a provider.",
             "status": None,
         }
 

@@ -6786,11 +6786,12 @@ def _empty_scheduler_health() -> dict[str, object]:
 
 def _scheduler_task_diagnostic(task: Any, *, now: datetime) -> dict[str, object]:
     status = _scheduler_task_status(task, now=now)
+    task_type = str(getattr(task, "task_type", ""))
     result = getattr(task, "result", None)
     skip_reason = result.get("skip_reason") if isinstance(result, dict) else None
     return {
         "task_id": str(getattr(task, "id", "")),
-        "task_type": str(getattr(task, "task_type", "")),
+        "task_type": task_type,
         "save_id": getattr(task, "save_id", None),
         "status": status,
         "enabled": bool(getattr(task, "enabled", False)),
@@ -6801,8 +6802,12 @@ def _scheduler_task_diagnostic(task: Any, *, now: datetime) -> dict[str, object]
         "last_completed_at": getattr(task, "last_completed_at", None),
         "last_job_id": getattr(task, "last_job_id", None),
         "failure_count": int(getattr(task, "failure_count", 0)),
-        "error": bragi_diagnostics_bindings().redact_diagnostic_text(
-            getattr(task, "error", None)
+        "error": (
+            None
+            if task_type == "observation_curation_drain"
+            else bragi_diagnostics_bindings().redact_diagnostic_text(
+                getattr(task, "error", None)
+            )
         ),
         "skip_reason": skip_reason if isinstance(skip_reason, str) else None,
     }

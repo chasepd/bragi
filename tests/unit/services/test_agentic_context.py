@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -664,6 +664,77 @@ def test_context_curation_cancellation_while_waiting_for_apply_guard_releases_le
     assert state.terminal_outcome is None
 
 
+def test_context_curation_renews_lease_during_slow_provider_work(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _seed_save(repositories)
+    player, _narrator = repositories.list_messages(save.id)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara prefers grounded narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+    )
+    renewal_count = 0
+    renew_claims = repositories.renew_context_observation_curation_claims
+
+    def recording_renewal(
+        observation_ids: Iterable[str],
+        *,
+        lease_token: str,
+        lease_seconds: int,
+    ) -> int:
+        nonlocal renewal_count
+        renewal_count += 1
+        return renew_claims(
+            observation_ids,
+            lease_token=lease_token,
+            lease_seconds=lease_seconds,
+        )
+
+    monkeypatch.setattr(
+        repositories,
+        "renew_context_observation_curation_claims",
+        recording_renewal,
+    )
+
+    class SlowCurator:
+        async def curate(
+            self,
+            *,
+            save_id: str,
+            observations: tuple[ContextObservationRecord, ...],
+        ) -> tuple[CurationDecision, ...]:
+            await asyncio.sleep(0.05)
+            return (
+                CurationDecision(
+                    observation_id=observations[0].id,
+                    action="discard",
+                    reason="Transient preference.",
+                    confidence=0.7,
+                ),
+            )
+
+    result = asyncio.run(
+        ContextCurationService(
+            repositories=repositories,
+            curator=SlowCurator(),
+            lease_seconds=600,
+            lease_renewal_interval_seconds=0.01,
+        ).curate_pending(save.id)
+    )
+
+    assert renewal_count >= 1
+    assert result.discarded_count == 1
+    updated = repositories.get_context_observation(observation.id)
+    assert updated is not None
+    assert updated.status == "discarded"
+
+
 def test_context_curation_rejects_unexpected_generated_script(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -843,6 +914,93 @@ def test_context_curation_retries_only_script_violating_observations(
 
     assert result.accepted_count == 2
     assert len(provider.structured_output_requests) == 2
+
+
+def test_context_curation_isolates_script_retry_provider_failure(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, narrator = repositories.list_messages(save.id)
+    clean_observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara likes concise narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+    )
+    retry_observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="open_thread",
+        claim="The red lens warning may return.",
+        evidence_quote="riders in the ash",
+        source_message_ids=[narrator.id],
+        scope="save",
+        confidence=0.8,
+    )
+
+    class FailingRetryProvider(RecordingStructuredProvider):
+        async def generate_structured_output(
+            self,
+            request: StructuredOutputRequest,
+        ) -> StructuredOutputResponse:
+            self.structured_output_requests.append(request)
+            if len(self.structured_output_requests) > 1:
+                raise RuntimeError("retry provider unavailable")
+            return StructuredOutputResponse(
+                data={
+                    "decisions": [
+                        {
+                            "observation_id": clean_observation.id,
+                            "action": "durable_memory",
+                            "reason": "Stable preference.",
+                            "confidence": 0.9,
+                            "memory_body": "Mara likes concise narration.",
+                            "context_title": "",
+                            "context_body": "",
+                            "tags": ["tone"],
+                        },
+                        {
+                            "observation_id": retry_observation.id,
+                            "action": "save_context",
+                            "reason": "未来剧情相关。",
+                            "confidence": 0.8,
+                            "memory_body": "",
+                            "context_title": "红色透镜警告",
+                            "context_body": "红色透镜显示灰烬中的骑手。",
+                            "tags": ["beacon"],
+                        },
+                    ]
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
+
+    provider = FailingRetryProvider({})
+    result = asyncio.run(
+        ContextCurationService(
+            repositories=repositories,
+            curator=StructuredProviderContextCurator(
+                provider=provider,
+                provider_name=provider.provider_name,
+                model_id="curator",
+                repositories=repositories,
+            ),
+        ).curate_pending(save.id)
+    )
+
+    assert result.accepted_count == 1
+    assert result.deferred_count == 1
+    assert result.omitted_count == 1
+    assert [memory.body for memory in repositories.list_memories(save.id)] == [
+        "Mara likes concise narration."
+    ]
+    retry_state = repositories.get_context_observation_curation_state(
+        retry_observation.id
+    )
+    assert retry_state is not None
+    assert retry_state.last_error == "missing_decision"
 
 
 def test_script_policy_retry_never_exceeds_curation_input_budget(
