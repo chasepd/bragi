@@ -3421,6 +3421,9 @@ class PersistenceRepositories:
             FROM context_observations observation
             JOIN context_observation_curation_state curation
               ON curation.observation_id = observation.id
+            LEFT JOIN scheduled_tasks scheduled
+              ON scheduled.task_type = 'observation_curation_drain'
+             AND scheduled.save_id = observation.save_id
             WHERE observation.status = 'pending'
               AND observation.archived_at IS NULL
               AND curation.terminal_outcome IS NULL
@@ -3433,7 +3436,12 @@ class PersistenceRepositories:
                   OR curation.lease_until <= CURRENT_TIMESTAMP
               )
             GROUP BY observation.save_id
-            ORDER BY MIN(observation.created_at), MIN(observation.rowid)
+            ORDER BY
+                CASE WHEN MAX(scheduled.last_completed_at) IS NULL
+                    THEN 0 ELSE 1 END,
+                MAX(scheduled.last_completed_at),
+                MIN(observation.created_at),
+                MIN(observation.rowid)
             LIMIT ? OFFSET ?
             """,
             (limit, max(0, offset)),
@@ -3509,6 +3517,7 @@ class PersistenceRepositories:
         *,
         lease_token: str,
         lease_seconds: int,
+        max_attempts: int = 5,
     ) -> list[ContextObservationRecord]:
         ids = tuple(dict.fromkeys(item for item in observation_ids if item))
         if not ids:
@@ -3517,8 +3526,59 @@ class PersistenceRepositories:
             raise ValueError("lease_token is required")
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be at least 1")
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
         self.begin_immediate_transaction()
         try:
+            exhausted_rows = self._fetch_all(
+                f"""
+                SELECT curation.observation_id
+                FROM context_observation_curation_state curation
+                JOIN context_observations observation
+                  ON observation.id = curation.observation_id
+                WHERE curation.observation_id IN ({_placeholders(len(ids))})
+                  AND curation.terminal_outcome IS NULL
+                  AND curation.attempt_count >= ?
+                  AND (
+                      curation.next_eligible_at IS NULL
+                      OR curation.next_eligible_at <= CURRENT_TIMESTAMP
+                  )
+                  AND (
+                      curation.lease_until IS NULL
+                      OR curation.lease_until <= CURRENT_TIMESTAMP
+                  )
+                  AND observation.status = 'pending'
+                  AND observation.archived_at IS NULL
+                """,
+                (*ids, max_attempts),
+            )
+            exhausted_ids = tuple(
+                str(row["observation_id"]) for row in exhausted_rows
+            )
+            if exhausted_ids:
+                self.connection.execute(
+                    f"""
+                    UPDATE context_observation_curation_state
+                    SET lease_token = NULL,
+                        lease_until = NULL,
+                        next_eligible_at = NULL,
+                        last_error = 'retry_budget_exhausted',
+                        terminal_outcome = 'retry_budget_exhausted',
+                        completed_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE observation_id IN ({_placeholders(len(exhausted_ids))})
+                    """,
+                    exhausted_ids,
+                )
+                self.connection.execute(
+                    f"""
+                    UPDATE context_observations
+                    SET status = 'curation_failed',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({_placeholders(len(exhausted_ids))})
+                    """,
+                    exhausted_ids,
+                )
             self.connection.execute(
                 f"""
                 UPDATE context_observation_curation_state
@@ -3530,6 +3590,7 @@ class PersistenceRepositories:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE observation_id IN ({_placeholders(len(ids))})
                   AND terminal_outcome IS NULL
+                  AND attempt_count < ?
                   AND (
                       next_eligible_at IS NULL
                       OR next_eligible_at <= CURRENT_TIMESTAMP
@@ -3542,7 +3603,7 @@ class PersistenceRepositories:
                         AND observation.archived_at IS NULL
                   )
                 """,
-                (lease_token, f"+{lease_seconds} seconds", *ids),
+                (lease_token, f"+{lease_seconds} seconds", *ids, max_attempts),
             )
             rows = self._fetch_all(
                 f"""
@@ -3569,6 +3630,41 @@ class PersistenceRepositories:
             self.rollback_transaction()
             raise
         return claimed
+
+    def release_context_observation_curation_claims(
+        self,
+        observation_ids: Iterable[str],
+        *,
+        lease_token: str,
+        error: str,
+    ) -> int:
+        ids = tuple(dict.fromkeys(item for item in observation_ids if item))
+        if not ids:
+            return 0
+        if not lease_token:
+            raise ValueError("lease_token is required")
+        safe_error = (redact_text(error) or "")[:240]
+        self.begin_immediate_transaction()
+        try:
+            cursor = self.connection.execute(
+                f"""
+                UPDATE context_observation_curation_state
+                SET lease_token = NULL,
+                    lease_until = NULL,
+                    next_eligible_at = CURRENT_TIMESTAMP,
+                    last_error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE observation_id IN ({_placeholders(len(ids))})
+                  AND lease_token = ?
+                  AND terminal_outcome IS NULL
+                """,
+                (safe_error, *ids, lease_token),
+            )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return cursor.rowcount
 
     def owns_context_observation_curation_lease(
         self,
