@@ -83,7 +83,10 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
-from bragi.services.request_budget import budget_tool_call_request
+from bragi.services.request_budget import (
+    budget_structured_output_request,
+    budget_tool_call_request,
+)
 from bragi.services.tool_call_helpers import (
     CONTEXT_SEARCH_TOOL_RETRY_INSTRUCTION,
     accepted_tool_result,
@@ -1071,9 +1074,11 @@ async def _retrieve_indexed_context_sources(
     ):
         return initial
     expanded_terms = await _structured_retrieval_expansion(
+        repositories=repositories,
         provider=provider,
         provider_name=provider_name,
         model_id=model_id,
+        save_id=save_id,
         latest_player_message=latest_player_message,
         scene_snapshot=scene_snapshot,
         characters=characters,
@@ -1104,9 +1109,11 @@ async def _retrieve_indexed_context_sources(
 
 async def _structured_retrieval_expansion(
     *,
+    repositories: PersistenceRepositories,
     provider: StructuredOutputProvider,
     provider_name: str,
     model_id: str,
+    save_id: str,
     latest_player_message: str,
     scene_snapshot: SceneSnapshotRecord | None,
     characters: list[CharacterRecord],
@@ -1166,33 +1173,44 @@ async def _structured_retrieval_expansion(
         f"- {message.speaker_name or message.role}: {message.body}"
         for message in visible_recent
     )
-    request = StructuredOutputRequest(
-        provider=provider_name,
-        model_id=model_id,
-        schema_name="context_retrieval_expansion",
-        schema=schema,
-        messages=(
-            ChatMessage(
-                role="system",
-                body=(
-                    "Expand the player's continuity query with short synonymous "
-                    "terms, phrases, and visible entity references. Use only the "
-                    "provided entity IDs and enforced schema."
+    request = request_with_openrouter_routing(
+        repositories,
+        StructuredOutputRequest(
+            provider=provider_name,
+            model_id=model_id,
+            schema_name="context_retrieval_expansion",
+            schema=schema,
+            messages=(
+                ChatMessage(
+                    role="system",
+                    body=(
+                        "Expand the player's continuity query with short synonymous "
+                        "terms, phrases, and visible entity references. Use only the "
+                        "provided entity IDs and enforced schema."
+                    ),
+                ),
+                ChatMessage(
+                    role="user",
+                    body=(
+                        f"Player query:\n{latest_player_message}\n\n"
+                        f"Visible entities:\n{entity_text}\n\n"
+                        f"Visible recent context:\n{recent_text}"
+                    ),
                 ),
             ),
-            ChatMessage(
-                role="user",
-                body=(
-                    f"Player query:\n{latest_player_message}\n\n"
-                    f"Visible entities:\n{entity_text}\n\n"
-                    f"Visible recent context:\n{recent_text}"
-                ),
-            ),
+            temperature=0.0,
         ),
-        temperature=0.0,
+        task="context_search",
+        save_id=save_id,
     )
     try:
-        response = await provider.generate_structured_output(request)
+        response = await provider.generate_structured_output(
+            budget_structured_output_request(
+                repositories,
+                request,
+                task="context_search",
+            )
+        )
     except (ProviderError, ValueError, KeyError, TypeError):
         return ()
     data = response.data
