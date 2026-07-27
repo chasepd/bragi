@@ -859,6 +859,65 @@ def test_scheduler_bounds_observation_curation_discovery_per_poll(
     assert discovery_calls == [(10, 0)]
 
 
+def test_scheduler_advances_past_active_curation_candidates(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_ids = [_save(repositories, title=f"Backlog {index}") for index in range(11)]
+    for index, save_id in enumerate(save_ids):
+        repositories.add_context_observation(
+            save_id=save_id,
+            observation_type="event",
+            claim=f"Observation {index}",
+            evidence_quote=f"Observation {index}",
+            source_message_ids=[],
+            scope="durable",
+            confidence=0.9,
+        )
+        set_save_model_override_preference(
+            repositories,
+            save_id=save_id,
+            task="memory_curation",
+            provider="fake",
+            model_id="fake-curator",
+        )
+    runtime = _ReviewRuntime(active_save_id=save_ids[0])
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        release = asyncio.Event()
+
+        async def blocking_worker(_handle: object) -> object:
+            await release.wait()
+            return {}
+
+        for save_id in save_ids[:10]:
+            await state.jobs.create(
+                "chat_turn",
+                blocking_worker,
+                save_id=save_id,
+                exclusive_key=f"chat_turn:{save_id}",
+                operation_queue_key=save_id,
+            )
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        for _ in range(2):
+            await scheduler.run_once()
+        for _ in range(20):
+            if runtime.observation_curation_calls:
+                break
+            await asyncio.sleep(0)
+        release.set()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.observation_curation_calls == [save_ids[10]]
+
+
 def test_scheduler_persists_only_metadata_for_curation_failures(
     tmp_path: Path,
 ) -> None:
