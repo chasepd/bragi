@@ -261,10 +261,10 @@ def cjk_lexical_anchors(value: str) -> tuple[str, ...]:
             if _cjk_script_family(run) == "han":
                 anchors.append(run)
             continue
-        anchors.extend(
-            run[index : index + 2]
-            for index in range(len(run) - 1)
-        )
+        for index in range(len(run) - 1):
+            anchors.append(run[index : index + 2])
+            if index + 3 <= len(run):
+                anchors.append(run[index : index + 3])
     return tuple(dict.fromkeys(anchors))
 
 

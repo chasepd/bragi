@@ -4747,6 +4747,58 @@ def test_repositories_restore_rebuilds_archived_exact_identifier_index(
     assert [hit.record.id for hit in hits] == [target.id]
 
 
+def test_repositories_restore_preserves_legacy_normalized_budget_allowance(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    source = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-legacy-budget",
+        title="Legacy expansion",
+        body="\ufdfa" * 32,
+    )
+    normalized_bytes = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_index_budget_state
+        WHERE save_id = ?
+        """,
+        (save_id,),
+    ).fetchone()[0]
+    repositories.connection.execute(
+        """
+        INSERT INTO context_source_legacy_budget_limits(
+            save_id, normalized_text_bytes
+        )
+        VALUES (?, ?)
+        """,
+        (save_id, normalized_bytes),
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_sources
+        SET archived_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (source.id,),
+    )
+    repositories.commit()
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD",
+        1,
+    )
+
+    repositories.restore_context_sources({source.id})
+
+    assert repositories.connection.execute(
+        "SELECT archived_at FROM context_sources WHERE id = ?",
+        (source.id,),
+    ).fetchone()[0] is None
+
+
 def test_repositories_rejects_index_budget_before_persisting_source(
     repositories: PersistenceRepositories,
     monkeypatch: pytest.MonkeyPatch,

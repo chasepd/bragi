@@ -105,7 +105,7 @@ MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
-MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
+MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
 MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 1_000_000
 MAX_CONTEXT_INDEX_BYTES_PER_REBUILD = 32 * 1024 * 1024
@@ -3579,9 +3579,8 @@ class PersistenceRepositories:
             raise ValueError("Context source text is too large to rebuild")
         if added_normalized_bytes > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD:
             raise ValueError("Normalized context source text is too large")
-        allowed_normalized_bytes = max(
-            MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD,
-            int(state_row[1]) if state_row is not None else 0,
+        allowed_normalized_bytes = self.context_source_normalized_budget_limit(
+            record.save_id
         )
         if normalized_text_bytes > allowed_normalized_bytes:
             raise ValueError("Normalized context source text is too large to rebuild")
@@ -3706,7 +3705,7 @@ class PersistenceRepositories:
         row = self.connection.execute(
             """
             SELECT normalized_text_bytes
-            FROM context_source_index_budget_state
+            FROM context_source_legacy_budget_limits
             WHERE save_id = ?
             """,
             (save_id,),

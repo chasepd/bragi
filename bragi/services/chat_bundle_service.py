@@ -88,6 +88,7 @@ _MAX_BUNDLE_MANIFEST_JSON_BYTES = 1024 * 1024
 _MAX_BUNDLE_DATA_JSON_BYTES = 128 * 1024 * 1024
 _MAX_BUNDLE_TABLE_ROWS = 20_000
 _MAX_BUNDLE_MESSAGE_ROWS = 5_000
+_MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES = 48 * 1024 * 1024
 _MAX_BUNDLE_TOTAL_ROWS = 50_000
 _MAX_BUNDLE_JSON_OBJECTS = 150_000
 _MAX_BUNDLE_JSON_NODES = 2_000_000
@@ -278,7 +279,12 @@ class ChatBundleService:
         _validate_bundle_context_source_index_budget(
             data,
             max_normalized_text_bytes=(
-                self.repositories.context_source_normalized_budget_limit(save_id)
+                min(
+                    self.repositories.context_source_normalized_budget_limit(
+                        save_id
+                    ),
+                    _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES,
+                )
             ),
         )
 
@@ -1033,7 +1039,12 @@ class ChatBundleService:
     ) -> ImportedChatBundle:
         manifest_payload, data = self._read_bundle(bundle_path)
         _manifest_from_payload(manifest_payload)
-        _validate_bundle_context_source_index_budget(data)
+        _validate_bundle_context_source_index_budget(
+            data,
+            max_normalized_text_bytes=(
+                _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+            ),
+        )
         media_members = _load_media_members(bundle_path, data)
         media_backups: dict[Path, bytes | None] = {}
         repair_tracker = _BundleImportRepairTracker()

@@ -21,12 +21,13 @@ def test_cjk_lexical_anchors_bound_oversized_runs() -> None:
     assert max(map(len, anchors)) <= 64
 
 
-def test_cjk_lexical_anchors_prioritize_middle_bigrams_before_trigrams() -> None:
+def test_cjk_lexical_anchors_cover_middle_bigrams_and_trigrams() -> None:
     body = "".join(chr(0x4E00 + index) for index in range(220))
 
     anchors = cjk_lexical_anchors(body)
 
-    assert body[200:202] in anchors[:255]
+    assert body[200:202] in anchors[:511]
+    assert body[200:203] in anchors[:511]
 
 
 def test_structured_identifiers_preserve_full_normalized_boundaries() -> None:

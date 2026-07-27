@@ -22,7 +22,7 @@ from bragi.text_search import (
 
 CURRENT_SCHEMA_VERSION = 72
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
-_MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
+_MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
 _MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
 _MAX_MEMORY_PROVENANCE_IDS = 64
@@ -4350,6 +4350,11 @@ def _ensure_context_source_search_terms_schema(
             index_bytes INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS context_source_legacy_budget_limits (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            normalized_text_bytes INTEGER NOT NULL
+        );
+
         CREATE TABLE context_source_normalized_budget_entries (
             context_source_id TEXT PRIMARY KEY
                 REFERENCES context_sources(id) ON DELETE CASCADE,
@@ -4596,6 +4601,21 @@ def _ensure_context_source_search_terms_schema(
             """,
             (str(source_id), str(save_id), normalized_bytes),
         )
+    connection.execute(
+        """
+        INSERT INTO context_source_legacy_budget_limits(
+            save_id, normalized_text_bytes
+        )
+        SELECT save_id, normalized_text_bytes
+        FROM context_source_index_budget_state
+        WHERE normalized_text_bytes > 33554432
+        ON CONFLICT(save_id) DO UPDATE SET
+            normalized_text_bytes = MAX(
+                normalized_text_bytes,
+                excluded.normalized_text_bytes
+            )
+        """
+    )
     exact_identifier_index_complete = connection.execute(
         """
         SELECT 1
