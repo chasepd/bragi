@@ -83,6 +83,8 @@ from bragi_common.media_mime import (
     canonical_media_mime_type,
 )
 
+MAX_CONTEXT_SEARCH_TERMS = 64
+MAX_UNICODE_SUBSTRING_TERMS = 32
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
 _UNSET = object()
 CHARACTER_TEXT_DELIVERY_STATUSES = frozenset(
@@ -3169,7 +3171,24 @@ class PersistenceRepositories:
     ) -> list[ContextSourceSearchHit]:
         if limit <= 0:
             return []
-        match_query = _fts_query_from_terms(query_terms, match_all=match_all)
+        bounded_query_terms = tuple(
+            sorted(
+                {
+                    str(term)
+                    for term in query_terms
+                    if str(term).strip()
+                },
+                key=lambda term: (
+                    -int(any(ord(character) > 127 for character in term)),
+                    -len(term),
+                    term,
+                ),
+            )[:MAX_CONTEXT_SEARCH_TERMS]
+        )
+        match_query = _fts_query_from_terms(
+            bounded_query_terms,
+            match_all=match_all,
+        )
         if not match_query:
             return []
         source_type_values = tuple(dict.fromkeys(str(item) for item in source_types))
@@ -3188,12 +3207,21 @@ class PersistenceRepositories:
         normalized_query_terms = tuple(
             dict.fromkeys(
                 term
-                for value in query_terms
+                for value in bounded_query_terms
                 for term in _unicode_search_terms(str(value))
             )
         )
         substring_terms = (
-            normalized_query_terms
+            tuple(
+                sorted(
+                    normalized_query_terms,
+                    key=lambda term: (
+                        -int(any(ord(character) > 127 for character in term)),
+                        -len(term),
+                        term,
+                    ),
+                )[:MAX_UNICODE_SUBSTRING_TERMS]
+            )
             if any(
                 any(ord(character) > 127 for character in term)
                 for term in normalized_query_terms
@@ -3269,16 +3297,22 @@ class PersistenceRepositories:
                 phrase_rows = phrase_rows[:limit]
                 break
         if substring_terms:
-            substring_joiner = " AND " if match_all else " OR "
-            substring_clauses = substring_joiner.join(
-                "(instr(bragi_normalize_text(context_sources.title), ?) > 0 "
-                "OR instr(bragi_normalize_text(context_sources.body), ?) > 0)"
-                for _term in substring_terms
-            )
-            substring_params = tuple(
-                value
-                for term in substring_terms
-                for value in (term, term)
+            substring_predicate = (
+                "NOT EXISTS ("
+                "SELECT 1 FROM json_each(?) substring_term "
+                "WHERE instr(bragi_normalize_text(context_sources.title), "
+                "CAST(substring_term.value AS TEXT)) = 0 "
+                "AND instr(bragi_normalize_text(context_sources.body), "
+                "CAST(substring_term.value AS TEXT)) = 0"
+                ")"
+                if match_all
+                else "EXISTS ("
+                "SELECT 1 FROM json_each(?) substring_term "
+                "WHERE instr(bragi_normalize_text(context_sources.title), "
+                "CAST(substring_term.value AS TEXT)) > 0 "
+                "OR instr(bragi_normalize_text(context_sources.body), "
+                "CAST(substring_term.value AS TEXT)) > 0"
+                ")"
             )
             substring_rows = self._fetch_all(
                 f"""
@@ -3302,7 +3336,7 @@ class PersistenceRepositories:
                   AND context_sources.source_type IN (
                       {_placeholders(len(source_type_values))}
                   )
-                  AND ({substring_clauses})
+                  AND ({substring_predicate})
                   {eligibility_sql}
                 ORDER BY context_sources.created_at DESC,
                          context_sources.rowid DESC
@@ -3311,7 +3345,7 @@ class PersistenceRepositories:
                 (
                     save_id,
                     *source_type_values,
-                    *substring_params,
+                    _dump_json(substring_terms),
                     *eligibility_params,
                     limit,
                 ),
@@ -3752,7 +3786,8 @@ class PersistenceRepositories:
             """
             UPDATE context_observations
             SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-            WHERE id IN (
+            WHERE save_id = ?
+              AND id IN (
                 SELECT source_id
                 FROM context_sources
                 WHERE save_id = ?
@@ -3761,7 +3796,7 @@ class PersistenceRepositories:
                       = 'scene_scratch'
             )
             """,
-            (save_id, row["id"]),
+            (save_id, save_id, row["id"]),
         )
         self.connection.execute(
             """
@@ -4209,7 +4244,8 @@ class PersistenceRepositories:
                 """
                 UPDATE context_observations
                 SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                WHERE id IN (
+                WHERE save_id = ?
+                  AND id IN (
                     SELECT source_id
                     FROM context_sources
                     WHERE save_id = ?
@@ -4222,7 +4258,12 @@ class PersistenceRepositories:
                           )
                 )
                 """,
-                (save_id, record.id, record.scene_generation),
+                (
+                    save_id,
+                    save_id,
+                    record.id,
+                    record.scene_generation,
+                ),
             )
             self.connection.execute(
                 """
@@ -8173,6 +8214,35 @@ class PersistenceRepositories:
             source_message_id=source_message_id,
             source_message_ids=source_message_ids,
         )
+        resolved_fingerprint = canonical_claim_fingerprint(body)
+        existing = self.get_memory_by_claim_fingerprint(
+            save_id=save_id,
+            claim_fingerprint=resolved_fingerprint,
+        )
+        if existing is not None:
+            return self.update_memory(
+                memory_id=existing.id,
+                body=existing.body,
+                tags=list(dict.fromkeys((*existing.tags, *tags))),
+                importance=max(existing.importance, importance),
+                source_message_ids=list(
+                    dict.fromkeys(
+                        (
+                            *existing.source_message_ids,
+                            *resolved_source_message_ids,
+                        )
+                    )
+                ),
+                source_observation_ids=list(
+                    dict.fromkeys(
+                        (
+                            *existing.source_observation_ids,
+                            *(source_observation_ids or ()),
+                        )
+                    )
+                ),
+                claim_fingerprint=resolved_fingerprint,
+            )
         record = MemoryRecord(
             id=memory_id or _new_id(),
             save_id=save_id,
@@ -8181,7 +8251,7 @@ class PersistenceRepositories:
             importance=importance,
             source_message_id=source_message_id,
             source_message_ids=resolved_source_message_ids,
-            claim_fingerprint=canonical_claim_fingerprint(body),
+            claim_fingerprint=resolved_fingerprint,
             source_observation_ids=_unique_strings(source_observation_ids or ()),
         )
         self.connection.execute(
@@ -8358,6 +8428,152 @@ class PersistenceRepositories:
             for row in rows
         ]
 
+    def list_memories_for_continuity_index(
+        self,
+        save_id: str,
+        *,
+        limit: int,
+    ) -> list[MemoryRecord]:
+        if limit <= 0:
+            return []
+        rows = self._fetch_all(
+            """
+            WITH classified AS (
+                SELECT
+                    id, save_id, body, tags_json, importance,
+                    source_message_id, source_message_ids_json,
+                    claim_fingerprint, source_observation_ids_json,
+                    created_at, rowid AS source_rowid,
+                    CASE
+                        WHEN (
+                            EXISTS (
+                                SELECT 1 FROM json_each(memories.tags_json) tag
+                                WHERE lower(CAST(tag.value AS TEXT)) = 'dossier'
+                            )
+                            AND EXISTS (
+                                SELECT 1 FROM json_each(memories.tags_json) tag
+                                WHERE lower(CAST(tag.value AS TEXT)) = 'relationship'
+                                   OR lower(CAST(tag.value AS TEXT))
+                                      LIKE 'character:%'
+                            )
+                        ) THEN 0.82
+                        WHEN EXISTS (
+                            SELECT 1 FROM json_each(memories.tags_json) tag
+                            WHERE lower(CAST(tag.value AS TEXT))
+                                  IN ('promise', 'oath', 'obligation', 'quest', 'task')
+                        ) OR lower(memories.body) LIKE '%promised%'
+                          OR lower(memories.body) LIKE '%swore%'
+                          OR lower(memories.body) LIKE '%owes%'
+                          OR lower(memories.body) LIKE '%must%'
+                        THEN 0.9
+                        WHEN EXISTS (
+                            SELECT 1 FROM json_each(memories.tags_json) tag
+                            WHERE lower(CAST(tag.value AS TEXT))
+                                  IN ('relationship', 'trust', 'rivalry')
+                        ) THEN 0.82
+                        WHEN EXISTS (
+                            SELECT 1 FROM json_each(memories.tags_json) tag
+                            WHERE lower(CAST(tag.value AS TEXT))
+                                  IN ('voice', 'speech', 'diction')
+                        ) THEN 0.95
+                        WHEN EXISTS (
+                            SELECT 1 FROM json_each(memories.tags_json) tag
+                            WHERE lower(CAST(tag.value AS TEXT))
+                                  IN ('inventory', 'item', 'object')
+                        ) THEN 0.85
+                        ELSE 0.45
+                    END AS fact_floor,
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM json_each(memories.tags_json) tag
+                            WHERE lower(CAST(tag.value AS TEXT)) IN (
+                                'promise', 'oath', 'obligation', 'quest', 'task',
+                                'relationship', 'trust', 'rivalry',
+                                'voice', 'speech', 'diction',
+                                'inventory', 'item', 'object'
+                            )
+                            OR lower(CAST(tag.value AS TEXT)) LIKE 'character:%'
+                        ) OR lower(memories.body) LIKE '%promised%'
+                          OR lower(memories.body) LIKE '%swore%'
+                          OR lower(memories.body) LIKE '%owes%'
+                          OR lower(memories.body) LIKE '%must%'
+                        THEN 1
+                        ELSE 0
+                    END AS high_value
+                FROM memories
+                WHERE save_id = ? AND archived_at IS NULL
+            ),
+            selected AS (
+                SELECT *
+                FROM classified
+                ORDER BY
+                    high_value DESC,
+                    CASE
+                        WHEN importance > fact_floor THEN importance
+                        ELSE fact_floor
+                    END DESC,
+                    created_at DESC,
+                    source_rowid DESC
+                LIMIT ?
+            )
+            SELECT
+                id, save_id, body, tags_json, importance, source_message_id,
+                source_message_ids_json, claim_fingerprint,
+                source_observation_ids_json
+            FROM selected
+            ORDER BY created_at, source_rowid
+            """,
+            (save_id, limit),
+        )
+        return [
+            MemoryRecord(
+                id=row["id"],
+                save_id=row["save_id"],
+                body=row["body"],
+                tags=_load_list(row["tags_json"]),
+                importance=row["importance"],
+                source_message_id=row["source_message_id"],
+                source_message_ids=_memory_source_message_ids(
+                    source_message_id=row["source_message_id"],
+                    source_message_ids=_load_list(row["source_message_ids_json"]),
+                ),
+                claim_fingerprint=row["claim_fingerprint"],
+                source_observation_ids=_load_list(
+                    row["source_observation_ids_json"]
+                ),
+            )
+            for row in rows
+        ]
+
+    def list_context_observations_by_ids(
+        self,
+        save_id: str,
+        observation_ids: set[str] | frozenset[str],
+    ) -> list[ContextObservationRecord]:
+        if not observation_ids:
+            return []
+        rows = self._fetch_all(
+            """
+            SELECT
+                observations.id, observations.save_id,
+                observations.observation_type, observations.claim,
+                observations.evidence_quote,
+                observations.source_message_ids_json, observations.scope,
+                observations.status, observations.confidence,
+                observations.tags_json, observations.metadata_json,
+                observations.created_at, observations.updated_at,
+                observations.archived_at
+            FROM context_observations AS observations
+            JOIN json_each(?) selected
+              ON observations.id = CAST(selected.value AS TEXT)
+            WHERE observations.save_id = ?
+              AND observations.archived_at IS NULL
+            ORDER BY observations.created_at, observations.rowid
+            """,
+            (_dump_json(sorted(observation_ids)), save_id),
+        )
+        return [_context_observation_from_row(row) for row in rows]
+
     def get_memory_by_claim_fingerprint(
         self,
         *,
@@ -8396,6 +8612,174 @@ class PersistenceRepositories:
                 row["source_observation_ids_json"]
             ),
         )
+
+    def consolidate_active_memory_duplicates(
+        self,
+        *,
+        save_id: str,
+    ) -> dict[str, str]:
+        groups: dict[str, list[MemoryRecord]] = {}
+        for memory in self.list_memories(save_id):
+            fingerprint = (
+                memory.claim_fingerprint
+                or canonical_claim_fingerprint(memory.body)
+            )
+            if fingerprint:
+                groups.setdefault(fingerprint, []).append(memory)
+        remapped_ids: dict[str, str] = {}
+        self.begin_transaction()
+        try:
+            for fingerprint, group in groups.items():
+                if len(group) < 2:
+                    continue
+                keeper = group[0]
+                self.update_memory(
+                    memory_id=keeper.id,
+                    body=keeper.body,
+                    tags=list(
+                        dict.fromkeys(
+                            tag
+                            for memory in group
+                            for tag in memory.tags
+                        )
+                    ),
+                    importance=max(memory.importance for memory in group),
+                    source_message_ids=list(
+                        dict.fromkeys(
+                            source_id
+                            for memory in group
+                            for source_id in memory.source_message_ids
+                        )
+                    ),
+                    source_observation_ids=list(
+                        dict.fromkeys(
+                            observation_id
+                            for memory in group
+                            for observation_id in memory.source_observation_ids
+                        )
+                    ),
+                    claim_fingerprint=fingerprint,
+                )
+                for duplicate in group[1:]:
+                    remapped_ids[duplicate.id] = keeper.id
+                    self.connection.execute(
+                        """
+                        DELETE FROM character_knowledge_edges AS duplicate_edge
+                        WHERE duplicate_edge.save_id = ?
+                          AND duplicate_edge.target_type IN ('memory', 'memories')
+                          AND duplicate_edge.target_id = ?
+                          AND EXISTS (
+                            SELECT 1
+                            FROM character_knowledge_edges AS keeper_edge
+                            WHERE keeper_edge.save_id = duplicate_edge.save_id
+                              AND keeper_edge.character_id =
+                                  duplicate_edge.character_id
+                              AND keeper_edge.target_type =
+                                  duplicate_edge.target_type
+                              AND keeper_edge.target_id = ?
+                          )
+                        """,
+                        (save_id, duplicate.id, keeper.id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE character_knowledge_edges
+                        SET target_id = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE save_id = ?
+                          AND target_type IN ('memory', 'memories')
+                          AND target_id = ?
+                        """,
+                        (keeper.id, save_id, duplicate.id),
+                    )
+                    self.connection.execute(
+                        """
+                        DELETE FROM entity_links AS duplicate_link
+                        WHERE duplicate_link.save_id = ?
+                          AND duplicate_link.target_type IN ('memory', 'memories')
+                          AND duplicate_link.target_id = ?
+                          AND EXISTS (
+                            SELECT 1
+                            FROM entity_links AS keeper_link
+                            WHERE keeper_link.save_id = duplicate_link.save_id
+                              AND keeper_link.entity_type =
+                                  duplicate_link.entity_type
+                              AND keeper_link.entity_id =
+                                  duplicate_link.entity_id
+                              AND keeper_link.target_type =
+                                  duplicate_link.target_type
+                              AND keeper_link.target_id = ?
+                              AND keeper_link.relation =
+                                  duplicate_link.relation
+                          )
+                        """,
+                        (save_id, duplicate.id, keeper.id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE entity_links
+                        SET target_id = ?
+                        WHERE save_id = ?
+                          AND target_type IN ('memory', 'memories')
+                          AND target_id = ?
+                        """,
+                        (keeper.id, save_id, duplicate.id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE OR IGNORE entity_links
+                        SET entity_id = ?
+                        WHERE save_id = ?
+                          AND entity_type IN ('memory', 'memories')
+                          AND entity_id = ?
+                        """,
+                        (keeper.id, save_id, duplicate.id),
+                    )
+                    self.connection.execute(
+                        """
+                        DELETE FROM entity_links
+                        WHERE save_id = ?
+                          AND entity_type IN ('memory', 'memories')
+                          AND entity_id = ?
+                        """,
+                        (save_id, duplicate.id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE context_update_suggestions
+                        SET entity_id = ?
+                        WHERE save_id = ?
+                          AND entity_type = 'memory'
+                          AND entity_id = ?
+                        """,
+                        (keeper.id, save_id, duplicate.id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE context_update_audit
+                        SET entity_id = ?
+                        WHERE save_id = ?
+                          AND entity_type = 'memory'
+                          AND entity_id = ?
+                        """,
+                        (keeper.id, save_id, duplicate.id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE context_sources
+                        SET archived_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE save_id = ?
+                          AND source_type = 'memory'
+                          AND source_id = ?
+                        """,
+                        (save_id, duplicate.id),
+                    )
+                    self.archive_memory(duplicate.id)
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return remapped_ids
 
     def count_active_memories(self, save_id: str) -> int:
         row = self._fetch_one(
@@ -10765,10 +11149,15 @@ def _context_source_eligibility_sql(
             "("
             f"json_array_length(json_extract({alias}.metadata_json, "
             "'$.source_provenance_groups')) > 0 "
-            "AND EXISTS ("
+            "AND ("
+            "("
+            f"json_extract({alias}.metadata_json, '$.source_provenance_mode') "
+            "= 'all' "
+            "AND NOT EXISTS ("
             f"SELECT 1 FROM json_each({alias}.metadata_json, "
             "'$.source_provenance_groups') provenance_group "
-            "WHERE NOT EXISTS ("
+            "WHERE json_array_length(provenance_group.value) > 0 "
+            "AND EXISTS ("
             "SELECT 1 FROM json_each(provenance_group.value) source_message "
             "JOIN message_visibility visibility "
             f"ON visibility.save_id = {alias}.save_id "
@@ -10776,6 +11165,27 @@ def _context_source_eligibility_sql(
             "WHERE visibility.visibility = 'not_visible' "
             f"AND visibility.character_id IN "
             f"({_placeholders(len(visibility_ids))})"
+            ")"
+            ")"
+            ")"
+            " OR "
+            "("
+            f"COALESCE(json_extract({alias}.metadata_json, "
+            "'$.source_provenance_mode'), 'any') != 'all' "
+            "AND EXISTS ("
+            f"SELECT 1 FROM json_each({alias}.metadata_json, "
+            "'$.source_provenance_groups') provenance_group "
+            "WHERE json_array_length(provenance_group.value) > 0 "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM json_each(provenance_group.value) source_message "
+            "JOIN message_visibility visibility "
+            f"ON visibility.save_id = {alias}.save_id "
+            "AND visibility.message_id = CAST(source_message.value AS TEXT) "
+            "WHERE visibility.visibility = 'not_visible' "
+            f"AND visibility.character_id IN "
+            f"({_placeholders(len(visibility_ids))})"
+            ")"
+            ")"
             ")"
             ")"
             ")"
@@ -10807,6 +11217,7 @@ def _context_source_eligibility_sql(
             ")"
             ")"
         )
+        params.extend(visibility_ids)
         params.extend(visibility_ids)
         params.extend(visibility_ids)
     if allowed_owner_names is not None or reference_character_ids is not None:
@@ -10885,9 +11296,17 @@ def _context_source_eligibility_sql(
                 current_turn_number,
             )
         )
-    for source_type, source_id in sorted(blocked_source_keys or ()):
-        clauses.append(f"NOT ({alias}.source_type = ? AND {alias}.source_id = ?)")
-        params.extend((source_type, source_id))
+    blocked_keys = tuple(sorted(blocked_source_keys or ()))
+    if blocked_keys:
+        clauses.append(
+            f"({alias}.source_type, {alias}.source_id) NOT IN ("
+            "SELECT "
+            "CAST(json_extract(value, '$[0]') AS TEXT), "
+            "CAST(json_extract(value, '$[1]') AS TEXT) "
+            "FROM json_each(?)"
+            ")"
+        )
+        params.append(_dump_json(blocked_keys))
     if not clauses:
         return "", ()
     return "AND " + " AND ".join(f"({clause})" for clause in clauses), tuple(params)

@@ -1816,6 +1816,21 @@ def test_import_save_preserves_memory_and_scene_scratch_provenance(
         source_observation_ids=[OBSERVATION_ID],
         claim_fingerprint="forged-imported-fingerprint",
     )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id=memory.id,
+        title="Beacon memory",
+        body=memory.body,
+        metadata={
+            "source_message_ids": [PLAYER_MESSAGE_ID, NARRATOR_MESSAGE_ID],
+            "source_provenance_groups": [
+                [PLAYER_MESSAGE_ID],
+                [NARRATOR_MESSAGE_ID],
+            ],
+            "source_provenance_mode": "any",
+        },
+    )
     location = repositories.add_location(
         save_id=save.id,
         name="Beacon gallery",
@@ -1856,11 +1871,21 @@ def test_import_save_preserves_memory_and_scene_scratch_provenance(
         source_type="observation",
     )
     imported_scene = repositories.get_scene_snapshot(imported_save_id)
+    [imported_memory_source] = repositories.list_context_sources(
+        imported_save_id,
+        source_type="memory",
+    )
+    imported_messages = repositories.list_messages(imported_save_id)
     assert imported_scene is not None
     assert imported_memory.claim_fingerprint == canonical_claim_fingerprint(
         imported_memory.body
     )
     assert imported_memory.source_observation_ids == [imported_observation.id]
+    assert imported_memory_source.source_id == imported_memory.id
+    assert imported_memory_source.metadata["source_provenance_groups"] == [
+        [imported_messages[0].id],
+        [imported_messages[1].id],
+    ]
     assert imported_scratch.source_id == imported_observation.id
     assert imported_scratch.scene_snapshot_id == imported_scene.id
     assert imported_scratch.scene_generation == scene.scene_generation

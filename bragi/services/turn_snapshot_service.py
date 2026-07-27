@@ -516,6 +516,9 @@ class TurnSnapshotService:
                 for row in rows:
                     self._insert_row(table_name, row)
             self._normalize_memory_fingerprints(save_id)
+            self.repositories.consolidate_active_memory_duplicates(
+                save_id=save_id
+            )
             _remove_snapshot_safety_transition_records(
                 self.repositories.connection,
                 save_id=save_id,
@@ -597,6 +600,9 @@ class TurnSnapshotService:
                         )
                     self._insert_row(table_name, remapped)
             self._normalize_memory_fingerprints(fork_save.id)
+            self.repositories.consolidate_active_memory_duplicates(
+                save_id=fork_save.id
+            )
             _remove_snapshot_safety_transition_records(
                 self.repositories.connection,
                 save_id=fork_save.id,

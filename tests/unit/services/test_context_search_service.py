@@ -960,14 +960,14 @@ def test_context_search_uses_curated_observation_sources_without_raw_duplicate(
     assert _candidate_source_id(
         prompt,
         source_type="observation",
-        expected_text="Curated ruby omen",
+        expected_text="Saved context",
     ) == observation.id
     assert "The ruby omen means the bridge oath is fragile." in prompt
     assert f"Evidence: {observation.evidence_quote}" not in prompt
     assert [item.source_id for item in result.selected_observations] == [
         observation.id
     ]
-    assert "Curated ruby omen" in result.selected_observations[0].text
+    assert "Saved context" in result.selected_observations[0].text
     job_result = json.loads(
         _context_search_jobs(repositories, save.id)[-1]["result_json"]
     )
@@ -4145,7 +4145,13 @@ def test_context_search_indexes_exact_memory_beyond_previous_default_bound(
     repositories.update_message_body(
         save_id=save.id,
         message_id=player_message.id,
-        body="I use the obsidian astrolabe at the forgotten observatory.",
+        body=(
+            "Before acting I consider weather guards ropes lanterns maps "
+            "rations witnesses schedules locks routes signals bridges towers. "
+            "The obsidian astrolabe opens the forgotten observatory. "
+            "Afterward I discuss supplies patrols repairs messages allies "
+            "horses gates ledgers bells windows courtyards kitchens cellars."
+        ),
     )
     provider = RecordingStructuredContextProvider(
         {

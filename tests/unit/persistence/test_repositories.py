@@ -3786,6 +3786,37 @@ def test_repositories_mixed_unicode_match_all_requires_ascii_terms(
     assert [hit.record for hit in hits] == [target]
 
 
+def test_repositories_bound_large_mixed_script_query(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-large-mixed-query",
+        title="古い秘密の扉",
+        body="古い秘密の扉は月石で開く。",
+    )
+    query_terms = {f"unrelatedterm{index:04d}" for index in range(1_100)}
+    query_terms.add("秘密")
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms=query_terms,
+        source_types={"memory"},
+        limit=8,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
 def test_repositories_exact_phrase_precedes_bounded_all_term_matches(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -4049,6 +4080,21 @@ def test_repositories_filter_singular_message_provenance_and_allow_visible_group
             ],
         },
     )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="conjunctive-grounding",
+        title="moonstone and vault code",
+        body="The moonstone opens the archive and reveals the hidden vault code.",
+        metadata={
+            "source_message_ids": [hidden_message.id, visible_message.id],
+            "source_provenance_groups": [
+                [hidden_message.id],
+                [visible_message.id],
+            ],
+            "source_provenance_mode": "all",
+        },
+    )
 
     hits = repositories.search_context_sources(
         save.id,
@@ -4083,6 +4129,10 @@ def test_repositories_apply_blocked_scoped_targets_before_search_limit(
             body="The moonstone opens the concealed archive.",
         )
         blocked.add(("memory", source_id))
+    blocked.update(
+        ("memory", f"nonexistent-hidden-{index:04d}")
+        for index in range(1_100)
+    )
     accessible = repositories.upsert_context_source(
         save_id=save.id,
         source_type="memory",

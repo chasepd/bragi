@@ -1361,15 +1361,29 @@ class ChatBundleService:
             ]
             if not source_observation_ids:
                 continue
-            self.repositories.update_memory(
-                memory_id=imported_memory.id,
-                body=imported_memory.body,
-                tags=imported_memory.tags,
-                importance=imported_memory.importance,
-                source_message_ids=imported_memory.source_message_ids,
-                source_observation_ids=source_observation_ids,
+            current_memory = self.repositories.get_memory_by_claim_fingerprint(
+                save_id=save.id,
                 claim_fingerprint=imported_memory.claim_fingerprint,
             )
+            if current_memory is None:
+                continue
+            self.repositories.update_memory(
+                memory_id=current_memory.id,
+                body=current_memory.body,
+                tags=current_memory.tags,
+                importance=current_memory.importance,
+                source_message_ids=current_memory.source_message_ids,
+                source_observation_ids=list(
+                    dict.fromkeys(
+                        (
+                            *current_memory.source_observation_ids,
+                            *source_observation_ids,
+                        )
+                    )
+                ),
+                claim_fingerprint=current_memory.claim_fingerprint,
+            )
+        self.repositories.consolidate_active_memory_duplicates(save_id=save.id)
 
         scenario_update_id_map: dict[str, str] = {}
         for row in _list_of_objects(
@@ -4746,6 +4760,36 @@ def _remapped_context_source_metadata_json(
             if mapped is not None:
                 mapped_items.append(mapped)
         remapped[field] = mapped_items
+    if "source_provenance_groups" in remapped:
+        raw_groups = remapped["source_provenance_groups"]
+        if not isinstance(raw_groups, list) or not all(
+            isinstance(group, list)
+            and all(isinstance(item, str) and item for item in group)
+            for group in raw_groups
+        ):
+            raise ChatBundleError(
+                "Bundle context_sources.metadata_json."
+                "source_provenance_groups must be a list of message-id lists"
+            )
+        mapped_groups: list[list[str]] = []
+        for group in raw_groups:
+            mapped_group: list[str] = []
+            for item in group:
+                mapped = _mapped_optional_source_ref(
+                    item,
+                    message_id_map,
+                    character_text_message_id_map,
+                    (
+                        "context_sources.metadata_json."
+                        "source_provenance_groups"
+                    ),
+                    repair_tracker,
+                )
+                if mapped is not None:
+                    mapped_group.append(mapped)
+            if mapped_group:
+                mapped_groups.append(mapped_group)
+        remapped["source_provenance_groups"] = mapped_groups
     return _dump_json_compact(remapped)
 
 

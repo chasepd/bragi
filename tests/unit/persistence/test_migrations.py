@@ -387,11 +387,59 @@ def test_migrate_database_upgrades_schema_70_context_lifecycle(
             importance=0.4,
             source_observation_ids=[observation.id],
         )
-        repositories.add_memory(
+        duplicate_id = "legacy-duplicate-memory"
+        connection.execute(
+            """
+            INSERT INTO memories(
+                id, save_id, body, tags_json, importance,
+                source_message_ids_json, claim_fingerprint,
+                source_observation_ids_json
+            )
+            VALUES (?, ?, ?, ?, ?, '[]', ?, '[]')
+            """,
+            (
+                duplicate_id,
+                save.id,
+                "mara likes tea",
+                json.dumps(["tea"], separators=(",", ":")),
+                0.9,
+                sha256(b"mara likes tea").hexdigest(),
+            ),
+        )
+        character = repositories.add_character(
             save_id=save.id,
-            body="mara likes tea",
-            tags=["tea"],
-            importance=0.9,
+            name="Captain Ilyra",
+        )
+        repositories.add_character_knowledge_edge(
+            save_id=save.id,
+            character_id=character.id,
+            target_type="memory",
+            target_id=duplicate_id,
+        )
+        repositories.add_entity_link(
+            save_id=save.id,
+            entity_type="character",
+            entity_id=character.id,
+            target_type="memory",
+            target_id=duplicate_id,
+            relation="recalls",
+        )
+        suggestion = repositories.add_context_update_suggestion(
+            save_id=save.id,
+            update_type="update",
+            entity_type="memory",
+            entity_id=duplicate_id,
+            field_path="tags",
+            proposed_value=["tea"],
+        )
+        audit = repositories.add_context_update_audit(
+            save_id=save.id,
+            operation="legacy-memory-update",
+            entity_type="memory",
+            entity_id=duplicate_id,
+            field_path="tags",
+            before=[],
+            after=["tea"],
         )
         connection.execute("DROP INDEX idx_memories_save_claim_fingerprint_active")
         connection.execute(
@@ -449,6 +497,30 @@ def test_migrate_database_upgrades_schema_70_context_lifecycle(
                 0.9,
             )
         ]
+        assert connection.execute(
+            """
+            SELECT target_id
+            FROM character_knowledge_edges
+            WHERE character_id = ?
+            """,
+            (character.id,),
+        ).fetchone() == (memory.id,)
+        assert connection.execute(
+            """
+            SELECT target_id
+            FROM entity_links
+            WHERE entity_type = 'character' AND entity_id = ?
+            """,
+            (character.id,),
+        ).fetchone() == (memory.id,)
+        assert connection.execute(
+            "SELECT entity_id FROM context_update_suggestions WHERE id = ?",
+            (suggestion.id,),
+        ).fetchone() == (memory.id,)
+        assert connection.execute(
+            "SELECT entity_id FROM context_update_audit WHERE id = ?",
+            (audit.id,),
+        ).fetchone() == (memory.id,)
         index_row = connection.execute(
             """
             SELECT sql FROM sqlite_master

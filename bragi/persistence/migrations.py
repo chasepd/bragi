@@ -1837,6 +1837,13 @@ def _migrate_schema_70_to_71(connection: sqlite3.Connection) -> None:
                 ),
             )
             duplicate_ids = [str(row[0]) for row in group[1:]]
+            for duplicate_id in duplicate_ids:
+                _remap_migrated_memory_references(
+                    connection,
+                    save_id=save_id,
+                    duplicate_id=duplicate_id,
+                    keeper_id=str(keeper[0]),
+                )
             connection.execute(
                 f"""
                 UPDATE memories
@@ -1867,6 +1874,87 @@ def _migrate_schema_70_to_71(connection: sqlite3.Connection) -> None:
             """
         )
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (71)")
+
+
+def _remap_migrated_memory_references(
+    connection: sqlite3.Connection,
+    *,
+    save_id: str,
+    duplicate_id: str,
+    keeper_id: str,
+) -> None:
+    if _table_exists(connection, "character_knowledge_edges"):
+        connection.execute(
+            """
+            UPDATE OR IGNORE character_knowledge_edges
+            SET target_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE save_id = ?
+              AND target_type IN ('memory', 'memories')
+              AND target_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM character_knowledge_edges
+            WHERE save_id = ?
+              AND target_type IN ('memory', 'memories')
+              AND target_id = ?
+            """,
+            (save_id, duplicate_id),
+        )
+    if _table_exists(connection, "entity_links"):
+        connection.execute(
+            """
+            UPDATE OR IGNORE entity_links
+            SET entity_id = ?
+            WHERE save_id = ?
+              AND entity_type IN ('memory', 'memories')
+              AND entity_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM entity_links
+            WHERE save_id = ?
+              AND entity_type IN ('memory', 'memories')
+              AND entity_id = ?
+            """,
+            (save_id, duplicate_id),
+        )
+        connection.execute(
+            """
+            UPDATE OR IGNORE entity_links
+            SET target_id = ?
+            WHERE save_id = ?
+              AND target_type IN ('memory', 'memories')
+              AND target_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
+        )
+        connection.execute(
+            """
+            DELETE FROM entity_links
+            WHERE save_id = ?
+              AND target_type IN ('memory', 'memories')
+              AND target_id = ?
+            """,
+            (save_id, duplicate_id),
+        )
+    for table_name in ("context_update_suggestions", "context_update_audit"):
+        if not _table_exists(connection, table_name):
+            continue
+        connection.execute(
+            f"""
+            UPDATE {table_name}
+            SET entity_id = ?
+            WHERE save_id = ?
+              AND entity_type = 'memory'
+              AND entity_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
+        )
 
 
 def _migration_claim_fingerprint(value: object) -> str:

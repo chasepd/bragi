@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from bragi.persistence.migrations import migrate_database
+from bragi.persistence.models import ContextObservationRecord, MemoryRecord
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.services.continuity_index_service import ContinuityIndexService
 
@@ -221,6 +222,183 @@ def test_continuity_index_caps_low_value_memories_but_keeps_high_value_facts(
     assert low_value[1].id not in indexed_memory_ids
     assert low_value[2].id not in indexed_memory_ids
     assert result.skipped_counts["memory"] == 3
+
+
+def test_continuity_index_bounds_memory_and_observation_hydration(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    source = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The watch records several details.",
+    )
+    observations = [
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="world_fact",
+            claim=f"Detail {index}.",
+            evidence_quote="records several details",
+            source_message_ids=[source.id],
+            scope="durable",
+            status="accepted",
+            confidence=0.8,
+            tags=["detail"],
+        )
+        for index in range(5)
+    ]
+    for index, observation in enumerate(observations):
+        repositories.add_memory(
+            save_id=save.id,
+            body=f"Recorded detail {index}.",
+            tags=["detail"],
+            importance=float(index) / 10,
+            source_message_id=source.id,
+            source_observation_ids=[observation.id],
+        )
+
+    class BoundedRepositories(PersistenceRepositories):
+        selected_observation_ids: set[str] = set()
+
+        def list_memories(self, save_id: str) -> list[MemoryRecord]:
+            raise AssertionError("continuity sync must not load every memory")
+
+        def list_context_observations(
+            self,
+            save_id: str,
+            *,
+            statuses: set[str] | frozenset[str] | tuple[str, ...] | None = None,
+            include_archived: bool = False,
+        ) -> list[ContextObservationRecord]:
+            raise AssertionError("continuity sync must not load every observation")
+
+        def list_context_observations_by_ids(
+            self,
+            save_id: str,
+            observation_ids: set[str] | frozenset[str],
+        ) -> list[ContextObservationRecord]:
+            self.selected_observation_ids = set(observation_ids)
+            return super().list_context_observations_by_ids(
+                save_id,
+                observation_ids,
+            )
+
+    bounded = BoundedRepositories(repositories.connection)
+    result = ContinuityIndexService(bounded, memory_limit=2).sync_save(save.id)
+
+    assert result.skipped_counts["memory"] == 3
+    assert len(bounded.selected_observation_ids) == 2
+    indexed = bounded.list_context_sources(save.id, source_type="memory")
+    assert len(indexed) == 2
+
+
+def test_continuity_index_distinguishes_conjunctive_and_alternative_provenance(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    first_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The vault code is amber.",
+    )
+    second_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The beacon is lit.",
+    )
+    first = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="world_fact",
+        claim="The vault code is amber.",
+        evidence_quote="The vault code is amber",
+        source_message_ids=[first_message.id],
+        scope="durable",
+        status="accepted",
+        confidence=0.9,
+        tags=["vault"],
+        metadata={
+            "curation": {
+                "action": "durable_memory",
+                "memory_body": "The vault code is amber.",
+            }
+        },
+    )
+    second = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="world_fact",
+        claim="The beacon is lit.",
+        evidence_quote="The beacon is lit",
+        source_message_ids=[second_message.id],
+        scope="durable",
+        status="accepted",
+        confidence=0.9,
+        tags=["beacon"],
+        metadata={
+            "curation": {
+                "action": "durable_memory",
+                "memory_body": "The beacon is lit.",
+            }
+        },
+    )
+    combined = repositories.add_memory(
+        save_id=save.id,
+        body="The vault code is amber and the beacon is lit.",
+        tags=["vault", "beacon"],
+        importance=0.9,
+        source_message_ids=[first_message.id, second_message.id],
+        source_observation_ids=[first.id, second.id],
+    )
+    duplicate_evidence = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="world_fact",
+        claim="The beacon is lit.",
+        evidence_quote="The beacon is lit",
+        source_message_ids=[first_message.id],
+        scope="durable",
+        status="accepted",
+        confidence=0.9,
+        tags=["beacon"],
+        metadata={
+            "curation": {
+                "action": "durable_memory",
+                "memory_body": "The beacon is lit.",
+            }
+        },
+    )
+    repeated = repositories.add_memory(
+        save_id=save.id,
+        body="The beacon is lit.",
+        tags=["beacon"],
+        importance=0.9,
+        source_message_ids=[first_message.id, second_message.id],
+        source_observation_ids=[second.id, duplicate_evidence.id],
+    )
+
+    ContinuityIndexService(repositories).sync_save(save.id)
+
+    by_source = {
+        source.source_id: source
+        for source in repositories.list_context_sources(
+            save.id,
+            source_type="memory",
+        )
+    }
+    assert by_source[combined.id].metadata["source_provenance_mode"] == "all"
+    assert by_source[repeated.id].metadata["source_provenance_mode"] == "any"
 
 
 def test_continuity_index_world_state_cap_prefers_recent_ties(

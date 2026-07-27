@@ -3749,23 +3749,30 @@ def _apply_focused_scene_update(
     if snapshot is None:
         return
     previous_location_id = snapshot.current_location_id
+    generation_before = snapshot.scene_generation
     scene_updates: list[tuple[str, object]] = []
     current_location = _find_location(
         applier.snapshot.locations,
         extracted.current_location_name,
     )
-    location_changed = (
-        current_location is not None
-        and current_location.id != previous_location_id
-    )
-    if extracted.scene_transition and not location_changed:
+    if current_location is not None:
+        snapshot = applier._apply_scene_field(
+            snapshot=snapshot,
+            field_path="current_location_id",
+            value=current_location.id,
+            reason=extracted.reason,
+            confidence=extracted.confidence,
+            source_message_id=extracted.source_message_id,
+        )
+    if (
+        extracted.scene_transition
+        and snapshot.scene_generation == generation_before
+    ):
         snapshot = applier.repositories.advance_scene_generation(
             save_id=applier.save_id,
             source_message_id=extracted.source_message_id,
         )
-        applier.scene_snapshot = snapshot
-    if current_location is not None:
-        scene_updates.append(("current_location_id", current_location.id))
+    applier.scene_snapshot = snapshot
     if extracted.in_world_time.strip():
         scene_updates.append(("in_world_time", extracted.in_world_time.strip()))
     if extracted.weather.strip():
@@ -3784,9 +3791,6 @@ def _apply_focused_scene_update(
     )
     if present_character_ids is not None:
         scene_updates.append(("present_character_ids", present_character_ids))
-    if not scene_updates:
-        return
-
     original_snapshot = snapshot
     for field_path, value in scene_updates:
         snapshot = applier._apply_scene_field(
@@ -4932,21 +4936,28 @@ class _ContextUpdateApplier:
             return
 
         next_location_id = current_location.id if current_location is not None else None
-        location_changed = (
-            next_location_id is not None
-            and previous_location_id != next_location_id
-        )
-        if extracted.scene_transition and not location_changed:
+        generation_before = existing.scene_generation
+        snapshot = existing
+        if next_location_id is not None:
+            snapshot = self._apply_scene_field(
+                snapshot=snapshot,
+                field_path="current_location_id",
+                value=next_location_id,
+                reason=extracted.reason,
+                confidence=extracted.confidence,
+                source_message_id=extracted.source_message_id,
+            )
+        if (
+            extracted.scene_transition
+            and snapshot.scene_generation == generation_before
+        ):
             existing = self.repositories.advance_scene_generation(
                 save_id=self.save_id,
                 source_message_id=extracted.source_message_id,
             )
-        snapshot = existing
+            snapshot = existing
+        location_changed = snapshot.current_location_id != previous_location_id
         scene_updates: list[tuple[str, object]] = [
-            (
-                "current_location_id",
-                next_location_id,
-            ),
             ("situation", extracted.situation.strip()),
             ("objective", extracted.objective.strip()),
             ("in_world_time", normalized_time),

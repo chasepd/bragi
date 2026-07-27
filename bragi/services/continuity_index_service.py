@@ -10,6 +10,7 @@ from bragi.persistence.models import (
     CharacterRecord,
     CharacterTextMessageRecord,
     CharacterTextThreadRecord,
+    ContextObservationRecord,
     ContextSourceRecord,
     LocationRecord,
     MemoryRecord,
@@ -17,7 +18,10 @@ from bragi.persistence.models import (
     SceneSnapshotRecord,
     WorldStateRecord,
 )
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.services.active_thread_lifecycle import (
     active_thread_is_prompt_visible,
     normalize_active_thread_status,
@@ -205,17 +209,30 @@ class ContinuityIndexService:
 
     def _sync_memories(self, save_id: str) -> tuple[list[ContextSourceRecord], int]:
         records: list[ContextSourceRecord] = []
-        active_memories = tuple(self.repositories.list_memories(save_id))
+        active_count = self.repositories.count_active_memories(save_id)
+        if self.memory_limit is None:
+            indexed_memories = tuple(self.repositories.list_memories(save_id))
+        elif self.memory_limit <= 0:
+            indexed_memories = ()
+        else:
+            indexed_memories = tuple(
+                self.repositories.list_memories_for_continuity_index(
+                    save_id,
+                    limit=self.memory_limit,
+                )
+            )
+        selected_observation_ids = {
+            observation_id
+            for memory in indexed_memories
+            for observation_id in memory.source_observation_ids
+        }
         observations_by_id = {
             observation.id: observation
-            for observation in self.repositories.list_context_observations(save_id)
+            for observation in self.repositories.list_context_observations_by_ids(
+                save_id,
+                selected_observation_ids,
+            )
         }
-        indexed_memories = _bounded_records(
-            active_memories,
-            self.memory_limit,
-            priority=_memory_index_priority,
-            prefer_recent=True,
-        )
         for memory in indexed_memories:
             fact_type = _memory_fact_type(memory)
             source_message_ids = tuple(_memory_source_message_ids(memory))
@@ -258,11 +275,15 @@ class ContinuityIndexService:
                     | {
                         "tags": list(memory.tags),
                         "source_provenance_groups": provenance_groups,
+                        "source_provenance_mode": _memory_provenance_mode(
+                            memory,
+                            observations_by_id=observations_by_id,
+                        ),
                     },
                     token_estimate=_estimate_tokens(memory.body),
                 )
             )
-        return records, max(0, len(active_memories) - len(indexed_memories))
+        return records, max(0, active_count - len(indexed_memories))
 
     def _sync_summaries(self, save_id: str) -> tuple[list[ContextSourceRecord], int]:
         records: list[ContextSourceRecord] = []
@@ -680,6 +701,34 @@ def _memory_source_message_ids(memory: MemoryRecord) -> tuple[str, ...]:
     if memory.source_message_id:
         source_ids.insert(0, memory.source_message_id)
     return tuple(dict.fromkeys(source_id for source_id in source_ids if source_id))
+
+
+def _memory_provenance_mode(
+    memory: MemoryRecord,
+    *,
+    observations_by_id: dict[str, ContextObservationRecord],
+) -> str:
+    memory_fingerprint = (
+        memory.claim_fingerprint or canonical_claim_fingerprint(memory.body)
+    )
+    for observation_id in memory.source_observation_ids:
+        observation = observations_by_id.get(observation_id)
+        if observation is None:
+            return "all"
+        curation = observation.metadata.get("curation")
+        curated_body = (
+            curation.get("memory_body")
+            if isinstance(curation, dict)
+            else None
+        )
+        supporting_body = (
+            curated_body.strip()
+            if isinstance(curated_body, str) and curated_body.strip()
+            else observation.claim
+        )
+        if canonical_claim_fingerprint(supporting_body) != memory_fingerprint:
+            return "all"
+    return "any"
 
 
 def _fact_type_importance(fact_type: str) -> float:

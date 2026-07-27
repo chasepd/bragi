@@ -105,6 +105,10 @@ STATE_CHANGE_CANDIDATE_LIMIT = 16
 MEDIA_ASSET_CANDIDATE_LIMIT = 8
 INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT = 80
 PROTECTED_CONTEXT_SOURCE_LIMIT = 32
+MAX_CONTEXT_QUERY_CHARS = 8_000
+MAX_CONTEXT_QUERY_TERMS = 64
+MAX_CONTEXT_EXACT_PHRASE_CHARS = 512
+MAX_CONTEXT_EXACT_PHRASES = 4
 INDEXED_CONTEXT_SOURCE_TYPES = frozenset(
     {
         "character_text_thread",
@@ -935,18 +939,25 @@ def _indexed_context_source_retrieval(
     additional_query_terms: tuple[str, ...] = (),
 ) -> _IndexedContextSourceRetrieval:
     started_at = perf_counter()
+    query_text = " ".join((latest_player_message, *additional_query_terms))
+    if len(query_text) > MAX_CONTEXT_QUERY_CHARS:
+        half = MAX_CONTEXT_QUERY_CHARS // 2
+        query_text = f"{query_text[:half]} {query_text[-half:]}"
     query_terms = sorted(
-        _meaningful_terms(
-            " ".join((latest_player_message, *additional_query_terms))
-        )
-    )
+        _meaningful_terms(query_text),
+        key=lambda term: (
+            -int(any(ord(character) > 127 for character in term)),
+            -len(term),
+            term,
+        ),
+    )[:MAX_CONTEXT_QUERY_TERMS]
     exact_phrases = tuple(
         dict.fromkeys(
-            phrase.strip()
+            phrase.strip()[:MAX_CONTEXT_EXACT_PHRASE_CHARS]
             for phrase in (latest_player_message, *additional_query_terms)
             if " " in phrase.strip()
         )
-    )
+    )[:MAX_CONTEXT_EXACT_PHRASES]
     turn_scope = character_scope_for_turn(
         scene_snapshot=scene_snapshot,
         characters=characters,
@@ -3312,7 +3323,7 @@ def _exact_raw_candidates(
         overlap_count = len(query_terms & candidate_terms)
         if overlap_count < min(2, len(query_terms)):
             continue
-        coverage = overlap_count / len(query_terms)
+        coverage = overlap_count / len(candidate_terms)
         if coverage < 0.5:
             continue
         ranked.append((coverage + overlap_count, candidate))
@@ -3860,7 +3871,7 @@ def _metadata_provenance_visible_to_present_characters(
     )
     nonempty_groups = tuple(group for group in groups if group)
     if nonempty_groups:
-        return any(
+        group_visibility = (
             _source_messages_visible_to_present_characters(
                 group,
                 present_character_ids=present_character_ids,
@@ -3868,6 +3879,9 @@ def _metadata_provenance_visible_to_present_characters(
             )
             for group in nonempty_groups
         )
+        if metadata.get("source_provenance_mode") == "all":
+            return all(group_visibility)
+        return any(group_visibility)
     return _source_messages_visible_to_present_characters(
         _metadata_source_message_ids(metadata),
         present_character_ids=present_character_ids,

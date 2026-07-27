@@ -6326,6 +6326,150 @@ def test_focused_scene_transition_expires_scratch_at_same_location(
     assert repositories.get_context_source(scratch.id) is None
 
 
+def test_focused_scene_transition_advances_when_location_change_is_locked(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    old_location = repositories.add_location(
+        save_id=save.id,
+        name="Beacon Gallery",
+    )
+    repositories.add_location(save_id=save.id, name="Gatehouse")
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=old_location.id,
+        situation="The watch studies the cracked lens.",
+        locked_fields=["current_location_id"],
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="observation",
+        source_id="locked-location-scratch",
+        title="Temporary lens state",
+        body="The cracked lens is still warm.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=1,
+        expires_after_turn_number=13,
+    )
+    narrator_message = repositories.update_message_body(
+        save_id=save.id,
+        message_id=narrator_message.id,
+        body="The narration cuts to a new scene in the Gatehouse.",
+    )
+    provider = SequenceToolCallProvider(
+        responses=[
+            (),
+            (
+                ProviderToolCall(
+                    id="locked-location-scene-transition",
+                    name="set_scene_location_presence",
+                    arguments_json=json.dumps(
+                        {
+                            "current_location_name": "Gatehouse",
+                            "scene_transition": True,
+                            "source_message_id": narrator_message.id,
+                            "evidence_quote": "cuts to a new scene in the Gatehouse",
+                            "reason": "The narration establishes a new scene.",
+                            "confidence": 0.98,
+                        }
+                    ),
+                ),
+            ),
+            (),
+        ]
+    )
+
+    asyncio.run(
+        module.ContextUpdateService(
+            repositories=repositories,
+            extractor=RecordingContextUpdateExtractor(
+                module.ContextUpdateExtraction()
+            ),
+            focused_scene_maintainer=module.ToolCallingFocusedSceneMaintainer(
+                provider=provider,
+                provider_name="fake",
+                model_id="fake-context-update",
+            ),
+        ).update_after_turn(
+            save_id=save.id,
+            source_message_ids=(player_message.id, narrator_message.id),
+        )
+    )
+
+    updated = repositories.get_scene_snapshot(save.id)
+    assert updated is not None
+    assert updated.current_location_id == old_location.id
+    assert updated.scene_generation == scene.scene_generation + 1
+    assert repositories.get_context_source(scratch.id) is None
+    assert any(
+        suggestion.entity_type == "scene_snapshot"
+        and suggestion.field_path == "current_location_id"
+        for suggestion in repositories.list_context_update_suggestions(save.id)
+    )
+
+
+def test_scene_transition_advances_when_extracted_location_change_is_locked(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, _player_message, narrator_message = _save_with_completed_turn(repositories)
+    old_location = repositories.add_location(
+        save_id=save.id,
+        name="Beacon Gallery",
+    )
+    repositories.add_location(save_id=save.id, name="Gatehouse")
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=old_location.id,
+        situation="The watch studies the cracked lens.",
+        nearby_objects=["signal horn"],
+        hazards=["hot glass"],
+        locked_fields=["current_location_id"],
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="observation",
+        source_id="broad-locked-location-scratch",
+        title="Temporary lens state",
+        body="The cracked lens is still warm.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=1,
+        expires_after_turn_number=13,
+    )
+    extraction = module.ContextUpdateExtraction(
+        scene=module.ExtractedSceneSnapshot(
+            source_message_id=narrator_message.id,
+            current_location_name="Gatehouse",
+            scene_transition=True,
+            reason="The narration establishes a new scene.",
+            confidence=0.98,
+        )
+    )
+
+    asyncio.run(
+        module.ContextUpdateService(
+            repositories=repositories,
+            extractor=RecordingContextUpdateExtractor(extraction),
+        ).update_after_turn(
+            save_id=save.id,
+            source_message_ids=(narrator_message.id,),
+        )
+    )
+
+    updated = repositories.get_scene_snapshot(save.id)
+    assert updated is not None
+    assert updated.current_location_id == old_location.id
+    assert updated.scene_generation == scene.scene_generation + 1
+    assert updated.nearby_objects == ["signal horn"]
+    assert updated.hazards == ["hot glass"]
+    assert repositories.get_context_source(scratch.id) is None
+
+
 def test_focused_scene_maintainer_uses_snapshot_emotion_scope_for_invalid_presence(
     repositories: PersistenceRepositories,
 ) -> None:

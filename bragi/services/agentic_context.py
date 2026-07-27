@@ -810,7 +810,9 @@ class ContextCurationService:
                     source_type="observation",
                     source_id=curated_observation.id,
                     title=(
-                        decision.context_title.strip() or curated_observation.claim
+                        "Scene scratch"
+                        if decision.action == "scene_scratch"
+                        else "Saved context"
                     ),
                     body=body,
                     metadata={
@@ -1537,7 +1539,7 @@ def _curation_schema(
                         "reason": {"type": "string"},
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
                         "memory_body": {"type": "string"},
-                        "context_title": {"type": "string"},
+                        "context_title": {"type": "string", "maxLength": 256},
                         "context_body": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "grounding_status": {
@@ -3103,7 +3105,6 @@ def _decision_metadata(decision: CurationDecision) -> dict[str, object]:
         "reason": decision.reason,
         "confidence": decision.confidence,
         "memory_body": decision.memory_body,
-        "context_title": decision.context_title,
         "context_body": decision.context_body,
         "tags": list(decision.tags),
         "grounding_status": decision.grounding_status,
@@ -3259,20 +3260,30 @@ def _curated_decision_is_grounded(
 
 def _grounding_terms(value: str) -> set[str]:
     stopwords = {
+        "a",
+        "an",
         "and",
+        "as",
+        "at",
+        "by",
         "for",
         "from",
+        "in",
         "into",
+        "is",
+        "of",
+        "on",
         "that",
         "the",
         "this",
+        "to",
         "was",
         "with",
     }
     terms = {
         term
         for term in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
-        if len(term) >= 3 and term not in stopwords
+        if term and term not in stopwords
     }
     terms.update(
         term
