@@ -326,7 +326,7 @@ class WebMaintenanceScheduler:
                 self._state.repositories.complete_scheduled_task(
                     task.id,
                     succeeded=False,
-                    error=str(exc),
+                    error=_scheduled_task_error(definition, str(exc)),
                     last_job_id=handle.record.id,
                     next_run_after_seconds=_backoff_seconds(task.failure_count),
                 )
@@ -334,11 +334,19 @@ class WebMaintenanceScheduler:
             payload = _job_result_payload(result)
             error = payload.get("error")
             succeeded = not isinstance(error, str) or not error
+            if definition.task_type == OBSERVATION_CURATION_DRAIN_TASK:
+                payload.pop("error", None)
+                payload.pop("failure_text", None)
+                if not succeeded:
+                    payload["error_present"] = True
             self._state.repositories.complete_scheduled_task(
                 task.id,
                 succeeded=succeeded,
                 result=payload,
-                error=error if isinstance(error, str) else None,
+                error=_scheduled_task_error(
+                    definition,
+                    error if isinstance(error, str) else None,
+                ),
                 last_job_id=handle.record.id,
                 next_run_after_seconds=(
                     definition.interval_seconds
@@ -962,6 +970,17 @@ def _backoff_seconds(failure_count: int) -> int:
             _SCHEDULER_RETRY_SECONDS * (2 ** min(max(failure_count, 0), 5)),
         )
     )
+
+
+def _scheduled_task_error(
+    definition: _MaintenanceTaskDefinition,
+    error: str | None,
+) -> str | None:
+    if not error:
+        return None
+    if definition.task_type == OBSERVATION_CURATION_DRAIN_TASK:
+        return "observation_curation_failed"
+    return error
 
 
 _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (

@@ -119,6 +119,10 @@ class CurationResult:
     skipped_reason: str = ""
 
 
+class CurationLeaseLostError(RuntimeError):
+    """Raised when a curation worker can no longer renew its claimed rows."""
+
+
 @dataclass(frozen=True)
 class NpcIntent:
     character_name: str
@@ -530,14 +534,17 @@ class StructuredProviderContextCurator:
                 > self.input_token_budget
             ):
                 continue
-            retry_response = await _structured_response(
-                provider=self.provider,
-                repositories=self.repositories,
-                providers=self.providers,
-                request=retry_request,
-                task="memory_curation",
-                save_id=save_id,
-            )
+            try:
+                retry_response = await _structured_response(
+                    provider=self.provider,
+                    repositories=self.repositories,
+                    providers=self.providers,
+                    request=retry_request,
+                    task="memory_curation",
+                    save_id=save_id,
+                )
+            except Exception:
+                continue
             retry_decisions = _curation_decisions_from_data(
                 retry_response.data,
                 (observation,),
@@ -573,6 +580,7 @@ class ContextCurationService:
         batch_item_limit: int = CURATION_BATCH_ITEM_LIMIT,
         input_token_budget: int = CURATION_INPUT_TOKEN_BUDGET,
         lease_seconds: int = CURATION_LEASE_SECONDS,
+        lease_renewal_interval_seconds: float | None = None,
         max_attempts: int = CURATION_MAX_ATTEMPTS,
         retry_delays_seconds: tuple[int, ...] = CURATION_RETRY_DELAYS_SECONDS,
         apply_guard: _ApplyGuardFactory | None = None,
@@ -582,6 +590,15 @@ class ContextCurationService:
         self.batch_item_limit = max(1, batch_item_limit)
         self.input_token_budget = max(1, input_token_budget)
         self.lease_seconds = max(1, lease_seconds)
+        self.lease_renewal_interval_seconds = min(
+            max(0.01, self.lease_seconds / 2),
+            max(
+                0.01,
+                lease_renewal_interval_seconds
+                if lease_renewal_interval_seconds is not None
+                else self.lease_seconds / 3,
+            ),
+        )
         self.max_attempts = max(1, max_attempts)
         self.retry_delays_seconds = retry_delays_seconds or (60,)
         self.apply_guard = apply_guard
@@ -684,13 +701,16 @@ class ContextCurationService:
             )
         try:
             decisions = await self._await_claimed_operation(
-                self.curator.curate(
+                self._curate_with_lease_renewal(
                     save_id=save_id,
                     observations=observations,
+                    lease_token=lease_token,
                 ),
                 observations=all_observations,
                 lease_token=lease_token,
             )
+        except CurationLeaseLostError:
+            raise
         except Exception:
             terminal_failure_count = 0
             for observation in observations:
@@ -801,6 +821,81 @@ class ContextCurationService:
             duplicate_decision_count=duplicate_decision_count,
             unknown_decision_count=unknown_decision_count,
         )
+
+    async def _curate_with_lease_renewal(
+        self,
+        *,
+        save_id: str,
+        observations: tuple[ContextObservationRecord, ...],
+        lease_token: str,
+    ) -> tuple[CurationDecision, ...]:
+        stop_renewal = asyncio.Event()
+        curator_task = asyncio.create_task(
+            self.curator.curate(
+                save_id=save_id,
+                observations=observations,
+            )
+        )
+        renewal_task = asyncio.create_task(
+            self._renew_claims_until_stopped(
+                observations,
+                lease_token=lease_token,
+                stop=stop_renewal,
+            )
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                (curator_task, renewal_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if renewal_task in done:
+                renewal_task.result()
+                raise CurationLeaseLostError(
+                    "Observation curation lease renewal stopped unexpectedly"
+                )
+            return curator_task.result()
+        finally:
+            stop_renewal.set()
+            for task in (curator_task, renewal_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                curator_task,
+                renewal_task,
+                return_exceptions=True,
+            )
+
+    async def _renew_claims_until_stopped(
+        self,
+        observations: tuple[ContextObservationRecord, ...],
+        *,
+        lease_token: str,
+        stop: asyncio.Event,
+    ) -> None:
+        observation_ids = tuple(observation.id for observation in observations)
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=self.lease_renewal_interval_seconds,
+                )
+            except TimeoutError:
+                try:
+                    renewed = (
+                        self.repositories.renew_context_observation_curation_claims(
+                            observation_ids,
+                            lease_token=lease_token,
+                            lease_seconds=self.lease_seconds,
+                        )
+                    )
+                except Exception as exc:
+                    raise CurationLeaseLostError(
+                        "Observation curation lease renewal failed"
+                    ) from exc
+                if renewed != len(observation_ids):
+                    raise CurationLeaseLostError(
+                        "Observation curation lease was lost"
+                    ) from None
 
     async def _await_claimed_operation(
         self,

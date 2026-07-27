@@ -12855,6 +12855,40 @@ def test_update_context_observes_without_inline_curation_when_provider_unavailab
     assert events == ["observation"]
 
 
+def test_observation_curation_reports_configured_provider_unavailable(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.save_provider_model(
+        provider="missing",
+        model_id="missing-curator",
+        display_name="Missing Curator",
+        capabilities=["structured_output"],
+        context_window=8192,
+    )
+    repositories.set_model_preference(
+        task="memory_curation",
+        provider="missing",
+        model_id="missing-curator",
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+    )
+
+    with pytest.raises(RuntimeError, match="curation provider is unavailable"):
+        asyncio.run(service.run_observation_curation(save_id=save.id))
+
+
 def test_run_context_update_retries_replays_full_context_after_state_retry(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -3666,6 +3666,40 @@ class PersistenceRepositories:
             raise
         return cursor.rowcount
 
+    def renew_context_observation_curation_claims(
+        self,
+        observation_ids: Iterable[str],
+        *,
+        lease_token: str,
+        lease_seconds: int,
+    ) -> int:
+        ids = tuple(dict.fromkeys(item for item in observation_ids if item))
+        if not ids:
+            return 0
+        if not lease_token:
+            raise ValueError("lease_token is required")
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be at least 1")
+        self.begin_immediate_transaction()
+        try:
+            cursor = self.connection.execute(
+                f"""
+                UPDATE context_observation_curation_state
+                SET lease_until = datetime('now', ?),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE observation_id IN ({_placeholders(len(ids))})
+                  AND lease_token = ?
+                  AND terminal_outcome IS NULL
+                  AND lease_until > CURRENT_TIMESTAMP
+                """,
+                (f"+{lease_seconds + 1} seconds", *ids, lease_token),
+            )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return cursor.rowcount
+
     def owns_context_observation_curation_lease(
         self,
         observation_id: str,

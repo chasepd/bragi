@@ -6202,7 +6202,7 @@ class ChatService:
                     apply_guard=apply_guard,
                 )
         if curation_service is None:
-            result["curation_skipped"] = "no curation model"
+            raise RuntimeError("Observation curation provider is unavailable")
         else:
             curated = await curation_service.curate_pending(save_id)
             result["curation"] = _agentic_result_mapping(curated)
