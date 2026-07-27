@@ -1746,7 +1746,7 @@ def test_context_search_uses_tool_fallback_when_primary_model_not_found(
         model.available
         for model in repositories.list_provider_models("fake")
         if model.model_id == "fake-context"
-    ] == [False]
+    ] == [True]
     job_result = json.loads(
         _context_search_jobs(repositories, save.id)[-1]["result_json"]
     )
@@ -1801,7 +1801,7 @@ def test_context_search_uses_deterministic_fallback_when_tool_provider_fails(
     assert job_result["fallback_skipped_reason"] == "no_fallback_model"
 
 
-def test_context_search_uses_deterministic_fallback_when_tool_fallback_fails(
+def test_context_search_keeps_missing_tool_fallback_model_available(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(
@@ -1822,9 +1822,9 @@ def test_context_search_uses_deterministic_fallback_when_tool_fallback_fails(
     fallback = FallbackToolContextProvider(
         responses=[
             ProviderError(
-                ProviderErrorCategory.PROVIDER_ERROR,
-                "fallback provider failed",
-                status_code=500,
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "fallback model missing",
+                status_code=404,
             )
         ]
     )
@@ -1842,6 +1842,11 @@ def test_context_search_uses_deterministic_fallback_when_tool_fallback_fails(
     assert [item.source_id for item in result.selected_state] == [state.id]
     assert result.retrieval_degraded is True
     assert result.retrieval_recovery == "deterministic_fallback"
+    assert [
+        model.available
+        for model in repositories.list_provider_models("fallback")
+        if model.model_id == "fallback-tools"
+    ] == [True]
     job_result = json.loads(
         _context_search_jobs(repositories, save.id)[-1]["result_json"]
     )
@@ -1850,11 +1855,11 @@ def test_context_search_uses_deterministic_fallback_when_tool_fallback_fails(
     assert job_result["fallback_provider"] == "fallback"
     assert job_result["fallback_model"] == "fallback-tools"
     assert job_result["fallback_used"] is False
-    assert job_result["error_category"] == ProviderErrorCategory.PROVIDER_ERROR.value
-    assert job_result["http_status"] == 500
+    assert job_result["error_category"] == ProviderErrorCategory.MODEL_NOT_FOUND.value
+    assert job_result["http_status"] == 404
 
 
-def test_context_search_circuit_breaks_model_not_found_until_catalog_refresh(
+def test_context_search_retries_model_after_model_not_found(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(
@@ -1878,7 +1883,19 @@ def test_context_search_circuit_breaks_model_not_found_until_catalog_refresh(
                 ProviderErrorCategory.MODEL_NOT_FOUND,
                 "model not found",
                 status_code=404,
-            )
+            ),
+            (
+                ProviderToolCall(
+                    id="recovered-memory",
+                    name="select_context_source",
+                    arguments_json=json.dumps(
+                        {
+                            "source_id": memory.id,
+                            "relevance_note": "The promise matters on retry.",
+                        }
+                    ),
+                ),
+            ),
         ]
     )
     service = ContextSearchService(
@@ -1892,36 +1909,12 @@ def test_context_search_circuit_breaks_model_not_found_until_catalog_refresh(
     second = asyncio.run(
         service.search(save_id=save.id, player_message_id=player_message.id)
     )
-    provider.responses.append(
-        (
-            ProviderToolCall(
-                id="refreshed-memory",
-                name="select_context_source",
-                arguments_json=json.dumps(
-                    {
-                        "source_id": memory.id,
-                        "relevance_note": "The promise matters after refresh.",
-                    }
-                ),
-            ),
-        )
-    )
-    repositories.save_provider_model(
-        provider="fake",
-        model_id="fake-context",
-        display_name="Fake Context",
-        capabilities=[ProviderCapability.TOOL_CALLING.value],
-    )
-    third = asyncio.run(
-        service.search(save_id=save.id, player_message_id=player_message.id)
-    )
 
     assert len(provider.tool_call_requests) == 2
     assert first.retrieval_recovery == "deterministic_fallback"
-    assert second.retrieval_recovery == "deterministic_fallback"
-    assert [item.source_id for item in third.selected_memories] == [memory.id]
-    assert third.retrieval_degraded is False
-    assert third.retrieval_recovery is None
+    assert [item.source_id for item in second.selected_memories] == [memory.id]
+    assert second.retrieval_degraded is False
+    assert second.retrieval_recovery is None
 
 
 def test_context_search_filters_character_scoped_knowledge_by_present_character(
@@ -3508,7 +3501,7 @@ def test_context_search_uses_structured_fallback_when_primary_blocks(
     assert jobs[-1]["status"] == "succeeded"
 
 
-def test_context_search_uses_structured_fallback_after_primary_model_circuit_break(
+def test_context_search_uses_structured_fallback_for_each_primary_model_error(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(repositories)
@@ -3565,7 +3558,7 @@ def test_context_search_uses_structured_fallback_after_primary_model_circuit_bre
         service.search(save_id=save.id, player_message_id=player_message.id)
     )
 
-    assert len(primary.structured_output_requests) == 1
+    assert len(primary.structured_output_requests) == 2
     assert len(fallback.structured_output_requests) == 2
     assert [item.source_id for item in first.selected_memories] == [memory.id]
     assert [item.source_id for item in second.selected_memories] == [memory.id]
@@ -3575,7 +3568,7 @@ def test_context_search_uses_structured_fallback_after_primary_model_circuit_bre
         model.available
         for model in repositories.list_provider_models("fake")
         if model.model_id == "fake-context"
-    ] == [False]
+    ] == [True]
     job_result = json.loads(
         _context_search_jobs(repositories, save.id)[-1]["result_json"]
     )

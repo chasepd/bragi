@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, cast
 from uuid import uuid4
 
+from bragi.observation_types import normalize_observation_type
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import (
     ActiveThreadRecord,
@@ -28,6 +29,8 @@ from bragi.persistence.models import (
     CharacterTextProvenanceRecord,
     CharacterTextThreadParticipantRecord,
     CharacterTextThreadRecord,
+    ContextObservationCurationHealthRecord,
+    ContextObservationCurationStateRecord,
     ContextObservationRecord,
     ContextSourceRecord,
     ContextSourceSearchHit,
@@ -89,8 +92,12 @@ MAX_UNICODE_SUBSTRING_TERMS = 32
 MAX_CONTEXT_EXACT_PHRASES = 8
 MAX_MEMORY_SOURCE_MESSAGE_IDS = 64
 MAX_MEMORY_SOURCE_OBSERVATION_IDS = 64
+MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
+MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
+SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
+MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
 _UNSET = object()
 CHARACTER_TEXT_DELIVERY_STATUSES = frozenset(
@@ -182,6 +189,10 @@ _SCHEDULED_TASK_COLUMNS = (
     "id, task_type, save_id, enabled, interval_seconds, next_run_at, lease_until, "
     "last_started_at, last_completed_at, last_job_id, failure_count, payload_json, "
     "result_json, error, created_at, updated_at"
+)
+_CONTEXT_OBSERVATION_CURATION_STATE_COLUMNS = (
+    "observation_id, save_id, attempt_count, next_eligible_at, lease_token, "
+    "lease_until, last_error, terminal_outcome, completed_at, created_at, updated_at"
 )
 _JOB_COLUMNS = (
     "id, save_id, creator_user_id, type, status, payload_json, result_json, error, "
@@ -2398,6 +2409,32 @@ class PersistenceRepositories:
         rows.reverse()
         return [MessageRecord(**dict(row)) for row in rows]
 
+    def list_messages_by_ids(
+        self,
+        save_id: str,
+        message_ids: Iterable[str],
+        *,
+        include_deleted: bool = False,
+    ) -> list[MessageRecord]:
+        ids = list(dict.fromkeys(message_ids))
+        if not ids:
+            return []
+        deleted_filter = "" if include_deleted else "AND deleted_at IS NULL"
+        rows = self._fetch_all(
+            f"""
+            SELECT id, save_id, role, body, speaker_name, provider, model,
+                   token_estimate, deleted_at, created_at, updated_at,
+                   safety_transition, content_rating
+            FROM messages
+            WHERE save_id = ?
+              AND id IN ({_placeholders(len(ids))})
+              {deleted_filter}
+            ORDER BY rowid
+            """,
+            (save_id, *ids),
+        )
+        return [MessageRecord(**dict(row)) for row in rows]
+
     def count_active_messages_by_role(
         self,
         save_id: str,
@@ -3590,7 +3627,8 @@ class PersistenceRepositories:
             bounded_query_terms,
             match_all=match_all,
         )
-        if not match_query and not exact_phrases:
+        phrase_match_query = _fts_query_from_exact_phrases(exact_phrases)
+        if not match_query and not phrase_match_query:
             return []
         source_type_values = tuple(dict.fromkeys(str(item) for item in source_types))
         if not source_type_values:
@@ -3675,6 +3713,48 @@ class PersistenceRepositories:
                     limit,
                 ),
             )
+        exact_phrase_rows = (
+            self._fetch_all(
+                f"""
+            SELECT
+                context_sources.id,
+                context_sources.save_id,
+                context_sources.source_type,
+                context_sources.source_id,
+                context_sources.title,
+                context_sources.body,
+                context_sources.metadata_json,
+                context_sources.token_estimate,
+                context_sources.scene_snapshot_id,
+                context_sources.scene_generation,
+                context_sources.created_turn_number,
+                context_sources.expires_after_turn_number,
+                bm25(context_source_fts, 1.2, 1.0) AS bm25_rank
+            FROM context_source_fts
+            JOIN context_sources
+              ON context_sources.rowid = context_source_fts.rowid
+            WHERE context_source_fts MATCH ?
+              AND context_sources.save_id = ?
+              AND context_sources.archived_at IS NULL
+              AND context_sources.source_type IN (
+                  {_placeholders(len(source_type_values))}
+              )
+              {eligibility_sql}
+            ORDER BY bm25_rank, context_sources.created_at DESC,
+                     context_sources.rowid DESC
+            LIMIT ?
+                """,
+                (
+                    phrase_match_query,
+                    save_id,
+                    *source_type_values,
+                    *eligibility_params,
+                    limit,
+                ),
+            )
+            if phrase_match_query
+            else []
+        )
         fts_rows = (
             self._fetch_all(
                 f"""
@@ -3717,10 +3797,15 @@ class PersistenceRepositories:
             if match_query
             else []
         )
-        rows_by_id = {
-            str(row["id"]): row
-            for row in (*term_rows, *fts_rows)
-        }
+        rows_by_id: dict[str, sqlite3.Row] = {}
+        for row in exact_phrase_rows:
+            rows_by_id.setdefault(str(row["id"]), row)
+        for index in range(max(len(term_rows), len(fts_rows))):
+            for ranked_rows in (term_rows, fts_rows):
+                if index >= len(ranked_rows):
+                    continue
+                row = ranked_rows[index]
+                rows_by_id.setdefault(str(row["id"]), row)
         rows = list(rows_by_id.values())[:limit]
         return [
             ContextSourceSearchHit(
@@ -3918,10 +4003,20 @@ class PersistenceRepositories:
         metadata: dict[str, object] | None = None,
         observation_id: str | None = None,
     ) -> ContextObservationRecord:
+        original_observation_type = observation_type.strip()
+        normalized_observation_type = normalize_observation_type(
+            original_observation_type
+        )
+        normalized_metadata = dict(metadata or {})
+        if normalized_observation_type != original_observation_type:
+            normalized_metadata.setdefault(
+                "original_observation_type",
+                original_observation_type,
+            )
         record = ContextObservationRecord(
             id=observation_id or _new_id(),
             save_id=save_id,
-            observation_type=observation_type.strip() or "observation",
+            observation_type=normalized_observation_type,
             claim=claim.strip(),
             evidence_quote=evidence_quote.strip(),
             source_message_ids=_unique_strings(source_message_ids or ()),
@@ -3929,7 +4024,7 @@ class PersistenceRepositories:
             status=status.strip() or "pending",
             confidence=confidence,
             tags=_unique_strings(tags or ()),
-            metadata=dict(metadata or {}),
+            metadata=normalized_metadata,
         )
         self.connection.execute(
             """
@@ -3952,6 +4047,25 @@ class PersistenceRepositories:
                 record.confidence,
                 _dump_json(record.tags),
                 _dump_json(record.metadata),
+            ),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO context_observation_curation_state(
+                observation_id, save_id, terminal_outcome, completed_at
+            )
+            VALUES (
+                ?, ?,
+                CASE WHEN ? = 'pending' THEN NULL ELSE ? END,
+                CASE WHEN ? = 'pending' THEN NULL ELSE CURRENT_TIMESTAMP END
+            )
+            """,
+            (
+                record.id,
+                record.save_id,
+                record.status,
+                record.status,
+                record.status,
             ),
         )
         self.commit()
@@ -4014,6 +4128,554 @@ class PersistenceRepositories:
         if limit is not None:
             rows.reverse()
         return [_context_observation_from_row(row) for row in rows]
+
+    def get_context_observation_curation_state(
+        self,
+        observation_id: str,
+    ) -> ContextObservationCurationStateRecord | None:
+        row = self._fetch_one(
+            f"""
+            SELECT {_CONTEXT_OBSERVATION_CURATION_STATE_COLUMNS}
+            FROM context_observation_curation_state
+            WHERE observation_id = ?
+            """,
+            (observation_id,),
+        )
+        return _context_observation_curation_state_from_row(row) if row else None
+
+    def ensure_context_observation_curation_states(self, save_id: str) -> int:
+        cursor = self.connection.execute(
+            """
+            INSERT OR IGNORE INTO context_observation_curation_state(
+                observation_id, save_id, terminal_outcome, completed_at
+            )
+            SELECT id, save_id,
+                   CASE WHEN status = 'pending' THEN NULL ELSE status END,
+                   CASE WHEN status = 'pending' THEN NULL ELSE CURRENT_TIMESTAMP END
+            FROM context_observations
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        )
+        self.commit()
+        return cursor.rowcount
+
+    def list_eligible_context_observations(
+        self,
+        save_id: str,
+        *,
+        limit: int,
+    ) -> list[ContextObservationRecord]:
+        if limit <= 0:
+            return []
+        rows = self._fetch_all(
+            """
+            SELECT observation.id, observation.save_id,
+                   observation.observation_type, observation.claim,
+                   observation.evidence_quote,
+                   observation.source_message_ids_json, observation.scope,
+                   observation.status, observation.confidence,
+                   observation.tags_json, observation.metadata_json,
+                   observation.created_at, observation.updated_at,
+                   observation.archived_at
+            FROM context_observations observation
+            JOIN context_observation_curation_state curation
+              ON curation.observation_id = observation.id
+            WHERE observation.save_id = ?
+              AND observation.status = 'pending'
+              AND observation.archived_at IS NULL
+              AND curation.terminal_outcome IS NULL
+              AND (
+                  curation.next_eligible_at IS NULL
+                  OR curation.next_eligible_at <= CURRENT_TIMESTAMP
+              )
+              AND (
+                  curation.lease_until IS NULL
+                  OR curation.lease_until <= CURRENT_TIMESTAMP
+              )
+            ORDER BY observation.created_at, observation.rowid
+            LIMIT ?
+            """,
+            (save_id, limit),
+        )
+        return [_context_observation_from_row(row) for row in rows]
+
+    def list_save_ids_with_due_context_observation_curation(
+        self,
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> list[str]:
+        if limit <= 0:
+            return []
+        rows = self._fetch_all(
+            """
+            SELECT observation.save_id
+            FROM context_observations observation
+            JOIN context_observation_curation_state curation
+              ON curation.observation_id = observation.id
+            LEFT JOIN scheduled_tasks scheduled
+              ON scheduled.task_type = 'observation_curation_drain'
+             AND scheduled.save_id = observation.save_id
+            WHERE observation.status = 'pending'
+              AND observation.archived_at IS NULL
+              AND curation.terminal_outcome IS NULL
+              AND (
+                  curation.next_eligible_at IS NULL
+                  OR curation.next_eligible_at <= CURRENT_TIMESTAMP
+              )
+              AND (
+                  curation.lease_until IS NULL
+                  OR curation.lease_until <= CURRENT_TIMESTAMP
+              )
+              AND (
+                  scheduled.id IS NULL
+                  OR (
+                      scheduled.enabled = 1
+                      AND scheduled.next_run_at <= CURRENT_TIMESTAMP
+                      AND (
+                          scheduled.lease_until IS NULL
+                          OR scheduled.lease_until <= CURRENT_TIMESTAMP
+                      )
+                  )
+              )
+            GROUP BY observation.save_id
+            ORDER BY
+                CASE WHEN MAX(scheduled.id) IS NULL THEN 0 ELSE 1 END,
+                MAX(scheduled.updated_at),
+                MIN(observation.created_at),
+                MIN(observation.rowid)
+            LIMIT ? OFFSET ?
+            """,
+            (limit, max(0, offset)),
+        )
+        return [str(row["save_id"]) for row in rows]
+
+    def context_observation_curation_health(
+        self,
+        save_id: str,
+    ) -> ContextObservationCurationHealthRecord:
+        row = self._fetch_one(
+            """
+            SELECT
+                SUM(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL THEN 1 ELSE 0 END)
+                    AS pending_count,
+                SUM(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL
+                    AND (curation.next_eligible_at IS NULL
+                         OR curation.next_eligible_at <= CURRENT_TIMESTAMP)
+                    AND (curation.lease_until IS NULL
+                         OR curation.lease_until <= CURRENT_TIMESTAMP)
+                    THEN 1 ELSE 0 END) AS eligible_count,
+                SUM(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL
+                    AND curation.lease_until > CURRENT_TIMESTAMP
+                    THEN 1 ELSE 0 END) AS leased_count,
+                MIN(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL
+                    THEN observation.created_at END) AS oldest_pending_at,
+                SUM(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL
+                    THEN curation.attempt_count ELSE 0 END) AS total_attempt_count,
+                MAX(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL
+                    THEN curation.attempt_count ELSE 0 END) AS max_attempt_count,
+                SUM(CASE WHEN observation.status = 'curation_failed'
+                    AND observation.archived_at IS NULL
+                    THEN 1 ELSE 0 END) AS terminal_failure_count
+            FROM context_observation_curation_state curation
+            JOIN context_observations observation
+              ON observation.id = curation.observation_id
+            WHERE curation.save_id = ?
+            """,
+            (save_id,),
+        )
+        if row is None:
+            raise RuntimeError("Curation health aggregate returned no row")
+        values = row
+        return ContextObservationCurationHealthRecord(
+            pending_count=int(values["pending_count"] or 0),
+            eligible_count=int(values["eligible_count"] or 0),
+            leased_count=int(values["leased_count"] or 0),
+            oldest_pending_at=(
+                str(values["oldest_pending_at"])
+                if values["oldest_pending_at"] is not None
+                else None
+            ),
+            total_attempt_count=int(values["total_attempt_count"] or 0),
+            max_attempt_count=int(values["max_attempt_count"] or 0),
+            terminal_failure_count=int(values["terminal_failure_count"] or 0),
+        )
+
+    def claim_context_observations(
+        self,
+        observation_ids: Iterable[str],
+        *,
+        lease_token: str,
+        lease_seconds: int,
+        max_attempts: int = 5,
+    ) -> list[ContextObservationRecord]:
+        ids = tuple(dict.fromkeys(item for item in observation_ids if item))
+        if not ids:
+            return []
+        if not lease_token:
+            raise ValueError("lease_token is required")
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be at least 1")
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        self.begin_immediate_transaction()
+        try:
+            exhausted_rows = self._fetch_all(
+                f"""
+                SELECT curation.observation_id
+                FROM context_observation_curation_state curation
+                JOIN context_observations observation
+                  ON observation.id = curation.observation_id
+                WHERE curation.observation_id IN ({_placeholders(len(ids))})
+                  AND curation.terminal_outcome IS NULL
+                  AND curation.attempt_count >= ?
+                  AND (
+                      curation.next_eligible_at IS NULL
+                      OR curation.next_eligible_at <= CURRENT_TIMESTAMP
+                  )
+                  AND (
+                      curation.lease_until IS NULL
+                      OR curation.lease_until <= CURRENT_TIMESTAMP
+                  )
+                  AND observation.status = 'pending'
+                  AND observation.archived_at IS NULL
+                """,
+                (*ids, max_attempts),
+            )
+            exhausted_ids = tuple(
+                str(row["observation_id"]) for row in exhausted_rows
+            )
+            if exhausted_ids:
+                self.connection.execute(
+                    f"""
+                    UPDATE context_observation_curation_state
+                    SET lease_token = NULL,
+                        lease_until = NULL,
+                        next_eligible_at = NULL,
+                        last_error = 'retry_budget_exhausted',
+                        terminal_outcome = 'retry_budget_exhausted',
+                        completed_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE observation_id IN ({_placeholders(len(exhausted_ids))})
+                    """,
+                    exhausted_ids,
+                )
+                self.connection.execute(
+                    f"""
+                    UPDATE context_observations
+                    SET status = 'curation_failed',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({_placeholders(len(exhausted_ids))})
+                    """,
+                    exhausted_ids,
+                )
+            self.connection.execute(
+                f"""
+                UPDATE context_observation_curation_state
+                SET attempt_count = attempt_count + 1,
+                    next_eligible_at = NULL,
+                    lease_token = ?,
+                    lease_until = datetime('now', ?),
+                    last_error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE observation_id IN ({_placeholders(len(ids))})
+                  AND terminal_outcome IS NULL
+                  AND attempt_count < ?
+                  AND (
+                      next_eligible_at IS NULL
+                      OR next_eligible_at <= CURRENT_TIMESTAMP
+                  )
+                  AND (lease_until IS NULL OR lease_until <= CURRENT_TIMESTAMP)
+                  AND EXISTS (
+                      SELECT 1 FROM context_observations observation
+                      WHERE observation.id = observation_id
+                        AND observation.status = 'pending'
+                        AND observation.archived_at IS NULL
+                  )
+                """,
+                (lease_token, f"+{lease_seconds} seconds", *ids, max_attempts),
+            )
+            rows = self._fetch_all(
+                f"""
+                SELECT id, save_id, observation_type, claim, evidence_quote,
+                       source_message_ids_json, scope, status, confidence,
+                       tags_json, metadata_json, created_at, updated_at, archived_at
+                FROM context_observations
+                WHERE id IN (
+                    SELECT observation_id
+                    FROM context_observation_curation_state
+                    WHERE lease_token = ?
+                      AND observation_id IN ({_placeholders(len(ids))})
+                )
+                """,
+                (lease_token, *ids),
+            )
+            records_by_id = {
+                record.id: record
+                for record in (_context_observation_from_row(row) for row in rows)
+            }
+            claimed = [records_by_id[item] for item in ids if item in records_by_id]
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return claimed
+
+    def release_context_observation_curation_claims(
+        self,
+        observation_ids: Iterable[str],
+        *,
+        lease_token: str,
+        error: str,
+    ) -> int:
+        ids = tuple(dict.fromkeys(item for item in observation_ids if item))
+        if not ids:
+            return 0
+        if not lease_token:
+            raise ValueError("lease_token is required")
+        safe_error = (redact_text(error) or "")[:240]
+        self.begin_immediate_transaction()
+        try:
+            cursor = self.connection.execute(
+                f"""
+                UPDATE context_observation_curation_state
+                SET lease_token = NULL,
+                    lease_until = NULL,
+                    next_eligible_at = CURRENT_TIMESTAMP,
+                    last_error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE observation_id IN ({_placeholders(len(ids))})
+                  AND lease_token = ?
+                  AND terminal_outcome IS NULL
+                """,
+                (safe_error, *ids, lease_token),
+            )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return cursor.rowcount
+
+    def renew_context_observation_curation_claims(
+        self,
+        observation_ids: Iterable[str],
+        *,
+        lease_token: str,
+        lease_seconds: int,
+    ) -> int:
+        ids = tuple(dict.fromkeys(item for item in observation_ids if item))
+        if not ids:
+            return 0
+        if not lease_token:
+            raise ValueError("lease_token is required")
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be at least 1")
+        self.begin_immediate_transaction()
+        try:
+            cursor = self.connection.execute(
+                f"""
+                UPDATE context_observation_curation_state
+                SET lease_until = datetime('now', ?),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE observation_id IN ({_placeholders(len(ids))})
+                  AND lease_token = ?
+                  AND terminal_outcome IS NULL
+                  AND lease_until > CURRENT_TIMESTAMP
+                """,
+                (f"+{lease_seconds + 1} seconds", *ids, lease_token),
+            )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return cursor.rowcount
+
+    def owns_context_observation_curation_lease(
+        self,
+        observation_id: str,
+        *,
+        lease_token: str,
+    ) -> bool:
+        return (
+            self._fetch_one(
+                """
+                SELECT 1
+                FROM context_observation_curation_state
+                WHERE observation_id = ?
+                  AND lease_token = ?
+                  AND terminal_outcome IS NULL
+                  AND lease_until > CURRENT_TIMESTAMP
+                """,
+                (observation_id, lease_token),
+            )
+            is not None
+        )
+
+    def complete_context_observation_curation(
+        self,
+        observation_id: str,
+        *,
+        lease_token: str,
+        status: str,
+        terminal_outcome: str,
+        metadata: dict[str, object] | None = None,
+    ) -> ContextObservationRecord | None:
+        self.begin_immediate_transaction()
+        try:
+            cursor = self.connection.execute(
+                """
+                UPDATE context_observation_curation_state
+                SET lease_token = NULL,
+                    lease_until = NULL,
+                    next_eligible_at = NULL,
+                    last_error = NULL,
+                    terminal_outcome = ?,
+                    completed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE observation_id = ?
+                  AND lease_token = ?
+                  AND terminal_outcome IS NULL
+                  AND lease_until > CURRENT_TIMESTAMP
+                """,
+                (terminal_outcome, observation_id, lease_token),
+            )
+            if cursor.rowcount == 0:
+                self.rollback_transaction()
+                return None
+            updated = self.update_context_observation(
+                observation_id,
+                status=status,
+                metadata=metadata,
+            )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return updated
+
+    def defer_context_observation_curation(
+        self,
+        observation_id: str,
+        *,
+        lease_token: str,
+        error: str,
+        retry_after_seconds: int,
+        max_attempts: int,
+    ) -> ContextObservationCurationStateRecord | None:
+        if retry_after_seconds < 1:
+            raise ValueError("retry_after_seconds must be at least 1")
+        self.begin_immediate_transaction()
+        try:
+            row = self._fetch_one(
+                """
+                SELECT attempt_count
+                FROM context_observation_curation_state
+                WHERE observation_id = ?
+                  AND lease_token = ?
+                  AND terminal_outcome IS NULL
+                  AND lease_until > CURRENT_TIMESTAMP
+                """,
+                (observation_id, lease_token),
+            )
+            if row is None:
+                self.rollback_transaction()
+                return None
+            exhausted = int(row["attempt_count"]) >= max(1, max_attempts)
+            safe_error = (redact_text(error) or "")[:240]
+            cursor = self.connection.execute(
+                """
+                UPDATE context_observation_curation_state
+                SET lease_token = NULL,
+                    lease_until = NULL,
+                    next_eligible_at = CASE
+                        WHEN ? THEN NULL ELSE datetime('now', ?)
+                    END,
+                    last_error = ?,
+                    terminal_outcome = CASE
+                        WHEN ? THEN 'retry_budget_exhausted' ELSE NULL
+                    END,
+                    completed_at = CASE
+                        WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE observation_id = ?
+                  AND lease_token = ?
+                  AND lease_until > CURRENT_TIMESTAMP
+                """,
+                (
+                    int(exhausted),
+                    f"+{retry_after_seconds} seconds",
+                    safe_error,
+                    int(exhausted),
+                    int(exhausted),
+                    observation_id,
+                    lease_token,
+                ),
+            )
+            if cursor.rowcount == 0:
+                self.rollback_transaction()
+                return None
+            if exhausted:
+                self.update_context_observation(
+                    observation_id,
+                    status="curation_failed",
+                )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return self.get_context_observation_curation_state(observation_id)
+
+    def restore_context_observation_curation_state(
+        self,
+        observation_id: str,
+        *,
+        attempt_count: int = 0,
+        next_eligible_at: str | None = None,
+        last_error: str | None = None,
+        terminal_outcome: str | None = None,
+        completed_at: str | None = None,
+    ) -> ContextObservationCurationStateRecord:
+        self.connection.execute(
+            """
+            UPDATE context_observation_curation_state
+            SET attempt_count = ?,
+                next_eligible_at = ?,
+                lease_token = NULL,
+                lease_until = NULL,
+                last_error = ?,
+                terminal_outcome = ?,
+                completed_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE observation_id = ?
+            """,
+            (
+                max(0, attempt_count),
+                next_eligible_at,
+                (redact_text(last_error) or "")[:240] if last_error else None,
+                terminal_outcome,
+                completed_at,
+                observation_id,
+            ),
+        )
+        self.commit()
+        state = self.get_context_observation_curation_state(observation_id)
+        if state is None:
+            raise ValueError(f"Unknown context observation id: {observation_id}")
+        return state
 
     def update_context_observation(
         self,
@@ -7506,9 +8168,20 @@ class PersistenceRepositories:
     ) -> list[EntityLinkRecord]:
         if not target_keys:
             return []
-        target_keys_json = _dump_json(sorted([list(key) for key in target_keys]))
-        present_ids_json = _dump_json(sorted(present_character_ids))
-        visibility_ids_json = _dump_json(sorted(visibility_character_ids))
+        target_keys_json = _dump_json(
+            sorted(
+                [
+                    [_normalized_graph_target_type(target_type), target_id]
+                    for target_type, target_id in target_keys
+                ]
+            )
+        )
+        present_ids_json = _dump_json(
+            sorted(present_character_ids)[:MAX_NARRATION_GRAPH_CHARACTER_IDS]
+        )
+        visibility_ids_json = _dump_json(
+            sorted(visibility_character_ids)[:MAX_NARRATION_GRAPH_CHARACTER_IDS]
+        )
         rows = self._fetch_all(
             """
             WITH target_keys(target_type, target_id) AS (
@@ -7535,43 +8208,90 @@ class PersistenceRepositories:
                                 WHERE hidden.save_id = links.save_id
                                   AND hidden.message_id = links.source_message_id
                                   AND hidden.visibility = 'not_visible'
-                            )
+                           )
                            THEN 0
-                           ELSE 1
+                           WHEN links.entity_type = 'character'
+                            AND links.relation = 'knows'
+                           THEN 1
+                           ELSE 2
                        END AS scope_class
                 FROM entity_links links
                 JOIN target_keys targets
-                  ON targets.target_type = links.target_type
+                  ON targets.target_type =
+                     CASE
+                         WHEN lower(links.target_type) IN ('state', 'world_state')
+                         THEN 'world_state'
+                         ELSE lower(links.target_type)
+                     END
                  AND targets.target_id = links.target_id
                 WHERE links.save_id = ?
-                  AND links.entity_type = 'character'
-                  AND links.relation = 'knows'
-                  AND NOT EXISTS (
+                  AND (
+                      links.entity_type != 'character'
+                      OR links.relation != 'knows'
+                      OR NOT EXISTS (
                         SELECT 1
                         FROM character_knowledge_edges edge
                         WHERE edge.save_id = links.save_id
                           AND edge.archived_at IS NULL
                           AND edge.character_id = links.entity_id
-                          AND edge.target_type = links.target_type
+                          AND (
+                              CASE
+                                  WHEN lower(edge.target_type)
+                                       IN ('state', 'world_state')
+                                  THEN 'world_state'
+                                  ELSE lower(edge.target_type)
+                              END
+                          ) = (
+                              CASE
+                                  WHEN lower(links.target_type)
+                                       IN ('state', 'world_state')
+                                  THEN 'world_state'
+                                  ELSE lower(links.target_type)
+                              END
+                          )
                           AND edge.target_id = links.target_id
+                      )
                   )
             ),
             ranked AS (
                 SELECT classified.*,
                        ROW_NUMBER() OVER (
-                           PARTITION BY target_type, target_id, scope_class,
-                                        CASE
-                                            WHEN scope_class = 0 THEN entity_id
-                                            ELSE ''
-                                        END
+                           PARTITION BY
+                               CASE
+                                   WHEN lower(target_type)
+                                        IN ('state', 'world_state')
+                                   THEN 'world_state'
+                                   ELSE lower(target_type)
+                               END,
+                               target_id,
+                               scope_class,
+                               CASE
+                                   WHEN scope_class IN (0, 2)
+                                   THEN entity_type || ':' || entity_id || ':' ||
+                                        relation
+                                   ELSE ''
+                               END
                            ORDER BY source_rowid DESC
-                       ) AS scope_rank
+                       ) AS scope_rank,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY
+                               CASE
+                                   WHEN lower(target_type)
+                                        IN ('state', 'world_state')
+                                   THEN 'world_state'
+                                   ELSE lower(target_type)
+                               END,
+                               target_id,
+                               scope_class
+                           ORDER BY entity_id, source_rowid DESC
+                       ) AS owner_rank
                 FROM classified
             )
             SELECT id, save_id, entity_type, entity_id, target_type, target_id,
                    relation, source_message_id
             FROM ranked
             WHERE scope_rank = 1
+              AND (scope_class = 1 OR owner_rank <= 8)
             ORDER BY target_type, target_id, scope_class
             """,
             (
@@ -7625,6 +8345,9 @@ class PersistenceRepositories:
         source_ids = list(source_message_ids or ())
         if source_message_id is not None and source_message_id not in source_ids:
             source_ids.insert(0, source_message_id)
+        source_ids = list(dict.fromkeys(source_ids))
+        if len(source_ids) > MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS:
+            raise ValueError("knowledge edge provenance is too large")
         record_id = edge_id or _new_id()
         self.connection.execute(
             """
@@ -7725,11 +8448,22 @@ class PersistenceRepositories:
     ) -> list[CharacterKnowledgeEdgeRecord]:
         if not target_keys:
             return []
-        target_keys_json = _dump_json(sorted([list(key) for key in target_keys]))
-        present_ids_json = _dump_json(sorted(present_character_ids))
-        visibility_ids_json = _dump_json(sorted(visibility_character_ids))
+        target_keys_json = _dump_json(
+            sorted(
+                [
+                    [_normalized_graph_target_type(target_type), target_id]
+                    for target_type, target_id in target_keys
+                ]
+            )
+        )
+        present_ids_json = _dump_json(
+            sorted(present_character_ids)[:MAX_NARRATION_GRAPH_CHARACTER_IDS]
+        )
+        visibility_ids_json = _dump_json(
+            sorted(visibility_character_ids)[:MAX_NARRATION_GRAPH_CHARACTER_IDS]
+        )
         rows = self._fetch_all(
-            """
+            f"""
             WITH target_keys(target_type, target_id) AS (
                 SELECT
                     CAST(json_extract(value, '$[0]') AS TEXT),
@@ -7747,7 +8481,8 @@ class PersistenceRepositories:
                                 edges.knowledge_state = 'knows'
                                 OR (
                                     edges.knowledge_state = 'may_know'
-                                    AND edges.confidence >= 0.75
+                                    AND edges.confidence >=
+                                        {SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD}
                                 )
                             )
                             AND NOT EXISTS (
@@ -7773,7 +8508,13 @@ class PersistenceRepositories:
                        END AS scope_class
                 FROM character_knowledge_edges edges
                 JOIN target_keys targets
-                  ON targets.target_type = edges.target_type
+                  ON targets.target_type =
+                     CASE
+                         WHEN lower(edges.target_type)
+                              IN ('state', 'world_state')
+                         THEN 'world_state'
+                         ELSE lower(edges.target_type)
+                     END
                  AND targets.target_id = edges.target_id
                 WHERE edges.save_id = ?
                   AND edges.archived_at IS NULL
@@ -7781,14 +8522,34 @@ class PersistenceRepositories:
             ranked AS (
                 SELECT classified.*,
                        ROW_NUMBER() OVER (
-                           PARTITION BY target_type, target_id, scope_class,
-                                        CASE
-                                            WHEN scope_class = 0
-                                            THEN character_id
-                                            ELSE ''
-                                        END
+                           PARTITION BY
+                               CASE
+                                   WHEN lower(target_type)
+                                        IN ('state', 'world_state')
+                                   THEN 'world_state'
+                                   ELSE lower(target_type)
+                               END,
+                               target_id,
+                               scope_class,
+                               CASE
+                                   WHEN scope_class = 0 THEN character_id
+                                   ELSE ''
+                               END
                            ORDER BY updated_at DESC, source_rowid DESC
-                       ) AS scope_rank
+                       ) AS scope_rank,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY
+                               CASE
+                                   WHEN lower(target_type)
+                                        IN ('state', 'world_state')
+                                   THEN 'world_state'
+                                   ELSE lower(target_type)
+                               END,
+                               target_id,
+                               scope_class
+                           ORDER BY character_id, updated_at DESC,
+                                    source_rowid DESC
+                       ) AS owner_rank
                 FROM classified
             )
             SELECT id, save_id, character_id, target_type, target_id,
@@ -7797,6 +8558,7 @@ class PersistenceRepositories:
                    created_at, updated_at, archived_at
             FROM ranked
             WHERE scope_rank = 1
+              AND (scope_class != 0 OR owner_rank <= 8)
             ORDER BY target_type, target_id, scope_class
             """,
             (
@@ -8498,6 +9260,7 @@ class PersistenceRepositories:
                   'context_precompute', 'context_search', 'context_update',
                   'context_update_retry', 'context_update_retry_drain',
                   'guided_context_cleanup', 'memory_consolidation',
+                  'observation_curation_drain',
                   'scenario_evolution', 'state_extraction_retry',
                   'state_extraction_retry_drain', 'state_pruning',
                   'web_maintenance_character_registry_maintenance',
@@ -9548,6 +10311,16 @@ class PersistenceRepositories:
                     )
                     self.connection.execute(
                         """
+                        UPDATE character_text_provenance
+                        SET target_id = ?
+                        WHERE save_id = ?
+                          AND target_type IN ('memory', 'memories')
+                          AND target_id = ?
+                        """,
+                        (keeper.id, save_id, duplicate.id),
+                    )
+                    self.connection.execute(
+                        """
                         UPDATE context_sources
                         SET archived_at = CURRENT_TIMESTAMP,
                             updated_at = CURRENT_TIMESTAMP
@@ -9617,6 +10390,9 @@ class PersistenceRepositories:
                     )
                 )
             )
+            provenance_overflow = (
+                len(source_ids) > MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS
+            )
             self.connection.execute(
                 """
                 UPDATE character_knowledge_edges
@@ -9627,15 +10403,31 @@ class PersistenceRepositories:
                 WHERE id = ?
                 """,
                 (
-                    row[f"{dominant_prefix}_state"],
-                    row[f"{dominant_prefix}_method"],
+                    (
+                        "does_not_know"
+                        if provenance_overflow
+                        else row[f"{dominant_prefix}_state"]
+                    ),
+                    (
+                        "unknown"
+                        if provenance_overflow
+                        else row[f"{dominant_prefix}_method"]
+                    ),
                     max(
                         float(row["keeper_confidence"]),
                         float(row["duplicate_confidence"]),
                     ),
-                    row[f"{dominant_prefix}_source_message_id"],
-                    _dump_json(source_ids),
-                    row[f"{dominant_prefix}_evidence"],
+                    (
+                        None
+                        if provenance_overflow
+                        else row[f"{dominant_prefix}_source_message_id"]
+                    ),
+                    _dump_json([] if provenance_overflow else source_ids),
+                    (
+                        "Provenance exceeded the safe bound."
+                        if provenance_overflow
+                        else row[f"{dominant_prefix}_evidence"]
+                    ),
                     row["keeper_edge_id"],
                 ),
             )
@@ -9937,22 +10729,6 @@ class PersistenceRepositories:
             WHERE provider = ? AND model_id IN ({placeholders})
             """,
             (provider, *missing_model_ids),
-        )
-        self.commit()
-
-    def mark_provider_model_unavailable(
-        self,
-        *,
-        provider: str,
-        model_id: str,
-    ) -> None:
-        self.connection.execute(
-            """
-            UPDATE provider_models
-            SET available = 0, refreshed_at = CURRENT_TIMESTAMP
-            WHERE provider = ? AND model_id = ?
-            """,
-            (provider, model_id),
         )
         self.commit()
 
@@ -12048,6 +12824,11 @@ def _placeholders(count: int) -> str:
     return ", ".join("?" for _ in range(count))
 
 
+def _normalized_graph_target_type(value: str) -> str:
+    normalized = value.strip().casefold()
+    return "world_state" if normalized in {"state", "world_state"} else normalized
+
+
 def _fts_query_from_terms(
     terms: set[str] | frozenset[str] | list[str] | tuple[str, ...],
     *,
@@ -12065,6 +12846,17 @@ def _fts_query_from_terms(
         escaped = term.replace('"', '""')
         quoted_terms.append(f'"{escaped}"*')
     return (" AND " if match_all else " OR ").join(quoted_terms)
+
+
+def _fts_query_from_exact_phrases(phrases: tuple[str, ...]) -> str:
+    quoted_phrases: list[str] = []
+    for phrase in phrases[:MAX_CONTEXT_EXACT_PHRASES]:
+        terms = unicode_word_terms(str(phrase)[:512])[:64]
+        if len(terms) < 2:
+            continue
+        escaped = " ".join(terms).replace('"', '""')
+        quoted_phrases.append(f'"{escaped}"')
+    return " OR ".join(dict.fromkeys(quoted_phrases))
 
 
 def _unicode_search_terms(value: str) -> tuple[str, ...]:
@@ -12100,11 +12892,13 @@ def _normalized_search_text(value: object) -> str:
 
 
 def _context_source_search_terms(title: str, body: str) -> tuple[str, ...]:
+    bounded_title = title[:MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
+    bounded_body = body[:MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
     terms = (
-        *unicode_word_terms(title),
-        *cjk_lexical_anchors(title),
-        *unicode_word_terms(body),
-        *cjk_lexical_anchors(body),
+        *unicode_word_terms(bounded_title),
+        *cjk_lexical_anchors(bounded_title),
+        *unicode_word_terms(bounded_body),
+        *cjk_lexical_anchors(bounded_body),
     )
     return tuple(dict.fromkeys(terms))[:4096]
 
@@ -12112,6 +12906,14 @@ def _context_source_search_terms(title: str, body: str) -> tuple[str, ...]:
 def _validate_context_source_provenance_metadata(
     metadata: dict[str, object],
 ) -> None:
+    scalar_source_ids: list[str] = []
+    for field in ("source_message_id", "last_seen_message_id"):
+        value = metadata.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value:
+            raise ValueError("context source scalar provenance is invalid")
+        scalar_source_ids.append(value)
     raw_source_ids = metadata.get("source_message_ids")
     if raw_source_ids is not None and (
         not isinstance(raw_source_ids, list)
@@ -12119,6 +12921,8 @@ def _validate_context_source_provenance_metadata(
         or not all(isinstance(item, str) and item for item in raw_source_ids)
     ):
         raise ValueError("context source message provenance is invalid or too large")
+    if isinstance(raw_source_ids, list):
+        scalar_source_ids.extend(raw_source_ids)
     raw_groups = metadata.get("source_provenance_groups")
     if raw_groups is not None and (
         not isinstance(raw_groups, list)
@@ -12132,6 +12936,18 @@ def _validate_context_source_provenance_metadata(
         )
     ):
         raise ValueError("context source provenance groups are invalid or too large")
+    if isinstance(raw_groups, list) and raw_groups:
+        grouped_source_ids = {
+            item
+            for group in raw_groups
+            if isinstance(group, list)
+            for item in group
+            if isinstance(item, str)
+        }
+        if not set(scalar_source_ids).issubset(grouped_source_ids):
+            raise ValueError(
+                "context source provenance groups omit scalar provenance"
+            )
     mode = metadata.get("source_provenance_mode")
     if mode is not None and mode not in {"all", "any"}:
         raise ValueError("context source provenance mode is invalid")
@@ -12269,7 +13085,7 @@ def _context_source_eligibility_sql(
             "SELECT CAST(value AS TEXT) FROM json_each(?)"
             ") "
             "AND (edge.knowledge_state = 'knows' OR ("
-            "edge.knowledge_state = 'may_know' AND edge.confidence >= 0.75"
+            "edge.knowledge_state = 'may_know' AND edge.confidence >= 0.7"
             ")) "
             "AND NOT EXISTS ("
             "SELECT 1 FROM message_visibility hidden "
@@ -13291,6 +14107,24 @@ def _context_observation_from_row(row: sqlite3.Row) -> ContextObservationRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         archived_at=row["archived_at"],
+    )
+
+
+def _context_observation_curation_state_from_row(
+    row: sqlite3.Row,
+) -> ContextObservationCurationStateRecord:
+    return ContextObservationCurationStateRecord(
+        observation_id=row["observation_id"],
+        save_id=row["save_id"],
+        attempt_count=row["attempt_count"],
+        next_eligible_at=row["next_eligible_at"],
+        lease_token=row["lease_token"],
+        lease_until=row["lease_until"],
+        last_error=row["last_error"],
+        terminal_outcome=row["terminal_outcome"],
+        completed_at=row["completed_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 

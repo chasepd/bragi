@@ -2790,7 +2790,12 @@ function ActiveSaveHealthPanel({ health }: { health: EngineHealthModel | null })
     ["Pending Suggestions", health.pending_suggestion_count],
     ["Stale Suggestions", health.stale_pending_suggestion_count],
     ["Summaries", health.summary_count],
-    ["Failed Continuity Jobs", health.recent_failed_continuity_job_count]
+    ["Failed Continuity Jobs", health.recent_failed_continuity_job_count],
+    ["Pending Observations", health.observation_curation.pending_count],
+    ["Eligible Observations", health.observation_curation.eligible_count],
+    ["Leased Observations", health.observation_curation.leased_count],
+    ["Curation Attempts", health.observation_curation.total_attempt_count],
+    ["Curation Failures", health.observation_curation.terminal_failure_count]
   ];
   return (
     <div className="diagnostic-lane">

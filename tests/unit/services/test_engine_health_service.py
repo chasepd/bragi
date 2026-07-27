@@ -98,3 +98,76 @@ def test_engine_health_warns_on_degraded_context_search(
     warnings = {warning.code: warning for warning in snapshot.warnings}
     assert warnings["degraded_context_search"].severity == "warning"
     assert "Secret chronicle phrase" not in json.dumps(snapshot.latest_context_search)
+
+
+def test_engine_health_reports_curation_backlog_without_worker_secrets(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Lantern Keep")
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The beacon was relit.",
+        evidence_quote="The beacon was relit.",
+        source_message_ids=[],
+        scope="durable",
+        confidence=0.9,
+    )
+    repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="private-worker-token",
+        lease_seconds=600,
+    )
+
+    snapshot = EngineHealthService(repositories).snapshot(save.id)
+
+    assert snapshot.observation_curation.pending_count == 1
+    assert snapshot.observation_curation.eligible_count == 0
+    assert snapshot.observation_curation.leased_count == 1
+    assert snapshot.observation_curation.total_attempt_count == 1
+    warnings = {warning.code: warning for warning in snapshot.warnings}
+    assert warnings["observation_curation_retries"].severity == "warning"
+    assert "private-worker-token" not in json.dumps(snapshot, default=str)
+
+
+def test_engine_health_describes_terminal_curation_failures_generically(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Lantern Keep")
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The beacon was relit.",
+    )
+    repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="worker",
+        lease_seconds=600,
+    )
+    repositories.complete_context_observation_curation(
+        observation.id,
+        lease_token="worker",
+        status="curation_failed",
+        terminal_outcome="input_budget_exceeded",
+    )
+
+    snapshot = EngineHealthService(repositories).snapshot(save.id)
+
+    warnings = {warning.code: warning for warning in snapshot.warnings}
+    warning = warnings["observation_curation_terminal_failures"]
+    assert warning.severity == "critical"
+    assert warning.message == "Observation curation has terminal failures."

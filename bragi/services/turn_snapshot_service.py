@@ -11,6 +11,7 @@ import sqlite3
 import zlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import cast
@@ -95,6 +96,7 @@ _SNAPSHOT_TABLES: tuple[_SnapshotTable, ...] = (
         order_by="source_type, source_id, rowid",
     ),
     _SnapshotTable("context_observations", active_only=True),
+    _SnapshotTable("context_observation_curation_state"),
     _SnapshotTable("locations", active_only=True),
     _SnapshotTable("characters", active_only=True),
     _SnapshotTable("scene_snapshots"),
@@ -162,6 +164,7 @@ _RESTORE_DELETE_ORDER = (
     "summaries",
     "memories",
     "state_changes",
+    "context_observation_curation_state",
     "context_observations",
     "world_state",
 )
@@ -189,6 +192,7 @@ _RESTORE_INSERT_ORDER = (
     "save_loss_outcomes",
     "context_sources",
     "context_observations",
+    "context_observation_curation_state",
     "context_update_suggestions",
     "context_update_audit",
     "entity_links",
@@ -218,6 +222,9 @@ _MESSAGE_REFERENCE_COLUMNS = {
 }
 
 _TABLE_REFERENCE_COLUMNS: dict[str, dict[str, str]] = {
+    "context_observation_curation_state": {
+        "observation_id": "context_observations"
+    },
     "locations": {"parent_location_id": "locations"},
     "characters": {"location_id": "locations"},
     "scene_snapshots": {"current_location_id": "locations"},
@@ -527,6 +534,7 @@ class TurnSnapshotService:
             self.repositories.consolidate_active_memory_duplicates(
                 save_id=save_id
             )
+            self.repositories.ensure_context_observation_curation_states(save_id)
             _remove_snapshot_safety_transition_records(
                 self.repositories.connection,
                 save_id=save_id,
@@ -612,6 +620,7 @@ class TurnSnapshotService:
             self.repositories.consolidate_active_memory_duplicates(
                 save_id=fork_save.id
             )
+            self.repositories.ensure_context_observation_curation_states(fork_save.id)
             _remove_snapshot_safety_transition_records(
                 self.repositories.connection,
                 save_id=fork_save.id,
@@ -1037,6 +1046,11 @@ class TurnSnapshotService:
                 rows[table.name] = _location_rows_parent_first(table_rows)
             elif table.name == "media_assets":
                 rows[table.name] = _media_rows_parent_first(table_rows)
+            elif table.name == "context_observation_curation_state":
+                rows[table.name] = tuple(
+                    portable_context_observation_curation_state_row(row)
+                    for row in table_rows
+                )
             else:
                 rows[table.name] = tuple(table_rows)
         _filter_character_text_snapshot_rows(rows)
@@ -1613,7 +1627,7 @@ class _SnapshotRemapper:
 
     def _mapped_source_ref(self, value: object) -> object:
         if not isinstance(value, str):
-            return value
+            raise ValueError("Snapshot context source provenance is invalid")
         text_message_id = parse_character_text_source_ref(value)
         if text_message_id is not None:
             mapped = self.id_maps.get("character_text_messages", {}).get(
@@ -1633,7 +1647,7 @@ class _SnapshotRemapper:
 
     def _remap_source_ref_list(self, raw: object) -> object:
         if not isinstance(raw, list):
-            return raw
+            raise ValueError("Snapshot context source provenance is invalid")
         if (
             len(raw) > _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS
             or not all(isinstance(item, str) and item for item in raw)
@@ -1660,13 +1674,39 @@ class _SnapshotRemapper:
                 raw["source_message_ids"]
             )
         raw_groups = raw.get("source_provenance_groups")
-        if isinstance(raw_groups, list):
+        if raw_groups is not None:
+            if not isinstance(raw_groups, list):
+                raise ValueError("Snapshot context source provenance is invalid")
             if len(raw_groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS:
                 raise ValueError("Snapshot context source provenance is too large")
-            remapped["source_provenance_groups"] = [
+            mapped_groups = [
                 self._remap_source_ref_list(group)
                 for group in raw_groups
             ]
+            remapped["source_provenance_groups"] = mapped_groups
+            grouped_source_ids = {
+                source_id
+                for group in mapped_groups
+                if isinstance(group, list)
+                for source_id in group
+                if isinstance(source_id, str)
+            }
+            scalar_source_ids: set[str] = set()
+            for field in ("source_message_id", "last_seen_message_id"):
+                source_id = remapped.get(field)
+                if isinstance(source_id, str):
+                    scalar_source_ids.add(source_id)
+            source_ids = remapped.get("source_message_ids")
+            if isinstance(source_ids, list):
+                scalar_source_ids.update(
+                    source_id
+                    for source_id in source_ids
+                    if isinstance(source_id, str)
+                )
+            if not scalar_source_ids.issubset(grouped_source_ids):
+                raise ValueError(
+                    "Snapshot context source provenance groups omit sources"
+                )
         return remapped
 
     def _remap_json_value(self, value: object) -> object:
@@ -1966,6 +2006,10 @@ def _sanitize_snapshot_rows_for_safety(
         table_name: tuple(dict(row) for row in table_rows)
         for table_name, table_rows in rows_by_table.items()
     }
+    rows["context_observation_curation_state"] = tuple(
+        portable_context_observation_curation_state_row(row)
+        for row in rows.get("context_observation_curation_state", ())
+    )
     rows["messages"] = tuple(
         _sanitize_snapshot_message_row(row)
         for row in rows.get("messages", ())
@@ -2005,6 +2049,7 @@ def _sanitize_snapshot_rows_for_safety(
         )
     }
     if not transition_ids:
+        _filter_context_observation_curation_snapshot_rows(rows)
         return rows
     message_order = {
         str(row["id"]): index
@@ -2037,7 +2082,52 @@ def _sanitize_snapshot_rows_for_safety(
                 continue
             sanitized_rows.append(row)
         rows[table_name] = tuple(sanitized_rows)
+    _filter_context_observation_curation_snapshot_rows(rows)
     return rows
+
+
+def portable_context_observation_curation_state_row(
+    row: Mapping[str, object],
+) -> dict[str, object]:
+    copied = dict(row)
+    lease_token = copied.get("lease_token")
+    lease_until = copied.get("lease_until")
+    attempt_count = copied.get("attempt_count")
+    if (
+        isinstance(lease_token, str)
+        and lease_token
+        and _timestamp_is_in_future(lease_until)
+        and isinstance(attempt_count, int)
+        and not isinstance(attempt_count, bool)
+        and attempt_count > 0
+    ):
+        copied["attempt_count"] = attempt_count - 1
+    copied["lease_token"] = None
+    copied["lease_until"] = None
+    return copied
+
+
+def _timestamp_is_in_future(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC) > datetime.now(UTC)
+
+
+def _filter_context_observation_curation_snapshot_rows(
+    rows: dict[str, tuple[dict[str, object], ...]],
+) -> None:
+    observation_ids = _row_ids(rows.get("context_observations", ()))
+    rows["context_observation_curation_state"] = tuple(
+        row
+        for row in rows.get("context_observation_curation_state", ())
+        if _required_row_ref_active(row, "observation_id", observation_ids)
+    )
 
 
 def _snapshot_media_row_with_unclassified_rating(
@@ -2711,6 +2801,11 @@ def _merge_snapshot_memory_rows(
         existing[field] = _merged_snapshot_json_string_lists(
             existing.get(field),
             incoming.get(field),
+            limit=(
+                None
+                if field == "tags_json"
+                else _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS
+            ),
         )
     existing["importance"] = max(
         _snapshot_numeric_value(existing.get("importance")),
@@ -2774,9 +2869,13 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
                 for value in raw_values
                 if isinstance(value, str) and value
             )
-        metadata[field] = list(
-            dict.fromkeys(values)
-        )
+        merged_values = list(dict.fromkeys(values))
+        if (
+            field == "source_message_ids"
+            and len(merged_values) > _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS
+        ):
+            raise ValueError("Merged snapshot provenance is too large")
+        metadata[field] = merged_values
     groups: list[list[str]] = []
     for item in loaded_metadata:
         raw_groups = item.get("source_provenance_groups")
@@ -2792,6 +2891,8 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
             ]
             if group and group not in groups:
                 groups.append(group)
+                if len(groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS:
+                    raise ValueError("Merged snapshot provenance is too large")
     metadata["source_provenance_groups"] = groups
     metadata["source_provenance_mode"] = (
         "all"
@@ -2838,10 +2939,16 @@ def _merge_snapshot_knowledge_edge_rows(
     existing["source_message_ids_json"] = _merged_snapshot_json_string_lists(
         existing.get("source_message_ids_json"),
         incoming.get("source_message_ids_json"),
+        limit=_MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS,
     )
 
 
-def _merged_snapshot_json_string_lists(first: object, second: object) -> str:
+def _merged_snapshot_json_string_lists(
+    first: object,
+    second: object,
+    *,
+    limit: int | None = None,
+) -> str:
     values: list[str] = []
     for raw in (first, second):
         try:
@@ -2854,7 +2961,10 @@ def _merged_snapshot_json_string_lists(first: object, second: object) -> str:
                 for value in loaded
                 if isinstance(value, str) and value
             )
-    return _compact_json(list(dict.fromkeys(values)))
+    merged = list(dict.fromkeys(values))
+    if limit is not None and len(merged) > limit:
+        raise ValueError("Merged snapshot provenance is too large")
+    return _compact_json(merged)
 
 
 def _snapshot_numeric_value(value: object) -> float:

@@ -3675,6 +3675,55 @@ class BragiRuntime:
             active_save_id=save_id,
         )
 
+    async def run_observation_curation(
+        self,
+        *,
+        active_save_id: str | None | object = ...,
+    ) -> RuntimeModel:
+        save_id = (
+            self.active_save_id
+            if active_save_id is ...
+            else cast(str | None, active_save_id)
+        )
+        if save_id is None:
+            return self.build_model(error="No active save selected")
+        try:
+            self._begin_maintenance_retry_drain(save_id)
+            try:
+                result = await ChatService(
+                    repositories=self.repositories,
+                    providers=self.providers,
+                    context_search_service=self.context_search_service,
+                    summary_service=self._summary_service(),
+                    media_service=self._media_service(),
+                    prompt_inspection_store=self._prompt_inspection_store_if_enabled(),
+                ).run_observation_curation(
+                    save_id=save_id,
+                    apply_guard=lambda: self._save_operation_lock(save_id),
+                )
+            finally:
+                self._end_maintenance_retry_drain(save_id)
+        except Exception as exc:
+            log_error_event(
+                "runtime.observation_curation_failed",
+                save_id=save_id,
+                **exception_log_fields(exc),
+            )
+            return self.build_model(
+                error=_user_visible_error(exc),
+                active_save_id=save_id,
+            )
+        curation = result.get("curation") if result is not None else None
+        considered = (
+            curation.get("considered_count", 0)
+            if isinstance(curation, Mapping)
+            else 0
+        )
+        return self.build_model(
+            status=f"Observation curation finished: {considered} considered.",
+            active_save_id=save_id,
+        )
+
     async def run_state_extraction_retries(
         self,
         *,

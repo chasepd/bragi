@@ -221,6 +221,7 @@ def test_diagnostics_limit_latest_matching_jobs_and_pass_repo_filters() -> None:
                 "dating_sim_maintenance",
                 "guided_context_cleanup",
                 "memory_consolidation",
+                "observation_curation_drain",
                 "post_turn_jobs",
                 "state_extraction_retry",
                 "state_extraction_retry_drain",
@@ -271,6 +272,7 @@ def test_diagnostics_prefer_recent_job_filters_when_available() -> None:
                 "dating_sim_maintenance",
                 "guided_context_cleanup",
                 "memory_consolidation",
+                "observation_curation_drain",
                 "post_turn_jobs",
                 "state_extraction_retry",
                 "state_extraction_retry_drain",
@@ -283,3 +285,26 @@ def test_diagnostics_prefer_recent_job_filters_when_available() -> None:
             "limit": 1,
         }
     ]
+
+
+def test_observation_curation_diagnostics_suppress_error_text() -> None:
+    diagnostics = maintenance_job_diagnostics(
+        _RecentRepositoriesDouble(
+            [
+                SimpleNamespace(
+                    id="job-curation",
+                    type="observation_curation_drain",
+                    status="failed",
+                    save_id="save-1",
+                    error="Private chronicle detail escaped from a provider.",
+                    started_at="2026-07-26T12:00:00Z",
+                    completed_at="2026-07-26T12:01:00Z",
+                    result={},
+                )
+            ]
+        )
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].error is None
+    assert diagnostics[0].summary == "No batch metrics"

@@ -29,6 +29,7 @@ EXPECTED_TABLES = {
     "character_text_threads",
     "characters",
     "context_observations",
+    "context_observation_curation_state",
     "context_source_fts",
     "context_sources",
     "context_update_audit",
@@ -348,7 +349,7 @@ def test_migrate_database_is_idempotent_for_current_schema(tmp_path: Path) -> No
         )
 
 
-def test_migrate_database_upgrades_schema_70_context_lifecycle(
+def test_migrate_database_upgrades_main_schema_71_context_lifecycle(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "bragi.sqlite3"
@@ -497,7 +498,7 @@ def test_migrate_database_upgrades_schema_70_context_lifecycle(
         connection.execute("ALTER TABLE context_sources DROP COLUMN scene_generation")
         connection.execute("ALTER TABLE context_sources DROP COLUMN scene_snapshot_id")
         connection.execute("ALTER TABLE scene_snapshots DROP COLUMN scene_generation")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 71")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 72")
         connection.commit()
 
     migrate_database(database_path)

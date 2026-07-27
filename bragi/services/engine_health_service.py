@@ -25,6 +25,7 @@ CONTINUITY_JOB_TYPES = frozenset(
         "world_suggestion_review",
         "memory_consolidation",
         "state_pruning",
+        "observation_curation_drain",
     }
 )
 STALE_PENDING_SUGGESTION_HOURS = 12
@@ -41,6 +42,18 @@ class EngineHealthWarning:
 
 
 @dataclass(frozen=True)
+class ObservationCurationHealth:
+    pending_count: int
+    eligible_count: int
+    leased_count: int
+    oldest_pending_at: str | None
+    oldest_pending_age_seconds: int | None
+    total_attempt_count: int
+    max_attempt_count: int
+    terminal_failure_count: int
+
+
+@dataclass(frozen=True)
 class EngineHealthSnapshot:
     save_id: str
     active_message_count: int
@@ -53,6 +66,7 @@ class EngineHealthSnapshot:
     summary_count: int
     recent_failed_continuity_job_count: int
     recent_failed_continuity_jobs_by_type: dict[str, int]
+    observation_curation: ObservationCurationHealth
     latest_context_search: dict[str, object] | None
     latest_chat_prompt: dict[str, object] | None
     warnings: tuple[EngineHealthWarning, ...]
@@ -105,6 +119,21 @@ class EngineHealthService:
             job_type="context_search",
         )
         latest_chat_prompt = _latest_chat_prompt_diagnostics(recent_jobs)
+        curation_record = self.repositories.context_observation_curation_health(
+            save_id
+        )
+        observation_curation = ObservationCurationHealth(
+            pending_count=curation_record.pending_count,
+            eligible_count=curation_record.eligible_count,
+            leased_count=curation_record.leased_count,
+            oldest_pending_at=curation_record.oldest_pending_at,
+            oldest_pending_age_seconds=_timestamp_age_seconds(
+                curation_record.oldest_pending_at
+            ),
+            total_attempt_count=curation_record.total_attempt_count,
+            max_attempt_count=curation_record.max_attempt_count,
+            terminal_failure_count=curation_record.terminal_failure_count,
+        )
         warnings = _warnings(
             history_player=history_settings.player_messages,
             history_narrator=history_settings.narrator_messages,
@@ -116,6 +145,7 @@ class EngineHealthService:
             failed_by_type=failed_by_type,
             latest_context_search=latest_context_search,
             latest_chat_prompt=latest_chat_prompt,
+            observation_curation=observation_curation,
         )
         return EngineHealthSnapshot(
             save_id=save_id,
@@ -133,6 +163,7 @@ class EngineHealthService:
             summary_count=len(summaries),
             recent_failed_continuity_job_count=len(failed_continuity_jobs),
             recent_failed_continuity_jobs_by_type=failed_by_type,
+            observation_curation=observation_curation,
             latest_context_search=latest_context_search,
             latest_chat_prompt=latest_chat_prompt,
             warnings=warnings,
@@ -207,8 +238,36 @@ def _warnings(
     failed_by_type: dict[str, int],
     latest_context_search: dict[str, object] | None,
     latest_chat_prompt: dict[str, object] | None,
+    observation_curation: ObservationCurationHealth,
 ) -> tuple[EngineHealthWarning, ...]:
     warnings: list[EngineHealthWarning] = []
+    if observation_curation.terminal_failure_count:
+        warnings.append(
+            EngineHealthWarning(
+                code="observation_curation_terminal_failures",
+                severity="critical",
+                message="Observation curation has terminal failures.",
+                count=observation_curation.terminal_failure_count,
+            )
+        )
+    elif observation_curation.total_attempt_count:
+        warnings.append(
+            EngineHealthWarning(
+                code="observation_curation_retries",
+                severity="warning",
+                message="Observation curation has retrying backlog.",
+                count=observation_curation.pending_count,
+            )
+        )
+    elif observation_curation.pending_count:
+        warnings.append(
+            EngineHealthWarning(
+                code="observation_curation_backlog",
+                severity="info",
+                message="Observations are waiting for background curation.",
+                count=observation_curation.pending_count,
+            )
+        )
     prose_history_total = history_player + history_narrator
     planner_history_total = planner_history_player + planner_history_narrator
     if any(
@@ -326,6 +385,13 @@ def _is_stale_timestamp(value: str | None, *, hours: int) -> bool:
     if parsed is None:
         return False
     return datetime.now(UTC) - parsed >= timedelta(hours=hours)
+
+
+def _timestamp_age_seconds(value: str | None) -> int | None:
+    parsed = _parse_sqlite_timestamp(value)
+    if parsed is None:
+        return None
+    return max(0, int((datetime.now(UTC) - parsed).total_seconds()))
 
 
 def _parse_sqlite_timestamp(value: str | None) -> datetime | None:

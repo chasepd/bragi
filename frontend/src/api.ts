@@ -767,6 +767,16 @@ export type EngineHealthModel = {
   summary_count: number;
   recent_failed_continuity_job_count: number;
   recent_failed_continuity_jobs_by_type: Record<string, number>;
+  observation_curation: {
+    pending_count: number;
+    eligible_count: number;
+    leased_count: number;
+    oldest_pending_at: string | null;
+    oldest_pending_age_seconds: number | null;
+    total_attempt_count: number;
+    max_attempt_count: number;
+    terminal_failure_count: number;
+  };
   latest_context_search: Record<string, unknown> | null;
   latest_chat_prompt: Record<string, unknown> | null;
   warnings: EngineHealthWarning[];

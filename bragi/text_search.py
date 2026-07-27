@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unicodedata
 
+MAX_CJK_LEXICAL_INPUT_CHARS = 16_384
+
 
 def unicode_word_terms(value: str) -> tuple[str, ...]:
     normalized = unicodedata.normalize("NFKC", value).casefold()
@@ -26,7 +28,10 @@ def unicode_word_terms(value: str) -> tuple[str, ...]:
 
 
 def cjk_lexical_anchors(value: str) -> tuple[str, ...]:
-    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = unicodedata.normalize(
+        "NFKC",
+        value[:MAX_CJK_LEXICAL_INPUT_CHARS],
+    ).casefold()
     runs: list[str] = []
     current: list[str] = []
     current_family = ""
@@ -48,7 +53,8 @@ def cjk_lexical_anchors(value: str) -> tuple[str, ...]:
             if _cjk_script_family(run) == "han":
                 anchors.append(run)
             continue
-        anchors.append(run)
+        if len(run) <= 64:
+            anchors.append(run)
         for width in (3, 2):
             if len(run) < width:
                 continue

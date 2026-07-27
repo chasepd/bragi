@@ -16,6 +16,7 @@ _DIAGNOSTIC_JOB_TYPES = (
     "dating_sim_maintenance",
     "guided_context_cleanup",
     "memory_consolidation",
+    "observation_curation_drain",
     "post_turn_jobs",
     "state_extraction_retry",
     "state_extraction_retry_drain",
@@ -150,12 +151,17 @@ def _list_legacy_failed_jobs(repositories: Any, *, limit: int) -> Iterable[Any] 
 def _maintenance_job_diagnostic(job: Any) -> MaintenanceJobDiagnostic:
     job_type = str(getattr(job, "type", ""))
     metrics = _metrics(job_type, getattr(job, "result", None))
+    error = (
+        None
+        if job_type == "observation_curation_drain"
+        else _optional_text(getattr(job, "error", None))
+    )
     return MaintenanceJobDiagnostic(
         job_id=str(getattr(job, "id", "")),
         job_type=job_type,
         status=str(getattr(job, "status", "")),
         save_id=_optional_text(getattr(job, "save_id", None)),
-        error=_optional_text(getattr(job, "error", None)),
+        error=error,
         started_at=_optional_text(getattr(job, "started_at", None)),
         completed_at=_optional_text(getattr(job, "completed_at", None)),
         summary=_summary(job_type, metrics),

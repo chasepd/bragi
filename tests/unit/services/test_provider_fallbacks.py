@@ -255,7 +255,7 @@ def test_chat_with_fallback_reports_unavailable_fallback_model(
     assert fields["fallback_skipped_reason"] == "fallback_model_unavailable"
 
 
-def test_chat_with_fallback_marks_model_not_found_unavailable(
+def test_chat_with_fallback_keeps_model_available_after_model_not_found(
     repositories: PersistenceRepositories,
 ) -> None:
     repositories.save_provider_model(
@@ -292,10 +292,10 @@ def test_chat_with_fallback_marks_model_not_found_unavailable(
         model.available
         for model in repositories.list_provider_models("primary")
         if model.model_id == "primary-chat"
-    ] == [False]
+    ] == [True]
 
 
-def test_chat_with_fallback_failure_reports_attempted_fallback(
+def test_chat_with_fallback_model_not_found_keeps_fallback_available(
     repositories: PersistenceRepositories,
 ) -> None:
     _configure_working_chat_fallback(repositories)
@@ -309,8 +309,9 @@ def test_chat_with_fallback_failure_reports_attempted_fallback(
     fallback = RecordingChatProvider(
         provider_name="fallback",
         error=ProviderError(
-            ProviderErrorCategory.PROVIDER_ERROR,
-            "fallback chat failed",
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "fallback chat model missing",
+            status_code=404,
         ),
     )
 
@@ -338,6 +339,11 @@ def test_chat_with_fallback_failure_reports_attempted_fallback(
     assert fields["fallback_attempted"] is True
     assert fields["fallback_provider"] == "fallback"
     assert fields["fallback_model_id"] == "fallback-chat"
+    assert [
+        model.available
+        for model in repositories.list_provider_models("fallback")
+        if model.model_id == "fallback-chat"
+    ] == [True]
 
 
 def test_chat_fallback_rebudgets_against_fallback_model_window(
@@ -386,7 +392,7 @@ def test_chat_fallback_rebudgets_against_fallback_model_window(
     assert response.body == "A concise summary."
 
 
-def test_chat_with_fallback_blank_primary_failure_reports_attempted_fallback(
+def test_chat_with_blank_primary_keeps_missing_fallback_model_available(
     repositories: PersistenceRepositories,
 ) -> None:
     _configure_working_chat_fallback(repositories)
@@ -397,8 +403,9 @@ def test_chat_with_fallback_blank_primary_failure_reports_attempted_fallback(
     fallback = RecordingChatProvider(
         provider_name="fallback",
         error=ProviderError(
-            ProviderErrorCategory.PROVIDER_ERROR,
-            "fallback chat failed",
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "fallback chat model missing",
+            status_code=404,
         ),
     )
 
@@ -426,6 +433,11 @@ def test_chat_with_fallback_blank_primary_failure_reports_attempted_fallback(
     assert fields["fallback_attempted"] is True
     assert fields["fallback_provider"] == "fallback"
     assert fields["fallback_model_id"] == "fallback-chat"
+    assert [
+        model.available
+        for model in repositories.list_provider_models("fallback")
+        if model.model_id == "fallback-chat"
+    ] == [True]
 
 
 def test_chat_with_fallback_applies_openrouter_reasoning_overrides(
@@ -748,7 +760,7 @@ def test_structured_output_fallback_attempts_configured_provider(
     assert response.data == {"selected": ["memory-1"]}
 
 
-def test_structured_output_fallback_marks_model_not_found_unavailable(
+def test_structured_output_fallback_keeps_model_available_after_model_not_found(
     repositories: PersistenceRepositories,
 ) -> None:
     _save_primary_structured_model(repositories)
@@ -781,10 +793,10 @@ def test_structured_output_fallback_marks_model_not_found_unavailable(
         model.available
         for model in repositories.list_provider_models("primary")
         if model.model_id == "primary-structured"
-    ] == [False]
+    ] == [True]
 
 
-def test_structured_output_fallback_failure_reports_attempted_fallback(
+def test_structured_output_model_not_found_keeps_fallback_available(
     repositories: PersistenceRepositories,
 ) -> None:
     _save_primary_structured_model(repositories)
@@ -799,8 +811,9 @@ def test_structured_output_fallback_failure_reports_attempted_fallback(
     fallback = RecordingStructuredProvider(
         provider_name="fallback",
         error=ProviderError(
-            ProviderErrorCategory.PROVIDER_ERROR,
-            "fallback structured output failed",
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "fallback structured output model missing",
+            status_code=404,
         ),
     )
 
@@ -822,6 +835,11 @@ def test_structured_output_fallback_failure_reports_attempted_fallback(
     assert fields["fallback_attempted"] is True
     assert fields["fallback_provider"] == "fallback"
     assert fields["fallback_model_id"] == "fallback-structured"
+    assert [
+        model.available
+        for model in repositories.list_provider_models("fallback")
+        if model.model_id == "fallback-structured"
+    ] == [True]
 
 
 def test_tool_call_fallback_uses_configured_provider_when_toggle_false(

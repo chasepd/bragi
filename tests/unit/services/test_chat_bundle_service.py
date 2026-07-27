@@ -238,6 +238,48 @@ def test_export_save_writes_manifest_data_and_referenced_media(
                 separators=(",", ":"),
             )
         )
+        [curation_state] = data["context_observation_curation_states"]
+        assert curation_state["observation_id"] == OBSERVATION_ID
+        assert curation_state["terminal_outcome"] == "accepted"
+        assert curation_state["lease_token"] is None
+        assert curation_state["lease_until"] is None
+
+
+def test_export_save_refunds_live_curation_attempt_when_clearing_lease(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The beacon was relit.",
+        evidence_quote="The beacon was relit.",
+        source_message_ids=[NARRATOR_MESSAGE_ID],
+        scope="durable",
+        confidence=0.9,
+    )
+    claimed = repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="export-worker-secret",
+        lease_seconds=600,
+    )
+    assert [row.id for row in claimed] == [observation.id]
+    bundle_path = tmp_path / "exports" / "night-watch.bragi-chat"
+
+    _chat_bundle_service(repositories, media_dir).export_save(save.id, bundle_path)
+
+    with zipfile.ZipFile(bundle_path) as bundle:
+        data = json.loads(bundle.read("data.json"))
+    [state] = [
+        row
+        for row in data["context_observation_curation_states"]
+        if row["observation_id"] == observation.id
+    ]
+    assert state["attempt_count"] == 0
+    assert state["lease_token"] is None
+    assert state["lease_until"] is None
 
 
 def test_export_save_uses_consistent_read_snapshot(
@@ -2365,6 +2407,12 @@ def test_import_save_remaps_colliding_ids_and_preserves_bundle_data(
         message_id_map[PLAYER_MESSAGE_ID],
         message_id_map[NARRATOR_MESSAGE_ID],
     ]
+    curation_state = repositories.get_context_observation_curation_state(
+        observations[0].id
+    )
+    assert curation_state is not None
+    assert curation_state.terminal_outcome == "accepted"
+    assert curation_state.lease_token is None
 
     summaries = repositories.list_summaries(imported_save_id)
     assert len(summaries) == 1

@@ -45,7 +45,7 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolDefinition,
 )
-from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.providers.errors import ProviderError
 from bragi.redaction import redact_text
 from bragi.services.context_assembly import scenario_section_candidates
 from bragi.services.continuity_index_service import ContinuityIndexService
@@ -114,6 +114,8 @@ MAX_CONTEXT_EXACT_PHRASE_CHARS = 512
 MAX_CONTEXT_EXACT_PHRASES = 4
 CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT = 64
 RAW_CONTEXT_RECORD_LIMIT = 512
+MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
+MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 INDEXED_CONTEXT_SOURCE_TYPES = frozenset(
     {
         "character_text_thread",
@@ -1869,12 +1871,6 @@ async def _select_context_with_structured_output(
         )
         result = _context_result_from_structured_data(response.data, candidates)
     except ProviderError as exc:
-        _mark_provider_model_unavailable_for_error(
-            repositories,
-            provider=provider_name,
-            model_id=model_id,
-            exc=exc,
-        )
         log_error_event(
             "provider.structured_output_failed",
             provider=provider_name,
@@ -2057,12 +2053,6 @@ async def _recover_context_structured_selection(
         )
         result = _context_result_from_structured_data(response.data, candidates)
     except ProviderError as exc:
-        _mark_provider_model_unavailable_for_error(
-            repositories,
-            provider=fallback_request.provider,
-            model_id=fallback_request.model_id,
-            exc=exc,
-        )
         log_error_event(
             "provider.structured_output_fallback_failed",
             provider=fallback_request.provider,
@@ -2182,12 +2172,6 @@ async def _select_context_with_tool_calls(
             error_category="schema_validation_failed",
         )
     except ProviderError as exc:
-        _mark_provider_model_unavailable_for_error(
-            repositories,
-            provider=provider_name,
-            model_id=model_id,
-            exc=exc,
-        )
         log_error_event(
             "provider.tool_call_failed",
             provider=provider_name,
@@ -2379,12 +2363,6 @@ async def _recover_context_tool_selection(
             error_category="schema_validation_failed",
         )
     except ProviderError as exc:
-        _mark_provider_model_unavailable_for_error(
-            repositories,
-            provider=fallback_request.provider,
-            model_id=fallback_request.model_id,
-            exc=exc,
-        )
         log_error_event(
             "provider.tool_call_fallback_failed",
             provider=fallback_request.provider,
@@ -2473,23 +2451,6 @@ def _error_category(exc: Exception | None) -> str | None:
 
 def _http_status(exc: Exception | None) -> int | None:
     return exc.status_code if isinstance(exc, ProviderError) else None
-
-
-def _mark_provider_model_unavailable_for_error(
-    repositories: PersistenceRepositories,
-    *,
-    provider: str,
-    model_id: str,
-    exc: Exception,
-) -> None:
-    if not isinstance(exc, ProviderError):
-        return
-    if exc.category != ProviderErrorCategory.MODEL_NOT_FOUND:
-        return
-    repositories.mark_provider_model_unavailable(
-        provider=provider,
-        model_id=model_id,
-    )
 
 
 async def _select_context_with_tool_feedback(
@@ -4176,6 +4137,21 @@ def _metadata_provenance_visible_to_present_characters(
     message_visibility: list[MessageVisibilityRecord],
 ) -> bool:
     raw_groups = metadata.get("source_provenance_groups")
+    mode = metadata.get("source_provenance_mode")
+    if mode is not None and mode not in {"all", "any"}:
+        return False
+    if raw_groups is not None and (
+        not isinstance(raw_groups, list)
+        or len(raw_groups) > MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS
+        or not all(
+            isinstance(group, list)
+            and bool(group)
+            and len(group) <= MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS
+            and all(isinstance(source_id, str) and source_id for source_id in group)
+            for group in raw_groups
+        )
+    ):
+        return False
     groups = (
         tuple(
             tuple(
@@ -4191,6 +4167,13 @@ def _metadata_provenance_visible_to_present_characters(
     )
     nonempty_groups = tuple(group for group in groups if group)
     if nonempty_groups:
+        grouped_source_ids = {
+            source_id for group in nonempty_groups for source_id in group
+        }
+        if not set(_metadata_source_message_ids(metadata)).issubset(
+            grouped_source_ids
+        ):
+            return False
         group_visibility = (
             _source_messages_visible_to_present_characters(
                 group,
@@ -4199,7 +4182,7 @@ def _metadata_provenance_visible_to_present_characters(
             )
             for group in nonempty_groups
         )
-        if metadata.get("source_provenance_mode") == "all":
+        if mode == "all":
             return all(group_visibility)
         return any(group_visibility)
     return _source_messages_visible_to_present_characters(

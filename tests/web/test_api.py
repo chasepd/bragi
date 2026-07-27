@@ -9172,6 +9172,45 @@ def test_diagnostics_endpoint_includes_scheduler_and_active_save_health(
     ]
 
 
+def test_diagnostics_endpoint_suppresses_curation_scheduler_error_text(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "bragi.sqlite3"
+    migrate_database(db_path)
+    repositories = PersistenceRepositories(
+        sqlite3.connect(db_path, check_same_thread=False)
+    )
+    save = _create_auth_save(
+        repositories,
+        title="Lantern Keep",
+        owner_user_id=None,
+    )
+    task = repositories.upsert_scheduled_task(
+        task_type="observation_curation_drain",
+        save_id=save.id,
+        interval_seconds=60,
+        payload={"active_save_only": False},
+        due_now=True,
+    )
+    repositories.complete_scheduled_task(
+        task.id,
+        succeeded=False,
+        error="Private chronicle detail escaped from a provider.",
+        next_run_after_seconds=120,
+    )
+    state = _state_double(tmp_path)
+    state.repositories = repositories
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.get(f"/api/diagnostics?save_id={save.id}")
+
+    assert response.status_code == 200
+    [diagnostic] = response.json()["scheduler_health"]["tasks"]
+    assert diagnostic["status"] == "failed"
+    assert diagnostic["error"] is None
+    assert "Private chronicle detail" not in response.text
+
+
 def test_diagnostics_endpoint_scopes_non_admin_to_save_health(
     tmp_path: Path,
 ) -> None:

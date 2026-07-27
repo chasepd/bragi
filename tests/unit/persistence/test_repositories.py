@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import threading
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -1871,6 +1872,394 @@ def test_repositories_persist_context_observations_with_source_evidence(
     }
 
 
+def test_repositories_list_messages_by_ids_is_save_scoped(
+    repositories: PersistenceRepositories,
+) -> None:
+    first_scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    first_save = repositories.create_save(
+        scenario_id=first_scenario.id,
+        title="Night Watch",
+    )
+    first_message = repositories.append_message(
+        save_id=first_save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I mark the eastern signal code in my notebook.",
+    )
+    second_save = repositories.create_save(
+        scenario_id=first_scenario.id,
+        title="Dawn Watch",
+    )
+    second_message = repositories.append_message(
+        save_id=second_save.id,
+        role="player",
+        speaker_name="Tarin",
+        body="I inspect the western gate.",
+    )
+
+    messages = repositories.list_messages_by_ids(
+        first_save.id,
+        (first_message.id, second_message.id, first_message.id),
+    )
+
+    assert messages == [first_message]
+
+
+def test_repositories_claim_context_observations_in_bounded_fifo_batches(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    observations = [
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="scene_fact",
+            claim=f"Observation {index}",
+        )
+        for index in range(3)
+    ]
+
+    eligible = repositories.list_eligible_context_observations(save.id, limit=2)
+    claimed = repositories.claim_context_observations(
+        [observation.id for observation in eligible],
+        lease_token="worker-one",
+        lease_seconds=600,
+    )
+
+    assert [observation.id for observation in claimed] == [
+        observations[0].id,
+        observations[1].id,
+    ]
+    assert [
+        observation.id
+        for observation in repositories.list_eligible_context_observations(
+            save.id,
+            limit=3,
+        )
+    ] == [observations[2].id]
+    state = repositories.get_context_observation_curation_state(
+        observations[0].id
+    )
+    assert state is not None
+    assert state.attempt_count == 1
+    assert state.lease_token == "worker-one"
+    assert state.lease_until is not None
+
+
+def test_repositories_normalize_observation_type_and_preserve_original(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="npc intent",
+        claim="Lio intends to inspect the lens.",
+        source_message_ids=[],
+    )
+
+    assert observation.observation_type == "character_intent"
+    assert observation.metadata["original_observation_type"] == "npc intent"
+
+
+def test_repositories_fence_stale_context_observation_curation_worker(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="scene_fact",
+        claim="The eastern signal is lit.",
+    )
+    repositories.claim_context_observations(
+        [observation.id],
+        lease_token="current-worker",
+        lease_seconds=600,
+    )
+
+    assert (
+        repositories.complete_context_observation_curation(
+            observation.id,
+            lease_token="stale-worker",
+            status="accepted",
+            terminal_outcome="accepted",
+        )
+        is None
+    )
+    current = repositories.get_context_observation(observation.id)
+    assert current is not None
+    assert current.status == "pending"
+
+    completed = repositories.complete_context_observation_curation(
+        observation.id,
+        lease_token="current-worker",
+        status="accepted",
+        terminal_outcome="accepted",
+    )
+
+    assert completed is not None
+    assert completed.status == "accepted"
+    state = repositories.get_context_observation_curation_state(observation.id)
+    assert state is not None
+    assert state.terminal_outcome == "accepted"
+    assert state.lease_token is None
+
+
+def test_context_observation_claims_are_exclusive_across_connections(
+    tmp_path: Path,
+    migrated_database_template: Path,
+) -> None:
+    database_path = tmp_path / "claims.sqlite3"
+    shutil.copy2(migrated_database_template, database_path)
+    connections = [
+        sqlite3.connect(database_path, timeout=5, check_same_thread=False)
+        for _ in range(2)
+    ]
+    repositories = [PersistenceRepositories(connection) for connection in connections]
+    try:
+        scenario = repositories[0].create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A border keep is cut off by ash storms.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories[0].create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        observations = [
+            repositories[0].add_context_observation(
+                save_id=save.id,
+                observation_type="event",
+                claim=f"Observation {index}",
+            )
+            for index in range(4)
+        ]
+        observation_ids = [observation.id for observation in observations]
+        barrier = threading.Barrier(2)
+        claimed_by_worker: list[list[str]] = [[], []]
+        claim_errors: list[BaseException] = []
+
+        def claim(worker_index: int) -> None:
+            try:
+                barrier.wait()
+                claimed_by_worker[worker_index] = [
+                    observation.id
+                    for observation in repositories[
+                        worker_index
+                    ].claim_context_observations(
+                        observation_ids,
+                        lease_token=f"worker-{worker_index}",
+                        lease_seconds=600,
+                    )
+                ]
+            except BaseException as exc:  # pragma: no cover - asserted in parent
+                claim_errors.append(exc)
+
+        threads = [threading.Thread(target=claim, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert claim_errors == []
+        assert set(claimed_by_worker[0]).isdisjoint(claimed_by_worker[1])
+        assert sorted(claimed_by_worker[0] + claimed_by_worker[1]) == sorted(
+            observation_ids
+        )
+    finally:
+        for connection in connections:
+            connection.close()
+
+
+def test_expired_context_observation_lease_cannot_complete_or_defer(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The eastern signal is lit.",
+    )
+    repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="expired-worker",
+        lease_seconds=600,
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_observation_curation_state
+        SET lease_until = '2000-01-01 00:00:00'
+        WHERE observation_id = ?
+        """,
+        (observation.id,),
+    )
+    repositories.commit()
+
+    assert not repositories.owns_context_observation_curation_lease(
+        observation.id,
+        lease_token="expired-worker",
+    )
+    assert (
+        repositories.complete_context_observation_curation(
+            observation.id,
+            lease_token="expired-worker",
+            status="accepted",
+            terminal_outcome="accepted",
+        )
+        is None
+    )
+    assert (
+        repositories.defer_context_observation_curation(
+            observation.id,
+            lease_token="expired-worker",
+            error="too late",
+            retry_after_seconds=60,
+            max_attempts=5,
+        )
+        is None
+    )
+    reclaimed = repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="replacement-worker",
+        lease_seconds=600,
+    )
+    assert [row.id for row in reclaimed] == [observation.id]
+
+
+def test_repeated_expired_context_observation_leases_exhaust_retry_budget(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The eastern signal is lit.",
+    )
+
+    for attempt in range(5):
+        claimed = repositories.claim_context_observations(
+            (observation.id,),
+            lease_token=f"worker-{attempt}",
+            lease_seconds=600,
+            max_attempts=5,
+        )
+        assert [row.id for row in claimed] == [observation.id]
+        repositories.connection.execute(
+            """
+            UPDATE context_observation_curation_state
+            SET lease_until = '2000-01-01 00:00:00'
+            WHERE observation_id = ?
+            """,
+            (observation.id,),
+        )
+        repositories.commit()
+
+    assert repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="worker-over-budget",
+        lease_seconds=600,
+        max_attempts=5,
+    ) == []
+    state = repositories.get_context_observation_curation_state(observation.id)
+    assert state is not None
+    assert state.attempt_count == 5
+    assert state.terminal_outcome == "retry_budget_exhausted"
+    updated = repositories.get_context_observation(observation.id)
+    assert updated is not None
+    assert updated.status == "curation_failed"
+
+
+def test_cancellation_release_cannot_clear_replacement_worker_lease(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The eastern signal is lit.",
+    )
+    repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="cancelled-worker",
+        lease_seconds=600,
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_observation_curation_state
+        SET lease_until = '2000-01-01 00:00:00'
+        WHERE observation_id = ?
+        """,
+        (observation.id,),
+    )
+    repositories.commit()
+    repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="replacement-worker",
+        lease_seconds=600,
+    )
+
+    released = repositories.release_context_observation_curation_claims(
+        (observation.id,),
+        lease_token="cancelled-worker",
+        error="cancelled",
+    )
+
+    assert released == 0
+    state = repositories.get_context_observation_curation_state(observation.id)
+    assert state is not None
+    assert state.lease_token == "replacement-worker"
+
+
 def test_repositories_archive_context_observations_for_deleted_messages(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -2224,35 +2613,6 @@ def test_repositories_count_provider_models(
     assert repositories.count_provider_models("openrouter") == 2
     assert repositories.count_provider_models("venice") == 1
     assert repositories.count_provider_models("missing") == 0
-
-
-def test_repositories_mark_provider_model_unavailable(
-    repositories: PersistenceRepositories,
-) -> None:
-    repositories.save_provider_model(
-        provider="openrouter",
-        model_id="openrouter/context",
-        display_name="OpenRouter Context",
-        capabilities=["tool_calling"],
-    )
-    repositories.save_provider_model(
-        provider="openrouter",
-        model_id="openrouter/chat",
-        display_name="OpenRouter Chat",
-        capabilities=["chat"],
-    )
-
-    repositories.mark_provider_model_unavailable(
-        provider="openrouter",
-        model_id="openrouter/context",
-    )
-
-    models_by_id = {
-        model.model_id: model
-        for model in repositories.list_provider_models("openrouter")
-    }
-    assert models_by_id["openrouter/context"].available is False
-    assert models_by_id["openrouter/chat"].available is True
 
 
 def test_repositories_replace_provider_catalog_entries(
@@ -4020,15 +4380,15 @@ def test_repositories_exact_phrase_precedes_bounded_all_term_matches(
         title="Old mechanism",
         body="The copper notch under the western stair opens the vault.",
     )
-    for index in range(30):
+    for index in range(40):
         repositories.upsert_context_source(
             save_id=save.id,
             source_type="memory",
             source_id=f"memory-all-terms-{index:02d}",
             title=f"New mechanism {index:02d}",
             body=(
-                "The western vault records a stair repair and a copper "
-                f"notch inspection {index:02d}."
+                "Western stair records say the notch inspection found copper "
+                f"under shelving {index:02d}."
             ),
         )
 
@@ -7242,6 +7602,52 @@ def test_repository_updates_message_body_and_records_revisions(
     assert revisions[-1].reconciliation_status == "failed"
     assert revisions[-1].reconciliation_error == "structured backend failed"
     assert revisions[-1].reconciled_at is not None
+
+
+def test_narration_graph_normalizes_state_alias_and_bounds_owner_rows(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    state = repositories.upsert_world_state(
+        save_id=save_id,
+        key="vault.code",
+        value={"phrase": "ember dawn"},
+        source_message_id=message_id,
+    )
+    characters = [
+        repositories.add_character(
+            save_id=save_id,
+            name=f"Warden {index:02d}",
+            character_id=f"character-{index:02d}",
+        )
+        for index in range(20)
+    ]
+    threshold_edge = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=characters[0].id,
+        target_type="state",
+        target_id=state.id,
+        knowledge_state="may_know",
+        confidence=0.72,
+    )
+    for character in characters[1:]:
+        repositories.add_character_knowledge_edge(
+            save_id=save_id,
+            character_id=character.id,
+            target_type="state",
+            target_id=state.id,
+            knowledge_state="knows",
+        )
+
+    edges = repositories.list_narration_character_knowledge_edges(
+        save_id,
+        target_keys={("world_state", state.id)},
+        present_character_ids={character.id for character in characters},
+        visibility_character_ids={character.id for character in characters},
+    )
+
+    assert threshold_edge.id in {edge.id for edge in edges}
+    assert len(edges) == 8
 
 
 def _persist_repository_save(

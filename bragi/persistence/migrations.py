@@ -11,10 +11,14 @@ from hashlib import sha256
 from pathlib import Path
 
 from bragi.model_tasks import is_retired_model_task
+from bragi.observation_types import normalize_observation_type
 from bragi.private_files import ensure_private_file
 from bragi.text_search import cjk_lexical_anchors, unicode_word_terms
 
-CURRENT_SCHEMA_VERSION = 71
+CURRENT_SCHEMA_VERSION = 72
+_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
+_MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
+_MAX_MEMORY_PROVENANCE_IDS = 64
 
 _PRESERVE_SCHEMA_SCRIPT_TRANSACTION: ContextVar[bool] = ContextVar(
     "_PRESERVE_SCHEMA_SCRIPT_TRANSACTION",
@@ -187,6 +191,26 @@ ON context_observations(save_id, status, archived_at);
 
 CREATE INDEX IF NOT EXISTS idx_context_observations_save_created
 ON context_observations(save_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS context_observation_curation_state (
+    observation_id TEXT PRIMARY KEY
+        REFERENCES context_observations(id) ON DELETE CASCADE,
+    save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_eligible_at TEXT,
+    lease_token TEXT,
+    lease_until TEXT,
+    last_error TEXT,
+    terminal_outcome TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_observation_curation_due
+ON context_observation_curation_state(
+    save_id, terminal_outcome, next_eligible_at, lease_until
+);
 
 CREATE TABLE IF NOT EXISTS scene_snapshots (
     id TEXT PRIMARY KEY,
@@ -628,23 +652,30 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 70:
+            if current == 71:
+                _migrate_schema_71_to_72(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 70:
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 69:
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 68:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 67:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 66:
                 _migrate_schema_66_to_67(connection)
@@ -652,6 +683,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 65:
                 _migrate_schema_65_to_66(connection)
@@ -660,6 +692,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 64:
                 _migrate_schema_64_to_65(connection)
@@ -669,6 +702,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 63:
                 _migrate_schema_63_to_64(connection)
@@ -679,6 +713,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 62:
                 _migrate_schema_62_to_63(connection)
@@ -690,6 +725,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 61:
                 _migrate_schema_61_to_62(connection)
@@ -702,6 +738,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
+                _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             else:
                 raise RuntimeError(
@@ -725,6 +762,7 @@ def migrate_database(database_path: Path | str) -> None:
             )
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
+        _ensure_context_observation_curation_schema(connection)
         _ensure_character_current_clothing_schema(connection)
         _ensure_character_text_schema(connection)
         _ensure_character_text_activity_schema(connection)
@@ -965,6 +1003,80 @@ def _ensure_context_observation_schema(connection: sqlite3.Connection) -> None:
         ON context_observations(save_id, created_at, id);
         """
     )
+
+
+def _ensure_context_observation_curation_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    if not _table_exists(connection, "context_observations") or not _table_exists(
+        connection,
+        "saves",
+    ):
+        return
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS context_observation_curation_state (
+            observation_id TEXT PRIMARY KEY
+                REFERENCES context_observations(id) ON DELETE CASCADE,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_eligible_at TEXT,
+            lease_token TEXT,
+            lease_until TEXT,
+            last_error TEXT,
+            terminal_outcome TEXT,
+            completed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_observation_curation_due
+        ON context_observation_curation_state(
+            save_id, terminal_outcome, next_eligible_at, lease_until
+        );
+        """,
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO context_observation_curation_state(
+            observation_id, save_id, terminal_outcome, completed_at
+        )
+        SELECT
+            id,
+            save_id,
+            CASE WHEN status = 'pending' THEN NULL ELSE status END,
+            CASE WHEN status = 'pending' THEN NULL ELSE updated_at END
+        FROM context_observations
+        """
+    )
+    for observation_id, observation_type, metadata_json in connection.execute(
+        "SELECT id, observation_type, metadata_json FROM context_observations"
+    ).fetchall():
+        original_type = str(observation_type)
+        normalized_type = normalize_observation_type(original_type)
+        if normalized_type == original_type:
+            continue
+        try:
+            metadata = json.loads(str(metadata_json))
+        except (TypeError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata.setdefault("original_observation_type", original_type)
+        connection.execute(
+            """
+            UPDATE context_observations
+            SET observation_type = ?, metadata_json = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                normalized_type,
+                json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                observation_id,
+            ),
+        )
 
 
 def _ensure_message_scene_presence_schema(connection: sqlite3.Connection) -> None:
@@ -1707,6 +1819,11 @@ def _migrate_schema_69_to_70(connection: sqlite3.Connection) -> None:
 
 
 def _migrate_schema_70_to_71(connection: sqlite3.Connection) -> None:
+    _ensure_context_observation_curation_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (71)")
+
+
+def _migrate_schema_71_to_72(connection: sqlite3.Connection) -> None:
     _add_column_if_missing(
         connection,
         "scene_snapshots",
@@ -1875,11 +1992,15 @@ def _migrate_schema_70_to_71(connection: sqlite3.Connection) -> None:
                     importance,
                     source_message_id,
                     json.dumps(
-                        list(dict.fromkeys(source_message_ids)),
+                        list(dict.fromkeys(source_message_ids))[
+                            :_MAX_MEMORY_PROVENANCE_IDS
+                        ],
                         separators=(",", ":"),
                     ),
                     json.dumps(
-                        list(dict.fromkeys(source_observation_ids)),
+                        list(dict.fromkeys(source_observation_ids))[
+                            :_MAX_MEMORY_PROVENANCE_IDS
+                        ],
                         separators=(",", ":"),
                     ),
                     keeper[0],
@@ -1923,7 +2044,7 @@ def _migrate_schema_70_to_71(connection: sqlite3.Connection) -> None:
             WHERE archived_at IS NULL AND claim_fingerprint != ''
             """
         )
-    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (71)")
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (72)")
 
 
 def _remap_migrated_memory_references(
@@ -2059,6 +2180,17 @@ def _remap_migrated_memory_references(
             """,
             (keeper_id, save_id, duplicate_id),
         )
+    if _table_exists(connection, "character_text_provenance"):
+        connection.execute(
+            """
+            UPDATE character_text_provenance
+            SET target_id = ?
+            WHERE save_id = ?
+              AND target_type IN ('memory', 'memories')
+              AND target_id = ?
+            """,
+            (keeper_id, save_id, duplicate_id),
+        )
 
 
 def _merge_migrated_memory_knowledge_edge_conflicts(
@@ -2113,6 +2245,10 @@ def _merge_migrated_memory_knowledge_edge_conflicts(
                     for value in values
                     if isinstance(value, str) and value
                 )
+        source_ids = list(dict.fromkeys(source_ids))
+        provenance_overflow = (
+            len(source_ids) > _MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS
+        )
         connection.execute(
             """
             UPDATE character_knowledge_edges
@@ -2123,15 +2259,23 @@ def _merge_migrated_memory_knowledge_edge_conflicts(
             WHERE id = ?
             """,
             (
-                row[dominant_offset + 1],
-                row[dominant_offset + 2],
+                (
+                    "does_not_know"
+                    if provenance_overflow
+                    else row[dominant_offset + 1]
+                ),
+                "unknown" if provenance_overflow else row[dominant_offset + 2],
                 max(float(str(row[3])), float(str(row[10]))),
-                row[dominant_offset + 4],
+                None if provenance_overflow else row[dominant_offset + 4],
                 json.dumps(
-                    list(dict.fromkeys(source_ids)),
+                    [] if provenance_overflow else source_ids,
                     separators=(",", ":"),
                 ),
-                row[dominant_offset + 6],
+                (
+                    "Provenance exceeded the safe bound."
+                    if provenance_overflow
+                    else row[dominant_offset + 6]
+                ),
                 row[0],
             ),
         )
@@ -2153,8 +2297,6 @@ def _migration_claim_fingerprint(value: object) -> str:
 
 def _migration_placeholders(count: int) -> str:
     return ", ".join("?" for _ in range(count))
-
-
 def _remove_retired_model_preferences(connection: sqlite3.Connection) -> None:
     if not _table_exists(connection, "model_preferences"):
         return
@@ -3801,7 +3943,7 @@ def _ensure_continuity_index_revision_schema(connection: sqlite3.Connection) -> 
         "character_text_threads": ("character_text_thread", "id"),
         "character_text_messages": ("character_text_thread", "thread_id"),
     }
-    for table_name in (*source_mappings, "scene_snapshots"):
+    for table_name in source_mappings:
         if not _table_exists(connection, table_name):
             continue
         for event in ("INSERT", "UPDATE", "DELETE"):
@@ -3810,8 +3952,6 @@ def _ensure_continuity_index_revision_schema(connection: sqlite3.Connection) -> 
                 f"bump_{table_name}_continuity_revision_after_{event.lower()}"
             )
             connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
-            if table_name == "scene_snapshots":
-                continue
             source_kind, source_column = source_mappings[table_name]
             source_id_sql = (
                 "'scenario'"
@@ -3855,6 +3995,110 @@ def _ensure_continuity_index_revision_schema(connection: sqlite3.Connection) -> 
                 END;
                 """,
             )
+    _ensure_scene_snapshot_continuity_triggers(connection)
+    _ensure_scenario_continuity_triggers(connection)
+
+
+def _ensure_scene_snapshot_continuity_triggers(
+    connection: sqlite3.Connection,
+) -> None:
+    if not _table_exists(connection, "scene_snapshots"):
+        return
+    for event, references in (
+        ("INSERT", ("NEW",)),
+        ("UPDATE", ("OLD", "NEW")),
+        ("DELETE", ("OLD",)),
+    ):
+        trigger_name = (
+            f"bump_scene_snapshots_continuity_revision_after_{event.lower()}"
+        )
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+        row_ref = "OLD" if event == "DELETE" else "NEW"
+        location_queries = " UNION ".join(
+            f"SELECT {reference}.current_location_id AS source_id"
+            for reference in references
+        )
+        character_queries = " UNION ".join(
+            (
+                "SELECT CAST(value AS TEXT) AS source_id "
+                f"FROM json_each(COALESCE({reference}."
+                "present_character_ids_json, '[]'))"
+            )
+            for reference in references
+        )
+        _execute_schema_script(
+            connection,
+            f"""
+            CREATE TRIGGER {trigger_name}
+            AFTER {event} ON scene_snapshots
+            BEGIN
+                INSERT INTO save_continuity_index_revisions(
+                    save_id, revision, indexed_revision, updated_at
+                )
+                VALUES ({row_ref}.save_id, 1, -1, CURRENT_TIMESTAMP)
+                ON CONFLICT(save_id) DO UPDATE SET
+                    revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP;
+
+                INSERT INTO continuity_index_dirty_sources(
+                    save_id, source_kind, source_id, dirty_generation, queued_at
+                )
+                SELECT {row_ref}.save_id, 'location', source_id, 1,
+                       CURRENT_TIMESTAMP
+                FROM ({location_queries})
+                WHERE source_id IS NOT NULL AND source_id != ''
+                ON CONFLICT(save_id, source_kind, source_id) DO UPDATE SET
+                    dirty_generation = dirty_generation + 1,
+                    queued_at = CURRENT_TIMESTAMP;
+
+                INSERT INTO continuity_index_dirty_sources(
+                    save_id, source_kind, source_id, dirty_generation, queued_at
+                )
+                SELECT {row_ref}.save_id, 'character', source_id, 1,
+                       CURRENT_TIMESTAMP
+                FROM ({character_queries})
+                WHERE source_id IS NOT NULL AND source_id != ''
+                ON CONFLICT(save_id, source_kind, source_id) DO UPDATE SET
+                    dirty_generation = dirty_generation + 1,
+                    queued_at = CURRENT_TIMESTAMP;
+            END;
+            """,
+        )
+
+
+def _ensure_scenario_continuity_triggers(connection: sqlite3.Connection) -> None:
+    if not _table_exists(connection, "scenarios"):
+        return
+    trigger_name = "bump_scenarios_continuity_revision_after_update"
+    connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+    _execute_schema_script(
+        connection,
+        f"""
+        CREATE TRIGGER {trigger_name}
+        AFTER UPDATE ON scenarios
+        BEGIN
+            INSERT INTO save_continuity_index_revisions(
+                save_id, revision, indexed_revision, updated_at
+            )
+            SELECT saves.id, 1, -1, CURRENT_TIMESTAMP
+            FROM saves
+            WHERE saves.scenario_id = NEW.id
+            ON CONFLICT(save_id) DO UPDATE SET
+                revision = revision + 1,
+                updated_at = CURRENT_TIMESTAMP;
+
+            INSERT INTO continuity_index_dirty_sources(
+                save_id, source_kind, source_id, dirty_generation, queued_at
+            )
+            SELECT saves.id, 'scenario', 'scenario', 1, CURRENT_TIMESTAMP
+            FROM saves
+            WHERE saves.scenario_id = NEW.id
+            ON CONFLICT(save_id, source_kind, source_id) DO UPDATE SET
+                dirty_generation = dirty_generation + 1,
+                queued_at = CURRENT_TIMESTAMP;
+        END;
+        """,
+    )
 
 
 def _ensure_context_source_search_terms_schema(
@@ -3915,11 +4159,13 @@ def _migration_context_source_search_terms(
     title: str,
     body: str,
 ) -> tuple[str, ...]:
+    bounded_title = title[:_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
+    bounded_body = body[:_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
     terms = (
-        *unicode_word_terms(title),
-        *cjk_lexical_anchors(title),
-        *unicode_word_terms(body),
-        *cjk_lexical_anchors(body),
+        *unicode_word_terms(bounded_title),
+        *cjk_lexical_anchors(bounded_title),
+        *unicode_word_terms(bounded_body),
+        *cjk_lexical_anchors(bounded_body),
     )
     return tuple(dict.fromkeys(terms))[:4096]
 

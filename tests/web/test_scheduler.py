@@ -13,6 +13,7 @@ from bragi.services.character_registry_maintenance_service import (
     CHARACTER_MAINTENANCE_TURN_CADENCE,
 )
 from bragi.services.memory_consolidation_service import MEMORY_CONSOLIDATION_THRESHOLD
+from bragi.services.model_preferences import set_save_model_override_preference
 from bragi_web.jobs import JobRegistry
 from bragi_web.runtime import SaveEventHub
 from bragi_web.scheduler import (
@@ -20,6 +21,7 @@ from bragi_web.scheduler import (
     CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_TASK,
     CONTEXT_UPDATE_RETRY_DRAIN_TASK,
     MEMORY_CONSOLIDATION_TASK,
+    OBSERVATION_CURATION_DRAIN_TASK,
     STATE_EXTRACTION_RETRY_DRAIN_TASK,
     STATE_PRUNING_TASK,
     WEB_MAINTENANCE_CHARACTER_REGISTRY_MAINTENANCE_JOB,
@@ -709,6 +711,356 @@ def test_scheduler_drains_context_update_retry_for_inactive_save(
     }
 
 
+def test_scheduler_drains_observation_curation_for_inactive_save(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    active_save_id = _save(repositories, title="Active Save")
+    inactive_save_id = _save(repositories, title="Inactive Save")
+    repositories.set_model_preference(
+        task="memory_curation",
+        provider="fake",
+        model_id="fake-curator",
+    )
+    repositories.add_context_observation(
+        save_id=inactive_save_id,
+        observation_type="event",
+        claim="The beacon was relit.",
+        evidence_quote="The beacon was relit.",
+        source_message_ids=[],
+        scope="durable",
+        confidence=0.9,
+    )
+    runtime = _ReviewRuntime(active_save_id=active_save_id)
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.observation_curation_calls == [inactive_save_id]
+    task = repositories.get_scheduled_task(
+        task_type=OBSERVATION_CURATION_DRAIN_TASK,
+        save_id=inactive_save_id,
+    )
+    assert task is not None
+    assert task.payload["active_save_only"] is False
+
+
+def test_scheduler_serializes_maintenance_tasks_selected_for_same_save(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_id = _save(repositories, title="Busy Save")
+    repositories.set_model_preference(
+        task="memory_curation",
+        provider="fake",
+        model_id="fake-curator",
+    )
+    repositories.set_model_preference(
+        task="context_update",
+        provider="fake",
+        model_id="fake-context",
+    )
+    repositories.add_context_observation(
+        save_id=save_id,
+        observation_type="event",
+        claim="The beacon was relit.",
+        evidence_quote="The beacon was relit.",
+        source_message_ids=[],
+        scope="durable",
+        confidence=0.9,
+    )
+    for index in range(MEMORY_CONSOLIDATION_THRESHOLD):
+        repositories.add_memory(
+            save_id=save_id,
+            body=f"Memory {index}",
+            tags=["test"],
+        )
+    runtime = _ReviewRuntime(active_save_id=save_id)
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.observation_curation_calls == [save_id]
+    assert runtime.memory_consolidation_calls == [save_id]
+    task_job_ids = [
+        task.last_job_id
+        for task_type in (OBSERVATION_CURATION_DRAIN_TASK, MEMORY_CONSOLIDATION_TASK)
+        if (
+            task := repositories.get_scheduled_task(
+                task_type=task_type,
+                save_id=save_id,
+            )
+        )
+        is not None
+    ]
+    assert len(task_job_ids) == 2
+    jobs = [state.jobs.get(job_id) for job_id in task_job_ids if job_id is not None]
+    assert len(jobs) == 2
+    assert all(job is not None and job.operation_queue_key == save_id for job in jobs)
+
+
+def test_scheduler_bounds_observation_curation_discovery_per_poll(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_ids = [_save(repositories, title=f"Backlog {index}") for index in range(25)]
+    for index, save_id in enumerate(save_ids):
+        repositories.add_context_observation(
+            save_id=save_id,
+            observation_type="event",
+            claim=f"Observation {index}",
+            evidence_quote=f"Observation {index}",
+            source_message_ids=[],
+            scope="durable",
+            confidence=0.9,
+        )
+    discovery_calls: list[tuple[int, int]] = []
+    original_list_due = (
+        repositories.list_save_ids_with_due_context_observation_curation
+    )
+
+    def record_list_due(*, limit: int, offset: int = 0) -> list[str]:
+        discovery_calls.append((limit, offset))
+        return original_list_due(limit=limit, offset=offset)
+
+    repositories.list_save_ids_with_due_context_observation_curation = record_list_due  # type: ignore[method-assign]
+    runtime = _ReviewRuntime(active_save_id=save_ids[0])
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert discovery_calls == [(10, 0)]
+
+
+def test_scheduler_advances_past_active_curation_candidates(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_ids = [_save(repositories, title=f"Backlog {index}") for index in range(11)]
+    for index, save_id in enumerate(save_ids):
+        repositories.add_context_observation(
+            save_id=save_id,
+            observation_type="event",
+            claim=f"Observation {index}",
+            evidence_quote=f"Observation {index}",
+            source_message_ids=[],
+            scope="durable",
+            confidence=0.9,
+        )
+        set_save_model_override_preference(
+            repositories,
+            save_id=save_id,
+            task="memory_curation",
+            provider="fake",
+            model_id="fake-curator",
+        )
+    runtime = _ReviewRuntime(active_save_id=save_ids[0])
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        release = asyncio.Event()
+
+        async def blocking_worker(_handle: object) -> object:
+            await release.wait()
+            return {}
+
+        for save_id in save_ids[:10]:
+            await state.jobs.create(
+                "chat_turn",
+                blocking_worker,
+                save_id=save_id,
+                exclusive_key=f"chat_turn:{save_id}",
+                operation_queue_key=save_id,
+            )
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        for _ in range(2):
+            await scheduler.run_once()
+        for _ in range(20):
+            if runtime.observation_curation_calls:
+                break
+            await asyncio.sleep(0)
+        release.set()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.observation_curation_calls == [save_ids[10]]
+
+
+def test_scheduler_persists_only_metadata_for_curation_failures(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_id = _save(repositories, title="Private Backlog")
+    repositories.add_context_observation(
+        save_id=save_id,
+        observation_type="event",
+        claim="A private chronicle detail.",
+        evidence_quote="A private chronicle detail.",
+        source_message_ids=[],
+        scope="durable",
+        confidence=0.9,
+    )
+    set_save_model_override_preference(
+        repositories,
+        save_id=save_id,
+        task="memory_curation",
+        provider="fake",
+        model_id="fake-curator",
+    )
+    runtime = _CurationErrorRuntime(active_save_id=save_id)
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    task = repositories.get_scheduled_task(
+        task_type=OBSERVATION_CURATION_DRAIN_TASK,
+        save_id=save_id,
+    )
+    assert task is not None
+    assert task.error == "observation_curation_failed"
+    assert task.result == {
+        "active_save_id": save_id,
+        "error_present": True,
+        "status": None,
+    }
+    assert "private chronicle" not in json.dumps(task.result).lower()
+
+
+def test_scheduler_skips_unconfigured_curation_backlogs_without_starvation(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_ids = [
+        _save(repositories, title=f"Backlog {index}") for index in range(11)
+    ]
+    for index, save_id in enumerate(save_ids):
+        repositories.add_context_observation(
+            save_id=save_id,
+            observation_type="event",
+            claim=f"Observation {index}",
+            evidence_quote=f"Observation {index}",
+            source_message_ids=[],
+            scope="durable",
+            confidence=0.9,
+        )
+    runnable_save_id = save_ids[-1]
+    set_save_model_override_preference(
+        repositories,
+        save_id=runnable_save_id,
+        task="memory_curation",
+        provider="fake",
+        model_id="fake-curator",
+    )
+    runtime = _ReviewRuntime(active_save_id=save_ids[0])
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        for _ in range(2):
+            await scheduler.run_once()
+            await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.observation_curation_calls == [runnable_save_id]
+
+
+def test_scheduler_replenishes_curation_candidates_after_due_checks(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_ids = [_save(repositories, title=f"Backlog {index}") for index in range(11)]
+    for index, save_id in enumerate(save_ids):
+        repositories.add_context_observation(
+            save_id=save_id,
+            observation_type="event",
+            claim=f"Observation {index}",
+            evidence_quote=f"Observation {index}",
+            source_message_ids=[],
+            scope="durable",
+            confidence=0.9,
+        )
+        set_save_model_override_preference(
+            repositories,
+            save_id=save_id,
+            task="memory_curation",
+            provider="fake",
+            model_id="fake-curator",
+        )
+    runtime = _ReviewRuntime(active_save_id=save_ids[0])
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+        repositories.connection.execute(
+            """
+            UPDATE scheduled_tasks
+            SET next_run_at = '2000-01-01 00:00:00'
+            WHERE task_type = ?
+            """,
+            (OBSERVATION_CURATION_DRAIN_TASK,),
+        )
+        repositories.commit()
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert set(runtime.observation_curation_calls[:10]) == set(save_ids[:10])
+    assert save_ids[10] in runtime.observation_curation_calls[10:]
+
+
 def test_scheduler_drains_inactive_context_retry_while_active_save_job_runs(
     tmp_path: Path,
 ) -> None:
@@ -1275,6 +1627,7 @@ class _ReviewRuntime:
         self.state_pruning_calls: list[str] = []
         self.state_retry_calls: list[str] = []
         self.context_retry_calls: list[str] = []
+        self.observation_curation_calls: list[str] = []
         self.character_text_world_update_retry_calls: list[str] = []
         self.memory_consolidation_calls: list[str] = []
         self.character_maintenance_calls: list[str] = []
@@ -1295,6 +1648,10 @@ class _ReviewRuntime:
 
     async def run_context_update_retries(self, *, active_save_id: str) -> object:
         self.context_retry_calls.append(active_save_id)
+        return {"active_save_id": active_save_id, "completed": 0, "error": None}
+
+    async def run_observation_curation(self, *, active_save_id: str) -> object:
+        self.observation_curation_calls.append(active_save_id)
         return {"active_save_id": active_save_id, "completed": 0, "error": None}
 
     async def run_state_extraction_retries(self, *, active_save_id: str) -> object:
@@ -1360,6 +1717,16 @@ class _ErrorResultRuntime(_ReviewRuntime):
         return {
             "active_save_id": active_save_id,
             "error": "review exploded",
+            "status": None,
+        }
+
+
+class _CurationErrorRuntime(_ReviewRuntime):
+    async def run_observation_curation(self, *, active_save_id: str) -> object:
+        self.observation_curation_calls.append(active_save_id)
+        return {
+            "active_save_id": active_save_id,
+            "error": "Private chronicle detail escaped from a provider.",
             "status": None,
         }
 

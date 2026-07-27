@@ -791,3 +791,77 @@ def test_continuity_index_does_not_cap_active_threads_before_retrieval(
 
     assert result.skipped_counts["active_thread"] == 0
     assert indexed_thread_ids == {thread.id for thread in threads}
+
+
+def test_scene_and_base_scenario_changes_queue_exact_continuity_sources(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A keep in the ash.",
+        player_role="Warden",
+        content={"lore": "The old lens is red."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    old_location = repositories.add_location(
+        save_id=save.id,
+        name="Old Gallery",
+    )
+    new_location = repositories.add_location(
+        save_id=save.id,
+        name="New Gallery",
+    )
+    old_character = repositories.add_character(
+        save_id=save.id,
+        name="Old Warden",
+    )
+    new_character = repositories.add_character(
+        save_id=save.id,
+        name="New Warden",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=old_location.id,
+        present_character_ids=[old_character.id],
+    )
+    while not ContinuityIndexService(repositories).sync_save(save.id).complete:
+        pass
+
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=new_location.id,
+        present_character_ids=[new_character.id],
+    )
+    dirty = {
+        (source_kind, source_id)
+        for source_kind, source_id, _generation in (
+            repositories.list_continuity_index_dirty_sources(save.id, limit=32)
+        )
+    }
+    assert {
+        ("location", old_location.id),
+        ("location", new_location.id),
+        ("character", old_character.id),
+        ("character", new_character.id),
+    } <= dirty
+
+    while not ContinuityIndexService(repositories).sync_save(save.id).complete:
+        pass
+    repositories.update_scenario(
+        scenario_id=scenario.id,
+        title=scenario.title,
+        premise=scenario.premise,
+        player_role=scenario.player_role,
+        content={"lore": "The repaired lens is blue."},
+    )
+
+    assert (
+        "scenario",
+        "scenario",
+    ) in {
+        (source_kind, source_id)
+        for source_kind, source_id, _generation in (
+            repositories.list_continuity_index_dirty_sources(save.id, limit=8)
+        )
+    }

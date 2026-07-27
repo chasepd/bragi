@@ -39,6 +39,7 @@ _JOB_TYPE_ORIGINS = {
     "context_cleanup": "scheduled_maintenance",
     "guided_context_cleanup": "scheduled_maintenance",
     "memory_consolidation": "scheduled_maintenance",
+    "observation_curation_drain": "scheduled_maintenance",
     "world_context_retention": "scheduled_maintenance",
     "dating_sim_maintenance": "scheduled_maintenance",
     "character_registry_maintenance": "scheduled_maintenance",

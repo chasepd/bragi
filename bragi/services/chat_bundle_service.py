@@ -63,7 +63,10 @@ from bragi.services.scenario_service import (
     scenario_record_is_retired,
     strip_deprecated_scenario_character_sections,
 )
-from bragi.services.turn_snapshot_service import TurnSnapshotService
+from bragi.services.turn_snapshot_service import (
+    TurnSnapshotService,
+    portable_context_observation_curation_state_row,
+)
 from bragi.world_time_model import (
     canonical_world_time_from_values,
     legacy_world_time_fields,
@@ -484,6 +487,21 @@ class ChatBundleService:
                 """,
                 (save_id,),
             ),
+            "context_observation_curation_states": [
+                portable_context_observation_curation_state_row(row)
+                for row in self._rows(
+                    """
+                    SELECT observation_id, save_id, attempt_count,
+                           next_eligible_at, lease_token, lease_until,
+                           last_error, terminal_outcome, completed_at,
+                           created_at, updated_at
+                    FROM context_observation_curation_state
+                    WHERE save_id = ?
+                    ORDER BY created_at, observation_id
+                    """,
+                    (save_id,),
+                )
+            ],
             "scene_snapshots": self._rows(
                 """
                 SELECT id, save_id, current_location_id, situation, objective,
@@ -1387,6 +1405,24 @@ class ChatBundleService:
                 claim_fingerprint=current_memory.claim_fingerprint,
             )
         self.repositories.consolidate_active_memory_duplicates(save_id=save.id)
+
+        for row in _list_of_objects(
+            data.get("context_observation_curation_states"),
+            "context_observation_curation_states",
+        ):
+            mapped_observation_id = observation_id_map.get(
+                _text(row, "observation_id")
+            )
+            if mapped_observation_id is None:
+                continue
+            self.repositories.restore_context_observation_curation_state(
+                mapped_observation_id,
+                attempt_count=_optional_int(row, "attempt_count") or 0,
+                next_eligible_at=_optional_text(row, "next_eligible_at"),
+                last_error=_optional_text(row, "last_error"),
+                terminal_outcome=_optional_text(row, "terminal_outcome"),
+                completed_at=_optional_text(row, "completed_at"),
+            )
 
         scenario_update_id_map: dict[str, str] = {}
         for row in _list_of_objects(
@@ -4727,11 +4763,22 @@ def _remapped_context_source_metadata_json(
                 repair_tracker=repair_tracker,
             )
     if "audience_character_ids" in remapped:
-        remapped["audience_character_ids"] = _mapped_context_source_metadata_id_list(
-            remapped["audience_character_ids"],
+        raw_audience = remapped["audience_character_ids"]
+        mapped_audience = _mapped_context_source_metadata_id_list(
+            raw_audience,
             entity_id_maps.get("character", {}),
             field_name="context_sources.metadata_json.audience_character_ids",
             repair_tracker=repair_tracker,
+        )
+        if isinstance(raw_audience, list) and raw_audience and not mapped_audience:
+            return None
+        remapped["audience_character_ids"] = mapped_audience
+    if "source_provenance_mode" in remapped and remapped[
+        "source_provenance_mode"
+    ] not in {"all", "any"}:
+        raise ChatBundleError(
+            "Bundle context_sources.metadata_json.source_provenance_mode "
+            "must be 'all' or 'any'"
         )
     if source_type == "character_text_thread" and "thread_id" in remapped:
         thread_id = remapped["thread_id"]
@@ -4839,6 +4886,22 @@ def _remapped_context_source_metadata_json(
                 mapped_group.append(mapped)
             mapped_groups.append(mapped_group)
         remapped["source_provenance_groups"] = mapped_groups
+        scalar_source_ids = {
+            source_id
+            for field in _CONTEXT_SOURCE_METADATA_MESSAGE_ID_FIELDS
+            if isinstance((source_id := remapped.get(field)), str)
+        }
+        for field in _CONTEXT_SOURCE_METADATA_MESSAGE_ID_LIST_FIELDS:
+            value = remapped.get(field)
+            if isinstance(value, list):
+                scalar_source_ids.update(
+                    item for item in value if isinstance(item, str)
+                )
+        grouped_source_ids = {
+            source_id for group in mapped_groups for source_id in group
+        }
+        if not scalar_source_ids.issubset(grouped_source_ids):
+            return None
     return _dump_json_compact(remapped)
 
 
@@ -5819,9 +5882,16 @@ def _merged_import_context_source_metadata_json(
                 for value in raw_values
                 if isinstance(value, str) and value
             )
-        metadata[field] = list(
-            dict.fromkeys(values)
-        )
+        merged_values = list(dict.fromkeys(values))
+        if (
+            field == "source_message_ids"
+            and len(merged_values)
+            > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS
+        ):
+            raise ChatBundleError(
+                "Merged context source message provenance is too large"
+            )
+        metadata[field] = merged_values
     groups: list[list[str]] = []
     for item in loaded_metadata:
         raw_groups = item.get("source_provenance_groups")
@@ -5837,6 +5907,10 @@ def _merged_import_context_source_metadata_json(
             ]
             if group and group not in groups:
                 groups.append(group)
+                if len(groups) > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS:
+                    raise ChatBundleError(
+                        "Merged context source provenance is too large"
+                    )
     metadata["source_provenance_groups"] = groups
     metadata["source_provenance_mode"] = (
         "all"
@@ -5913,11 +5987,17 @@ def _coalesce_import_knowledge_edges(
         existing["source_message_ids_json"] = _merge_json_string_lists(
             existing.get("source_message_ids_json"),
             row.get("source_message_ids_json"),
+            limit=_MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS,
         )
     return list(coalesced.values())
 
 
-def _merge_json_string_lists(first: object, second: object) -> str:
+def _merge_json_string_lists(
+    first: object,
+    second: object,
+    *,
+    limit: int | None = None,
+) -> str:
     values: list[str] = []
     for raw in (first, second):
         try:
@@ -5930,7 +6010,10 @@ def _merge_json_string_lists(first: object, second: object) -> str:
                 for value in loaded
                 if isinstance(value, str) and value
             )
-    return _dump_json_compact(list(dict.fromkeys(values)))
+    merged = list(dict.fromkeys(values))
+    if limit is not None and len(merged) > limit:
+        raise ChatBundleError("Merged provenance is too large")
+    return _dump_json_compact(merged)
 
 
 def _numeric_import_value(value: object) -> float:

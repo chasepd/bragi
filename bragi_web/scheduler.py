@@ -20,6 +20,7 @@ WORLD_SUGGESTION_REVIEW_TASK = "world_suggestion_review"
 STATE_PRUNING_TASK = "state_pruning"
 STATE_EXTRACTION_RETRY_DRAIN_TASK = "state_extraction_retry_drain"
 CONTEXT_UPDATE_RETRY_DRAIN_TASK = "context_update_retry_drain"
+OBSERVATION_CURATION_DRAIN_TASK = "observation_curation_drain"
 CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_TASK = (
     "character_text_world_update_retry_drain"
 )
@@ -46,6 +47,7 @@ WORLD_SUGGESTION_REVIEW_INTERVAL_SECONDS = 60
 STATE_PRUNING_INTERVAL_SECONDS = 60
 STATE_EXTRACTION_RETRY_DRAIN_INTERVAL_SECONDS = 60
 CONTEXT_UPDATE_RETRY_DRAIN_INTERVAL_SECONDS = 60
+OBSERVATION_CURATION_DRAIN_INTERVAL_SECONDS = 60
 CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_INTERVAL_SECONDS = 60
 WORLD_CONTEXT_RETENTION_INTERVAL_SECONDS = 15 * 60
 MEMORY_CONSOLIDATION_INTERVAL_SECONDS = 10 * 60
@@ -153,8 +155,20 @@ class WebMaintenanceScheduler:
             for save_id in target_save_ids
         }
         for definition in _MAINTENANCE_TASKS:
+            selected_for_definition = 0
             for save_id in target_save_ids_by_task[definition.task_type]:
+                if (
+                    definition.task_type == OBSERVATION_CURATION_DRAIN_TASK
+                    and selected_for_definition >= _DUE_ROUTINE_TARGET_LIMIT
+                ):
+                    break
                 if _has_active_save_job(self._state, save_id):
+                    if definition.task_type == OBSERVATION_CURATION_DRAIN_TASK:
+                        _record_active_job_deferral(
+                            repositories,
+                            definition,
+                            save_id,
+                        )
                     observe(
                         "web.scheduler.run_skipped",
                         level="debug",
@@ -248,6 +262,7 @@ class WebMaintenanceScheduler:
                         )
                         continue
                     selected_tasks.append((definition, leased))
+                    selected_for_definition += 1
         return selected_tasks
 
     async def _run_forever(self) -> None:
@@ -317,7 +332,7 @@ class WebMaintenanceScheduler:
                 self._state.repositories.complete_scheduled_task(
                     task.id,
                     succeeded=False,
-                    error=str(exc),
+                    error=_scheduled_task_error(definition, str(exc)),
                     last_job_id=handle.record.id,
                     next_run_after_seconds=_backoff_seconds(task.failure_count),
                 )
@@ -325,11 +340,19 @@ class WebMaintenanceScheduler:
             payload = _job_result_payload(result)
             error = payload.get("error")
             succeeded = not isinstance(error, str) or not error
+            if definition.task_type == OBSERVATION_CURATION_DRAIN_TASK:
+                payload.pop("error", None)
+                payload.pop("failure_text", None)
+                if not succeeded:
+                    payload["error_present"] = True
             self._state.repositories.complete_scheduled_task(
                 task.id,
                 succeeded=succeeded,
                 result=payload,
-                error=error if isinstance(error, str) else None,
+                error=_scheduled_task_error(
+                    definition,
+                    error if isinstance(error, str) else None,
+                ),
                 last_job_id=handle.record.id,
                 next_run_after_seconds=(
                     definition.interval_seconds
@@ -354,6 +377,7 @@ class WebMaintenanceScheduler:
                 worker,
                 save_id=save_id,
                 exclusive_key=_task_exclusive_key(definition.task_type, save_id),
+                operation_queue_key=save_id,
             )
         except JobRegistryExclusiveKeyError as exc:
             self._state.repositories.complete_scheduled_task(
@@ -459,6 +483,19 @@ def _task_target_save_ids(
         )
         if callable(list_due_reviews):
             return tuple(list_due_reviews(limit=_DUE_ROUTINE_TARGET_LIMIT))
+    if definition.task_type == OBSERVATION_CURATION_DRAIN_TASK:
+        list_due_curation = getattr(
+            repositories,
+            "list_save_ids_with_due_context_observation_curation",
+            None,
+        )
+        if callable(list_due_curation):
+            return tuple(
+                list_due_curation(
+                    limit=_DUE_ROUTINE_TARGET_LIMIT,
+                    offset=0,
+                )
+            )
     retry_job_type = _RETRY_DRAIN_JOB_TYPES.get(definition.task_type)
     if retry_job_type is not None:
         return _save_ids_with_queued_jobs(repositories, job_type=retry_job_type)
@@ -528,6 +565,8 @@ def _scheduled_task_payload(
     retry_job_type = _RETRY_DRAIN_JOB_TYPES.get(definition.task_type)
     if retry_job_type is not None:
         return {"active_save_only": False, "queued_job_type": retry_job_type}
+    if definition.task_type == OBSERVATION_CURATION_DRAIN_TASK:
+        return {"active_save_only": False}
     return {"active_save_only": True}
 
 
@@ -591,6 +630,49 @@ def _record_policy_not_due(
                 payload=_scheduled_task_payload(definition),
                 due_now=False,
             )
+
+
+def _record_active_job_deferral(
+    repositories: Any,
+    definition: _MaintenanceTaskDefinition,
+    save_id: str,
+) -> None:
+    due_tasks = repositories.list_due_scheduled_tasks(
+        task_types=(definition.task_type,),
+        save_id=save_id,
+        limit=1,
+    )
+    for task in due_tasks:
+        leased = repositories.lease_scheduled_task(
+            task.id,
+            lease_seconds=definition.lease_seconds,
+        )
+        if leased is None:
+            continue
+        repositories.complete_scheduled_task(
+            leased.id,
+            succeeded=True,
+            result={
+                "status": "skipped",
+                "skip_reason": "active_same_save_job",
+            },
+            next_run_after_seconds=definition.interval_seconds,
+        )
+        return
+    if (
+        repositories.get_scheduled_task(
+            task_type=definition.task_type,
+            save_id=save_id,
+        )
+        is None
+    ):
+        repositories.upsert_scheduled_task(
+            task_type=definition.task_type,
+            save_id=save_id,
+            interval_seconds=definition.interval_seconds,
+            payload=_scheduled_task_payload(definition),
+            due_now=False,
+        )
 
 
 def _complete_leased_task_policy_skip(
@@ -671,6 +753,22 @@ def _context_update_retry_drain_due(repositories: Any, save_id: str) -> bool:
     return any(
         job.type == "context_update_retry" and job.save_id == save_id
         for job in repositories.list_jobs_by_status(("queued",))
+    )
+
+
+def _observation_curation_drain_due(repositories: Any, save_id: str) -> bool:
+    from bragi.services.agentic_context import agentic_context_pipeline_enabled
+
+    if not agentic_context_pipeline_enabled(repositories, save_id=save_id):
+        return False
+    if not _model_preference_configured(
+        repositories,
+        save_id=save_id,
+        purpose="memory_curation",
+    ):
+        return False
+    return bool(
+        repositories.list_eligible_context_observations(save_id, limit=1)
     )
 
 
@@ -914,6 +1012,17 @@ def _backoff_seconds(failure_count: int) -> int:
     )
 
 
+def _scheduled_task_error(
+    definition: _MaintenanceTaskDefinition,
+    error: str | None,
+) -> str | None:
+    if not error:
+        return None
+    if definition.task_type == OBSERVATION_CURATION_DRAIN_TASK:
+        return "observation_curation_failed"
+    return error
+
+
 _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
     _MaintenanceTaskDefinition(
         task_type=WORLD_SUGGESTION_REVIEW_TASK,
@@ -948,6 +1057,15 @@ _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
         runtime_method="run_context_update_retries",
         event_reason="context_update_retry",
         should_schedule=_context_update_retry_drain_due,
+    ),
+    _MaintenanceTaskDefinition(
+        task_type=OBSERVATION_CURATION_DRAIN_TASK,
+        interval_seconds=OBSERVATION_CURATION_DRAIN_INTERVAL_SECONDS,
+        progress_label="Curating observations",
+        runtime_method="run_observation_curation",
+        event_reason="observation_curation",
+        should_schedule=_observation_curation_drain_due,
+        cache_policy_checks=True,
     ),
     _MaintenanceTaskDefinition(
         task_type=CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_TASK,
