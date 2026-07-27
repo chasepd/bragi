@@ -990,6 +990,48 @@ def _rehydrate_selected_context(
             },
         )
     )
+    selected_target_keys = {
+        (source.source_type, source.source_id)
+        for source in selected_context_sources
+    }
+    present_character_ids = (
+        set(snapshot.scene_snapshot.present_character_ids)
+        if snapshot.scene_snapshot is not None
+        else set()
+    )
+    selected_knowledge_edges = repositories.list_narration_character_knowledge_edges(
+        save_id,
+        target_keys=selected_target_keys,
+        present_character_ids=present_character_ids,
+        visibility_character_ids=present_character_ids,
+    )
+    selected_entity_links = repositories.list_narration_entity_links(
+        save_id,
+        target_keys=selected_target_keys,
+        present_character_ids=present_character_ids,
+        visibility_character_ids=present_character_ids,
+    )
+    snapshot = replace(
+        snapshot,
+        character_knowledge_edges=tuple(
+            {
+                edge.id: edge
+                for edge in (
+                    *snapshot.character_knowledge_edges,
+                    *selected_knowledge_edges,
+                )
+            }.values()
+        ),
+        entity_links=tuple(
+            {
+                link.id: link
+                for link in (
+                    *snapshot.entity_links,
+                    *selected_entity_links,
+                )
+            }.values()
+        ),
+    )
     selected_source_message_ids = {
         source_id
         for source in selected_context_sources

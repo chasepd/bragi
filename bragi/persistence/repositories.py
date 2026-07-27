@@ -81,6 +81,8 @@ from bragi.redaction import redact_text
 from bragi.safety import normalize_message_safety
 from bragi.text_search import (
     cjk_lexical_anchors,
+    identifier_filter_matches,
+    structured_identifier_filter,
     structured_identifiers,
     unicode_word_terms,
 )
@@ -107,7 +109,7 @@ MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
 MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 128
-MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 500_000
+MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 3_000_000
 MAX_CONTEXT_INDEX_TEXT_CHARS_PER_REBUILD = 32 * 1024 * 1024
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
@@ -245,6 +247,12 @@ class PersistenceRepositories:
             "bragi_normalize_text",
             1,
             _normalized_search_text,
+            deterministic=True,
+        )
+        self.connection.create_function(
+            "bragi_identifier_filter_matches",
+            2,
+            identifier_filter_matches,
             deterministic=True,
         )
         self._transaction_depth = 0
@@ -3432,6 +3440,24 @@ class PersistenceRepositories:
         )
         self.connection.execute(
             """
+            INSERT INTO context_source_exact_identifier_filters(
+                context_source_id,
+                save_id,
+                identifiers_blob
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT(context_source_id) DO UPDATE SET
+                save_id = excluded.save_id,
+                identifiers_blob = excluded.identifiers_blob
+            """,
+            (
+                record.id,
+                record.save_id,
+                structured_identifier_filter(record.title, record.body),
+            ),
+        )
+        self.connection.execute(
+            """
             DELETE FROM context_source_exact_identifiers
             WHERE context_source_id = ?
             """,
@@ -3825,20 +3851,21 @@ class PersistenceRepositories:
                 f"""
                 WITH ranked_ids AS (
                     SELECT context_sources.id
-                    FROM context_source_exact_identifiers exact_identifier
+                    FROM context_source_exact_identifier_filters
+                         exact_identifier_filter
                     JOIN context_sources
                       ON context_sources.id =
-                         exact_identifier.context_source_id
-                    WHERE exact_identifier.save_id = ?
-                      AND exact_identifier.identifier IN (
-                          SELECT CAST(value AS TEXT) FROM json_each(?)
-                      )
+                         exact_identifier_filter.context_source_id
+                    WHERE exact_identifier_filter.save_id = ?
+                      AND bragi_identifier_filter_matches(
+                          exact_identifier_filter.identifiers_blob,
+                          ?
+                      ) = 1
                       AND context_sources.archived_at IS NULL
                       AND context_sources.source_type IN (
                           {_placeholders(len(source_type_values))}
                       )
                       {eligibility_sql}
-                    GROUP BY context_sources.id
                     ORDER BY context_sources.created_at DESC,
                              context_sources.rowid DESC
                     LIMIT ?

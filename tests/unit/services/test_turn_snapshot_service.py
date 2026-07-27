@@ -108,6 +108,35 @@ def test_snapshot_object_decode_rejects_oversized_declared_object() -> None:
         )
 
 
+def test_snapshot_object_decode_rejects_json_node_bomb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        turn_snapshot_module,
+        "_MAX_SNAPSHOT_OBJECT_JSON_NODES",
+        4,
+    )
+    payload = b"[0,0,0,0]"
+    kind = "row:messages"
+    object_hash = turn_snapshot_module._snapshot_object_hash(
+        kind=kind,
+        payload=payload,
+    )
+
+    with pytest.raises(ValueError, match="Invalid snapshot object payload"):
+        turn_snapshot_module._decode_exported_snapshot_object(
+            {
+                "object_hash": object_hash,
+                "kind": kind,
+                "encoding": turn_snapshot_module.SNAPSHOT_ENCODING,
+                "payload_base64": base64.b64encode(
+                    zlib.compress(payload)
+                ).decode("ascii"),
+                "uncompressed_size": len(payload),
+            }
+        )
+
+
 def test_snapshot_validation_bounds_snapshot_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -132,10 +161,16 @@ def test_snapshot_validation_bounds_unique_manifest_reference_work(
         1,
     )
     objects: dict[str, dict[str, object]] = {}
-    row_hash = turn_snapshot_module._add_snapshot_object_export(
+    first_row_hash = turn_snapshot_module._add_snapshot_object_export(
         objects,
         kind="row:messages",
         value={"id": "message-one"},
+        created_at=None,
+    )
+    second_row_hash = turn_snapshot_module._add_snapshot_object_export(
+        objects,
+        kind="row:messages",
+        value={"id": "message-two"},
         created_at=None,
     )
     manifest_hash = turn_snapshot_module._add_snapshot_object_export(
@@ -145,15 +180,15 @@ def test_snapshot_validation_bounds_unique_manifest_reference_work(
             "format": turn_snapshot_module.SNAPSHOT_FORMAT,
             "tables": {
                 "messages": [
-                    {"id": "message-one", "object_hash": row_hash},
-                    {"id": "message-two", "object_hash": row_hash},
+                    {"id": "message-one", "object_hash": first_row_hash},
+                    {"id": "message-two", "object_hash": second_row_hash},
                 ]
             },
         },
         created_at=None,
     )
 
-    with pytest.raises(ValueError, match="too many row references"):
+    with pytest.raises(ValueError, match="too many unique rows"):
         turn_snapshot_module._validate_exported_snapshot_rows(
             [{"id": "snapshot-one", "root_manifest_hash": manifest_hash}],
             objects.values(),
@@ -188,6 +223,27 @@ def test_snapshot_validation_rejects_duplicate_row_object_references() -> None:
             [{"id": "snapshot-one", "root_manifest_hash": manifest_hash}],
             objects.values(),
         )
+
+
+def test_snapshot_table_signature_ignores_unused_manifest_entry_fields() -> None:
+    first = {
+        "tables": {
+            "messages": [
+                {"id": "message-one", "object_hash": "row-hash", "nonce": "one"}
+            ]
+        }
+    }
+    second = {
+        "tables": {
+            "messages": [
+                {"id": "message-two", "object_hash": "row-hash", "nonce": "two"}
+            ]
+        }
+    }
+
+    assert turn_snapshot_module._snapshot_manifest_table_signature(
+        first
+    ) == turn_snapshot_module._snapshot_manifest_table_signature(second)
 
 
 def test_snapshot_trigger_key_remapping_is_schema_aware() -> None:
@@ -325,6 +381,16 @@ def test_snapshot_json_remapping_updates_known_context_and_media_references() ->
             ),
         },
     )
+    scalar_location_suggestion = remapper.remap_row(
+        "context_update_suggestions",
+        {
+            "id": "location-suggestion-old",
+            "save_id": "save-old",
+            "entity_type": "character",
+            "field_path": "location_id",
+            "proposed_value_json": json.dumps("location-old"),
+        },
+    )
     director_pressure = remapper.remap_row(
         "world_state",
         {
@@ -350,6 +416,16 @@ def test_snapshot_json_remapping_updates_known_context_and_media_references() ->
             "metadata_json": json.dumps({"scenario_id": "scenario-old"}),
         },
     )
+    message_context = remapper.remap_row(
+        "context_sources",
+        {
+            "id": "message-context-old",
+            "save_id": "save-old",
+            "source_type": "message",
+            "source_id": "message-old",
+            "metadata_json": "{}",
+        },
+    )
 
     assert context_source["source_id"] == "observation-new"
     assert json.loads(str(context_source["metadata_json"]))["observation_id"] == (
@@ -366,12 +442,16 @@ def test_snapshot_json_remapping_updates_known_context_and_media_references() ->
         "source_observation_id": "observation-new",
         "location_id": "location-new",
     }
+    assert json.loads(
+        str(scalar_location_suggestion["proposed_value_json"])
+    ) == "location-new"
     assert json.loads(str(director_pressure["value_json"]))[
         "escalation_history"
     ] == [{"source_message_id": "message-new"}]
     assert json.loads(str(scenario_context["metadata_json"]))["scenario_id"] == (
         "scenario-new"
     )
+    assert message_context["source_id"] == "message-new"
     media_metadata = json.loads(str(media["metadata_json"]))
     assert media_metadata == {
         "request_source_message_id": "text-new",
@@ -437,6 +517,17 @@ def test_snapshot_context_merge_preserves_large_conjunctive_derivation() -> None
 
     assert merged["source_provenance_groups"] == [first_group, second_group]
     assert merged["source_provenance_mode"] == "all"
+
+
+def test_snapshot_context_merge_does_not_broaden_selected_body_audience() -> None:
+    merged = json.loads(
+        turn_snapshot_module._merged_context_source_metadata_json(
+            json.dumps({"audience_character_ids": ["character-a"]}),
+            json.dumps({"audience_character_ids": ["character-b"]}),
+        )
+    )
+
+    assert merged["audience_character_ids"] == ["character-a"]
 
 
 def test_legacy_memory_normalization_preserves_other_id_namespaces() -> None:

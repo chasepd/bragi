@@ -16,15 +16,11 @@ def merge_context_source_metadata(
 ) -> dict[str, object]:
     """Merge alternative derivations without weakening visibility constraints."""
     loaded = [_metadata_object(value) for value in (first, second)]
-    metadata: dict[str, object] = {}
-    for item in loaded:
-        metadata.update(item)
+    metadata: dict[str, object] = dict(loaded[0]) if loaded else {}
 
     provenance_overflow = False
     for field in (
         "source_message_ids",
-        "audience_character_ids",
-        "known_by",
         "tags",
     ):
         values = _merged_string_values(loaded, field)

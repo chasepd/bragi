@@ -181,6 +181,21 @@ def test_bundle_json_decode_stops_at_object_budget(
         )
 
 
+def test_bundle_json_decode_stops_at_primitive_value_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(chat_bundle_module, "_MAX_BUNDLE_JSON_NODES", 4)
+
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="too many values",
+    ):
+        chat_bundle_module._json_object_from_bytes(
+            b'{"rows":[0,0,0,0]}',
+            "data.json",
+        )
+
+
 def test_import_context_sources_keep_legacy_provenance_alternatives() -> None:
     [source] = _coalesce_import_context_sources(
         [

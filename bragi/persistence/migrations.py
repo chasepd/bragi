@@ -16,6 +16,7 @@ from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.private_files import ensure_private_file
 from bragi.text_search import (
     cjk_lexical_anchors,
+    structured_identifier_filter,
     structured_identifiers,
     unicode_word_terms,
 )
@@ -24,7 +25,7 @@ CURRENT_SCHEMA_VERSION = 72
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 128
-_MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 500_000
+_MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 3_000_000
 _MAX_CONTEXT_INDEX_TEXT_CHARS_PER_REBUILD = 32 * 1024 * 1024
 _MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
 _MAX_MEMORY_PROVENANCE_IDS = 64
@@ -1048,17 +1049,6 @@ def _ensure_context_observation_curation_schema(
         );
         """,
     )
-    total_text_chars = int(
-        connection.execute(
-            """
-            SELECT COALESCE(SUM(LENGTH(title) + LENGTH(body)), 0)
-            FROM context_sources
-            WHERE archived_at IS NULL
-            """
-        ).fetchone()[0]
-    )
-    if total_text_chars > _MAX_CONTEXT_INDEX_TEXT_CHARS_PER_REBUILD:
-        raise RuntimeError("Context source text is too large to index")
     connection.execute(
         """
         INSERT OR IGNORE INTO context_observation_curation_state(
@@ -4320,13 +4310,54 @@ def _ensure_context_source_search_terms_schema(
             context_source_id
         );
 
+        CREATE TABLE IF NOT EXISTS context_source_exact_identifier_filters (
+            context_source_id TEXT PRIMARY KEY
+                REFERENCES context_sources(id) ON DELETE CASCADE,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            identifiers_blob BLOB NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_source_identifier_filters_save
+        ON context_source_exact_identifier_filters(save_id, context_source_id);
+
         DELETE FROM context_source_search_terms
         WHERE context_source_id NOT IN (SELECT id FROM context_sources);
 
         DELETE FROM context_source_exact_identifiers
         WHERE context_source_id NOT IN (SELECT id FROM context_sources);
+
+        DELETE FROM context_source_exact_identifier_filters
+        WHERE context_source_id NOT IN (SELECT id FROM context_sources);
         """,
     )
+    missing_text_chars = int(
+        connection.execute(
+            """
+            SELECT COALESCE(SUM(LENGTH(source.title) + LENGTH(source.body)), 0)
+            FROM context_sources source
+            WHERE source.archived_at IS NULL
+              AND (
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM context_source_search_terms term
+                        WHERE term.context_source_id = source.id
+                    )
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM context_source_exact_identifiers identifier
+                        WHERE identifier.context_source_id = source.id
+                    )
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM context_source_exact_identifier_filters filter
+                        WHERE filter.context_source_id = source.id
+                    )
+                  )
+            """
+        ).fetchone()[0]
+    )
+    if missing_text_chars > _MAX_CONTEXT_INDEX_TEXT_CHARS_PER_REBUILD:
+        raise RuntimeError("Context source text is too large to index")
     missing_rows = connection.execute(
         """
         SELECT source.id, source.save_id, source.title, source.body
@@ -4395,6 +4426,43 @@ def _ensure_context_source_search_terms_schema(
                 for identifier in identifiers or ("",)
             ),
         )
+    missing_filter_rows = connection.execute(
+        """
+        SELECT source.id, source.save_id, source.title, source.body
+        FROM context_sources source
+        WHERE source.archived_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM context_source_exact_identifier_filters filter
+              WHERE filter.context_source_id = source.id
+          )
+        ORDER BY source.rowid
+        """
+    ).fetchall()
+    indexed_rows += len(missing_filter_rows)
+    if indexed_rows > _MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
+        raise RuntimeError("Context source index is too large to rebuild")
+    connection.executemany(
+        """
+        INSERT INTO context_source_exact_identifier_filters(
+            context_source_id,
+            save_id,
+            identifiers_blob
+        )
+        VALUES (?, ?, ?)
+        """,
+        (
+            (
+                str(source_id),
+                str(save_id),
+                structured_identifier_filter(
+                    str(title or ""),
+                    str(body or ""),
+                ),
+            )
+            for source_id, save_id, title, body in missing_filter_rows
+        ),
+    )
 
 
 def _migration_context_source_search_terms(

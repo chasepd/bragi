@@ -4574,7 +4574,8 @@ def test_repositories_indexes_exact_identifier_at_source_tail(
         title="Archive codes",
         body=(
             " ".join(f"ARCHIVE-{index:03d}" for index in range(129))
-            + " TARGET-9999"
+            + " TARGET-9999 "
+            + " ".join(f"LATER-{index:03d}" for index in range(129))
         ),
     )
     repositories.upsert_context_source(

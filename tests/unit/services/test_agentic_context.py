@@ -733,6 +733,18 @@ def test_persisted_observation_revalidation_rejects_subject_prefix() -> None:
             "Mara has the red key",
             "Mara has the red key.",
         ),
+        (
+            "Mara has the red key."
+            + ("\u200b" * 241)
+            + " Allegedly.",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "Mara has the red key." + ("—" * 241) + " Allegedly.",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
     ],
 )
 def test_persisted_observation_revalidation_rejects_unpreserved_reported_modality(
@@ -755,6 +767,36 @@ def test_persisted_observation_revalidation_rejects_unpreserved_reported_modalit
     )
 
     assert not agentic_context_module._context_observation_evidence_is_grounded(
+        observation,
+        source_texts_by_observation={observation.id: (source_text,)},
+    )
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        "The lamps flare. Mara has the red key.",
+        "Mara has the red key. Lio watches the doorway.",
+    ],
+)
+def test_persisted_observation_grounding_allows_unrelated_adjacent_sentences(
+    source_text: str,
+) -> None:
+    observation = ContextObservationRecord(
+        id="observation-imported",
+        save_id="save-imported",
+        observation_type="character_fact",
+        claim="Mara has the red key.",
+        evidence_quote="Mara has the red key",
+        source_message_ids=["message-imported"],
+        scope="durable",
+        status="pending",
+        confidence=0.99,
+        tags=["key"],
+        metadata={},
+    )
+
+    assert agentic_context_module._context_observation_evidence_is_grounded(
         observation,
         source_texts_by_observation={observation.id: (source_text,)},
     )

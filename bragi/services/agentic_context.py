@@ -2361,13 +2361,129 @@ def _source_context_for_evidence_quote(
 ) -> str:
     if not quote_matches_source(evidence_quote, source_body):
         return ""
-    quote_start = source_body.casefold().find(evidence_quote.casefold())
+    searchable_source = _compact_grounding_padding(source_body)
+    searchable_quote = _compact_grounding_padding(evidence_quote)
+    quote_start = searchable_source.casefold().find(searchable_quote.casefold())
     if quote_start < 0:
-        return source_body
-    quote_end = quote_start + len(evidence_quote)
-    context_start = max(0, quote_start - 240)
-    context_end = min(len(source_body), quote_end + 240)
-    return source_body[context_start:context_end]
+        return searchable_source
+    quote_end = quote_start + len(searchable_quote)
+    boundaries = [
+        index
+        for index, character in enumerate(searchable_source)
+        if _grounding_sentence_boundary(character)
+    ]
+    preceding_boundaries = [
+        index for index in boundaries if index < quote_start
+    ]
+    following_boundaries = [
+        index
+        for index in boundaries
+        if index >= max(quote_start, quote_end - 1)
+    ]
+    context_start = (
+        preceding_boundaries[-1] + 1 if preceding_boundaries else 0
+    )
+    context_end = (
+        following_boundaries[0] + 1
+        if following_boundaries
+        else len(searchable_source)
+    )
+    context = searchable_source[context_start:context_end]
+    previous_start = (
+        preceding_boundaries[-2] + 1
+        if len(preceding_boundaries) > 1
+        else 0
+    )
+    previous = searchable_source[previous_start:context_start]
+    next_end = (
+        following_boundaries[1] + 1
+        if len(following_boundaries) > 1
+        else len(searchable_source)
+    )
+    following = searchable_source[context_end:next_end]
+    if _grounding_adjacent_qualifier(previous):
+        context = previous + context
+    if _grounding_adjacent_qualifier(following):
+        context += following
+    return context
+
+
+def _grounding_sentence_boundary(character: str) -> bool:
+    name = unicodedata.name(character, "")
+    return (
+        character in {".", "!", "?", "\n"}
+        or "QUESTION" in name
+        or "INTERROBANG" in name
+    )
+
+
+def _grounding_adjacent_qualifier(value: str) -> bool:
+    terms = set(_ordered_grounding_terms(value))
+    qualifier_terms = {
+        "allegedly",
+        "apparently",
+        "claim",
+        "claimed",
+        "claims",
+        "could",
+        "doubt",
+        "doubts",
+        "honest",
+        "if",
+        "maybe",
+        "may",
+        "might",
+        "perhaps",
+        "possibly",
+        "really",
+        "reported",
+        "rumor",
+        "rumour",
+        "speculation",
+        "unconfirmed",
+        "uncertain",
+        "unverified",
+    }
+    return bool(
+        terms & qualifier_terms
+        or _grounding_denial_conflicts("", value)
+        or _grounding_negation_conflicts("", value)
+        or any(
+            (
+                "QUESTION" in unicodedata.name(character, "")
+                or "INTERROBANG" in unicodedata.name(character, "")
+            )
+            for character in value
+        )
+    )
+
+
+def _compact_grounding_padding(value: str) -> str:
+    compacted: list[str] = []
+    in_padding_run = False
+    for character in unicodedata.normalize("NFKC", value):
+        name = unicodedata.name(character, "")
+        semantic_punctuation = (
+            character in {".", "!", "?", "~"}
+            or "QUESTION" in name
+            or "INTERROBANG" in name
+            or "NOT SIGN" in name
+            or "NEGATION" in name
+            or "CROSS MARK" in name
+        )
+        if character == "\n":
+            compacted.append(character)
+            in_padding_run = False
+        elif character.isalnum() or character in {"'", "’"}:
+            compacted.append(character)
+            in_padding_run = False
+        elif semantic_punctuation:
+            compacted.append(character)
+            in_padding_run = False
+        elif not in_padding_run:
+            compacted.append(" ")
+            in_padding_run = True
+    return "".join(compacted)
 
 
 def _structured_request_with_script_policy_feedback(

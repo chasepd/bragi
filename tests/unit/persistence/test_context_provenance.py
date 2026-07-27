@@ -72,3 +72,12 @@ def test_merge_context_source_metadata_preserves_large_conjunctive_derivation(
 
     assert merged["source_provenance_groups"] == [first_group, second_group]
     assert merged["source_provenance_mode"] == "all"
+
+
+def test_merge_context_source_metadata_does_not_broaden_first_audience() -> None:
+    merged = merge_context_source_metadata(
+        {"audience_character_ids": ["character-a"]},
+        {"audience_character_ids": ["character-b"]},
+    )
+
+    assert merged["audience_character_ids"] == ["character-a"]

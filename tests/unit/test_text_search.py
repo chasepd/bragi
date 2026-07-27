@@ -1,4 +1,9 @@
-from bragi.text_search import cjk_lexical_anchors, structured_identifiers
+from bragi.text_search import (
+    cjk_lexical_anchors,
+    identifier_filter_matches,
+    structured_identifier_filter,
+    structured_identifiers,
+)
 
 
 def test_cjk_lexical_anchors_split_script_runs_and_preserve_entities() -> None:
@@ -22,3 +27,11 @@ def test_structured_identifiers_preserve_full_normalized_boundaries() -> None:
         "a-7.5",
         "a-7-b",
     )
+
+
+def test_structured_identifier_filter_matches_middle_identifier() -> None:
+    body = " ".join(f"CODE-{index:03d}" for index in range(257))
+    identifier_filter = structured_identifier_filter("", body)
+
+    assert identifier_filter_matches(identifier_filter, '["code-128"]') == 1
+    assert identifier_filter_matches(identifier_filter, '["missing-999"]') == 0

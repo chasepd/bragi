@@ -18,6 +18,7 @@ from typing import cast
 from uuid import uuid4
 
 from bragi.app_logging import log_event
+from bragi.json_safety import JsonSafetyError, validate_json_structure
 from bragi.persistence.models import MediaAssetRecord, MessageRecord, SaveRecord
 from bragi.persistence.repositories import (
     PersistenceRepositories,
@@ -52,6 +53,8 @@ _MAX_IMPORTED_SNAPSHOT_COUNT = 4_096
 _MAX_SNAPSHOT_MANIFEST_ENTRIES = 10_000
 _MAX_SNAPSHOT_IMPORT_REFERENCE_WORK = 50_000
 _MAX_SNAPSHOT_IMPORT_REFERENCED_BYTES = 128 * 1024 * 1024
+_MAX_SNAPSHOT_OBJECT_JSON_NODES = 100_000
+_MAX_SNAPSHOT_OBJECT_JSON_DEPTH = 128
 SNAPSHOT_ENCODING = "zlib-json-v1"
 
 
@@ -1585,6 +1588,7 @@ class _SnapshotRemapper:
         if not isinstance(value, str) or source_type is None:
             return value
         direct_tables = {
+            "message": "messages",
             "character_voice": "characters",
             "open_obligation": "active_threads",
             "character_text_thread": "character_text_threads",
@@ -1667,7 +1671,7 @@ class _SnapshotRemapper:
             table_name == "context_update_suggestions"
             and column == "proposed_value_json"
         ):
-            return _compact_json(self._remap_suggestion_value(raw))
+            return _compact_json(self._remap_suggestion_value(raw, row=row))
         if column == "source_message_ids_json":
             return _compact_json(self._remap_source_ref_list(raw))
         if table_name == "context_sources" and column == "metadata_json":
@@ -1724,7 +1728,21 @@ class _SnapshotRemapper:
         remapped["escalation_history"] = remapped_history
         return remapped
 
-    def _remap_suggestion_value(self, raw: object) -> object:
+    def _remap_suggestion_value(
+        self,
+        raw: object,
+        *,
+        row: Mapping[str, object],
+    ) -> object:
+        if isinstance(raw, str) and (
+            row.get("entity_type"),
+            row.get("field_path"),
+        ) in {
+            ("character", "location_id"),
+            ("location", "parent_location_id"),
+            ("scene_snapshot", "current_location_id"),
+        }:
+            return self._required_mapped_table_id("locations", raw)
         if not isinstance(raw, dict):
             return raw
         remapped = dict(raw)
@@ -2891,11 +2909,17 @@ def _decode_exported_snapshot_object(row: Mapping[str, object]) -> tuple[str, ob
         ):
             raise ValueError(f"Snapshot object size mismatch: {object_hash}")
         payload += decompressor.flush()
+        validate_json_structure(
+            payload,
+            max_nodes=_MAX_SNAPSHOT_OBJECT_JSON_NODES,
+            max_depth=_MAX_SNAPSHOT_OBJECT_JSON_DEPTH,
+        )
         value = json.loads(payload.decode("utf-8"))
     except (
         binascii.Error,
         UnicodeDecodeError,
         json.JSONDecodeError,
+        JsonSafetyError,
         zlib.error,
     ) as exc:
         raise ValueError(f"Invalid snapshot object payload: {object_hash}") from exc
@@ -2922,12 +2946,13 @@ def _validate_exported_snapshot_rows(
         seen_snapshot_ids.add(snapshot_id)
         _text(row, "root_manifest_hash")
 
+    raw_objects_by_hash: dict[str, dict[str, object]] = {}
     objects_by_hash: dict[str, tuple[str, object]] = {}
     object_sizes_by_hash: dict[str, int] = {}
     total_uncompressed_size = 0
     for object_row in object_rows:
         object_hash = _text(object_row, "object_hash")
-        if object_hash in objects_by_hash:
+        if object_hash in raw_objects_by_hash:
             raise ValueError(f"Duplicate snapshot object in bundle: {object_hash}")
         declared_size = _int(object_row, "uncompressed_size")
         if declared_size < 0:
@@ -2935,17 +2960,20 @@ def _validate_exported_snapshot_rows(
         total_uncompressed_size += declared_size
         if total_uncompressed_size > _MAX_SNAPSHOT_TOTAL_UNCOMPRESSED_BYTES:
             raise ValueError("Snapshot objects are too large")
-        objects_by_hash[object_hash] = _decode_exported_snapshot_object(object_row)
+        raw_objects_by_hash[object_hash] = dict(object_row)
         object_sizes_by_hash[object_hash] = declared_size
 
-    total_manifest_entries = 0
     total_referenced_bytes = 0
     validated_table_signatures: set[str] = set()
+    referenced_object_hashes: set[str] = set()
+    unique_referenced_row_hashes: set[str] = set()
     root_hashes = {
         _text(row, "root_manifest_hash") for row in snapshots
     }
     for root_hash in root_hashes:
-        manifest = _required_exported_snapshot_object(
+        referenced_object_hashes.add(root_hash)
+        manifest = _required_decoded_exported_snapshot_object(
+            raw_objects_by_hash,
             objects_by_hash,
             root_hash,
             expected_kind="snapshot_manifest",
@@ -2972,9 +3000,6 @@ def _validate_exported_snapshot_rows(
             manifest_entry_count += len(entries)
             if manifest_entry_count > _MAX_SNAPSHOT_MANIFEST_ENTRIES:
                 raise ValueError("Snapshot manifest contains too many entries")
-            total_manifest_entries += len(entries)
-            if total_manifest_entries > _MAX_SNAPSHOT_IMPORT_REFERENCE_WORK:
-                raise ValueError("Snapshot manifests contain too many row references")
             for entry in entries:
                 if not isinstance(entry, Mapping):
                     raise ValueError(f"Snapshot table entry is invalid: {table_name}")
@@ -2984,15 +3009,29 @@ def _validate_exported_snapshot_rows(
                         f"Duplicate snapshot row object reference: {object_hash}"
                     )
                 seen_row_object_hashes.add(object_hash)
-                total_referenced_bytes += object_sizes_by_hash.get(object_hash, 0)
-                if (
-                    total_referenced_bytes
-                    > _MAX_SNAPSHOT_IMPORT_REFERENCED_BYTES
-                ):
-                    raise ValueError(
-                        "Snapshot manifests reference too much row data"
+                referenced_object_hashes.add(object_hash)
+                if object_hash not in unique_referenced_row_hashes:
+                    unique_referenced_row_hashes.add(object_hash)
+                    if (
+                        len(unique_referenced_row_hashes)
+                        > _MAX_SNAPSHOT_IMPORT_REFERENCE_WORK
+                    ):
+                        raise ValueError(
+                            "Snapshot manifests contain too many unique rows"
+                        )
+                    total_referenced_bytes += object_sizes_by_hash.get(
+                        object_hash,
+                        0,
                     )
-                value = _required_exported_snapshot_object(
+                    if (
+                        total_referenced_bytes
+                        > _MAX_SNAPSHOT_IMPORT_REFERENCED_BYTES
+                    ):
+                        raise ValueError(
+                            "Snapshot manifests reference too much row data"
+                        )
+                value = _required_decoded_exported_snapshot_object(
+                    raw_objects_by_hash,
                     objects_by_hash,
                     object_hash,
                     expected_kind=f"row:{table_name}",
@@ -3001,13 +3040,55 @@ def _validate_exported_snapshot_rows(
                     raise ValueError(
                         f"Snapshot row object is not a row: {object_hash}"
                     )
+    unreferenced_hashes = set(raw_objects_by_hash) - referenced_object_hashes
+    if unreferenced_hashes:
+        raise ValueError("Snapshot bundle contains unreferenced objects")
     return objects_by_hash
 
 
 def _snapshot_manifest_table_signature(manifest: Mapping[str, object]) -> str:
+    raw_tables = manifest.get("tables", {})
+    effective_tables: dict[str, object] = {}
+    if isinstance(raw_tables, Mapping):
+        for table_name, entries in raw_tables.items():
+            if isinstance(entries, list):
+                effective_tables[str(table_name)] = [
+                    (
+                        entry.get("object_hash")
+                        if isinstance(entry, Mapping)
+                        else entry
+                    )
+                    for entry in entries
+                ]
+            else:
+                effective_tables[str(table_name)] = entries
+    else:
+        effective_tables[""] = raw_tables
     return sha256(
-        _canonical_json_bytes(manifest.get("tables", {}))
+        _canonical_json_bytes(effective_tables)
     ).hexdigest()
+
+
+def _required_decoded_exported_snapshot_object(
+    raw_objects_by_hash: Mapping[str, Mapping[str, object]],
+    decoded_objects_by_hash: dict[str, tuple[str, object]],
+    object_hash: str,
+    *,
+    expected_kind: str,
+) -> object:
+    if object_hash not in decoded_objects_by_hash:
+        try:
+            raw_row = raw_objects_by_hash[object_hash]
+        except KeyError as exc:
+            raise ValueError(f"Missing snapshot object: {object_hash}") from exc
+        decoded_objects_by_hash[object_hash] = (
+            _decode_exported_snapshot_object(raw_row)
+        )
+    return _required_exported_snapshot_object(
+        decoded_objects_by_hash,
+        object_hash,
+        expected_kind=expected_kind,
+    )
 
 
 def _required_exported_snapshot_object(
@@ -3358,7 +3439,6 @@ def _merge_snapshot_context_source_rows(
 
 
 def _merged_context_source_metadata_json(first: object, second: object) -> str:
-    metadata: dict[str, object] = {}
     loaded_metadata: list[dict[str, object]] = []
     for raw in (first, second):
         try:
@@ -3368,12 +3448,12 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
         if isinstance(loaded, dict):
             typed = cast(dict[str, object], loaded)
             loaded_metadata.append(typed)
-            metadata.update(typed)
+    metadata: dict[str, object] = (
+        dict(loaded_metadata[0]) if loaded_metadata else {}
+    )
     provenance_overflow = False
     for field in (
         "source_message_ids",
-        "audience_character_ids",
-        "known_by",
         "tags",
     ):
         values: list[str] = []

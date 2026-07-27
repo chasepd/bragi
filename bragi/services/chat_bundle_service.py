@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from bragi import __version__
 from bragi.app_logging import log_event
+from bragi.json_safety import JsonSafetyError, validate_json_structure
 from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION
 from bragi.persistence.repositories import (
@@ -84,9 +85,12 @@ _MAX_BUNDLE_MEDIA_FILE_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_BUNDLE_MEDIA_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_BUNDLE_MANIFEST_JSON_BYTES = 1024 * 1024
 _MAX_BUNDLE_DATA_JSON_BYTES = 128 * 1024 * 1024
-_MAX_BUNDLE_TABLE_ROWS = 50_000
-_MAX_BUNDLE_TOTAL_ROWS = 100_000
+_MAX_BUNDLE_TABLE_ROWS = 20_000
+_MAX_BUNDLE_MESSAGE_ROWS = 5_000
+_MAX_BUNDLE_TOTAL_ROWS = 50_000
 _MAX_BUNDLE_JSON_OBJECTS = 150_000
+_MAX_BUNDLE_JSON_NODES = 2_000_000
+_MAX_BUNDLE_JSON_DEPTH = 128
 _MAX_BUNDLE_JSON_TOTAL_BYTES = (
     _MAX_BUNDLE_MANIFEST_JSON_BYTES + _MAX_BUNDLE_DATA_JSON_BYTES
 )
@@ -3945,6 +3949,8 @@ def _validate_bundle_data(
         if not isinstance(value, list):
             continue
         row_count = len(value)
+        if table_name == "messages" and row_count > _MAX_BUNDLE_MESSAGE_ROWS:
+            raise ChatBundleError("Chat bundle contains too many messages")
         if row_count > _MAX_BUNDLE_TABLE_ROWS:
             raise ChatBundleError(
                 f"Chat bundle table has too many rows: {table_name}"
@@ -4090,6 +4096,14 @@ def _validate_manifest_payload(payload: dict[str, object]) -> None:
 
 
 def _json_object_from_bytes(payload: bytes, name: str) -> dict[str, object]:
+    try:
+        validate_json_structure(
+            payload,
+            max_nodes=_MAX_BUNDLE_JSON_NODES,
+            max_depth=_MAX_BUNDLE_JSON_DEPTH,
+        )
+    except JsonSafetyError as exc:
+        raise ChatBundleError(f"{name} {exc}") from exc
     object_count = 0
 
     def bounded_object(value: dict[str, object]) -> dict[str, object]:

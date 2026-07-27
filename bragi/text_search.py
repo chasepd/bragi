@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import re
 import unicodedata
+import zlib
 
 MAX_CJK_LEXICAL_INPUT_CHARS = 16_384
 MAX_STRUCTURED_IDENTIFIER_INPUT_CHARS = 65_536
 MAX_STRUCTURED_IDENTIFIER_CHARS = 512
 MAX_STRUCTURED_IDENTIFIERS = 4_096
+MAX_IDENTIFIER_FILTER_IDENTIFIERS = 32_768
+MAX_IDENTIFIER_FILTER_UNCOMPRESSED_BYTES = 8 * (
+    MAX_STRUCTURED_IDENTIFIER_INPUT_CHARS + 1
+)
 
 
 def unicode_word_terms(value: str) -> tuple[str, ...]:
@@ -65,6 +71,60 @@ def structured_identifiers(
             )
         )
     )[:max_identifiers]
+
+
+def structured_identifier_filter(title: str, body: str) -> bytes:
+    identifiers = tuple(
+        dict.fromkeys(
+            (
+                *structured_identifiers(
+                    title,
+                    max_identifiers=MAX_IDENTIFIER_FILTER_IDENTIFIERS,
+                ),
+                *structured_identifiers(
+                    body,
+                    max_identifiers=MAX_IDENTIFIER_FILTER_IDENTIFIERS,
+                ),
+            )
+        )
+    )
+    return zlib.compress("\n".join(identifiers).encode("utf-8"))
+
+
+def identifier_filter_matches(value: object, identifiers_json: object) -> int:
+    if not isinstance(value, bytes):
+        return 0
+    try:
+        decompressor = zlib.decompressobj()
+        decoded = decompressor.decompress(
+            value,
+            MAX_IDENTIFIER_FILTER_UNCOMPRESSED_BYTES + 1,
+        )
+        if (
+            len(decoded) > MAX_IDENTIFIER_FILTER_UNCOMPRESSED_BYTES
+            or decompressor.unconsumed_tail
+            or not decompressor.eof
+        ):
+            return 0
+        requested = json.loads(str(identifiers_json))
+    except (UnicodeDecodeError, ValueError, zlib.error):
+        return 0
+    if not isinstance(requested, list):
+        return 0
+    padded = b"\n" + decoded + b"\n"
+    return int(
+        any(
+            isinstance(identifier, str)
+            and bool(identifier)
+            and (
+                b"\n"
+                + identifier.casefold().encode("utf-8")
+                + b"\n"
+            )
+            in padded
+            for identifier in requested
+        )
+    )
 
 
 def cjk_lexical_anchors(value: str) -> tuple[str, ...]:
