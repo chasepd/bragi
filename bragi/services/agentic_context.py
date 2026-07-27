@@ -1481,15 +1481,18 @@ def _observation_evidence_is_grounded(
 ) -> bool:
     if not _meaningful_evidence_span(observation.evidence_quote):
         return False
-    quote_is_sourced = any(
-        source_body is not None
-        and quote_matches_source(observation.evidence_quote, source_body)
-        for source_body in (
-            messages_by_id.get(source_id)
-            for source_id in observation.source_message_ids
+    source_contexts = tuple(
+        context
+        for source_id in observation.source_message_ids
+        if (source_body := messages_by_id.get(source_id)) is not None
+        if (
+            context := _source_context_for_evidence_quote(
+                observation.evidence_quote,
+                source_body,
+            )
         )
     )
-    if not quote_is_sourced:
+    if not source_contexts:
         return False
     if _grounding_negation_conflicts(
         observation.claim,
@@ -1499,6 +1502,12 @@ def _observation_evidence_is_grounded(
     if _grounding_denial_conflicts(
         observation.claim,
         observation.evidence_quote,
+    ):
+        return False
+    if any(
+        _grounding_negation_conflicts(observation.claim, context)
+        or _grounding_denial_conflicts(observation.claim, context)
+        for context in source_contexts
     ):
         return False
     if _grounding_anchor_conflicts(
@@ -1815,11 +1824,18 @@ def _context_observation_evidence_is_grounded(
         or not observation.source_message_ids
     ):
         return False
-    return (
-        any(
-            quote_matches_source(observation.evidence_quote, source_text)
-            for source_text in source_texts_by_observation.get(observation.id, ())
+    source_contexts = tuple(
+        context
+        for source_text in source_texts_by_observation.get(observation.id, ())
+        if (
+            context := _source_context_for_evidence_quote(
+                observation.evidence_quote,
+                source_text,
+            )
         )
+    )
+    return (
+        bool(source_contexts)
         and not _grounding_negation_conflicts(
             observation.claim,
             observation.evidence_quote,
@@ -1827,6 +1843,11 @@ def _context_observation_evidence_is_grounded(
         and not _grounding_denial_conflicts(
             observation.claim,
             observation.evidence_quote,
+        )
+        and not any(
+            _grounding_negation_conflicts(observation.claim, context)
+            or _grounding_denial_conflicts(observation.claim, context)
+            for context in source_contexts
         )
         and not _grounding_anchor_conflicts(
             observation.claim,
@@ -1837,6 +1858,24 @@ def _context_observation_evidence_is_grounded(
             observation.evidence_quote,
         )
     )
+
+
+def _source_context_for_evidence_quote(
+    evidence_quote: str,
+    source_body: str,
+) -> str:
+    if not quote_matches_source(evidence_quote, source_body):
+        return ""
+    quote_start = source_body.casefold().find(evidence_quote.casefold())
+    if quote_start < 0:
+        return source_body
+    quote_end = quote_start + len(evidence_quote)
+    context_end = min(len(source_body), quote_end + 240)
+    for separator in (".", "!", "?", "\n"):
+        separator_index = source_body.find(separator, quote_end)
+        if separator_index >= 0:
+            context_end = min(context_end, separator_index + 1)
+    return source_body[quote_start:context_end]
 
 
 def _structured_request_with_script_policy_feedback(

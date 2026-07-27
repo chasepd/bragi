@@ -81,7 +81,7 @@ def test_snapshot_remaps_colliding_message_provenance_by_field_type() -> None:
         target_save_id="fork-save",
         rows_by_table={
             "messages": ({"id": colliding_id},),
-            "memories": ({"id": "memory-one"},),
+            "memories": ({"id": "memory-one"}, {"id": "all"}),
             "context_sources": ({"id": "context-one"},),
         },
     )
@@ -107,17 +107,46 @@ def test_snapshot_remaps_colliding_message_provenance_by_field_type() -> None:
                     "source_message_id": colliding_id,
                     "source_message_ids": [colliding_id],
                     "source_provenance_groups": [[colliding_id]],
+                    "source_provenance_mode": "all",
                 }
             ),
         },
     )
 
     assert json.loads(str(memory["source_message_ids_json"])) == [fork_message_id]
+    assert json.loads(str(context_source["metadata_json"]))[
+        "source_provenance_mode"
+    ] == "all"
     metadata = json.loads(str(context_source["metadata_json"]))
     assert metadata["source_message_id"] == fork_message_id
     assert metadata["source_message_ids"] == [fork_message_id]
     assert metadata["source_provenance_groups"] == [[fork_message_id]]
     assert fork_message_id != "fork-save"
+
+
+def test_snapshot_rejects_unknown_context_source_provenance() -> None:
+    remapper = turn_snapshot_module._SnapshotRemapper(
+        source_save_id="source-save",
+        target_save_id="fork-save",
+        rows_by_table={
+            "messages": ({"id": "known-message"},),
+            "context_sources": ({"id": "context-one"},),
+        },
+    )
+
+    with pytest.raises(ValueError, match="unknown provenance source"):
+        remapper.remap_row(
+            "context_sources",
+            {
+                "id": "context-one",
+                "save_id": "source-save",
+                "source_type": "world_state",
+                "source_id": "state-one",
+                "metadata_json": json.dumps(
+                    {"source_message_ids": ["missing-message"]}
+                ),
+            },
+        )
 
 
 def test_capture_dedupes_objects_and_restore_recovers_exact_state(

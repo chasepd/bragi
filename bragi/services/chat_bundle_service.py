@@ -93,6 +93,8 @@ _CONTEXT_SOURCE_METADATA_MESSAGE_ID_FIELDS = (
     "last_seen_message_id",
 )
 _CONTEXT_SOURCE_METADATA_MESSAGE_ID_LIST_FIELDS = ("source_message_ids",)
+_MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
+_MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 
 
 class ChatBundleError(ValueError):
@@ -999,6 +1001,7 @@ class ChatBundleService:
                 owner_user_id=owner_user_id,
                 repair_tracker=repair_tracker,
             )
+            self.repositories.rebuild_context_source_search_terms(imported.save_id)
             self.repositories.commit_transaction()
         except Exception:
             self.repositories.rollback_transaction()
@@ -3086,10 +3089,17 @@ def _export_context_source_message_ids(
             source_ids.append(item)
     raw_groups = metadata.get("source_provenance_groups")
     if raw_groups is not None:
-        if not isinstance(raw_groups, list):
+        if (
+            not isinstance(raw_groups, list)
+            or len(raw_groups) > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS
+        ):
             return None
         for group in raw_groups:
-            if not isinstance(group, list) or not group:
+            if (
+                not isinstance(group, list)
+                or not group
+                or len(group) > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS
+            ):
                 return None
             for item in group:
                 if not isinstance(item, str) or not item:
@@ -4757,13 +4767,16 @@ def _remapped_context_source_metadata_json(
                 f"Bundle context_sources.metadata_json.{field} "
                 "must be a message id"
             )
-        remapped[field] = _mapped_optional_source_ref(
+        mapped = _mapped_optional_source_ref(
             value,
             message_id_map,
             character_text_message_id_map,
             f"context_sources.metadata_json.{field}",
             repair_tracker,
         )
+        if mapped is None:
+            return None
+        remapped[field] = mapped
     for field in _CONTEXT_SOURCE_METADATA_MESSAGE_ID_LIST_FIELDS:
         if field not in remapped:
             continue
@@ -4775,6 +4788,8 @@ def _remapped_context_source_metadata_json(
                 f"Bundle context_sources.metadata_json.{field} "
                 "must be a list of message ids"
             )
+        if len(value) > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS:
+            return None
         mapped_items: list[str] = []
         for item in value:
             mapped = _mapped_optional_source_ref(
@@ -4784,16 +4799,22 @@ def _remapped_context_source_metadata_json(
                 f"context_sources.metadata_json.{field}",
                 repair_tracker,
             )
-            if mapped is not None:
-                mapped_items.append(mapped)
+            if mapped is None:
+                return None
+            mapped_items.append(mapped)
         remapped[field] = mapped_items
     if "source_provenance_groups" in remapped:
         raw_groups = remapped["source_provenance_groups"]
-        if not isinstance(raw_groups, list) or not all(
-            isinstance(group, list)
-            and bool(group)
-            and all(isinstance(item, str) and item for item in group)
-            for group in raw_groups
+        if (
+            not isinstance(raw_groups, list)
+            or len(raw_groups) > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS
+            or not all(
+                isinstance(group, list)
+                and bool(group)
+                and len(group) <= _MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS
+                and all(isinstance(item, str) and item for item in group)
+                for group in raw_groups
+            )
         ):
             raise ChatBundleError(
                 "Bundle context_sources.metadata_json."

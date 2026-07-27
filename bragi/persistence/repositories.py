@@ -86,6 +86,11 @@ from bragi_common.media_mime import (
 
 MAX_CONTEXT_SEARCH_TERMS = 64
 MAX_UNICODE_SUBSTRING_TERMS = 32
+MAX_CONTEXT_EXACT_PHRASES = 8
+MAX_MEMORY_SOURCE_MESSAGE_IDS = 64
+MAX_MEMORY_SOURCE_OBSERVATION_IDS = 64
+MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
+MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
 _UNSET = object()
 CHARACTER_TEXT_DELIVERY_STATUSES = frozenset(
@@ -1135,9 +1140,75 @@ class PersistenceRepositories:
             """,
             (save_id,),
         )
-        return (
+        return self.continuity_index_dirty_source_count(save_id) > 0 or (
             row is None
             or int(row["revision"]) != int(row["indexed_revision"])
+        )
+
+    def continuity_index_requires_full_rebuild(self, save_id: str) -> bool:
+        row = self._fetch_one(
+            """
+            SELECT indexed_revision
+            FROM save_continuity_index_revisions
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        )
+        return row is None or int(row["indexed_revision"]) < 0
+
+    def list_continuity_index_dirty_sources(
+        self,
+        save_id: str,
+        *,
+        limit: int,
+    ) -> list[tuple[str, str, int]]:
+        rows = self._fetch_all(
+            """
+            SELECT source_kind, source_id, dirty_generation
+            FROM continuity_index_dirty_sources
+            WHERE save_id = ?
+            ORDER BY queued_at, source_kind, source_id
+            LIMIT ?
+            """,
+            (save_id, max(0, limit)),
+        )
+        return [
+            (
+                str(row["source_kind"]),
+                str(row["source_id"]),
+                int(row["dirty_generation"]),
+            )
+            for row in rows
+        ]
+
+    def continuity_index_dirty_source_count(self, save_id: str) -> int:
+        row = self._fetch_one(
+            """
+            SELECT COUNT(*) AS source_count
+            FROM continuity_index_dirty_sources
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        )
+        return 0 if row is None else int(row["source_count"])
+
+    def delete_continuity_index_dirty_source(
+        self,
+        save_id: str,
+        *,
+        source_kind: str,
+        source_id: str,
+        dirty_generation: int,
+    ) -> None:
+        self.connection.execute(
+            """
+            DELETE FROM continuity_index_dirty_sources
+            WHERE save_id = ?
+              AND source_kind = ?
+              AND source_id = ?
+              AND dirty_generation = ?
+            """,
+            (save_id, source_kind, source_id, dirty_generation),
         )
 
     def mark_continuity_index_synced(self, save_id: str) -> None:
@@ -1154,6 +1225,10 @@ class PersistenceRepositories:
                 indexed_revision = revision,
                 updated_at = CURRENT_TIMESTAMP
             """,
+            (save_id,),
+        )
+        self.connection.execute(
+            "DELETE FROM continuity_index_dirty_sources WHERE save_id = ?",
             (save_id,),
         )
 
@@ -3123,6 +3198,64 @@ class PersistenceRepositories:
             for row in rows
         ]
 
+    def get_world_state_by_id(
+        self,
+        save_id: str,
+        state_id: str,
+    ) -> WorldStateRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, key, value_json, category, confidence,
+                   source_message_id
+            FROM world_state
+            WHERE save_id = ? AND id = ? AND archived_at IS NULL
+            """,
+            (save_id, state_id),
+        )
+        if row is None:
+            return None
+        return WorldStateRecord(
+            id=row["id"],
+            save_id=row["save_id"],
+            key=row["key"],
+            value=_load_object(row["value_json"]),
+            category=row["category"],
+            confidence=row["confidence"],
+            source_message_id=row["source_message_id"],
+        )
+
+    def list_world_state_by_keys(
+        self,
+        save_id: str,
+        keys: set[str] | frozenset[str],
+    ) -> list[WorldStateRecord]:
+        if not keys:
+            return []
+        rows = self._fetch_all(
+            """
+            SELECT id, save_id, key, value_json, category, confidence,
+                   source_message_id
+            FROM world_state
+            WHERE save_id = ?
+              AND archived_at IS NULL
+              AND key IN (SELECT CAST(value AS TEXT) FROM json_each(?))
+            ORDER BY key
+            """,
+            (save_id, _dump_json(sorted(keys))),
+        )
+        return [
+            WorldStateRecord(
+                id=row["id"],
+                save_id=row["save_id"],
+                key=row["key"],
+                value=_load_object(row["value_json"]),
+                category=row["category"],
+                confidence=row["confidence"],
+                source_message_id=row["source_message_id"],
+            )
+            for row in rows
+        ]
+
     def upsert_context_source(
         self,
         *,
@@ -3139,6 +3272,8 @@ class PersistenceRepositories:
         created_turn_number: int | None = None,
         expires_after_turn_number: int | None = None,
     ) -> ContextSourceRecord:
+        resolved_metadata = dict(metadata or {})
+        _validate_context_source_provenance_metadata(resolved_metadata)
         existing = self._fetch_one(
             """
             SELECT id, save_id, source_type, source_id, title, body, metadata_json,
@@ -3156,7 +3291,7 @@ class PersistenceRepositories:
             source_id=source_id,
             title=title,
             body=body,
-            metadata=dict(metadata or {}),
+            metadata=resolved_metadata,
             token_estimate=token_estimate,
             scene_snapshot_id=scene_snapshot_id,
             scene_generation=scene_generation,
@@ -3212,8 +3347,38 @@ class PersistenceRepositories:
                 record.expires_after_turn_number,
             ),
         )
+        self._replace_context_source_search_terms(record)
         self.commit()
         return self.get_context_source(record.id) or record
+
+    def _replace_context_source_search_terms(
+        self,
+        record: ContextSourceRecord,
+    ) -> None:
+        self.connection.execute(
+            "DELETE FROM context_source_search_terms WHERE context_source_id = ?",
+            (record.id,),
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO context_source_search_terms(
+                context_source_id,
+                save_id,
+                term
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                (record.id, record.save_id, term)
+                for term in _context_source_search_terms(record.title, record.body)
+            ),
+        )
+
+    def rebuild_context_source_search_terms(self, save_id: str) -> None:
+        rows = self.list_context_sources(save_id)
+        for record in rows:
+            self._replace_context_source_search_terms(record)
+        self.commit()
 
     def get_context_source(self, context_source_id: str) -> ContextSourceRecord | None:
         row = self._fetch_one(
@@ -3227,6 +3392,79 @@ class PersistenceRepositories:
             (context_source_id,),
         )
         return _context_source_from_row(row) if row else None
+
+    def archive_context_source_by_key(
+        self,
+        save_id: str,
+        *,
+        source_type: str,
+        source_id: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE context_sources
+            SET archived_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE save_id = ? AND source_type = ? AND source_id = ?
+            """,
+            (save_id, source_type, source_id),
+        )
+
+    def archive_continuity_character_sources_except(
+        self,
+        save_id: str,
+        *,
+        character_id: str,
+        active_keys: set[tuple[str, str]] | frozenset[tuple[str, str]],
+    ) -> None:
+        rows = self._fetch_all(
+            """
+            SELECT id, source_type, source_id
+            FROM context_sources
+            WHERE save_id = ?
+              AND archived_at IS NULL
+              AND json_extract(metadata_json, '$.indexed_by') =
+                  'continuity_index'
+              AND (
+                    (source_type = 'character_voice' AND source_id = ?)
+                    OR (
+                        source_type = 'memory'
+                        AND (
+                            source_id = 'character_profile:' || ?
+                            OR source_id LIKE 'relationship:' || ? || ':%'
+                        )
+                    )
+              )
+            """,
+            (save_id, character_id, character_id, character_id),
+        )
+        for row in rows:
+            key = (str(row["source_type"]), str(row["source_id"]))
+            if key not in active_keys:
+                self.archive_context_source(str(row["id"]))
+
+    def archive_continuity_sources_by_type_except(
+        self,
+        save_id: str,
+        *,
+        source_type: str,
+        active_source_ids: set[str] | frozenset[str],
+    ) -> None:
+        rows = self._fetch_all(
+            """
+            SELECT id, source_id
+            FROM context_sources
+            WHERE save_id = ?
+              AND source_type = ?
+              AND archived_at IS NULL
+              AND json_extract(metadata_json, '$.indexed_by') =
+                  'continuity_index'
+            """,
+            (save_id, source_type),
+        )
+        for row in rows:
+            if str(row["source_id"]) not in active_source_ids:
+                self.archive_context_source(str(row["id"]))
 
     def list_context_sources(
         self,
@@ -3377,37 +3615,21 @@ class PersistenceRepositories:
                 )
             )
         )
-        substring_terms = (
-            tuple(
-                sorted(
-                    normalized_query_terms,
-                    key=lambda term: (
-                        -int(any(ord(character) > 127 for character in term)),
-                        -len(term),
-                        term,
-                    ),
-                )[:MAX_UNICODE_SUBSTRING_TERMS]
-            )
-            if any(
-                any(ord(character) > 127 for character in term)
-                for term in normalized_query_terms
-            )
-            else ()
-        )
-        substring_rows: list[sqlite3.Row] = []
-        phrase_values = tuple(
-            dict.fromkeys(
-                phrase.strip()
-                for phrase in exact_phrases
-                if phrase.strip()
+        phrase_terms = tuple(
+            term
+            for phrase in exact_phrases[:MAX_CONTEXT_EXACT_PHRASES]
+            for term in (
+                *unicode_word_terms(phrase),
+                *cjk_lexical_anchors(phrase),
             )
         )
-        phrase_rows: list[sqlite3.Row] = []
-        for phrase in phrase_values:
-            normalized_phrase = _normalized_search_text(phrase)
-            if not normalized_phrase:
-                continue
-            matching_rows = self._fetch_all(
+        indexed_terms = tuple(
+            dict.fromkeys((*normalized_query_terms, *phrase_terms))
+        )[:MAX_UNICODE_SUBSTRING_TERMS]
+        term_rows: list[sqlite3.Row] = []
+        if indexed_terms:
+            indexed_terms_json = _dump_json(indexed_terms)
+            term_rows = self._fetch_all(
                 f"""
                 SELECT
                     context_sources.id,
@@ -3422,113 +3644,34 @@ class PersistenceRepositories:
                     context_sources.scene_generation,
                     context_sources.created_turn_number,
                     context_sources.expires_after_turn_number,
-                    -2.0 AS bm25_rank
-                FROM context_sources
-                WHERE context_sources.save_id = ?
+                    -COUNT(DISTINCT search_terms.term) AS bm25_rank
+                FROM context_source_search_terms search_terms
+                JOIN context_sources
+                  ON context_sources.id = search_terms.context_source_id
+                WHERE search_terms.save_id = ?
+                  AND search_terms.term IN (
+                      SELECT CAST(value AS TEXT) FROM json_each(?)
+                  )
                   AND context_sources.archived_at IS NULL
                   AND context_sources.source_type IN (
                       {_placeholders(len(source_type_values))}
                   )
-                  AND (
-                    instr(
-                        bragi_normalize_text(context_sources.title),
-                        ?
-                    ) > 0
-                    OR instr(
-                        bragi_normalize_text(context_sources.body),
-                        ?
-                    ) > 0
-                  )
                   {eligibility_sql}
-                ORDER BY context_sources.created_at DESC,
-                         context_sources.rowid DESC
-                LIMIT ?
-                """,
-                (
-                    save_id,
-                    *source_type_values,
-                    normalized_phrase,
-                    normalized_phrase,
-                    *eligibility_params,
-                    limit,
-                ),
-            )
-            seen_phrase_ids = {str(row["id"]) for row in phrase_rows}
-            phrase_rows.extend(
-                row
-                for row in matching_rows
-                if str(row["id"]) not in seen_phrase_ids
-            )
-            if len(phrase_rows) >= limit:
-                phrase_rows = phrase_rows[:limit]
-                break
-        if substring_terms:
-            substring_terms_json = _dump_json(substring_terms)
-            substring_predicate = (
-                "NOT EXISTS ("
-                "SELECT 1 FROM json_each(?) substring_term "
-                "WHERE instr(bragi_normalize_text(context_sources.title), "
-                "CAST(substring_term.value AS TEXT)) = 0 "
-                "AND instr(bragi_normalize_text(context_sources.body), "
-                "CAST(substring_term.value AS TEXT)) = 0"
-                ")"
-                if match_all
-                else "EXISTS ("
-                "SELECT 1 FROM json_each(?) substring_term "
-                "WHERE instr(bragi_normalize_text(context_sources.title), "
-                "CAST(substring_term.value AS TEXT)) > 0 "
-                "OR instr(bragi_normalize_text(context_sources.body), "
-                "CAST(substring_term.value AS TEXT)) > 0"
-                ")"
-            )
-            substring_rows = self._fetch_all(
-                f"""
-                SELECT
-                    context_sources.id,
-                    context_sources.save_id,
-                    context_sources.source_type,
-                    context_sources.source_id,
-                    context_sources.title,
-                    context_sources.body,
-                    context_sources.metadata_json,
-                    context_sources.token_estimate,
-                    context_sources.scene_snapshot_id,
-                    context_sources.scene_generation,
-                    context_sources.created_turn_number,
-                    context_sources.expires_after_turn_number,
-                    -(
-                        1.0 + (
-                            SELECT COUNT(*)
-                            FROM json_each(?) substring_score_term
-                            WHERE instr(
-                                bragi_normalize_text(context_sources.title),
-                                CAST(substring_score_term.value AS TEXT)
-                            ) > 0
-                            OR instr(
-                                bragi_normalize_text(context_sources.body),
-                                CAST(substring_score_term.value AS TEXT)
-                            ) > 0
-                        )
-                    ) AS bm25_rank
-                FROM context_sources
-                WHERE context_sources.save_id = ?
-                  AND context_sources.archived_at IS NULL
-                  AND context_sources.source_type IN (
-                      {_placeholders(len(source_type_values))}
-                  )
-                  AND ({substring_predicate})
-                  {eligibility_sql}
+                GROUP BY context_sources.id
+                HAVING ? = 0
+                    OR COUNT(DISTINCT search_terms.term) = ?
                 ORDER BY bm25_rank,
                          context_sources.created_at DESC,
                          context_sources.rowid DESC
                 LIMIT ?
                 """,
                 (
-                    substring_terms_json,
                     save_id,
+                    indexed_terms_json,
                     *source_type_values,
-                    substring_terms_json,
                     *eligibility_params,
+                    int(match_all),
+                    len(indexed_terms),
                     limit,
                 ),
             )
@@ -3576,7 +3719,7 @@ class PersistenceRepositories:
         )
         rows_by_id = {
             str(row["id"]): row
-            for row in (*phrase_rows, *substring_rows, *fts_rows)
+            for row in (*term_rows, *fts_rows)
         }
         rows = list(rows_by_id.values())[:limit]
         return [
@@ -6246,6 +6389,30 @@ class PersistenceRepositories:
         )
         return [_character_text_message_from_row(row) for row in rows]
 
+    def list_recent_sent_character_text_messages(
+        self,
+        *,
+        save_id: str,
+        thread_id: str,
+        limit: int,
+    ) -> list[CharacterTextMessageRecord]:
+        if limit <= 0:
+            return []
+        rows = self._fetch_all(
+            f"""
+            SELECT {_CHARACTER_TEXT_MESSAGE_COLUMNS}
+            FROM character_text_messages
+            WHERE save_id = ?
+              AND thread_id = ?
+              AND deleted_at IS NULL
+              AND delivery_status = 'sent'
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            (save_id, thread_id, limit),
+        )
+        rows.reverse()
+        return [_character_text_message_from_row(row) for row in rows]
     def add_character_text_message_attachment(
         self,
         *,
@@ -6970,7 +7137,7 @@ class PersistenceRepositories:
         )
         self.commit()
 
-    def _player_character_id(self, save_id: str) -> str | None:
+    def get_player_character_id(self, save_id: str) -> str | None:
         row = self._fetch_one(
             """
             SELECT id
@@ -6984,6 +7151,9 @@ class PersistenceRepositories:
             (save_id,),
         )
         return str(row["id"]) if row else None
+
+    def _player_character_id(self, save_id: str) -> str | None:
+        return self.get_player_character_id(save_id)
 
     def _clear_other_player_characters(self, save_id: str, character_id: str) -> None:
         self.connection.execute(
@@ -7132,6 +7302,77 @@ class PersistenceRepositories:
         )
         return [_active_thread_from_row(row) for row in rows]
 
+    def has_active_threads(self, save_id: str) -> bool:
+        return (
+            self._fetch_one(
+                """
+                SELECT 1
+                FROM active_threads
+                WHERE save_id = ? AND archived_at IS NULL
+                LIMIT 1
+                """,
+                (save_id,),
+            )
+            is not None
+        )
+
+    def list_narration_active_threads(
+        self,
+        save_id: str,
+        *,
+        reference_character_ids: set[str] | frozenset[str],
+        visibility_character_ids: set[str] | frozenset[str],
+        limit: int,
+    ) -> list[ActiveThreadRecord]:
+        reference_ids_json = _dump_json(sorted(reference_character_ids))
+        visibility_ids_json = _dump_json(sorted(visibility_character_ids))
+        rows = self._fetch_all(
+            """
+            SELECT id, save_id, title, description, status, priority, visibility,
+                   related_entities_json, source_message_id, locked_fields_json,
+                   first_seen_message_id, last_updated_message_id
+            FROM active_threads
+            WHERE save_id = ?
+              AND archived_at IS NULL
+              AND lower(status) NOT IN ('closed', 'completed', 'resolved')
+              AND lower(visibility) != 'hidden'
+              AND (
+                    lower(visibility) != 'private'
+                    OR EXISTS (
+                        SELECT 1
+                        FROM json_each(related_entities_json) related
+                        JOIN json_each(?) reference
+                          ON CAST(related.value AS TEXT) =
+                             CAST(reference.value AS TEXT)
+                          OR CAST(related.value AS TEXT) =
+                             'character:' || CAST(reference.value AS TEXT)
+                    )
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM message_visibility hidden
+                    JOIN json_each(?) present
+                      ON hidden.character_id = CAST(present.value AS TEXT)
+                    WHERE hidden.save_id = active_threads.save_id
+                      AND hidden.visibility = 'not_visible'
+                      AND hidden.message_id IN (
+                            active_threads.source_message_id,
+                            active_threads.first_seen_message_id,
+                            active_threads.last_updated_message_id
+                      )
+              )
+            ORDER BY priority DESC, updated_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            (
+                save_id,
+                reference_ids_json,
+                visibility_ids_json,
+                max(0, limit),
+            ),
+        )
+        return [_active_thread_from_row(row) for row in rows]
+
     def archive_active_thread(self, thread_id: str) -> None:
         self.connection.execute(
             """
@@ -7252,6 +7493,93 @@ class PersistenceRepositories:
             ORDER BY entity_type, entity_id, target_type, target_id, relation
             """,
             (save_id,),
+        )
+        return [EntityLinkRecord(**dict(row)) for row in rows]
+
+    def list_narration_entity_links(
+        self,
+        save_id: str,
+        *,
+        target_keys: set[tuple[str, str]] | frozenset[tuple[str, str]],
+        present_character_ids: set[str] | frozenset[str],
+        visibility_character_ids: set[str] | frozenset[str],
+    ) -> list[EntityLinkRecord]:
+        if not target_keys:
+            return []
+        target_keys_json = _dump_json(sorted([list(key) for key in target_keys]))
+        present_ids_json = _dump_json(sorted(present_character_ids))
+        visibility_ids_json = _dump_json(sorted(visibility_character_ids))
+        rows = self._fetch_all(
+            """
+            WITH target_keys(target_type, target_id) AS (
+                SELECT
+                    CAST(json_extract(value, '$[0]') AS TEXT),
+                    CAST(json_extract(value, '$[1]') AS TEXT)
+                FROM json_each(?)
+            ),
+            classified AS (
+                SELECT links.*,
+                       links.rowid AS source_rowid,
+                       CASE
+                           WHEN links.entity_type = 'character'
+                            AND links.relation = 'knows'
+                            AND links.entity_id IN (
+                                SELECT CAST(value AS TEXT) FROM json_each(?)
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM message_visibility hidden
+                                JOIN json_each(?) present
+                                  ON hidden.character_id =
+                                     CAST(present.value AS TEXT)
+                                WHERE hidden.save_id = links.save_id
+                                  AND hidden.message_id = links.source_message_id
+                                  AND hidden.visibility = 'not_visible'
+                            )
+                           THEN 0
+                           ELSE 1
+                       END AS scope_class
+                FROM entity_links links
+                JOIN target_keys targets
+                  ON targets.target_type = links.target_type
+                 AND targets.target_id = links.target_id
+                WHERE links.save_id = ?
+                  AND links.entity_type = 'character'
+                  AND links.relation = 'knows'
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM character_knowledge_edges edge
+                        WHERE edge.save_id = links.save_id
+                          AND edge.archived_at IS NULL
+                          AND edge.character_id = links.entity_id
+                          AND edge.target_type = links.target_type
+                          AND edge.target_id = links.target_id
+                  )
+            ),
+            ranked AS (
+                SELECT classified.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY target_type, target_id, scope_class,
+                                        CASE
+                                            WHEN scope_class = 0 THEN entity_id
+                                            ELSE ''
+                                        END
+                           ORDER BY source_rowid DESC
+                       ) AS scope_rank
+                FROM classified
+            )
+            SELECT id, save_id, entity_type, entity_id, target_type, target_id,
+                   relation, source_message_id
+            FROM ranked
+            WHERE scope_rank = 1
+            ORDER BY target_type, target_id, scope_class
+            """,
+            (
+                target_keys_json,
+                present_ids_json,
+                visibility_ids_json,
+                save_id,
+            ),
         )
         return [EntityLinkRecord(**dict(row)) for row in rows]
 
@@ -7384,6 +7712,99 @@ class PersistenceRepositories:
             ORDER BY character_id, target_type, target_id, created_at, rowid
             """,
             tuple(params),
+        )
+        return [_character_knowledge_edge_from_row(row) for row in rows]
+
+    def list_narration_character_knowledge_edges(
+        self,
+        save_id: str,
+        *,
+        target_keys: set[tuple[str, str]] | frozenset[tuple[str, str]],
+        present_character_ids: set[str] | frozenset[str],
+        visibility_character_ids: set[str] | frozenset[str],
+    ) -> list[CharacterKnowledgeEdgeRecord]:
+        if not target_keys:
+            return []
+        target_keys_json = _dump_json(sorted([list(key) for key in target_keys]))
+        present_ids_json = _dump_json(sorted(present_character_ids))
+        visibility_ids_json = _dump_json(sorted(visibility_character_ids))
+        rows = self._fetch_all(
+            """
+            WITH target_keys(target_type, target_id) AS (
+                SELECT
+                    CAST(json_extract(value, '$[0]') AS TEXT),
+                    CAST(json_extract(value, '$[1]') AS TEXT)
+                FROM json_each(?)
+            ),
+            classified AS (
+                SELECT edges.*,
+                       edges.rowid AS source_rowid,
+                       CASE
+                           WHEN edges.character_id IN (
+                                SELECT CAST(value AS TEXT) FROM json_each(?)
+                           )
+                            AND (
+                                edges.knowledge_state = 'knows'
+                                OR (
+                                    edges.knowledge_state = 'may_know'
+                                    AND edges.confidence >= 0.75
+                                )
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM message_visibility hidden
+                                JOIN json_each(?) present
+                                  ON hidden.character_id =
+                                     CAST(present.value AS TEXT)
+                                WHERE hidden.save_id = edges.save_id
+                                  AND hidden.visibility = 'not_visible'
+                                  AND (
+                                      hidden.message_id = edges.source_message_id
+                                      OR hidden.message_id IN (
+                                          SELECT CAST(value AS TEXT)
+                                          FROM json_each(
+                                              edges.source_message_ids_json
+                                          )
+                                      )
+                                  )
+                            )
+                           THEN 0
+                           ELSE 1
+                       END AS scope_class
+                FROM character_knowledge_edges edges
+                JOIN target_keys targets
+                  ON targets.target_type = edges.target_type
+                 AND targets.target_id = edges.target_id
+                WHERE edges.save_id = ?
+                  AND edges.archived_at IS NULL
+            ),
+            ranked AS (
+                SELECT classified.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY target_type, target_id, scope_class,
+                                        CASE
+                                            WHEN scope_class = 0
+                                            THEN character_id
+                                            ELSE ''
+                                        END
+                           ORDER BY updated_at DESC, source_rowid DESC
+                       ) AS scope_rank
+                FROM classified
+            )
+            SELECT id, save_id, character_id, target_type, target_id,
+                   knowledge_state, acquisition_method, confidence,
+                   source_message_id, source_message_ids_json, evidence_quote,
+                   created_at, updated_at, archived_at
+            FROM ranked
+            WHERE scope_rank = 1
+            ORDER BY target_type, target_id, scope_class
+            """,
+            (
+                target_keys_json,
+                present_ids_json,
+                visibility_ids_json,
+                save_id,
+            ),
         )
         return [_character_knowledge_edge_from_row(row) for row in rows]
 
@@ -8508,7 +8929,9 @@ class PersistenceRepositories:
             source_message_id=source_message_id,
             source_message_ids=resolved_source_message_ids,
             claim_fingerprint=resolved_fingerprint,
-            source_observation_ids=_unique_strings(source_observation_ids or ()),
+            source_observation_ids=_unique_strings(
+                source_observation_ids or ()
+            )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS],
         )
         self.connection.execute(
             """
@@ -8577,7 +9000,7 @@ class PersistenceRepositories:
                 _load_list(current["source_observation_ids_json"])
                 if source_observation_ids is None
                 else source_observation_ids
-            )
+            )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS]
         )
         resolved_fingerprint = canonical_claim_fingerprint(body)
         self.connection.execute(
@@ -8702,6 +9125,36 @@ class PersistenceRepositories:
             )
             for row in rows
         ]
+
+    def get_memory(self, save_id: str, memory_id: str) -> MemoryRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, body, tags_json, importance, source_message_id,
+                   source_message_ids_json, claim_fingerprint,
+                   source_observation_ids_json
+            FROM memories
+            WHERE save_id = ? AND id = ? AND archived_at IS NULL
+            """,
+            (save_id, memory_id),
+        )
+        if row is None:
+            return None
+        return MemoryRecord(
+            id=row["id"],
+            save_id=row["save_id"],
+            body=row["body"],
+            tags=_load_list(row["tags_json"]),
+            importance=row["importance"],
+            source_message_id=row["source_message_id"],
+            source_message_ids=_memory_source_message_ids(
+                source_message_id=row["source_message_id"],
+                source_message_ids=_load_list(row["source_message_ids_json"]),
+            ),
+            claim_fingerprint=row["claim_fingerprint"],
+            source_observation_ids=_load_list(
+                row["source_observation_ids_json"]
+            ),
+        )
 
     def list_memories_for_continuity_index(
         self,
@@ -9332,6 +9785,18 @@ class PersistenceRepositories:
         if limit is not None:
             rows.reverse()
         return [SummaryRecord(**dict(row)) for row in rows]
+
+    def get_summary(self, save_id: str, summary_id: str) -> SummaryRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, covers_message_start_id, covers_message_end_id,
+                   body, provider, model, content_rating
+            FROM summaries
+            WHERE save_id = ? AND id = ? AND archived_at IS NULL
+            """,
+            (save_id, summary_id),
+        )
+        return SummaryRecord(**dict(row)) if row is not None else None
 
     def summary_visible_to_characters(
         self,
@@ -11634,6 +12099,44 @@ def _normalized_search_text(value: object) -> str:
     return unicodedata.normalize("NFKC", str(value)).casefold()
 
 
+def _context_source_search_terms(title: str, body: str) -> tuple[str, ...]:
+    terms = (
+        *unicode_word_terms(title),
+        *cjk_lexical_anchors(title),
+        *unicode_word_terms(body),
+        *cjk_lexical_anchors(body),
+    )
+    return tuple(dict.fromkeys(terms))[:4096]
+
+
+def _validate_context_source_provenance_metadata(
+    metadata: dict[str, object],
+) -> None:
+    raw_source_ids = metadata.get("source_message_ids")
+    if raw_source_ids is not None and (
+        not isinstance(raw_source_ids, list)
+        or len(raw_source_ids) > MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS
+        or not all(isinstance(item, str) and item for item in raw_source_ids)
+    ):
+        raise ValueError("context source message provenance is invalid or too large")
+    raw_groups = metadata.get("source_provenance_groups")
+    if raw_groups is not None and (
+        not isinstance(raw_groups, list)
+        or len(raw_groups) > MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS
+        or not all(
+            isinstance(group, list)
+            and bool(group)
+            and len(group) <= MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS
+            and all(isinstance(item, str) and item for item in group)
+            for group in raw_groups
+        )
+    ):
+        raise ValueError("context source provenance groups are invalid or too large")
+    mode = metadata.get("source_provenance_mode")
+    if mode is not None and mode not in {"all", "any"}:
+        raise ValueError("context source provenance mode is invalid")
+
+
 def _context_source_eligibility_sql(
     *,
     alias: str,
@@ -11726,6 +12229,99 @@ def _context_source_eligibility_sql(
         params.extend(visibility_ids)
         params.extend(visibility_ids)
         params.extend(visibility_ids)
+    if visibility_character_ids is not None:
+        scope_ids_json = _dump_json(sorted(visibility_character_ids))
+        target_matches_edge = (
+            f"(edge.target_type = {alias}.source_type OR ("
+            f"{alias}.source_type = 'world_state' AND edge.target_type = 'state')) "
+            f"AND edge.target_id = {alias}.source_id"
+        )
+        target_matches_link = (
+            f"(link.target_type = {alias}.source_type OR ("
+            f"{alias}.source_type = 'world_state' AND link.target_type = 'state')) "
+            f"AND link.target_id = {alias}.source_id"
+        )
+        clauses.append(
+            "("
+            f"{alias}.source_type NOT IN "
+            "('memory', 'world_state', 'summary', 'scenario_section') "
+            "OR ("
+            "NOT EXISTS ("
+            "SELECT 1 FROM character_knowledge_edges edge "
+            f"WHERE edge.save_id = {alias}.save_id "
+            "AND edge.archived_at IS NULL "
+            f"AND {target_matches_edge}"
+            ") "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM entity_links link "
+            f"WHERE link.save_id = {alias}.save_id "
+            "AND link.entity_type = 'character' "
+            "AND link.relation = 'knows' "
+            f"AND {target_matches_link}"
+            ")"
+            ") "
+            "OR EXISTS ("
+            "SELECT 1 FROM character_knowledge_edges edge "
+            f"WHERE edge.save_id = {alias}.save_id "
+            "AND edge.archived_at IS NULL "
+            f"AND {target_matches_edge} "
+            "AND edge.character_id IN ("
+            "SELECT CAST(value AS TEXT) FROM json_each(?)"
+            ") "
+            "AND (edge.knowledge_state = 'knows' OR ("
+            "edge.knowledge_state = 'may_know' AND edge.confidence >= 0.75"
+            ")) "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM message_visibility hidden "
+            f"WHERE hidden.save_id = {alias}.save_id "
+            "AND hidden.visibility = 'not_visible' "
+            "AND hidden.character_id IN ("
+            "SELECT CAST(value AS TEXT) FROM json_each(?)"
+            ") "
+            "AND (hidden.message_id = edge.source_message_id OR "
+            "hidden.message_id IN ("
+            "SELECT CAST(value AS TEXT) "
+            "FROM json_each(edge.source_message_ids_json)"
+            "))"
+            ")"
+            ") "
+            "OR EXISTS ("
+            "SELECT 1 FROM entity_links link "
+            f"WHERE link.save_id = {alias}.save_id "
+            "AND link.entity_type = 'character' "
+            "AND link.relation = 'knows' "
+            f"AND {target_matches_link} "
+            "AND link.entity_id IN ("
+            "SELECT CAST(value AS TEXT) FROM json_each(?)"
+            ") "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM character_knowledge_edges edge "
+            "WHERE edge.save_id = link.save_id "
+            "AND edge.archived_at IS NULL "
+            "AND edge.character_id = link.entity_id "
+            "AND edge.target_type = link.target_type "
+            "AND edge.target_id = link.target_id"
+            ") "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM message_visibility hidden "
+            f"WHERE hidden.save_id = {alias}.save_id "
+            "AND hidden.visibility = 'not_visible' "
+            "AND hidden.character_id IN ("
+            "SELECT CAST(value AS TEXT) FROM json_each(?)"
+            ") "
+            "AND hidden.message_id = link.source_message_id"
+            ")"
+            ")"
+            ")"
+        )
+        params.extend(
+            (
+                scope_ids_json,
+                scope_ids_json,
+                scope_ids_json,
+                scope_ids_json,
+            )
+        )
     if allowed_owner_names is not None or reference_character_ids is not None:
         owners = tuple(sorted(allowed_owner_names or ()))
         character_ids = tuple(sorted(reference_character_ids or ()))
@@ -12081,7 +12677,7 @@ def _memory_source_message_ids(
     values = [str(value) for value in source_message_ids or [] if value]
     if source_message_id:
         values.insert(0, source_message_id)
-    return _dedupe_strings(tuple(values))
+    return _dedupe_strings(tuple(values))[:MAX_MEMORY_SOURCE_MESSAGE_IDS]
 
 
 def _save_scenario_evolution_turn_interval_setting_key(save_id: str) -> str:

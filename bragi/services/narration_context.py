@@ -106,6 +106,50 @@ def load_narration_context_snapshot(
             limit=raw_record_limit,
         )
     )
+    raw_target_keys = frozenset(
+        {
+            *(("world_state", state.id) for state in world_state),
+            *(("world_state", state.id) for state in world_state_for_scope),
+            *(("memory", memory.id) for memory in memories),
+            *(("summary", summary.id) for summary in summaries),
+        }
+    )
+    active_threads = (
+        tuple(repositories.list_active_threads(save_id))
+        if raw_record_limit is None
+        else tuple(
+            repositories.list_narration_active_threads(
+                save_id,
+                reference_character_ids=visibility_character_ids or set(),
+                visibility_character_ids=visibility_character_ids or set(),
+                limit=raw_record_limit,
+            )
+        )
+    )
+    character_knowledge_edges = (
+        tuple(repositories.list_character_knowledge_edges(save_id))
+        if raw_record_limit is None
+        else tuple(
+            repositories.list_narration_character_knowledge_edges(
+                save_id,
+                target_keys=raw_target_keys,
+                present_character_ids=visibility_character_ids or set(),
+                visibility_character_ids=visibility_character_ids or set(),
+            )
+        )
+    )
+    entity_links = (
+        tuple(repositories.list_entity_links(save_id))
+        if raw_record_limit is None
+        else tuple(
+            repositories.list_narration_entity_links(
+                save_id,
+                target_keys=raw_target_keys,
+                present_character_ids=visibility_character_ids or set(),
+                visibility_character_ids=visibility_character_ids or set(),
+            )
+        )
+    )
     visibility_message_ids = (
         {
             *(message.id for message in details.messages),
@@ -147,6 +191,26 @@ def load_narration_context_snapshot(
                 for suggestion in pending_suggestions
                 for source_id in suggestion.source_message_ids
             ),
+            *(
+                source_id
+                for thread in active_threads
+                for source_id in (
+                    thread.source_message_id,
+                    thread.first_seen_message_id,
+                    thread.last_updated_message_id,
+                )
+                if source_id is not None
+            ),
+            *(
+                source_id
+                for edge in character_knowledge_edges
+                for source_id in edge.source_message_ids
+            ),
+            *(
+                link.source_message_id
+                for link in entity_links
+                if link.source_message_id is not None
+            ),
         }
         if raw_record_limit is not None
         else None
@@ -156,10 +220,8 @@ def load_narration_context_snapshot(
         scene_snapshot=scene_snapshot,
         locations=tuple(repositories.list_locations(save_id)),
         characters=tuple(repositories.list_characters(save_id)),
-        active_threads=tuple(repositories.list_active_threads(save_id)),
-        character_knowledge_edges=tuple(
-            repositories.list_character_knowledge_edges(save_id)
-        ),
+        active_threads=active_threads,
+        character_knowledge_edges=character_knowledge_edges,
         message_visibility=tuple(
             repositories.list_message_visibility(
                 save_id,
@@ -167,7 +229,7 @@ def load_narration_context_snapshot(
                 message_ids=visibility_message_ids,
             )
         ),
-        entity_links=tuple(repositories.list_entity_links(save_id)),
+        entity_links=entity_links,
         world_state=world_state,
         world_state_for_scope=world_state_for_scope,
         state_changes=state_changes,

@@ -65,6 +65,7 @@ def allowed_character_scoped_targets(
     character_knowledge_edges: list[CharacterKnowledgeEdgeRecord],
     entity_links: list[EntityLinkRecord],
     latest_player_message: str,
+    message_visibility: list[MessageVisibilityRecord] | None = None,
 ) -> ScopedTargets:
     characters_by_id = {character.id: character for character in characters}
     present_ids = character_scope_for_turn(
@@ -81,6 +82,16 @@ def allowed_character_scoped_targets(
             continue
         target = (target_type, edge.target_id)
         graph_targets.add((edge.character_id, *target))
+        if any(
+            not message_visible_to_present_characters(
+                message_id=source_id,
+                present_character_ids=present_ids,
+                message_visibility=message_visibility or [],
+            )
+            for source_id in edge.source_message_ids
+        ):
+            blocked.add(target)
+            continue
         character = characters_by_id.get(edge.character_id)
         if (
             character is not None
@@ -108,6 +119,15 @@ def allowed_character_scoped_targets(
             continue
         target = (target_type, link.target_id)
         if (link.entity_id, *target) in graph_targets:
+            continue
+        if link.source_message_id is not None and not (
+            message_visible_to_present_characters(
+                message_id=link.source_message_id,
+                present_character_ids=present_ids,
+                message_visibility=message_visibility or [],
+            )
+        ):
+            blocked.add(target)
             continue
         character = characters_by_id.get(link.entity_id)
         if character is not None and link.entity_id in present_ids:

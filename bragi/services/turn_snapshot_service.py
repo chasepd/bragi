@@ -42,6 +42,8 @@ from bragi.services.sexual_content_safety import (
 )
 
 SNAPSHOT_FORMAT = "bragi-turn-snapshot-v1"
+_MAX_SNAPSHOT_PROVENANCE_GROUPS = 64
+_MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS = 64
 SNAPSHOT_ENCODING = "zlib-json-v1"
 
 
@@ -521,6 +523,7 @@ class TurnSnapshotService:
                 for row in rows:
                     self._insert_row(table_name, row)
             self._normalize_memory_fingerprints(save_id)
+            self.repositories.rebuild_context_source_search_terms(save_id)
             self.repositories.consolidate_active_memory_duplicates(
                 save_id=save_id
             )
@@ -605,6 +608,7 @@ class TurnSnapshotService:
                         )
                     self._insert_row(table_name, remapped)
             self._normalize_memory_fingerprints(fork_save.id)
+            self.repositories.rebuild_context_source_search_terms(fork_save.id)
             self.repositories.consolidate_active_memory_duplicates(
                 save_id=fork_save.id
             )
@@ -1612,26 +1616,42 @@ class _SnapshotRemapper:
             return value
         text_message_id = parse_character_text_source_ref(value)
         if text_message_id is not None:
-            mapped = self._mapped_table_id(
-                "character_text_messages",
-                text_message_id,
+            mapped = self.id_maps.get("character_text_messages", {}).get(
+                text_message_id
             )
-            return (
-                character_text_source_ref(mapped)
-                if isinstance(mapped, str)
-                else value
+            if mapped is None:
+                raise ValueError(
+                    f"Snapshot context source has unknown provenance source: {value}"
+                )
+            return character_text_source_ref(mapped)
+        mapped_message_id = self.id_maps["messages"].get(value)
+        if mapped_message_id is None:
+            raise ValueError(
+                f"Snapshot context source has unknown provenance source: {value}"
             )
-        return self._mapped_message_id(value)
+        return mapped_message_id
 
     def _remap_source_ref_list(self, raw: object) -> object:
         if not isinstance(raw, list):
             return raw
+        if (
+            len(raw) > _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS
+            or not all(isinstance(item, str) and item for item in raw)
+        ):
+            raise ValueError("Snapshot context source provenance is invalid")
         return [self._mapped_source_ref(item) for item in raw]
 
     def _remap_context_source_metadata(self, raw: object) -> object:
         remapped = self._remap_json_value(raw)
         if not isinstance(raw, dict) or not isinstance(remapped, dict):
             return remapped
+        if "source_provenance_mode" in raw:
+            mode = raw["source_provenance_mode"]
+            if mode not in {"all", "any"}:
+                raise ValueError(
+                    "Snapshot context source has invalid source_provenance_mode"
+                )
+            remapped["source_provenance_mode"] = mode
         for field in ("source_message_id", "last_seen_message_id"):
             if field in raw:
                 remapped[field] = self._mapped_source_ref(raw[field])
@@ -1641,6 +1661,8 @@ class _SnapshotRemapper:
             )
         raw_groups = raw.get("source_provenance_groups")
         if isinstance(raw_groups, list):
+            if len(raw_groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS:
+                raise ValueError("Snapshot context source provenance is too large")
             remapped["source_provenance_groups"] = [
                 self._remap_source_ref_list(group)
                 for group in raw_groups

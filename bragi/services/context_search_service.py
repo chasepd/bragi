@@ -292,7 +292,7 @@ class ContextSearchService:
                 message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
             )
             if details is not None:
-                ContinuityIndexService(self.repositories).sync_save(save_id)
+                _sync_continuity_index_for_search(self.repositories, save_id)
             initial_fingerprint = self.repositories.context_candidate_revision_token(
                 save_id
             )
@@ -313,6 +313,7 @@ class ContextSearchService:
                 characters=list(snapshot.characters),
                 character_knowledge_edges=list(snapshot.character_knowledge_edges),
                 entity_links=list(snapshot.entity_links),
+                message_visibility=list(snapshot.message_visibility),
             )
             candidate_observations = _observations_with_indexed_sources(
                 self.repositories,
@@ -483,7 +484,7 @@ class ContextSearchService:
             continuity_index_synced = False
             narration_snapshot: NarrationContextSnapshot | None = None
             if cache_entry is None:
-                ContinuityIndexService(self.repositories).sync_save(save_id)
+                _sync_continuity_index_for_search(self.repositories, save_id)
                 continuity_index_synced = True
                 narration_snapshot = load_narration_context_snapshot(
                     self.repositories,
@@ -554,14 +555,45 @@ class ContextSearchService:
                 candidate_diagnostics = candidate_set.diagnostics
                 cache_status = "miss"
             else:
+                fresh_pending_suggestions = tuple(
+                    self.repositories.list_context_update_suggestions(
+                        save_id,
+                        status="pending",
+                        limit=RAW_CONTEXT_RECORD_LIMIT,
+                    )
+                )
+                pending_source_message_ids = {
+                    source_id
+                    for suggestion in fresh_pending_suggestions
+                    for source_id in suggestion.source_message_ids
+                }
+                present_character_ids = (
+                    set(cache_entry.snapshot.scene_snapshot.present_character_ids)
+                    if cache_entry.snapshot.scene_snapshot is not None
+                    else set()
+                )
+                refreshed_pending_visibility = tuple(
+                    self.repositories.list_message_visibility(
+                        save_id,
+                        character_ids=present_character_ids,
+                        message_ids=pending_source_message_ids,
+                    )
+                )
                 snapshot = replace(
                     cache_entry.snapshot,
                     details=details,
-                    pending_context_suggestions=tuple(
-                        self.repositories.list_context_update_suggestions(
-                            save_id,
-                            status="pending",
-                        )
+                    pending_context_suggestions=fresh_pending_suggestions,
+                    message_visibility=tuple(
+                        visibility
+                        for visibility in cache_entry.snapshot.message_visibility
+                        if visibility.message_id not in pending_source_message_ids
+                    ),
+                )
+                snapshot = replace(
+                    snapshot,
+                    message_visibility=(
+                        *snapshot.message_visibility,
+                        *refreshed_pending_visibility,
                     ),
                 )
                 narration_snapshot = snapshot
@@ -883,6 +915,17 @@ class ContextSearchService:
         return None
 
 
+def _sync_continuity_index_for_search(
+    repositories: PersistenceRepositories,
+    save_id: str,
+) -> None:
+    result = ContinuityIndexService(repositories).sync_save(save_id)
+    if not result.complete:
+        raise RuntimeError(
+            "Continuity index maintenance backlog is still draining; retry the turn"
+        )
+
+
 def _rehydrate_selected_context(
     *,
     repositories: PersistenceRepositories,
@@ -902,7 +945,7 @@ def _rehydrate_selected_context(
         ignored_message_id=player_message_id,
     )
     if current_revision != preselection_revision:
-        ContinuityIndexService(repositories).sync_save(save_id)
+        _sync_continuity_index_for_search(repositories, save_id)
     details = repositories.load_save_details(
         save_id,
         message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
@@ -1039,6 +1082,7 @@ def _indexed_context_source_retrieval(
     characters: list[CharacterRecord],
     character_knowledge_edges: list[CharacterKnowledgeEdgeRecord],
     entity_links: list[EntityLinkRecord],
+    message_visibility: list[MessageVisibilityRecord],
     additional_query_terms: tuple[str, ...] = (),
 ) -> _IndexedContextSourceRetrieval:
     started_at = perf_counter()
@@ -1064,6 +1108,7 @@ def _indexed_context_source_retrieval(
         character_knowledge_edges=character_knowledge_edges,
         entity_links=entity_links,
         latest_player_message=latest_player_message,
+        message_visibility=message_visibility,
     )
     allowed_owner_names = {
         scoped_owner_name(owner)
@@ -1200,6 +1245,7 @@ async def _retrieve_indexed_context_sources(
         characters=characters,
         character_knowledge_edges=character_knowledge_edges,
         entity_links=entity_links,
+        message_visibility=message_visibility,
     )
     if not latest_player_message.strip():
         return initial
@@ -1257,6 +1303,7 @@ async def _retrieve_indexed_context_sources(
         characters=characters,
         character_knowledge_edges=character_knowledge_edges,
         entity_links=entity_links,
+        message_visibility=message_visibility,
         additional_query_terms=expanded_terms,
     )
     return replace(
@@ -1631,6 +1678,7 @@ def _context_candidate_set(
         character_knowledge_edges=character_knowledge_edges or [],
         entity_links=entity_links or [],
         latest_player_message=latest_player_message,
+        message_visibility=message_visibility or [],
     )
     context_source_records = context_sources or []
     observation_records = observations or []

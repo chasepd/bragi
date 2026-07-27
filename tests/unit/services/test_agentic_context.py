@@ -447,6 +447,52 @@ def test_observation_service_rejects_explicit_denial_after_claim_span(
     assert repositories.list_context_observations(save.id) == []
 
 
+def test_observation_service_rejects_quote_truncated_before_denial(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    source = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara has the red key, but that claim is false.",
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        "observation_type": "character_fact",
+                        "claim": "Mara has the red key.",
+                        "evidence_quote": "Mara has the red key",
+                        "source_message_ids": [source.id],
+                        "scope": "durable",
+                        "confidence": 0.99,
+                        "tags": ["key"],
+                    }
+                ]
+            }
+        }
+    )
+    service = ObservationService(
+        repositories=repositories,
+        extractor=StructuredProviderObservationExtractor(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="observer",
+        ),
+    )
+
+    result = asyncio.run(
+        service.observe_turn(
+            save_id=save.id,
+            source_message_ids=(source.id,),
+        )
+    )
+
+    assert result.observed_count == 0
+    assert repositories.list_context_observations(save.id) == []
+
+
 def test_persisted_observation_revalidation_rejects_subject_prefix() -> None:
     observation = ContextObservationRecord(
         id="observation-imported",

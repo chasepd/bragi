@@ -3767,6 +3767,68 @@ def test_repositories_search_context_sources_with_fts(
     assert isinstance(hits[0].bm25_rank, float)
 
 
+def test_context_source_search_enforces_graph_scope_outside_raw_candidates(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Archive",
+        premise="An archive holds unevenly shared secrets.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Index")
+    present = repositories.add_character(save_id=save.id, name="Nira", met=True)
+    absent = repositories.add_character(save_id=save.id, name="Lio", met=True)
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["moonstone"],
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id=memory.id,
+        title="moonstone",
+        body=memory.body,
+        metadata={"indexed_by": "continuity_index"},
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=absent.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="knows",
+        acquisition_method="told",
+    )
+
+    blocked = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=1,
+        visibility_character_ids={present.id},
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=present.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="knows",
+        acquisition_method="told",
+    )
+    allowed = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=1,
+        visibility_character_ids={present.id},
+    )
+
+    assert blocked == []
+    assert [hit.record.source_id for hit in allowed] == [memory.id]
+
+
 def test_repositories_search_context_sources_with_unicode_terms(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -5208,6 +5208,23 @@ def test_context_search_cache_hit_refreshes_pending_suggestions(
         repositories=repositories,
         providers={"fake": provider},
     )
+    character = repositories.add_character(save_id=save.id, name="Orin", met=True)
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[character.id],
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=player_message.id,
+        character_id=character.id,
+        visibility="not_visible",
+    )
+    for index in range(70):
+        repositories.append_message(
+            save_id=save.id,
+            role="narrator",
+            body=f"Unrelated bridge detail {index}.",
+        )
     service.precompute_next_turn(save.id)
     suggestion = repositories.add_context_update_suggestion(
         save_id=save.id,
@@ -5233,6 +5250,12 @@ def test_context_search_cache_hit_refreshes_pending_suggestions(
 
     assert result.narration_snapshot is not None
     assert result.narration_snapshot.pending_context_suggestions == (suggestion,)
+    assert any(
+        visibility.message_id == player_message.id
+        and visibility.character_id == character.id
+        and visibility.visibility == "not_visible"
+        for visibility in result.narration_snapshot.message_visibility
+    )
     job_result = json.loads(
         _context_search_jobs(repositories, save.id)[-1]["result_json"]
     )

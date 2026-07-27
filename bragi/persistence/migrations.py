@@ -12,6 +12,7 @@ from pathlib import Path
 
 from bragi.model_tasks import is_retired_model_task
 from bragi.private_files import ensure_private_file
+from bragi.text_search import cjk_lexical_anchors, unicode_word_terms
 
 CURRENT_SCHEMA_VERSION = 71
 
@@ -730,6 +731,7 @@ def migrate_database(database_path: Path | str) -> None:
         _ensure_scene_world_time_schema(connection)
         _ensure_hot_narration_query_indexes(connection)
         _ensure_continuity_index_revision_schema(connection)
+        _ensure_context_source_search_terms_schema(connection)
         connection.commit()
 
 
@@ -755,6 +757,7 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         _ensure_provider_catalog_schema(connection)
         _ensure_hot_narration_query_indexes(connection)
         _ensure_context_source_fts_schema(connection)
+        _ensure_context_source_search_terms_schema(connection)
         _ensure_message_scene_presence_schema(connection)
         _ensure_message_action_choices_schema(connection)
         _normalize_legacy_action_choice_scenarios(connection)
@@ -1132,6 +1135,50 @@ def _ensure_hot_narration_query_indexes(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_context_observations_save_active_created
         ON context_observations(save_id, created_at)
         WHERE archived_at IS NULL
+        """,
+    )
+    _create_index_if_columns_exist(
+        connection,
+        "character_knowledge_edges",
+        {
+            "save_id",
+            "target_type",
+            "target_id",
+            "archived_at",
+            "character_id",
+        },
+        """
+        CREATE INDEX IF NOT EXISTS idx_knowledge_edges_save_target_character
+        ON character_knowledge_edges(
+            save_id,
+            target_type,
+            target_id,
+            archived_at,
+            character_id
+        )
+        """,
+    )
+    _create_index_if_columns_exist(
+        connection,
+        "entity_links",
+        {
+            "save_id",
+            "target_type",
+            "target_id",
+            "relation",
+            "entity_type",
+            "entity_id",
+        },
+        """
+        CREATE INDEX IF NOT EXISTS idx_entity_links_save_target_relation_entity
+        ON entity_links(
+            save_id,
+            target_type,
+            target_id,
+            relation,
+            entity_type,
+            entity_id
+        )
         """,
     )
     _create_index_if_columns_exist(
@@ -3707,6 +3754,23 @@ def _ensure_continuity_index_revision_schema(connection: sqlite3.Connection) -> 
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS continuity_index_dirty_sources (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            source_kind TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            dirty_generation INTEGER NOT NULL DEFAULT 1,
+            queued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(save_id, source_kind, source_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_continuity_dirty_save_queue
+        ON continuity_index_dirty_sources(
+            save_id,
+            queued_at,
+            source_kind,
+            source_id
+        );
+
         INSERT OR IGNORE INTO save_continuity_index_revisions(
             save_id,
             revision,
@@ -3726,18 +3790,18 @@ def _ensure_continuity_index_revision_schema(connection: sqlite3.Connection) -> 
         END;
         """,
     )
-    for table_name in (
-        "world_state",
-        "memories",
-        "summaries",
-        "active_threads",
-        "locations",
-        "characters",
-        "scene_snapshots",
-        "save_scenario_updates",
-        "character_text_threads",
-        "character_text_messages",
-    ):
+    source_mappings = {
+        "world_state": ("world_state", "id"),
+        "memories": ("memory", "id"),
+        "summaries": ("summary", "id"),
+        "active_threads": ("active_thread", "id"),
+        "locations": ("location", "id"),
+        "characters": ("character", "id"),
+        "save_scenario_updates": ("scenario", None),
+        "character_text_threads": ("character_text_thread", "id"),
+        "character_text_messages": ("character_text_thread", "thread_id"),
+    }
+    for table_name in (*source_mappings, "scene_snapshots"):
         if not _table_exists(connection, table_name):
             continue
         for event in ("INSERT", "UPDATE", "DELETE"):
@@ -3745,10 +3809,19 @@ def _ensure_continuity_index_revision_schema(connection: sqlite3.Connection) -> 
             trigger_name = (
                 f"bump_{table_name}_continuity_revision_after_{event.lower()}"
             )
+            connection.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            if table_name == "scene_snapshots":
+                continue
+            source_kind, source_column = source_mappings[table_name]
+            source_id_sql = (
+                "'scenario'"
+                if source_column is None
+                else f"{row_ref}.{source_column}"
+            )
             _execute_schema_script(
                 connection,
                 f"""
-                CREATE TRIGGER IF NOT EXISTS {trigger_name}
+                CREATE TRIGGER {trigger_name}
                 AFTER {event} ON {table_name}
                 BEGIN
                     INSERT INTO save_continuity_index_revisions(
@@ -3761,9 +3834,94 @@ def _ensure_continuity_index_revision_schema(connection: sqlite3.Connection) -> 
                     ON CONFLICT(save_id) DO UPDATE SET
                         revision = revision + 1,
                         updated_at = CURRENT_TIMESTAMP;
+
+                    INSERT INTO continuity_index_dirty_sources(
+                        save_id,
+                        source_kind,
+                        source_id,
+                        dirty_generation,
+                        queued_at
+                    )
+                    VALUES (
+                        {row_ref}.save_id,
+                        '{source_kind}',
+                        {source_id_sql},
+                        1,
+                        CURRENT_TIMESTAMP
+                    )
+                    ON CONFLICT(save_id, source_kind, source_id) DO UPDATE SET
+                        dirty_generation = dirty_generation + 1,
+                        queued_at = CURRENT_TIMESTAMP;
                 END;
                 """,
             )
+
+
+def _ensure_context_source_search_terms_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    if not _table_exists(connection, "context_sources"):
+        return
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS context_source_search_terms (
+            context_source_id TEXT NOT NULL
+                REFERENCES context_sources(id) ON DELETE CASCADE,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            term TEXT NOT NULL,
+            PRIMARY KEY(context_source_id, term)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_source_terms_save_term
+        ON context_source_search_terms(save_id, term, context_source_id);
+
+        DELETE FROM context_source_search_terms
+        WHERE context_source_id NOT IN (SELECT id FROM context_sources);
+        """,
+    )
+    missing_rows = connection.execute(
+        """
+        SELECT source.id, source.save_id, source.title, source.body
+        FROM context_sources source
+        WHERE source.archived_at IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM context_source_search_terms term
+              WHERE term.context_source_id = source.id
+          )
+        ORDER BY source.rowid
+        """
+    ).fetchall()
+    for source_id, save_id, title, body in missing_rows:
+        terms = _migration_context_source_search_terms(
+            str(title or ""),
+            str(body or ""),
+        )
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO context_source_search_terms(
+                context_source_id,
+                save_id,
+                term
+            )
+            VALUES (?, ?, ?)
+            """,
+            ((str(source_id), str(save_id), term) for term in terms),
+        )
+
+
+def _migration_context_source_search_terms(
+    title: str,
+    body: str,
+) -> tuple[str, ...]:
+    terms = (
+        *unicode_word_terms(title),
+        *cjk_lexical_anchors(title),
+        *unicode_word_terms(body),
+        *cjk_lexical_anchors(body),
+    )
+    return tuple(dict.fromkeys(terms))[:4096]
 
 
 def _ensure_message_context_revision_schema(connection: sqlite3.Connection) -> None:

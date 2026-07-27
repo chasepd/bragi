@@ -5017,7 +5017,7 @@ def test_import_save_remaps_context_update_suggestion_scalar_location_ids(
     assert suggestions["Move Iris to a missing location."].proposed_value is None
 
 
-def test_import_save_repairs_unknown_context_source_metadata_refs(
+def test_import_save_drops_unknown_context_source_metadata_refs(
     repositories: PersistenceRepositories,
     tmp_path: Path,
 ) -> None:
@@ -5087,43 +5087,11 @@ def test_import_save_repairs_unknown_context_source_metadata_refs(
     imported_save_id = _imported_save_id(imported)
 
     imported_messages = repositories.list_messages(imported_save_id)
-    repaired_context = next(
-        source
-        for source in repositories.list_context_sources(imported_save_id)
-        if source.title == "Unknown metadata"
-    )
     assert all(
-        source.title != "Unsafe provenance"
+        source.title not in {"Unknown metadata", "Unsafe provenance"}
         for source in repositories.list_context_sources(imported_save_id)
     )
-    assert repaired_context.metadata["source_message_id"] is None
-    assert repaired_context.metadata["source_message_ids"] == [imported_messages[0].id]
-    assert repaired_context.metadata["last_seen_message_id"] == imported_messages[1].id
-
-    reexport_path = tmp_path / "night-watch-reexported-repaired-context.bragi-chat"
-    service.export_save(imported_save_id, reexport_path)
-
-    with zipfile.ZipFile(reexport_path) as bundle:
-        reexported_data = json.loads(bundle.read("data.json"))
-    reexported_sources = reexported_data["context_sources"]
-    assert isinstance(reexported_sources, list)
-    reexported_context = next(
-        source
-        for source in reexported_sources
-        if isinstance(source, dict) and source.get("title") == "Unknown metadata"
-    )
-    reexported_metadata = json.loads(str(reexported_context["metadata_json"]))
-    assert reexported_metadata["source_message_id"] is None
-    assert reexported_metadata["source_message_ids"] == [imported_messages[0].id]
-
-    reimported = service.import_save(reexport_path)
-    reimported_save_id = _imported_save_id(reimported)
-    reimported_context = next(
-        source
-        for source in repositories.list_context_sources(reimported_save_id)
-        if source.title == "Unknown metadata"
-    )
-    assert reimported_context.metadata["source_message_id"] is None
+    assert imported_messages
 
 
 @pytest.mark.parametrize(

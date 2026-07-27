@@ -21,7 +21,7 @@ def has_active_thread_records(
     repositories: PersistenceRepositories,
     save_id: str,
 ) -> bool:
-    return bool(repositories.list_active_threads(save_id))
+    return repositories.has_active_threads(save_id)
 
 
 def archive_open_thread_aggregate_state(

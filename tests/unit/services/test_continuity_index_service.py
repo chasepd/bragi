@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Never
 
 import pytest
 
@@ -164,6 +165,94 @@ def test_continuity_index_skips_resync_until_source_data_changes(
         source_message_id=source.id,
     )
     assert repositories.continuity_index_needs_sync(save.id)
+
+
+def test_continuity_index_updates_one_dirty_memory_without_broad_scans(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    ContinuityIndexService(repositories).sync_save(save.id)
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The moonstone opens the sealed archive.",
+        tags=["moonstone"],
+    )
+
+    class PointOnlyRepositories(PersistenceRepositories):
+        def load_save_details(
+            self,
+            save_id: str,
+            *,
+            message_limit: int | None = None,
+            before_message_id: str | None = None,
+        ) -> Never:
+            raise AssertionError("dirty sync must not load the full save")
+
+        def list_memories(
+            self,
+            save_id: str,
+            *,
+            limit: int | None = None,
+        ) -> Never:
+            raise AssertionError("dirty sync must not list every memory")
+
+        def list_context_sources(
+            self,
+            save_id: str,
+            *,
+            source_type: str | None = None,
+        ) -> Never:
+            raise AssertionError("dirty sync must not list every context source")
+
+    point_only = PointOnlyRepositories(repositories.connection)
+    result = ContinuityIndexService(point_only).sync_save(save.id)
+
+    assert result.complete
+    assert result.processed_dirty_count == 1
+    indexed = point_only.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memory"},
+        limit=1,
+    )
+    assert [hit.record.source_id for hit in indexed] == [memory.id]
+
+
+def test_continuity_index_caps_dirty_work_per_sync(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    service = ContinuityIndexService(repositories)
+    service.sync_save(save.id)
+    for index in range(129):
+        repositories.add_memory(
+            save_id=save.id,
+            body=f"Bounded dirty memory {index}.",
+            tags=["bounded"],
+            memory_id=f"bounded-memory-{index}",
+        )
+
+    first = service.sync_save(save.id)
+    second = service.sync_save(save.id)
+
+    assert not first.complete
+    assert first.processed_dirty_count == 128
+    assert second.complete
+    assert second.processed_dirty_count == 1
 
 
 def test_continuity_index_treats_consolidated_dossiers_as_high_value_context(
