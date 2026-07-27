@@ -3307,13 +3307,11 @@ def _grounding_order_is_preserved(claim: str, evidence: str) -> bool:
     evidence_terms = _ordered_grounding_terms(evidence)
     if not claim_terms:
         return False
-    evidence_index = 0
-    for claim_term in claim_terms:
-        try:
-            evidence_index = evidence_terms.index(claim_term, evidence_index) + 1
-        except ValueError:
-            return False
-    return True
+    claim_length = len(claim_terms)
+    return any(
+        evidence_terms[index : index + claim_length] == claim_terms
+        for index in range(len(evidence_terms) - claim_length + 1)
+    )
 
 
 def _ordered_grounding_terms(value: str) -> list[str]:

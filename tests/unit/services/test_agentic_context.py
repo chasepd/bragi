@@ -352,6 +352,52 @@ def test_observation_service_rejects_claim_unrelated_to_real_evidence(
     assert repositories.list_context_observations(save.id) == []
 
 
+def test_observation_service_rejects_subject_misattribution(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    source = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara says Lio has the red key.",
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        "observation_type": "character_fact",
+                        "claim": "Mara has the red key.",
+                        "evidence_quote": "Mara says Lio has the red key",
+                        "source_message_ids": [source.id],
+                        "scope": "durable",
+                        "confidence": 0.99,
+                        "tags": ["key"],
+                    }
+                ]
+            }
+        }
+    )
+    service = ObservationService(
+        repositories=repositories,
+        extractor=StructuredProviderObservationExtractor(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="observer",
+        ),
+    )
+
+    result = asyncio.run(
+        service.observe_turn(
+            save_id=save.id,
+            source_message_ids=(source.id,),
+        )
+    )
+
+    assert result.observed_count == 0
+    assert repositories.list_context_observations(save.id) == []
+
+
 def test_observation_service_caps_and_deduplicates_provider_candidates(
     repositories: PersistenceRepositories,
 ) -> None:

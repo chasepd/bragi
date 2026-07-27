@@ -2026,16 +2026,26 @@ class CountingNarrationPersistenceRepositories(PersistenceRepositories):
         self._count("entity_links")
         return super().list_entity_links(save_id)
 
-    def list_world_state(self, save_id: str) -> list[WorldStateRecord]:
+    def list_world_state(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[WorldStateRecord]:
         self._count("world_state")
-        return super().list_world_state(save_id)
+        return super().list_world_state(save_id, limit=limit)
 
     def list_world_state_including_archived(
         self,
         save_id: str,
+        *,
+        limit: int | None = None,
     ) -> list[WorldStateRecord]:
         self._count("world_state_including_archived")
-        return super().list_world_state_including_archived(save_id)
+        return super().list_world_state_including_archived(
+            save_id,
+            limit=limit,
+        )
 
     def list_state_changes(self, save_id: str) -> list[StateChangeRecord]:
         self._count("state_changes")
@@ -2045,9 +2055,14 @@ class CountingNarrationPersistenceRepositories(PersistenceRepositories):
         self._count("media_assets")
         return super().list_media_assets(save_id)
 
-    def list_memories(self, save_id: str) -> list[MemoryRecord]:
+    def list_memories(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[MemoryRecord]:
         self._count("memories")
-        return super().list_memories(save_id)
+        return super().list_memories(save_id, limit=limit)
 
     def list_summaries(self, save_id: str) -> list[SummaryRecord]:
         self._count("summaries")
@@ -2059,12 +2074,14 @@ class CountingNarrationPersistenceRepositories(PersistenceRepositories):
         *,
         statuses: set[str] | frozenset[str] | tuple[str, ...] | None = None,
         include_archived: bool = False,
+        limit: int | None = None,
     ) -> list[ContextObservationRecord]:
         self._count("context_observations")
         return super().list_context_observations(
             save_id,
             statuses=statuses,
             include_archived=include_archived,
+            limit=limit,
         )
 
     def list_context_sources(
@@ -15563,6 +15580,15 @@ def test_submit_player_turn_runs_context_search_before_narrator_and_injects_cont
         provider="openrouter",
         model="anthropic/claude-3.5-sonnet",
     )
+    repositories.add_summary(
+        save_id=save.id,
+        covers_message_start_id=unselected_message.id,
+        covers_message_end_id=selected_message.id,
+        body="The ash storm isolated the keep before dawn.",
+        provider="fake",
+        model="fake-summary",
+        summary_id="summary-ash-storm",
+    )
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
@@ -18531,6 +18557,85 @@ def test_submit_player_turn_includes_latest_summary_when_search_selects_none(
         "Mara checked the outer wall and found the ash road hidden. "
         "(relevance: latest rolling summary.)"
     )
+
+
+def test_submit_player_turn_excludes_summary_covering_hidden_message(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    character = repositories.add_character(save_id=save.id, name="Ilyra")
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Ilyra watches the beacon.",
+        present_character_ids=[character.id],
+    )
+    older_player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I checked the outer wall.",
+    )
+    hidden_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="A concealed route leads beneath the wall.",
+        provider="openrouter",
+        model="anthropic/claude-3.5-sonnet",
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_narrator.id,
+        character_id=character.id,
+        visibility="not_visible",
+    )
+    summary = repositories.add_summary(
+        save_id=save.id,
+        covers_message_start_id=older_player.id,
+        covers_message_end_id=hidden_narrator.id,
+        body="Mara found the concealed route beneath the wall.",
+        provider="fake",
+        model="fake-summary",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="openrouter",
+        model_id="anthropic/claude-3.5-sonnet",
+    )
+    provider = RecordingChatProvider("openrouter")
+    service = ChatService(
+        repositories=repositories,
+        providers={"openrouter": provider},
+        context_search_service=ScriptedContextSearch(
+            ContextSearchResult(
+                selected_summaries=(
+                    SelectedContextItem(
+                        source_type="summary",
+                        source_id=summary.id,
+                        text=summary.body,
+                        relevance_note="The route may be useful.",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I ask Ilyra whether she knows another way out.",
+            speaker_name="Mara",
+        )
+    )
+
+    assert provider.chat_requests[0].summary is None
 
 
 def test_submit_player_turn_summarizes_before_context_search_and_keeps_context_separate(

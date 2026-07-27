@@ -2247,6 +2247,50 @@ class PersistenceRepositories:
         )
         return [MessageRecord(**dict(row)) for row in rows]
 
+    def list_recent_messages_visible_to_characters(
+        self,
+        save_id: str,
+        *,
+        character_ids: set[str] | frozenset[str] | tuple[str, ...],
+        limit: int,
+    ) -> list[MessageRecord]:
+        if limit <= 0:
+            return []
+        scoped_character_ids = tuple(sorted(set(character_ids)))
+        visibility_filter = ""
+        params: list[object] = [save_id]
+        if scoped_character_ids:
+            visibility_filter = f"""
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM message_visibility AS visibility
+                    WHERE visibility.save_id = message.save_id
+                      AND visibility.message_id = message.id
+                      AND visibility.character_id IN (
+                            {_placeholders(len(scoped_character_ids))}
+                          )
+                      AND visibility.visibility = 'not_visible'
+                )
+            """
+            params.extend(scoped_character_ids)
+        params.append(limit)
+        rows = self._fetch_all(
+            f"""
+            SELECT id, save_id, role, body, speaker_name, provider, model,
+                   token_estimate, deleted_at, created_at, updated_at,
+                   safety_transition, content_rating
+            FROM messages AS message
+            WHERE save_id = ?
+              AND deleted_at IS NULL
+              {visibility_filter}
+            ORDER BY message.rowid DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        rows.reverse()
+        return [MessageRecord(**dict(row)) for row in rows]
+
     def count_active_messages_by_role(
         self,
         save_id: str,
@@ -2960,30 +3004,58 @@ class PersistenceRepositories:
         self.commit()
         return cursor.rowcount > 0
 
-    def list_world_state(self, save_id: str) -> list[WorldStateRecord]:
-        return self._list_world_state(save_id, include_archived=False)
+    def list_world_state(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[WorldStateRecord]:
+        return self._list_world_state(
+            save_id,
+            include_archived=False,
+            limit=limit,
+        )
 
     def list_world_state_including_archived(
         self,
         save_id: str,
+        *,
+        limit: int | None = None,
     ) -> list[WorldStateRecord]:
-        return self._list_world_state(save_id, include_archived=True)
+        return self._list_world_state(
+            save_id,
+            include_archived=True,
+            limit=limit,
+        )
 
     def _list_world_state(
         self,
         save_id: str,
         *,
         include_archived: bool,
+        limit: int | None = None,
     ) -> list[WorldStateRecord]:
         archived_filter = "" if include_archived else "AND archived_at IS NULL"
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        order_sql = (
+            "ORDER BY updated_at DESC, rowid DESC"
+            if limit is not None
+            else "ORDER BY key"
+        )
+        params: tuple[object, ...] = (
+            (save_id, max(0, limit))
+            if limit is not None
+            else (save_id,)
+        )
         rows = self._fetch_all(
             f"""
             SELECT id, save_id, key, value_json, category, confidence, source_message_id
             FROM world_state
             WHERE save_id = ? {archived_filter}
-            ORDER BY key
+            {order_sql}
+            {limit_sql}
             """,
-            (save_id,),
+            params,
         )
         return [
             WorldStateRecord(
@@ -3648,6 +3720,7 @@ class PersistenceRepositories:
         *,
         statuses: set[str] | frozenset[str] | tuple[str, ...] | None = None,
         include_archived: bool = False,
+        limit: int | None = None,
     ) -> list[ContextObservationRecord]:
         filters = ["save_id = ?"]
         params: list[object] = [save_id]
@@ -3659,6 +3732,14 @@ class PersistenceRepositories:
             params.extend(values)
         if not include_archived:
             filters.append("archived_at IS NULL")
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        order_sql = (
+            "ORDER BY created_at DESC, rowid DESC"
+            if limit is not None
+            else "ORDER BY created_at, rowid"
+        )
+        if limit is not None:
+            params.append(max(0, limit))
         rows = self._fetch_all(
             f"""
             SELECT id, save_id, observation_type, claim, evidence_quote,
@@ -3666,7 +3747,8 @@ class PersistenceRepositories:
                    metadata_json, created_at, updated_at, archived_at
             FROM context_observations
             WHERE {' AND '.join(filters)}
-            ORDER BY created_at, rowid
+            {order_sql}
+            {limit_sql}
             """,
             tuple(params),
         )
@@ -4238,9 +4320,38 @@ class PersistenceRepositories:
                 record.scene_generation,
             ),
         )
-        if (
+        location_changed = (
+            existing is not None
+            and existing["current_location_id"] != current_location_id
+        )
+        generation_changed = (
             existing is not None
             and scene_generation != int(existing["scene_generation"])
+        )
+        if location_changed or generation_changed:
+            self.connection.execute(
+                """
+                UPDATE active_threads
+                SET archived_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE save_id = ?
+                  AND archived_at IS NULL
+                  AND (
+                        lower(trim(visibility)) IN (
+                            'scene',
+                            'scene local',
+                            'scene only',
+                            'current scene',
+                            'local'
+                        )
+                        OR lower(visibility) LIKE '%scene%'
+                        OR lower(visibility) LIKE '%local%'
+                      )
+                """,
+                (save_id,),
+            )
+        if (
+            generation_changed
         ):
             self.connection.execute(
                 """
@@ -8398,17 +8509,34 @@ class PersistenceRepositories:
         )
         self.commit()
 
-    def list_memories(self, save_id: str) -> list[MemoryRecord]:
+    def list_memories(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[MemoryRecord]:
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        order_sql = (
+            "ORDER BY created_at DESC, rowid DESC"
+            if limit is not None
+            else "ORDER BY created_at, rowid"
+        )
+        params: tuple[object, ...] = (
+            (save_id, max(0, limit))
+            if limit is not None
+            else (save_id,)
+        )
         rows = self._fetch_all(
-            """
+            f"""
             SELECT id, save_id, body, tags_json, importance, source_message_id,
                    source_message_ids_json, claim_fingerprint,
                    source_observation_ids_json
             FROM memories
             WHERE save_id = ? AND archived_at IS NULL
-            ORDER BY created_at, rowid
+            {order_sql}
+            {limit_sql}
             """,
-            (save_id,),
+            params,
         )
         return [
             MemoryRecord(
@@ -9040,6 +9168,56 @@ class PersistenceRepositories:
             (save_id,),
         )
         return [SummaryRecord(**dict(row)) for row in rows]
+
+    def summary_visible_to_characters(
+        self,
+        *,
+        save_id: str,
+        covers_message_start_id: str,
+        covers_message_end_id: str,
+        character_ids: set[str] | frozenset[str] | tuple[str, ...],
+    ) -> bool:
+        scoped_character_ids = tuple(sorted(set(character_ids)))
+        if not scoped_character_ids:
+            return True
+        endpoints = self._fetch_all(
+            """
+            SELECT id, rowid AS message_rowid
+            FROM messages
+            WHERE save_id = ? AND id IN (?, ?)
+            """,
+            (save_id, covers_message_start_id, covers_message_end_id),
+        )
+        endpoint_rowids = {
+            str(row["id"]): int(row["message_rowid"]) for row in endpoints
+        }
+        start_rowid = endpoint_rowids.get(covers_message_start_id)
+        end_rowid = endpoint_rowids.get(covers_message_end_id)
+        if start_rowid is None or end_rowid is None:
+            return False
+        hidden = self._fetch_one(
+            f"""
+            SELECT 1
+            FROM message_visibility AS visibility
+            JOIN messages AS message
+              ON message.id = visibility.message_id
+             AND message.save_id = visibility.save_id
+            WHERE visibility.save_id = ?
+              AND visibility.character_id IN (
+                    {_placeholders(len(scoped_character_ids))}
+                  )
+              AND visibility.visibility = 'not_visible'
+              AND message.rowid BETWEEN ? AND ?
+            LIMIT 1
+            """,
+            (
+                save_id,
+                *scoped_character_ids,
+                min(start_rowid, end_rowid),
+                max(start_rowid, end_rowid),
+            ),
+        )
+        return hidden is None
 
     def save_provider_model(
         self,

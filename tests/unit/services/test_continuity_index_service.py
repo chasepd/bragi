@@ -267,7 +267,12 @@ def test_continuity_index_bounds_memory_and_observation_hydration(
     class BoundedRepositories(PersistenceRepositories):
         selected_observation_ids: set[str] = set()
 
-        def list_memories(self, save_id: str) -> list[MemoryRecord]:
+        def list_memories(
+            self,
+            save_id: str,
+            *,
+            limit: int | None = None,
+        ) -> list[MemoryRecord]:
             raise AssertionError("continuity sync must not load every memory")
 
         def list_context_observations(
@@ -276,6 +281,7 @@ def test_continuity_index_bounds_memory_and_observation_hydration(
             *,
             statuses: set[str] | frozenset[str] | tuple[str, ...] | None = None,
             include_archived: bool = False,
+            limit: int | None = None,
         ) -> list[ContextObservationRecord]:
             raise AssertionError("continuity sync must not load every observation")
 

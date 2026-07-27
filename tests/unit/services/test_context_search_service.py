@@ -36,6 +36,7 @@ from bragi.providers.contracts import (
     ToolCallResponse,
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.services import context_search_service as context_search_module
 from bragi.services.agentic_context import ContextCurationService, CurationDecision
 from bragi.services.context_search_service import (
     MAX_CONTEXT_CANDIDATE_POOL,
@@ -49,6 +50,7 @@ from bragi.services.context_search_service import (
     _memory_provenance_visible_to_present_characters,
 )
 from bragi.services.continuity_index_service import ContinuityIndexService
+from bragi.services.narration_context import load_narration_context_snapshot
 
 
 class RecordingStructuredContextProvider:
@@ -406,13 +408,23 @@ class CountingPersistenceRepositories(PersistenceRepositories):
         super().__init__(connection)
         self.list_counts: dict[str, int] = {}
 
-    def list_world_state(self, save_id: str) -> list[WorldStateRecord]:
+    def list_world_state(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[WorldStateRecord]:
         self.list_counts["world_state"] = self.list_counts.get("world_state", 0) + 1
-        return super().list_world_state(save_id)
+        return super().list_world_state(save_id, limit=limit)
 
-    def list_memories(self, save_id: str) -> list[MemoryRecord]:
+    def list_memories(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[MemoryRecord]:
         self.list_counts["memories"] = self.list_counts.get("memories", 0) + 1
-        return super().list_memories(save_id)
+        return super().list_memories(save_id, limit=limit)
 
     def list_summaries(self, save_id: str) -> list[SummaryRecord]:
         self.list_counts["summaries"] = self.list_counts.get("summaries", 0) + 1
@@ -544,6 +556,37 @@ def test_context_query_terms_keep_short_ascii_identifiers_and_mixed_scripts() ->
     assert "moonstone" in bounded_query
 
 
+def test_context_query_terms_preserve_middle_terms_across_scripts() -> None:
+    query = " ".join(
+        (
+            *(f"漢字{index:02d}" for index in range(40)),
+            "moonstone",
+            *(f"漢語{index:02d}" for index in range(40)),
+        )
+    )
+
+    terms = _bounded_context_query_terms(query)
+
+    assert len(terms) == 64
+    assert "moonstone" in terms
+
+
+def test_exact_raw_candidates_match_short_identifier_in_long_fact() -> None:
+    candidate = context_search_module._ContextCandidate(
+        source_type="memory",
+        source_id="memory-a7",
+        text="Only A-7 opens the old river vault.",
+    )
+
+    selected = context_search_module._exact_raw_candidates(
+        (candidate,),
+        indexed_candidates=(),
+        latest_player_message="A-7",
+    )
+
+    assert selected == (candidate,)
+
+
 def test_context_query_terms_bound_large_raw_inputs_and_keep_tail_terms() -> None:
     query = " ".join(f"noise{index:05d}" for index in range(2_000))
     query = f"{query} moonstone"
@@ -552,6 +595,101 @@ def test_context_query_terms_bound_large_raw_inputs_and_keep_tail_terms() -> Non
 
     assert len(terms) <= 64
     assert "moonstone" in terms
+
+
+def test_narration_snapshot_bounds_raw_context_records(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Archive",
+        premise="A guarded archive.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Boundary")
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The archive changes.",
+    )
+    for index in range(3):
+        repositories.upsert_world_state(
+            save_id=save.id,
+            key=f"archive.fact.{index}",
+            value={"index": index},
+        )
+        repositories.add_memory(
+            save_id=save.id,
+            body=f"Archive memory {index}.",
+            tags=["archive"],
+            source_message_id=message.id,
+        )
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="world_fact",
+            claim=f"Archive observation {index}.",
+            evidence_quote="The archive changes",
+            source_message_ids=[message.id],
+            scope="durable",
+        )
+
+    snapshot = load_narration_context_snapshot(
+        repositories,
+        save_id=save.id,
+        raw_record_limit=2,
+    )
+
+    assert snapshot is not None
+    assert len(snapshot.world_state) == 2
+    assert len(snapshot.world_state_for_scope) == 2
+    assert len(snapshot.memories) == 2
+    assert len(snapshot.observations) == 2
+
+
+def test_recent_visible_messages_are_not_starved_by_hidden_rows(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Archive",
+        premise="A guarded archive.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Boundary")
+    character = repositories.add_character(save_id=save.id, name="Ilyra")
+    accessible = [
+        repositories.append_message(
+            save_id=save.id,
+            role="narrator",
+            body=f"Accessible event {index}.",
+        )
+        for index in range(6)
+    ]
+    hidden = [
+        repositories.append_message(
+            save_id=save.id,
+            role="narrator",
+            body=f"Hidden event {index}.",
+        )
+        for index in range(64)
+    ]
+    for message in hidden:
+        repositories.add_message_visibility(
+            save_id=save.id,
+            message_id=message.id,
+            character_id=character.id,
+            visibility="not_visible",
+        )
+
+    visible = repositories.list_recent_messages_visible_to_characters(
+        save.id,
+        character_ids={character.id},
+        limit=6,
+    )
+
+    assert visible == accessible
 
 
 def test_raw_memory_provenance_allows_one_independently_visible_observation(

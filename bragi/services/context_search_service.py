@@ -112,6 +112,8 @@ MAX_CONTEXT_QUERY_CHARS = 8_000
 MAX_CONTEXT_QUERY_TERMS = 64
 MAX_CONTEXT_EXACT_PHRASE_CHARS = 512
 MAX_CONTEXT_EXACT_PHRASES = 4
+CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT = 64
+RAW_CONTEXT_RECORD_LIMIT = 512
 INDEXED_CONTEXT_SOURCE_TYPES = frozenset(
     {
         "character_text_thread",
@@ -285,7 +287,10 @@ class ContextSearchService:
             payload={"scope": "next_turn_context_candidates"},
         )
         try:
-            details = self.repositories.load_save_details(save_id)
+            details = self.repositories.load_save_details(
+                save_id,
+                message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+            )
             if details is not None:
                 ContinuityIndexService(self.repositories).sync_save(save_id)
             initial_fingerprint = self.repositories.context_candidate_revision_token(
@@ -296,6 +301,7 @@ class ContextSearchService:
                 save_id=save_id,
                 details=details,
                 include_context_sources=False,
+                raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
             )
             if snapshot is None:
                 raise ValueError(f"Unknown save id: {save_id}")
@@ -447,7 +453,10 @@ class ContextSearchService:
         )
         try:
             provider = self.providers[preference.provider]
-            details = self.repositories.load_save_details(save_id)
+            details = self.repositories.load_save_details(
+                save_id,
+                message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+            )
             if details is None:
                 raise ValueError(f"Unknown save id: {save_id}")
             messages = (
@@ -475,9 +484,20 @@ class ContextSearchService:
                     save_id=save_id,
                     details=details,
                     include_context_sources=False,
+                    raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
                 )
                 if narration_snapshot is None:
                     raise ValueError(f"Unknown save id: {save_id}")
+                messages = _context_search_visible_messages(
+                    self.repositories,
+                    save_id=save_id,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    required_messages=tuple(
+                        message
+                        for message in messages
+                        if message.id == player_message_id
+                    ),
+                )
                 retrieved_sources = await _retrieve_indexed_context_sources(
                     self.repositories,
                     provider=provider,
@@ -533,6 +553,16 @@ class ContextSearchService:
                     ),
                 )
                 narration_snapshot = snapshot
+                messages = _context_search_visible_messages(
+                    self.repositories,
+                    save_id=save_id,
+                    scene_snapshot=snapshot.scene_snapshot,
+                    required_messages=tuple(
+                        message
+                        for message in messages
+                        if message.id == player_message_id
+                    ),
+                )
                 retrieved_sources = await _retrieve_indexed_context_sources(
                     self.repositories,
                     provider=provider,
@@ -855,7 +885,10 @@ def _rehydrate_selected_context(
     )
     if current_revision != preselection_revision:
         ContinuityIndexService(repositories).sync_save(save_id)
-    details = repositories.load_save_details(save_id)
+    details = repositories.load_save_details(
+        save_id,
+        message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+    )
     if details is None:
         raise ValueError(f"Unknown save id: {save_id}")
     messages = (
@@ -868,9 +901,18 @@ def _rehydrate_selected_context(
         save_id=save_id,
         details=details,
         include_context_sources=True,
+        raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
     )
     if snapshot is None:
         raise ValueError(f"Unknown save id: {save_id}")
+    messages = _context_search_visible_messages(
+        repositories,
+        save_id=save_id,
+        scene_snapshot=snapshot.scene_snapshot,
+        required_messages=tuple(
+            message for message in messages if message.id == player_message_id
+        ),
+    )
     fresh_candidates = _context_candidate_set(
         scenario=details.scenario,
         scene_snapshot=snapshot.scene_snapshot,
@@ -1182,15 +1224,12 @@ async def _structured_retrieval_expansion(
     present_ids = frozenset(
         scene_snapshot.present_character_ids if scene_snapshot is not None else ()
     )
-    visible_recent = [
-        message
-        for message in recent_messages
-        if message_visible_to_present_characters(
-            message_id=message.id,
-            present_character_ids=present_ids,
-            message_visibility=message_visibility,
-        )
-    ][-6:]
+    visible_recent = _latest_visible_messages(
+        recent_messages,
+        limit=6,
+        present_character_ids=present_ids,
+        message_visibility=message_visibility,
+    )
     eligible_characters = [
         character
         for character in characters
@@ -1301,15 +1340,12 @@ async def _tool_retrieval_expansion(
     present_ids = frozenset(
         scene_snapshot.present_character_ids if scene_snapshot is not None else ()
     )
-    visible_recent = [
-        message
-        for message in recent_messages
-        if message_visible_to_present_characters(
-            message_id=message.id,
-            present_character_ids=present_ids,
-            message_visibility=message_visibility,
-        )
-    ][-6:]
+    visible_recent = _latest_visible_messages(
+        recent_messages,
+        limit=6,
+        present_character_ids=present_ids,
+        message_visibility=message_visibility,
+    )
     eligible_characters = [
         character
         for character in characters
@@ -3324,7 +3360,10 @@ def _exact_raw_candidates(
         if overlap_count < min(2, len(query_terms)):
             continue
         coverage = overlap_count / len(candidate_terms)
-        if coverage < 0.5:
+        short_identifier_match = (
+            len(query_terms) <= 2 and overlap_count == len(query_terms)
+        )
+        if coverage < 0.5 and not short_identifier_match:
             continue
         ranked.append((coverage + overlap_count, candidate))
     ranked.sort(key=lambda item: item[0], reverse=True)
@@ -3612,13 +3651,23 @@ def _bounded_context_query_text(text: str) -> str:
 
 def _bounded_context_query_terms(text: str) -> tuple[str, ...]:
     ordered = _ordered_meaningful_query_terms(_bounded_context_query_text(text))
-    if len(ordered) > MAX_CONTEXT_QUERY_TERMS:
-        reserve = MAX_CONTEXT_QUERY_TERMS // 2
-        ordered = (*ordered[:reserve], *ordered[-reserve:])
-    return _balanced_script_terms(
-        set(ordered),
-        limit=MAX_CONTEXT_QUERY_TERMS,
+    if len(ordered) <= MAX_CONTEXT_QUERY_TERMS:
+        return _balanced_script_terms(
+            set(ordered),
+            limit=MAX_CONTEXT_QUERY_TERMS,
+        )
+    edge_reserve = MAX_CONTEXT_QUERY_TERMS // 4
+    selected = list(
+        dict.fromkeys((*ordered[:edge_reserve], *ordered[-edge_reserve:]))
     )
+    remaining = set(ordered) - set(selected)
+    selected.extend(
+        _balanced_script_terms(
+            remaining,
+            limit=MAX_CONTEXT_QUERY_TERMS - len(selected),
+        )
+    )
+    return tuple(selected[:MAX_CONTEXT_QUERY_TERMS])
 
 
 def _balanced_script_terms(
@@ -4024,24 +4073,48 @@ def _message_candidates(
     present_character_ids: frozenset[str],
     message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
-    visible_records = [
-        record
-        for record in records
-        if record.id != player_message_id
-        and message_visible_to_present_characters(
-            message_id=record.id,
-            present_character_ids=present_character_ids,
-            message_visibility=message_visibility,
-        )
-    ]
+    visible_records = _latest_visible_messages(
+        records,
+        limit=RECENT_MESSAGE_CANDIDATE_LIMIT,
+        present_character_ids=present_character_ids,
+        message_visibility=message_visibility,
+        excluded_message_id=player_message_id,
+    )
     return tuple(
         _ContextCandidate(
             source_type="message",
             source_id=record.id,
             text=f"{record.speaker_name or record.role}: {record.body}",
         )
-        for record in visible_records[-RECENT_MESSAGE_CANDIDATE_LIMIT:]
+        for record in visible_records
     )
+
+
+def _latest_visible_messages(
+    records: list[MessageRecord],
+    *,
+    limit: int,
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
+    excluded_message_id: str | None = None,
+) -> list[MessageRecord]:
+    if limit <= 0:
+        return []
+    hidden_message_ids = {
+        record.message_id
+        for record in message_visibility
+        if record.character_id in present_character_ids
+        and record.visibility == "not_visible"
+    }
+    selected: list[MessageRecord] = []
+    for record in reversed(records):
+        if record.id == excluded_message_id or record.id in hidden_message_ids:
+            continue
+        selected.append(record)
+        if len(selected) >= limit:
+            break
+    selected.reverse()
+    return selected
 
 
 def _memory_selection_text(record: MemoryRecord, *, text: str | None = None) -> str:
@@ -4161,6 +4234,29 @@ def _message_body(messages: list[MessageRecord], message_id: str) -> str:
         if message.id == message_id:
             return message.body
     return ""
+
+
+def _context_search_visible_messages(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    scene_snapshot: SceneSnapshotRecord | None,
+    required_messages: tuple[MessageRecord, ...] = (),
+) -> list[MessageRecord]:
+    visible_messages = repositories.list_recent_messages_visible_to_characters(
+        save_id,
+        character_ids=(
+            set(scene_snapshot.present_character_ids)
+            if scene_snapshot is not None
+            else set()
+        ),
+        limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+    )
+    visible_ids = {message.id for message in visible_messages}
+    visible_messages.extend(
+        message for message in required_messages if message.id not in visible_ids
+    )
+    return visible_messages
 
 
 def _result_json(

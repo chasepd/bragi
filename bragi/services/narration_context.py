@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from bragi.persistence.models import (
     ActiveThreadRecord,
@@ -52,30 +52,63 @@ def load_narration_context_snapshot(
     save_id: str,
     details: SaveDetailsRecord | None = None,
     include_context_sources: bool = True,
+    raw_record_limit: int | None = None,
 ) -> NarrationContextSnapshot | None:
     details = details or repositories.load_save_details(save_id)
     if details is None:
         return None
+    scene_snapshot = repositories.get_scene_snapshot(save_id)
+    visibility_character_ids = (
+        set(scene_snapshot.present_character_ids)
+        if raw_record_limit is not None and scene_snapshot is not None
+        else None
+    )
+    if raw_record_limit is not None:
+        details = replace(
+            details,
+            messages=repositories.list_recent_messages_visible_to_characters(
+                save_id,
+                character_ids=visibility_character_ids or set(),
+                limit=len(details.messages),
+            ),
+        )
     return NarrationContextSnapshot(
         details=details,
-        scene_snapshot=repositories.get_scene_snapshot(save_id),
+        scene_snapshot=scene_snapshot,
         locations=tuple(repositories.list_locations(save_id)),
         characters=tuple(repositories.list_characters(save_id)),
         active_threads=tuple(repositories.list_active_threads(save_id)),
         character_knowledge_edges=tuple(
             repositories.list_character_knowledge_edges(save_id)
         ),
-        message_visibility=tuple(repositories.list_message_visibility(save_id)),
+        message_visibility=tuple(
+            repositories.list_message_visibility(
+                save_id,
+                character_ids=visibility_character_ids,
+            )
+        ),
         entity_links=tuple(repositories.list_entity_links(save_id)),
-        world_state=tuple(repositories.list_world_state(save_id)),
+        world_state=tuple(
+            repositories.list_world_state(save_id, limit=raw_record_limit)
+        ),
         world_state_for_scope=tuple(
-            repositories.list_world_state_including_archived(save_id)
+            repositories.list_world_state_including_archived(
+                save_id,
+                limit=raw_record_limit,
+            )
         ),
         state_changes=tuple(repositories.list_state_changes(save_id)),
         media_assets=tuple(repositories.list_media_assets(save_id)),
-        memories=tuple(repositories.list_memories(save_id)),
+        memories=tuple(
+            repositories.list_memories(save_id, limit=raw_record_limit)
+        ),
         summaries=tuple(repositories.list_summaries(save_id)),
-        observations=tuple(repositories.list_context_observations(save_id)),
+        observations=tuple(
+            repositories.list_context_observations(
+                save_id,
+                limit=raw_record_limit,
+            )
+        ),
         context_sources=(
             tuple(repositories.list_context_sources(save_id))
             if include_context_sources

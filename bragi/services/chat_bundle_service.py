@@ -5730,12 +5730,88 @@ def _coalesce_import_context_sources(
     for row in rows:
         key = (row.get("save_id"), row.get("source_type"), row.get("source_id"))
         existing = coalesced.get(key)
-        if existing is None or (
+        if existing is None:
+            coalesced[key] = row
+        elif (
             existing.get("archived_at") is not None
             and row.get("archived_at") is None
         ):
             coalesced[key] = row
+        elif (existing.get("archived_at") is None) == (
+            row.get("archived_at") is None
+        ):
+            existing["metadata_json"] = _merged_import_context_source_metadata_json(
+                existing.get("metadata_json"),
+                row.get("metadata_json"),
+            )
+            existing["token_estimate"] = max(
+                int(_numeric_import_value(existing.get("token_estimate"))),
+                int(_numeric_import_value(row.get("token_estimate"))),
+            )
     return list(coalesced.values())
+
+
+def _merged_import_context_source_metadata_json(
+    first: object,
+    second: object,
+) -> str:
+    metadata: dict[str, object] = {}
+    loaded_metadata: list[dict[str, object]] = []
+    for raw in (first, second):
+        try:
+            loaded = json.loads(str(raw))
+        except (json.JSONDecodeError, TypeError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            typed = cast(dict[str, object], loaded)
+            loaded_metadata.append(typed)
+            metadata.update(typed)
+    for field in (
+        "source_message_ids",
+        "audience_character_ids",
+        "known_by",
+        "tags",
+    ):
+        values: list[str] = []
+        for item in loaded_metadata:
+            raw_values = item.get(field)
+            if not isinstance(raw_values, list):
+                continue
+            values.extend(
+                str(value)
+                for value in raw_values
+                if isinstance(value, str) and value
+            )
+        metadata[field] = list(
+            dict.fromkeys(values)
+        )
+    groups: list[list[str]] = []
+    for item in loaded_metadata:
+        raw_groups = item.get("source_provenance_groups")
+        if not isinstance(raw_groups, list):
+            continue
+        for raw_group in raw_groups:
+            if not isinstance(raw_group, list):
+                continue
+            group = [
+                str(value)
+                for value in raw_group
+                if isinstance(value, str) and value
+            ]
+            if group and group not in groups:
+                groups.append(group)
+    metadata["source_provenance_groups"] = groups
+    metadata["source_provenance_mode"] = (
+        "all"
+        if any(
+            item.get("source_provenance_mode") == "all"
+            for item in loaded_metadata
+        )
+        else "any"
+    )
+    if any(item.get("requires_audience") is True for item in loaded_metadata):
+        metadata["requires_audience"] = True
+    return _dump_json_compact(metadata)
 
 
 def _coalesce_import_entity_links(

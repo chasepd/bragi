@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 import shutil
 import sqlite3
 import zlib
@@ -1423,7 +1424,7 @@ class _SnapshotRemapper:
                     value,
                 )
             elif table_name == "context_sources" and column == "source_id":
-                remapped[column] = self._mapped_entity_id(
+                remapped[column] = self._mapped_context_source_id(
                     cast(str | None, row.get("source_type")),
                     value,
                 )
@@ -1489,6 +1490,52 @@ class _SnapshotRemapper:
         if table_name is None:
             return self.id_maps["messages"].get(value, value)
         return self._mapped_table_id(table_name, value)
+
+    def _mapped_context_source_id(
+        self,
+        source_type: str | None,
+        value: object,
+    ) -> object:
+        if not isinstance(value, str) or source_type is None:
+            return value
+        direct_tables = {
+            "character_voice": "characters",
+            "open_obligation": "active_threads",
+            "character_text_thread": "character_text_threads",
+        }
+        if source_type in direct_tables:
+            return self._mapped_table_id(direct_tables[source_type], value)
+        if source_type == "scenario_section":
+            match = re.fullmatch(r"scenario:([^:]+):section:(.+)", value)
+            if match is None:
+                return value
+            scenario_id = self._mapped_table_id("scenarios", match.group(1))
+            return f"scenario:{scenario_id}:section:{match.group(2)}"
+        if source_type == "world_state" and value.startswith("location:"):
+            return (
+                "location:"
+                f"{self._mapped_table_id('locations', value.removeprefix('location:'))}"
+            )
+        if source_type == "memory":
+            mapped_memory_id = self._mapped_table_id("memories", value)
+            if mapped_memory_id != value:
+                return mapped_memory_id
+            if value.startswith("character_profile:"):
+                character_id = value.removeprefix("character_profile:")
+                return (
+                    "character_profile:"
+                    f"{self._mapped_table_id('characters', character_id)}"
+                )
+            match = re.fullmatch(r"relationship:([^:]+):(.+)", value)
+            if match is not None:
+                character_id = str(
+                    self._mapped_table_id(
+                        "characters",
+                        match.group(1),
+                    )
+                )
+                return f"relationship:{character_id}:{match.group(2)}"
+        return self._mapped_entity_id(source_type, value)
 
     def _mapped_media_path(
         self,
@@ -2538,6 +2585,8 @@ def _coalesce_remapped_snapshot_rows(
             continue
         if table_name == "memories":
             _merge_snapshot_memory_rows(existing, row)
+        elif table_name == "context_sources":
+            _merge_snapshot_context_source_rows(existing, row)
         elif table_name == "character_knowledge_edges":
             _merge_snapshot_knowledge_edge_rows(existing, row)
         elif (
@@ -2602,6 +2651,89 @@ def _merge_snapshot_memory_rows(
         and incoming.get("archived_at") is None
     ):
         existing["archived_at"] = None
+
+
+def _merge_snapshot_context_source_rows(
+    existing: dict[str, object],
+    incoming: Mapping[str, object],
+) -> None:
+    existing_active = existing.get("archived_at") is None
+    incoming_active = incoming.get("archived_at") is None
+    if incoming_active and not existing_active:
+        replacement = dict(incoming)
+        existing.clear()
+        existing.update(replacement)
+        return
+    if existing_active and not incoming_active:
+        return
+    existing["metadata_json"] = _merged_context_source_metadata_json(
+        existing.get("metadata_json"),
+        incoming.get("metadata_json"),
+    )
+    existing["token_estimate"] = max(
+        int(_snapshot_numeric_value(existing.get("token_estimate"))),
+        int(_snapshot_numeric_value(incoming.get("token_estimate"))),
+    )
+
+
+def _merged_context_source_metadata_json(first: object, second: object) -> str:
+    metadata: dict[str, object] = {}
+    loaded_metadata: list[dict[str, object]] = []
+    for raw in (first, second):
+        try:
+            loaded = json.loads(str(raw))
+        except (json.JSONDecodeError, TypeError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            typed = cast(dict[str, object], loaded)
+            loaded_metadata.append(typed)
+            metadata.update(typed)
+    for field in (
+        "source_message_ids",
+        "audience_character_ids",
+        "known_by",
+        "tags",
+    ):
+        values: list[str] = []
+        for item in loaded_metadata:
+            raw_values = item.get(field)
+            if not isinstance(raw_values, list):
+                continue
+            values.extend(
+                str(value)
+                for value in raw_values
+                if isinstance(value, str) and value
+            )
+        metadata[field] = list(
+            dict.fromkeys(values)
+        )
+    groups: list[list[str]] = []
+    for item in loaded_metadata:
+        raw_groups = item.get("source_provenance_groups")
+        if not isinstance(raw_groups, list):
+            continue
+        for raw_group in raw_groups:
+            if not isinstance(raw_group, list):
+                continue
+            group = [
+                str(value)
+                for value in raw_group
+                if isinstance(value, str) and value
+            ]
+            if group and group not in groups:
+                groups.append(group)
+    metadata["source_provenance_groups"] = groups
+    metadata["source_provenance_mode"] = (
+        "all"
+        if any(
+            item.get("source_provenance_mode") == "all"
+            for item in loaded_metadata
+        )
+        else "any"
+    )
+    if any(item.get("requires_audience") is True for item in loaded_metadata):
+        metadata["requires_audience"] = True
+    return _compact_json(metadata)
 
 
 def _merge_snapshot_knowledge_edge_rows(

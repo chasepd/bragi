@@ -9458,6 +9458,26 @@ def _budgeted_narrator_context(
         context_result,
         suppressed_keys=deterministic_source_keys,
     )
+    summary_records = (
+        tuple(narration_snapshot.summaries)
+        if narration_snapshot is not None
+        else tuple(repositories.list_summaries(save_id))
+    )
+    visible_summary_records = tuple(
+        summary
+        for summary in summary_records
+        if _summary_visible_to_present_characters(
+            repositories=repositories,
+            summary=summary,
+            scene_snapshot=snapshot,
+        )
+    )
+    visible_summary_ids = {summary.id for summary in visible_summary_records}
+    visible_selected_summaries = tuple(
+        item
+        for item in context_result.selected_summaries
+        if item.source_id in visible_summary_ids
+    )
     sources = (
         *base_sources,
         *_selected_character_voice_sources(
@@ -9527,7 +9547,7 @@ def _budgeted_narrator_context(
             repositories=repositories,
             save_id=save_id,
             player_message=player_message,
-            selected_summaries=context_result.selected_summaries,
+            selected_summaries=visible_selected_summaries,
             scene_snapshot=(
                 narration_snapshot.scene_snapshot
                 if narration_snapshot is not None
@@ -9548,14 +9568,10 @@ def _budgeted_narrator_context(
                 if narration_snapshot is not None
                 else None
             ),
-            summaries=(
-                narration_snapshot.summaries
-                if narration_snapshot is not None
-                else None
-            ),
+            summaries=visible_summary_records,
         ),
         *_selected_context_sources(
-            context_result.selected_summaries,
+            visible_selected_summaries,
             tier="summary",
             suppressed_keys=deterministic_source_keys,
             relevance_query=player_message.body,
@@ -10149,6 +10165,23 @@ def _latest_summary_sources(
             reason="latest rolling summary",
             always_include=True,
         ),
+    )
+
+
+def _summary_visible_to_present_characters(
+    *,
+    repositories: PersistenceRepositories,
+    summary: SummaryRecord,
+    scene_snapshot: SceneSnapshotRecord | None,
+) -> bool:
+    present_character_ids = frozenset(
+        scene_snapshot.present_character_ids if scene_snapshot is not None else ()
+    )
+    return repositories.summary_visible_to_characters(
+        save_id=summary.save_id,
+        covers_message_start_id=summary.covers_message_start_id,
+        covers_message_end_id=summary.covers_message_end_id,
+        character_ids=present_character_ids,
     )
 
 

@@ -1310,6 +1310,16 @@ def test_world_data_service_accepts_locked_transition_without_advancing_twice(
         created_turn_number=1,
         expires_after_turn_number=13,
     )
+    scene_thread = repositories.add_active_thread(
+        save_id=save_id,
+        title="Gatehouse countdown",
+        visibility="scene local",
+    )
+    public_thread = repositories.add_active_thread(
+        save_id=save_id,
+        title="Reach the capital",
+        visibility="public",
+    )
     suggestion = repositories.add_context_update_suggestion(
         save_id=save_id,
         update_type="field_update",
@@ -1342,6 +1352,8 @@ def test_world_data_service_accepts_locked_transition_without_advancing_twice(
     assert updated.current_location_id == next_location.id
     assert updated.scene_generation == transitioned.scene_generation
     assert repositories.get_context_source(scratch.id) is not None
+    assert repositories.get_active_thread(scene_thread.id) is None
+    assert repositories.get_active_thread(public_thread.id) is not None
 
 
 def test_world_data_service_rejects_protected_character_archive_suggestion(
