@@ -155,7 +155,13 @@ class WebMaintenanceScheduler:
             for save_id in target_save_ids
         }
         for definition in _MAINTENANCE_TASKS:
+            selected_for_definition = 0
             for save_id in target_save_ids_by_task[definition.task_type]:
+                if (
+                    definition.task_type == OBSERVATION_CURATION_DRAIN_TASK
+                    and selected_for_definition >= _DUE_ROUTINE_TARGET_LIMIT
+                ):
+                    break
                 if _has_active_save_job(self._state, save_id):
                     observe(
                         "web.scheduler.run_skipped",
@@ -250,6 +256,7 @@ class WebMaintenanceScheduler:
                         )
                         continue
                     selected_tasks.append((definition, leased))
+                    selected_for_definition += 1
         return selected_tasks
 
     async def _run_forever(self) -> None:
@@ -470,7 +477,7 @@ def _task_target_save_ids(
         if callable(list_due_curation):
             runnable_save_ids: list[str] = []
             offset = 0
-            while len(runnable_save_ids) < _DUE_ROUTINE_TARGET_LIMIT:
+            while True:
                 page = tuple(
                     list_due_curation(
                         limit=_DUE_ROUTINE_TARGET_LIMIT,
@@ -482,8 +489,6 @@ def _task_target_save_ids(
                 for save_id in page:
                     if _observation_curation_drain_due(repositories, save_id):
                         _append_unique_save_id(runnable_save_ids, save_id)
-                        if len(runnable_save_ids) >= _DUE_ROUTINE_TARGET_LIMIT:
-                            break
                 offset += len(page)
             return tuple(runnable_save_ids)
     retry_job_type = _RETRY_DRAIN_JOB_TYPES.get(definition.task_type)

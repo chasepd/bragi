@@ -2119,6 +2119,104 @@ def test_expired_context_observation_lease_cannot_complete_or_defer(
     assert [row.id for row in reclaimed] == [observation.id]
 
 
+def test_repeated_expired_context_observation_leases_exhaust_retry_budget(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The eastern signal is lit.",
+    )
+
+    for attempt in range(5):
+        claimed = repositories.claim_context_observations(
+            (observation.id,),
+            lease_token=f"worker-{attempt}",
+            lease_seconds=600,
+            max_attempts=5,
+        )
+        assert [row.id for row in claimed] == [observation.id]
+        repositories.connection.execute(
+            """
+            UPDATE context_observation_curation_state
+            SET lease_until = '2000-01-01 00:00:00'
+            WHERE observation_id = ?
+            """,
+            (observation.id,),
+        )
+        repositories.commit()
+
+    assert repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="worker-over-budget",
+        lease_seconds=600,
+        max_attempts=5,
+    ) == []
+    state = repositories.get_context_observation_curation_state(observation.id)
+    assert state is not None
+    assert state.attempt_count == 5
+    assert state.terminal_outcome == "retry_budget_exhausted"
+    updated = repositories.get_context_observation(observation.id)
+    assert updated is not None
+    assert updated.status == "curation_failed"
+
+
+def test_cancellation_release_cannot_clear_replacement_worker_lease(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The eastern signal is lit.",
+    )
+    repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="cancelled-worker",
+        lease_seconds=600,
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_observation_curation_state
+        SET lease_until = '2000-01-01 00:00:00'
+        WHERE observation_id = ?
+        """,
+        (observation.id,),
+    )
+    repositories.commit()
+    repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="replacement-worker",
+        lease_seconds=600,
+    )
+
+    released = repositories.release_context_observation_curation_claims(
+        (observation.id,),
+        lease_token="cancelled-worker",
+        error="cancelled",
+    )
+
+    assert released == 0
+    state = repositories.get_context_observation_curation_state(observation.id)
+    assert state is not None
+    assert state.lease_token == "replacement-worker"
+
+
 def test_repositories_archive_context_observations_for_deleted_messages(
     repositories: PersistenceRepositories,
 ) -> None:

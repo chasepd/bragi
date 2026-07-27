@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Protocol, TypeVar
@@ -604,21 +604,26 @@ class ContextCurationService:
                 (eligible[0].id,),
                 lease_token=lease_token,
                 lease_seconds=self.lease_seconds,
+                max_attempts=self.max_attempts,
             )
             if claimed:
-                await self._apply_mutation(
-                    lambda: self.repositories.complete_context_observation_curation(
-                        claimed[0].id,
-                        lease_token=lease_token,
-                        status="curation_failed",
-                        terminal_outcome="input_budget_exceeded",
-                        metadata={
-                            "curation_failure": {
-                                "reason": "input_budget_exceeded",
-                                "input_token_budget": self.input_token_budget,
-                            }
-                        },
-                    )
+                await self._await_claimed_operation(
+                    self._apply_mutation(
+                        lambda: self.repositories.complete_context_observation_curation(
+                            claimed[0].id,
+                            lease_token=lease_token,
+                            status="curation_failed",
+                            terminal_outcome="input_budget_exceeded",
+                            metadata={
+                                "curation_failure": {
+                                    "reason": "input_budget_exceeded",
+                                    "input_token_budget": self.input_token_budget,
+                                }
+                            },
+                        )
+                    ),
+                    observations=tuple(claimed),
+                    lease_token=lease_token,
                 )
                 return CurationResult(
                     save_id=save_id,
@@ -631,6 +636,7 @@ class ContextCurationService:
                 (observation.id for observation in selected),
                 lease_token=lease_token,
                 lease_seconds=self.lease_seconds,
+                max_attempts=self.max_attempts,
             )
         )
         if not all_observations:
@@ -666,8 +672,10 @@ class ContextCurationService:
                     lease_token=lease_token,
                 )
 
-            await self._apply_mutation(
-                reject_evidence
+            await self._await_claimed_operation(
+                self._apply_mutation(reject_evidence),
+                observations=all_observations,
+                lease_token=lease_token,
             )
         if not observations:
             return CurationResult(
@@ -676,26 +684,14 @@ class ContextCurationService:
                 discarded_count=discarded_count,
             )
         try:
-            decisions = await self.curator.curate(
-                save_id=save_id,
-                observations=observations,
+            decisions = await self._await_claimed_operation(
+                self.curator.curate(
+                    save_id=save_id,
+                    observations=observations,
+                ),
+                observations=all_observations,
+                lease_token=lease_token,
             )
-        except asyncio.CancelledError:
-            for observation in observations:
-
-                def defer_cancelled(
-                    selected: ContextObservationRecord = observation,
-                ) -> int:
-                    return self._defer_observation(
-                        selected,
-                        lease_token=lease_token,
-                        error="cancelled",
-                    )
-
-                await self._apply_mutation(
-                    defer_cancelled
-                )
-            raise
         except Exception:
             terminal_failure_count = 0
             for observation in observations:
@@ -709,8 +705,10 @@ class ContextCurationService:
                         error="provider_failure",
                     )
 
-                terminal_failure_count += await self._apply_mutation(
-                    defer_provider_failure
+                terminal_failure_count += await self._await_claimed_operation(
+                    self._apply_mutation(defer_provider_failure),
+                    observations=all_observations,
+                    lease_token=lease_token,
                 )
             return CurationResult(
                 save_id=save_id,
@@ -764,8 +762,10 @@ class ContextCurationService:
                     lease_token=lease_token,
                 )
 
-            applied = await self._apply_mutation(
-                apply_decision
+            applied = await self._await_claimed_operation(
+                self._apply_mutation(apply_decision),
+                observations=all_observations,
+                lease_token=lease_token,
             )
             accepted_count += applied[0]
             discarded_count += applied[1]
@@ -785,8 +785,10 @@ class ContextCurationService:
                     error="missing_decision",
                 )
 
-            terminal_failure_count += await self._apply_mutation(
-                defer_missing_decision
+            terminal_failure_count += await self._await_claimed_operation(
+                self._apply_mutation(defer_missing_decision),
+                observations=all_observations,
+                lease_token=lease_token,
             )
         return CurationResult(
             save_id=save_id,
@@ -799,6 +801,36 @@ class ContextCurationService:
             terminal_failure_count=terminal_failure_count,
             duplicate_decision_count=duplicate_decision_count,
             unknown_decision_count=unknown_decision_count,
+        )
+
+    async def _await_claimed_operation(
+        self,
+        operation: Awaitable[_MutationResult],
+        *,
+        observations: tuple[ContextObservationRecord, ...],
+        lease_token: str,
+    ) -> _MutationResult:
+        try:
+            return await operation
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                self._release_claims_after_cancellation(
+                    observations,
+                    lease_token=lease_token,
+                )
+            )
+            raise
+
+    async def _release_claims_after_cancellation(
+        self,
+        observations: tuple[ContextObservationRecord, ...],
+        *,
+        lease_token: str,
+    ) -> None:
+        self.repositories.release_context_observation_curation_claims(
+            (observation.id for observation in observations),
+            lease_token=lease_token,
+            error="cancelled",
         )
 
     async def _apply_mutation(

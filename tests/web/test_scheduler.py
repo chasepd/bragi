@@ -796,6 +796,57 @@ def test_scheduler_skips_unconfigured_curation_backlogs_without_starvation(
     assert runtime.observation_curation_calls == [runnable_save_id]
 
 
+def test_scheduler_replenishes_curation_candidates_after_due_checks(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_ids = [_save(repositories, title=f"Backlog {index}") for index in range(11)]
+    for index, save_id in enumerate(save_ids):
+        repositories.add_context_observation(
+            save_id=save_id,
+            observation_type="event",
+            claim=f"Observation {index}",
+            evidence_quote=f"Observation {index}",
+            source_message_ids=[],
+            scope="durable",
+            confidence=0.9,
+        )
+        set_save_model_override_preference(
+            repositories,
+            save_id=save_id,
+            task="memory_curation",
+            provider="fake",
+            model_id="fake-curator",
+        )
+    runtime = _ReviewRuntime(active_save_id=save_ids[0])
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+        repositories.connection.execute(
+            """
+            UPDATE scheduled_tasks
+            SET next_run_at = '2000-01-01 00:00:00'
+            WHERE task_type = ?
+            """,
+            (OBSERVATION_CURATION_DRAIN_TASK,),
+        )
+        repositories.commit()
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert set(runtime.observation_curation_calls[:10]) == set(save_ids[:10])
+    assert save_ids[10] in runtime.observation_curation_calls[10:]
+
+
 def test_scheduler_drains_inactive_context_retry_while_active_save_job_runs(
     tmp_path: Path,
 ) -> None:

@@ -588,6 +588,82 @@ def test_context_curation_cancellation_releases_lease_for_restart(
     assert state.terminal_outcome is None
 
 
+def test_context_curation_cancellation_while_waiting_for_apply_guard_releases_lease(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, _narrator = repositories.list_messages(save.id)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara prefers grounded narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "discard",
+                        "reason": "Transient preference.",
+                        "confidence": 0.7,
+                        "memory_body": "",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": [],
+                    }
+                ]
+            }
+        }
+    )
+    guard_entered = asyncio.Event()
+    guard_release = asyncio.Event()
+
+    class BlockingApplyGuard:
+        async def __aenter__(self) -> None:
+            guard_entered.set()
+            await guard_release.wait()
+
+        async def __aexit__(
+            self,
+            exc_type: object,
+            exc_value: object,
+            traceback: object,
+        ) -> None:
+            return None
+
+    async def run() -> None:
+        task = asyncio.create_task(
+            ContextCurationService(
+                repositories=repositories,
+                curator=StructuredProviderContextCurator(
+                    provider=provider,
+                    provider_name=provider.provider_name,
+                    model_id="curator",
+                ),
+                apply_guard=BlockingApplyGuard,
+            ).curate_pending(save.id)
+        )
+        await asyncio.wait_for(guard_entered.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+    state = repositories.get_context_observation_curation_state(observation.id)
+    assert state is not None
+    assert state.lease_token is None
+    assert state.lease_until is None
+    assert state.next_eligible_at is not None
+    assert state.last_error == "cancelled"
+    assert state.terminal_outcome is None
+
+
 def test_context_curation_rejects_unexpected_generated_script(
     repositories: PersistenceRepositories,
 ) -> None:
