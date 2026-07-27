@@ -3845,8 +3845,8 @@ class MediaService:
                                 "text with no explanation."
                             ),
                         ),
-                        ChatMessage(role="user", body=scene_context),
                     ),
+                    current_scene_recap=(scene_context,),
                     temperature=0.4,
                     max_output_tokens=360,
                 ),
