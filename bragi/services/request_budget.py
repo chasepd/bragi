@@ -96,11 +96,29 @@ def enforce_chat_request_budget(
 
 
 def budget_structured_output_request(
-    repositories: PersistenceRepositories,
+    repositories: PersistenceRepositories | None,
     request: StructuredOutputRequest,
     *,
     task: str,
 ) -> StructuredOutputRequest:
+    if repositories is None:
+        log_event(
+            "provider.request_budget_unenforced",
+            provider=request.provider,
+            model=request.model_id,
+            task=task,
+            reason="no_repository_context",
+        )
+        return replace(
+            request,
+            max_output_tokens=_reserved_output_tokens(
+                request.max_output_tokens,
+                _STRUCTURED_OUTPUT_RESERVES.get(
+                    task,
+                    DEFAULT_STRUCTURED_OUTPUT_RESERVE,
+                ),
+            ),
+        )
     context_window = model_context_window(
         repositories,
         provider=request.provider,
