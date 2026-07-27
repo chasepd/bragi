@@ -14,6 +14,7 @@ from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.http_client import (
     JsonHttpResponse,
     _iter_sse_data,
+    _safe_started_diagnostics,
     ensure_success,
     request_bytes,
     request_json,
@@ -293,7 +294,7 @@ def test_request_json_logs_safe_started_event_before_opening_request(
         "model": "payload-model-secret",
         "messages": [
             {
-                "role": "user",
+                "role": "system",
                 "content": "body-secret [memory:memory-1]",
             }
         ],
@@ -355,7 +356,10 @@ def test_request_json_logs_safe_started_event_before_opening_request(
         "model": "safe-model-id",
         "message_count": 1,
         "message_content_chars": len("body-secret [memory:memory-1]"),
-        "source_ids": ["memory:memory-1"],
+        "source_id_count": 1,
+        "source_id_sha256": [
+            hashlib.sha256(b"memory:memory-1").hexdigest(),
+        ],
     }
     assert "header-secret" not in repr(fields)
     assert "body-secret" not in repr(fields)
@@ -363,6 +367,41 @@ def test_request_json_logs_safe_started_event_before_opening_request(
     assert "query-secret" not in repr(fields)
     assert "Authorization" not in repr(fields)
     assert "messages" not in repr(fields)
+
+
+def test_safe_started_diagnostics_bounds_trusted_source_ids() -> None:
+    diagnostics = _safe_started_diagnostics(
+        provider="openrouter",
+        task="chat",
+        model="safe-model",
+        schema_name=None,
+        payload={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "[secret:account-password]",
+                },
+                *(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"[memory:memory-{index}] safe marker "
+                            f"[memory:{'x' * 200}]"
+                        ),
+                    }
+                    for index in range(100)
+                ),
+            ]
+        },
+    )
+
+    source_id_hashes = diagnostics["source_id_sha256"]
+    assert diagnostics["source_id_count"] == 64
+    assert isinstance(source_id_hashes, list)
+    assert len(source_id_hashes) == 64
+    assert source_id_hashes[0] == hashlib.sha256(b"memory:memory-0").hexdigest()
+    assert "secret:account-password" not in repr(diagnostics)
+    assert all(len(source_id_hash) == 64 for source_id_hash in source_id_hashes)
 
 
 def test_ensure_success_includes_safe_response_headers_in_payload() -> None:

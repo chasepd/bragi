@@ -18059,7 +18059,7 @@ def test_final_prompt_budget_preserves_summary_before_low_priority_retrieval() -
             ),
             max_output_tokens=1,
         ),
-        model_context_window=900,
+        model_context_window=1500,
     )
 
     budget = request.context_breakdown["final_prompt_budget"]

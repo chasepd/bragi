@@ -5,16 +5,22 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
+from bragi.app_logging import log_event
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.chat_rendering import (
     estimate_chat_request_tokens,
 )
-from bragi.providers.contracts import ChatRequest, StructuredOutputRequest
+from bragi.providers.contracts import (
+    ChatRequest,
+    StructuredOutputRequest,
+    ToolCallRequest,
+)
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.token_accounting import estimate_text_tokens
 
 DEFAULT_CHAT_OUTPUT_RESERVE = 1024
 DEFAULT_STRUCTURED_OUTPUT_RESERVE = 1024
+DEFAULT_TOOL_CALL_OUTPUT_RESERVE = 512
 _CHAT_OUTPUT_RESERVES = {
     "character_text": 256,
     "image_prompt": 512,
@@ -91,6 +97,7 @@ def budget_structured_output_request(
         model_id=request.model_id,
     )
     if context_window is None:
+        _log_unenforced_budget(request.provider, request.model_id, task)
         return request
     return enforce_structured_output_request_budget(
         request,
@@ -112,8 +119,9 @@ def enforce_structured_output_request_budget(
             DEFAULT_STRUCTURED_OUTPUT_RESERVE,
         ),
     )
-    messages_text = "\n\n".join(
-        f"{message.role}:\n{message.body}" for message in request.messages
+    estimated_message_tokens = sum(
+        estimate_text_tokens(f"{message.role}:\n{message.body}") + 4
+        for message in request.messages
     )
     schema_text = json.dumps(
         request.schema,
@@ -121,8 +129,11 @@ def enforce_structured_output_request_budget(
         separators=(",", ":"),
         sort_keys=True,
     )
-    estimated_message_tokens = estimate_text_tokens(messages_text)
-    estimated_schema_tokens = estimate_text_tokens(schema_text)
+    estimated_schema_tokens = (
+        estimate_text_tokens(schema_text)
+        + estimate_text_tokens(request.schema_name)
+        + 32
+    )
     diagnostics = _budget_diagnostics(
         task=task,
         provider=request.provider,
@@ -138,6 +149,101 @@ def enforce_structured_output_request_budget(
             "schema_name": request.schema_name,
             "estimated_message_tokens": estimated_message_tokens,
             "estimated_schema_tokens": estimated_schema_tokens,
+        }
+    )
+    if diagnostics["still_over_budget"] is True:
+        raise _overflow_error(diagnostics)
+    return request
+
+
+def budget_tool_call_request(
+    repositories: PersistenceRepositories,
+    request: ToolCallRequest,
+    *,
+    task: str,
+) -> ToolCallRequest:
+    context_window = model_context_window(
+        repositories,
+        provider=request.provider,
+        model_id=request.model_id,
+    )
+    if context_window is None:
+        _log_unenforced_budget(request.provider, request.model_id, task)
+        return request
+    return enforce_tool_call_request_budget(
+        request,
+        model_context_window=context_window,
+        task=task,
+    )
+
+
+def enforce_tool_call_request_budget(
+    request: ToolCallRequest,
+    *,
+    model_context_window: int,
+    task: str,
+) -> ToolCallRequest:
+    reserved_output_tokens = _reserved_output_tokens(
+        request.max_output_tokens,
+        _STRUCTURED_OUTPUT_RESERVES.get(
+            task,
+            DEFAULT_TOOL_CALL_OUTPUT_RESERVE,
+        ),
+    )
+    estimated_message_tokens = sum(
+        estimate_text_tokens(
+            json.dumps(
+                {
+                    "role": message.role,
+                    "body": message.body,
+                    "speaker_name": message.speaker_name,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "name": call.name,
+                            "arguments_json": call.arguments_json,
+                        }
+                        for call in message.tool_calls
+                    ],
+                    "tool_call_id": message.tool_call_id,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        + 4
+        for message in request.messages
+    )
+    tool_text = json.dumps(
+        [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            }
+            for tool in request.tools
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    estimated_tool_tokens = estimate_text_tokens(tool_text) + 32
+    diagnostics = _budget_diagnostics(
+        task=task,
+        provider=request.provider,
+        model_id=request.model_id,
+        model_context_window=model_context_window,
+        reserved_output_tokens=reserved_output_tokens,
+        estimated_input_tokens=(
+            estimated_message_tokens + estimated_tool_tokens
+        ),
+    )
+    diagnostics.update(
+        {
+            "estimated_message_tokens": estimated_message_tokens,
+            "estimated_tool_tokens": estimated_tool_tokens,
+            "tool_count": len(request.tools),
         }
     )
     if diagnostics["still_over_budget"] is True:
@@ -210,3 +316,13 @@ def _chat_request_with_budget_diagnostics(
     context_breakdown = dict(request.context_breakdown)
     context_breakdown["request_budget"] = diagnostics
     return replace(request, context_breakdown=context_breakdown)
+
+
+def _log_unenforced_budget(provider: str, model_id: str, task: str) -> None:
+    log_event(
+        "provider.request_budget_unenforced",
+        provider=provider,
+        model=model_id,
+        task=task,
+        reason="no_model_context_window",
+    )

@@ -16,6 +16,7 @@ from bragi.providers.contracts import (
 )
 from bragi.services.model_preferences import roleplay_model_preference
 from bragi.services.openrouter_routing_settings import request_with_openrouter_routing
+from bragi.services.request_budget import budget_structured_output_request
 
 NPC_KNOWLEDGE_AUDIT_MODE_SETTING = "npc_knowledge_audit_mode"
 NPC_KNOWLEDGE_AUDIT_MODE_SOFT_FAIL = "soft_fail"
@@ -141,6 +142,11 @@ class NpcKnowledgeAuditService:
             ),
             task="npc_knowledge_audit",
             save_id=save_id,
+        )
+        audit_request = budget_structured_output_request(
+            self.repositories,
+            audit_request,
+            task="npc_knowledge_audit",
         )
         response = await provider.generate_structured_output(audit_request)
         return NpcKnowledgeAuditResult(

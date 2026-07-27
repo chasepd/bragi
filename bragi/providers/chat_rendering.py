@@ -42,7 +42,6 @@ def provider_chat_message(message: ChatMessage) -> dict[str, str]:
 def chat_system_body(request: ChatRequest) -> str:
     parts = [
         *_purpose_instruction_sections(request),
-        request.scenario_instructions,
         _guidance_section(
             "Turn directive",
             request.turn_directive,
@@ -82,7 +81,12 @@ def rendered_chat_request_text(request: ChatRequest) -> str:
 
 
 def estimate_chat_request_tokens(request: ChatRequest) -> int:
-    return _estimate_tokens(rendered_chat_request_text(request))
+    messages = provider_chat_messages(request)
+    return (
+        _estimate_tokens(rendered_chat_request_text(request))
+        + 3
+        + (4 * len(messages))
+    )
 
 
 def _guidance_section(title: str, guidance: str, caveat: str) -> str:
@@ -207,6 +211,12 @@ def _effective_prompt_purpose(request: ChatRequest) -> ChatPromptPurpose:
 def _data_context_block(request: ChatRequest) -> str:
     sections = [
         _pending_context_review_section(request.pending_context_suggestions),
+        _section(
+            "Scenario context",
+            (request.scenario_instructions,)
+            if request.scenario_instructions.strip()
+            else (),
+        ),
         _section(
             "Retrieved scenario sections",
             request.retrieved_scenario_sections,

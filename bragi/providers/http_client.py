@@ -64,9 +64,25 @@ SENSITIVE_PROVIDER_RESPONSE_HEADERS = frozenset(
     }
 )
 _SOURCE_ID_PATTERN = re.compile(
-    r"\[([a-z][a-z0-9_]*:[A-Za-z0-9][A-Za-z0-9._:-]*)\]"
+    r"\[([a-z][a-z0-9_]*):([A-Za-z0-9][A-Za-z0-9._:-]{0,95})\]"
+    r"(?![A-Za-z0-9._:-])"
 )
 _MAX_CAPTURED_SOURCE_IDS = 64
+_TRUSTED_SOURCE_ID_TYPES = frozenset(
+    {
+        "character_text_thread",
+        "character_voice",
+        "media_asset",
+        "memory",
+        "message",
+        "observation",
+        "open_obligation",
+        "scenario_section",
+        "state_change",
+        "summary",
+        "world_state",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -694,6 +710,8 @@ def _safe_message_diagnostics(payload: dict[str, Any]) -> dict[str, object]:
     for message in messages:
         if not isinstance(message, dict):
             continue
+        if message.get("role") != "system":
+            continue
         content = message.get("content")
         if isinstance(content, str):
             content_chars += len(content)
@@ -712,17 +730,26 @@ def _safe_message_diagnostics(payload: dict[str, Any]) -> dict[str, object]:
         "message_content_chars": content_chars,
     }
     if source_ids:
-        diagnostics["source_ids"] = source_ids
+        diagnostics["source_id_count"] = len(source_ids)
+        diagnostics["source_id_sha256"] = [
+            hashlib.sha256(source_id.encode("utf-8")).hexdigest()
+            for source_id in source_ids
+        ]
     return diagnostics
 
 
 def _append_source_ids(source_ids: list[str], text: str) -> None:
-    for source_id in _SOURCE_ID_PATTERN.findall(text):
+    if len(source_ids) >= _MAX_CAPTURED_SOURCE_IDS:
+        return
+    for source_type, identifier in _SOURCE_ID_PATTERN.findall(text):
+        if source_type not in _TRUSTED_SOURCE_ID_TYPES:
+            continue
+        source_id = f"{source_type}:{identifier}"
         if source_id in source_ids:
             continue
-        source_ids.append(source_id)
         if len(source_ids) >= _MAX_CAPTURED_SOURCE_IDS:
             return
+        source_ids.append(source_id)
 
 
 def _schema_enum_value_count_from_payload(payload: dict[str, Any] | None) -> int | None:
