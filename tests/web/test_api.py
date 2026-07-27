@@ -11575,6 +11575,27 @@ def test_manual_scenario_rejects_non_string_interaction_mode(
     )
 
 
+def test_manual_scenario_rejects_empty_interaction_mode(
+    tmp_path: Path,
+) -> None:
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, _RuntimeDouble())))
+    ) as client:
+        response = client.post(
+            "/api/scenarios/manual",
+            json={
+                "scenario_type": "full_roleplay",
+                "title": "Invalid",
+                "premise": "Invalid",
+                "player_role": "",
+                "interaction_mode": "",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Unknown interaction mode: "
+
+
 @pytest.mark.parametrize(
     ("path", "payload"),
     [

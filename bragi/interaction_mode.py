@@ -13,7 +13,7 @@ class InteractionMode(StrEnum):
 def normalize_interaction_mode(
     value: InteractionMode | str | None,
 ) -> InteractionMode:
-    if value is None or value == "":
+    if value is None:
         return InteractionMode.ROLEPLAY
     try:
         return InteractionMode(value)

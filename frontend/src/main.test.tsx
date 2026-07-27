@@ -12054,7 +12054,9 @@ describe("frontend helpers", () => {
     expect(
       within(dialog).queryByLabelText("Player Character Profile")
     ).not.toBeInTheDocument();
-    expect(within(dialog).getByLabelText("Action choices")).toBeDisabled();
+    expect(
+      within(dialog).queryByLabelText("Action choices")
+    ).not.toBeInTheDocument();
     await userEvent.type(within(dialog).getByLabelText("Title"), "The Ceremony");
     await userEvent.type(
       within(dialog).getByLabelText("Premise"),
@@ -15528,8 +15530,7 @@ describe("frontend helpers", () => {
       "aria-selected",
       "true"
     );
-    expect(screen.getByLabelText("Action choices")).not.toBeChecked();
-    expect(screen.getByLabelText("Action choices")).toBeDisabled();
+    expect(screen.queryByLabelText("Action choices")).not.toBeInTheDocument();
   });
 
   it("imports and exports reusable scenario bundles from the scenario library", async () => {

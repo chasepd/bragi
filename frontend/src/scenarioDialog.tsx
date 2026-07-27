@@ -338,15 +338,17 @@ export function ScenarioDialog({
             }
           ]}
         />
-        <label className="toggle-row compact-toggle">
+        {form.interaction_mode === "roleplay" ? (
+          <label className="toggle-row compact-toggle">
             <input
               type="checkbox"
               checked={form.action_choices_enabled}
-              disabled={form.interaction_mode === "storyteller" || (mode === "draft" && draft !== null)}
+              disabled={mode === "draft" && draft !== null}
               onChange={(event) => setForm({ ...form, action_choices_enabled: event.target.checked })}
             />
             <span>Action choices</span>
-        </label>
+          </label>
+        ) : null}
         {mode === "manual" ? <ManualScenarioForm form={form} setForm={setForm} flow={flow} /> : null}
         {mode === "draft" ? (
           <>
