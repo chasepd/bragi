@@ -389,7 +389,7 @@ def test_safe_started_diagnostics_bounds_trusted_source_ids() -> None:
                             f"[memory:{'x' * 200}]"
                         ),
                     }
-                    for index in range(100)
+                    for index in range(10_000)
                 ),
             ]
         },

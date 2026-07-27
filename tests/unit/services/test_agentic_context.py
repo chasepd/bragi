@@ -913,6 +913,13 @@ def test_narrator_planner_returns_message_spec_from_structured_output() -> None:
 
     structured_request = provider.structured_output_requests[0]
     assert structured_request.schema_name == "narrator_message_plan"
+    assert "untrusted evidence" in structured_request.messages[0].body
+    assert structured_request.messages[1].body.startswith(
+        "BEGIN BRAGI UNTRUSTED SOURCE REQUEST DATA"
+    )
+    assert structured_request.messages[1].body.endswith(
+        "END BRAGI UNTRUSTED SOURCE REQUEST DATA"
+    )
     schema_properties = structured_request.schema["properties"]
     for field in (
         "narrative_beats",
@@ -1053,6 +1060,9 @@ def test_narrator_planner_defaults_missing_new_plan_fields() -> None:
     prompt_text = "\n".join(
         message.body for message in provider.structured_output_requests[0].messages
     )
+    assert "untrusted evidence" in prompt_text
+    assert "BEGIN BRAGI UNTRUSTED SOURCE REQUEST DATA" in prompt_text
+    assert "END BRAGI UNTRUSTED SOURCE REQUEST DATA" in prompt_text
     assert "full spectrum" in prompt_text
     assert "hostile" in prompt_text
     assert "unreasonable" in prompt_text
@@ -1150,6 +1160,9 @@ def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
     prompt_text = "\n".join(
         message.body for message in provider.structured_output_requests[0].messages
     )
+    assert "untrusted evidence" in prompt_text
+    assert "BEGIN BRAGI UNTRUSTED VERIFICATION INPUT DATA" in prompt_text
+    assert "END BRAGI UNTRUSTED VERIFICATION INPUT DATA" in prompt_text
     assert "Observation: The lens is red." in prompt_text
     assert "NPC knowledge leaks" in prompt_text
     assert "unearned NPC compliance" in prompt_text
