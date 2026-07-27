@@ -467,6 +467,26 @@ class TurnSnapshotService:
             ).fetchone()
         return _snapshot_record_from_row(row) if row is not None else None
 
+    def snapshot_present_character_ids(self, *, snapshot_id: str) -> tuple[str, ...]:
+        snapshot = self._get_snapshot(snapshot_id)
+        manifest = self._snapshot_manifest(snapshot)
+        rows_by_table = _sanitize_snapshot_rows_for_safety(
+            self._rows_from_manifest(manifest)
+        )
+        scene_rows = rows_by_table.get("scene_snapshots", ())
+        if not scene_rows:
+            return ()
+        raw_ids = scene_rows[-1].get("present_character_ids_json")
+        if not isinstance(raw_ids, str) or not raw_ids.strip():
+            return ()
+        try:
+            parsed = json.loads(raw_ids)
+        except json.JSONDecodeError:
+            return ()
+        if not isinstance(parsed, list):
+            return ()
+        return tuple(item for item in parsed if isinstance(item, str) and item)
+
     def latest_snapshot_before_message(
         self,
         *,

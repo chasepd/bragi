@@ -11940,6 +11940,107 @@ def test_run_post_turn_jobs_persists_scene_presence_for_turn_messages(
         ]
 
 
+def test_run_post_turn_jobs_rebases_stale_scene_presence_from_turn_snapshot(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I climb toward the beacon lens.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon lens hums awake.",
+    )
+    mara = repositories.add_character(save_id=save.id, name="Mara")
+    lio = repositories.add_character(save_id=save.id, name="Archivist Lio")
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara climbs alone.",
+        present_character_ids=[mara.id],
+    )
+    base_snapshot = TurnSnapshotService(repositories).capture_message_snapshot(
+        save_id=save.id,
+        message_id=narrator_message.id,
+        reason="narrator_turn_complete",
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+    )
+    turn_revision = service._turn_revision_boundary(
+        save_id=save.id,
+        player_message_id=player_message.id,
+        narrator_message_id=narrator_message.id,
+        base_snapshot_id=base_snapshot.id,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Lio takes over the beacon lens.",
+        present_character_ids=[lio.id],
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I head down toward the signal yard.",
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Lio remains behind and trims the beacon.",
+    )
+
+    async def context_step(**_kwargs: object) -> str:
+        raise AssertionError("stale turn must not run current-head context update")
+
+    monkeypatch.setattr(service, "_update_context_if_configured", context_step)
+
+    asyncio.run(
+        service.run_post_turn_jobs(
+            save_id=save.id,
+            player_message_id=player_message.id,
+            narrator_message_id=narrator_message.id,
+            turn_revision=turn_revision,
+        )
+    )
+
+    coordinator = _post_turn_jobs(repositories, save.id)[0]
+    assert coordinator["result"]["turn_revision_status"] == "stale_rebase"
+    assert _post_turn_child_result(coordinator, "context") == {
+        "source_scoped_rebased": True,
+        "turn_revision_status": "stale_rebase",
+        "source_message_ids": [player_message.id, narrator_message.id],
+    }
+    assert _post_turn_child_result(coordinator, "scenario") == {
+        "skipped_reason": "stale_turn_rebase",
+        "turn_revision_status": "stale_rebase",
+        "source_message_ids": [player_message.id, narrator_message.id],
+    }
+    for message in (player_message, narrator_message):
+        rows = repositories.list_message_scene_presence(
+            save.id,
+            message_id=message.id,
+        )
+        assert [(row.character_id, row.source) for row in rows] == [
+            (mara.id, "post_turn_context")
+        ]
+
+
 def test_run_post_turn_jobs_leaves_world_context_retention_for_scheduler(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -12374,6 +12475,158 @@ def test_run_state_extraction_retries_applies_once_and_queues_context_retry(
         for job in repositories.list_jobs_by_status(("queued",))
         if job.type == "context_update_retry"
     ] == context_retries
+
+
+def test_run_state_extraction_retries_source_scopes_stale_turns(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I climb toward the beacon lens.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon lens hums awake.",
+    )
+    base_snapshot = TurnSnapshotService(repositories).capture_message_snapshot(
+        save_id=save.id,
+        message_id=narrator_message.id,
+        reason="narrator_turn_complete",
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+    )
+    turn_revision = service._turn_revision_boundary(
+        save_id=save.id,
+        player_message_id=player_message.id,
+        narrator_message_id=narrator_message.id,
+        base_snapshot_id=base_snapshot.id,
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I cross the yard after the beacon wakes.",
+    )
+    later_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The lower yard opens under cold ash.",
+    )
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="scene.location",
+        value={"name": "Lower yard"},
+        category="scene",
+        source_message_id=later_narrator.id,
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-state-memory",
+        display_name="Fake State Memory",
+        capabilities=["structured_output"],
+        context_window=32768,
+    )
+    repositories.set_model_preference(
+        task="state_memory",
+        provider="fake",
+        model_id="fake-state-memory",
+    )
+    repositories.create_job(
+        save_id=save.id,
+        type="state_extraction_retry",
+        status="queued",
+        payload={
+            "source_message_ids": [player_message.id, narrator_message.id],
+            "reason": "post_turn_state_failed",
+            "retry_attempt": 1,
+            "max_retry_attempts": 3,
+            "provider": "fake",
+            "model": "fake-state-memory",
+            "include_memories": True,
+            "turn_revision": turn_revision.to_json(),
+        },
+    )
+    events: list[str] = []
+    provider = RecordingStateMemoryProvider(
+        "fake",
+        events=events,
+        structured_data={
+            "state_changes": [
+                {
+                    "operation": "upsert",
+                    "key": "scene.location",
+                    "value": {"name": "Beacon gallery"},
+                    "category": "scene",
+                    "confidence": 0.87,
+                    "evidence_quote": "The beacon lens hums awake.",
+                }
+            ],
+            "memories": [
+                {
+                    "body": "Mara woke the beacon before crossing the yard.",
+                    "tags": ["beacon"],
+                    "importance": 0.91,
+                    "evidence_quote": "The beacon lens hums awake.",
+                }
+            ],
+        },
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=None,
+    )
+
+    completed = asyncio.run(service.run_state_extraction_retries(save_id=save.id))
+
+    assert completed == 1
+    assert events == ["state_memory_extraction"]
+    assert [
+        (state.key, state.value, state.source_message_id)
+        for state in repositories.list_world_state(save.id)
+    ] == [("scene.location", {"name": "Lower yard"}, later_narrator.id)]
+    assert [memory.body for memory in repositories.list_memories(save.id)] == [
+        "Mara woke the beacon before crossing the yard."
+    ]
+    state_changes = repositories.list_state_changes(save.id)
+    assert [
+        (change.state_key, change.before_json, change.after_json)
+        for change in state_changes
+    ] == [
+        ("scene.location", None, '{"name":"Beacon gallery"}')
+    ]
+    succeeded_retry = next(
+        job
+        for job in repositories.list_jobs_by_status(("succeeded",))
+        if job.type == "state_extraction_retry"
+    )
+    assert succeeded_retry.result is not None
+    assert succeeded_retry.result["source_scoped_rebased"] is True
+    assert succeeded_retry.result["turn_revision_status"] == "stale_rebase"
+    context_retries = [
+        job
+        for job in repositories.list_jobs_by_status(("queued",))
+        if job.type == "context_update_retry"
+    ]
+    assert len(context_retries) == 1
+    assert context_retries[0].payload["turn_revision"] == turn_revision.to_json()
+    assert repositories.latest_active_message_id(save.id) == later_narrator.id
 
 
 def test_run_post_turn_jobs_defers_low_priority_work_after_provider_pressure(

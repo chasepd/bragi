@@ -231,7 +231,7 @@ _POST_TURN_PROGRESS_JOB_ORDER = (
     "scenario",
     "image",
 )
-POST_TURN_BACKGROUND_CATCHUP_TIMEOUT_SECONDS = 15.0
+POST_TURN_BACKGROUND_CATCHUP_TIMEOUT_SECONDS = 120.0
 _CHAT_TURN_PROGRESS_JOB_ORDER = (
     "submission",
     "history",
@@ -3230,6 +3230,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     save_id=turn.save_id or "",
                     player_message_id=turn.player_message_id or "",
                     narrator_message_id=turn.narrator_message_id or "",
+                    turn_revision=getattr(turn, "turn_revision", None),
                     prepared_action_choices=getattr(
                         turn,
                         "prepared_action_choices",
@@ -3247,6 +3248,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                         save_id=turn.save_id or "",
                         player_message_id=turn.player_message_id or "",
                         narrator_message_id=turn.narrator_message_id or "",
+                        turn_revision=getattr(turn, "turn_revision", None),
                         prepared_action_choices=getattr(
                             turn,
                             "prepared_action_choices",
@@ -3417,6 +3419,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     save_id=turn.save_id or "",
                     player_message_id=turn.player_message_id or "",
                     narrator_message_id=turn.narrator_message_id or "",
+                    turn_revision=getattr(turn, "turn_revision", None),
                     prepared_action_choices=getattr(
                         turn,
                         "prepared_action_choices",
@@ -3434,6 +3437,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                         save_id=turn.save_id or "",
                         player_message_id=turn.player_message_id or "",
                         narrator_message_id=turn.narrator_message_id or "",
+                        turn_revision=getattr(turn, "turn_revision", None),
                         prepared_action_choices=getattr(
                             turn,
                             "prepared_action_choices",
@@ -8894,6 +8898,7 @@ async def _queue_post_turn_jobs_background(
     save_id: str,
     player_message_id: str,
     narrator_message_id: str,
+    turn_revision: object | None = None,
     prepared_action_choices: object | None = None,
     prior_phase_jobs: list[dict[str, str]] | None = None,
     current_user_id: str | None = None,
@@ -8905,6 +8910,7 @@ async def _queue_post_turn_jobs_background(
             save_id=save_id,
             player_message_id=player_message_id,
             narrator_message_id=narrator_message_id,
+            turn_revision=turn_revision,
             prepared_action_choices=prepared_action_choices,
             prior_phase_jobs=None,
             current_user_id=current_user_id,
@@ -8946,6 +8952,7 @@ async def _run_post_turn_jobs_with_ordered_progress(
     save_id: str,
     player_message_id: str,
     narrator_message_id: str,
+    turn_revision: object | None = None,
     prepared_action_choices: object | None = None,
     prior_phase_jobs: list[dict[str, str]] | None = None,
     current_user_id: str | None = None,
@@ -8976,6 +8983,11 @@ async def _run_post_turn_jobs_with_ordered_progress(
             "narrator_message_id": narrator_message_id,
             "progress_callback": progress_callback,
         }
+        if turn_revision is not None and _call_accepts_keyword(
+            state.runtime.run_post_turn_jobs,
+            "turn_revision",
+        ):
+            kwargs["turn_revision"] = turn_revision
         if (
             prepared_action_choices is not None
             and _call_accepts_keyword(

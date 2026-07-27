@@ -682,6 +682,7 @@ class StateService:
         include_memories: bool = True,
         suppressed_memory_fingerprints: frozenset[str] = frozenset(),
         suppressed_state_keys: frozenset[str] = frozenset(),
+        source_scoped_only: bool = False,
     ) -> AppliedExtraction:
         job = self.jobs.create_running(
             save_id=save_id,
@@ -703,6 +704,7 @@ class StateService:
                     if suppressed_state_keys
                     else {}
                 ),
+                **({"source_scoped_only": True} if source_scoped_only else {}),
             },
             collect_provider_diagnostics=True,
         )
@@ -745,6 +747,7 @@ class StateService:
                 safety_transition_source_message_ids=safety_transition_source_ids,
                 suppressed_memory_fingerprints=suppressed_memory_fingerprints,
                 suppressed_state_keys=suppressed_state_keys,
+                source_scoped_only=source_scoped_only,
             )
             self.repositories.commit_transaction()
         except Exception as exc:
@@ -841,6 +844,7 @@ class StateService:
         suppressed_memory_fingerprints: frozenset[str] = frozenset(),
         suppressed_state_keys: frozenset[str] = frozenset(),
         safety_transition_source_message_ids: frozenset[str] = frozenset(),
+        source_scoped_only: bool = False,
     ) -> AppliedExtraction:
         world_state_records: list[WorldStateRecord] = []
         memory_records: list[MemoryRecord] = []
@@ -909,11 +913,15 @@ class StateService:
                 change=change,
             ):
                 continue
-            before = _find_world_state(
-                self.repositories.list_world_state(save_id),
-                change.key,
+            before = (
+                None
+                if source_scoped_only
+                else _find_world_state(
+                    self.repositories.list_world_state(save_id),
+                    change.key,
+                )
             )
-            if confirm_state_changes:
+            if confirm_state_changes and not source_scoped_only:
                 self._queue_state_change_confirmation(
                     save_id=save_id,
                     change=change,
@@ -925,35 +933,37 @@ class StateService:
                 value = change.value
                 if change.key == "loop.current" and before is not None:
                     value = _merge_loop_current_summary(before.value, change.value)
-                preserve_replaced_world_state_memory(
-                    repositories=self.repositories,
-                    save_id=save_id,
-                    before=before,
-                    after_value=value,
-                    source_message_id=change.source_message_id,
-                )
-                world_state = self.repositories.upsert_world_state(
-                    save_id=save_id,
-                    key=change.key,
-                    value=value,
-                    category=change.category,
-                    confidence=change.confidence,
-                    source_message_id=change.source_message_id,
-                )
-                world_state_records.append(world_state)
+                if not source_scoped_only:
+                    preserve_replaced_world_state_memory(
+                        repositories=self.repositories,
+                        save_id=save_id,
+                        before=before,
+                        after_value=value,
+                        source_message_id=change.source_message_id,
+                    )
+                    world_state = self.repositories.upsert_world_state(
+                        save_id=save_id,
+                        key=change.key,
+                        value=value,
+                        category=change.category,
+                        confidence=change.confidence,
+                        source_message_id=change.source_message_id,
+                    )
+                    world_state_records.append(world_state)
                 after_json = _dump(value)
             elif change.operation in {"remove", "delete"}:
-                preserve_replaced_world_state_memory(
-                    repositories=self.repositories,
-                    save_id=save_id,
-                    before=before,
-                    after_value=None,
-                    source_message_id=change.source_message_id,
-                )
-                self.repositories.archive_world_state(
-                    save_id=save_id,
-                    key=change.key,
-                )
+                if not source_scoped_only:
+                    preserve_replaced_world_state_memory(
+                        repositories=self.repositories,
+                        save_id=save_id,
+                        before=before,
+                        after_value=None,
+                        source_message_id=change.source_message_id,
+                    )
+                    self.repositories.archive_world_state(
+                        save_id=save_id,
+                        key=change.key,
+                    )
             if (
                 change.operation == "upsert"
                 and before is not None

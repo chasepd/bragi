@@ -137,6 +137,7 @@ from bragi.services.chat_service import (
     NarratorStreamCallback,
     PostTurnProgressCallback,
     TurnProgressCallback,
+    TurnRevisionBoundary,
     timeskip_message_body,
 )
 from bragi.services.content_rating import effective_content_safety_policy
@@ -481,6 +482,7 @@ class SubmittedRuntimeTurn:
     save_id: str | None = None
     player_message_id: str | None = None
     narrator_message_id: str | None = None
+    turn_revision: TurnRevisionBoundary | None = None
     context_trimmed: bool = False
     prepared_action_choices: PreparedActionChoiceGeneration | None = None
     delta: ChatTurnDeltaModel | None = None
@@ -3510,6 +3512,7 @@ class BragiRuntime:
         save_id: str,
         player_message_id: str,
         narrator_message_id: str,
+        turn_revision: TurnRevisionBoundary | dict[str, object] | None = None,
         progress_callback: PostTurnProgressCallback | None = None,
         prepared_action_choices: PreparedActionChoiceGeneration | None = None,
         current_user_id: str | None = None,
@@ -3529,6 +3532,8 @@ class BragiRuntime:
                 "narrator_message_id": narrator_message_id,
             }
             parameters = inspect.signature(chat_service.run_post_turn_jobs).parameters
+            if turn_revision is not None and "turn_revision" in parameters:
+                kwargs["turn_revision"] = turn_revision
             if progress_callback is not None and "progress_callback" in parameters:
                 kwargs["progress_callback"] = progress_callback
             if "current_user_id" in parameters:
@@ -4770,6 +4775,7 @@ class BragiRuntime:
                 save_id=submitted_save_id,
                 player_message_id=submitted_turn.player_message.id,
                 narrator_message_id=submitted_turn.narrator_message.id,
+                turn_revision=getattr(submitted_turn, "turn_revision", None),
                 context_trimmed=context_trimmed,
                 prepared_action_choices=getattr(
                     submitted_turn,
@@ -4938,6 +4944,7 @@ class BragiRuntime:
                 save_id=submitted_save_id,
                 player_message_id=submitted_turn.player_message.id,
                 narrator_message_id=submitted_turn.narrator_message.id,
+                turn_revision=getattr(submitted_turn, "turn_revision", None),
                 context_trimmed=context_trimmed,
                 prepared_action_choices=getattr(
                     submitted_turn,

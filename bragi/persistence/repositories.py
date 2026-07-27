@@ -2579,6 +2579,19 @@ class PersistenceRepositories:
         )
         return int(row["rowid"]) if row is not None else None
 
+    def latest_active_message_id(self, save_id: str) -> str | None:
+        row = self._fetch_one(
+            """
+            SELECT id
+            FROM messages
+            WHERE save_id = ? AND deleted_at IS NULL
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (save_id,),
+        )
+        return str(row["id"]) if row is not None else None
+
     def find_active_message_after_rowid(
         self,
         save_id: str,

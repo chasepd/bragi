@@ -309,7 +309,7 @@ POST_TURN_PROVIDER_TASKS = {
     "image": "image_generation",
 }
 POST_TURN_CONTEXT_UPDATE_BUDGET_SECONDS = 60.0
-POST_TURN_BACKGROUND_CATCHUP_TIMEOUT_SECONDS = 15.0
+POST_TURN_BACKGROUND_CATCHUP_TIMEOUT_SECONDS = 120.0
 STATE_EXTRACTION_RETRY_JOB_TYPE = "state_extraction_retry"
 STATE_EXTRACTION_RETRY_MAX_ATTEMPTS = CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS
 STATE_EXTRACTION_RETRY_DRAIN_LIMIT = CONTEXT_UPDATE_RETRY_DRAIN_LIMIT
@@ -383,12 +383,73 @@ class CancellationToken:
 
 
 @dataclass(frozen=True)
+class TurnRevisionBoundary:
+    save_id: str
+    player_message_id: str
+    narrator_message_id: str
+    expected_head_message_id: str
+    expected_revision_token: str
+    base_snapshot_id: str | None = None
+    rebase_policy: str = "source_scoped"
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "save_id": self.save_id,
+            "player_message_id": self.player_message_id,
+            "narrator_message_id": self.narrator_message_id,
+            "expected_head_message_id": self.expected_head_message_id,
+            "expected_revision_token": self.expected_revision_token,
+            "base_snapshot_id": self.base_snapshot_id,
+            "rebase_policy": self.rebase_policy,
+        }
+
+    @classmethod
+    def from_json(cls, value: object) -> TurnRevisionBoundary | None:
+        if not isinstance(value, Mapping):
+            return None
+        save_id = value.get("save_id")
+        player_message_id = value.get("player_message_id")
+        narrator_message_id = value.get("narrator_message_id")
+        expected_head_message_id = value.get("expected_head_message_id")
+        expected_revision_token = value.get("expected_revision_token")
+        if not isinstance(save_id, str) or not save_id:
+            return None
+        if not isinstance(player_message_id, str) or not player_message_id:
+            return None
+        if not isinstance(narrator_message_id, str) or not narrator_message_id:
+            return None
+        if (
+            not isinstance(expected_head_message_id, str)
+            or not expected_head_message_id
+        ):
+            return None
+        if not isinstance(expected_revision_token, str) or not expected_revision_token:
+            return None
+        base_snapshot_id = value.get("base_snapshot_id")
+        rebase_policy = value.get("rebase_policy")
+        return cls(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+            expected_head_message_id=expected_head_message_id,
+            expected_revision_token=expected_revision_token,
+            base_snapshot_id=(
+                base_snapshot_id if isinstance(base_snapshot_id, str) else None
+            ),
+            rebase_policy=(
+                rebase_policy if isinstance(rebase_policy, str) else "source_scoped"
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class SubmittedTurn:
     player_message: MessageRecord
     narrator_message: MessageRecord
     fallback_used: bool = False
     context_trimmed: bool = False
     prepared_action_choices: PreparedActionChoiceGeneration | None = None
+    turn_revision: TurnRevisionBoundary | None = None
 
 
 @dataclass(frozen=True)
@@ -2763,10 +2824,18 @@ class ChatService:
                 player_message_id=player_message.id,
                 narrator_message_id=narrator_message.id,
             )
-        TurnSnapshotService(self.repositories).capture_message_snapshot(
+        final_snapshot = TurnSnapshotService(
+            self.repositories
+        ).capture_message_snapshot(
             save_id=save_id,
             message_id=narrator_message.id,
             reason="narrator_turn_complete",
+        )
+        turn_revision = self._turn_revision_boundary(
+            save_id=save_id,
+            player_message_id=player_message.id,
+            narrator_message_id=narrator_message.id,
+            base_snapshot_id=final_snapshot.id,
         )
         log_event(
             "chat.turn_succeeded",
@@ -2794,6 +2863,7 @@ class ChatService:
             prepared_action_choices=(
                 prepared_action_choices if defer_action_choices else None
             ),
+            turn_revision=turn_revision,
         )
 
     async def _await_background_post_turn_catchup(self, *, save_id: str) -> None:
@@ -2879,6 +2949,67 @@ class ChatService:
                 )
 
         task.add_done_callback(task_done)
+
+    def _turn_revision_boundary(
+        self,
+        *,
+        save_id: str,
+        player_message_id: str,
+        narrator_message_id: str,
+        base_snapshot_id: str | None = None,
+    ) -> TurnRevisionBoundary:
+        return TurnRevisionBoundary(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+            expected_head_message_id=narrator_message_id,
+            expected_revision_token=self.repositories.context_candidate_revision_token(
+                save_id
+            ),
+            base_snapshot_id=base_snapshot_id,
+        )
+
+    def _coerce_turn_revision(
+        self,
+        value: TurnRevisionBoundary | Mapping[str, object] | None,
+        *,
+        save_id: str,
+        player_message_id: str,
+        narrator_message_id: str,
+    ) -> TurnRevisionBoundary:
+        if isinstance(value, TurnRevisionBoundary):
+            return value
+        parsed = TurnRevisionBoundary.from_json(value)
+        if parsed is not None:
+            return parsed
+        snapshot = TurnSnapshotService(self.repositories).latest_snapshot_for_message(
+            save_id=save_id,
+            message_id=narrator_message_id,
+        )
+        return TurnRevisionBoundary(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+            expected_head_message_id=(
+                self.repositories.latest_active_message_id(save_id)
+                or narrator_message_id
+            ),
+            expected_revision_token=self.repositories.context_candidate_revision_token(
+                save_id
+            ),
+            base_snapshot_id=snapshot.id if snapshot is not None else None,
+        )
+
+    def _turn_revision_is_current_head(
+        self,
+        boundary: TurnRevisionBoundary,
+    ) -> bool:
+        if boundary.save_id == "":
+            return False
+        return (
+            self.repositories.latest_active_message_id(boundary.save_id)
+            == boundary.expected_head_message_id
+        )
 
     def _prepare_action_choices_if_configured(
         self,
@@ -3675,11 +3806,20 @@ class ChatService:
         save_id: str,
         player_message_id: str,
         narrator_message_id: str,
+        turn_revision: TurnRevisionBoundary | Mapping[str, object] | None = None,
         progress_callback: PostTurnProgressCallback | None = None,
         world_update_context: PostTurnWorldUpdateContext | None = None,
         verified_coverage: VerifiedPostTurnCoverage | None = None,
         current_user_id: str | None = None,
     ) -> None:
+        boundary = self._coerce_turn_revision(
+            turn_revision,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+        )
+        current_head = self._turn_revision_is_current_head(boundary)
+        stale_rebase = not current_head
         configured_inference_mode = post_turn_inference_mode(
             self.repositories,
             save_id=save_id,
@@ -3711,12 +3851,20 @@ class ChatService:
                     "effective_post_turn_inference_mode": inference_mode,
                     "post_turn_inference_mode_reason": inference_mode_reason,
                     "verified_plan_coverage": verified_coverage.to_json(),
+                    "turn_revision": boundary.to_json(),
+                    "turn_revision_status": (
+                        "current_head" if current_head else "stale_rebase"
+                    ),
                 },
                 collect_provider_diagnostics=True,
             )
-            prepared_image = self._prepare_automatic_image_if_due(
-                save_id=save_id,
-                source_message_id=narrator_message_id,
+            prepared_image = (
+                None
+                if stale_rebase
+                else self._prepare_automatic_image_if_due(
+                    save_id=save_id,
+                    source_message_id=narrator_message_id,
+                )
             )
             return coordinator, prepared_image
 
@@ -3920,6 +4068,7 @@ class ChatService:
                         pressure=current_pressure,
                         inference_mode=inference_mode,
                         verified_coverage=verified_coverage,
+                        turn_revision=boundary,
                     )
                     step_results[name] = {
                         "deferred": True,
@@ -3981,6 +4130,7 @@ class ChatService:
                     reason="post_turn_context_update_timeout",
                     inference_mode=inference_mode,
                     verified_coverage=verified_coverage,
+                    turn_revision=boundary,
                 )
                 step_results[name] = {
                     "deferred": True,
@@ -4016,6 +4166,7 @@ class ChatService:
             post_turn_inference_mode=configured_inference_mode,
             effective_post_turn_inference_mode=inference_mode,
             post_turn_inference_mode_reason=inference_mode_reason,
+            turn_revision_status="current_head" if current_head else "stale_rebase",
         )
         publish("state", "pending")
 
@@ -4026,6 +4177,8 @@ class ChatService:
                 narrator_message_id=narrator_message_id,
                 inference_mode=inference_mode,
                 verified_coverage=verified_coverage,
+                source_scoped_only=stale_rebase,
+                turn_revision=boundary,
             ),
             "context": lambda: self._update_context_if_configured(
                 save_id=save_id,
@@ -4033,6 +4186,7 @@ class ChatService:
                 narrator_message_id=narrator_message_id,
                 inference_mode=inference_mode,
                 verified_coverage=verified_coverage,
+                turn_revision=boundary,
             ),
             "time_reconciliation": lambda: (
                 self._reconcile_world_time_after_turn_if_configured(
@@ -4076,6 +4230,42 @@ class ChatService:
         }
 
         async def run_named_step(name: str) -> str:
+            if stale_rebase and name == "context":
+                return await run_step(
+                    name,
+                    lambda: _PostTurnStepResult(
+                        "succeeded",
+                        {
+                            "source_scoped_rebased": True,
+                            "turn_revision_status": "stale_rebase",
+                            "source_message_ids": [
+                                player_message_id,
+                                narrator_message_id,
+                            ],
+                        },
+                    ),
+                )
+            if stale_rebase and name in {
+                "time_reconciliation",
+                "proactive_text",
+                "director",
+                "scenario",
+                "image",
+            }:
+                return await run_step(
+                    name,
+                    lambda: _PostTurnStepResult(
+                        "skipped",
+                        {
+                            "skipped_reason": "stale_turn_rebase",
+                            "turn_revision_status": "stale_rebase",
+                            "source_message_ids": [
+                                player_message_id,
+                                narrator_message_id,
+                            ],
+                        },
+                    ),
+                )
             if name in pressure_sensitive_jobs:
                 return await run_pressure_sensitive_step(name, callbacks[name])
             return await run_step(name, callbacks[name])
@@ -4085,6 +4275,8 @@ class ChatService:
                 save_id=save_id,
                 source_message_ids=(player_message_id, narrator_message_id),
                 source="post_turn_context",
+                base_snapshot_id=boundary.base_snapshot_id,
+                source_scoped_only=stale_rebase,
             )
 
         pending = set(POST_TURN_JOB_ORDER)
@@ -4196,6 +4388,8 @@ class ChatService:
             "effective_post_turn_inference_mode": inference_mode,
             "post_turn_inference_mode_reason": inference_mode_reason,
             "verified_plan_coverage": verified_coverage.to_json(),
+            "turn_revision": boundary.to_json(),
+            "turn_revision_status": "current_head" if current_head else "stale_rebase",
             "context_update_deferred_count": (
                 1 if statuses.get("context") == "deferred" else 0
             ),
@@ -4215,7 +4409,25 @@ class ChatService:
             coordinator_result["maintenance_degraded"] = True
             coordinator_result["maintenance_failed_jobs"] = maintenance_failed_jobs
 
+        def finalize_current_head_snapshot() -> None:
+            if not current_head or not self._turn_revision_is_current_head(boundary):
+                return
+            try:
+                TurnSnapshotService(self.repositories).capture_message_snapshot(
+                    save_id=save_id,
+                    message_id=narrator_message_id,
+                    reason="post_turn_jobs_finalized",
+                )
+            except Exception as exc:
+                log_error_event(
+                    "chat.post_turn_snapshot_finalize_failed",
+                    save_id=save_id,
+                    narrator_message_id=narrator_message_id,
+                    **exception_log_fields(exc),
+                )
+
         def finish_coordinator() -> None:
+            finalize_current_head_snapshot()
             self.jobs.succeed(coordinator.id, result=coordinator_result)
 
         if world_update_context is None:
@@ -4278,6 +4490,20 @@ class ChatService:
                     error="State retry job is missing source_message_ids",
                 )
                 continue
+            raw_turn_revision = payload.get("turn_revision")
+            explicit_turn_revision = (
+                isinstance(raw_turn_revision, TurnRevisionBoundary)
+                or TurnRevisionBoundary.from_json(raw_turn_revision) is not None
+            )
+            boundary = self._coerce_turn_revision(
+                raw_turn_revision
+                if isinstance(raw_turn_revision, TurnRevisionBoundary | Mapping)
+                else None,
+                save_id=retry_save_id,
+                player_message_id=source_message_ids[0],
+                narrator_message_id=source_message_ids[-1],
+            )
+            stale_rebase = not self._turn_revision_is_current_head(boundary)
             if self._successful_state_extraction_exists(
                 save_id=retry_save_id,
                 source_message_ids=source_message_ids,
@@ -4297,15 +4523,18 @@ class ChatService:
                     full_post_turn_context=True,
                     inference_mode=inference_mode,
                     verified_coverage=verified_coverage,
+                    turn_revision=boundary if explicit_turn_revision else None,
                 )
-                self.jobs.succeed(
-                    running.id,
-                    result={
-                        "source_message_ids": list(source_message_ids),
-                        "already_applied": True,
-                        "context_retry_job_id": context_retry_job.id,
-                    },
-                )
+                already_applied_result: dict[str, object] = {
+                    "source_message_ids": list(source_message_ids),
+                    "already_applied": True,
+                    "context_retry_job_id": context_retry_job.id,
+                }
+                if explicit_turn_revision:
+                    already_applied_result["turn_revision_status"] = (
+                        "stale_rebase" if stale_rebase else "current_head"
+                    )
+                self.jobs.succeed(running.id, result=already_applied_result)
                 completed += 1
                 continue
             extractor_info = self._state_extractor_for_retry(
@@ -4337,6 +4566,7 @@ class ChatService:
                     include_memories=include_memories,
                     inference_mode=inference_mode,
                     verified_coverage=verified_coverage,
+                    source_scoped_only=stale_rebase,
                 )
             except asyncio.CancelledError:
                 self.jobs.cancel(
@@ -4391,6 +4621,9 @@ class ChatService:
                                 provider=provider_name,
                                 model=model_id,
                                 pressure=retry_pressure,
+                                turn_revision=(
+                                    boundary if explicit_turn_revision else None
+                                ),
                             ),
                         )
                         retry_result["next_retry_job_id"] = next_retry.id
@@ -4417,6 +4650,7 @@ class ChatService:
                 full_post_turn_context=True,
                 inference_mode=inference_mode,
                 verified_coverage=verified_coverage,
+                turn_revision=boundary if explicit_turn_revision else None,
             )
             success_result: dict[str, object] = {
                 "source_message_ids": list(source_message_ids),
@@ -4424,6 +4658,12 @@ class ChatService:
                 "memory_count": len(applied.memories),
                 "context_retry_job_id": context_retry_job.id,
             }
+            if explicit_turn_revision:
+                success_result["turn_revision_status"] = (
+                    "stale_rebase" if stale_rebase else "current_head"
+                )
+            if stale_rebase:
+                success_result["source_scoped_rebased"] = True
             if applied.suppressed_memory_count:
                 success_result["suppressed_memory_count"] = (
                     applied.suppressed_memory_count
@@ -4474,6 +4714,45 @@ class ChatService:
                     error="Retry job is missing source_message_ids",
                 )
                 continue
+            raw_turn_revision = payload.get("turn_revision")
+            explicit_turn_revision = (
+                isinstance(raw_turn_revision, TurnRevisionBoundary)
+                or TurnRevisionBoundary.from_json(raw_turn_revision) is not None
+            )
+            boundary = self._coerce_turn_revision(
+                raw_turn_revision
+                if isinstance(raw_turn_revision, TurnRevisionBoundary | Mapping)
+                else None,
+                save_id=retry_save_id,
+                player_message_id=source_message_ids[0],
+                narrator_message_id=source_message_ids[-1],
+            )
+            stale_rebase = (
+                explicit_turn_revision
+                and not self._turn_revision_is_current_head(boundary)
+            )
+            if stale_rebase:
+                self._run_post_turn_context_barrier(
+                    save_id=retry_save_id,
+                    source_message_ids=source_message_ids,
+                    source="context_retry",
+                    base_snapshot_id=boundary.base_snapshot_id,
+                    source_scoped_only=True,
+                )
+                self.jobs.succeed(
+                    running.id,
+                    result={
+                        "source_message_ids": list(source_message_ids),
+                        "full_post_turn_context": _context_retry_full_post_turn_context(
+                            payload
+                        ),
+                        "context_status": "succeeded",
+                        "source_scoped_rebased": True,
+                        "turn_revision_status": "stale_rebase",
+                    },
+                )
+                completed += 1
+                continue
             if _context_retry_full_post_turn_context(payload):
                 inference_mode = _context_retry_inference_mode(payload)
                 verified_coverage = verified_post_turn_coverage_from_mapping(
@@ -4490,6 +4769,7 @@ class ChatService:
                         narrator_message_id=source_message_ids[-1],
                         inference_mode=inference_mode,
                         verified_coverage=verified_coverage,
+                        turn_revision=boundary if explicit_turn_revision else None,
                     )
                 except asyncio.CancelledError:
                     self.jobs.cancel(
@@ -4535,6 +4815,8 @@ class ChatService:
                     save_id=retry_save_id,
                     source_message_ids=source_message_ids,
                     source="context_retry",
+                    base_snapshot_id=boundary.base_snapshot_id,
+                    source_scoped_only=False,
                 )
                 context_status, context_result = _post_turn_step_status_and_result(
                     full_context_result
@@ -4544,6 +4826,10 @@ class ChatService:
                     "full_post_turn_context": True,
                     "context_status": context_status,
                 }
+                if explicit_turn_revision:
+                    full_context_result_payload["turn_revision_status"] = (
+                        "current_head"
+                    )
                 if context_result is not None:
                     full_context_result_payload["context_result"] = context_result
                 retry_pressure = provider_pressure_from_result(context_result)
@@ -4646,6 +4932,9 @@ class ChatService:
                                     max_retry_attempts=max_retry_attempts,
                                     existing_payload=payload,
                                     pressure=retry_pressure,
+                                    turn_revision=(
+                                        boundary if explicit_turn_revision else None
+                                    ),
                                 ),
                             },
                         )
@@ -4669,6 +4958,8 @@ class ChatService:
             success_result: dict[str, object] = {
                 "source_message_ids": list(source_message_ids),
             }
+            if explicit_turn_revision:
+                success_result["turn_revision_status"] = "current_head"
             retry_pressure = provider_pressure_from_result(
                 _context_update_result_mapping(update_result)
             )
@@ -4679,6 +4970,8 @@ class ChatService:
                 save_id=retry_save_id,
                 source_message_ids=source_message_ids,
                 source="context_retry",
+                base_snapshot_id=boundary.base_snapshot_id,
+                source_scoped_only=False,
             )
             self.jobs.succeed(
                 running.id,
@@ -4693,13 +4986,17 @@ class ChatService:
         save_id: str,
         source_message_ids: tuple[str, ...],
         source: str,
+        base_snapshot_id: str | None = None,
+        source_scoped_only: bool = False,
     ) -> None:
         self._persist_turn_message_scene_presence(
             save_id=save_id,
             source_message_ids=source_message_ids,
             source=source,
+            base_snapshot_id=base_snapshot_id,
+            source_scoped_only=source_scoped_only,
         )
-        if len(source_message_ids) < 2:
+        if source_scoped_only or len(source_message_ids) < 2:
             return
         self._update_dating_routes_after_turn(
             save_id=save_id,
@@ -4713,9 +5010,29 @@ class ChatService:
         save_id: str,
         source_message_ids: tuple[str, ...],
         source: str,
+        base_snapshot_id: str | None = None,
+        source_scoped_only: bool = False,
     ) -> None:
-        snapshot = self.repositories.get_scene_snapshot(save_id)
-        present_character_ids = snapshot.present_character_ids if snapshot else []
+        if source_scoped_only:
+            present_character_ids: tuple[str, ...] = ()
+            if base_snapshot_id:
+                try:
+                    present_character_ids = TurnSnapshotService(
+                        self.repositories
+                    ).snapshot_present_character_ids(snapshot_id=base_snapshot_id)
+                except Exception as exc:
+                    log_error_event(
+                        "chat.message_scene_presence_snapshot_read_failed",
+                        save_id=save_id,
+                        snapshot_id=base_snapshot_id,
+                        source=source,
+                        **exception_log_fields(exc),
+                    )
+        else:
+            snapshot = self.repositories.get_scene_snapshot(save_id)
+            present_character_ids = (
+                tuple(snapshot.present_character_ids) if snapshot else ()
+            )
         messages = {
             message.id: message
             for message in self.repositories.list_messages(save_id)
@@ -4856,6 +5173,7 @@ class ChatService:
         include_memories: bool,
         inference_mode: str,
         verified_coverage: VerifiedPostTurnCoverage,
+        source_scoped_only: bool = False,
     ) -> AppliedExtraction:
         suppressed_memory_fingerprints = (
             verified_coverage.memory_fingerprints
@@ -4876,6 +5194,7 @@ class ChatService:
             include_memories=include_memories,
             suppressed_memory_fingerprints=suppressed_memory_fingerprints,
             suppressed_state_keys=suppressed_state_keys,
+            source_scoped_only=source_scoped_only,
         )
 
     def _state_extractor_for_retry(
@@ -6041,6 +6360,8 @@ class ChatService:
         narrator_message_id: str,
         inference_mode: str = POST_TURN_INFERENCE_MODE_LEGACY,
         verified_coverage: VerifiedPostTurnCoverage | None = None,
+        source_scoped_only: bool = False,
+        turn_revision: TurnRevisionBoundary | None = None,
     ) -> str | _PostTurnStepResult:
         verified_coverage = verified_coverage or VerifiedPostTurnCoverage(
             source_message_ids=(player_message_id, narrator_message_id)
@@ -6080,6 +6401,7 @@ class ChatService:
                 reason="state_extraction_unavailable",
                 provider=preference.provider,
                 model=preference.model_id,
+                turn_revision=turn_revision,
             )
             log_error_event(
                 "chat.state_extraction_skipped",
@@ -6114,6 +6436,7 @@ class ChatService:
                 include_memories=include_memories,
                 inference_mode=inference_mode,
                 verified_coverage=verified_coverage,
+                source_scoped_only=source_scoped_only,
             )
             return _state_extraction_step_result(
                 applied,
@@ -6132,6 +6455,7 @@ class ChatService:
                 provider=preference.provider,
                 model=preference.model_id,
                 pressure=pressure,
+                turn_revision=turn_revision,
             )
             log_error_event(
                 "chat.state_extraction_failed",
@@ -6300,6 +6624,7 @@ class ChatService:
         narrator_message_id: str,
         inference_mode: str = POST_TURN_INFERENCE_MODE_LEGACY,
         verified_coverage: VerifiedPostTurnCoverage | None = None,
+        turn_revision: TurnRevisionBoundary | None = None,
     ) -> str | _PostTurnStepResult:
         verified_coverage = verified_coverage or VerifiedPostTurnCoverage(
             source_message_ids=(player_message_id, narrator_message_id)
@@ -6405,6 +6730,7 @@ class ChatService:
                 pressure=pressure,
                 inference_mode=inference_mode,
                 verified_coverage=verified_coverage,
+                turn_revision=turn_revision,
             )
             log_error_event(
                 "chat.context_update_failed",
@@ -6477,6 +6803,7 @@ class ChatService:
         provider: str | None = None,
         model: str | None = None,
         pressure: ProviderPressure | None = None,
+        turn_revision: TurnRevisionBoundary | None = None,
     ) -> JobRecord:
         existing = self._queued_state_extraction_retry_job(
             save_id=save_id,
@@ -6500,6 +6827,7 @@ class ChatService:
             provider=provider,
             model=model,
             pressure=pressure,
+            turn_revision=turn_revision,
         )
         if existing is not None:
             return self.repositories.update_queued_job_payload(
@@ -6598,6 +6926,7 @@ class ChatService:
         full_post_turn_context: bool = False,
         inference_mode: str | None = None,
         verified_coverage: VerifiedPostTurnCoverage | None = None,
+        turn_revision: TurnRevisionBoundary | None = None,
     ) -> JobRecord:
         existing = self._queued_context_update_retry_job(
             save_id=save_id,
@@ -6621,6 +6950,7 @@ class ChatService:
             full_post_turn_context=full_post_turn_context,
             inference_mode=inference_mode,
             verified_coverage=verified_coverage,
+            turn_revision=turn_revision,
         )
         if existing is not None:
             return self.repositories.update_queued_job_payload(
@@ -10273,6 +10603,7 @@ def _state_extraction_retry_payload(
     provider: str | None = None,
     model: str | None = None,
     pressure: ProviderPressure | None = None,
+    turn_revision: TurnRevisionBoundary | None = None,
 ) -> dict[str, object]:
     payload = dict(existing_payload or {})
     payload.update(
@@ -10303,6 +10634,8 @@ def _state_extraction_retry_payload(
             payload["last_pressure_http_status"] = pressure.http_status
         if pressure.source_job_id is not None:
             payload["last_pressure_job_id"] = pressure.source_job_id
+    if turn_revision is not None:
+        payload["turn_revision"] = turn_revision.to_json()
     return payload
 
 
@@ -10319,6 +10652,7 @@ def _context_update_retry_payload(
     full_post_turn_context: bool = False,
     inference_mode: str | None = None,
     verified_coverage: VerifiedPostTurnCoverage | None = None,
+    turn_revision: TurnRevisionBoundary | None = None,
 ) -> dict[str, object]:
     payload = dict(existing_payload or {})
     payload.update(
@@ -10343,6 +10677,8 @@ def _context_update_retry_payload(
         payload["effective_post_turn_inference_mode"] = inference_mode
     if verified_coverage is not None:
         payload["verified_plan_coverage"] = verified_coverage.to_json()
+    if turn_revision is not None:
+        payload["turn_revision"] = turn_revision.to_json()
     if pressure is not None:
         payload["last_deferred_reason"] = (
             "provider_pressure" if reason == "provider_pressure_deferred" else reason
