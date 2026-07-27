@@ -446,12 +446,14 @@ class StructuredProviderContextCurator:
         model_id: str,
         repositories: PersistenceRepositories | None = None,
         providers: dict[str, ProviderClient] | None = None,
+        input_token_budget: int = CURATION_INPUT_TOKEN_BUDGET,
     ) -> None:
         self.provider = provider
         self.provider_name = provider_name
         self.model_id = model_id
         self.repositories = repositories
         self.providers = providers
+        self.input_token_budget = max(1, input_token_budget)
 
     async def curate(
         self,
@@ -503,58 +505,63 @@ class StructuredProviderContextCurator:
         )
         if not violating_decisions:
             return decisions
-        violating_ids = {
-            decision.observation_id for decision in violating_decisions
+        violating_by_id = {
+            decision.observation_id: decision for decision in violating_decisions
         }
+        violating_ids = set(violating_by_id)
         retry_observations = tuple(
             observation
             for observation in observations
             if observation.id in violating_ids
         )
-        subset_request = request_with_openrouter_routing(
-            self.repositories,
-            replace(
+        retry_by_id: dict[str, CurationDecision] = {}
+        for observation in retry_observations:
+            rejected = violating_by_id[observation.id]
+            subset_request = replace(
                 request,
-                schema=_curation_schema(retry_observations),
-                messages=_curation_messages(retry_observations),
-            ),
-            task="memory_curation",
-            save_id=save_id,
-        )
-        retry_request = _structured_request_with_script_policy_feedback(
-            subset_request,
-            tuple(
-                violation
-                for decision in violating_decisions
-                for violation in decision.script_policy_violations
-            ),
-        )
-        retry_response = await _structured_response(
-            provider=self.provider,
-            repositories=self.repositories,
-            providers=self.providers,
-            request=retry_request,
-            task="memory_curation",
-            save_id=save_id,
-        )
-        retry_decisions = _curation_decisions_from_data(
-            retry_response.data,
-            retry_observations,
-        )
-        checked_retry_decisions = _mark_curation_decision_script_policy_violations(
-            retry_decisions,
-            observations=retry_observations,
-            source_texts_by_observation=source_texts_by_observation,
-            mode=mode,
-        )
-        retry_by_id = {
-            decision.observation_id: decision for decision in checked_retry_decisions
-        }
+                schema=_curation_schema((observation,)),
+                messages=_curation_messages((observation,)),
+            )
+            retry_request = _structured_request_with_script_policy_feedback(
+                subset_request,
+                rejected.script_policy_violations,
+            )
+            if (
+                _structured_request_estimated_tokens(retry_request)
+                > self.input_token_budget
+            ):
+                continue
+            retry_response = await _structured_response(
+                provider=self.provider,
+                repositories=self.repositories,
+                providers=self.providers,
+                request=retry_request,
+                task="memory_curation",
+                save_id=save_id,
+            )
+            retry_decisions = _curation_decisions_from_data(
+                retry_response.data,
+                (observation,),
+            )
+            checked_retry_decisions = (
+                _mark_curation_decision_script_policy_violations(
+                    retry_decisions,
+                    observations=(observation,),
+                    source_texts_by_observation=source_texts_by_observation,
+                    mode=mode,
+                )
+            )
+            if checked_retry_decisions:
+                retry_by_id[observation.id] = checked_retry_decisions[0]
         return tuple(
-            retry_by_id.get(decision.observation_id, decision)
-            if decision.observation_id in violating_ids
-            else decision
-            for decision in decisions
+            decision
+            for decision in (
+                retry_by_id.get(decision.observation_id)
+                if decision.observation_id in violating_ids
+                else decision
+                for decision in decisions
+            )
+            if decision is not None
         )
 
 
@@ -822,6 +829,32 @@ class ContextCurationService:
             lease_token=lease_token,
         ):
             return (0, 0, 0, 0, 0)
+        current_observation = self.repositories.get_context_observation(
+            observation.id
+        )
+        if current_observation is None or current_observation.status != "pending":
+            return (0, 0, 0, 0, 0)
+        current_source_texts = _curation_source_texts_by_observation(
+            repositories=self.repositories,
+            save_id=save_id,
+            observations=(current_observation,),
+        )
+        if not _context_observation_evidence_is_grounded(
+            current_observation,
+            source_texts_by_observation=current_source_texts,
+        ):
+            self._mark_observation_evidence_rejected(
+                current_observation,
+                lease_token=lease_token,
+            )
+            return (0, 1, 0, 0, 0)
+        decision = _mark_curation_decision_script_policy_violations(
+            (decision,),
+            observations=(current_observation,),
+            source_texts_by_observation=current_source_texts,
+            mode=script_guard_mode(self.repositories, save_id=save_id),
+        )[0]
+        observation = current_observation
         if decision.script_policy_violations:
             self._mark_observation_script_policy_rejected(
                 observation,
@@ -952,13 +985,15 @@ class ContextCurationService:
         *,
         lease_token: str,
     ) -> None:
-        self.repositories.complete_context_observation_curation(
+        completed = self.repositories.complete_context_observation_curation(
             observation.id,
             lease_token=lease_token,
             status=status,
             terminal_outcome=status,
             metadata={"curation": _decision_metadata(decision)},
         )
+        if completed is None:
+            raise RuntimeError("Observation curation lease was lost")
 
     def _mark_observation_script_policy_rejected(
         self,
@@ -968,7 +1003,7 @@ class ContextCurationService:
         lease_token: str,
     ) -> None:
         diagnostic = first_violation_diagnostic(violations)
-        self.repositories.complete_context_observation_curation(
+        completed = self.repositories.complete_context_observation_curation(
             observation.id,
             lease_token=lease_token,
             status="discarded",
@@ -983,6 +1018,8 @@ class ContextCurationService:
                 },
             },
         )
+        if completed is None:
+            raise RuntimeError("Observation curation lease was lost")
 
     def _mark_observation_evidence_rejected(
         self,
@@ -990,7 +1027,7 @@ class ContextCurationService:
         *,
         lease_token: str,
     ) -> None:
-        self.repositories.complete_context_observation_curation(
+        completed = self.repositories.complete_context_observation_curation(
             observation.id,
             lease_token=lease_token,
             status="discarded",
@@ -1006,6 +1043,8 @@ class ContextCurationService:
                 },
             },
         )
+        if completed is None:
+            raise RuntimeError("Observation curation lease was lost")
 
     def _defer_observation(
         self,
@@ -1633,6 +1672,23 @@ def _curation_request_estimated_tokens(
             "schema": _curation_schema(observations),
             "messages": [
                 {"role": message.role, "body": message.body} for message in messages
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return max(1, (len(payload) + 3) // 4)
+
+
+def _structured_request_estimated_tokens(
+    request: StructuredOutputRequest,
+) -> int:
+    payload = json.dumps(
+        {
+            "schema": request.schema,
+            "messages": [
+                {"role": message.role, "body": message.body}
+                for message in request.messages
             ],
         },
         sort_keys=True,

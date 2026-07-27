@@ -21,6 +21,7 @@ from bragi.providers.contracts import (
     StructuredOutputRequest,
     StructuredOutputResponse,
 )
+from bragi.services import agentic_context as agentic_context_module
 from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_SETTING,
     PLAN_FIRST_NARRATOR_SETTING,
@@ -545,6 +546,48 @@ def test_context_curation_terminalizes_an_observation_over_input_budget(
     assert state.terminal_outcome == "input_budget_exceeded"
 
 
+def test_context_curation_cancellation_releases_lease_for_restart(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, _narrator = repositories.list_messages(save.id)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara prefers grounded narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+    )
+
+    class CancelledCurator:
+        async def curate(
+            self,
+            *,
+            save_id: str,
+            observations: tuple[ContextObservationRecord, ...],
+        ) -> tuple[CurationDecision, ...]:
+            raise asyncio.CancelledError
+
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=CancelledCurator(),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(service.curate_pending(save.id))
+
+    state = repositories.get_context_observation_curation_state(observation.id)
+    assert state is not None
+    assert state.attempt_count == 1
+    assert state.lease_token is None
+    assert state.lease_until is None
+    assert state.next_eligible_at is not None
+    assert state.last_error == "cancelled"
+    assert state.terminal_outcome is None
+
+
 def test_context_curation_rejects_unexpected_generated_script(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -726,6 +769,62 @@ def test_context_curation_retries_only_script_violating_observations(
     assert len(provider.structured_output_requests) == 2
 
 
+def test_script_policy_retry_never_exceeds_curation_input_budget(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, _narrator = repositories.list_messages(save.id)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara likes concise narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "稳定的叙事偏好。",
+                        "confidence": 0.9,
+                        "memory_body": "玩家喜欢简洁的叙事。",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                    }
+                ]
+            }
+        }
+    )
+    input_budget = agentic_context_module._curation_request_estimated_tokens(
+        (observation,)
+    )
+    curator = StructuredProviderContextCurator(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="curator",
+        repositories=repositories,
+        input_token_budget=input_budget,
+    )
+
+    decisions = asyncio.run(
+        curator.curate(save_id=save.id, observations=(observation,))
+    )
+
+    assert decisions == ()
+    assert len(provider.structured_output_requests) == 1
+    assert all(
+        agentic_context_module._structured_request_estimated_tokens(request)
+        <= input_budget
+        for request in provider.structured_output_requests
+    )
+
+
 def test_context_curation_service_rejects_custom_curator_unexpected_script(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -827,6 +926,59 @@ def test_context_curation_discards_observations_with_ungrounded_evidence(
     updated = repositories.get_context_observation(observation.id)
     assert updated is not None
     assert updated.status == "discarded"
+
+
+def test_context_curation_rechecks_evidence_after_provider_io(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, _narrator = repositories.list_messages(save.id)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara likes grounded narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+    )
+
+    class EditingCurator:
+        async def curate(
+            self,
+            *,
+            save_id: str,
+            observations: tuple[ContextObservationRecord, ...],
+        ) -> tuple[CurationDecision, ...]:
+            repositories.connection.execute(
+                "UPDATE messages SET body = ? WHERE id = ?",
+                ("The player changed this message.", player.id),
+            )
+            repositories.commit()
+            return (
+                CurationDecision(
+                    observation_id=observations[0].id,
+                    action="durable_memory",
+                    reason="Stable preference.",
+                    confidence=0.9,
+                    memory_body="Mara likes grounded narration.",
+                ),
+            )
+
+    result = asyncio.run(
+        ContextCurationService(
+            repositories=repositories,
+            curator=EditingCurator(),
+        ).curate_pending(save.id)
+    )
+
+    assert result.accepted_count == 0
+    assert result.discarded_count == 1
+    assert repositories.list_memories(save.id) == []
+    updated = repositories.get_context_observation(observation.id)
+    assert updated is not None
+    assert updated.status == "discarded"
+    assert "evidence_rejected" in updated.metadata
 
 
 def test_context_curation_discards_observations_with_missing_source_message(

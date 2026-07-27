@@ -2057,6 +2057,68 @@ def test_context_observation_claims_are_exclusive_across_connections(
             connection.close()
 
 
+def test_expired_context_observation_lease_cannot_complete_or_defer(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The eastern signal is lit.",
+    )
+    repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="expired-worker",
+        lease_seconds=600,
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_observation_curation_state
+        SET lease_until = '2000-01-01 00:00:00'
+        WHERE observation_id = ?
+        """,
+        (observation.id,),
+    )
+    repositories.commit()
+
+    assert not repositories.owns_context_observation_curation_lease(
+        observation.id,
+        lease_token="expired-worker",
+    )
+    assert (
+        repositories.complete_context_observation_curation(
+            observation.id,
+            lease_token="expired-worker",
+            status="accepted",
+            terminal_outcome="accepted",
+        )
+        is None
+    )
+    assert (
+        repositories.defer_context_observation_curation(
+            observation.id,
+            lease_token="expired-worker",
+            error="too late",
+            retry_after_seconds=60,
+            max_attempts=5,
+        )
+        is None
+    )
+    reclaimed = repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="replacement-worker",
+        lease_seconds=600,
+    )
+    assert [row.id for row in reclaimed] == [observation.id]
+
+
 def test_repositories_archive_context_observations_for_deleted_messages(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -13,6 +13,7 @@ from bragi.services.character_registry_maintenance_service import (
     CHARACTER_MAINTENANCE_TURN_CADENCE,
 )
 from bragi.services.memory_consolidation_service import MEMORY_CONSOLIDATION_THRESHOLD
+from bragi.services.model_preferences import set_save_model_override_preference
 from bragi_web.jobs import JobRegistry
 from bragi_web.runtime import SaveEventHub
 from bragi_web.scheduler import (
@@ -751,6 +752,48 @@ def test_scheduler_drains_observation_curation_for_inactive_save(
     )
     assert task is not None
     assert task.payload["active_save_only"] is False
+
+
+def test_scheduler_skips_unconfigured_curation_backlogs_without_starvation(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    save_ids = [
+        _save(repositories, title=f"Backlog {index}") for index in range(11)
+    ]
+    for index, save_id in enumerate(save_ids):
+        repositories.add_context_observation(
+            save_id=save_id,
+            observation_type="event",
+            claim=f"Observation {index}",
+            evidence_quote=f"Observation {index}",
+            source_message_ids=[],
+            scope="durable",
+            confidence=0.9,
+        )
+    runnable_save_id = save_ids[-1]
+    set_save_model_override_preference(
+        repositories,
+        save_id=runnable_save_id,
+        task="memory_curation",
+        provider="fake",
+        model_id="fake-curator",
+    )
+    runtime = _ReviewRuntime(active_save_id=save_ids[0])
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.observation_curation_calls == [runnable_save_id]
 
 
 def test_scheduler_drains_inactive_context_retry_while_active_save_job_runs(

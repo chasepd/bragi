@@ -3411,6 +3411,7 @@ class PersistenceRepositories:
         self,
         *,
         limit: int,
+        offset: int = 0,
     ) -> list[str]:
         if limit <= 0:
             return []
@@ -3433,9 +3434,9 @@ class PersistenceRepositories:
               )
             GROUP BY observation.save_id
             ORDER BY MIN(observation.created_at), MIN(observation.rowid)
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (limit,),
+            (limit, max(0, offset)),
         )
         return [str(row["save_id"]) for row in rows]
 
@@ -3583,6 +3584,7 @@ class PersistenceRepositories:
                 WHERE observation_id = ?
                   AND lease_token = ?
                   AND terminal_outcome IS NULL
+                  AND lease_until > CURRENT_TIMESTAMP
                 """,
                 (observation_id, lease_token),
             )
@@ -3613,6 +3615,7 @@ class PersistenceRepositories:
                 WHERE observation_id = ?
                   AND lease_token = ?
                   AND terminal_outcome IS NULL
+                  AND lease_until > CURRENT_TIMESTAMP
                 """,
                 (terminal_outcome, observation_id, lease_token),
             )
@@ -3650,6 +3653,7 @@ class PersistenceRepositories:
                 WHERE observation_id = ?
                   AND lease_token = ?
                   AND terminal_outcome IS NULL
+                  AND lease_until > CURRENT_TIMESTAMP
                 """,
                 (observation_id, lease_token),
             )
@@ -3658,7 +3662,7 @@ class PersistenceRepositories:
                 return None
             exhausted = int(row["attempt_count"]) >= max(1, max_attempts)
             safe_error = (redact_text(error) or "")[:240]
-            self.connection.execute(
+            cursor = self.connection.execute(
                 """
                 UPDATE context_observation_curation_state
                 SET lease_token = NULL,
@@ -3674,7 +3678,9 @@ class PersistenceRepositories:
                         WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL
                     END,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE observation_id = ? AND lease_token = ?
+                WHERE observation_id = ?
+                  AND lease_token = ?
+                  AND lease_until > CURRENT_TIMESTAMP
                 """,
                 (
                     int(exhausted),
@@ -3686,6 +3692,9 @@ class PersistenceRepositories:
                     lease_token,
                 ),
             )
+            if cursor.rowcount == 0:
+                self.rollback_transaction()
+                return None
             if exhausted:
                 self.update_context_observation(
                     observation_id,
