@@ -2985,7 +2985,7 @@ def _context_active_threads(
             thread,
             known_character_ids=known_character_ids,
         )
-        if not audience_ids or audience_ids & reference_character_ids:
+        if audience_ids & reference_character_ids:
             visible.append(thread)
     return visible
 

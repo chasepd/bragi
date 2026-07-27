@@ -95,6 +95,7 @@ def test_consolidation_rewrites_canonical_archives_duplicates_and_unions_sources
         tags=["relationship"],
         importance=0.7,
         source_message_id=messages[0].id,
+        source_observation_ids=["observation-canonical"],
     )
     duplicate = repositories.add_memory(
         save_id=save.id,
@@ -102,6 +103,7 @@ def test_consolidation_rewrites_canonical_archives_duplicates_and_unions_sources
         tags=["relationship", "ilyra"],
         importance=0.8,
         source_message_id=messages[1].id,
+        source_observation_ids=["observation-duplicate"],
     )
     provider = FakeStructuredProvider(
         {
@@ -154,6 +156,10 @@ def test_consolidation_rewrites_canonical_archives_duplicates_and_unions_sources
     assert memories[0].importance == 0.92
     assert memories[0].source_message_id == messages[0].id
     assert memories[0].source_message_ids == [messages[0].id, messages[1].id]
+    assert memories[0].source_observation_ids == [
+        "observation-canonical",
+        "observation-duplicate",
+    ]
 
     archived = repositories.connection.execute(
         "SELECT archived_at FROM memories WHERE id = ?",

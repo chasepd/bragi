@@ -1868,6 +1868,31 @@ def test_import_save_preserves_memory_and_scene_scratch_provenance(
     assert imported_scratch.expires_after_turn_number == 13
 
 
+def test_import_save_accepts_legacy_memories_without_observation_provenance(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    bundle_path = tmp_path / "exports" / "night-watch-schema-70.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    def remove_v71_memory_fields(data: dict[str, object]) -> None:
+        rows = data["memories"]
+        assert isinstance(rows, list)
+        for row in rows:
+            assert isinstance(row, dict)
+            row.pop("source_observation_ids_json", None)
+
+    _rewrite_bundle_data(bundle_path, remove_v71_memory_fields)
+
+    imported = service.import_save(bundle_path)
+    [imported_memory] = repositories.list_memories(_imported_save_id(imported))
+
+    assert imported_memory.source_observation_ids == []
+
+
 def test_import_save_ignores_historical_job_diagnostics(
     repositories: PersistenceRepositories,
     tmp_path: Path,

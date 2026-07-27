@@ -1550,7 +1550,10 @@ def _curation_decisions_from_data(
     raw_items = data.get("decisions", [])
     if not isinstance(raw_items, list):
         raise ValueError("Curation decisions must be a list")
-    allowed_ids = {observation.id for observation in observations}
+    observations_by_id = {
+        observation.id: observation for observation in observations
+    }
+    allowed_ids = set(observations_by_id)
     decisions: list[CurationDecision] = []
     for raw in raw_items:
         if not isinstance(raw, dict):
@@ -1558,6 +1561,7 @@ def _curation_decisions_from_data(
         observation_id = _string(raw.get("observation_id"))
         if observation_id not in allowed_ids:
             continue
+        observation = observations_by_id[observation_id]
         decisions.append(
             CurationDecision(
                 observation_id=observation_id,
@@ -1568,12 +1572,16 @@ def _curation_decisions_from_data(
                 context_title=_string(raw.get("context_title")),
                 context_body=_string(raw.get("context_body")),
                 tags=_string_tuple(raw.get("tags")),
-                grounding_status=_string(raw.get("grounding_status")),
-                supporting_evidence_quote=_string(
-                    raw.get("supporting_evidence_quote")
+                grounding_status=(
+                    _string(raw.get("grounding_status")) or "entailed"
                 ),
-                supporting_source_message_ids=_string_tuple(
-                    raw.get("supporting_source_message_ids")
+                supporting_evidence_quote=(
+                    _string(raw.get("supporting_evidence_quote"))
+                    or observation.evidence_quote
+                ),
+                supporting_source_message_ids=(
+                    _string_tuple(raw.get("supporting_source_message_ids"))
+                    or tuple(observation.source_message_ids)
                 ),
             )
         )
@@ -3155,33 +3163,32 @@ def _curated_decision_is_grounded(
     observation: ContextObservationRecord,
     source_texts: tuple[str, ...],
 ) -> bool:
-    if decision.grounding_status:
-        if decision.grounding_status != "entailed":
-            return False
-        if not decision.supporting_source_message_ids:
-            return False
-        if not set(decision.supporting_source_message_ids).issubset(
-            observation.source_message_ids
-        ):
-            return False
-        if not _meaningful_evidence_span(decision.supporting_evidence_quote):
-            return False
-        if len(source_texts) != len(observation.source_message_ids):
-            return False
-        supporting_texts = tuple(
-            source_text
-            for source_message_id, source_text in zip(
-                observation.source_message_ids,
-                source_texts,
-                strict=True,
-            )
-            if source_message_id in decision.supporting_source_message_ids
+    if decision.grounding_status != "entailed":
+        return False
+    if not decision.supporting_source_message_ids:
+        return False
+    if not set(decision.supporting_source_message_ids).issubset(
+        observation.source_message_ids
+    ):
+        return False
+    if not _meaningful_evidence_span(decision.supporting_evidence_quote):
+        return False
+    if len(source_texts) != len(observation.source_message_ids):
+        return False
+    supporting_texts = tuple(
+        source_text
+        for source_message_id, source_text in zip(
+            observation.source_message_ids,
+            source_texts,
+            strict=True,
         )
-        if not supporting_texts or not any(
-            quote_matches_source(decision.supporting_evidence_quote, source_text)
-            for source_text in supporting_texts
-        ):
-            return False
+        if source_message_id in decision.supporting_source_message_ids
+    )
+    if not supporting_texts or not any(
+        quote_matches_source(decision.supporting_evidence_quote, source_text)
+        for source_text in supporting_texts
+    ):
+        return False
     proposed = (
         decision.memory_body.strip() or observation.claim
         if decision.action == "durable_memory"
@@ -3195,7 +3202,11 @@ def _curated_decision_is_grounded(
         )
     )
     grounding_text = " ".join(
-        (observation.claim, observation.evidence_quote, *source_texts)
+        (
+            observation.claim,
+            observation.evidence_quote,
+            decision.supporting_evidence_quote,
+        )
     )
     if _grounding_negation_conflicts(proposed, observation.claim):
         return False
@@ -3204,7 +3215,7 @@ def _curated_decision_is_grounded(
     if not proposed_terms:
         return False
     overlap = proposed_terms & grounding_terms
-    return len(overlap) / len(proposed_terms) >= 0.6
+    return len(overlap) / len(proposed_terms) >= 0.8
 
 
 def _grounding_terms(value: str) -> set[str]:
@@ -3219,11 +3230,17 @@ def _grounding_terms(value: str) -> set[str]:
         "was",
         "with",
     }
-    return {
+    terms = {
         term if len(term) <= 6 else term[:5]
         for term in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
         if len(term) >= 3 and term not in stopwords
     }
+    terms.update(
+        term
+        for term in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
+        if term in {"no", "not", "never", "none", "without"}
+    )
+    return terms
 
 
 def _grounding_negation_conflicts(proposed: str, observation_claim: str) -> bool:

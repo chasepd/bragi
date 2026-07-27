@@ -79,6 +79,12 @@ class RecordingWorldDataContextProvider:
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "context_retrieval_expansion":
+            return StructuredOutputResponse(
+                data={"terms": [], "phrases": [], "entity_ids": []},
+                provider=request.provider,
+                model_id=request.model_id,
+            )
         self.structured_output_requests.append(request)
         prompt = "\n".join(message.body for message in request.messages)
         assert "The archived bell memory should not enter narrator context." not in (
@@ -1201,6 +1207,14 @@ def test_world_data_service_applies_memory_suggestion_with_observation_provenanc
         },
         source_message_ids=[ids["message"]],
     )
+    existing = repositories.add_memory(
+        save_id=save_id,
+        body=observation.claim,
+        tags=["existing"],
+        importance=0.4,
+        source_message_ids=[],
+        source_observation_ids=["earlier-observation"],
+    )
     service = world_data.WorldDataService(
         repositories=repositories,
         active_save_id=save_id,
@@ -1208,13 +1222,21 @@ def test_world_data_service_applies_memory_suggestion_with_observation_provenanc
 
     service.apply_suggestions((suggestion.id,))
 
-    memory = next(
+    [memory] = [
         memory
         for memory in repositories.list_memories(save_id)
         if memory.body == observation.claim
-    )
-    assert memory.source_observation_ids == [observation.id]
-    assert memory.claim_fingerprint == fingerprint
+    ]
+    assert memory.id == existing.id
+    assert memory.tags == ["existing", "ilyra", "promise"]
+    assert memory.importance == 0.9
+    assert memory.source_message_ids == [ids["message"]]
+    assert memory.source_observation_ids == [
+        "earlier-observation",
+        observation.id,
+    ]
+    assert memory.claim_fingerprint != fingerprint
+    assert memory.claim_fingerprint
 
 
 def test_world_data_service_applies_scene_time_suggestion_with_canonical_provenance(

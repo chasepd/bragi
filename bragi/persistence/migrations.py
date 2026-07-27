@@ -1694,6 +1694,77 @@ def _migrate_schema_70_to_71(connection: sqlite3.Connection) -> None:
                 "UPDATE memories SET claim_fingerprint = ? WHERE id = ?",
                 (_migration_claim_fingerprint(body), memory_id),
             )
+        if _table_exists(connection, "context_observations"):
+            observations_by_claim: dict[tuple[str, str], list[str]] = {}
+            observation_rows = connection.execute(
+                """
+                SELECT id, save_id, claim, metadata_json
+                FROM context_observations
+                WHERE archived_at IS NULL AND status = 'accepted'
+                ORDER BY created_at, rowid
+                """
+            ).fetchall()
+            for observation_id, save_id, claim, metadata_json in observation_rows:
+                try:
+                    metadata = json.loads(metadata_json)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(metadata, dict):
+                    continue
+                curation = metadata.get("curation")
+                if (
+                    not isinstance(curation, dict)
+                    or curation.get("action") != "durable_memory"
+                ):
+                    continue
+                memory_body = curation.get("memory_body")
+                body = (
+                    memory_body.strip()
+                    if isinstance(memory_body, str) and memory_body.strip()
+                    else str(claim)
+                )
+                fingerprint = _migration_claim_fingerprint(body)
+                if fingerprint:
+                    observations_by_claim.setdefault(
+                        (str(save_id), fingerprint),
+                        [],
+                    ).append(str(observation_id))
+            memory_rows = connection.execute(
+                """
+                SELECT id, save_id, claim_fingerprint,
+                       source_observation_ids_json
+                FROM memories
+                WHERE archived_at IS NULL
+                """
+            ).fetchall()
+            for memory_id, save_id, fingerprint, existing_json in memory_rows:
+                matching_ids = observations_by_claim.get(
+                    (str(save_id), str(fingerprint)),
+                    [],
+                )
+                if not matching_ids:
+                    continue
+                try:
+                    existing = json.loads(existing_json)
+                except (json.JSONDecodeError, TypeError):
+                    existing = []
+                existing_ids = (
+                    [str(item) for item in existing if isinstance(item, str)]
+                    if isinstance(existing, list)
+                    else []
+                )
+                merged_ids = list(dict.fromkeys((*existing_ids, *matching_ids)))
+                connection.execute(
+                    """
+                    UPDATE memories
+                    SET source_observation_ids_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        json.dumps(merged_ids, separators=(",", ":")),
+                        memory_id,
+                    ),
+                )
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_memories_save_claim_fingerprint_active

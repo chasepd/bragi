@@ -3710,6 +3710,86 @@ def test_repositories_search_context_sources_with_unicode_terms(
     assert [hit.record for hit in cjk_hits] == [cjk]
 
 
+def test_repositories_unicode_match_all_cannot_be_starved_by_partial_matches(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-target",
+        title="秘密の地図",
+        body="秘密の地図は古い書庫にある。",
+    )
+    for index in range(90):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=f"memory-noise-{index:02d}",
+            title=f"秘密 {index:02d}",
+            body="秘密だけを記録した新しいメモ。",
+        )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"秘密", "地図"},
+        source_types={"memory"},
+        limit=1,
+        match_all=True,
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_exact_phrase_precedes_bounded_all_term_matches(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    target = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-exact-phrase",
+        title="Old mechanism",
+        body="The copper notch under the western stair opens the vault.",
+    )
+    for index in range(30):
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id=f"memory-all-terms-{index:02d}",
+            title=f"New mechanism {index:02d}",
+            body=(
+                "The western vault records a stair repair and a copper "
+                f"notch inspection {index:02d}."
+            ),
+        )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"copper", "notch", "western", "stair"},
+        source_types={"memory"},
+        limit=24,
+        match_all=True,
+        exact_phrases=("copper notch under the western stair",),
+    )
+
+    assert hits[0].record == target
+
+
 def test_repositories_apply_context_visibility_before_search_limit(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3831,14 +3911,40 @@ def test_repositories_expire_scene_scratch_on_generation_change(
     assert same_scene.scene_generation == scene.scene_generation
     assert repositories.get_context_source(scratch.id) is not None
 
+    advanced_scene = repositories.advance_scene_generation(
+        save_id=save_id,
+        source_message_id=message_id,
+    )
+    same_location_next_scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        current_location_id=first_location.id,
+        situation="A new confrontation begins.",
+        source_message_id=message_id,
+    )
+    assert same_location_next_scene.scene_generation == advanced_scene.scene_generation
+    assert same_location_next_scene.scene_generation == scene.scene_generation + 1
+    assert repositories.get_context_source(scratch.id) is None
+
+    next_scratch = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="observation",
+        source_id="next-scratch-observation",
+        title="Temporary archive state",
+        body="The confrontation remains unresolved.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=same_location_next_scene.id,
+        scene_generation=same_location_next_scene.scene_generation,
+        created_turn_number=2,
+        expires_after_turn_number=14,
+    )
     next_scene = repositories.upsert_scene_snapshot(
         save_id=save_id,
         current_location_id=second_location.id,
         source_message_id=message_id,
     )
 
-    assert next_scene.scene_generation == scene.scene_generation + 1
-    assert repositories.get_context_source(scratch.id) is None
+    assert next_scene.scene_generation == scene.scene_generation + 2
+    assert repositories.get_context_source(next_scratch.id) is None
 
 
 def test_repositories_archive_scene_scratch_after_turn_ttl(
@@ -3876,6 +3982,38 @@ def test_repositories_archive_scene_scratch_after_turn_ttl(
         marker.id
         for marker in repositories.list_curated_observation_source_markers(save_id)
     ] == [scratch.id]
+
+
+def test_repositories_hide_expired_scene_scratch_from_ordinary_reads(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        situation="The beacon lens is warm.",
+        source_message_id=message_id,
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="observation",
+        source_id="scratch-observation",
+        title="Temporary lens state",
+        body="The lens is warm.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=0,
+        expires_after_turn_number=1,
+    )
+
+    repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        body="The scene advances.",
+    )
+
+    assert repositories.get_context_source(scratch.id) is None
+    assert repositories.list_context_sources(save_id) == []
 
 
 def test_repositories_delete_scene_snapshot_archives_bound_scratch(

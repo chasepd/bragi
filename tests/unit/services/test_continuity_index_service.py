@@ -409,3 +409,74 @@ def test_continuity_index_excludes_completed_active_threads(
     }
     assert ("open_obligation", thread.id) not in keys
     assert repositories.get_context_source(stale_index.id) is None
+
+
+def test_continuity_index_private_thread_with_unknown_audience_fails_closed(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    thread = repositories.add_active_thread(
+        save_id=save.id,
+        title="Private signal",
+        description="The hidden lens code must not leave the tower.",
+        priority=10,
+        visibility="private",
+        related_entities=["character:missing-character"],
+    )
+
+    result = ContinuityIndexService(repositories).sync_save(save.id)
+    source = next(
+        source
+        for source in repositories.list_context_sources(save.id)
+        if source.source_type == "open_obligation" and source.source_id == thread.id
+    )
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"lens"},
+        source_types={"open_obligation"},
+        limit=8,
+        reference_character_ids=set(),
+    )
+
+    assert result.skipped_counts["active_thread"] == 0
+    assert source.metadata["requires_audience"] is True
+    assert hits == []
+
+
+def test_continuity_index_does_not_cap_active_threads_before_retrieval(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    threads = [
+        repositories.add_active_thread(
+            save_id=save.id,
+            title=f"Obligation {index:02d}",
+            description=f"Resolve signal duty {index:02d}.",
+            priority=100 - index,
+        )
+        for index in range(81)
+    ]
+
+    result = ContinuityIndexService(repositories).sync_save(save.id)
+    indexed_thread_ids = {
+        source.source_id
+        for source in repositories.list_context_sources(save.id)
+        if source.source_type == "open_obligation"
+    }
+
+    assert result.skipped_counts["active_thread"] == 0
+    assert indexed_thread_ids == {thread.id for thread in threads}

@@ -363,10 +363,28 @@ def test_migrate_database_upgrades_schema_70_context_lifecycle(
             content={},
         )
         save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+        observation = repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="character_fact",
+            claim="Mara likes tea.",
+            evidence_quote="Mara likes tea.",
+            source_message_ids=[],
+            scope="durable",
+            status="accepted",
+            confidence=0.95,
+            tags=["preference"],
+            metadata={
+                "curation": {
+                    "action": "durable_memory",
+                    "memory_body": "Mara Likes Tea!",
+                }
+            },
+        )
         memory = repositories.add_memory(
             save_id=save.id,
             body="Mara Likes Tea!",
             tags=[],
+            source_observation_ids=[observation.id],
         )
         connection.execute("DROP INDEX idx_memories_save_claim_fingerprint_active")
         connection.execute(
@@ -406,7 +424,10 @@ def test_migrate_database_upgrades_schema_70_context_lifecycle(
             FROM memories WHERE id = ?
             """,
             (memory.id,),
-        ).fetchone() == (expected_fingerprint, "[]")
+        ).fetchone() == (
+            expected_fingerprint,
+            json.dumps([observation.id], separators=(",", ":")),
+        )
         index_row = connection.execute(
             """
             SELECT sql FROM sqlite_master

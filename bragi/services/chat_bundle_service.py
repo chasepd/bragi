@@ -1352,9 +1352,10 @@ class ChatBundleService:
                 continue
             source_observation_ids = [
                 observation_id_map[original_id]
-                for original_id in _json_string_list(
-                    row,
-                    "source_observation_ids_json",
+                for original_id in (
+                    _json_string_list(row, "source_observation_ids_json")
+                    if "source_observation_ids_json" in row
+                    else []
                 )
                 if original_id in observation_id_map
             ]

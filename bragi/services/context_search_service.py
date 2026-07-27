@@ -130,6 +130,7 @@ RELATIVE_PATH_PATTERN = re.compile(
 )
 BASE64_LIKE_TOKEN_PATTERN = re.compile(r"\b(?:[A-Za-z0-9+/]{40,}={0,2}\s*){2,}")
 CONTEXT_SEARCH_SELECTION_TOOL = "select_context_source"
+CONTEXT_RETRIEVAL_EXPANSION_TOOL = "expand_context_retrieval"
 CONTEXT_RETRIEVAL_RECOVERY_PROVIDER_FALLBACK = "provider_fallback"
 CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC = "deterministic_fallback"
 
@@ -926,6 +927,13 @@ def _indexed_context_source_retrieval(
             " ".join((latest_player_message, *additional_query_terms))
         )
     )
+    exact_phrases = tuple(
+        dict.fromkeys(
+            phrase.strip()
+            for phrase in (latest_player_message, *additional_query_terms)
+            if " " in phrase.strip()
+        )
+    )
     turn_scope = character_scope_for_turn(
         scene_snapshot=scene_snapshot,
         characters=characters,
@@ -984,6 +992,7 @@ def _indexed_context_source_retrieval(
         current_turn_number=current_turn_number,
         blocked_source_keys=scoped_targets.blocked,
         match_all=True,
+        exact_phrases=exact_phrases,
     )
     broad_hits = repositories.search_context_sources(
         save_id,
@@ -1066,30 +1075,60 @@ async def _retrieve_indexed_context_sources(
         character_knowledge_edges=character_knowledge_edges,
         entity_links=entity_links,
     )
+    if not latest_player_message.strip():
+        return initial
+    supports_tools = (
+        isinstance(provider, ToolCallProvider)
+        and _model_supports_tool_calling(
+            repositories=repositories,
+            provider=provider_name,
+            model_id=model_id,
+        )
+    )
+    supports_structured = (
+        isinstance(provider, StructuredOutputProvider)
+        and _model_supports_structured_output(
+            repositories=repositories,
+            provider=provider_name,
+            model_id=model_id,
+        )
+    )
     initial_hit_count = initial.diagnostics.get("indexed_retrieval_hit_count")
-    query_needs_expansion = (
+    tool_expansion_needed = (
         not isinstance(initial_hit_count, int | float)
         or initial_hit_count <= 0
         or _query_contains_referential_pronoun(latest_player_message)
     )
-    if (
-        not latest_player_message.strip()
-        or not query_needs_expansion
-        or not isinstance(provider, StructuredOutputProvider)
-    ):
+    if supports_tools:
+        if not tool_expansion_needed:
+            return initial
+        expanded_terms = await _tool_retrieval_expansion(
+            repositories=repositories,
+            provider=cast(ToolCallProvider, provider),
+            provider_name=provider_name,
+            model_id=model_id,
+            save_id=save_id,
+            latest_player_message=latest_player_message,
+            scene_snapshot=scene_snapshot,
+            characters=characters,
+            recent_messages=recent_messages,
+            message_visibility=message_visibility,
+        )
+    elif supports_structured:
+        expanded_terms = await _structured_retrieval_expansion(
+            repositories=repositories,
+            provider=cast(StructuredOutputProvider, provider),
+            provider_name=provider_name,
+            model_id=model_id,
+            save_id=save_id,
+            latest_player_message=latest_player_message,
+            scene_snapshot=scene_snapshot,
+            characters=characters,
+            recent_messages=recent_messages,
+            message_visibility=message_visibility,
+        )
+    else:
         return initial
-    expanded_terms = await _structured_retrieval_expansion(
-        repositories=repositories,
-        provider=provider,
-        provider_name=provider_name,
-        model_id=model_id,
-        save_id=save_id,
-        latest_player_message=latest_player_message,
-        scene_snapshot=scene_snapshot,
-        characters=characters,
-        recent_messages=recent_messages,
-        message_visibility=message_visibility,
-    )
     if not expanded_terms:
         return initial
     expanded = _indexed_context_source_retrieval(
@@ -1216,9 +1255,145 @@ async def _structured_retrieval_expansion(
                 task="context_search",
             )
         )
-    except (ProviderError, ValueError, KeyError, TypeError):
+    except (ProviderError, ValueError, KeyError, TypeError, AssertionError):
         return ()
     data = response.data
+    terms = _string_values(data.get("terms"), limit=12)
+    phrases = _string_values(data.get("phrases"), limit=6)
+    selected_ids = set(_string_values(data.get("entity_ids"), limit=8))
+    entity_terms = tuple(
+        value
+        for character in eligible_characters
+        if character.id in selected_ids
+        for value in (character.name, *character.aliases)
+    )
+    return tuple(dict.fromkeys((*terms, *phrases, *entity_terms)))
+
+
+async def _tool_retrieval_expansion(
+    *,
+    repositories: PersistenceRepositories,
+    provider: ToolCallProvider,
+    provider_name: str,
+    model_id: str,
+    save_id: str,
+    latest_player_message: str,
+    scene_snapshot: SceneSnapshotRecord | None,
+    characters: list[CharacterRecord],
+    recent_messages: list[MessageRecord],
+    message_visibility: list[MessageVisibilityRecord],
+) -> tuple[str, ...]:
+    present_ids = frozenset(
+        scene_snapshot.present_character_ids if scene_snapshot is not None else ()
+    )
+    visible_recent = [
+        message
+        for message in recent_messages
+        if message_visible_to_present_characters(
+            message_id=message.id,
+            present_character_ids=present_ids,
+            message_visibility=message_visibility,
+        )
+    ][-6:]
+    eligible_characters = [
+        character
+        for character in characters
+        if character.id in present_ids
+        or character_name_is_mentioned(
+            name=character.name,
+            aliases=character.aliases,
+            text=" ".join(message.body for message in visible_recent),
+        )
+    ]
+    entity_ids = [character.id for character in eligible_characters]
+    parameters: dict[str, object] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "terms": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {"type": "string"},
+            },
+            "phrases": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {"type": "string"},
+            },
+            "entity_ids": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {"type": "string", "enum": entity_ids},
+            },
+        },
+        "required": ["terms", "phrases", "entity_ids"],
+    }
+    entity_text = "\n".join(
+        f"- {character.id}: {character.name}; aliases={', '.join(character.aliases)}"
+        for character in eligible_characters
+    ) or "none"
+    recent_text = "\n".join(
+        f"- {message.speaker_name or message.role}: {message.body}"
+        for message in visible_recent
+    )
+    request = request_with_openrouter_routing(
+        repositories,
+        ToolCallRequest(
+            provider=provider_name,
+            model_id=model_id,
+            messages=(
+                ToolCallMessage(
+                    role="system",
+                    body=(
+                        "Call expand_context_retrieval once with short synonymous "
+                        "terms, phrases, and visible entity references. Use only "
+                        "the provided entity IDs."
+                    ),
+                ),
+                ToolCallMessage(
+                    role="user",
+                    body=(
+                        f"Player query:\n{latest_player_message}\n\n"
+                        f"Visible entities:\n{entity_text}\n\n"
+                        f"Visible recent context:\n{recent_text}"
+                    ),
+                ),
+            ),
+            tools=(
+                ToolDefinition(
+                    name=CONTEXT_RETRIEVAL_EXPANSION_TOOL,
+                    description="Expand a continuity query for local retrieval.",
+                    parameters=parameters,
+                ),
+            ),
+            temperature=0.0,
+        ),
+        task="context_search",
+        save_id=save_id,
+    )
+    try:
+        response = await provider.generate_tool_calls(
+            budget_tool_call_request(
+                repositories,
+                request,
+                task="context_search",
+            )
+        )
+    except (ProviderError, ValueError, KeyError, TypeError):
+        return ()
+    call = next(
+        (
+            item
+            for item in response.tool_calls
+            if item.name == CONTEXT_RETRIEVAL_EXPANSION_TOOL
+        ),
+        None,
+    )
+    if call is None:
+        return ()
+    data, parse_error = parse_tool_arguments_json(call.arguments_json)
+    if data is None or parse_error is not None:
+        return ()
     terms = _string_values(data.get("terms"), limit=12)
     phrases = _string_values(data.get("phrases"), limit=6)
     selected_ids = set(_string_values(data.get("entity_ids"), limit=8))
@@ -1378,6 +1553,8 @@ def _context_candidate_set(
         scoped_targets=scoped_targets,
         reference_character_ids=audience_reference_character_ids,
         accepted_observation_ids=accepted_observation_ids,
+        present_character_ids=turn_scope.present_character_ids,
+        message_visibility=message_visibility or [],
     )
     state_candidates = (
         _state_candidates(
@@ -1389,13 +1566,20 @@ def _context_candidate_set(
         else ()
     )
     memory_candidates = (
-        _memory_candidates(memories, scoped_targets=scoped_targets)
+        _memory_candidates(
+            memories,
+            scoped_targets=scoped_targets,
+            present_character_ids=turn_scope.present_character_ids,
+            message_visibility=message_visibility or [],
+        )
         if include_missing_raw_candidates
         else ()
     )
     observation_candidates = _observation_candidates(
         observation_records,
         excluded_observation_ids=curated_observation_source_ids,
+        present_character_ids=turn_scope.present_character_ids,
+        message_visibility=message_visibility or [],
     )
     if indexed_candidates:
         canonical_candidates = (
@@ -3043,6 +3227,8 @@ def _indexed_context_candidates(
     scoped_targets: ScopedTargets,
     reference_character_ids: frozenset[str],
     accepted_observation_ids: frozenset[str],
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
     candidates: list[_ContextCandidate] = []
     for record in records:
@@ -3053,6 +3239,14 @@ def _indexed_context_candidates(
             accepted_observation_ids=accepted_observation_ids,
         )
         if source_type is None:
+            continue
+        if source_type in {"memory", "observation"} and not (
+            _source_messages_visible_to_present_characters(
+                _metadata_source_message_ids(record.metadata),
+                present_character_ids=present_character_ids,
+                message_visibility=message_visibility,
+            )
+        ):
             continue
         if _audience_candidate_blocked(record, reference_character_ids):
             continue
@@ -3120,8 +3314,9 @@ def _audience_candidate_blocked(
     reference_character_ids: frozenset[str],
 ) -> bool:
     audience_character_ids = record.metadata.get("audience_character_ids")
+    requires_audience = record.metadata.get("requires_audience") is True
     if not isinstance(audience_character_ids, list) or not audience_character_ids:
-        return False
+        return requires_audience
     normalized_audience = {
         str(character_id)
         for character_id in audience_character_ids
@@ -3507,9 +3702,25 @@ def _memory_candidates(
     records: list[MemoryRecord],
     *,
     scoped_targets: ScopedTargets,
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
     candidates: list[_ContextCandidate] = []
     for record in records:
+        source_message_ids = tuple(
+            dict.fromkeys(
+                (
+                    *record.source_message_ids,
+                    *((record.source_message_id,) if record.source_message_id else ()),
+                )
+            )
+        )
+        if not _source_messages_visible_to_present_characters(
+            source_message_ids,
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility,
+        ):
+            continue
         text = _scoped_candidate_text(
             source_type="memory",
             source_id=record.id,
@@ -3533,12 +3744,20 @@ def _observation_candidates(
     records: list[ContextObservationRecord],
     *,
     excluded_observation_ids: frozenset[str],
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
     candidates: list[_ContextCandidate] = []
     for record in records:
         if record.status != "accepted":
             continue
         if record.id in excluded_observation_ids:
+            continue
+        if not _source_messages_visible_to_present_characters(
+            tuple(record.source_message_ids),
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility,
+        ):
             continue
         text = (
             f"{record.claim} Evidence: {record.evidence_quote or 'not quoted'}; "
@@ -3557,6 +3776,37 @@ def _observation_candidates(
             )
         )
     return tuple(candidates)
+
+
+def _metadata_source_message_ids(
+    metadata: Mapping[str, object],
+) -> tuple[str, ...]:
+    raw_ids = metadata.get("source_message_ids")
+    if not isinstance(raw_ids, list):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            str(item)
+            for item in raw_ids
+            if isinstance(item, str) and item.strip()
+        )
+    )
+
+
+def _source_messages_visible_to_present_characters(
+    source_message_ids: tuple[str, ...],
+    *,
+    present_character_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
+) -> bool:
+    return all(
+        message_visible_to_present_characters(
+            message_id=message_id,
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility,
+        )
+        for message_id in source_message_ids
+    )
 
 
 def _message_candidates(

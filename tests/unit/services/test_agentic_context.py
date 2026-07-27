@@ -846,6 +846,62 @@ def test_context_curation_rejects_quote_from_wrong_declared_source(
     assert repositories.list_memories(save.id) == []
 
 
+def test_context_curation_rejects_high_overlap_negation_contradiction(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    source = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara has no key to the vault.",
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="character_fact",
+        claim="Mara has no key to the vault.",
+        evidence_quote="Mara has no key to the vault",
+        source_message_ids=[source.id],
+        scope="durable",
+        confidence=0.95,
+        tags=["vault"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "Vault access fact.",
+                        "confidence": 0.95,
+                        "memory_body": "Mara has a key to the vault.",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["vault"],
+                        "grounding_status": "entailed",
+                        "supporting_evidence_quote": "Mara has no key to the vault",
+                        "supporting_source_message_ids": [source.id],
+                    }
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.accepted_count == 0
+    assert result.confirmation_count == 1
+    assert repositories.list_memories(save.id) == []
+
+
 def test_context_curation_queues_durable_memory_when_confirmation_enabled(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -31,7 +31,10 @@ from bragi.persistence.models import (
     SceneSnapshotRecord,
     SummaryRecord,
 )
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.services.character_locks import merge_character_locked_fields
 from bragi.services.character_profile_completion import (
     CHARACTER_STARTERS_CONTENT_KEY,
@@ -3177,23 +3180,59 @@ def _apply_suggestion_value(
             if isinstance(raw_source_observation_ids, list)
             else None
         )
-        claim_fingerprint = value.get("claim_fingerprint")
-        repositories.add_memory(
-            save_id=save_id,
-            body=body,
-            tags=_string_list_value(value.get("tags", []), "Memory tags"),
-            importance=float(importance),
-            source_message_id=(
-                source_message_id if isinstance(source_message_id, str) else None
-            ),
-            source_message_ids=memory_source_message_ids,
-            source_observation_ids=memory_source_observation_ids,
-            claim_fingerprint=(
-                claim_fingerprint
-                if isinstance(claim_fingerprint, str)
-                else None
-            ),
-        )
+        tags = _string_list_value(value.get("tags", []), "Memory tags")
+        fingerprint = canonical_claim_fingerprint(body)
+        repositories.begin_immediate_transaction()
+        try:
+            existing = next(
+                (
+                    memory
+                    for memory in repositories.list_memories(save_id)
+                    if memory.claim_fingerprint == fingerprint
+                ),
+                None,
+            )
+            if existing is None:
+                repositories.add_memory(
+                    save_id=save_id,
+                    body=body,
+                    tags=tags,
+                    importance=float(importance),
+                    source_message_id=(
+                        source_message_id
+                        if isinstance(source_message_id, str)
+                        else None
+                    ),
+                    source_message_ids=memory_source_message_ids,
+                    source_observation_ids=memory_source_observation_ids,
+                )
+            else:
+                repositories.update_memory(
+                    memory_id=existing.id,
+                    body=existing.body,
+                    tags=list(dict.fromkeys((*existing.tags, *tags))),
+                    importance=max(existing.importance, float(importance)),
+                    source_message_ids=list(
+                        dict.fromkeys(
+                            (
+                                *existing.source_message_ids,
+                                *(memory_source_message_ids or ()),
+                            )
+                        )
+                    ),
+                    source_observation_ids=list(
+                        dict.fromkeys(
+                            (
+                                *existing.source_observation_ids,
+                                *(memory_source_observation_ids or ()),
+                            )
+                        )
+                    ),
+                )
+            repositories.commit_transaction()
+        except Exception:
+            repositories.rollback_transaction()
+            raise
         return
     if suggestion.entity_type == "character" and suggestion.update_type == "create":
         if not isinstance(value, dict):

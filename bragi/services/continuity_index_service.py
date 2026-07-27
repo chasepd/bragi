@@ -52,7 +52,7 @@ HIGH_VALUE_FACT_TYPES = frozenset(
 DEFAULT_WORLD_STATE_INDEX_LIMIT: int | None = None
 DEFAULT_MEMORY_INDEX_LIMIT: int | None = None
 DEFAULT_SUMMARY_INDEX_LIMIT: int | None = None
-DEFAULT_ACTIVE_THREAD_INDEX_LIMIT = 80
+DEFAULT_ACTIVE_THREAD_INDEX_LIMIT: int | None = None
 CHARACTER_PROFILE_DETAIL_MAX_CHARS = 320
 CHARACTER_TEXT_THREAD_RECENT_MESSAGE_LIMIT = 4
 CHARACTER_TEXT_THREAD_LINE_MAX_CHARS = 220
@@ -72,7 +72,7 @@ class ContinuityIndexService:
         world_state_limit: int | None = DEFAULT_WORLD_STATE_INDEX_LIMIT,
         memory_limit: int | None = DEFAULT_MEMORY_INDEX_LIMIT,
         summary_limit: int | None = DEFAULT_SUMMARY_INDEX_LIMIT,
-        active_thread_limit: int = DEFAULT_ACTIVE_THREAD_INDEX_LIMIT,
+        active_thread_limit: int | None = DEFAULT_ACTIVE_THREAD_INDEX_LIMIT,
     ) -> None:
         self.repositories = repositories
         self.world_state_limit = (
@@ -80,9 +80,23 @@ class ContinuityIndexService:
         )
         self.memory_limit = None if memory_limit is None else max(0, memory_limit)
         self.summary_limit = None if summary_limit is None else max(0, summary_limit)
-        self.active_thread_limit = max(0, active_thread_limit)
+        self.active_thread_limit = (
+            None
+            if active_thread_limit is None
+            else max(0, active_thread_limit)
+        )
 
     def sync_save(self, save_id: str) -> ContinuityIndexSyncResult:
+        self.repositories.begin_transaction()
+        try:
+            result = self._sync_save(save_id)
+            self.repositories.commit_transaction()
+            return result
+        except Exception:
+            self.repositories.rollback_transaction()
+            raise
+
+    def _sync_save(self, save_id: str) -> ContinuityIndexSyncResult:
         details = self.repositories.load_save_details(save_id)
         if details is None:
             raise ValueError(f"Unknown save id: {save_id}")
@@ -314,6 +328,7 @@ class ContinuityIndexService:
                     thread.related_entities,
                     known_character_ids=frozenset(characters_by_id),
                 )
+                metadata["requires_audience"] = True
                 if audience_ids:
                     metadata |= {
                         "audience_character_ids": sorted(audience_ids),

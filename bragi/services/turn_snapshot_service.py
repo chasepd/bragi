@@ -322,6 +322,7 @@ _ENTITY_TABLES = {
     "state": "world_state",
     "world_state": "world_state",
     "memory": "memories",
+    "observation": "context_observations",
     "summary": "summaries",
     "context_source": "context_sources",
     "dating_route_state": "dating_route_states",

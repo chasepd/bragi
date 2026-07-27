@@ -729,6 +729,7 @@ def test_snapshot_backed_fork_remaps_character_text_rows_and_attachment_media(
 
 def test_restore_snapshot_replaces_scene_scratch_before_its_scene(
     repositories: PersistenceRepositories,
+    tmp_path: Path,
 ) -> None:
     save = _create_save(repositories)
     message = repositories.append_message(
@@ -779,6 +780,18 @@ def test_restore_snapshot_replaces_scene_scratch_before_its_scene(
     assert restored_scene is not None
     assert restored_scratch is not None
     assert restored_scratch.scene_snapshot_id == restored_scene.id
+
+    fork = SaveForkService(repositories).fork_from_message(
+        save_id=save.id,
+        message_id=message.id,
+        media_dir=tmp_path / "media",
+    )
+    [fork_observation] = repositories.list_context_observations(fork.save.id)
+    [fork_scratch] = repositories.list_context_sources(
+        fork.save.id,
+        source_type="observation",
+    )
+    assert fork_scratch.source_id == fork_observation.id
 
 
 def test_snapshot_backed_fork_remaps_character_text_reply_links(

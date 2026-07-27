@@ -9810,7 +9810,7 @@ def test_submit_player_turn_cancels_running_context_search_child_task(
     asyncio.run(submit_and_cancel())
 
     assert [request.schema_name for request in provider.structured_output_requests] == [
-        "context_search_selection"
+        "context_retrieval_expansion"
     ]
     assert provider.chat_requests == []
     persisted_messages = repositories.list_messages(save.id)
@@ -9924,7 +9924,7 @@ def test_submit_player_turn_cancels_context_search_from_another_thread(
     asyncio.run(submit_and_cancel_from_thread())
 
     assert [request.schema_name for request in provider.structured_output_requests] == [
-        "context_search_selection"
+        "context_retrieval_expansion"
     ]
     assert provider.chat_requests == []
     persisted_messages = repositories.list_messages(save.id)
