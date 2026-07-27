@@ -42,7 +42,7 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolDefinition,
 )
-from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.providers.errors import ProviderError
 from bragi.redaction import redact_text
 from bragi.services.context_assembly import scenario_section_candidates
 from bragi.services.continuity_index_service import ContinuityIndexService
@@ -1191,12 +1191,6 @@ async def _select_context_with_structured_output(
         )
         result = _context_result_from_structured_data(response.data, candidates)
     except ProviderError as exc:
-        _mark_provider_model_unavailable_for_error(
-            repositories,
-            provider=provider_name,
-            model_id=model_id,
-            exc=exc,
-        )
         log_error_event(
             "provider.structured_output_failed",
             provider=provider_name,
@@ -1379,12 +1373,6 @@ async def _recover_context_structured_selection(
         )
         result = _context_result_from_structured_data(response.data, candidates)
     except ProviderError as exc:
-        _mark_provider_model_unavailable_for_error(
-            repositories,
-            provider=fallback_request.provider,
-            model_id=fallback_request.model_id,
-            exc=exc,
-        )
         log_error_event(
             "provider.structured_output_fallback_failed",
             provider=fallback_request.provider,
@@ -1504,12 +1492,6 @@ async def _select_context_with_tool_calls(
             error_category="schema_validation_failed",
         )
     except ProviderError as exc:
-        _mark_provider_model_unavailable_for_error(
-            repositories,
-            provider=provider_name,
-            model_id=model_id,
-            exc=exc,
-        )
         log_error_event(
             "provider.tool_call_failed",
             provider=provider_name,
@@ -1701,12 +1683,6 @@ async def _recover_context_tool_selection(
             error_category="schema_validation_failed",
         )
     except ProviderError as exc:
-        _mark_provider_model_unavailable_for_error(
-            repositories,
-            provider=fallback_request.provider,
-            model_id=fallback_request.model_id,
-            exc=exc,
-        )
         log_error_event(
             "provider.tool_call_fallback_failed",
             provider=fallback_request.provider,
@@ -1795,23 +1771,6 @@ def _error_category(exc: Exception | None) -> str | None:
 
 def _http_status(exc: Exception | None) -> int | None:
     return exc.status_code if isinstance(exc, ProviderError) else None
-
-
-def _mark_provider_model_unavailable_for_error(
-    repositories: PersistenceRepositories,
-    *,
-    provider: str,
-    model_id: str,
-    exc: Exception,
-) -> None:
-    if not isinstance(exc, ProviderError):
-        return
-    if exc.category != ProviderErrorCategory.MODEL_NOT_FOUND:
-        return
-    repositories.mark_provider_model_unavailable(
-        provider=provider,
-        model_id=model_id,
-    )
 
 
 async def _select_context_with_tool_feedback(
