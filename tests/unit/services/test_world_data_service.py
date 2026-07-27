@@ -188,6 +188,10 @@ def test_world_data_service_model_is_import_safe_and_exposes_active_save_data(
     assert _value(summaries[ids["summary"]], "body") == (
         "The watch began as the tower beacon started failing."
     )
+    assert _value(summaries[ids["summary"]], "source_message_ids") == (
+        ids["message"],
+    )
+    assert _value(summaries[ids["summary"]], "source_summary_ids") == ()
     assert _error_text(model) == ""
 
 
@@ -3512,6 +3516,7 @@ def _persist_world_data_fixture(
         body="The watch began as the tower beacon started failing.",
         provider="fake",
         model="fake-summary",
+        source_message_ids=(message.id,),
     )
     return save.id, {
         "message": message.id,

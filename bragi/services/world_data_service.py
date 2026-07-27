@@ -139,6 +139,8 @@ class WorldDataSummaryRow:
     covers_message_start_id: str
     covers_message_end_id: str
     archived: bool = False
+    source_message_ids: tuple[str, ...] = ()
+    source_summary_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -680,6 +682,8 @@ class WorldDataService:
                     model=record.model,
                     covers_message_start_id=record.covers_message_start_id,
                     covers_message_end_id=record.covers_message_end_id,
+                    source_message_ids=tuple(record.source_message_ids),
+                    source_summary_ids=tuple(record.source_summary_ids),
                 )
                 for record in self.repositories.list_summaries(active_save.id)
                 if not _summary_exceeds_rating(
@@ -2820,6 +2824,8 @@ def _summary_from_model(model: WorldDataModel, summary_id: str) -> SummaryRecord
                 model=summary.model,
                 covers_message_start_id=summary.covers_message_start_id,
                 covers_message_end_id=summary.covers_message_end_id,
+                source_message_ids=summary.source_message_ids,
+                source_summary_ids=summary.source_summary_ids,
             )
     raise ValueError("Summary edit does not belong to the active save")
 

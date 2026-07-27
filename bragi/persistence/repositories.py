@@ -11479,6 +11479,8 @@ class PersistenceRepositories:
         provider: str,
         model: str,
         content_rating: str = "unclassified",
+        source_message_ids: tuple[str, ...] | list[str] = (),
+        source_summary_ids: tuple[str, ...] | list[str] = (),
         summary_id: str | None = None,
     ) -> SummaryRecord:
         record = SummaryRecord(
@@ -11490,14 +11492,21 @@ class PersistenceRepositories:
             provider=provider,
             model=model,
             content_rating=content_rating,
+            source_message_ids=tuple(
+                dict.fromkeys(item for item in source_message_ids if item)
+            ),
+            source_summary_ids=tuple(
+                dict.fromkeys(item for item in source_summary_ids if item)
+            ),
         )
         self.connection.execute(
             """
             INSERT INTO summaries(
                 id, save_id, covers_message_start_id, covers_message_end_id,
-                body, provider, model, content_rating
+                body, provider, model, content_rating,
+                source_message_ids_json, source_summary_ids_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -11508,6 +11517,8 @@ class PersistenceRepositories:
                 record.provider,
                 record.model,
                 record.content_rating,
+                _dump_json(list(record.source_message_ids)),
+                _dump_json(list(record.source_summary_ids)),
             ),
         )
         self.commit()
@@ -11534,7 +11545,8 @@ class PersistenceRepositories:
         row = self._fetch_one(
             """
             SELECT id, save_id, covers_message_start_id, covers_message_end_id,
-                   body, provider, model, content_rating
+                   body, provider, model, content_rating,
+                   source_message_ids_json, source_summary_ids_json
             FROM summaries
             WHERE id = ?
             """,
@@ -11542,7 +11554,7 @@ class PersistenceRepositories:
         )
         if row is None:
             raise ValueError(f"Unknown summary id: {summary_id}")
-        return SummaryRecord(**dict(row))
+        return _summary_from_row(row)
 
     def archive_summary(self, summary_id: str) -> None:
         self.connection.execute(
@@ -11588,7 +11600,8 @@ class PersistenceRepositories:
         rows = self._fetch_all(
             f"""
             SELECT id, save_id, covers_message_start_id, covers_message_end_id,
-                   body, provider, model, content_rating
+                   body, provider, model, content_rating,
+                   source_message_ids_json, source_summary_ids_json
             FROM summaries
             WHERE save_id = ? AND archived_at IS NULL
             {order_sql}
@@ -11598,19 +11611,20 @@ class PersistenceRepositories:
         )
         if limit is not None:
             rows.reverse()
-        return [SummaryRecord(**dict(row)) for row in rows]
+        return [_summary_from_row(row) for row in rows]
 
     def get_summary(self, save_id: str, summary_id: str) -> SummaryRecord | None:
         row = self._fetch_one(
             """
             SELECT id, save_id, covers_message_start_id, covers_message_end_id,
-                   body, provider, model, content_rating
+                   body, provider, model, content_rating,
+                   source_message_ids_json, source_summary_ids_json
             FROM summaries
             WHERE save_id = ? AND id = ? AND archived_at IS NULL
             """,
             (save_id, summary_id),
         )
-        return SummaryRecord(**dict(row)) if row is not None else None
+        return _summary_from_row(row) if row is not None else None
 
     def summary_visible_to_characters(
         self,
@@ -14873,6 +14887,21 @@ def _context_source_from_row(row: sqlite3.Row) -> ContextSourceRecord:
         scene_generation=_optional_int(row["scene_generation"]),
         created_turn_number=_optional_int(row["created_turn_number"]),
         expires_after_turn_number=_optional_int(row["expires_after_turn_number"]),
+    )
+
+
+def _summary_from_row(row: sqlite3.Row) -> SummaryRecord:
+    return SummaryRecord(
+        id=row["id"],
+        save_id=row["save_id"],
+        covers_message_start_id=row["covers_message_start_id"],
+        covers_message_end_id=row["covers_message_end_id"],
+        body=row["body"],
+        provider=row["provider"],
+        model=row["model"],
+        content_rating=row["content_rating"],
+        source_message_ids=tuple(_load_list(row["source_message_ids_json"])),
+        source_summary_ids=tuple(_load_list(row["source_summary_ids_json"])),
     )
 
 

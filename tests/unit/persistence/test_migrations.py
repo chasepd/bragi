@@ -877,6 +877,66 @@ def test_current_schema_repairs_nonunique_memory_fingerprint_index(
         assert index_row[2] == 1
 
 
+def test_migration_72_to_73_adds_summary_lineage_and_repairs_message_estimates(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        message = repositories.append_message(
+            save_id=save.id,
+            role="narrator",
+            speaker_name="Narrator",
+            body="The bell rings twice.",
+            provider="fake",
+            model="fake-chat",
+            token_estimate=999,
+        )
+        repositories.add_summary(
+            save_id=save.id,
+            covers_message_start_id=message.id,
+            covers_message_end_id=message.id,
+            body="The bell rang twice.",
+            provider="fake",
+            model="fake-summary",
+        )
+        connection.execute("ALTER TABLE summaries DROP COLUMN source_summary_ids_json")
+        connection.execute("ALTER TABLE summaries DROP COLUMN source_message_ids_json")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 73")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert {
+            "source_message_ids_json",
+            "source_summary_ids_json",
+        } <= _column_names(connection, "summaries")
+        assert connection.execute(
+            "SELECT token_estimate FROM messages WHERE id = ?",
+            (message.id,),
+        ).fetchone() == (6,)
+        assert connection.execute(
+            """
+            SELECT source_message_ids_json, source_summary_ids_json
+            FROM summaries
+            """
+        ).fetchone() == ("[]", "[]")
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
 def test_current_schema_repair_bounds_memory_observation_backfill(
     tmp_path: Path,
 ) -> None:

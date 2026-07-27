@@ -734,6 +734,8 @@ class SummaryRecord:
     provider: str
     model: str
     content_rating: str = "unclassified"
+    source_message_ids: tuple[str, ...] = ()
+    source_summary_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

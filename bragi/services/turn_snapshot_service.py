@@ -118,7 +118,7 @@ _SNAPSHOT_TABLES: tuple[_SnapshotTable, ...] = (
     _SnapshotTable("context_update_audit"),
     _SnapshotTable("state_changes"),
     _SnapshotTable("memories", active_only=True),
-    _SnapshotTable("summaries", active_only=True),
+    _SnapshotTable("summaries"),
     _SnapshotTable("save_scenario_updates", active_only=True),
     _SnapshotTable("save_loss_conditions", active_only=True),
     _SnapshotTable("save_loss_condition_changes", active_only=True),
@@ -327,6 +327,9 @@ _JSON_COLUMNS_BY_TABLE: dict[str, frozenset[str]] = {
             "source_message_ids_json",
             "source_observation_ids_json",
         }
+    ),
+    "summaries": frozenset(
+        {"source_message_ids_json", "source_summary_ids_json"}
     ),
     "save_scenario_updates": frozenset({"content_json", "source_message_ids_json"}),
     "save_loss_condition_changes": frozenset({"before_json", "after_json"}),
@@ -1772,6 +1775,8 @@ class _SnapshotRemapper:
             return _compact_json(self._remap_suggestion_value(raw, row=row))
         if column == "source_message_ids_json":
             return _compact_json(self._remap_source_ref_list(raw))
+        if table_name == "summaries" and column == "source_summary_ids_json":
+            return _compact_json(self._remap_id_list(raw, "summaries"))
         if table_name == "context_sources" and column == "metadata_json":
             return _compact_json(
                 self._remap_context_source_metadata(

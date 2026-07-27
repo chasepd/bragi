@@ -80,6 +80,26 @@ def test_fork_from_player_message_includes_selected_player_message(
         speaker_name="Keeper",
         body="I touch the glass.",
     )
+    prior_summary = repositories.add_summary(
+        save_id=original.id,
+        covers_message_start_id=player.id,
+        covers_message_end_id=player.id,
+        body="The keeper touched the glass.",
+        provider="fake",
+        model="fake-summary",
+        source_message_ids=(player.id,),
+    )
+    repositories.archive_summary(prior_summary.id)
+    repositories.add_summary(
+        save_id=original.id,
+        covers_message_start_id=player.id,
+        covers_message_end_id=player.id,
+        body="The keeper touched the glass and noted its response.",
+        provider="fake",
+        model="fake-summary",
+        source_message_ids=(player.id,),
+        source_summary_ids=(prior_summary.id,),
+    )
     snapshot_service.capture_message_snapshot(
         save_id=original.id,
         message_id=player.id,
@@ -99,3 +119,17 @@ def test_fork_from_player_message_includes_selected_player_message(
     assert [message.body for message in repositories.list_messages(result.save.id)] == [
         "I touch the glass."
     ]
+    forked_player = repositories.list_messages(result.save.id)[0]
+    [forked_summary] = repositories.list_summaries(result.save.id)
+    forked_prior_summary = repositories.connection.execute(
+        """
+        SELECT id, archived_at
+        FROM summaries
+        WHERE save_id = ? AND body = ?
+        """,
+        (result.save.id, "The keeper touched the glass."),
+    ).fetchone()
+    assert forked_prior_summary is not None
+    assert forked_prior_summary["archived_at"] is not None
+    assert forked_summary.source_message_ids == (forked_player.id,)
+    assert forked_summary.source_summary_ids == (forked_prior_summary["id"],)

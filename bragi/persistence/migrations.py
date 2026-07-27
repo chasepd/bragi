@@ -22,7 +22,7 @@ from bragi.text_search import (
     unicode_word_terms,
 )
 
-CURRENT_SCHEMA_VERSION = 72
+CURRENT_SCHEMA_VERSION = 73
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
@@ -432,6 +432,8 @@ CREATE TABLE IF NOT EXISTS summaries (
     provider TEXT NOT NULL,
     model TEXT NOT NULL,
     content_rating TEXT NOT NULL DEFAULT 'unclassified',
+    source_message_ids_json TEXT NOT NULL DEFAULT '[]',
+    source_summary_ids_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     archived_at TEXT
 );
@@ -662,7 +664,10 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 71:
+            if current == 72:
+                _migrate_schema_72_to_73(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 71:
                 _migrate_schema_71_to_72(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 70:
@@ -772,6 +777,11 @@ def migrate_database(database_path: Path | str) -> None:
             )
         if not _memory_claim_fingerprint_index_is_unique(connection):
             _migrate_schema_71_to_72(connection)
+        if (
+            not _summary_lineage_schema_is_current(connection)
+            or not _schema_migration_applied(connection, 73)
+        ):
+            _migrate_schema_72_to_73(connection)
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
         _ensure_context_observation_curation_schema(connection)
@@ -2064,6 +2074,61 @@ def _migrate_schema_71_to_72(connection: sqlite3.Connection) -> None:
             """
         )
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (72)")
+
+
+def _migrate_schema_72_to_73(connection: sqlite3.Connection) -> None:
+    _ensure_summary_lineage_schema(connection)
+    _recompute_message_body_token_estimates(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (73)")
+
+
+def _summary_lineage_schema_is_current(connection: sqlite3.Connection) -> bool:
+    if not _table_exists(connection, "summaries"):
+        return True
+    return {
+        "source_message_ids_json",
+        "source_summary_ids_json",
+    } <= _column_names(connection, "summaries")
+
+
+def _schema_migration_applied(connection: sqlite3.Connection, version: int) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (version,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _ensure_summary_lineage_schema(connection: sqlite3.Connection) -> None:
+    _add_column_if_missing(
+        connection,
+        "summaries",
+        "source_message_ids_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    _add_column_if_missing(
+        connection,
+        "summaries",
+        "source_summary_ids_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+
+
+def _recompute_message_body_token_estimates(connection: sqlite3.Connection) -> None:
+    if not _table_exists(connection, "messages"):
+        return
+    connection.execute(
+        """
+        UPDATE messages
+        SET token_estimate = MAX(
+            1,
+            CAST((length(body) + 3) / 4 AS INTEGER)
+        )
+        WHERE token_estimate IS NOT NULL
+        """
+    )
 
 
 def _remap_migrated_memory_references(

@@ -27,7 +27,7 @@ from bragi.services.content_safety_service import (
     ContentSafetyResult,
     ContentSafetyService,
 )
-from bragi.services.summary_service import SummaryService
+from bragi.services.summary_service import PendingMessageEstimate, SummaryService
 
 
 class BlockingContentSafetyService:
@@ -232,6 +232,55 @@ def test_summary_service_configured_threshold_controls_generation(
     assert summary.id in jobs[0]["result_json"]
 
 
+def test_summary_service_summarizes_messages_crossing_raw_history_frontier(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, messages = _save_with_summary_preference(repositories)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key="recent_player_message_window",
+        value=1,
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key="recent_narrator_message_window",
+        value=1,
+    )
+    provider = RecordingSummaryProvider(
+        response_body=(
+            "Mara crossed the ash bridge, heard the bell, and asked who rang it."
+        ),
+    )
+    service = SummaryService(
+        repositories=repositories,
+        providers={"fake": provider},
+        threshold=0.99,
+    )
+
+    summary = asyncio.run(
+        service.summarize_if_needed(
+            save_id=save.id,
+            context_window=1_000_000,
+            pending_message=PendingMessageEstimate(
+                body="I follow the answer into the cinders.",
+                role="player",
+            ),
+        )
+    )
+
+    assert summary is not None
+    assert summary.covers_message_start_id == messages[0].id
+    assert summary.covers_message_end_id == messages[2].id
+    assert summary.source_message_ids == tuple(message.id for message in messages[:3])
+    assert len(provider.chat_requests) == 1
+    prompt = _request_prompt(provider.chat_requests[0])
+    assert messages[0].body in prompt
+    assert messages[2].body in prompt
+    assert messages[3].body not in prompt
+
+
 def test_summary_service_includes_only_canonical_fade_transition_in_coverage(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -381,6 +430,81 @@ def test_summary_service_prompts_for_factual_continuity_ledger(
     assert "Avoid first-person and second-person phrasing" in instruction
 
 
+def test_summary_service_budgets_summary_output_before_provider_dispatch(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _messages = _save_with_summary_preference(repositories)
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-summary",
+        display_name="Fake Summary",
+        capabilities=["chat"],
+        context_window=4096,
+    )
+    provider = RecordingSummaryProvider(
+        response_body="Mara crossed the ash bridge and heard the bell below.",
+    )
+    service = SummaryService(
+        repositories=repositories,
+        providers={"fake": provider},
+        threshold=0.50,
+    )
+
+    asyncio.run(
+        service.summarize_if_needed(
+            save_id=save.id,
+            context_window=180,
+        )
+    )
+
+    assert provider.chat_requests[0].max_output_tokens == 256
+
+
+def test_summary_service_batches_summary_source_messages_by_model_window(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, messages = _save_with_summary_preference(repositories)
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-summary",
+        display_name="Fake Summary",
+        capabilities=["chat"],
+        context_window=2200,
+    )
+    for message in messages[:2]:
+        repositories.connection.execute(
+            "UPDATE messages SET token_estimate = ? WHERE id = ?",
+            (1000, message.id),
+        )
+    repositories.connection.commit()
+    provider = SequenceSummaryProvider(
+        [
+            "Mara stepped onto the ash bridge.",
+            "Mara crossed the ash bridge and heard the hidden bell.",
+        ],
+    )
+    service = SummaryService(
+        repositories=repositories,
+        providers={"fake": provider},
+        threshold=0.50,
+    )
+
+    summary = asyncio.run(
+        service.summarize_if_needed(
+            save_id=save.id,
+            context_window=180,
+        )
+    )
+
+    assert summary is not None
+    assert len(provider.chat_requests) == 2
+    assert provider.chat_requests[1].summary is not None
+    assert "Mara stepped onto the ash bridge." in provider.chat_requests[1].summary
+    assert summary.covers_message_start_id == messages[0].id
+    assert summary.covers_message_end_id == messages[1].id
+    assert summary.source_message_ids == (messages[0].id, messages[1].id)
+
+
 def test_summary_service_repairs_rejected_continuation_like_summary(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -504,6 +628,8 @@ def test_summary_service_rolls_prior_summary_into_new_summary(
     assert summary is not None
     assert summary.covers_message_start_id == prior_summary.covers_message_start_id
     assert summary.covers_message_end_id == messages[3].id
+    assert summary.source_message_ids == (messages[2].id, messages[3].id)
+    assert summary.source_summary_ids == (prior_summary.id,)
     active_summaries = repositories.list_summaries(save.id)
     assert active_summaries == [summary]
     assert prior_summary not in active_summaries
@@ -573,7 +699,7 @@ def test_summary_service_counts_single_large_active_summary_as_context_pressure(
     assert messages[3].body not in prompt
 
 
-def test_summary_service_safety_reviews_and_rates_generated_summary(
+def test_summary_service_rejects_safety_placeholder_without_advancing_coverage(
     repositories: PersistenceRepositories,
 ) -> None:
     repositories.set_app_setting("content_filter_rating", "pg")
@@ -589,17 +715,19 @@ def test_summary_service_safety_reviews_and_rates_generated_summary(
         content_safety_service=cast(ContentSafetyService, safety),
     )
 
-    summary = asyncio.run(
-        service.summarize_if_needed(
-            save_id=save.id,
-            context_window=100,
+    with pytest.raises(ValueError, match="content safety"):
+        asyncio.run(
+            service.summarize_if_needed(
+                save_id=save.id,
+                context_window=100,
+            )
         )
-    )
 
-    assert summary is not None
-    assert summary.body == CONTENT_FILTER_TRANSITION
-    assert summary.content_rating == "g"
+    assert repositories.list_summaries(save.id) == []
     assert safety.fade_settings == [False]
+    jobs = _summarization_jobs(repositories, save.id)
+    assert jobs[-1]["status"] == "failed"
+    assert "content safety" in jobs[-1]["error"]
 
 
 def test_summary_service_rolls_up_multiple_active_summaries_without_message_pressure(
