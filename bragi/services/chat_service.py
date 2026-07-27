@@ -9339,6 +9339,7 @@ def _budgeted_narrator_context(
         memories=visible_memory_records,
         world_state=visible_world_state_records,
         summaries=visible_summary_records,
+        message_visibility=message_visibility_records,
     )
     pre_turn_hint_sources = pre_turn_scene_hint_sources(
         repositories=repositories,

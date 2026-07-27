@@ -1315,6 +1315,67 @@ def test_character_knowledge_edges_are_attributed_as_character_scoped(
     assert "Tarin knows Avery made the archive-code joke" not in linked_text
 
 
+def test_character_knowledge_edges_hidden_from_present_scene_are_not_linked_facts(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, current_location = _create_context_save(
+        repositories,
+        scenario_id="scenario-hidden-knowledge-edge-linked-facts",
+        save_id="save-hidden-knowledge-edge-linked-facts",
+    )
+    present = repositories.add_character(
+        save_id=save.id,
+        name="Nira",
+        role="Archive guide",
+        location_id=current_location.id,
+        met=True,
+        character_id="character-hidden-knowledge-nira",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=current_location.id,
+        situation="Nira has just arrived.",
+        present_character_ids=[present.id],
+        snapshot_id="snapshot-hidden-knowledge-edge",
+    )
+    hidden_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Tarin whispered that the moonstone opens the cobalt ledger.",
+        message_id="message-hidden-knowledge-edge",
+    )
+    hidden_memory = repositories.add_memory(
+        save_id=save.id,
+        body="Tarin knows the moonstone opens the cobalt ledger.",
+        tags=["tarin"],
+        memory_id="memory-hidden-knowledge-edge",
+        source_message_id=hidden_message.id,
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_message.id,
+        character_id=present.id,
+        visibility="not_visible",
+        source="scene_presence",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=present.id,
+        target_type="memory",
+        target_id=hidden_memory.id,
+        knowledge_state="knows",
+        acquisition_method="witnessed",
+        source_message_id=hidden_message.id,
+    )
+
+    sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
+
+    linked_text = "\n".join(
+        source.text for source in sources if source.tier == "active_linked_facts"
+    )
+    assert "Tarin knows the moonstone opens the cobalt ledger" not in linked_text
+
+
 def test_private_active_threads_are_limited_to_turn_audience(
     repositories: PersistenceRepositories,
 ) -> None:

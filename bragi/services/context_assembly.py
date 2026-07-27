@@ -18,6 +18,7 @@ from bragi.persistence.models import (
     LocationRecord,
     MemoryRecord,
     MessageRecord,
+    MessageVisibilityRecord,
     SaveDetailsRecord,
     ScenarioRecord,
     SceneSnapshotRecord,
@@ -38,6 +39,7 @@ from bragi.services.dating_route_policy import (
 from bragi.services.knowledge_boundary import (
     character_scope_for_turn,
     knowledge_edge_has_character_text_source,
+    message_visible_to_present_characters,
 )
 from bragi.services.mention_matching import character_name_is_mentioned
 from bragi.services.open_threads import is_open_threads_aggregate_key
@@ -1189,6 +1191,9 @@ def deterministic_context_sources(
     memories: tuple[MemoryRecord, ...] | list[MemoryRecord] | None = None,
     world_state: tuple[WorldStateRecord, ...] | list[WorldStateRecord] | None = None,
     summaries: tuple[SummaryRecord, ...] | list[SummaryRecord] | None = None,
+    message_visibility: (
+        tuple[MessageVisibilityRecord, ...] | list[MessageVisibilityRecord] | None
+    ) = None,
 ) -> tuple[ContextSource, ...]:
     details = (
         details
@@ -1379,6 +1384,7 @@ def deterministic_context_sources(
             world_state=world_state_records,
             summaries=summaries,
             characters=tuple(character_records),
+            message_visibility=message_visibility,
             always_include=mode == "narrator",
         )
     )
@@ -1885,6 +1891,9 @@ def _active_linked_fact_sources(
     world_state: tuple[WorldStateRecord, ...] | list[WorldStateRecord] | None = None,
     summaries: tuple[SummaryRecord, ...] | list[SummaryRecord] | None = None,
     characters: tuple[CharacterRecord, ...] | list[CharacterRecord] | None = None,
+    message_visibility: (
+        tuple[MessageVisibilityRecord, ...] | list[MessageVisibilityRecord] | None
+    ) = None,
     always_include: bool = False,
 ) -> tuple[ContextSource, ...]:
     active_entities = _active_scene_entities(snapshot=snapshot, threads=threads)
@@ -1895,6 +1904,17 @@ def _active_linked_fact_sources(
         for entity_type, entity_id in active_entities
         if entity_type == "character"
     }
+    if message_visibility is not None:
+        visibility_records = tuple(message_visibility)
+    elif active_character_ids:
+        visibility_records = tuple(
+            repositories.list_message_visibility(
+                save_id,
+                character_ids=active_character_ids,
+            )
+        )
+    else:
+        visibility_records = ()
     link_records = (
         tuple(entity_links)
         if entity_links is not None
@@ -1932,6 +1952,11 @@ def _active_linked_fact_sources(
         if not (
             edge.character_id in player_character_ids
             and knowledge_edge_has_character_text_source(edge)
+        )
+        if _knowledge_edge_source_visible_to_active_characters(
+            edge,
+            active_character_ids=active_character_ids,
+            message_visibility=visibility_records,
         )
     )
     if not links and not knowledge_edges:
@@ -2021,6 +2046,12 @@ def _active_linked_fact_sources(
         )
     for link in links:
         target_type = _normalized_link_type(link.target_type)
+        if not _link_source_visible_to_active_characters(
+            link,
+            active_character_ids=active_character_ids,
+            message_visibility=visibility_records,
+        ):
+            continue
         if (
             link.entity_type == "character"
             and link.relation == "knows"
@@ -2247,9 +2278,50 @@ def _normalized_link_type(value: str) -> str:
     normalized = value.strip().casefold()
     if normalized in {"state", "world_state"}:
         return "world_state"
+    if normalized in {"memory", "memories"}:
+        return "memory"
     if normalized in {"scenario", "scenario_section"}:
         return "scenario_section"
     return normalized
+
+
+def _knowledge_edge_source_visible_to_active_characters(
+    edge: CharacterKnowledgeEdgeRecord,
+    *,
+    active_character_ids: set[str],
+    message_visibility: tuple[MessageVisibilityRecord, ...],
+) -> bool:
+    source_message_ids = tuple(
+        dict.fromkeys(
+            (
+                *edge.source_message_ids,
+                *([edge.source_message_id] if edge.source_message_id else []),
+            )
+        )
+    )
+    return all(
+        message_visible_to_present_characters(
+            message_id=source_message_id,
+            present_character_ids=frozenset(active_character_ids),
+            message_visibility=list(message_visibility),
+        )
+        for source_message_id in source_message_ids
+    )
+
+
+def _link_source_visible_to_active_characters(
+    link: EntityLinkRecord,
+    *,
+    active_character_ids: set[str],
+    message_visibility: tuple[MessageVisibilityRecord, ...],
+) -> bool:
+    if link.source_message_id is None:
+        return True
+    return message_visible_to_present_characters(
+        message_id=link.source_message_id,
+        present_character_ids=frozenset(active_character_ids),
+        message_visibility=list(message_visibility),
+    )
 
 
 def _link_reason(link: EntityLinkRecord) -> str:

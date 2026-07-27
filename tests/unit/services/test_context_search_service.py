@@ -731,6 +731,77 @@ def test_narration_snapshot_bounds_raw_context_records(
     assert len(snapshot.observations) == 2
 
 
+def test_context_search_bounded_snapshot_blocks_legacy_plural_memory_edge(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Archive",
+        premise="A guarded archive.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Boundary")
+    older_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Nira hears that the moonstone opens the cobalt ledger.",
+    )
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I ask Nira about the moonstone ledger.",
+    )
+    present = repositories.add_character(
+        save_id=save.id,
+        name="Nira",
+        aliases=["Nira"],
+        met=True,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Nira studies the ledger room.",
+        present_character_ids=[present.id],
+    )
+    hidden_memory = repositories.add_memory(
+        save_id=save.id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["moonstone"],
+        source_message_id=older_message.id,
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=present.id,
+        target_type="memories",
+        target_id=hidden_memory.id,
+        knowledge_state="does_not_know",
+        acquisition_method="witnessed",
+    )
+    repositories.set_model_preference(
+        task="context_search",
+        provider="fake",
+        model_id="fake-context",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-context",
+        display_name="Fake Context",
+        capabilities=[ProviderCapability.STRUCTURED_OUTPUT.value],
+    )
+    provider = RecordingStructuredContextProvider()
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    asyncio.run(service.search(save_id=save.id, player_message_id=player_message.id))
+
+    prompt = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert hidden_memory.body not in prompt
+
+
 def test_indexed_observation_hydration_recovers_older_bounded_record(
     repositories: PersistenceRepositories,
 ) -> None:

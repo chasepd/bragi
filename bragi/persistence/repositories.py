@@ -8868,6 +8868,8 @@ class PersistenceRepositories:
                      CASE
                          WHEN lower(links.target_type) IN ('state', 'world_state')
                          THEN 'world_state'
+                         WHEN lower(links.target_type) IN ('memory', 'memories')
+                         THEN 'memory'
                          ELSE lower(links.target_type)
                      END
                  AND targets.target_id = links.target_id
@@ -8886,6 +8888,9 @@ class PersistenceRepositories:
                                   WHEN lower(edge.target_type)
                                        IN ('state', 'world_state')
                                   THEN 'world_state'
+                                  WHEN lower(edge.target_type)
+                                       IN ('memory', 'memories')
+                                  THEN 'memory'
                                   ELSE lower(edge.target_type)
                               END
                           ) = (
@@ -8893,6 +8898,9 @@ class PersistenceRepositories:
                                   WHEN lower(links.target_type)
                                        IN ('state', 'world_state')
                                   THEN 'world_state'
+                                  WHEN lower(links.target_type)
+                                       IN ('memory', 'memories')
+                                  THEN 'memory'
                                   ELSE lower(links.target_type)
                               END
                           )
@@ -8908,6 +8916,9 @@ class PersistenceRepositories:
                                    WHEN lower(target_type)
                                         IN ('state', 'world_state')
                                    THEN 'world_state'
+                                   WHEN lower(target_type)
+                                        IN ('memory', 'memories')
+                                   THEN 'memory'
                                    ELSE lower(target_type)
                                END,
                                target_id,
@@ -8926,6 +8937,9 @@ class PersistenceRepositories:
                                    WHEN lower(target_type)
                                         IN ('state', 'world_state')
                                    THEN 'world_state'
+                                   WHEN lower(target_type)
+                                        IN ('memory', 'memories')
+                                   THEN 'memory'
                                    ELSE lower(target_type)
                                END,
                                target_id,
@@ -9155,11 +9169,14 @@ class PersistenceRepositories:
                        END AS scope_class
                 FROM character_knowledge_edges edges
                 JOIN target_keys targets
-                  ON targets.target_type =
+                 ON targets.target_type =
                      CASE
                          WHEN lower(edges.target_type)
                               IN ('state', 'world_state')
                          THEN 'world_state'
+                         WHEN lower(edges.target_type)
+                              IN ('memory', 'memories')
+                         THEN 'memory'
                          ELSE lower(edges.target_type)
                      END
                  AND targets.target_id = edges.target_id
@@ -9174,6 +9191,9 @@ class PersistenceRepositories:
                                    WHEN lower(target_type)
                                         IN ('state', 'world_state')
                                    THEN 'world_state'
+                                   WHEN lower(target_type)
+                                        IN ('memory', 'memories')
+                                   THEN 'memory'
                                    ELSE lower(target_type)
                                END,
                                target_id,
@@ -9195,6 +9215,9 @@ class PersistenceRepositories:
                                    WHEN lower(target_type)
                                         IN ('state', 'world_state')
                                    THEN 'world_state'
+                                   WHEN lower(target_type)
+                                        IN ('memory', 'memories')
+                                   THEN 'memory'
                                    ELSE lower(target_type)
                                END,
                                target_id,
@@ -14282,7 +14305,8 @@ def _context_source_eligibility_sql(
         clauses.append(
             "("
             f"{alias}.source_type NOT IN "
-            "('memory', 'world_state', 'summary', 'scenario_section') "
+            "('memory', 'memories', 'world_state', 'summary', "
+            "'scenario_section') "
             "OR ("
             "NOT EXISTS ("
             "SELECT 1 FROM character_knowledge_edges edge "

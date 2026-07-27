@@ -4485,6 +4485,51 @@ def test_context_source_search_blocks_legacy_plural_memory_edges(
     assert hits == []
 
 
+def test_context_source_search_blocks_legacy_plural_memory_source_type(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Archive",
+        premise="An archive holds unevenly shared secrets.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Index")
+    present = repositories.add_character(save_id=save.id, name="Nira", met=True)
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["moonstone"],
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memories",
+        source_id=memory.id,
+        title="moonstone",
+        body=memory.body,
+        metadata={"indexed_by": "continuity_index"},
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=present.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="does_not_know",
+        acquisition_method="told",
+    )
+
+    hits = repositories.search_context_sources(
+        save.id,
+        query_terms={"moonstone"},
+        source_types={"memories"},
+        limit=1,
+        visibility_character_ids={present.id},
+    )
+
+    assert hits == []
+
+
 def test_repositories_search_context_sources_with_unicode_terms(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -8573,6 +8618,72 @@ def test_narration_graph_keeps_present_owner_restrictions_across_aliases(
     )
 
     assert first_denial.id in {edge.id for edge in edges}
+
+
+def test_narration_graph_normalizes_legacy_plural_memory_edges(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    memory = repositories.add_memory(
+        save_id=save_id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["moonstone"],
+        source_message_id=message_id,
+    )
+    character = repositories.add_character(save_id=save_id, name="Nira")
+    denial = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="memories",
+        target_id=memory.id,
+        knowledge_state="does_not_know",
+    )
+
+    edges = repositories.list_narration_character_knowledge_edges(
+        save_id,
+        target_keys={("memory", memory.id)},
+        present_character_ids={character.id},
+        visibility_character_ids={character.id},
+    )
+
+    assert [edge.id for edge in edges] == [denial.id]
+
+
+def test_narration_graph_legacy_plural_memory_edge_overrides_link(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    memory = repositories.add_memory(
+        save_id=save_id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["moonstone"],
+        source_message_id=message_id,
+    )
+    character = repositories.add_character(save_id=save_id, name="Nira")
+    repositories.add_entity_link(
+        save_id=save_id,
+        entity_type="character",
+        entity_id=character.id,
+        target_type="memory",
+        target_id=memory.id,
+        relation="knows",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="memories",
+        target_id=memory.id,
+        knowledge_state="does_not_know",
+    )
+
+    links = repositories.list_narration_entity_links(
+        save_id,
+        target_keys={("memory", memory.id)},
+        present_character_ids={character.id},
+        visibility_character_ids={character.id},
+    )
+
+    assert links == []
 
 
 def _persist_repository_save(
