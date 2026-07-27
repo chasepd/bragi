@@ -13,6 +13,7 @@ import pytest
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import SaveRecord
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.services import turn_snapshot_service as turn_snapshot_module
 from bragi.services.character_text_world_update_service import character_text_source_ref
 from bragi.services.chat_bundle_service import ChatBundleService
 from bragi.services.message_revision_service import MessageRevisionService
@@ -71,6 +72,52 @@ def test_snapshot_import_coalesces_many_to_one_memory_remaps() -> None:
         "observation-one",
         "observation-two",
     ]
+
+
+def test_snapshot_remaps_colliding_message_provenance_by_field_type() -> None:
+    colliding_id = "save-and-message-collision"
+    remapper = turn_snapshot_module._SnapshotRemapper(
+        source_save_id=colliding_id,
+        target_save_id="fork-save",
+        rows_by_table={
+            "messages": ({"id": colliding_id},),
+            "memories": ({"id": "memory-one"},),
+            "context_sources": ({"id": "context-one"},),
+        },
+    )
+    fork_message_id = remapper.id_maps["messages"][colliding_id]
+
+    memory = remapper.remap_row(
+        "memories",
+        {
+            "id": "memory-one",
+            "save_id": colliding_id,
+            "source_message_ids_json": json.dumps([colliding_id]),
+        },
+    )
+    context_source = remapper.remap_row(
+        "context_sources",
+        {
+            "id": "context-one",
+            "save_id": colliding_id,
+            "source_type": "memory",
+            "source_id": "memory-one",
+            "metadata_json": json.dumps(
+                {
+                    "source_message_id": colliding_id,
+                    "source_message_ids": [colliding_id],
+                    "source_provenance_groups": [[colliding_id]],
+                }
+            ),
+        },
+    )
+
+    assert json.loads(str(memory["source_message_ids_json"])) == [fork_message_id]
+    metadata = json.loads(str(context_source["metadata_json"]))
+    assert metadata["source_message_id"] == fork_message_id
+    assert metadata["source_message_ids"] == [fork_message_id]
+    assert metadata["source_provenance_groups"] == [[fork_message_id]]
+    assert fork_message_id != "fork-save"
 
 
 def test_capture_dedupes_objects_and_restore_recovers_exact_state(

@@ -426,9 +426,14 @@ class CountingPersistenceRepositories(PersistenceRepositories):
         self.list_counts["memories"] = self.list_counts.get("memories", 0) + 1
         return super().list_memories(save_id, limit=limit)
 
-    def list_summaries(self, save_id: str) -> list[SummaryRecord]:
+    def list_summaries(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[SummaryRecord]:
         self.list_counts["summaries"] = self.list_counts.get("summaries", 0) + 1
-        return super().list_summaries(save_id)
+        return super().list_summaries(save_id, limit=limit)
 
     def list_context_sources(
         self,
@@ -446,11 +451,16 @@ class CountingPersistenceRepositories(PersistenceRepositories):
         save_id: str,
         *,
         status: str | None = None,
+        limit: int | None = None,
     ) -> list[ContextUpdateSuggestionRecord]:
         self.list_counts["context_update_suggestions"] = (
             self.list_counts.get("context_update_suggestions", 0) + 1
         )
-        return super().list_context_update_suggestions(save_id, status=status)
+        return super().list_context_update_suggestions(
+            save_id,
+            status=status,
+            limit=limit,
+        )
 
     def search_context_sources(
         self,
@@ -533,7 +543,7 @@ def test_context_selection_instruction_prioritizes_mystery_context() -> None:
 
 
 def test_meaningful_terms_preserve_single_character_cjk_entities() -> None:
-    assert _meaningful_terms("李は東門にいる") == {"李は東門にいる"}
+    assert {"李は東門にいる", "李", "東門"} <= _meaningful_terms("李は東門にいる")
     assert _meaningful_terms("ask 李 now") == {"ask", "李", "now"}
 
 
@@ -571,6 +581,20 @@ def test_context_query_terms_preserve_middle_terms_across_scripts() -> None:
     assert "moonstone" in terms
 
 
+def test_context_query_terms_preserve_middle_short_identifiers() -> None:
+    query = " ".join(
+        (
+            *(f"verboseprefix{index:02d}" for index in range(50)),
+            "A-7",
+            *(f"verbosesuffix{index:02d}" for index in range(50)),
+        )
+    )
+
+    terms = _bounded_context_query_terms(query)
+
+    assert {"a", "7"} <= set(terms)
+
+
 def test_exact_raw_candidates_match_short_identifier_in_long_fact() -> None:
     candidate = context_search_module._ContextCandidate(
         source_type="memory",
@@ -582,6 +606,22 @@ def test_exact_raw_candidates_match_short_identifier_in_long_fact() -> None:
         (candidate,),
         indexed_candidates=(),
         latest_player_message="A-7",
+    )
+
+    assert selected == (candidate,)
+
+
+def test_exact_raw_candidates_match_natural_cjk_query() -> None:
+    candidate = context_search_module._ContextCandidate(
+        source_type="memory",
+        source_id="memory-cjk",
+        text="月石羅針盤は東の書庫を開く。",
+    )
+
+    selected = context_search_module._exact_raw_candidates(
+        (candidate,),
+        indexed_candidates=(),
+        latest_player_message="月石羅針盤はどこ",
     )
 
     assert selected == (candidate,)
@@ -645,6 +685,72 @@ def test_narration_snapshot_bounds_raw_context_records(
     assert len(snapshot.world_state_for_scope) == 2
     assert len(snapshot.memories) == 2
     assert len(snapshot.observations) == 2
+
+
+def test_indexed_observation_hydration_recovers_older_bounded_record(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Archive",
+        premise="A guarded archive.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Boundary")
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The old moonstone key opens the archive.",
+    )
+    old_observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="world_fact",
+        claim="The old moonstone key opens the archive.",
+        evidence_quote="old moonstone key opens the archive",
+        source_message_ids=[message.id],
+        scope="durable",
+        status="accepted",
+    )
+    marker = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="observation",
+        source_id=old_observation.id,
+        title="Old moonstone key",
+        body=old_observation.claim,
+        metadata={
+            "curation_action": "save_context",
+            "observation_id": old_observation.id,
+            "source_message_ids": [message.id],
+        },
+    )
+    for index in range(513):
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="world_fact",
+            claim=f"New archive detail {index}.",
+            evidence_quote="The old moonstone key opens the archive",
+            source_message_ids=[message.id],
+            scope="turn",
+        )
+    snapshot = load_narration_context_snapshot(
+        repositories,
+        save_id=save.id,
+        raw_record_limit=512,
+    )
+    assert snapshot is not None
+    assert old_observation.id not in {
+        observation.id for observation in snapshot.observations
+    }
+
+    hydrated = context_search_module._observations_with_indexed_sources(
+        repositories,
+        save_id=save.id,
+        observations=snapshot.observations,
+        context_sources=(marker,),
+    )
+
+    assert old_observation.id in {observation.id for observation in hydrated}
 
 
 def test_recent_visible_messages_are_not_starved_by_hidden_rows(
@@ -4369,7 +4475,7 @@ def test_context_search_indexes_exact_memory_beyond_previous_default_bound(
         importance=0.1,
         source_message_id=source_message.id,
     )
-    for index in range(260):
+    for index in range(520):
         repositories.add_memory(
             save_id=save.id,
             body=f"High-priority bridge watch record {index:03d}.",

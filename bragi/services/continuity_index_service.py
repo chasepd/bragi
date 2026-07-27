@@ -53,9 +53,9 @@ HIGH_VALUE_FACT_TYPES = frozenset(
     }
 )
 
-DEFAULT_WORLD_STATE_INDEX_LIMIT = 250
-DEFAULT_MEMORY_INDEX_LIMIT = 250
-DEFAULT_SUMMARY_INDEX_LIMIT = 80
+DEFAULT_WORLD_STATE_INDEX_LIMIT: int | None = None
+DEFAULT_MEMORY_INDEX_LIMIT: int | None = None
+DEFAULT_SUMMARY_INDEX_LIMIT: int | None = None
 DEFAULT_ACTIVE_THREAD_INDEX_LIMIT: int | None = None
 CHARACTER_PROFILE_DETAIL_MAX_CHARS = 320
 CHARACTER_TEXT_THREAD_RECENT_MESSAGE_LIMIT = 4
@@ -91,6 +91,8 @@ class ContinuityIndexService:
         )
 
     def sync_save(self, save_id: str) -> ContinuityIndexSyncResult:
+        if not self.repositories.continuity_index_needs_sync(save_id):
+            return ContinuityIndexSyncResult(indexed_count=0)
         self.repositories.begin_transaction()
         try:
             result = self._sync_save(save_id)
@@ -101,7 +103,10 @@ class ContinuityIndexService:
             raise
 
     def _sync_save(self, save_id: str) -> ContinuityIndexSyncResult:
-        details = self.repositories.load_save_details(save_id)
+        details = self.repositories.load_save_details(
+            save_id,
+            message_limit=1 if self.world_state_limit is None else None,
+        )
         if details is None:
             raise ValueError(f"Unknown save id: {save_id}")
         records: list[ContextSourceRecord] = []
@@ -110,9 +115,13 @@ class ContinuityIndexService:
         snapshot = self.repositories.get_scene_snapshot(save_id)
         locations = self.repositories.list_locations(save_id)
         characters = self.repositories.list_characters(save_id)
-        message_order = {
-            message.id: index for index, message in enumerate(details.messages)
-        }
+        message_order = (
+            {}
+            if self.world_state_limit is None
+            else {
+                message.id: index for index, message in enumerate(details.messages)
+            }
+        )
         records.extend(self._sync_scenario_sections(save_id, scenario))
         world_state_records, skipped = self._sync_world_state(
             save_id,
@@ -133,6 +142,7 @@ class ContinuityIndexService:
         records.extend(self._sync_locations(save_id, locations, snapshot))
         records.extend(self._sync_characters(save_id, characters, snapshot))
         self._archive_stale_index_rows(save_id, records)
+        self.repositories.mark_continuity_index_synced(save_id)
         return ContinuityIndexSyncResult(
             indexed_count=len(records),
             skipped_counts=skipped_counts,

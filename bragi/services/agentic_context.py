@@ -1496,6 +1496,11 @@ def _observation_evidence_is_grounded(
         observation.evidence_quote,
     ):
         return False
+    if _grounding_denial_conflicts(
+        observation.claim,
+        observation.evidence_quote,
+    ):
+        return False
     if _grounding_anchor_conflicts(
         observation.claim,
         observation.evidence_quote,
@@ -1816,6 +1821,14 @@ def _context_observation_evidence_is_grounded(
             for source_text in source_texts_by_observation.get(observation.id, ())
         )
         and not _grounding_negation_conflicts(
+            observation.claim,
+            observation.evidence_quote,
+        )
+        and not _grounding_denial_conflicts(
+            observation.claim,
+            observation.evidence_quote,
+        )
+        and not _grounding_anchor_conflicts(
             observation.claim,
             observation.evidence_quote,
         )
@@ -3290,6 +3303,35 @@ def _grounding_negation_conflicts(proposed: str, observation_claim: str) -> bool
     proposed_negated = bool(_grounding_terms(proposed) & negations)
     observation_negated = bool(_grounding_terms(observation_claim) & negations)
     return proposed_negated != observation_negated
+
+
+def _grounding_denial_conflicts(claim: str, evidence: str) -> bool:
+    denial_terms = {
+        "denied",
+        "denies",
+        "false",
+        "falsely",
+        "incorrect",
+        "refuted",
+        "refutes",
+        "untrue",
+    }
+    claim_terms = set(_ordered_grounding_terms(claim))
+    evidence_terms = set(_ordered_grounding_terms(evidence))
+    if (evidence_terms & denial_terms) - claim_terms:
+        return True
+    normalized_evidence = " ".join(evidence.casefold().split())
+    normalized_claim = " ".join(claim.casefold().split())
+    denial_phrases = (
+        "did not happen",
+        "never happened",
+        "not actually true",
+        "not true",
+    )
+    return any(
+        phrase in normalized_evidence and phrase not in normalized_claim
+        for phrase in denial_phrases
+    )
 
 
 def _grounding_anchor_conflicts(proposed: str, observation_claim: str) -> bool:

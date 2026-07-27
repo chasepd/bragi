@@ -23,6 +23,7 @@ from bragi.providers.contracts import (
     StructuredOutputRequest,
     StructuredOutputResponse,
 )
+from bragi.services import agentic_context as agentic_context_module
 from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_SETTING,
     PLAN_FIRST_NARRATOR_SETTING,
@@ -396,6 +397,77 @@ def test_observation_service_rejects_subject_misattribution(
 
     assert result.observed_count == 0
     assert repositories.list_context_observations(save.id) == []
+
+
+def test_observation_service_rejects_explicit_denial_after_claim_span(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    source = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara has the red key, but that claim is false.",
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        "observation_type": "character_fact",
+                        "claim": "Mara has the red key.",
+                        "evidence_quote": (
+                            "Mara has the red key, but that claim is false"
+                        ),
+                        "source_message_ids": [source.id],
+                        "scope": "durable",
+                        "confidence": 0.99,
+                        "tags": ["key"],
+                    }
+                ]
+            }
+        }
+    )
+    service = ObservationService(
+        repositories=repositories,
+        extractor=StructuredProviderObservationExtractor(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="observer",
+        ),
+    )
+
+    result = asyncio.run(
+        service.observe_turn(
+            save_id=save.id,
+            source_message_ids=(source.id,),
+        )
+    )
+
+    assert result.observed_count == 0
+    assert repositories.list_context_observations(save.id) == []
+
+
+def test_persisted_observation_revalidation_rejects_subject_prefix() -> None:
+    observation = ContextObservationRecord(
+        id="observation-imported",
+        save_id="save-imported",
+        observation_type="character_fact",
+        claim="Mara has the red key.",
+        evidence_quote="Lio says Mara has the red key",
+        source_message_ids=["message-imported"],
+        scope="durable",
+        status="pending",
+        confidence=0.99,
+        tags=["key"],
+        metadata={},
+    )
+
+    assert not agentic_context_module._context_observation_evidence_is_grounded(
+        observation,
+        source_texts_by_observation={
+            observation.id: ("Lio says Mara has the red key.",),
+        },
+    )
 
 
 def test_observation_service_caps_and_deduplicates_provider_candidates(

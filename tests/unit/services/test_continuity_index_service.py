@@ -128,6 +128,44 @@ def test_continuity_index_syncs_atomic_facts_with_evidence_metadata(
     assert ("memory", memory.id) not in remaining_keys
 
 
+def test_continuity_index_skips_resync_until_source_data_changes(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    source = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The lens glows red.",
+    )
+    repositories.add_memory(
+        save_id=save.id,
+        body="The lens glows red.",
+        tags=["lens"],
+        source_message_id=source.id,
+    )
+    service = ContinuityIndexService(repositories)
+
+    first = service.sync_save(save.id)
+    second = service.sync_save(save.id)
+
+    assert first.indexed_count > 0
+    assert second.indexed_count == 0
+    repositories.add_memory(
+        save_id=save.id,
+        body="The lens hums at dawn.",
+        tags=["lens"],
+        source_message_id=source.id,
+    )
+    assert repositories.continuity_index_needs_sync(save.id)
+
+
 def test_continuity_index_treats_consolidated_dossiers_as_high_value_context(
     repositories: PersistenceRepositories,
 ) -> None:

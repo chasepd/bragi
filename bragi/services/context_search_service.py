@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import unicodedata
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -97,6 +96,7 @@ from bragi.services.tool_call_helpers import (
     parse_tool_arguments_json,
     validate_tool_arguments_shape,
 )
+from bragi.text_search import cjk_lexical_anchors, unicode_word_terms
 
 MAX_CONTEXT_SELECTIONS = 16
 MAX_CONTEXT_SEARCH_TOOL_FEEDBACK_TURNS = 2
@@ -314,6 +314,12 @@ class ContextSearchService:
                 character_knowledge_edges=list(snapshot.character_knowledge_edges),
                 entity_links=list(snapshot.entity_links),
             )
+            candidate_observations = _observations_with_indexed_sources(
+                self.repositories,
+                save_id=save_id,
+                observations=snapshot.observations,
+                context_sources=retrieved_sources.records,
+            )
             candidates = _next_turn_context_candidates(
                 scenario=snapshot.details.scenario,
                 scene_snapshot=snapshot.scene_snapshot,
@@ -327,7 +333,7 @@ class ContextSearchService:
                 media_assets=list(snapshot.media_assets),
                 memories=list(snapshot.memories),
                 summaries=list(snapshot.summaries),
-                observations=list(snapshot.observations),
+                observations=list(candidate_observations),
                 context_sources=list(retrieved_sources.records),
                 recent_messages=snapshot.details.messages,
                 include_missing_raw_candidates=False,
@@ -514,6 +520,12 @@ class ContextSearchService:
                     recent_messages=messages,
                     message_visibility=list(narration_snapshot.message_visibility),
                 )
+                candidate_observations = _observations_with_indexed_sources(
+                    self.repositories,
+                    save_id=save_id,
+                    observations=narration_snapshot.observations,
+                    context_sources=retrieved_sources.records,
+                )
                 candidate_set = _context_candidate_set(
                     scenario=scenario,
                     scene_snapshot=narration_snapshot.scene_snapshot,
@@ -531,7 +543,7 @@ class ContextSearchService:
                     media_assets=list(narration_snapshot.media_assets),
                     memories=list(narration_snapshot.memories),
                     summaries=list(narration_snapshot.summaries),
-                    observations=list(narration_snapshot.observations),
+                    observations=list(candidate_observations),
                     context_sources=list(retrieved_sources.records),
                     recent_messages=messages,
                     player_message_id=player_message_id,
@@ -579,6 +591,12 @@ class ContextSearchService:
                     recent_messages=messages,
                     message_visibility=list(snapshot.message_visibility),
                 )
+                candidate_observations = _observations_with_indexed_sources(
+                    self.repositories,
+                    save_id=save_id,
+                    observations=snapshot.observations,
+                    context_sources=retrieved_sources.records,
+                )
                 candidate_set = _context_candidate_set(
                     scenario=scenario,
                     scene_snapshot=snapshot.scene_snapshot,
@@ -594,7 +612,7 @@ class ContextSearchService:
                     media_assets=list(snapshot.media_assets),
                     memories=list(snapshot.memories),
                     summaries=list(snapshot.summaries),
-                    observations=list(snapshot.observations),
+                    observations=list(candidate_observations),
                     context_sources=list(retrieved_sources.records),
                     recent_messages=messages,
                     player_message_id=player_message_id,
@@ -900,7 +918,7 @@ def _rehydrate_selected_context(
         repositories,
         save_id=save_id,
         details=details,
-        include_context_sources=True,
+        include_context_sources=False,
         raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
     )
     if snapshot is None:
@@ -913,12 +931,52 @@ def _rehydrate_selected_context(
             message for message in messages if message.id == player_message_id
         ),
     )
+    selected_context_sources = tuple(
+        repositories.list_context_sources_by_keys(
+            save_id,
+            {
+                (item.source_type, item.source_id)
+                for item in selected_items
+            },
+        )
+    )
+    selected_source_message_ids = {
+        source_id
+        for source in selected_context_sources
+        for source_id in _context_source_message_ids(source)
+    }
+    selected_message_visibility = tuple(
+        repositories.list_message_visibility(
+            save_id,
+            character_ids=(
+                set(snapshot.scene_snapshot.present_character_ids)
+                if snapshot.scene_snapshot is not None
+                else set()
+            ),
+            message_ids=selected_source_message_ids,
+        )
+    )
+    candidate_message_visibility = list(
+        {
+            visibility.id: visibility
+            for visibility in (
+                *snapshot.message_visibility,
+                *selected_message_visibility,
+            )
+        }.values()
+    )
+    candidate_observations = _observations_with_indexed_sources(
+        repositories,
+        save_id=save_id,
+        observations=snapshot.observations,
+        context_sources=selected_context_sources,
+    )
     fresh_candidates = _context_candidate_set(
         scenario=details.scenario,
         scene_snapshot=snapshot.scene_snapshot,
         characters=list(snapshot.characters),
         character_knowledge_edges=list(snapshot.character_knowledge_edges),
-        message_visibility=list(snapshot.message_visibility),
+        message_visibility=candidate_message_visibility,
         entity_links=list(snapshot.entity_links),
         world_state=list(snapshot.world_state),
         world_state_for_scope=list(snapshot.world_state_for_scope),
@@ -926,8 +984,8 @@ def _rehydrate_selected_context(
         media_assets=list(snapshot.media_assets),
         memories=list(snapshot.memories),
         summaries=list(snapshot.summaries),
-        observations=list(snapshot.observations),
-        context_sources=list(snapshot.context_sources),
+        observations=list(candidate_observations),
+        context_sources=list(selected_context_sources),
         recent_messages=messages,
         player_message_id=player_message_id,
         include_missing_raw_candidates=True,
@@ -1089,7 +1147,10 @@ def _indexed_context_source_retrieval(
             continue
         seen_ids.add(hit.record.id)
         records.append(hit.record)
-    for record in repositories.list_curated_observation_source_markers(save_id):
+    for record in repositories.list_curated_observation_source_markers(
+        save_id,
+        limit=RAW_CONTEXT_RECORD_LIMIT,
+    ):
         if (
             record.id in seen_ids
             or record.metadata.get("curation_action")
@@ -3476,6 +3537,53 @@ def _accepted_observation_ids(
     return frozenset(record.id for record in records if record.status == "accepted")
 
 
+def _observations_with_indexed_sources(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    observations: tuple[ContextObservationRecord, ...],
+    context_sources: tuple[ContextSourceRecord, ...],
+) -> tuple[ContextObservationRecord, ...]:
+    existing_ids = {observation.id for observation in observations}
+    missing_ids = {
+        source.source_id
+        for source in context_sources
+        if source.source_type == "observation"
+        and source.source_id not in existing_ids
+    }
+    if not missing_ids:
+        return observations
+    return (
+        *observations,
+        *repositories.list_context_observations_by_ids(save_id, missing_ids),
+    )
+
+
+def _context_source_message_ids(
+    source: ContextSourceRecord,
+) -> frozenset[str]:
+    source_ids: set[str] = set()
+    for metadata_field in ("source_message_id", "last_seen_message_id"):
+        value = source.metadata.get(metadata_field)
+        if isinstance(value, str) and value:
+            source_ids.add(value)
+    raw_ids = source.metadata.get("source_message_ids")
+    if isinstance(raw_ids, list):
+        source_ids.update(
+            value for value in raw_ids if isinstance(value, str) and value
+        )
+    raw_groups = source.metadata.get("source_provenance_groups")
+    if isinstance(raw_groups, list):
+        source_ids.update(
+            value
+            for group in raw_groups
+            if isinstance(group, list)
+            for value in group
+            if isinstance(value, str) and value
+        )
+    return frozenset(source_ids)
+
+
 def _curated_observation_source_ids(
     records: list[ContextSourceRecord],
     *,
@@ -3609,18 +3717,7 @@ def _meaningful_terms(text: str) -> set[str]:
 
 
 def _ordered_meaningful_query_terms(text: str) -> tuple[str, ...]:
-    normalized = unicodedata.normalize("NFKC", text).casefold()
-    terms: list[str] = []
-    current: list[str] = []
-    for character in normalized:
-        if character.isalnum() or (character in {"'", "’"} and current):
-            current.append("'" if character == "’" else character)
-            continue
-        if current:
-            terms.append("".join(current).strip("'"))
-            current = []
-    if current:
-        terms.append("".join(current).strip("'"))
+    terms = (*unicode_word_terms(text), *cjk_lexical_anchors(text))
     return tuple(
         dict.fromkeys(
             term
@@ -3657,8 +3754,22 @@ def _bounded_context_query_terms(text: str) -> tuple[str, ...]:
             limit=MAX_CONTEXT_QUERY_TERMS,
         )
     edge_reserve = MAX_CONTEXT_QUERY_TERMS // 4
+    identifier_reserve = MAX_CONTEXT_QUERY_TERMS // 8
+    identifier_terms = tuple(
+        term
+        for term in ordered
+        if len(term) <= 2
+        and term.isascii()
+        and term.isalnum()
+    )[:identifier_reserve]
     selected = list(
-        dict.fromkeys((*ordered[:edge_reserve], *ordered[-edge_reserve:]))
+        dict.fromkeys(
+            (
+                *identifier_terms,
+                *ordered[:edge_reserve],
+                *ordered[-edge_reserve:],
+            )
+        )
     )
     remaining = set(ordered) - set(selected)
     selected.extend(

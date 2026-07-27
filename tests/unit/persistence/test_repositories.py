@@ -3801,7 +3801,7 @@ def test_repositories_search_context_sources_with_unicode_terms(
     )
     cjk_hits = repositories.search_context_sources(
         save.id,
-        query_terms={"書庫"},
+        query_terms={"月石羅針盤はどこ"},
         source_types={"memory"},
         limit=8,
     )

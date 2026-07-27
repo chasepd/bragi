@@ -71,6 +71,7 @@ from bragi.persistence.models import (
 )
 from bragi.redaction import redact_text
 from bragi.safety import normalize_message_safety
+from bragi.text_search import cjk_lexical_anchors, unicode_word_terms
 from bragi.world_time_model import (
     canonical_world_time_from_legacy,
     canonical_world_time_from_values,
@@ -1124,6 +1125,37 @@ class PersistenceRepositories:
             "context_revision": context_revision - ignored_message_revision,
         }
         return _json_digest(payload)
+
+    def continuity_index_needs_sync(self, save_id: str) -> bool:
+        row = self._fetch_one(
+            """
+            SELECT revision, indexed_revision
+            FROM save_continuity_index_revisions
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        )
+        return (
+            row is None
+            or int(row["revision"]) != int(row["indexed_revision"])
+        )
+
+    def mark_continuity_index_synced(self, save_id: str) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO save_continuity_index_revisions(
+                save_id,
+                revision,
+                indexed_revision,
+                updated_at
+            )
+            VALUES (?, 0, 0, CURRENT_TIMESTAMP)
+            ON CONFLICT(save_id) DO UPDATE SET
+                indexed_revision = revision,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (save_id,),
+        )
 
     def add_save_scenario_update(
         self,
@@ -2940,17 +2972,36 @@ class PersistenceRepositories:
         self.commit()
         return record
 
-    def list_state_changes(self, save_id: str) -> list[StateChangeRecord]:
+    def list_state_changes(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[StateChangeRecord]:
+        order_sql = (
+            "ORDER BY created_at DESC, rowid DESC"
+            if limit is not None
+            else "ORDER BY created_at, rowid"
+        )
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        params: tuple[object, ...] = (
+            (save_id, max(0, limit))
+            if limit is not None
+            else (save_id,)
+        )
         rows = self._fetch_all(
-            """
+            f"""
             SELECT id, save_id, source_message_id, operation, state_key,
                    before_json, after_json
             FROM state_changes
             WHERE save_id = ?
-            ORDER BY created_at, rowid
+            {order_sql}
+            {limit_sql}
             """,
-            (save_id,),
+            params,
         )
+        if limit is not None:
+            rows.reverse()
         return [StateChangeRecord(**dict(row)) for row in rows]
 
     def delete_world_state(
@@ -3057,6 +3108,8 @@ class PersistenceRepositories:
             """,
             params,
         )
+        if limit is not None:
+            rows.reverse()
         return [
             WorldStateRecord(
                 id=row["id"],
@@ -3198,12 +3251,53 @@ class PersistenceRepositories:
         )
         return [_context_source_from_row(row) for row in rows]
 
+    def list_context_sources_by_keys(
+        self,
+        save_id: str,
+        source_keys: set[tuple[str, str]] | frozenset[tuple[str, str]],
+    ) -> list[ContextSourceRecord]:
+        if not source_keys:
+            return []
+        rows = self._fetch_all(
+            """
+            SELECT source.id, source.save_id, source.source_type,
+                   source.source_id, source.title, source.body,
+                   source.metadata_json, source.token_estimate,
+                   source.scene_snapshot_id, source.scene_generation,
+                   source.created_turn_number, source.expires_after_turn_number
+            FROM context_sources AS source
+            JOIN json_each(?) AS selected
+              ON source.source_type =
+                 CAST(json_extract(selected.value, '$[0]') AS TEXT)
+             AND source.source_id =
+                 CAST(json_extract(selected.value, '$[1]') AS TEXT)
+            WHERE source.save_id = ? AND source.archived_at IS NULL
+            ORDER BY source.source_type, source.title,
+                     source.created_at, source.rowid
+            """,
+            (_dump_json(sorted(source_keys)), save_id),
+        )
+        return [_context_source_from_row(row) for row in rows]
+
     def list_curated_observation_source_markers(
         self,
         save_id: str,
+        *,
+        limit: int | None = None,
     ) -> list[ContextSourceRecord]:
+        order_sql = (
+            "ORDER BY created_at DESC, rowid DESC"
+            if limit is not None
+            else "ORDER BY created_at, rowid"
+        )
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        params: tuple[object, ...] = (
+            (save_id, max(0, limit))
+            if limit is not None
+            else (save_id,)
+        )
         rows = self._fetch_all(
-            """
+            f"""
             SELECT id, save_id, source_type, source_id, title, body, metadata_json,
                    token_estimate, scene_snapshot_id, scene_generation,
                    created_turn_number, expires_after_turn_number
@@ -3217,10 +3311,13 @@ class PersistenceRepositories:
                     OR json_extract(metadata_json, '$.curation_action')
                        = 'scene_scratch'
                   )
-            ORDER BY created_at, rowid
+            {order_sql}
+            {limit_sql}
             """,
-            (save_id,),
+            params,
         )
+        if limit is not None:
+            rows.reverse()
         return [_context_source_from_row(row) for row in rows]
 
     def search_context_sources(
@@ -3274,7 +3371,10 @@ class PersistenceRepositories:
             dict.fromkeys(
                 term
                 for value in bounded_query_terms
-                for term in _unicode_search_terms(str(value))
+                for term in (
+                    *_unicode_search_terms(str(value)),
+                    *cjk_lexical_anchors(str(value)),
+                )
             )
         )
         substring_terms = (
@@ -3363,6 +3463,7 @@ class PersistenceRepositories:
                 phrase_rows = phrase_rows[:limit]
                 break
         if substring_terms:
+            substring_terms_json = _dump_json(substring_terms)
             substring_predicate = (
                 "NOT EXISTS ("
                 "SELECT 1 FROM json_each(?) substring_term "
@@ -3395,7 +3496,20 @@ class PersistenceRepositories:
                     context_sources.scene_generation,
                     context_sources.created_turn_number,
                     context_sources.expires_after_turn_number,
-                    -1.0 AS bm25_rank
+                    -(
+                        1.0 + (
+                            SELECT COUNT(*)
+                            FROM json_each(?) substring_score_term
+                            WHERE instr(
+                                bragi_normalize_text(context_sources.title),
+                                CAST(substring_score_term.value AS TEXT)
+                            ) > 0
+                            OR instr(
+                                bragi_normalize_text(context_sources.body),
+                                CAST(substring_score_term.value AS TEXT)
+                            ) > 0
+                        )
+                    ) AS bm25_rank
                 FROM context_sources
                 WHERE context_sources.save_id = ?
                   AND context_sources.archived_at IS NULL
@@ -3404,14 +3518,16 @@ class PersistenceRepositories:
                   )
                   AND ({substring_predicate})
                   {eligibility_sql}
-                ORDER BY context_sources.created_at DESC,
+                ORDER BY bm25_rank,
+                         context_sources.created_at DESC,
                          context_sources.rowid DESC
                 LIMIT ?
                 """,
                 (
+                    substring_terms_json,
                     save_id,
                     *source_type_values,
-                    _dump_json(substring_terms),
+                    substring_terms_json,
                     *eligibility_params,
                     limit,
                 ),
@@ -3752,6 +3868,8 @@ class PersistenceRepositories:
             """,
             tuple(params),
         )
+        if limit is not None:
+            rows.reverse()
         return [_context_observation_from_row(row) for row in rows]
 
     def update_context_observation(
@@ -7365,12 +7483,23 @@ class PersistenceRepositories:
         *,
         message_id: str | None = None,
         character_ids: set[str] | frozenset[str] | tuple[str, ...] | None = None,
+        message_ids: set[str] | frozenset[str] | tuple[str, ...] | None = None,
     ) -> list[MessageVisibilityRecord]:
         filters = ["save_id = ?"]
         params: list[object] = [save_id]
         if message_id is not None:
             filters.append("message_id = ?")
             params.append(message_id)
+        if message_ids is not None:
+            ids = tuple(sorted(set(message_ids)))
+            if not ids:
+                return []
+            filters.append(
+                "message_id IN ("
+                "SELECT CAST(value AS TEXT) FROM json_each(?)"
+                ")"
+            )
+            params.append(_dump_json(ids))
         if character_ids is not None:
             ids = tuple(character_ids)
             if not ids:
@@ -7816,9 +7945,20 @@ class PersistenceRepositories:
         save_id: str,
         *,
         status: str | None = None,
+        limit: int | None = None,
     ) -> list[ContextUpdateSuggestionRecord]:
         status_filter = "" if status is None else "AND status = ?"
-        params: tuple[Any, ...] = (save_id,) if status is None else (save_id, status)
+        params: list[object] = [save_id]
+        if status is not None:
+            params.append(status)
+        order_sql = (
+            "ORDER BY created_at DESC, rowid DESC"
+            if limit is not None
+            else "ORDER BY created_at, rowid"
+        )
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        if limit is not None:
+            params.append(max(0, limit))
         rows = self._fetch_all(
             f"""
             SELECT id, save_id, update_type, entity_type, entity_id, field_path,
@@ -7827,10 +7967,13 @@ class PersistenceRepositories:
                    review_attempt_count, next_review_at, last_review_error
             FROM context_update_suggestions
             WHERE save_id = ? {status_filter}
-            ORDER BY created_at, rowid
+            {order_sql}
+            {limit_sql}
             """,
-            params,
+            tuple(params),
         )
+        if limit is not None:
+            rows.reverse()
         return [_context_update_suggestion_from_row(row) for row in rows]
 
     def has_context_update_suggestions(
@@ -8538,6 +8681,8 @@ class PersistenceRepositories:
             """,
             params,
         )
+        if limit is not None:
+            rows.reverse()
         return [
             MemoryRecord(
                 id=row["id"],
@@ -9156,17 +9301,36 @@ class PersistenceRepositories:
         )
         self.commit()
 
-    def list_summaries(self, save_id: str) -> list[SummaryRecord]:
+    def list_summaries(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[SummaryRecord]:
+        order_sql = (
+            "ORDER BY created_at DESC, rowid DESC"
+            if limit is not None
+            else "ORDER BY created_at, rowid"
+        )
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        params: tuple[object, ...] = (
+            (save_id, max(0, limit))
+            if limit is not None
+            else (save_id,)
+        )
         rows = self._fetch_all(
-            """
+            f"""
             SELECT id, save_id, covers_message_start_id, covers_message_end_id,
                    body, provider, model, content_rating
             FROM summaries
             WHERE save_id = ? AND archived_at IS NULL
-            ORDER BY created_at, rowid
+            {order_sql}
+            {limit_sql}
             """,
-            (save_id,),
+            params,
         )
+        if limit is not None:
+            rows.reverse()
         return [SummaryRecord(**dict(row)) for row in rows]
 
     def summary_visible_to_characters(
@@ -10868,18 +11032,37 @@ class PersistenceRepositories:
         )
         return MediaAssetRecord(**dict(row)) if row else record
 
-    def list_media_assets(self, save_id: str) -> list[MediaAssetRecord]:
+    def list_media_assets(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[MediaAssetRecord]:
+        order_sql = (
+            "ORDER BY created_at DESC, rowid DESC"
+            if limit is not None
+            else "ORDER BY created_at, rowid"
+        )
+        limit_sql = "LIMIT ?" if limit is not None else ""
+        params: tuple[object, ...] = (
+            (save_id, max(0, limit))
+            if limit is not None
+            else (save_id,)
+        )
         rows = self._fetch_all(
-            """
+            f"""
             SELECT id, save_id, source_message_id, type, path, thumbnail_path,
                    prompt, provider, model, status, mime_type, metadata_json,
                    source_media_asset_id, created_at, archived_at
             FROM media_assets
             WHERE save_id = ? AND archived_at IS NULL
-            ORDER BY created_at, rowid
+            {order_sql}
+            {limit_sql}
             """,
-            (save_id,),
+            params,
         )
+        if limit is not None:
+            rows.reverse()
         return [MediaAssetRecord(**dict(row)) for row in rows]
 
     def get_media_asset(
@@ -11420,23 +11603,7 @@ def _fts_query_from_terms(
 
 
 def _unicode_search_terms(value: str) -> tuple[str, ...]:
-    normalized = _normalized_search_text(value)
-    terms: list[str] = []
-    current: list[str] = []
-    for character in normalized:
-        if character.isalnum() or (character in {"'", "’"} and current):
-            current.append("'" if character == "’" else character)
-            continue
-        if current:
-            term = "".join(current).strip("'")
-            if term:
-                terms.append(term)
-            current = []
-    if current:
-        term = "".join(current).strip("'")
-        if term:
-            terms.append(term)
-    return tuple(terms)
+    return unicode_word_terms(value)
 
 
 def _bounded_repository_search_terms(

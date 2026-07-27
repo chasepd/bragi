@@ -83,6 +83,38 @@ def test_scoped_targets_only_unlock_for_present_characters() -> None:
     assert ("world_state", "state-ren-ledger") in targets.blocked
 
 
+def test_scoped_targets_supersede_legacy_links_by_owner_and_target() -> None:
+    present = _character("character-sienna", name="Sienna")
+    absent = _character("character-ren", name="Archivist Ren")
+    snapshot = _scene_snapshot(present_character_ids=[present.id])
+    shared_memory_id = "memory-shared-ledger"
+
+    targets = allowed_character_scoped_targets(
+        scene_snapshot=snapshot,
+        characters=[present, absent],
+        character_knowledge_edges=[
+            _knowledge_edge(
+                character_id=absent.id,
+                target_type="memory",
+                target_id=shared_memory_id,
+            ),
+        ],
+        entity_links=[
+            _entity_link(
+                entity_id=present.id,
+                target_type="memory",
+                target_id=shared_memory_id,
+            ),
+        ],
+        latest_player_message="I ask Sienna about the ledger.",
+    )
+
+    assert targets.allowed == {
+        ("memory", shared_memory_id): ("Sienna knows",),
+    }
+    assert ("memory", shared_memory_id) not in targets.blocked
+
+
 def test_absent_mentions_do_not_hide_messages_from_present_scene() -> None:
     present = _character("character-sienna", name="Sienna")
     absent = _character("character-ren", name="Archivist Ren", aliases=["Ren"])

@@ -74,13 +74,13 @@ def allowed_character_scoped_targets(
     ).present_character_ids
     allowed: dict[tuple[str, str], tuple[str, ...]] = {}
     blocked: set[tuple[str, str]] = set()
-    graph_targets: set[tuple[str, str]] = set()
+    graph_targets: set[tuple[str, str, str]] = set()
     for edge in character_knowledge_edges:
         target_type = normalized_knowledge_target_type(edge.target_type)
         if target_type not in {"memory", "world_state", "summary", "scenario_section"}:
             continue
         target = (target_type, edge.target_id)
-        graph_targets.add(target)
+        graph_targets.add((edge.character_id, *target))
         character = characters_by_id.get(edge.character_id)
         if (
             character is not None
@@ -107,7 +107,7 @@ def allowed_character_scoped_targets(
         if target_type not in {"memory", "world_state", "summary"}:
             continue
         target = (target_type, link.target_id)
-        if target in graph_targets:
+        if (link.entity_id, *target) in graph_targets:
             continue
         character = characters_by_id.get(link.entity_id)
         if character is not None and link.entity_id in present_ids:

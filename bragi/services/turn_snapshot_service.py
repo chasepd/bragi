@@ -29,6 +29,10 @@ from bragi.safety import (
     FADE_TO_BLACK_TRANSITION_KIND,
     normalize_message_safety,
 )
+from bragi.services.character_text_world_update_service import (
+    character_text_source_ref,
+    parse_character_text_source_ref,
+)
 from bragi.services.scenario_content_rating import (
     metadata_with_scenario_content_ratings,
 )
@@ -1563,6 +1567,10 @@ class _SnapshotRemapper:
             return _compact_json(self._remap_id_list(raw, "characters"))
         if table_name == "active_threads" and column == "related_entities_json":
             return _compact_json(self._remap_related_entities(raw))
+        if column == "source_message_ids_json":
+            return _compact_json(self._remap_source_ref_list(raw))
+        if table_name == "context_sources" and column == "metadata_json":
+            return _compact_json(self._remap_context_source_metadata(raw))
         return _compact_json(self._remap_json_value(raw))
 
     def _remap_json_id_list(self, value: object, table_name: str) -> object:
@@ -1597,6 +1605,46 @@ class _SnapshotRemapper:
             mapped_id = self._mapped_entity_id(entity_type, entity_id)
             if isinstance(mapped_id, str):
                 remapped.append(f"{entity_type}:{mapped_id}")
+        return remapped
+
+    def _mapped_source_ref(self, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        text_message_id = parse_character_text_source_ref(value)
+        if text_message_id is not None:
+            mapped = self._mapped_table_id(
+                "character_text_messages",
+                text_message_id,
+            )
+            return (
+                character_text_source_ref(mapped)
+                if isinstance(mapped, str)
+                else value
+            )
+        return self._mapped_message_id(value)
+
+    def _remap_source_ref_list(self, raw: object) -> object:
+        if not isinstance(raw, list):
+            return raw
+        return [self._mapped_source_ref(item) for item in raw]
+
+    def _remap_context_source_metadata(self, raw: object) -> object:
+        remapped = self._remap_json_value(raw)
+        if not isinstance(raw, dict) or not isinstance(remapped, dict):
+            return remapped
+        for field in ("source_message_id", "last_seen_message_id"):
+            if field in raw:
+                remapped[field] = self._mapped_source_ref(raw[field])
+        if "source_message_ids" in raw:
+            remapped["source_message_ids"] = self._remap_source_ref_list(
+                raw["source_message_ids"]
+            )
+        raw_groups = raw.get("source_provenance_groups")
+        if isinstance(raw_groups, list):
+            remapped["source_provenance_groups"] = [
+                self._remap_source_ref_list(group)
+                for group in raw_groups
+            ]
         return remapped
 
     def _remap_json_value(self, value: object) -> object:

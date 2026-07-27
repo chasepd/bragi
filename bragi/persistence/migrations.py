@@ -729,6 +729,7 @@ def migrate_database(database_path: Path | str) -> None:
         _ensure_character_text_activity_schema(connection)
         _ensure_scene_world_time_schema(connection)
         _ensure_hot_narration_query_indexes(connection)
+        _ensure_continuity_index_revision_schema(connection)
         connection.commit()
 
 
@@ -744,6 +745,7 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         )
         _ensure_character_knowledge_schema(connection)
         _ensure_context_revision_schema(connection)
+        _ensure_continuity_index_revision_schema(connection)
         _ensure_scheduled_tasks_schema(connection)
         _ensure_auth_schema(connection)
         _ensure_save_access_schema(connection)
@@ -768,6 +770,7 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         _ensure_character_text_message_attachment_schema(connection)
         _ensure_turn_snapshot_schema(connection)
         _ensure_context_revision_schema(connection)
+        _ensure_continuity_index_revision_schema(connection)
         _ensure_character_contact_name_schema(connection)
         _ensure_character_texting_style_schema(connection)
         _ensure_character_current_clothing_schema(connection)
@@ -3689,6 +3692,78 @@ def _ensure_context_revision_schema(connection: sqlite3.Connection) -> None:
                 """
             )
     _ensure_message_context_revision_triggers(connection)
+
+
+def _ensure_continuity_index_revision_schema(connection: sqlite3.Connection) -> None:
+    if not _table_exists(connection, "saves"):
+        return
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS save_continuity_index_revisions (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL DEFAULT 0,
+            indexed_revision INTEGER NOT NULL DEFAULT -1,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        INSERT OR IGNORE INTO save_continuity_index_revisions(
+            save_id,
+            revision,
+            indexed_revision
+        )
+        SELECT id, 0, -1 FROM saves;
+
+        CREATE TRIGGER IF NOT EXISTS init_continuity_revision_after_save_insert
+        AFTER INSERT ON saves
+        BEGIN
+            INSERT OR IGNORE INTO save_continuity_index_revisions(
+                save_id,
+                revision,
+                indexed_revision
+            )
+            VALUES (NEW.id, 0, -1);
+        END;
+        """,
+    )
+    for table_name in (
+        "world_state",
+        "memories",
+        "summaries",
+        "active_threads",
+        "locations",
+        "characters",
+        "scene_snapshots",
+        "save_scenario_updates",
+        "character_text_threads",
+        "character_text_messages",
+    ):
+        if not _table_exists(connection, table_name):
+            continue
+        for event in ("INSERT", "UPDATE", "DELETE"):
+            row_ref = "OLD" if event == "DELETE" else "NEW"
+            trigger_name = (
+                f"bump_{table_name}_continuity_revision_after_{event.lower()}"
+            )
+            _execute_schema_script(
+                connection,
+                f"""
+                CREATE TRIGGER IF NOT EXISTS {trigger_name}
+                AFTER {event} ON {table_name}
+                BEGIN
+                    INSERT INTO save_continuity_index_revisions(
+                        save_id,
+                        revision,
+                        indexed_revision,
+                        updated_at
+                    )
+                    VALUES ({row_ref}.save_id, 1, -1, CURRENT_TIMESTAMP)
+                    ON CONFLICT(save_id) DO UPDATE SET
+                        revision = revision + 1,
+                        updated_at = CURRENT_TIMESTAMP;
+                END;
+                """,
+            )
 
 
 def _ensure_message_context_revision_schema(connection: sqlite3.Connection) -> None:

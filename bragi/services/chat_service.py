@@ -21,9 +21,11 @@ from bragi.app_logging import (
 from bragi.persistence.models import (
     CharacterKnowledgeEdgeRecord,
     CharacterRecord,
+    ContextUpdateSuggestionRecord,
     EntityLinkRecord,
     JobRecord,
     MessageRecord,
+    MessageVisibilityRecord,
     ModelPreferenceRecord,
     SaveScenarioUpdateRecord,
     SceneSnapshotRecord,
@@ -9340,6 +9342,55 @@ def _budgeted_narrator_context(
         if narration_snapshot is not None
         else repositories.get_scene_snapshot(save_id)
     )
+    message_visibility_records = (
+        tuple(narration_snapshot.message_visibility)
+        if narration_snapshot is not None
+        else tuple(repositories.list_message_visibility(save_id))
+    )
+    hidden_message_ids = _hidden_message_ids_for_present_characters(
+        scene_snapshot=snapshot,
+        message_visibility=message_visibility_records,
+    )
+    memory_records = (
+        tuple(narration_snapshot.memories)
+        if narration_snapshot is not None
+        else tuple(repositories.list_memories(save_id))
+    )
+    visible_memory_records = tuple(
+        memory
+        for memory in memory_records
+        if not hidden_message_ids.intersection(memory.source_message_ids)
+    )
+    world_state_records = (
+        tuple(narration_snapshot.world_state)
+        if narration_snapshot is not None
+        else tuple(repositories.list_world_state(save_id))
+    )
+    visible_world_state_records = tuple(
+        state
+        for state in world_state_records
+        if state.source_message_id not in hidden_message_ids
+    )
+    entity_link_records = (
+        tuple(narration_snapshot.entity_links)
+        if narration_snapshot is not None
+        else tuple(repositories.list_entity_links(save_id))
+    )
+    visible_entity_link_records = tuple(
+        link
+        for link in entity_link_records
+        if link.source_message_id not in hidden_message_ids
+    )
+    knowledge_edge_records = (
+        tuple(narration_snapshot.character_knowledge_edges)
+        if narration_snapshot is not None
+        else tuple(repositories.list_character_knowledge_edges(save_id))
+    )
+    visible_knowledge_edge_records = tuple(
+        edge
+        for edge in knowledge_edge_records
+        if not hidden_message_ids.intersection(edge.source_message_ids)
+    )
     summary_records = (
         tuple(narration_snapshot.summaries)
         if narration_snapshot is not None
@@ -9375,22 +9426,10 @@ def _budgeted_narrator_context(
             if narration_snapshot is not None
             else None
         ),
-        character_knowledge_edges=(
-            narration_snapshot.character_knowledge_edges
-            if narration_snapshot is not None
-            else None
-        ),
-        entity_links=(
-            narration_snapshot.entity_links
-            if narration_snapshot is not None
-            else None
-        ),
-        memories=(
-            narration_snapshot.memories if narration_snapshot is not None else None
-        ),
-        world_state=(
-            narration_snapshot.world_state if narration_snapshot is not None else None
-        ),
+        character_knowledge_edges=visible_knowledge_edge_records,
+        entity_links=visible_entity_link_records,
+        memories=visible_memory_records,
+        world_state=visible_world_state_records,
         summaries=visible_summary_records,
     )
     pre_turn_hint_sources = pre_turn_scene_hint_sources(
@@ -9476,6 +9515,25 @@ def _budgeted_narrator_context(
         for item in context_result.selected_summaries
         if item.source_id in visible_summary_ids
     )
+    pending_suggestion_records = (
+        tuple(narration_snapshot.pending_context_suggestions)
+        if narration_snapshot is not None
+        else tuple(
+            repositories.list_context_update_suggestions(
+                save_id,
+                status="pending",
+            )
+        )
+    )
+    visible_pending_suggestions = tuple(
+        suggestion
+        for suggestion in pending_suggestion_records
+        if _context_update_suggestion_visible_to_present_characters(
+            suggestion=suggestion,
+            scene_snapshot=snapshot,
+            message_visibility=message_visibility_records,
+        )
+    )
     sources = (
         *base_sources,
         *_selected_character_voice_sources(
@@ -9493,11 +9551,7 @@ def _budgeted_narrator_context(
         *pending_context_suggestion_sources(
             repositories=repositories,
             save_id=save_id,
-            suggestions=(
-                narration_snapshot.pending_context_suggestions
-                if narration_snapshot is not None
-                else None
-            ),
+            suggestions=visible_pending_suggestions,
         ),
         *_selected_context_sources(
             context_result.selected_state,
@@ -9556,16 +9610,8 @@ def _budgeted_narrator_context(
                 if narration_snapshot is not None
                 else None
             ),
-            character_knowledge_edges=(
-                narration_snapshot.character_knowledge_edges
-                if narration_snapshot is not None
-                else None
-            ),
-            entity_links=(
-                narration_snapshot.entity_links
-                if narration_snapshot is not None
-                else None
-            ),
+            character_knowledge_edges=visible_knowledge_edge_records,
+            entity_links=visible_entity_link_records,
             summaries=visible_summary_records,
         ),
         *_selected_context_sources(
@@ -10180,6 +10226,37 @@ def _summary_visible_to_present_characters(
         covers_message_start_id=summary.covers_message_start_id,
         covers_message_end_id=summary.covers_message_end_id,
         character_ids=present_character_ids,
+    )
+
+
+def _context_update_suggestion_visible_to_present_characters(
+    *,
+    suggestion: ContextUpdateSuggestionRecord,
+    scene_snapshot: SceneSnapshotRecord | None,
+    message_visibility: tuple[MessageVisibilityRecord, ...],
+) -> bool:
+    if not suggestion.source_message_ids:
+        return True
+    hidden_message_ids = _hidden_message_ids_for_present_characters(
+        scene_snapshot=scene_snapshot,
+        message_visibility=message_visibility,
+    )
+    return not bool(hidden_message_ids & set(suggestion.source_message_ids))
+
+
+def _hidden_message_ids_for_present_characters(
+    *,
+    scene_snapshot: SceneSnapshotRecord | None,
+    message_visibility: tuple[MessageVisibilityRecord, ...],
+) -> frozenset[str]:
+    present_character_ids = set(
+        scene_snapshot.present_character_ids if scene_snapshot is not None else ()
+    )
+    return frozenset(
+        visibility.message_id
+        for visibility in message_visibility
+        if visibility.character_id in present_character_ids
+        and visibility.visibility == "not_visible"
     )
 
 

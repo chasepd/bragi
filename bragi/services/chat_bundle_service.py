@@ -2022,7 +2022,7 @@ class ChatBundleService:
                 field_name="context_sources.scene_snapshot_id",
                 repair_tracker=repair_tracker,
             )
-            copied["metadata_json"] = _remapped_context_source_metadata_json(
+            remapped_metadata_json = _remapped_context_source_metadata_json(
                 copied,
                 message_id_map,
                 character_text_message_id_map,
@@ -2031,6 +2031,10 @@ class ChatBundleService:
                 entity_id_maps=entity_id_maps,
                 repair_tracker=repair_tracker,
             )
+            if remapped_metadata_json is None:
+                context_source_id_map.pop(_text(row, "id"), None)
+                continue
+            copied["metadata_json"] = remapped_metadata_json
             context_sources.append(copied)
         _insert_rows(
             connection,
@@ -3080,6 +3084,17 @@ def _export_context_source_message_ids(
             if not isinstance(item, str) or not item:
                 return None
             source_ids.append(item)
+    raw_groups = metadata.get("source_provenance_groups")
+    if raw_groups is not None:
+        if not isinstance(raw_groups, list):
+            return None
+        for group in raw_groups:
+            if not isinstance(group, list) or not group:
+                return None
+            for item in group:
+                if not isinstance(item, str) or not item:
+                    return None
+                source_ids.append(item)
     return tuple(dict.fromkeys(source_ids))
 
 
@@ -4665,7 +4680,7 @@ def _remapped_context_source_metadata_json(
     scenario_id_map: dict[str, str],
     entity_id_maps: dict[str, dict[str, str]],
     repair_tracker: _BundleImportRepairTracker | None = None,
-) -> str:
+) -> str | None:
     metadata = _optional_json_object(row, "metadata_json") or {}
     remapped = dict(metadata)
     source_type = _text(row, "source_type")
@@ -4776,6 +4791,7 @@ def _remapped_context_source_metadata_json(
         raw_groups = remapped["source_provenance_groups"]
         if not isinstance(raw_groups, list) or not all(
             isinstance(group, list)
+            and bool(group)
             and all(isinstance(item, str) and item for item in group)
             for group in raw_groups
         ):
@@ -4797,10 +4813,10 @@ def _remapped_context_source_metadata_json(
                     ),
                     repair_tracker,
                 )
-                if mapped is not None:
-                    mapped_group.append(mapped)
-            if mapped_group:
-                mapped_groups.append(mapped_group)
+                if mapped is None:
+                    return None
+                mapped_group.append(mapped)
+            mapped_groups.append(mapped_group)
         remapped["source_provenance_groups"] = mapped_groups
     return _dump_json_compact(remapped)
 

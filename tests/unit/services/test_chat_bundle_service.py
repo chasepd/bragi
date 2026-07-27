@@ -1229,6 +1229,22 @@ def test_export_save_drops_context_sources_with_stale_metadata_message_refs(
     )
     repositories.upsert_context_source(
         save_id=save.id,
+        source_type="world_state",
+        source_id="stale-provenance-context",
+        title="Stale provenance context",
+        body="This row has an inaccessible provenance alternative.",
+        metadata={
+            "source_message_ids": [NARRATOR_MESSAGE_ID],
+            "source_provenance_groups": [
+                [NARRATOR_MESSAGE_ID],
+                [deleted_message.id],
+            ],
+            "source_provenance_mode": "all",
+        },
+        context_source_id="ctx-stale-provenance",
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
         source_type="message",
         source_id=f"{NARRATOR_MESSAGE_ID},{deleted_message.id}",
         title="Stale message context",
@@ -1246,6 +1262,7 @@ def test_export_save_drops_context_sources_with_stale_metadata_message_refs(
     context_source_ids = [row["id"] for row in data["context_sources"]]
     assert "ctx-portable" in context_source_ids
     assert "ctx-stale-metadata" not in context_source_ids
+    assert "ctx-stale-provenance" not in context_source_ids
     assert "ctx-stale-source-id" not in context_source_ids
 
 
@@ -5031,6 +5048,30 @@ def test_import_save_repairs_unknown_context_source_metadata_refs(
             "archived_at": None,
         }
     )
+    context_sources.append(
+        {
+            "id": "ctx-unsafe-provenance",
+            "save_id": SAVE_ID,
+            "source_type": "world_state",
+            "source_id": "beacon_lens",
+            "title": "Unsafe provenance",
+            "body": "This row must be omitted instead of weakening provenance.",
+            "metadata_json": json.dumps(
+                {
+                    "source_message_ids": [PLAYER_MESSAGE_ID],
+                    "source_provenance_groups": [
+                        [PLAYER_MESSAGE_ID],
+                        ["message-not-exported"],
+                    ],
+                    "source_provenance_mode": "all",
+                }
+            ),
+            "token_estimate": 8,
+            "created_at": "2026-07-01T12:00:00+00:00",
+            "updated_at": "2026-07-01T12:00:00+00:00",
+            "archived_at": None,
+        }
+    )
     broken_bundle_path = (
         tmp_path / "night-watch-unknown-context-source-metadata.bragi-chat"
     )
@@ -5050,6 +5091,10 @@ def test_import_save_repairs_unknown_context_source_metadata_refs(
         source
         for source in repositories.list_context_sources(imported_save_id)
         if source.title == "Unknown metadata"
+    )
+    assert all(
+        source.title != "Unsafe provenance"
+        for source in repositories.list_context_sources(imported_save_id)
     )
     assert repaired_context.metadata["source_message_id"] is None
     assert repaired_context.metadata["source_message_ids"] == [imported_messages[0].id]

@@ -2014,12 +2014,14 @@ class CountingNarrationPersistenceRepositories(PersistenceRepositories):
         *,
         message_id: str | None = None,
         character_ids: set[str] | frozenset[str] | tuple[str, ...] | None = None,
+        message_ids: set[str] | frozenset[str] | tuple[str, ...] | None = None,
     ) -> list[MessageVisibilityRecord]:
         self._count("message_visibility")
         return super().list_message_visibility(
             save_id,
             message_id=message_id,
             character_ids=character_ids,
+            message_ids=message_ids,
         )
 
     def list_entity_links(self, save_id: str) -> list[EntityLinkRecord]:
@@ -2047,13 +2049,23 @@ class CountingNarrationPersistenceRepositories(PersistenceRepositories):
             limit=limit,
         )
 
-    def list_state_changes(self, save_id: str) -> list[StateChangeRecord]:
+    def list_state_changes(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[StateChangeRecord]:
         self._count("state_changes")
-        return super().list_state_changes(save_id)
+        return super().list_state_changes(save_id, limit=limit)
 
-    def list_media_assets(self, save_id: str) -> list[MediaAssetRecord]:
+    def list_media_assets(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[MediaAssetRecord]:
         self._count("media_assets")
-        return super().list_media_assets(save_id)
+        return super().list_media_assets(save_id, limit=limit)
 
     def list_memories(
         self,
@@ -2064,9 +2076,14 @@ class CountingNarrationPersistenceRepositories(PersistenceRepositories):
         self._count("memories")
         return super().list_memories(save_id, limit=limit)
 
-    def list_summaries(self, save_id: str) -> list[SummaryRecord]:
+    def list_summaries(
+        self,
+        save_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[SummaryRecord]:
         self._count("summaries")
-        return super().list_summaries(save_id)
+        return super().list_summaries(save_id, limit=limit)
 
     def list_context_observations(
         self,
@@ -2098,9 +2115,14 @@ class CountingNarrationPersistenceRepositories(PersistenceRepositories):
         save_id: str,
         *,
         status: str | None = None,
+        limit: int | None = None,
     ) -> list[ContextUpdateSuggestionRecord]:
         self._count("context_update_suggestions")
-        return super().list_context_update_suggestions(save_id, status=status)
+        return super().list_context_update_suggestions(
+            save_id,
+            status=status,
+            limit=limit,
+        )
 
 
 def test_submit_player_turn_persists_messages_and_uses_active_chat_model(
@@ -18616,6 +18638,39 @@ def test_submit_player_turn_excludes_summary_covering_hidden_message(
         target_id=summary.id,
         relation="related",
     )
+    repositories.add_context_update_suggestion(
+        save_id=save.id,
+        update_type="field_update",
+        entity_type="location",
+        field_path="connections",
+        proposed_value=["concealed route beneath the wall"],
+        confidence=0.95,
+        source_message_ids=[hidden_narrator.id],
+    )
+    hidden_memory = repositories.add_memory(
+        save_id=save.id,
+        body="The concealed route opens behind the west buttress.",
+        tags=["route"],
+        source_message_id=hidden_narrator.id,
+    )
+    hidden_state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="keep.concealed_route",
+        value={"entrance": "west buttress"},
+        source_message_id=hidden_narrator.id,
+    )
+    for target_type, target_id in (
+        ("memory", hidden_memory.id),
+        ("world_state", hidden_state.id),
+    ):
+        repositories.add_entity_link(
+            save_id=save.id,
+            entity_type="character",
+            entity_id=character.id,
+            target_type=target_type,
+            target_id=target_id,
+            relation="related",
+        )
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
@@ -18650,6 +18705,9 @@ def test_submit_player_turn_excludes_summary_covering_hidden_message(
     request = provider.chat_requests[0]
     assert request.summary is None
     assert summary.body not in request.scenario_instructions
+    assert hidden_memory.body not in request.scenario_instructions
+    assert hidden_state.key not in request.scenario_instructions
+    assert request.pending_context_suggestions == ()
 
 
 def test_submit_player_turn_summarizes_before_context_search_and_keeps_context_separate(

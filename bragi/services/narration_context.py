@@ -72,6 +72,85 @@ def load_narration_context_snapshot(
                 limit=len(details.messages),
             ),
         )
+    world_state = tuple(
+        repositories.list_world_state(save_id, limit=raw_record_limit)
+    )
+    world_state_for_scope = tuple(
+        repositories.list_world_state_including_archived(
+            save_id,
+            limit=raw_record_limit,
+        )
+    )
+    state_changes = tuple(
+        repositories.list_state_changes(save_id, limit=raw_record_limit)
+    )
+    media_assets = tuple(
+        repositories.list_media_assets(save_id, limit=raw_record_limit)
+    )
+    memories = tuple(
+        repositories.list_memories(save_id, limit=raw_record_limit)
+    )
+    summaries = tuple(
+        repositories.list_summaries(save_id, limit=raw_record_limit)
+    )
+    observations = tuple(
+        repositories.list_context_observations(
+            save_id,
+            limit=raw_record_limit,
+        )
+    )
+    pending_suggestions = tuple(
+        repositories.list_context_update_suggestions(
+            save_id,
+            status="pending",
+            limit=raw_record_limit,
+        )
+    )
+    visibility_message_ids = (
+        {
+            *(message.id for message in details.messages),
+            *(
+                state.source_message_id
+                for state in (*world_state, *world_state_for_scope)
+                if state.source_message_id is not None
+            ),
+            *(
+                change.source_message_id
+                for change in state_changes
+                if change.source_message_id is not None
+            ),
+            *(
+                asset.source_message_id
+                for asset in media_assets
+                if asset.source_message_id is not None
+            ),
+            *(
+                source_id
+                for memory in memories
+                for source_id in memory.source_message_ids
+            ),
+            *(
+                source_id
+                for summary in summaries
+                for source_id in (
+                    summary.covers_message_start_id,
+                    summary.covers_message_end_id,
+                )
+            ),
+            *(
+                source_id
+                for observation in observations
+                for source_id in observation.source_message_ids
+            ),
+            *(
+                source_id
+                for suggestion in pending_suggestions
+                for source_id in suggestion.source_message_ids
+            ),
+        }
+        if raw_record_limit is not None
+        else None
+    )
     return NarrationContextSnapshot(
         details=details,
         scene_snapshot=scene_snapshot,
@@ -85,36 +164,21 @@ def load_narration_context_snapshot(
             repositories.list_message_visibility(
                 save_id,
                 character_ids=visibility_character_ids,
+                message_ids=visibility_message_ids,
             )
         ),
         entity_links=tuple(repositories.list_entity_links(save_id)),
-        world_state=tuple(
-            repositories.list_world_state(save_id, limit=raw_record_limit)
-        ),
-        world_state_for_scope=tuple(
-            repositories.list_world_state_including_archived(
-                save_id,
-                limit=raw_record_limit,
-            )
-        ),
-        state_changes=tuple(repositories.list_state_changes(save_id)),
-        media_assets=tuple(repositories.list_media_assets(save_id)),
-        memories=tuple(
-            repositories.list_memories(save_id, limit=raw_record_limit)
-        ),
-        summaries=tuple(repositories.list_summaries(save_id)),
-        observations=tuple(
-            repositories.list_context_observations(
-                save_id,
-                limit=raw_record_limit,
-            )
-        ),
+        world_state=world_state,
+        world_state_for_scope=world_state_for_scope,
+        state_changes=state_changes,
+        media_assets=media_assets,
+        memories=memories,
+        summaries=summaries,
+        observations=observations,
         context_sources=(
             tuple(repositories.list_context_sources(save_id))
             if include_context_sources
             else ()
         ),
-        pending_context_suggestions=tuple(
-            repositories.list_context_update_suggestions(save_id, status="pending")
-        ),
+        pending_context_suggestions=pending_suggestions,
     )
