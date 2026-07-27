@@ -13,7 +13,10 @@ from pytest import MonkeyPatch
 
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import SaveRecord
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.services.director_pressure_service import DIRECTOR_PRESSURE_STATE_KEY
 from bragi.services.generation_settings import MODEL_THINKING_PREFERENCES_SETTING
 from bragi.services.image_style_settings import (
@@ -1811,7 +1814,7 @@ def test_import_save_preserves_memory_and_scene_scratch_provenance(
         importance=memory.importance,
         source_message_ids=memory.source_message_ids,
         source_observation_ids=[OBSERVATION_ID],
-        claim_fingerprint="mara-knows-eastern-signal-code",
+        claim_fingerprint="forged-imported-fingerprint",
     )
     location = repositories.add_location(
         save_id=save.id,
@@ -1854,7 +1857,9 @@ def test_import_save_preserves_memory_and_scene_scratch_provenance(
     )
     imported_scene = repositories.get_scene_snapshot(imported_save_id)
     assert imported_scene is not None
-    assert imported_memory.claim_fingerprint == "mara-knows-eastern-signal-code"
+    assert imported_memory.claim_fingerprint == canonical_claim_fingerprint(
+        imported_memory.body
+    )
     assert imported_memory.source_observation_ids == [imported_observation.id]
     assert imported_scratch.source_id == imported_observation.id
     assert imported_scratch.scene_snapshot_id == imported_scene.id

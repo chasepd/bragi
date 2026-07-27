@@ -19,7 +19,10 @@ from uuid import uuid4
 from bragi import __version__
 from bragi.app_logging import log_event
 from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 from bragi.private_files import write_private_bytes
 from bragi.services.action_choice_flags import normalize_legacy_action_choice_scenario
 from bragi.services.character_text_world_update_service import (
@@ -1246,7 +1249,7 @@ class ChatBundleService:
                     message_order=message_order,
                     repair_tracker=repair_tracker,
                 ),
-                claim_fingerprint=_optional_text(row, "claim_fingerprint"),
+                claim_fingerprint=canonical_claim_fingerprint(_text(row, "body")),
             )
             memory_id_map[original_id] = memory.id
         imported_id_maps["memory"] = memory_id_map

@@ -3136,7 +3136,63 @@ class PersistenceRepositories:
             current_turn_number=current_turn_number,
             blocked_source_keys=blocked_source_keys,
         )
-        rows = self._fetch_all(
+        substring_terms = tuple(
+            dict.fromkeys(
+                term
+                for value in query_terms
+                for term in _unicode_search_terms(str(value))
+                if any(ord(character) > 127 for character in term)
+            )
+        )
+        substring_rows: list[sqlite3.Row] = []
+        if substring_terms:
+            substring_clauses = " OR ".join(
+                "(instr(context_sources.title, ?) > 0 "
+                "OR instr(context_sources.body, ?) > 0)"
+                for _term in substring_terms
+            )
+            substring_params = tuple(
+                value
+                for term in substring_terms
+                for value in (term, term)
+            )
+            substring_rows = self._fetch_all(
+                f"""
+                SELECT
+                    context_sources.id,
+                    context_sources.save_id,
+                    context_sources.source_type,
+                    context_sources.source_id,
+                    context_sources.title,
+                    context_sources.body,
+                    context_sources.metadata_json,
+                    context_sources.token_estimate,
+                    context_sources.scene_snapshot_id,
+                    context_sources.scene_generation,
+                    context_sources.created_turn_number,
+                    context_sources.expires_after_turn_number,
+                    -1.0 AS bm25_rank
+                FROM context_sources
+                WHERE context_sources.save_id = ?
+                  AND context_sources.archived_at IS NULL
+                  AND context_sources.source_type IN (
+                      {_placeholders(len(source_type_values))}
+                  )
+                  AND ({substring_clauses})
+                  {eligibility_sql}
+                ORDER BY context_sources.created_at DESC,
+                         context_sources.rowid DESC
+                LIMIT ?
+                """,
+                (
+                    save_id,
+                    *source_type_values,
+                    *substring_params,
+                    *eligibility_params,
+                    limit,
+                ),
+            )
+        fts_rows = self._fetch_all(
             f"""
             SELECT
                 context_sources.id,
@@ -3174,6 +3230,10 @@ class PersistenceRepositories:
                 limit,
             ),
         )
+        rows_by_id = {
+            str(row["id"]): row for row in (*substring_rows, *fts_rows)
+        }
+        rows = list(rows_by_id.values())[:limit]
         return [
             ContextSourceSearchHit(
                 record=_context_source_from_row(row),
@@ -3285,7 +3345,7 @@ class PersistenceRepositories:
             )
         rows = self._fetch_all(
             f"""
-            SELECT id
+            SELECT id, source_id
             FROM context_sources
             WHERE save_id = ?
               AND archived_at IS NULL
@@ -3297,6 +3357,7 @@ class PersistenceRepositories:
             params,
         )
         stale_ids = frozenset(str(row["id"]) for row in rows)
+        stale_observation_ids = frozenset(str(row["source_id"]) for row in rows)
         if not stale_ids:
             return stale_ids
         self.connection.execute(
@@ -3306,6 +3367,14 @@ class PersistenceRepositories:
             WHERE id IN ({_placeholders(len(stale_ids))})
             """,
             tuple(stale_ids),
+        )
+        self.connection.execute(
+            f"""
+            UPDATE context_observations
+            SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE id IN ({_placeholders(len(stale_observation_ids))})
+            """,
+            tuple(stale_observation_ids),
         )
         self.commit()
         return stale_ids
@@ -3550,6 +3619,33 @@ class PersistenceRepositories:
         )
         if row is None:
             return None
+        self.connection.execute(
+            """
+            UPDATE context_observations
+            SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE id IN (
+                SELECT source_id
+                FROM context_sources
+                WHERE save_id = ?
+                  AND scene_snapshot_id = ?
+                  AND json_extract(metadata_json, '$.curation_action')
+                      = 'scene_scratch'
+            )
+            """,
+            (save_id, row["id"]),
+        )
+        self.connection.execute(
+            """
+            UPDATE context_sources
+            SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE save_id = ?
+              AND scene_snapshot_id = ?
+              AND archived_at IS NULL
+              AND json_extract(metadata_json, '$.curation_action')
+                  = 'scene_scratch'
+            """,
+            (save_id, row["id"]),
+        )
         self.connection.execute(
             "DELETE FROM scene_snapshots WHERE save_id = ?",
             (save_id,),
@@ -3940,6 +4036,25 @@ class PersistenceRepositories:
             existing is not None
             and scene_generation != int(existing["scene_generation"])
         ):
+            self.connection.execute(
+                """
+                UPDATE context_observations
+                SET archived_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id IN (
+                    SELECT source_id
+                    FROM context_sources
+                    WHERE save_id = ?
+                      AND archived_at IS NULL
+                      AND json_extract(metadata_json, '$.curation_action')
+                          = 'scene_scratch'
+                      AND (
+                            scene_snapshot_id IS NOT ?
+                            OR scene_generation IS NOT ?
+                          )
+                )
+                """,
+                (save_id, record.id, record.scene_generation),
+            )
             self.connection.execute(
                 """
                 UPDATE context_sources
@@ -10415,12 +10530,12 @@ def _unicode_search_terms(value: str) -> tuple[str, ...]:
             continue
         if current:
             term = "".join(current).strip("'")
-            if len(term) >= 2:
+            if len(term) >= 2 or any(ord(character) > 127 for character in term):
                 terms.append(term)
             current = []
     if current:
         term = "".join(current).strip("'")
-        if len(term) >= 2:
+        if len(term) >= 2 or any(ord(character) > 127 for character in term):
             terms.append(term)
     return tuple(terms)
 
@@ -10458,14 +10573,23 @@ def _context_source_eligibility_sql(
         if allowed_owner_names is None:
             owner_match = "1"
         elif owners:
+            owner_variants = tuple(
+                sorted(
+                    {
+                        variant
+                        for owner in owners
+                        for variant in (owner, owner.casefold(), owner.upper())
+                    }
+                )
+            )
             owner_match = (
                 "EXISTS ("
                 f"SELECT 1 FROM json_each({alias}.metadata_json, '$.known_by') owner "
-                f"WHERE CAST(owner.value AS TEXT) IN "
-                f"({_placeholders(len(owners))})"
+                f"WHERE CAST(owner.value AS TEXT) COLLATE NOCASE IN "
+                f"({_placeholders(len(owner_variants))})"
                 ")"
             )
-            params.extend(owners)
+            params.extend(owner_variants)
         audience_count = (
             f"COALESCE(json_array_length(json_extract({alias}.metadata_json, "
             "'$.audience_character_ids')), 0)"

@@ -1968,11 +1968,21 @@ def test_context_search_does_not_unlock_scoped_context_from_alias_substring(
         aliases=["Lio"],
         met=True,
     )
+    hidden_observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="character_fact",
+        claim="Lio knows the crypt map is hidden under the drowned ledger.",
+        evidence_quote="Lio seals the crypt ledger",
+        source_message_ids=[older_message.id],
+        scope="durable",
+        status="accepted",
+    )
     hidden_memory = repositories.add_memory(
         save_id=save.id,
         body="Lio knows the crypt map is hidden under the drowned ledger.",
         tags=["lio"],
         source_message_id=older_message.id,
+        source_observation_ids=[hidden_observation.id],
     )
     repositories.add_entity_link(
         save_id=save.id,
@@ -3625,6 +3635,13 @@ def test_context_search_uses_structured_paraphrase_and_pronoun_expansion(
         importance=0.8,
         source_message_id=source_message.id,
     )
+    repositories.add_memory(
+        save_id=save.id,
+        body="The general store closes before sunset.",
+        tags=["market"],
+        importance=0.2,
+        source_message_id=source_message.id,
+    )
     physician = repositories.add_character(
         save_id=save.id,
         name="Physician Tessa",
@@ -3852,6 +3869,62 @@ def test_context_search_retrieves_matching_memory_from_index(
     assert target_memory.body in prompt
     assert indexed_memory.body not in prompt
     assert [item.source_id for item in result.selected_memories] == [target_memory.id]
+
+
+def test_context_search_indexes_exact_memory_beyond_previous_default_bound(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    source_message = next(
+        message
+        for message in repositories.list_messages(save.id)
+        if message.role == "narrator"
+    )
+    target = repositories.add_memory(
+        save_id=save.id,
+        body="The obsidian astrolabe opens the forgotten observatory.",
+        tags=["routine"],
+        importance=0.1,
+        source_message_id=source_message.id,
+    )
+    for index in range(260):
+        repositories.add_memory(
+            save_id=save.id,
+            body=f"High-priority bridge watch record {index:03d}.",
+            tags=["promise"],
+            importance=1.0,
+            source_message_id=source_message.id,
+        )
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="I use the obsidian astrolabe at the forgotten observatory.",
+    )
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": target.id,
+                    "relevance_note": "The exact old fact answers the action.",
+                }
+            ]
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    prompt = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert target.body in prompt
+    assert [item.source_id for item in result.selected_memories] == [target.id]
 
 
 def test_context_search_filters_indexed_known_by_facts_deterministically(

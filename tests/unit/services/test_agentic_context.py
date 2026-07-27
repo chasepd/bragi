@@ -786,10 +786,64 @@ def test_context_curation_queues_unsupported_curated_claim_for_confirmation(
     suggestions = repositories.list_context_update_suggestions(save.id)
     assert len(suggestions) == 1
     assert suggestions[0].entity_type == "memory"
+    assert suggestions[0].entity_id is None
+    assert suggestions[0].update_type == "create"
+    assert suggestions[0].field_path == "*"
     updated = repositories.get_context_observation(observation.id)
     assert updated is not None
     assert updated.status == "needs_confirmation"
     assert updated.metadata["grounding_rejected"]
+
+
+def test_context_curation_rejects_quote_from_wrong_declared_source(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, narrator = repositories.list_messages(save.id)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara wants grounded narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id, narrator.id],
+        scope="durable",
+        confidence=0.9,
+        tags=["tone"],
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observation.id,
+                        "action": "durable_memory",
+                        "reason": "Stable narrator preference.",
+                        "confidence": 0.88,
+                        "memory_body": "Mara wants grounded narration.",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                        "grounding_status": "entailed",
+                        "supporting_evidence_quote": "Keep it grounded",
+                        "supporting_source_message_ids": [narrator.id],
+                    }
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.confirmation_count == 1
+    assert repositories.list_memories(save.id) == []
 
 
 def test_context_curation_queues_durable_memory_when_confirmation_enabled(

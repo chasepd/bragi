@@ -3701,7 +3701,7 @@ def test_repositories_search_context_sources_with_unicode_terms(
     )
     cjk_hits = repositories.search_context_sources(
         save.id,
-        query_terms={"月石羅針盤"},
+        query_terms={"書庫"},
         source_types={"memory"},
         limit=8,
     )
@@ -3736,6 +3736,7 @@ def test_repositories_apply_context_visibility_before_search_limit(
         source_id="accessible",
         title="moonstone public",
         body="The moonstone opens the public archive.",
+        metadata={"known_by": ["mara"]},
     )
 
     hits = repositories.search_context_sources(
@@ -3875,6 +3876,33 @@ def test_repositories_archive_scene_scratch_after_turn_ttl(
         marker.id
         for marker in repositories.list_curated_observation_source_markers(save_id)
     ] == [scratch.id]
+
+
+def test_repositories_delete_scene_snapshot_archives_bound_scratch(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        situation="The beacon lens is warm.",
+        source_message_id=message_id,
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="observation",
+        source_id="scratch-observation",
+        title="Temporary lens state",
+        body="The lens is warm.",
+        metadata={"curation_action": "scene_scratch"},
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+    )
+
+    deleted_id = repositories.delete_scene_snapshot(save_id)
+
+    assert deleted_id == scene.id
+    assert repositories.get_scene_snapshot(save_id) is None
+    assert repositories.get_context_source(scratch.id) is None
 
 
 def test_repositories_list_protected_context_sources(

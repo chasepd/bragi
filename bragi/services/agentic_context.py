@@ -629,103 +629,118 @@ class ContextCurationService:
                         confirmation_count += 1
                         continue
                     fingerprint = canonical_claim_fingerprint(body)
-                    existing_memory = _memory_with_fingerprint(
-                        self.repositories,
-                        save_id=save_id,
-                        fingerprint=fingerprint,
-                    )
-                    if existing_memory is not None:
-                        self.repositories.update_memory(
-                            memory_id=existing_memory.id,
-                            body=existing_memory.body,
-                            tags=list(
-                                dict.fromkeys(
-                                    (*existing_memory.tags, *tags)
-                                )
-                            ),
-                            importance=max(
-                                existing_memory.importance,
-                                decision.confidence,
-                            ),
-                            source_message_ids=list(
-                                dict.fromkeys(
-                                    (
-                                        *existing_memory.source_message_ids,
-                                        *source_message_ids,
+                    self.repositories.begin_immediate_transaction()
+                    try:
+                        existing_memory = _memory_with_fingerprint(
+                            self.repositories,
+                            save_id=save_id,
+                            fingerprint=fingerprint,
+                        )
+                        if existing_memory is not None:
+                            self.repositories.update_memory(
+                                memory_id=existing_memory.id,
+                                body=existing_memory.body,
+                                tags=list(
+                                    dict.fromkeys(
+                                        (*existing_memory.tags, *tags)
                                     )
-                                )
-                            ),
-                            source_observation_ids=list(
-                                dict.fromkeys(
-                                    (
-                                        *existing_memory.source_observation_ids,
-                                        curated_observation.id,
+                                ),
+                                importance=max(
+                                    existing_memory.importance,
+                                    decision.confidence,
+                                ),
+                                source_message_ids=list(
+                                    dict.fromkeys(
+                                        (
+                                            *existing_memory.source_message_ids,
+                                            *source_message_ids,
+                                        )
                                     )
-                                )
+                                ),
+                                source_observation_ids=list(
+                                    dict.fromkeys(
+                                        (
+                                            *existing_memory.source_observation_ids,
+                                            curated_observation.id,
+                                        )
+                                    )
+                                ),
+                                claim_fingerprint=fingerprint,
+                            )
+                            self._mark_observation(
+                                curated_observation,
+                                decision,
+                                "accepted",
+                            )
+                            self.repositories.commit_transaction()
+                            continue
+                        pending_suggestion = (
+                            _pending_memory_suggestion_with_fingerprint(
+                                self.repositories,
+                                save_id=save_id,
+                                fingerprint=fingerprint,
+                            )
+                        )
+                        if pending_suggestion is not None:
+                            _merge_pending_memory_suggestion(
+                                self.repositories,
+                                suggestion=pending_suggestion,
+                                observation=curated_observation,
+                                tags=tags,
+                                confidence=decision.confidence,
+                                fingerprint=fingerprint,
+                            )
+                            self._mark_observation(
+                                curated_observation,
+                                decision,
+                                "needs_confirmation",
+                            )
+                            self.repositories.commit_transaction()
+                            continue
+                        if manual_memory_confirmation_enabled(
+                            self.repositories,
+                            save_id=save_id,
+                        ):
+                            self._queue_memory_confirmation(
+                                save_id=save_id,
+                                observation=curated_observation,
+                                body=body,
+                                tags=tags,
+                                confidence=decision.confidence,
+                                reason=decision.reason,
+                            )
+                            confirmation_count += 1
+                            self._mark_observation(
+                                curated_observation,
+                                decision,
+                                "needs_confirmation",
+                            )
+                            self.repositories.commit_transaction()
+                            continue
+                        self.repositories.add_memory(
+                            save_id=save_id,
+                            body=body.strip(),
+                            tags=list(tags),
+                            importance=decision.confidence,
+                            source_message_id=(
+                                curated_observation.source_message_ids[0]
+                                if curated_observation.source_message_ids
+                                else None
                             ),
+                            source_message_ids=source_message_ids,
+                            source_observation_ids=(curated_observation.id,),
                             claim_fingerprint=fingerprint,
                         )
+                        accepted_count += 1
                         self._mark_observation(
                             curated_observation,
                             decision,
                             "accepted",
                         )
-                        continue
-                    pending_suggestion = _pending_memory_suggestion_with_fingerprint(
-                        self.repositories,
-                        save_id=save_id,
-                        fingerprint=fingerprint,
-                    )
-                    if pending_suggestion is not None:
-                        _merge_pending_memory_suggestion(
-                            self.repositories,
-                            suggestion=pending_suggestion,
-                            observation=curated_observation,
-                            tags=tags,
-                            confidence=decision.confidence,
-                            fingerprint=fingerprint,
-                        )
-                        self._mark_observation(
-                            curated_observation,
-                            decision,
-                            "needs_confirmation",
-                        )
-                        continue
-                    if manual_memory_confirmation_enabled(
-                        self.repositories,
-                        save_id=save_id,
-                    ):
-                        self._queue_memory_confirmation(
-                            save_id=save_id,
-                            observation=curated_observation,
-                            body=body,
-                            tags=tags,
-                            confidence=decision.confidence,
-                            reason=decision.reason,
-                        )
-                        confirmation_count += 1
-                        self._mark_observation(
-                            curated_observation,
-                            decision,
-                            "needs_confirmation",
-                        )
-                        continue
-                    self.repositories.add_memory(
-                        save_id=save_id,
-                        body=body.strip(),
-                        tags=list(tags),
-                        importance=decision.confidence,
-                        source_message_id=(
-                            curated_observation.source_message_ids[0]
-                            if curated_observation.source_message_ids
-                            else None
-                        ),
-                        source_message_ids=source_message_ids,
-                        source_observation_ids=(curated_observation.id,),
-                        claim_fingerprint=fingerprint,
-                    )
-                    accepted_count += 1
-                    self._mark_observation(curated_observation, decision, "accepted")
+                        self.repositories.commit_transaction()
+                    except Exception:
+                        self.repositories.rollback_transaction()
+                        raise
             elif decision.action in {"save_context", "scene_scratch"}:
                 body = decision.context_body.strip() or curated_observation.claim
                 if not _curated_decision_is_grounded(
@@ -850,19 +865,37 @@ class ContextCurationService:
         diagnostic_reason = reason or (
             "Curated prose was not entailed by its cited observation evidence."
         )
-        self.repositories.add_context_update_suggestion(
-            save_id=save_id,
-            update_type="review",
-            entity_type=(
-                "memory" if decision.action == "durable_memory" else "observation"
-            ),
-            entity_id=observation.id,
-            field_path=decision.action,
-            proposed_value={
+        if decision.action == "durable_memory":
+            update_type = "create"
+            entity_type = "memory"
+            entity_id = None
+            field_path = "*"
+            proposed_value = _curated_memory_proposed_value(
+                body=proposed_body,
+                tags=tuple(decision.tags or observation.tags),
+                importance=decision.confidence,
+                source_message_ids=tuple(observation.source_message_ids),
+                source_observation_id=observation.id,
+            ) | {
+                "grounding_review": _decision_metadata(decision),
+            }
+        else:
+            update_type = "review"
+            entity_type = "observation"
+            entity_id = observation.id
+            field_path = decision.action
+            proposed_value = {
                 **_decision_metadata(decision),
                 "body": proposed_body,
                 "source_observation_ids": [observation.id],
-            },
+            }
+        self.repositories.add_context_update_suggestion(
+            save_id=save_id,
+            update_type=update_type,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            field_path=field_path,
+            proposed_value=proposed_value,
             reason=diagnostic_reason,
             confidence=decision.confidence,
             source_message_ids=observation.source_message_ids,
@@ -3133,9 +3166,20 @@ def _curated_decision_is_grounded(
             return False
         if not _meaningful_evidence_span(decision.supporting_evidence_quote):
             return False
-        if not any(
+        if len(source_texts) != len(observation.source_message_ids):
+            return False
+        supporting_texts = tuple(
+            source_text
+            for source_message_id, source_text in zip(
+                observation.source_message_ids,
+                source_texts,
+                strict=True,
+            )
+            if source_message_id in decision.supporting_source_message_ids
+        )
+        if not supporting_texts or not any(
             quote_matches_source(decision.supporting_evidence_quote, source_text)
-            for source_text in source_texts
+            for source_text in supporting_texts
         ):
             return False
     proposed = (
@@ -3153,6 +3197,8 @@ def _curated_decision_is_grounded(
     grounding_text = " ".join(
         (observation.claim, observation.evidence_quote, *source_texts)
     )
+    if _grounding_negation_conflicts(proposed, observation.claim):
+        return False
     proposed_terms = _grounding_terms(proposed)
     grounding_terms = _grounding_terms(grounding_text)
     if not proposed_terms:
@@ -3178,6 +3224,13 @@ def _grounding_terms(value: str) -> set[str]:
         for term in re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE)
         if len(term) >= 3 and term not in stopwords
     }
+
+
+def _grounding_negation_conflicts(proposed: str, observation_claim: str) -> bool:
+    negations = {"no", "not", "never", "none", "without"}
+    proposed_negated = bool(_grounding_terms(proposed) & negations)
+    observation_negated = bool(_grounding_terms(observation_claim) & negations)
+    return proposed_negated != observation_negated
 
 
 def _curated_memory_proposed_value(

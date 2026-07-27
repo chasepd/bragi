@@ -139,6 +139,7 @@ _RESTORE_DELETE_ORDER = (
     "entity_links",
     "context_update_audit",
     "context_update_suggestions",
+    "context_sources",
     "scene_snapshots",
     "active_threads",
     "characters",
@@ -152,7 +153,6 @@ _RESTORE_DELETE_ORDER = (
     "memories",
     "state_changes",
     "context_observations",
-    "context_sources",
     "world_state",
 )
 

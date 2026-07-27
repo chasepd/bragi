@@ -947,6 +947,9 @@ def _indexed_context_source_retrieval(
         roles=("narrator",),
     )["narrator"]
     reference_character_ids = set(turn_scope.reference_character_ids)
+    reference_character_ids.difference_update(
+        character.id for character in characters if character.is_player_character
+    )
     current_scene_snapshot_id = (
         scene_snapshot.id if scene_snapshot is not None else None
     )
@@ -1064,12 +1067,14 @@ async def _retrieve_indexed_context_sources(
         entity_links=entity_links,
     )
     initial_hit_count = initial.diagnostics.get("indexed_retrieval_hit_count")
+    query_needs_expansion = (
+        not isinstance(initial_hit_count, int | float)
+        or initial_hit_count <= 0
+        or _query_contains_referential_pronoun(latest_player_message)
+    )
     if (
         not latest_player_message.strip()
-        or (
-            isinstance(initial_hit_count, int | float)
-            and initial_hit_count > 0
-        )
+        or not query_needs_expansion
         or not isinstance(provider, StructuredOutputProvider)
     ):
         return initial
@@ -1236,6 +1241,26 @@ def _string_values(value: object, *, limit: int) -> tuple[str, ...]:
     )
 
 
+def _query_contains_referential_pronoun(value: str) -> bool:
+    return bool(
+        _meaningful_terms(value)
+        & {
+            "he",
+            "her",
+            "him",
+            "his",
+            "it",
+            "its",
+            "she",
+            "that",
+            "their",
+            "them",
+            "they",
+            "this",
+        }
+    )
+
+
 def _context_source_type_counts(
     records: list[ContextSourceRecord] | tuple[ContextSourceRecord, ...],
 ) -> dict[str, int]:
@@ -1345,6 +1370,7 @@ def _context_candidate_set(
     accepted_observation_ids = _accepted_observation_ids(observation_records)
     curated_observation_source_ids = _curated_observation_source_ids(
         context_source_records,
+        memories=memories,
         accepted_observation_ids=accepted_observation_ids,
     )
     indexed_candidates = _indexed_context_candidates(
@@ -3178,9 +3204,10 @@ def _accepted_observation_ids(
 def _curated_observation_source_ids(
     records: list[ContextSourceRecord],
     *,
+    memories: list[MemoryRecord],
     accepted_observation_ids: frozenset[str],
 ) -> frozenset[str]:
-    return frozenset(
+    context_observation_ids = frozenset(
         observation_id
         for record in records
         if (
@@ -3191,6 +3218,13 @@ def _curated_observation_source_ids(
         )
         is not None
     )
+    memory_observation_ids = frozenset(
+        observation_id
+        for memory in memories
+        for observation_id in memory.source_observation_ids
+        if observation_id in accepted_observation_ids
+    )
+    return context_observation_ids | memory_observation_ids
 
 
 def _curated_observation_source_id(
@@ -3532,19 +3566,23 @@ def _message_candidates(
     present_character_ids: frozenset[str],
     message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
+    visible_records = [
+        record
+        for record in records
+        if record.id != player_message_id
+        and message_visible_to_present_characters(
+            message_id=record.id,
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility,
+        )
+    ]
     return tuple(
         _ContextCandidate(
             source_type="message",
             source_id=record.id,
             text=f"{record.speaker_name or record.role}: {record.body}",
         )
-        for record in records[-RECENT_MESSAGE_CANDIDATE_LIMIT:]
-        if record.id != player_message_id
-        if message_visible_to_present_characters(
-            message_id=record.id,
-            present_character_ids=present_character_ids,
-            message_visibility=message_visibility,
-        )
+        for record in visible_records[-RECENT_MESSAGE_CANDIDATE_LIMIT:]
     )
 
 

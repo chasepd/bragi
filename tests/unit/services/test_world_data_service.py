@@ -1169,6 +1169,54 @@ def test_world_data_service_applies_entity_link_delete_suggestion(
     assert audit.entity_id == ids["link"]
 
 
+def test_world_data_service_applies_memory_suggestion_with_observation_provenance(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    world_data = _import_world_data_service_without_gtk(monkeypatch)
+    save_id, ids = _persist_normalized_world_data_fixture(repositories)
+    observation = repositories.add_context_observation(
+        save_id=save_id,
+        observation_type="promise",
+        claim="Ilyra promised to guard the stair.",
+        evidence_quote="Ilyra holds the stair",
+        source_message_ids=[ids["message"]],
+        scope="durable",
+        status="needs_confirmation",
+    )
+    fingerprint = "ilyra-promised-to-guard-the-stair"
+    suggestion = repositories.add_context_update_suggestion(
+        save_id=save_id,
+        update_type="create",
+        entity_type="memory",
+        field_path="*",
+        proposed_value={
+            "body": observation.claim,
+            "tags": ["ilyra", "promise"],
+            "importance": 0.9,
+            "source_message_id": ids["message"],
+            "source_message_ids": [ids["message"]],
+            "source_observation_ids": [observation.id],
+            "claim_fingerprint": fingerprint,
+        },
+        source_message_ids=[ids["message"]],
+    )
+    service = world_data.WorldDataService(
+        repositories=repositories,
+        active_save_id=save_id,
+    )
+
+    service.apply_suggestions((suggestion.id,))
+
+    memory = next(
+        memory
+        for memory in repositories.list_memories(save_id)
+        if memory.body == observation.claim
+    )
+    assert memory.source_observation_ids == [observation.id]
+    assert memory.claim_fingerprint == fingerprint
+
+
 def test_world_data_service_applies_scene_time_suggestion_with_canonical_provenance(
     repositories: PersistenceRepositories,
     monkeypatch: MonkeyPatch,

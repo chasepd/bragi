@@ -154,7 +154,7 @@ CREATE TABLE IF NOT EXISTS context_sources (
     body TEXT NOT NULL DEFAULT '',
     metadata_json TEXT NOT NULL DEFAULT '{}',
     token_estimate INTEGER,
-    scene_snapshot_id TEXT REFERENCES scene_snapshots(id),
+    scene_snapshot_id TEXT REFERENCES scene_snapshots(id) ON DELETE SET NULL,
     scene_generation INTEGER,
     created_turn_number INTEGER,
     expires_after_turn_number INTEGER,
@@ -1192,6 +1192,16 @@ def _ensure_hot_narration_query_indexes(connection: sqlite3.Connection) -> None:
     )
     _create_index_if_columns_exist(
         connection,
+        "memories",
+        {"save_id", "claim_fingerprint", "archived_at"},
+        """
+        CREATE INDEX IF NOT EXISTS idx_memories_save_claim_fingerprint_active
+        ON memories(save_id, claim_fingerprint)
+        WHERE archived_at IS NULL AND claim_fingerprint != ''
+        """,
+    )
+    _create_index_if_columns_exist(
+        connection,
         "scheduled_tasks",
         {"task_type", "enabled", "next_run_at", "lease_until"},
         """
@@ -1654,7 +1664,10 @@ def _migrate_schema_70_to_71(connection: sqlite3.Connection) -> None:
         "INTEGER NOT NULL DEFAULT 1",
     )
     for column_name, definition in (
-        ("scene_snapshot_id", "TEXT REFERENCES scene_snapshots(id)"),
+        (
+            "scene_snapshot_id",
+            "TEXT REFERENCES scene_snapshots(id) ON DELETE SET NULL",
+        ),
         ("scene_generation", "INTEGER"),
         ("created_turn_number", "INTEGER"),
         ("expires_after_turn_number", "INTEGER"),

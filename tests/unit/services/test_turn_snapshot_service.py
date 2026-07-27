@@ -727,6 +727,60 @@ def test_snapshot_backed_fork_remaps_character_text_rows_and_attachment_media(
     ]
 
 
+def test_restore_snapshot_replaces_scene_scratch_before_its_scene(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon lens stays warm.",
+    )
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The beacon lens stays warm.",
+        source_message_id=message.id,
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="scene_detail",
+        claim="The beacon lens is warm.",
+        evidence_quote="beacon lens stays warm",
+        source_message_ids=[message.id],
+        scope="scene",
+        status="accepted",
+    )
+    scratch = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="observation",
+        source_id=observation.id,
+        title="Warm lens",
+        body=observation.claim,
+        metadata={
+            "observation_id": observation.id,
+            "curation_action": "scene_scratch",
+        },
+        scene_snapshot_id=scene.id,
+        scene_generation=scene.scene_generation,
+        created_turn_number=1,
+        expires_after_turn_number=13,
+    )
+    service = TurnSnapshotService(repositories)
+    snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+
+    service.restore_save_to_snapshot(save_id=save.id, snapshot_id=snapshot.id)
+
+    restored_scene = repositories.get_scene_snapshot(save.id)
+    restored_scratch = repositories.get_context_source(scratch.id)
+    assert restored_scene is not None
+    assert restored_scratch is not None
+    assert restored_scratch.scene_snapshot_id == restored_scene.id
+
+
 def test_snapshot_backed_fork_remaps_character_text_reply_links(
     repositories: PersistenceRepositories,
     tmp_path: Path,

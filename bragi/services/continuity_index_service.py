@@ -49,9 +49,9 @@ HIGH_VALUE_FACT_TYPES = frozenset(
     }
 )
 
-DEFAULT_WORLD_STATE_INDEX_LIMIT = 250
-DEFAULT_MEMORY_INDEX_LIMIT = 250
-DEFAULT_SUMMARY_INDEX_LIMIT = 80
+DEFAULT_WORLD_STATE_INDEX_LIMIT: int | None = None
+DEFAULT_MEMORY_INDEX_LIMIT: int | None = None
+DEFAULT_SUMMARY_INDEX_LIMIT: int | None = None
 DEFAULT_ACTIVE_THREAD_INDEX_LIMIT = 80
 CHARACTER_PROFILE_DETAIL_MAX_CHARS = 320
 CHARACTER_TEXT_THREAD_RECENT_MESSAGE_LIMIT = 4
@@ -69,15 +69,17 @@ class ContinuityIndexService:
         self,
         repositories: PersistenceRepositories,
         *,
-        world_state_limit: int = DEFAULT_WORLD_STATE_INDEX_LIMIT,
-        memory_limit: int = DEFAULT_MEMORY_INDEX_LIMIT,
-        summary_limit: int = DEFAULT_SUMMARY_INDEX_LIMIT,
+        world_state_limit: int | None = DEFAULT_WORLD_STATE_INDEX_LIMIT,
+        memory_limit: int | None = DEFAULT_MEMORY_INDEX_LIMIT,
+        summary_limit: int | None = DEFAULT_SUMMARY_INDEX_LIMIT,
         active_thread_limit: int = DEFAULT_ACTIVE_THREAD_INDEX_LIMIT,
     ) -> None:
         self.repositories = repositories
-        self.world_state_limit = max(0, world_state_limit)
-        self.memory_limit = max(0, memory_limit)
-        self.summary_limit = max(0, summary_limit)
+        self.world_state_limit = (
+            None if world_state_limit is None else max(0, world_state_limit)
+        )
+        self.memory_limit = None if memory_limit is None else max(0, memory_limit)
+        self.summary_limit = None if summary_limit is None else max(0, summary_limit)
         self.active_thread_limit = max(0, active_thread_limit)
 
     def sync_save(self, save_id: str) -> ContinuityIndexSyncResult:
@@ -541,12 +543,14 @@ def _metadata(
 
 def _bounded_records[T](
     records: tuple[T, ...],
-    limit: int,
+    limit: int | None,
     *,
     priority: Callable[[T], float],
     prefer_recent: bool = False,
     recency: Callable[[T], int | None] | None = None,
 ) -> tuple[T, ...]:
+    if limit is None:
+        return records
     if limit <= 0:
         return ()
     if len(records) <= limit:

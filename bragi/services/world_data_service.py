@@ -3163,11 +3163,21 @@ def _apply_suggestion_value(
             raise ValueError("Memory importance must be numeric")
         source_message_id = value.get("source_message_id")
         raw_source_message_ids = value.get("source_message_ids")
+        raw_source_observation_ids = value.get("source_observation_ids")
         memory_source_message_ids = (
             _string_list_value(raw_source_message_ids, "Memory source message IDs")
             if isinstance(raw_source_message_ids, list)
             else None
         )
+        memory_source_observation_ids = (
+            _string_list_value(
+                raw_source_observation_ids,
+                "Memory source observation IDs",
+            )
+            if isinstance(raw_source_observation_ids, list)
+            else None
+        )
+        claim_fingerprint = value.get("claim_fingerprint")
         repositories.add_memory(
             save_id=save_id,
             body=body,
@@ -3177,6 +3187,12 @@ def _apply_suggestion_value(
                 source_message_id if isinstance(source_message_id, str) else None
             ),
             source_message_ids=memory_source_message_ids,
+            source_observation_ids=memory_source_observation_ids,
+            claim_fingerprint=(
+                claim_fingerprint
+                if isinstance(claim_fingerprint, str)
+                else None
+            ),
         )
         return
     if suggestion.entity_type == "character" and suggestion.update_type == "create":
