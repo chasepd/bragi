@@ -119,6 +119,10 @@ MAX_CONTEXT_EXACT_PHRASE_CHARS = 512
 MAX_CONTEXT_EXACT_PHRASES = 4
 CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT = 64
 RAW_CONTEXT_RECORD_LIMIT = 512
+CONTINUITY_FLOOR_STATE_LIMIT = 4
+CONTINUITY_FLOOR_MEMORY_LIMIT = 4
+CONTINUITY_FLOOR_SCENARIO_SECTION_LIMIT = 3
+CONTINUITY_FLOOR_MEMORY_MIN_IMPORTANCE = 0.8
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 INDEXED_CONTEXT_SOURCE_TYPES = frozenset(
@@ -194,6 +198,7 @@ class _ContextCandidate:
     source_id: str
     text: str
     selection_text: str | None = None
+    continuity_critical: bool = False
 
 
 @dataclass(frozen=True)
@@ -208,6 +213,8 @@ class _ContextCandidateDiagnostics:
     excluded_observation_status_counts: dict[str, int]
     curated_observation_candidate_count: int
     suppressed_raw_observation_count: int
+    continuity_floor_candidate_count: int
+    continuity_floor_source_type_counts: dict[str, int]
     retrieval_diagnostics: dict[str, object] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, object]:
@@ -235,6 +242,12 @@ class _ContextCandidateDiagnostics:
             ),
             "suppressed_raw_observation_count": (
                 self.suppressed_raw_observation_count
+            ),
+            "continuity_floor_candidate_count": (
+                self.continuity_floor_candidate_count
+            ),
+            "continuity_floor_source_type_counts": (
+                self.continuity_floor_source_type_counts
             ),
             **self.retrieval_diagnostics,
         }
@@ -273,6 +286,7 @@ class _ContextSelectionOutcome:
     fallback_skipped_reason: str | None = None
     error_category: str | None = None
     http_status: int | None = None
+    empty_selection_policy: str | None = None
 
 
 class ContextSearchService:
@@ -376,6 +390,16 @@ class ContextSearchService:
                 "source_type_counts": _source_type_counts_json(candidates),
                 "indexed_candidate_count": sum(
                     1 for candidate in candidates if candidate.source_type != "message"
+                ),
+                "continuity_floor_candidate_count": sum(
+                    1 for candidate in candidates if candidate.continuity_critical
+                ),
+                "continuity_floor_source_type_counts": _source_type_counts_json(
+                    tuple(
+                        candidate
+                        for candidate in candidates
+                        if candidate.continuity_critical
+                    )
                 ),
                 "cache_digest": cache_digest,
                 "duration_ms": _elapsed_ms(started_at),
@@ -795,12 +819,15 @@ class ContextSearchService:
                     candidates=candidates,
                 )
             result = selection.result
+            empty_selection_fallback_candidates = _empty_selection_fallback_candidates(
+                candidates,
+                fallback_allowed=selection.fallback_allowed,
+            )
             if (
-                candidates
-                and selection.fallback_allowed
+                empty_selection_fallback_candidates
                 and _context_result_is_empty(result)
             ):
-                result = _fallback_context_result(candidates)
+                result = _fallback_context_result(empty_selection_fallback_candidates)
                 result = replace(
                     result,
                     retrieval_degraded=True,
@@ -811,6 +838,7 @@ class ContextSearchService:
                     result=result,
                     fallback_allowed=False,
                     fallback_used=False,
+                    empty_selection_policy=CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC,
                 )
                 log_event(
                     "context_search.fallback_selected",
@@ -830,6 +858,17 @@ class ContextSearchService:
                     character_voice_count=len(result.selected_character_voice),
                     summary_count=len(result.selected_summaries),
                     recent_message_count=len(result.selected_recent_messages),
+                )
+            elif candidates and _context_result_is_empty(result):
+                selection = replace(
+                    selection,
+                    empty_selection_policy="accepted_no_context",
+                )
+                log_event(
+                    "context_search.empty_selection_accepted",
+                    save_id=save_id,
+                    player_message_id=player_message_id,
+                    candidate_count=len(candidates),
                 )
             result, narration_snapshot = _rehydrate_selected_context(
                 repositories=self.repositories,
@@ -953,6 +992,12 @@ def _rehydrate_selected_context(
         save_id,
         ignored_message_id=player_message_id,
     )
+    if (
+        current_revision == preselection_revision
+        and fallback_snapshot is not None
+        and _snapshot_contains_selected_items(fallback_snapshot, selected_items)
+    ):
+        return result, fallback_snapshot
     if current_revision != preselection_revision:
         _sync_continuity_index_for_search(repositories, save_id)
     details = repositories.load_save_details(
@@ -1131,6 +1176,32 @@ def _rehydrate_selected_context(
             retrieval_recovery=result.retrieval_recovery,
         ),
         snapshot,
+    )
+
+
+def _snapshot_contains_selected_items(
+    snapshot: NarrationContextSnapshot,
+    selected_items: tuple[SelectedContextItem, ...],
+) -> bool:
+    available_keys = {
+        *(("world_state", record.id) for record in snapshot.world_state),
+        *(("state_change", record.id) for record in snapshot.state_changes),
+        *(("media_asset", record.id) for record in snapshot.media_assets),
+        *(("memory", record.id) for record in snapshot.memories),
+        *(("observation", record.id) for record in snapshot.observations),
+        *(("summary", record.id) for record in snapshot.summaries),
+        *(("message", record.id) for record in snapshot.details.messages),
+        *(("open_obligation", record.id) for record in snapshot.active_threads),
+        *(
+            ("scenario_section", source_id)
+            for source_id, _section_id, _text in scenario_section_candidates(
+                snapshot.details.scenario
+            )
+        ),
+    }
+    return all(
+        (item.source_type, item.source_id) in available_keys
+        for item in selected_items
     )
 
 
@@ -1759,6 +1830,7 @@ def _context_candidate_set(
         present_character_ids=turn_scope.present_character_ids,
         message_visibility=message_visibility or [],
     )
+    scenario_candidates = _scenario_section_candidates(scenario)
     raw_state_candidates = _state_candidates(
         world_state,
         scoped_targets=scoped_targets,
@@ -1790,6 +1862,21 @@ def _context_candidate_set(
             latest_player_message=latest_player_message,
         )
     )
+    has_indexed_hits = _retrieval_diagnostics_has_hits(
+        retrieval_diagnostics,
+        indexed_candidates=indexed_candidates,
+    )
+    continuity_floor_candidates = (
+        ()
+        if include_missing_raw_candidates or has_indexed_hits
+        else _continuity_floor_candidates(
+            world_state=world_state,
+            state_candidates=raw_state_candidates,
+            memories=memories,
+            memory_candidates=raw_memory_candidates,
+            scenario_candidates=scenario_candidates,
+        )
+    )
     observation_candidates = _observation_candidates(
         observation_records,
         excluded_observation_ids=curated_observation_source_ids,
@@ -1797,27 +1884,33 @@ def _context_candidate_set(
         message_visibility=message_visibility or [],
     )
     if indexed_candidates:
-        canonical_candidates = (
-            *indexed_candidates,
-            *exact_raw_candidates,
-            *(
-                _missing_raw_candidates(
-                    state_candidates,
-                    memory_candidates,
-                    indexed_candidates=indexed_candidates,
-                )
-                if include_missing_raw_candidates
-                else ()
+        canonical_candidates = _merge_continuity_floor_candidates(
+            (
+                *indexed_candidates,
+                *exact_raw_candidates,
+                *(
+                    _missing_raw_candidates(
+                        state_candidates,
+                        memory_candidates,
+                        indexed_candidates=indexed_candidates,
+                    )
+                    if include_missing_raw_candidates
+                    else ()
+                ),
             ),
+            continuity_floor_candidates,
         )
     elif include_missing_raw_candidates:
         canonical_candidates = (
-            *_scenario_section_candidates(scenario),
+            *scenario_candidates,
             *state_candidates,
             *memory_candidates,
         )
     else:
-        canonical_candidates = exact_raw_candidates
+        canonical_candidates = _merge_continuity_floor_candidates(
+            exact_raw_candidates,
+            continuity_floor_candidates,
+        )
     candidates = (
         *canonical_candidates,
         *observation_candidates,
@@ -3094,6 +3187,18 @@ def _fallback_context_result(
     return _context_result_from_items(items)
 
 
+def _empty_selection_fallback_candidates(
+    candidates: tuple[_ContextCandidate, ...],
+    *,
+    fallback_allowed: bool,
+) -> tuple[_ContextCandidate, ...]:
+    if not candidates:
+        return ()
+    if fallback_allowed:
+        return candidates
+    return tuple(candidate for candidate in candidates if candidate.continuity_critical)
+
+
 def _fallback_candidates(
     candidates: tuple[_ContextCandidate, ...],
 ) -> tuple[_ContextCandidate, ...]:
@@ -3231,6 +3336,12 @@ def _candidate_diagnostics(
             if record.status == "accepted"
             if record.id in curated_observation_source_ids
         ),
+        continuity_floor_candidate_count=sum(
+            1 for candidate in after if candidate.continuity_critical
+        ),
+        continuity_floor_source_type_counts=_source_type_counts_json(
+            tuple(candidate for candidate in after if candidate.continuity_critical)
+        ),
         retrieval_diagnostics=dict(retrieval_diagnostics or {}),
     )
 
@@ -3253,6 +3364,7 @@ def _candidate_digest(candidates: tuple[_ContextCandidate, ...]) -> str:
                 "source_id": candidate.source_id,
                 "text_hash": _text_digest(candidate.text),
                 "selection_text_hash": _text_digest(candidate.selection_text or ""),
+                "continuity_critical": candidate.continuity_critical,
             }
             for candidate in candidates
         ]
@@ -3443,9 +3555,37 @@ def _indexed_context_candidates(
                 source_id=record.source_id,
                 text=text,
                 selection_text=metadata_text,
+                continuity_critical=_indexed_context_source_is_continuity_critical(
+                    record,
+                    source_type=source_type,
+                ),
             )
         )
     return tuple(candidates)
+
+
+def _indexed_context_source_is_continuity_critical(
+    record: ContextSourceRecord,
+    *,
+    source_type: str,
+) -> bool:
+    return (
+        source_type in {"open_obligation", "character_voice"}
+        or record.metadata.get("always_include_reason") is not None
+    )
+
+
+def _retrieval_diagnostics_has_hits(
+    diagnostics: Mapping[str, object] | None,
+    *,
+    indexed_candidates: tuple[_ContextCandidate, ...],
+) -> bool:
+    if diagnostics is None:
+        return bool(indexed_candidates)
+    hit_count = diagnostics.get("indexed_retrieval_hit_count")
+    if isinstance(hit_count, int | float):
+        return hit_count > 0
+    return bool(indexed_candidates)
 
 
 def _missing_raw_candidates(
@@ -3462,6 +3602,122 @@ def _missing_raw_candidates(
         for candidate in (*state_candidates, *memory_candidates)
         if (candidate.source_type, candidate.source_id) not in indexed_keys
     )
+
+
+def _continuity_floor_candidates(
+    *,
+    world_state: list[WorldStateRecord],
+    state_candidates: tuple[_ContextCandidate, ...],
+    memories: list[MemoryRecord],
+    memory_candidates: tuple[_ContextCandidate, ...],
+    scenario_candidates: tuple[_ContextCandidate, ...],
+) -> tuple[_ContextCandidate, ...]:
+    return tuple(
+        _mark_continuity_critical(candidate)
+        for candidate in (
+            *_continuity_floor_state_candidates(
+                world_state=world_state,
+                state_candidates=state_candidates,
+            ),
+            *_continuity_floor_memory_candidates(
+                memories=memories,
+                memory_candidates=memory_candidates,
+            ),
+            *scenario_candidates[:CONTINUITY_FLOOR_SCENARIO_SECTION_LIMIT],
+        )
+    )
+
+
+def _continuity_floor_state_candidates(
+    *,
+    world_state: list[WorldStateRecord],
+    state_candidates: tuple[_ContextCandidate, ...],
+) -> tuple[_ContextCandidate, ...]:
+    candidates_by_id = {
+        candidate.source_id: candidate for candidate in state_candidates
+    }
+    selected: list[_ContextCandidate] = []
+    selected_ids: set[str] = set()
+    for record in world_state:
+        if len(selected) >= CONTINUITY_FLOOR_STATE_LIMIT:
+            break
+        if record.category != "scene" and not record.key.startswith("scene."):
+            continue
+        candidate = candidates_by_id.get(record.id)
+        if candidate is None:
+            continue
+        selected.append(candidate)
+        selected_ids.add(record.id)
+    if len(selected) >= CONTINUITY_FLOOR_STATE_LIMIT:
+        return tuple(selected)
+    for record in reversed(world_state):
+        if len(selected) >= CONTINUITY_FLOOR_STATE_LIMIT:
+            break
+        if record.id in selected_ids:
+            continue
+        candidate = candidates_by_id.get(record.id)
+        if candidate is None:
+            continue
+        selected.append(candidate)
+        selected_ids.add(record.id)
+    return tuple(selected)
+
+
+def _continuity_floor_memory_candidates(
+    *,
+    memories: list[MemoryRecord],
+    memory_candidates: tuple[_ContextCandidate, ...],
+) -> tuple[_ContextCandidate, ...]:
+    candidates_by_id = {
+        candidate.source_id: candidate for candidate in memory_candidates
+    }
+    ranked: list[tuple[float, int, _ContextCandidate]] = []
+    for index, record in enumerate(memories):
+        if record.importance < CONTINUITY_FLOOR_MEMORY_MIN_IMPORTANCE:
+            continue
+        candidate = candidates_by_id.get(record.id)
+        if candidate is None:
+            continue
+        ranked.append((-record.importance, -index, candidate))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return tuple(
+        candidate
+        for _importance, _index, candidate in ranked[:CONTINUITY_FLOOR_MEMORY_LIMIT]
+    )
+
+
+def _merge_continuity_floor_candidates(
+    candidates: tuple[_ContextCandidate, ...],
+    continuity_floor_candidates: tuple[_ContextCandidate, ...],
+) -> tuple[_ContextCandidate, ...]:
+    if not continuity_floor_candidates:
+        return candidates
+    by_key = {
+        (candidate.source_type, candidate.source_id): candidate
+        for candidate in continuity_floor_candidates
+    }
+    merged: list[_ContextCandidate] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        key = (candidate.source_type, candidate.source_id)
+        seen_keys.add(key)
+        floor_candidate = by_key.get(key)
+        if floor_candidate is None:
+            merged.append(candidate)
+        else:
+            merged.append(_mark_continuity_critical(candidate))
+    merged.extend(
+        candidate
+        for candidate in continuity_floor_candidates
+        if (candidate.source_type, candidate.source_id) not in seen_keys
+    )
+    return tuple(merged)
+
+
+def _mark_continuity_critical(candidate: _ContextCandidate) -> _ContextCandidate:
+    if candidate.continuity_critical:
+        return candidate
+    return replace(candidate, continuity_critical=True)
 
 
 def _exact_raw_candidates(
@@ -3778,13 +4034,26 @@ def _narrow_context_candidates(
     )
     selected_indexes: set[int] = set()
     selected_type_counts: Counter[str] = Counter()
+    for index, candidate in enumerate(candidates):
+        if not candidate.continuity_critical:
+            continue
+        selected_indexes.add(index)
+        selected_type_counts[candidate.source_type] += 1
+        if len(selected_indexes) >= MAX_CONTEXT_CANDIDATE_POOL:
+            break
     for source_type in dict.fromkeys(
         candidate.source_type for candidate in candidates
     ):
+        if len(selected_indexes) >= MAX_CONTEXT_CANDIDATE_POOL:
+            break
         reserved = [
             item for item in ranked if item[1].source_type == source_type
         ][:4]
         for index, candidate in reserved:
+            if len(selected_indexes) >= MAX_CONTEXT_CANDIDATE_POOL:
+                break
+            if index in selected_indexes:
+                continue
             selected_indexes.add(index)
             selected_type_counts[candidate.source_type] += 1
     for index, candidate in ranked:
@@ -4575,6 +4844,7 @@ def _selection_metadata(selection: _ContextSelectionOutcome) -> dict[str, object
         ("fallback_model", selection.fallback_model_id),
         ("fallback_skipped_reason", selection.fallback_skipped_reason),
         ("error_category", selection.error_category),
+        ("empty_selection_policy", selection.empty_selection_policy),
     ):
         if value:
             metadata[key] = value

@@ -1783,13 +1783,14 @@ def test_context_search_tool_feedback_exhaustion_without_accepted_calls_uses_fal
     assert jobs[-1]["status"] == "succeeded"
 
 
-def test_context_search_tool_no_selection_stays_empty(
+def test_context_search_tool_no_selection_uses_continuity_floor(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(
         repositories,
         model_capabilities=[ProviderCapability.TOOL_CALLING.value],
     )
+    state = repositories.list_world_state(save.id)[0]
     provider = SequenceToolContextProvider(responses=[()])
     service = ContextSearchService(
         repositories=repositories,
@@ -1801,11 +1802,18 @@ def test_context_search_tool_no_selection_stays_empty(
     )
 
     assert len(provider.tool_call_requests) == 1
-    assert result == ContextSearchResult(continuity_index_synced=True)
+    assert [item.source_id for item in result.selected_state] == [state.id]
+    assert result.selected_state[0].relevance_note == (
+        "Selected by deterministic fallback after empty context selection."
+    )
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "deterministic_fallback"
     jobs = _context_search_jobs(repositories, save.id)
     assert jobs[-1]["status"] == "succeeded"
     assert jobs[-1]["result_json"] is not None
-    assert "deterministic fallback" not in jobs[-1]["result_json"]
+    job_result = json.loads(jobs[-1]["result_json"])
+    assert job_result["retrieval_degraded"] is True
+    assert job_result["retrieval_recovery"] == "deterministic_fallback"
 
 
 def test_context_search_uses_tool_fallback_when_primary_model_not_found(
@@ -3703,10 +3711,11 @@ def test_context_search_uses_structured_fallback_for_each_primary_model_error(
     assert job_result["fallback_model"] == "fallback-structured"
 
 
-def test_context_search_structured_empty_selection_stays_empty(
+def test_context_search_structured_empty_selection_uses_continuity_floor(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(repositories)
+    state = repositories.list_world_state(save.id)[0]
     provider = RecordingStructuredContextProvider({"selections": []})
     service = ContextSearchService(
         repositories=repositories,
@@ -3718,11 +3727,105 @@ def test_context_search_structured_empty_selection_stays_empty(
     )
 
     assert len(provider.structured_output_requests) == 1
-    assert result == ContextSearchResult(continuity_index_synced=True)
+    assert [item.source_id for item in result.selected_state] == [state.id]
+    assert result.selected_state[0].relevance_note == (
+        "Selected by deterministic fallback after empty context selection."
+    )
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "deterministic_fallback"
     jobs = _context_search_jobs(repositories, save.id)
     assert jobs[-1]["status"] == "succeeded"
     assert jobs[-1]["result_json"] is not None
-    assert "deterministic fallback" not in jobs[-1]["result_json"]
+    job_result = json.loads(jobs[-1]["result_json"])
+    assert job_result["retrieval_degraded"] is True
+    assert job_result["retrieval_recovery"] == "deterministic_fallback"
+    assert job_result["fallback_used"] is False
+
+
+def test_context_search_offers_continuity_floor_when_index_has_no_hits(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="survival_expedition",
+        title="Frostline",
+        premise="An expedition crosses the white shelf.",
+        player_role="Scout",
+        content={
+            "route_options": "The lower pass is blocked by glass ice.",
+        },
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="White Shelf")
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The camp marked the lower pass as unsafe.",
+    )
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="Okay.",
+    )
+    state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="scene.location",
+        value={"name": "North Ridge Camp"},
+        category="scene",
+        source_message_id=narrator_message.id,
+    )
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The frost lantern marks the safe camp perimeter overnight.",
+        tags=["camp"],
+        importance=0.9,
+        source_message_id=narrator_message.id,
+    )
+    repositories.set_model_preference(
+        task="context_search",
+        provider="fake",
+        model_id="fake-context",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-context",
+        display_name="Fake Context",
+        capabilities=[ProviderCapability.STRUCTURED_OUTPUT.value],
+    )
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": memory.id,
+                    "relevance_note": "The lantern detail is continuity-critical.",
+                }
+            ]
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    prompt = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert "scene.location" in prompt
+    assert state.id in prompt
+    assert memory.body in prompt
+    assert "The lower pass is blocked by glass ice." in prompt
+    assert [item.source_id for item in result.selected_memories] == [memory.id]
+    jobs = _context_search_jobs(repositories, save.id)
+    job_result = json.loads(jobs[-1]["result_json"])
+    diagnostics = job_result["diagnostics"]
+    assert diagnostics["indexed_retrieval_hit_count"] == 0
+    assert diagnostics["protected_context_source_count"] >= 1
+    assert diagnostics["continuity_floor_candidate_count"] >= 3
 
 
 def test_context_search_rehydrates_selected_items_beyond_selector_excerpt(
@@ -4055,36 +4158,39 @@ def test_context_search_marks_job_failed_when_preferred_provider_is_missing(
     assert jobs[-1]["result_json"] is None
 
 
-def test_context_search_does_not_fallback_when_selector_selects_no_candidates(
+def test_context_search_accepts_empty_selection_without_continuity_floor(
     repositories: PersistenceRepositories,
 ) -> None:
-    save, player_message = _save_with_context_search_preference(repositories)
-    source_message = next(
-        message
-        for message in repositories.list_messages(save.id)
-        if message.role == "narrator"
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Bridge of Cinders",
+        premise="A bridge remembers every oath broken on it.",
+        player_role="Oathkeeper",
+        content={},
     )
-    repositories.add_memory(
+    save = repositories.create_save(scenario_id=scenario.id, title="Crossing")
+    repositories.append_message(
         save_id=save.id,
-        body="Mara distrusts bells that ring without wind.",
-        tags=["bells", "suspicion"],
-        source_message_id=source_message.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="A silver bell rings beneath the bridge.",
     )
-    repositories.add_summary(
+    player_message = repositories.append_message(
         save_id=save.id,
-        covers_message_start_id=source_message.id,
-        covers_message_end_id=source_message.id,
-        body="Older summary: Mara reached the bridge before dusk.",
+        role="player",
+        speaker_name="Mara",
+        body="Continue.",
+    )
+    repositories.set_model_preference(
+        task="context_search",
         provider="fake",
-        model="fake-summary",
+        model_id="fake-context",
     )
-    recent_summary = repositories.add_summary(
-        save_id=save.id,
-        covers_message_start_id=source_message.id,
-        covers_message_end_id=player_message.id,
-        body="Latest summary: Mara heard the windless bell beneath the bridge.",
+    repositories.save_provider_model(
         provider="fake",
-        model="fake-summary",
+        model_id="fake-context",
+        display_name="Fake Context",
+        capabilities=[ProviderCapability.STRUCTURED_OUTPUT.value],
     )
     provider = RecordingStructuredContextProvider({"selections": []})
     service = ContextSearchService(
@@ -4100,11 +4206,14 @@ def test_context_search_does_not_fallback_when_selector_selects_no_candidates(
     request_text = "\n".join(
         message.body for message in provider.structured_output_requests[0].messages
     )
-    assert recent_summary.body not in request_text
+    assert "A silver bell rings beneath the bridge." in request_text
     assert provider.chat_requests == []
     assert len(provider.structured_output_requests) == 1
     jobs = _context_search_jobs(repositories, save.id)
     assert jobs[-1]["status"] == "succeeded"
+    job_result = json.loads(jobs[-1]["result_json"])
+    assert job_result["empty_selection_policy"] == "accepted_no_context"
+    assert job_result["diagnostics"]["continuity_floor_candidate_count"] == 0
 
 
 def test_context_search_drops_unsafe_and_recent_overlapping_summaries(
@@ -5239,6 +5348,8 @@ def test_precompute_next_turn_persists_metadata_only_job_result(
         "world_state": 1,
         "message": 2,
     }
+    assert result["continuity_floor_candidate_count"] == 1
+    assert result["continuity_floor_source_type_counts"] == {"world_state": 1}
     assert result["indexed_retrieval_enabled"] is True
     assert isinstance(result["indexed_retrieval_query_term_count"], int)
     assert result["indexed_retrieval_hit_count"] == 0
@@ -5283,6 +5394,63 @@ def test_context_search_cache_hit_includes_new_player_message_in_request(
     raw_result = jobs[-1]["result_json"]
     assert raw_result is not None
     assert "continuity_index_synced" not in raw_result
+
+
+def test_context_search_cache_hit_uses_continuity_floor_without_index_hits(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _player_message = _save_with_context_search_preference(repositories)
+    source_message = next(
+        message
+        for message in repositories.list_messages(save.id)
+        if message.role == "narrator"
+    )
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The east lantern marks Orin's safe rendezvous after dusk.",
+        tags=["lantern"],
+        importance=0.9,
+        source_message_id=source_message.id,
+    )
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": memory.id,
+                    "relevance_note": "The lantern detail still constrains continuity.",
+                }
+            ]
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+    service.precompute_next_turn(save.id)
+    next_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="Okay.",
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=next_message.id)
+    )
+
+    prompt = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert memory.body in prompt
+    assert [item.source_id for item in result.selected_memories] == [memory.id]
+    job_result = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    diagnostics = job_result["diagnostics"]
+    assert diagnostics["cache_status"] == "hit"
+    assert diagnostics["indexed_retrieval_hit_count"] == 0
+    assert diagnostics["continuity_floor_candidate_count"] >= 2
 
 
 def test_context_search_cache_hit_keeps_absent_mention_scoped_context_hidden(
