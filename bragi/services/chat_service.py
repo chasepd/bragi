@@ -6379,12 +6379,31 @@ class ChatService:
                 await merge_curation_result()
                 return "skipped"
         try:
-            update_task = asyncio.create_task(
-                service.update_after_turn(
-                    save_id=save_id,
-                    source_message_ids=(player_message_id, narrator_message_id),
+            update_task: asyncio.Task[object]
+            if (
+                isinstance(service, ContextUpdateService)
+                and inference_mode == POST_TURN_INFERENCE_MODE_HYBRID
+            ):
+                update_task = asyncio.create_task(
+                    service.update_after_turn(
+                        save_id=save_id,
+                        source_message_ids=(
+                            player_message_id,
+                            narrator_message_id,
+                        ),
+                        verified_coverage=verified_coverage,
+                    )
                 )
-            )
+            else:
+                update_task = asyncio.create_task(
+                    service.update_after_turn(
+                        save_id=save_id,
+                        source_message_ids=(
+                            player_message_id,
+                            narrator_message_id,
+                        ),
+                    )
+                )
             await asyncio.sleep(0)
             curation_task = asyncio.create_task(
                 self._curate_if_configured(save_id=save_id)
@@ -7472,6 +7491,17 @@ def _planned_commit_diagnostics(
     candidates: tuple[StateCommitCandidate, ...],
     planner_rejections: tuple[PlannerRejection, ...] = (),
 ) -> dict[str, object]:
+    commit_rejections = tuple(
+        rejection
+        for rejection in planner_rejections
+        if rejection.candidate_type
+        in {
+            "scene_presence",
+            "scene_snapshot_field",
+            "character_learned_memory",
+            "character_knowledge_edge",
+        }
+    )
     by_type: dict[str, dict[str, int]] = {}
     by_domain: dict[str, dict[str, int]] = {}
     for candidate in candidates:
@@ -7491,10 +7521,10 @@ def _planned_commit_diagnostics(
             "application_status": "rejected",
             "changed": False,
         }
-        for rejection in planner_rejections
+        for rejection in commit_rejections
     ]
     by_reason: dict[str, int] = {}
-    for rejection in planner_rejections:
+    for rejection in commit_rejections:
         type_bucket = by_type.setdefault(
             rejection.candidate_type,
             _empty_planned_commit_counts(),
@@ -7511,17 +7541,20 @@ def _planned_commit_diagnostics(
         domain_bucket["skipped"] += 1
         by_reason[rejection.reason] = by_reason.get(rejection.reason, 0) + 1
     return {
-        "proposed_count": len(candidates) + len(planner_rejections),
+        "proposed_count": len(candidates) + len(commit_rejections),
         "committed_count": 0,
         "queued_count": 0,
-        "rejected_count": len(planner_rejections),
-        "skipped_count": len(planner_rejections),
+        "rejected_count": len(commit_rejections),
+        "skipped_count": len(commit_rejections),
         "contradicted_count": 0,
         "confirmation_queued_count": 0,
         "by_type": by_type,
         "by_domain": by_domain,
         "by_reason": by_reason,
         "decisions": decisions,
+        "planner_rejections": [
+            rejection.to_json() for rejection in planner_rejections
+        ],
         "coverage": VerifiedPostTurnCoverage().to_json(),
     }
 

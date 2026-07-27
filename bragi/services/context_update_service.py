@@ -82,6 +82,7 @@ from bragi.services.phone_number_exchange import (
 from bragi.services.phone_number_exchange import (
     infer_phone_number_exchanges as infer_phone_number_exchange_records,
 )
+from bragi.services.post_turn_inference import VerifiedPostTurnCoverage
 from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
@@ -321,6 +322,77 @@ class ContextUpdateExtraction:
     tool_diagnostics: dict[str, object] = field(
         default_factory=dict,
         compare=False,
+    )
+
+
+def _filter_scene_for_verified_coverage(
+    scene: ExtractedSceneSnapshot,
+    *,
+    coverage: VerifiedPostTurnCoverage,
+    current_snapshot: SceneSnapshotRecord | None,
+    characters: tuple[CharacterRecord, ...],
+) -> ExtractedSceneSnapshot:
+    covered_fields = coverage.scene_snapshot_fields
+    present_character_names = scene.present_character_names
+    covered_presence_ids = coverage.scene_presence_character_ids
+    if covered_presence_ids and (
+        scene.present_character_names is not None
+        or scene.current_location_name.strip()
+    ):
+        present_names: list[str] = []
+        for name in scene.present_character_names or ():
+            resolution = _resolve_character(characters, name)
+            if (
+                resolution.record is not None
+                and resolution.record.id in covered_presence_ids
+            ):
+                continue
+            present_names.append(name)
+        current_present_ids = (
+            set(current_snapshot.present_character_ids) if current_snapshot else set()
+        )
+        present_names.extend(
+            character.name
+            for character in characters
+            if character.id in covered_presence_ids
+            and character.id in current_present_ids
+        )
+        present_character_names = tuple(dict.fromkeys(present_names))
+    return replace(
+        scene,
+        situation="" if "situation" in covered_fields else scene.situation,
+        objective="" if "objective" in covered_fields else scene.objective,
+        in_world_time=(
+            ""
+            if covered_fields & {"in_world_time", "time_of_day", "day_of_week"}
+            else scene.in_world_time
+        ),
+        weather="" if "weather" in covered_fields else scene.weather,
+        mood="" if "mood" in covered_fields else scene.mood,
+        nearby_objects=(
+            None if "nearby_objects" in covered_fields else scene.nearby_objects
+        ),
+        hazards=None if "hazards" in covered_fields else scene.hazards,
+        present_character_names=present_character_names,
+    )
+
+
+def _filter_extraction_for_verified_coverage(
+    extraction: ContextUpdateExtraction,
+    *,
+    coverage: VerifiedPostTurnCoverage | None,
+    request: ContextUpdateRequest,
+) -> ContextUpdateExtraction:
+    if coverage is None or coverage.empty or extraction.scene is None:
+        return extraction
+    return replace(
+        extraction,
+        scene=_filter_scene_for_verified_coverage(
+            extraction.scene,
+            coverage=coverage,
+            current_snapshot=request.scene_snapshot,
+            characters=request.characters,
+        ),
     )
 
 
@@ -2766,6 +2838,7 @@ class ContextUpdateService:
         *,
         save_id: str,
         source_message_ids: tuple[str, ...],
+        verified_coverage: VerifiedPostTurnCoverage | None = None,
     ) -> AppliedContextUpdate:
         job = self.jobs.create_running(
             save_id=save_id,
@@ -2850,6 +2923,11 @@ class ContextUpdateService:
             )
             step_started_at = perf_counter()
             extraction = await self.extractor.extract(request)
+            extraction = _filter_extraction_for_verified_coverage(
+                extraction,
+                coverage=verified_coverage,
+                request=request,
+            )
             record_context_step("extraction", step_started_at)
             step_started_at = perf_counter()
             self.repositories.begin_transaction()
@@ -2875,6 +2953,7 @@ class ContextUpdateService:
             focused_applied = await self._maintain_focused_scene_after_update(
                 save_id=save_id,
                 messages=messages,
+                verified_coverage=verified_coverage,
             )
             record_context_step(
                 "focused_scene",
@@ -3244,6 +3323,7 @@ class ContextUpdateService:
         *,
         save_id: str,
         messages: tuple[MessageRecord, ...],
+        verified_coverage: VerifiedPostTurnCoverage | None = None,
     ) -> AppliedFocusedSceneMaintenance:
         if self.focused_scene_maintainer is None:
             return AppliedFocusedSceneMaintenance()
@@ -3261,6 +3341,19 @@ class ContextUpdateService:
         )
         try:
             maintenance = await self.focused_scene_maintainer.maintain(request)
+            if verified_coverage is not None and not verified_coverage.empty:
+                maintenance = replace(
+                    maintenance,
+                    scene_updates=tuple(
+                        _filter_scene_for_verified_coverage(
+                            update,
+                            coverage=verified_coverage,
+                            current_snapshot=request.scene_snapshot,
+                            characters=request.characters,
+                        )
+                        for update in maintenance.scene_updates
+                    ),
+                )
             self.repositories.begin_transaction()
             applied = self.apply_focused_scene_maintenance(
                 save_id=save_id,
