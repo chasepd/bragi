@@ -1838,9 +1838,15 @@ def test_snapshot_fork_copies_legacy_normalized_budget_allowance(
         "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD",
         1,
     )
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD",
+        1,
+    )
     repositories.ensure_context_source_legacy_budget_limit(
         save_id=save.id,
         normalized_text_bytes=normalized_text_bytes,
+        normalized_record_bytes=normalized_text_bytes,
     )
     repositories.commit()
     service = TurnSnapshotService(repositories)
@@ -1861,7 +1867,16 @@ def test_snapshot_fork_copies_legacy_normalized_budget_allowance(
         """,
         (fork.save.id,),
     ).fetchone()[0]
+    fork_record_limit = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_legacy_record_budget_limits
+        WHERE save_id = ?
+        """,
+        (fork.save.id,),
+    ).fetchone()[0]
     assert fork_limit == normalized_text_bytes
+    assert fork_record_limit == normalized_text_bytes
 
 
 def test_snapshot_backed_fork_rejects_media_paths_outside_media_root(

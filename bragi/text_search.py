@@ -20,6 +20,11 @@ MAX_UNICODE_WORD_TERM_CHARS = 512
 MAX_STRUCTURED_IDENTIFIER_BOUNDARY_PROBE_CHARS = (
     MAX_STRUCTURED_IDENTIFIER_CHARS * 4
 )
+MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS = (
+    (MAX_STRUCTURED_IDENTIFIER_INPUT_CHARS - 1) // 2
+    + MAX_STRUCTURED_IDENTIFIER_BOUNDARY_PROBE_CHARS
+    + 1
+)
 
 
 def _bounded_nfkc_casefold(
@@ -68,9 +73,39 @@ def structured_identifiers(
     max_input_chars: int = MAX_STRUCTURED_IDENTIFIER_INPUT_CHARS,
     max_identifiers: int = MAX_STRUCTURED_IDENTIFIERS,
 ) -> tuple[str, ...]:
+    return _structured_identifiers_from_bounded_input(
+        _bounded_identifier_input(value, max_input_chars=max_input_chars),
+        max_identifiers=max_identifiers,
+    )
+
+
+def structured_identifiers_from_edges(
+    prefix: str,
+    suffix: str,
+    *,
+    total_chars: int,
+    max_identifiers: int = MAX_STRUCTURED_IDENTIFIERS,
+) -> tuple[str, ...]:
+    bounded_input = _bounded_identifier_input_from_edges(
+        prefix,
+        suffix,
+        total_chars=total_chars,
+        max_input_chars=MAX_STRUCTURED_IDENTIFIER_INPUT_CHARS,
+    )
+    return _structured_identifiers_from_bounded_input(
+        bounded_input,
+        max_identifiers=max_identifiers,
+    )
+
+
+def _structured_identifiers_from_bounded_input(
+    value: str,
+    *,
+    max_identifiers: int,
+) -> tuple[str, ...]:
     normalized = unicodedata.normalize(
         "NFKC",
-        _bounded_identifier_input(value, max_input_chars=max_input_chars),
+        value,
     ).casefold()
     identifiers = tuple(
         dict.fromkeys(
@@ -135,6 +170,52 @@ def _bounded_identifier_input(value: str, *, max_input_chars: int) -> str:
             ):
                 suffix_start += 1
     return f"{value[:prefix_end]} {value[suffix_start:]}"
+
+
+def _bounded_identifier_input_from_edges(
+    prefix: str,
+    suffix: str,
+    *,
+    total_chars: int,
+    max_input_chars: int,
+) -> str:
+    if max_input_chars <= 0 or total_chars <= 0:
+        return ""
+    if total_chars <= max_input_chars:
+        return prefix[:total_chars]
+    edge_chars = max(1, (max_input_chars - 1) // 2)
+    prefix_end = min(edge_chars, len(prefix))
+    if (
+        prefix_end < len(prefix)
+        and _structured_identifier_character(prefix[prefix_end - 1])
+        and _structured_identifier_character(prefix[prefix_end])
+    ):
+        token_span = _bounded_identifier_token_span(prefix, cut=prefix_end)
+        if token_span is not None:
+            prefix_end = token_span[1]
+        else:
+            while (
+                prefix_end > 0
+                and _structured_identifier_character(prefix[prefix_end - 1])
+            ):
+                prefix_end -= 1
+    suffix_start = max(0, len(suffix) - edge_chars)
+    if (
+        suffix_start > 0
+        and suffix_start < len(suffix)
+        and _structured_identifier_character(suffix[suffix_start - 1])
+        and _structured_identifier_character(suffix[suffix_start])
+    ):
+        token_span = _bounded_identifier_token_span(suffix, cut=suffix_start)
+        if token_span is not None:
+            suffix_start = token_span[0]
+        else:
+            while (
+                suffix_start < len(suffix)
+                and _structured_identifier_character(suffix[suffix_start])
+            ):
+                suffix_start += 1
+    return f"{prefix[:prefix_end]} {suffix[suffix_start:]}"
 
 
 def _bounded_identifier_token_span(

@@ -23,6 +23,7 @@ from bragi.persistence.models import MediaAssetRecord, MessageRecord, SaveRecord
 from bragi.persistence.repositories import (
     PersistenceRepositories,
     canonical_claim_fingerprint,
+    validate_context_source_index_budget,
 )
 from bragi.safety import (
     CONTENT_FILTER_TRANSITION,
@@ -734,7 +735,8 @@ class TurnSnapshotService:
         target_save_id: str,
         message_id_map: Mapping[str, str],
         id_maps: dict[str, dict[str, str]] | None = None,
-        media_path_map: Mapping[tuple[str, str], str] | None = None,
+        media_path_map: Mapping[tuple[str, str], str | None] | None = None,
+        require_verified_media_paths: bool = False,
     ) -> int:
         snapshots = [dict(row) for row in snapshot_rows]
         objects = [dict(row) for row in object_rows]
@@ -781,6 +783,7 @@ class TurnSnapshotService:
             id_maps=id_maps,
             message_id_map=message_id_map,
             media_path_map=media_path_map,
+            require_media_path_map=require_verified_media_paths,
         )
         snapshot_id_map = {
             _text(row, "id"): str(uuid4()) for row in snapshots
@@ -888,8 +891,8 @@ class TurnSnapshotService:
     ) -> None:
         _validate_exported_snapshot_rows(snapshot_rows, object_rows)
 
+    @staticmethod
     def media_asset_rows_from_snapshot_objects(
-        self,
         object_rows: Iterable[Mapping[str, object]],
     ) -> tuple[dict[str, object], ...]:
         rows: list[dict[str, object]] = []
@@ -908,6 +911,55 @@ class TurnSnapshotService:
                 seen.add(row_id)
             rows.append(media_row)
         return tuple(rows)
+
+    @staticmethod
+    def context_source_budget_from_snapshot_objects(
+        *,
+        snapshot_rows: Iterable[Mapping[str, object]],
+        object_rows: Iterable[Mapping[str, object]],
+        max_normalized_text_bytes: int,
+        max_normalized_record_bytes: int,
+    ) -> tuple[int, int]:
+        snapshots = [dict(row) for row in snapshot_rows]
+        objects = [dict(row) for row in object_rows]
+        decoded_objects = _validate_exported_snapshot_rows(
+            snapshot_rows=snapshots,
+            object_rows=objects,
+        )
+        max_total_bytes = 0
+        max_record_bytes = 0
+        seen_signatures: set[str] = set()
+        for snapshot in snapshots:
+            manifest_hash = _text(snapshot, "root_manifest_hash")
+            manifest = _required_exported_snapshot_object(
+                decoded_objects,
+                manifest_hash,
+                expected_kind="snapshot_manifest",
+            )
+            if not isinstance(manifest, Mapping):
+                raise ValueError("Snapshot manifest object is not valid")
+            signature = _snapshot_manifest_table_signature(manifest)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            context_rows: list[Mapping[str, object]] = []
+            for entry in _manifest_tables(manifest).get("context_sources", ()):
+                context_row = _required_exported_snapshot_object(
+                    decoded_objects,
+                    _text(entry, "object_hash"),
+                    expected_kind="row:context_sources",
+                )
+                if not isinstance(context_row, Mapping):
+                    raise ValueError("Snapshot context source is not valid")
+                context_rows.append(context_row)
+            total_bytes, record_bytes = validate_context_source_index_budget(
+                context_rows,
+                max_normalized_text_bytes=max_normalized_text_bytes,
+                max_normalized_record_bytes=max_normalized_record_bytes,
+            )
+            max_total_bytes = max(max_total_bytes, total_bytes)
+            max_record_bytes = max(max_record_bytes, record_bytes)
+        return max_total_bytes, max_record_bytes
 
     def media_asset_records_from_save_snapshots(
         self,
@@ -1444,12 +1496,14 @@ class _SnapshotRemapper:
         rows_by_table: Mapping[str, Iterable[Mapping[str, object]]],
         id_maps: dict[str, dict[str, str]] | None = None,
         message_id_map: Mapping[str, str] | None = None,
-        media_path_map: Mapping[tuple[str, str], str] | None = None,
+        media_path_map: Mapping[tuple[str, str], str | None] | None = None,
+        require_media_path_map: bool = False,
     ) -> None:
         self.source_save_id = source_save_id
         self.target_save_id = target_save_id
         self.id_maps = id_maps or {}
         self.media_path_map = dict(media_path_map or {})
+        self.require_media_path_map = require_media_path_map
         self.id_maps.setdefault("saves", {source_save_id: target_save_id})
         self.id_maps.setdefault("save", self.id_maps["saves"])
         self.id_maps.setdefault("messages", dict(message_id_map or {}))
@@ -1654,7 +1708,16 @@ class _SnapshotRemapper:
     ) -> object:
         if not isinstance(row_id, str) or not isinstance(value, str):
             return value
-        return self.media_path_map.get((row_id, column), value)
+        key = (row_id, column)
+        if key in self.media_path_map:
+            return self.media_path_map[key]
+        if self.require_media_path_map:
+            if column == "thumbnail_path":
+                return None
+            raise ValueError(
+                f"Snapshot media asset lacks verified imported path: {row_id}"
+            )
+        return value
 
     def _remap_json_text(
         self,

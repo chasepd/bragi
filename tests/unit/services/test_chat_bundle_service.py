@@ -580,6 +580,168 @@ def test_import_preserves_exported_legacy_normalized_budget_allowance(
     assert imported_limit == normalized_text_bytes
 
 
+def test_import_preserves_snapshot_legacy_normalized_budget_allowance(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    source = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="custom_note",
+        source_id="snapshot-legacy-budget-note",
+        title="Legacy note",
+        body="The moonstone opens the archive.",
+    )
+    normalized_text_bytes = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_index_budget_state
+        WHERE save_id = ?
+        """,
+        (save.id,),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD",
+        1,
+    )
+    repositories.ensure_context_source_legacy_budget_limit(
+        save_id=save.id,
+        normalized_text_bytes=normalized_text_bytes,
+    )
+    repositories.commit()
+    TurnSnapshotService(repositories).capture_baseline_snapshot(save.id)
+    repositories.archive_context_source(source.id)
+    repositories.connection.execute(
+        """
+        DELETE FROM context_source_legacy_budget_limits
+        WHERE save_id = ?
+        """,
+        (save.id,),
+    )
+    repositories.commit()
+    bundle_path = tmp_path / "exports" / "snapshot-legacy-budget.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+
+    imported_save_id = _imported_save_id(imported)
+    imported_limit = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_legacy_budget_limits
+        WHERE save_id = ?
+        """,
+        (imported_save_id,),
+    ).fetchone()[0]
+    snapshot_id = repositories.connection.execute(
+        """
+        SELECT id
+        FROM save_turn_snapshots
+        WHERE save_id = ?
+        """,
+        (imported_save_id,),
+    ).fetchone()[0]
+    TurnSnapshotService(repositories).restore_save_to_snapshot(
+        save_id=imported_save_id,
+        snapshot_id=snapshot_id,
+    )
+    assert imported_limit == normalized_text_bytes
+    assert [
+        restored.source_id
+        for restored in repositories.list_context_sources(imported_save_id)
+    ] == ["snapshot-legacy-budget-note"]
+
+
+def test_native_export_storage_satisfies_import_compression_guard(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _chat_bundle_module()
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    bundle_path = tmp_path / "exports" / "import-safe-storage.bragi-chat"
+    monkeypatch.setattr(module, "_MIN_BUNDLE_COMPRESSION_RATIO_CHECK_BYTES", 1)
+    monkeypatch.setattr(module, "_MAX_BUNDLE_COMPRESSION_RATIO", 1.0)
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+
+    with zipfile.ZipFile(bundle_path) as bundle:
+        assert all(
+            info.compress_type == zipfile.ZIP_STORED
+            for info in bundle.infolist()
+        )
+    service.import_save(bundle_path)
+
+
+def test_import_rejects_uncovered_snapshot_media_object(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    TurnSnapshotService(repositories).capture_baseline_snapshot(save.id)
+    exported_path = tmp_path / "covered-snapshot-media.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, exported_path)
+    with zipfile.ZipFile(exported_path) as bundle:
+        manifest = json.loads(bundle.read("manifest.json"))
+        data = json.loads(bundle.read("data.json"))
+    _move_media_asset_to_snapshot_only(
+        manifest,
+        data,
+        media_asset_id=MEDIA_ASSET_ID,
+    )
+    data["snapshot_media_assets"] = []
+    bundle_path = tmp_path / "uncovered-snapshot-media.bragi-chat"
+    _write_bundle(bundle_path, manifest=manifest, data=data)
+
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="do not cover",
+    ):
+        service.import_save(bundle_path)
+
+
+def test_export_import_preserves_exact_identifier_after_long_token(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="custom_note",
+        source_id="long-token-tail",
+        title="Archive codes",
+        body="KEEP-1 " + ("A" * 70_000) + " TAIL-2",
+    )
+    bundle_path = tmp_path / "long-token-tail.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+
+    imported_save_id = _imported_save_id(imported)
+    identifiers = {
+        row[0]
+        for row in repositories.connection.execute(
+            """
+            SELECT identifier
+            FROM context_source_exact_identifiers
+            WHERE save_id = ?
+            """,
+            (imported_save_id,),
+        )
+    }
+    assert {"keep-1", "tail-2"} <= identifiers
+
+
 def test_export_save_refunds_live_curation_attempt_when_clearing_lease(
     repositories: PersistenceRepositories,
     tmp_path: Path,

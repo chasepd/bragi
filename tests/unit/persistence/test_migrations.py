@@ -381,7 +381,7 @@ def test_migrate_database_rebuilds_incomplete_exact_identifier_index(
         connection.execute(
             """
             DELETE FROM context_source_search_index_state
-            WHERE key = 'exact_identifiers_complete_v3'
+            WHERE key = 'exact_identifiers_complete_v2'
             """
         )
         connection.execute(
@@ -433,7 +433,7 @@ def test_migrate_database_rebuilds_incomplete_exact_identifier_index(
         assert [hit.record.id for hit in hits] == [source.id]
 
 
-def test_migrate_database_rebuilds_outdated_lexical_term_index(
+def test_migrate_database_keeps_outdated_lexical_index_searchable(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "bragi.sqlite3"
@@ -458,12 +458,6 @@ def test_migrate_database_rebuilds_outdated_lexical_term_index(
             source_id="memory-long-han-run",
             title="長文",
             body=body,
-        )
-        connection.execute(
-            """
-            DELETE FROM context_source_search_index_state
-            WHERE key = 'lexical_terms_complete_v2'
-            """
         )
         connection.execute(
             """
@@ -494,18 +488,70 @@ def test_migrate_database_rebuilds_outdated_lexical_term_index(
     migrate_database(database_path)
 
     with sqlite3.connect(database_path) as connection:
-        indexed_terms = {
-            row[0]
-            for row in connection.execute(
-                """
-                SELECT term
-                FROM context_source_search_terms
-                WHERE context_source_id = ?
-                """,
-                (source.id,),
-            )
-        }
-        assert set(cjk_lexical_anchors(query)) <= indexed_terms
+        repositories = PersistenceRepositories(connection)
+        hits = repositories.search_context_sources(
+            save.id,
+            query_terms=set(cjk_lexical_anchors(query)),
+            source_types={"memory"},
+            limit=1,
+            match_all=True,
+        )
+        assert [hit.record.id for hit in hits] == [source.id]
+
+
+def test_migrate_database_preserves_legacy_per_record_normalized_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="custom_note",
+            source_id="legacy-expansion",
+            title="Legacy expansion",
+            body="\ufdfa" * 32,
+        )
+        normalized_bytes = connection.execute(
+            """
+            SELECT normalized_text_bytes
+            FROM context_source_normalized_budget_entries
+            WHERE save_id = ?
+            """,
+            (save.id,),
+        ).fetchone()[0]
+        connection.commit()
+    monkeypatch.setattr(
+        migrations,
+        "_MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD",
+        1,
+    )
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        stored_limit = connection.execute(
+            """
+            SELECT normalized_text_bytes
+            FROM context_source_legacy_record_budget_limits
+            WHERE save_id = ?
+            """,
+            (save.id,),
+        ).fetchone()[0]
+        assert stored_limit == normalized_bytes
 
 
 def test_migrate_database_upgrades_main_schema_71_context_lifecycle(

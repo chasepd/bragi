@@ -4561,13 +4561,20 @@ def test_repositories_matches_middle_han_trigram_via_bigrams(
 
     hits = repositories.search_context_sources(
         save_id,
-        query_terms=set(cjk_lexical_anchors(query)),
+        query_terms={*cjk_lexical_anchors(query), "where", "is"},
         source_types={"memory"},
         limit=1,
         match_all=True,
     )
+    broad_hits = repositories.search_context_sources(
+        save_id,
+        query_terms={*cjk_lexical_anchors(query), "where", "is"},
+        source_types={"memory"},
+        limit=1,
+    )
 
     assert [hit.record for hit in hits] == [target]
+    assert [hit.record for hit in broad_hits] == [target]
 
 
 def test_repositories_exact_phrase_supports_short_ascii_identifiers(
@@ -4710,6 +4717,34 @@ def test_repositories_indexes_exact_identifier_at_source_tail(
     assert [hit.record for hit in hits] == [target]
 
 
+def test_repositories_rebuild_preserves_exact_identifier_after_long_token(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-long-token-tail",
+        title="Archive codes",
+        body="KEEP-1 " + ("A" * 70_000) + " TAIL-2",
+    )
+
+    repositories.rebuild_context_source_search_terms(save_id)
+
+    identifiers = {
+        row[0]
+        for row in repositories.connection.execute(
+            """
+            SELECT identifier
+            FROM context_source_exact_identifiers
+            WHERE context_source_id = ?
+            """,
+            (target.id,),
+        )
+    }
+    assert identifiers == {"keep-1", "tail-2"}
+
+
 def test_repositories_restore_rebuilds_archived_exact_identifier_index(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -4790,6 +4825,54 @@ def test_repositories_restore_preserves_legacy_normalized_budget_allowance(
         "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD",
         1,
     )
+
+    repositories.restore_context_sources({source.id})
+
+    assert repositories.connection.execute(
+        "SELECT archived_at FROM context_sources WHERE id = ?",
+        (source.id,),
+    ).fetchone()[0] is None
+
+
+def test_repositories_restore_preserves_legacy_record_budget_allowance(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    source = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="custom_note",
+        source_id="legacy-record-budget",
+        title="Legacy expansion",
+        body="\ufdfa" * 32,
+    )
+    normalized_bytes = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_normalized_budget_entries
+        WHERE context_source_id = ?
+        """,
+        (source.id,),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD",
+        1,
+    )
+    repositories.ensure_context_source_legacy_budget_limit(
+        save_id=save_id,
+        normalized_text_bytes=normalized_bytes,
+        normalized_record_bytes=normalized_bytes,
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_sources
+        SET archived_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (source.id,),
+    )
+    repositories.commit()
 
     repositories.restore_context_sources({source.id})
 

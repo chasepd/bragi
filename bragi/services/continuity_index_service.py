@@ -101,7 +101,7 @@ class ContinuityIndexService:
     def sync_save(self, save_id: str) -> ContinuityIndexSyncResult:
         if not self.repositories.continuity_index_needs_sync(save_id):
             return ContinuityIndexSyncResult(indexed_count=0)
-        self.repositories.begin_transaction()
+        self.repositories.begin_immediate_transaction()
         try:
             dirty_sources = self.repositories.list_continuity_index_dirty_sources(
                 save_id,

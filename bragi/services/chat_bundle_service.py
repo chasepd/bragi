@@ -22,6 +22,8 @@ from bragi.json_safety import JsonSafetyError, validate_json_structure
 from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION
 from bragi.persistence.repositories import (
+    MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD,
+    MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD,
     PersistenceRepositories,
     canonical_claim_fingerprint,
     validate_context_source_index_budget,
@@ -285,6 +287,12 @@ class ChatBundleService:
                     ),
                     _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES,
                 )
+            ),
+            max_normalized_record_bytes=min(
+                self.repositories.context_source_normalized_record_budget_limit(
+                    save_id
+                ),
+                _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES,
             ),
         )
 
@@ -1009,6 +1017,32 @@ class ChatBundleService:
         )
         data["turn_snapshots"] = snapshot_rows
         data["snapshot_objects"] = snapshot_objects
+        (
+            snapshot_normalized_budget,
+            snapshot_normalized_record_budget,
+        ) = _snapshot_context_source_budget(data)
+        normalized_budget = max(
+            self.repositories.context_source_normalized_budget_limit(save_id),
+            snapshot_normalized_budget,
+        )
+        normalized_record_budget = max(
+            self.repositories.context_source_normalized_record_budget_limit(
+                save_id
+            ),
+            snapshot_normalized_record_budget,
+        )
+        if (
+            normalized_budget > _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+            or normalized_record_budget
+            > _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+        ):
+            raise ChatBundleError(
+                "Legacy context source budget is too large to export"
+            )
+        data["context_source_budget"] = {
+            "normalized_text_bytes": normalized_budget,
+            "normalized_record_bytes": normalized_record_budget,
+        }
         return (
             data,
             cast(dict[str, object], data["save"]),
@@ -1039,10 +1073,24 @@ class ChatBundleService:
     ) -> ImportedChatBundle:
         manifest_payload, data = self._read_bundle(bundle_path)
         _manifest_from_payload(manifest_payload)
-        imported_normalized_text_bytes = (
+        (
+            declared_normalized_text_bytes,
+            declared_normalized_record_bytes,
+        ) = _bundle_context_source_budget(data)
+        (
+            snapshot_normalized_text_bytes,
+            snapshot_normalized_record_bytes,
+        ) = _snapshot_context_source_budget(data)
+        (
+            imported_normalized_text_bytes,
+            imported_normalized_record_bytes,
+        ) = (
             _validate_bundle_context_source_index_budget(
                 data,
                 max_normalized_text_bytes=(
+                    _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+                ),
+                max_normalized_record_bytes=(
                     _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
                 ),
             )
@@ -1062,7 +1110,16 @@ class ChatBundleService:
             )
             self.repositories.ensure_context_source_legacy_budget_limit(
                 save_id=imported.save_id,
-                normalized_text_bytes=imported_normalized_text_bytes,
+                normalized_text_bytes=max(
+                    imported_normalized_text_bytes,
+                    declared_normalized_text_bytes,
+                    snapshot_normalized_text_bytes,
+                ),
+                normalized_record_bytes=max(
+                    imported_normalized_record_bytes,
+                    declared_normalized_record_bytes,
+                    snapshot_normalized_record_bytes,
+                ),
             )
             self.repositories.rebuild_context_source_search_terms(imported.save_id)
             self.repositories.commit_transaction()
@@ -1640,7 +1697,7 @@ class ChatBundleService:
             media_asset_id_map.setdefault(_text(row, "id"), uuid4().hex)
         imported_id_maps["media_asset"] = media_asset_id_map
         imported_id_maps["media_assets"] = media_asset_id_map
-        media_path_map: dict[tuple[str, str], str] = {}
+        media_path_map: dict[tuple[str, str], str | None] = {}
         for row in media_rows:
             original_media_asset_id = _text(row, "id")
             asset_id = live_media_asset_id_map[original_media_asset_id]
@@ -1679,6 +1736,8 @@ class ChatBundleService:
                 media_path_map[
                     (original_media_asset_id, "thumbnail_path")
                 ] = thumbnail_relative_path
+            else:
+                media_path_map[(original_media_asset_id, "thumbnail_path")] = None
 
             self.repositories.create_media_asset(
                 save_id=save.id,
@@ -1749,6 +1808,8 @@ class ChatBundleService:
                 media_path_map[
                     (original_media_asset_id, "thumbnail_path")
                 ] = thumbnail_relative_path
+            else:
+                media_path_map[(original_media_asset_id, "thumbnail_path")] = None
 
         self._import_context_graph(
             data,
@@ -1769,6 +1830,7 @@ class ChatBundleService:
                 message_id_map=message_id_map,
                 id_maps=imported_id_maps,
                 media_path_map=media_path_map,
+                require_verified_media_paths=True,
             )
         except ValueError as exc:
             raise ChatBundleError(str(exc)) from exc
@@ -3700,7 +3762,7 @@ def _write_bundle_atomically(
         with zipfile.ZipFile(
             temporary_path,
             mode="w",
-            compression=zipfile.ZIP_DEFLATED,
+            compression=zipfile.ZIP_STORED,
         ) as bundle:
             bundle.writestr(MANIFEST_NAME, _dump_json_pretty(manifest_payload))
             bundle.writestr(DATA_NAME, _dump_json_pretty(data))
@@ -4018,17 +4080,76 @@ def _validate_bundle_context_source_index_budget(
     data: Mapping[str, object],
     *,
     max_normalized_text_bytes: int | None = None,
-) -> int:
+    max_normalized_record_bytes: int | None = None,
+) -> tuple[int, int]:
     try:
         rows = _list_of_objects(
             data.get("context_sources"),
             "context_sources",
         )
-        if max_normalized_text_bytes is None:
+        if (
+            max_normalized_text_bytes is None
+            and max_normalized_record_bytes is None
+        ):
             return validate_context_source_index_budget(rows)
         return validate_context_source_index_budget(
             rows,
-            max_normalized_text_bytes=max_normalized_text_bytes,
+            max_normalized_text_bytes=(
+                max_normalized_text_bytes
+                if max_normalized_text_bytes is not None
+                else MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
+            ),
+            max_normalized_record_bytes=(
+                max_normalized_record_bytes
+                if max_normalized_record_bytes is not None
+                else MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD
+            ),
+        )
+    except ValueError as exc:
+        raise ChatBundleError(str(exc)) from exc
+
+
+def _bundle_context_source_budget(
+    data: Mapping[str, object],
+) -> tuple[int, int]:
+    value = data.get("context_source_budget")
+    if value is None:
+        return 0, 0
+    if not isinstance(value, Mapping):
+        raise ChatBundleError("Chat bundle context source budget is invalid")
+    limits: list[int] = []
+    for field in ("normalized_text_bytes", "normalized_record_bytes"):
+        raw_limit = value.get(field)
+        if (
+            not isinstance(raw_limit, int)
+            or isinstance(raw_limit, bool)
+            or raw_limit < 0
+            or raw_limit > _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+        ):
+            raise ChatBundleError("Chat bundle context source budget is invalid")
+        limits.append(raw_limit)
+    return limits[0], limits[1]
+
+
+def _snapshot_context_source_budget(
+    data: Mapping[str, object],
+) -> tuple[int, int]:
+    try:
+        return TurnSnapshotService.context_source_budget_from_snapshot_objects(
+            snapshot_rows=_list_of_objects(
+                data.get("turn_snapshots"),
+                "turn_snapshots",
+            ),
+            object_rows=_list_of_objects(
+                data.get("snapshot_objects"),
+                "snapshot_objects",
+            ),
+            max_normalized_text_bytes=(
+                _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+            ),
+            max_normalized_record_bytes=(
+                _MAX_BUNDLE_CONTEXT_SOURCE_NORMALIZED_BYTES
+            ),
         )
     except ValueError as exc:
         raise ChatBundleError(str(exc)) from exc
@@ -4141,6 +4262,24 @@ def _validate_bundle_data(
     )
     _validate_unique_ids(snapshot_media_assets, "snapshot_media_assets")
     active_media_asset_ids = {_text(row, "id") for row in media_assets}
+    snapshot_object_media_ids = {
+        _text(row, "id")
+        for row in TurnSnapshotService.media_asset_rows_from_snapshot_objects(
+            snapshot_objects
+        )
+    }
+    expected_snapshot_media_ids = (
+        snapshot_object_media_ids - active_media_asset_ids
+    )
+    provided_snapshot_media_ids = {
+        _text(row, "id") for row in snapshot_media_assets
+    }
+    if not expected_snapshot_media_ids.issubset(
+        provided_snapshot_media_ids
+    ):
+        raise ChatBundleError(
+            "Snapshot media assets do not cover snapshot media objects"
+        )
     for row in snapshot_media_assets:
         if _text(row, "id") in active_media_asset_ids:
             raise ChatBundleError(

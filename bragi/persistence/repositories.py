@@ -80,8 +80,10 @@ from bragi.persistence.models import (
 from bragi.redaction import redact_text
 from bragi.safety import normalize_message_safety
 from bragi.text_search import (
+    MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS,
     cjk_lexical_anchors,
     structured_identifiers,
+    structured_identifiers_from_edges,
     unicode_word_terms,
 )
 from bragi.world_time_model import (
@@ -251,9 +253,9 @@ class PersistenceRepositories:
             deterministic=True,
         )
         self.connection.create_function(
-            "bragi_text_contains_all",
-            3,
-            _normalized_text_contains_all,
+            "bragi_text_match_score",
+            4,
+            _normalized_text_match_score,
             deterministic=True,
         )
         self._transaction_depth = 0
@@ -1010,7 +1012,7 @@ class PersistenceRepositories:
         if self.get_save(save_id) is None:
             return False
 
-        self.begin_transaction()
+        self.begin_immediate_transaction()
         try:
             for table_name in (
                 "media_assets",
@@ -3583,7 +3585,10 @@ class PersistenceRepositories:
         normalized_text_bytes += added_normalized_bytes
         if source_text_bytes > MAX_CONTEXT_SOURCE_TEXT_BYTES_PER_REBUILD:
             raise ValueError("Context source text is too large to rebuild")
-        if added_normalized_bytes > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD:
+        if (
+            added_normalized_bytes
+            > self.context_source_normalized_record_budget_limit(record.save_id)
+        ):
             raise ValueError("Normalized context source text is too large")
         allowed_normalized_bytes = self.context_source_normalized_budget_limit(
             record.save_id
@@ -3645,20 +3650,39 @@ class PersistenceRepositories:
         normalized_text_budget = self.context_source_normalized_budget_limit(
             save_id
         )
-        self.begin_transaction()
+        normalized_record_budget = (
+            self.context_source_normalized_record_budget_limit(save_id)
+        )
+        self.begin_immediate_transaction()
         try:
             indexed_rows = 0
             indexed_bytes = 0
             source_text_bytes = 0
             normalized_text_bytes = 0
             rows = self.connection.execute(
-                """
+                f"""
                 SELECT id, save_id, source_type, source_id,
                        substr(title, 1, 65536) AS title,
                        substr(body, 1, 65536) AS body,
                        metadata_json, token_estimate, scene_snapshot_id,
                        scene_generation, created_turn_number,
-                       expires_after_turn_number
+                       expires_after_turn_number,
+                       substr(
+                           title, 1,
+                           {MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+                       ) AS identifier_title_prefix,
+                       substr(
+                           title, -{MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+                       ) AS identifier_title_suffix,
+                       length(title) AS identifier_title_chars,
+                       substr(
+                           body, 1,
+                           {MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+                       ) AS identifier_body_prefix,
+                       substr(
+                           body, -{MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+                       ) AS identifier_body_suffix,
+                       length(body) AS identifier_body_chars
                 FROM context_sources
                 WHERE save_id = ? AND archived_at IS NULL
                 ORDER BY rowid
@@ -3668,9 +3692,13 @@ class PersistenceRepositories:
             for row in rows:
                 record = _context_source_from_row(row)
                 terms = _context_source_search_terms(record.title, record.body)
-                identifiers = _context_source_exact_identifiers(
-                    record.title,
-                    record.body,
+                identifiers = _context_source_exact_identifiers_from_edges(
+                    title_prefix=str(row["identifier_title_prefix"] or ""),
+                    title_suffix=str(row["identifier_title_suffix"] or ""),
+                    title_chars=int(row["identifier_title_chars"]),
+                    body_prefix=str(row["identifier_body_prefix"] or ""),
+                    body_suffix=str(row["identifier_body_suffix"] or ""),
+                    body_chars=int(row["identifier_body_chars"]),
                 )
                 added_source_bytes, added_normalized_bytes = (
                     _context_source_text_budget_usage(
@@ -3685,6 +3713,8 @@ class PersistenceRepositories:
                     normalized_text_bytes=normalized_text_bytes,
                     max_normalized_text_bytes=normalized_text_budget,
                 )
+                if added_normalized_bytes > normalized_record_budget:
+                    raise ValueError("Normalized context source text is too large")
                 indexed_rows += len(terms) + max(1, len(identifiers))
                 indexed_bytes += sum(
                     len(value.encode("utf-8"))
@@ -3722,6 +3752,21 @@ class PersistenceRepositories:
             current_bytes,
         )
 
+    def context_source_normalized_record_budget_limit(self, save_id: str) -> int:
+        row = self.connection.execute(
+            """
+            SELECT normalized_text_bytes
+            FROM context_source_legacy_record_budget_limits
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        ).fetchone()
+        current_bytes = int(row[0]) if row is not None else 0
+        return max(
+            MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD,
+            current_bytes,
+        )
+
     def copy_context_source_legacy_budget_limit(
         self,
         *,
@@ -3744,32 +3789,60 @@ class PersistenceRepositories:
             """,
             (target_save_id, source_save_id),
         )
-
-    def ensure_context_source_legacy_budget_limit(
-        self,
-        *,
-        save_id: str,
-        normalized_text_bytes: int,
-    ) -> None:
-        if (
-            normalized_text_bytes
-            <= MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
-        ):
-            return
         self.connection.execute(
             """
-            INSERT INTO context_source_legacy_budget_limits(
+            INSERT INTO context_source_legacy_record_budget_limits(
                 save_id, normalized_text_bytes
             )
-            VALUES (?, ?)
+            SELECT ?, normalized_text_bytes
+            FROM context_source_legacy_record_budget_limits
+            WHERE save_id = ?
             ON CONFLICT(save_id) DO UPDATE SET
                 normalized_text_bytes = MAX(
                     normalized_text_bytes,
                     excluded.normalized_text_bytes
                 )
             """,
-            (save_id, normalized_text_bytes),
+            (target_save_id, source_save_id),
         )
+
+    def ensure_context_source_legacy_budget_limit(
+        self,
+        *,
+        save_id: str,
+        normalized_text_bytes: int,
+        normalized_record_bytes: int = 0,
+    ) -> None:
+        if normalized_text_bytes > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD:
+            self.connection.execute(
+                """
+                INSERT INTO context_source_legacy_budget_limits(
+                    save_id, normalized_text_bytes
+                )
+                VALUES (?, ?)
+                ON CONFLICT(save_id) DO UPDATE SET
+                    normalized_text_bytes = MAX(
+                        normalized_text_bytes,
+                        excluded.normalized_text_bytes
+                    )
+                """,
+                (save_id, normalized_text_bytes),
+            )
+        if normalized_record_bytes > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD:
+            self.connection.execute(
+                """
+                INSERT INTO context_source_legacy_record_budget_limits(
+                    save_id, normalized_text_bytes
+                )
+                VALUES (?, ?)
+                ON CONFLICT(save_id) DO UPDATE SET
+                    normalized_text_bytes = MAX(
+                        normalized_text_bytes,
+                        excluded.normalized_text_bytes
+                    )
+                """,
+                (save_id, normalized_record_bytes),
+            )
 
     def get_context_source(self, context_source_id: str) -> ContextSourceRecord | None:
         row = self._fetch_one(
@@ -4026,9 +4099,20 @@ class PersistenceRepositories:
         indexed_terms = tuple(
             dict.fromkeys((*normalized_query_terms, *phrase_terms))
         )[:MAX_UNICODE_SUBSTRING_TERMS]
+        cjk_terms = tuple(
+            term
+            for term in indexed_terms
+            if term in cjk_lexical_anchors(term)
+        )
+        cjk_trigrams = tuple(term for term in cjk_terms if len(term) == 3)
         substring_scan_terms = (
-            indexed_terms
-            if any(cjk_lexical_anchors(term) for term in indexed_terms)
+            cjk_trigrams
+            or tuple(term for term in cjk_terms if len(term) == 2)
+            or cjk_terms
+        )
+        substring_required_terms = (
+            tuple(term for term in indexed_terms if term not in cjk_terms)
+            if match_all and not cjk_trigrams
             else ()
         )
         term_rows: list[sqlite3.Row] = []
@@ -4094,45 +4178,55 @@ class PersistenceRepositories:
         cjk_substring_rows = (
             self._fetch_all(
                 f"""
+                WITH matched AS MATERIALIZED (
+                    SELECT
+                        context_sources.*,
+                        context_sources.rowid AS source_rowid,
+                        bragi_text_match_score(
+                            context_sources.title,
+                            context_sources.body,
+                            ?,
+                            ?
+                        ) AS match_score
+                    FROM context_sources
+                    WHERE context_sources.save_id = ?
+                      AND context_sources.archived_at IS NULL
+                      AND context_sources.source_type IN (
+                          {_placeholders(len(source_type_values))}
+                      )
+                      {eligibility_sql}
+                )
                 SELECT
-                    context_sources.id,
-                    context_sources.save_id,
-                    context_sources.source_type,
-                    context_sources.source_id,
-                    context_sources.title,
-                    context_sources.body,
-                    context_sources.metadata_json,
-                    context_sources.token_estimate,
-                    context_sources.scene_snapshot_id,
-                    context_sources.scene_generation,
-                    context_sources.created_turn_number,
-                    context_sources.expires_after_turn_number,
-                    -900.0 AS bm25_rank
-                FROM context_sources
-                WHERE context_sources.save_id = ?
-                  AND context_sources.archived_at IS NULL
-                  AND context_sources.source_type IN (
-                      {_placeholders(len(source_type_values))}
-                  )
-                  {eligibility_sql}
-                  AND bragi_text_contains_all(
-                      context_sources.title,
-                      context_sources.body,
-                      ?
-                  ) = 1
-                ORDER BY context_sources.created_at DESC,
-                         context_sources.rowid DESC
+                    matched.id,
+                    matched.save_id,
+                    matched.source_type,
+                    matched.source_id,
+                    matched.title,
+                    matched.body,
+                    matched.metadata_json,
+                    matched.token_estimate,
+                    matched.scene_snapshot_id,
+                    matched.scene_generation,
+                    matched.created_turn_number,
+                    matched.expires_after_turn_number,
+                    -900.0 - matched.match_score AS bm25_rank
+                FROM matched
+                WHERE matched.match_score > 0
+                ORDER BY matched.match_score DESC,
+                         matched.created_at DESC,
+                         matched.source_rowid DESC
                 LIMIT ?
                 """,
                 (
+                    _dump_json(substring_scan_terms),
+                    _dump_json(substring_required_terms),
                     save_id,
                     *source_type_values,
                     *eligibility_params,
-                    _dump_json(substring_scan_terms),
                     limit,
                 ),
             )
-            if match_all and substring_scan_terms
+            if substring_scan_terms
             else []
         )
         exact_identifier_rows = (
@@ -4461,7 +4555,7 @@ class PersistenceRepositories:
     ) -> None:
         if not context_source_ids:
             return
-        self.begin_transaction()
+        self.begin_immediate_transaction()
         try:
             rows = self._fetch_all(
                 f"""
@@ -13749,19 +13843,23 @@ def _normalized_search_text(value: object) -> str:
     return unicodedata.normalize("NFKC", str(value)).casefold()
 
 
-def _normalized_text_contains_all(
+def _normalized_text_match_score(
     title: object,
     body: object,
     terms_json: object,
+    required_terms_json: object,
 ) -> int:
     try:
         terms_payload = json.loads(str(terms_json))
+        required_terms_payload = json.loads(str(required_terms_json))
     except (TypeError, ValueError):
         return 0
     if (
         not isinstance(terms_payload, list)
         or not terms_payload
         or len(terms_payload) > MAX_UNICODE_SUBSTRING_TERMS
+        or not isinstance(required_terms_payload, list)
+        or len(required_terms_payload) > MAX_UNICODE_SUBSTRING_TERMS
     ):
         return 0
     terms = tuple(
@@ -13770,16 +13868,28 @@ def _normalized_text_contains_all(
     )
     if any(not term for term in terms):
         return 0
+    required_terms = tuple(
+        unicodedata.normalize("NFKC", str(term)[:512]).casefold()
+        for term in required_terms_payload
+    )
+    if any(not term for term in required_terms):
+        return 0
     normalized_title = _normalized_search_text(
         str(title)[:MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
     )
     normalized_body = _normalized_search_text(
         str(body)[:MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS]
     )
-    return int(
-        all(
+    if not all(
+        term in normalized_title or term in normalized_body
+        for term in required_terms
+    ):
+        return 0
+    return sum(
+        1
+        for term in terms
+        if (
             term in normalized_title or term in normalized_body
-            for term in terms
         )
     )
 
@@ -13841,17 +13951,57 @@ def _context_source_exact_identifiers(
     )
 
 
+def _context_source_exact_identifiers_from_edges(
+    *,
+    title_prefix: str,
+    title_suffix: str,
+    title_chars: int,
+    body_prefix: str,
+    body_suffix: str,
+    body_chars: int,
+) -> tuple[str, ...]:
+    identifiers = tuple(
+        dict.fromkeys(
+            (
+                *structured_identifiers_from_edges(
+                    title_prefix,
+                    title_suffix,
+                    total_chars=title_chars,
+                    max_identifiers=MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS,
+                ),
+                *structured_identifiers_from_edges(
+                    body_prefix,
+                    body_suffix,
+                    total_chars=body_chars,
+                    max_identifiers=MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS,
+                ),
+            )
+        )
+    )
+    if len(identifiers) <= MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS:
+        return identifiers
+    edge_count = MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS // 2
+    return (
+        *identifiers[:edge_count],
+        *identifiers[-edge_count:],
+    )
+
+
 def validate_context_source_index_budget(
     rows: Iterable[Mapping[str, object]],
     *,
     max_normalized_text_bytes: int = (
         MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
     ),
-) -> int:
+    max_normalized_record_bytes: int = (
+        MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD
+    ),
+) -> tuple[int, int]:
     indexed_rows = 0
     indexed_bytes = 0
     source_text_bytes = 0
     normalized_text_bytes = 0
+    normalized_record_bytes = 0
     for row in rows:
         title = str(row.get("title") or "")
         body = str(row.get("body") or "")
@@ -13860,6 +14010,12 @@ def validate_context_source_index_budget(
         )
         source_text_bytes += added_source_bytes
         normalized_text_bytes += added_normalized_bytes
+        normalized_record_bytes = max(
+            normalized_record_bytes,
+            added_normalized_bytes,
+        )
+        if normalized_record_bytes > max_normalized_record_bytes:
+            raise ValueError("Normalized context source text is too large")
         _raise_if_context_source_text_budget_exceeded(
             source_text_bytes=source_text_bytes,
             normalized_text_bytes=normalized_text_bytes,
@@ -13877,7 +14033,7 @@ def validate_context_source_index_budget(
             raise ValueError("Context source index is too large to rebuild")
         if indexed_bytes > MAX_CONTEXT_INDEX_BYTES_PER_REBUILD:
             raise ValueError("Context source index text is too large to rebuild")
-    return normalized_text_bytes
+    return normalized_text_bytes, normalized_record_bytes
 
 
 def _context_source_text_budget_usage(

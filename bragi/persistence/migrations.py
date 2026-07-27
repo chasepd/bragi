@@ -15,8 +15,10 @@ from bragi.observation_types import normalize_observation_type
 from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.private_files import ensure_private_file
 from bragi.text_search import (
+    MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS,
     cjk_lexical_anchors,
     structured_identifiers,
+    structured_identifiers_from_edges,
     unicode_word_terms,
 )
 
@@ -24,6 +26,7 @@ CURRENT_SCHEMA_VERSION = 72
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
+_MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD = 4 * 1024 * 1024
 _MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
 _MAX_MEMORY_PROVENANCE_IDS = 64
 
@@ -4355,6 +4358,11 @@ def _ensure_context_source_search_terms_schema(
             normalized_text_bytes INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS context_source_legacy_record_budget_limits (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            normalized_text_bytes INTEGER NOT NULL
+        );
+
         CREATE TABLE context_source_normalized_budget_entries (
             context_source_id TEXT PRIMARY KEY
                 REFERENCES context_sources(id) ON DELETE CASCADE,
@@ -4616,24 +4624,30 @@ def _ensure_context_source_search_terms_schema(
             )
         """
     )
-    lexical_term_index_complete = connection.execute(
+    connection.execute(
         """
-        SELECT 1
-        FROM context_source_search_index_state
-        WHERE key = 'lexical_terms_complete_v2'
-        """
-    ).fetchone()
-    if lexical_term_index_complete is None:
-        connection.execute("DELETE FROM context_source_search_terms")
+        INSERT INTO context_source_legacy_record_budget_limits(
+            save_id, normalized_text_bytes
+        )
+        SELECT save_id, MAX(normalized_text_bytes)
+        FROM context_source_normalized_budget_entries
+        GROUP BY save_id
+        HAVING MAX(normalized_text_bytes) > ?
+        ON CONFLICT(save_id) DO UPDATE SET
+            normalized_text_bytes = MAX(
+                normalized_text_bytes,
+                excluded.normalized_text_bytes
+            )
+        """,
+        (_MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD,),
+    )
     exact_identifier_index_complete = connection.execute(
         """
         SELECT 1
         FROM context_source_search_index_state
-        WHERE key = 'exact_identifiers_complete_v3'
+        WHERE key = 'exact_identifiers_complete_v2'
         """
     ).fetchone()
-    if exact_identifier_index_complete is None:
-        connection.execute("DELETE FROM context_source_exact_identifiers")
     missing_rows = connection.execute(
         """
         SELECT source.id, source.save_id,
@@ -4666,10 +4680,26 @@ def _ensure_context_source_search_terms_schema(
             ((str(source_id), str(save_id), term) for term in terms),
         )
     missing_identifier_rows = connection.execute(
-        """
+        f"""
         SELECT source.id, source.save_id,
-               substr(source.title, 1, 65536),
-               substr(source.body, 1, 65536)
+               substr(
+                   source.title, 1,
+                   {MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+               ),
+               substr(
+                   source.title,
+                   -{MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+               ),
+               length(source.title),
+               substr(
+                   source.body, 1,
+                   {MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+               ),
+               substr(
+                   source.body,
+                   -{MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS}
+               ),
+               length(source.body)
         FROM context_sources source
         WHERE source.archived_at IS NULL
           AND (
@@ -4684,10 +4714,23 @@ def _ensure_context_source_search_terms_schema(
         """,
         (int(exact_identifier_index_complete is None),),
     )
-    for source_id, save_id, title, body in missing_identifier_rows:
-        identifiers = _migration_context_source_exact_identifiers(
-            str(title or ""),
-            str(body or ""),
+    for (
+        source_id,
+        save_id,
+        title_prefix,
+        title_suffix,
+        title_chars,
+        body_prefix,
+        body_suffix,
+        body_chars,
+    ) in missing_identifier_rows:
+        identifiers = _migration_context_source_exact_identifiers_from_edges(
+            title_prefix=str(title_prefix or ""),
+            title_suffix=str(title_suffix or ""),
+            title_chars=int(title_chars),
+            body_prefix=str(body_prefix or ""),
+            body_suffix=str(body_suffix or ""),
+            body_chars=int(body_chars),
         )
         connection.executemany(
             """
@@ -4706,13 +4749,7 @@ def _ensure_context_source_search_terms_schema(
     connection.execute(
         """
         INSERT OR REPLACE INTO context_source_search_index_state(key, value)
-        VALUES ('lexical_terms_complete_v2', '1')
-        """
-    )
-    connection.execute(
-        """
-        INSERT OR REPLACE INTO context_source_search_index_state(key, value)
-        VALUES ('exact_identifiers_complete_v3', '1')
+        VALUES ('exact_identifiers_complete_v2', '1')
         """
     )
 
@@ -4747,6 +4784,42 @@ def _migration_context_source_exact_identifiers(
                 *structured_identifiers(
                     body,
                     max_input_chars=_MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS,
+                    max_identifiers=_MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS,
+                ),
+            )
+        )
+    )
+    if len(identifiers) <= _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS:
+        return identifiers
+    edge_count = _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS // 2
+    return (
+        *identifiers[:edge_count],
+        *identifiers[-edge_count:],
+    )
+
+
+def _migration_context_source_exact_identifiers_from_edges(
+    *,
+    title_prefix: str,
+    title_suffix: str,
+    title_chars: int,
+    body_prefix: str,
+    body_suffix: str,
+    body_chars: int,
+) -> tuple[str, ...]:
+    identifiers = tuple(
+        dict.fromkeys(
+            (
+                *structured_identifiers_from_edges(
+                    title_prefix,
+                    title_suffix,
+                    total_chars=title_chars,
+                    max_identifiers=_MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS,
+                ),
+                *structured_identifiers_from_edges(
+                    body_prefix,
+                    body_suffix,
+                    total_chars=body_chars,
                     max_identifiers=_MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS,
                 ),
             )
