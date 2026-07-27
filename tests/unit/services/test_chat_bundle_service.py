@@ -196,6 +196,21 @@ def test_bundle_json_decode_stops_at_primitive_value_budget(
         )
 
 
+def test_bundle_validation_stops_at_nested_json_value_budget() -> None:
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="nested JSON",
+    ):
+        chat_bundle_module._validate_bundle_nested_json(
+            {
+                "state_changes": [
+                    {"before_json": json.dumps([0] * 20)}
+                ]
+            },
+            json_node_budget=[10],
+        )
+
+
 def test_import_context_sources_keep_legacy_provenance_alternatives() -> None:
     [source] = _coalesce_import_context_sources(
         [
@@ -225,6 +240,41 @@ def test_import_context_sources_keep_legacy_provenance_alternatives() -> None:
         ["message-hidden"],
         ["message-visible"],
     ]
+
+
+def test_import_context_sources_reject_conflicting_body_provenance() -> None:
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="Conflicting context sources",
+    ):
+        _coalesce_import_context_sources(
+            [
+                {
+                    "id": "source-hidden",
+                    "save_id": "target-save",
+                    "source_type": "memory",
+                    "source_id": "merged-memory",
+                    "title": "Secret",
+                    "body": "The hidden vault code is AMBER-77.",
+                    "metadata_json": (
+                        '{"source_message_ids":["message-hidden"]}'
+                    ),
+                    "archived_at": None,
+                },
+                {
+                    "id": "source-visible",
+                    "save_id": "target-save",
+                    "source_type": "memory",
+                    "source_id": "merged-memory",
+                    "title": "Harmless",
+                    "body": "The lamps are lit.",
+                    "metadata_json": (
+                        '{"source_message_ids":["message-visible"]}'
+                    ),
+                    "archived_at": None,
+                },
+            ]
+        )
 
 
 def test_import_proactive_triggers_coalesce_and_remap_schema_keys() -> None:
@@ -447,6 +497,36 @@ def test_export_save_writes_manifest_data_and_referenced_media(
         assert curation_state["terminal_outcome"] == "accepted"
         assert curation_state["lease_token"] is None
         assert curation_state["lease_until"] is None
+
+
+def test_export_rejects_snapshot_that_cannot_be_imported(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    bundle_path = tmp_path / "exports" / "oversized.bragi-chat"
+
+    def reject_snapshot_rows(**_kwargs: object) -> None:
+        raise ValueError("Snapshot manifest contains too many entries")
+
+    monkeypatch.setattr(
+        TurnSnapshotService,
+        "validate_exported_snapshot_rows",
+        staticmethod(reject_snapshot_rows),
+    )
+
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="too many entries",
+    ):
+        _chat_bundle_service(repositories, media_dir).export_save(
+            save.id,
+            bundle_path,
+        )
+
+    assert not bundle_path.exists()
 
 
 def test_export_save_refunds_live_curation_attempt_when_clearing_lease(

@@ -81,8 +81,6 @@ from bragi.redaction import redact_text
 from bragi.safety import normalize_message_safety
 from bragi.text_search import (
     cjk_lexical_anchors,
-    identifier_filter_matches,
-    structured_identifier_filter,
     structured_identifiers,
     unicode_word_terms,
 )
@@ -108,9 +106,8 @@ MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
-MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 128
-MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 3_000_000
-MAX_CONTEXT_INDEX_TEXT_CHARS_PER_REBUILD = 32 * 1024 * 1024
+MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
+MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 250_000
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
@@ -247,12 +244,6 @@ class PersistenceRepositories:
             "bragi_normalize_text",
             1,
             _normalized_search_text,
-            deterministic=True,
-        )
-        self.connection.create_function(
-            "bragi_identifier_filter_matches",
-            2,
-            identifier_filter_matches,
             deterministic=True,
         )
         self._transaction_depth = 0
@@ -1261,6 +1252,23 @@ class PersistenceRepositories:
         )
         self.connection.execute(
             "DELETE FROM continuity_index_dirty_sources WHERE save_id = ?",
+            (save_id,),
+        )
+
+    def require_continuity_index_full_rebuild(self, save_id: str) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO save_continuity_index_revisions(
+                save_id,
+                revision,
+                indexed_revision,
+                updated_at
+            )
+            VALUES (?, 0, -1, CURRENT_TIMESTAMP)
+            ON CONFLICT(save_id) DO UPDATE SET
+                indexed_revision = -1,
+                updated_at = CURRENT_TIMESTAMP
+            """,
             (save_id,),
         )
 
@@ -3440,24 +3448,6 @@ class PersistenceRepositories:
         )
         self.connection.execute(
             """
-            INSERT INTO context_source_exact_identifier_filters(
-                context_source_id,
-                save_id,
-                identifiers_blob
-            )
-            VALUES (?, ?, ?)
-            ON CONFLICT(context_source_id) DO UPDATE SET
-                save_id = excluded.save_id,
-                identifiers_blob = excluded.identifiers_blob
-            """,
-            (
-                record.id,
-                record.save_id,
-                structured_identifier_filter(record.title, record.body),
-            ),
-        )
-        self.connection.execute(
-            """
             DELETE FROM context_source_exact_identifiers
             WHERE context_source_id = ?
             """,
@@ -3484,24 +3474,14 @@ class PersistenceRepositories:
         )
 
     def rebuild_context_source_search_terms(self, save_id: str) -> None:
-        total_text_chars = int(
-            self.connection.execute(
-                """
-                SELECT COALESCE(SUM(LENGTH(title) + LENGTH(body)), 0)
-                FROM context_sources
-                WHERE save_id = ? AND archived_at IS NULL
-                """,
-                (save_id,),
-            ).fetchone()[0]
-        )
-        if total_text_chars > MAX_CONTEXT_INDEX_TEXT_CHARS_PER_REBUILD:
-            raise ValueError("Context source text is too large to index")
         self.begin_transaction()
         try:
             indexed_rows = 0
             rows = self.connection.execute(
                 """
-                SELECT id, save_id, source_type, source_id, title, body,
+                SELECT id, save_id, source_type, source_id,
+                       substr(title, 1, 65536) AS title,
+                       substr(body, 1, 65536) AS body,
                        metadata_json, token_estimate, scene_snapshot_id,
                        scene_generation, created_turn_number,
                        expires_after_turn_number
@@ -3850,17 +3830,15 @@ class PersistenceRepositories:
             self._fetch_all(
                 f"""
                 WITH ranked_ids AS (
-                    SELECT context_sources.id
-                    FROM context_source_exact_identifier_filters
-                         exact_identifier_filter
+                    SELECT DISTINCT context_sources.id
+                    FROM context_source_exact_identifiers exact_identifier
                     JOIN context_sources
                       ON context_sources.id =
-                         exact_identifier_filter.context_source_id
-                    WHERE exact_identifier_filter.save_id = ?
-                      AND bragi_identifier_filter_matches(
-                          exact_identifier_filter.identifiers_blob,
-                          ?
-                      ) = 1
+                         exact_identifier.context_source_id
+                    WHERE exact_identifier.save_id = ?
+                      AND exact_identifier.identifier IN (
+                          SELECT CAST(value AS TEXT) FROM json_each(?)
+                      )
                       AND context_sources.archived_at IS NULL
                       AND context_sources.source_type IN (
                           {_placeholders(len(source_type_values))}
@@ -13464,10 +13442,12 @@ def _context_source_exact_identifiers(
                 *structured_identifiers(
                     title,
                     max_input_chars=MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS,
+                    max_identifiers=MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS,
                 ),
                 *structured_identifiers(
                     body,
                     max_input_chars=MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS,
+                    max_identifiers=MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS,
                 ),
             )
         )
@@ -13479,6 +13459,20 @@ def _context_source_exact_identifiers(
         *identifiers[:edge_count],
         *identifiers[-edge_count:],
     )
+
+
+def validate_context_source_index_budget(
+    rows: Iterable[Mapping[str, object]],
+) -> None:
+    indexed_rows = 0
+    for row in rows:
+        title = str(row.get("title") or "")
+        body = str(row.get("body") or "")
+        terms = _context_source_search_terms(title, body)
+        identifiers = _context_source_exact_identifiers(title, body)
+        indexed_rows += len(terms) + max(1, len(identifiers))
+        if indexed_rows > MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
+            raise ValueError("Context source index is too large to rebuild")
 
 
 def _validate_context_source_provenance_metadata(

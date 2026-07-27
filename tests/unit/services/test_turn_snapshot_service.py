@@ -195,6 +195,131 @@ def test_snapshot_validation_bounds_unique_manifest_reference_work(
         )
 
 
+def test_snapshot_validation_bounds_aggregate_json_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        turn_snapshot_module,
+        "_MAX_SNAPSHOT_TOTAL_JSON_NODES",
+        30,
+    )
+    objects: dict[str, dict[str, object]] = {}
+    row_hashes = [
+        turn_snapshot_module._add_snapshot_object_export(
+            objects,
+            kind="row:messages",
+            value={"id": f"message-{index}", "values": [0] * 10},
+            created_at=None,
+        )
+        for index in range(2)
+    ]
+    manifest_hash = turn_snapshot_module._add_snapshot_object_export(
+        objects,
+        kind="snapshot_manifest",
+        value={
+            "format": turn_snapshot_module.SNAPSHOT_FORMAT,
+            "tables": {
+                "messages": [
+                    {"id": f"message-{index}", "object_hash": row_hash}
+                    for index, row_hash in enumerate(row_hashes)
+                ]
+            },
+        },
+        created_at=None,
+    )
+
+    with pytest.raises(ValueError, match="Invalid snapshot object payload"):
+        turn_snapshot_module._validate_exported_snapshot_rows(
+            [{"id": "snapshot-one", "root_manifest_hash": manifest_hash}],
+            objects.values(),
+        )
+
+
+def test_snapshot_validation_charges_distinct_manifest_permutations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        turn_snapshot_module,
+        "_MAX_SNAPSHOT_IMPORT_REFERENCE_WORK",
+        3,
+    )
+    objects: dict[str, dict[str, object]] = {}
+    row_hashes = [
+        turn_snapshot_module._add_snapshot_object_export(
+            objects,
+            kind="row:messages",
+            value={"id": f"message-{index}"},
+            created_at=None,
+        )
+        for index in range(2)
+    ]
+    manifest_hashes = [
+        turn_snapshot_module._add_snapshot_object_export(
+            objects,
+            kind="snapshot_manifest",
+            value={
+                "format": turn_snapshot_module.SNAPSHOT_FORMAT,
+                "tables": {
+                    "messages": [
+                        {
+                            "id": f"message-{index}",
+                            "object_hash": row_hashes[index],
+                        }
+                        for index in order
+                    ]
+                },
+            },
+            created_at=None,
+        )
+        for order in ((0, 1), (1, 0))
+    ]
+
+    with pytest.raises(ValueError, match="too many row references"):
+        turn_snapshot_module._validate_exported_snapshot_rows(
+            [
+                {"id": f"snapshot-{index}", "root_manifest_hash": manifest_hash}
+                for index, manifest_hash in enumerate(manifest_hashes)
+            ],
+            objects.values(),
+        )
+
+
+def test_snapshot_validation_bounds_nested_json_string_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        turn_snapshot_module,
+        "_MAX_SNAPSHOT_TOTAL_JSON_NODES",
+        80,
+    )
+    objects: dict[str, dict[str, object]] = {}
+    row_hash = turn_snapshot_module._add_snapshot_object_export(
+        objects,
+        kind="row:state_changes",
+        value={"id": "change-one", "before_json": json.dumps([0] * 100)},
+        created_at=None,
+    )
+    manifest_hash = turn_snapshot_module._add_snapshot_object_export(
+        objects,
+        kind="snapshot_manifest",
+        value={
+            "format": turn_snapshot_module.SNAPSHOT_FORMAT,
+            "tables": {
+                "state_changes": [
+                    {"id": "change-one", "object_hash": row_hash}
+                ]
+            },
+        },
+        created_at=None,
+    )
+
+    with pytest.raises(ValueError, match="Invalid snapshot nested JSON"):
+        turn_snapshot_module._validate_exported_snapshot_rows(
+            [{"id": "snapshot-one", "root_manifest_hash": manifest_hash}],
+            objects.values(),
+        )
+
+
 def test_snapshot_validation_rejects_duplicate_row_object_references() -> None:
     objects: dict[str, dict[str, object]] = {}
     row_hash = turn_snapshot_module._add_snapshot_object_export(
@@ -253,6 +378,7 @@ def test_snapshot_trigger_key_remapping_is_schema_aware() -> None:
         rows_by_table={},
         id_maps={
             "messages": {"message-old": "message-new"},
+            "character_text_messages": {"text-old": "text-new"},
             "characters": {"character-old": "character-new"},
             "locations": {"location-old": "location-new"},
             "scenarios": {"scenario-old": "scenario-new"},
@@ -426,6 +552,16 @@ def test_snapshot_json_remapping_updates_known_context_and_media_references() ->
             "metadata_json": "{}",
         },
     )
+    multi_message_context = remapper.remap_row(
+        "context_sources",
+        {
+            "id": "messages-context-old",
+            "save_id": "save-old",
+            "source_type": "messages",
+            "source_id": "message-old, character_text_message:text-old",
+            "metadata_json": "{}",
+        },
+    )
 
     assert context_source["source_id"] == "observation-new"
     assert json.loads(str(context_source["metadata_json"]))["observation_id"] == (
@@ -452,6 +588,9 @@ def test_snapshot_json_remapping_updates_known_context_and_media_references() ->
         "scenario-new"
     )
     assert message_context["source_id"] == "message-new"
+    assert multi_message_context["source_id"] == (
+        "message-new,character_text_message:text-new"
+    )
     media_metadata = json.loads(str(media["metadata_json"]))
     assert media_metadata == {
         "request_source_message_id": "text-new",
@@ -528,6 +667,39 @@ def test_snapshot_context_merge_does_not_broaden_selected_body_audience() -> Non
     )
 
     assert merged["audience_character_ids"] == ["character-a"]
+
+
+def test_snapshot_context_merge_rejects_conflicting_body_provenance() -> None:
+    with pytest.raises(ValueError, match="Conflicting context sources"):
+        turn_snapshot_module._coalesce_remapped_snapshot_rows(
+            "context_sources",
+            [
+                {
+                    "id": "source-hidden",
+                    "save_id": "save-one",
+                    "source_type": "memory",
+                    "source_id": "memory-one",
+                    "title": "Secret",
+                    "body": "The hidden vault code is AMBER-77.",
+                    "metadata_json": json.dumps(
+                        {"source_message_ids": ["message-hidden"]}
+                    ),
+                    "archived_at": None,
+                },
+                {
+                    "id": "source-visible",
+                    "save_id": "save-one",
+                    "source_type": "memory",
+                    "source_id": "memory-one",
+                    "title": "Harmless",
+                    "body": "The lamps are lit.",
+                    "metadata_json": json.dumps(
+                        {"source_message_ids": ["message-visible"]}
+                    ),
+                    "archived_at": None,
+                },
+            ],
+        )
 
 
 def test_legacy_memory_normalization_preserves_other_id_namespaces() -> None:
@@ -882,6 +1054,7 @@ def test_legacy_duplicate_memories_restore_and_fork_after_unique_index_repair(
     repositories.connection.commit()
 
     service.restore_save_to_snapshot(save_id=save.id, snapshot_id=snapshot.id)
+    assert repositories.continuity_index_requires_full_rebuild(save.id)
     restored = repositories.list_memories(save.id)
     fork = service.fork_snapshot_to_save(
         source_save_id=save.id,

@@ -12,7 +12,7 @@ def validate_json_structure(
     *,
     max_nodes: int,
     max_depth: int,
-) -> None:
+) -> int:
     """Bound non-string JSON separators before materializing Python objects."""
     nodes = 1
     depth = 0
@@ -40,3 +40,4 @@ def validate_json_structure(
             nodes += 1
         if nodes > max_nodes:
             raise JsonSafetyError("JSON contains too many values")
+    return nodes

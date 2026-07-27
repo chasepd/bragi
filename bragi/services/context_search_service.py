@@ -1037,6 +1037,16 @@ def _rehydrate_selected_context(
         for source in selected_context_sources
         for source_id in _context_source_message_ids(source)
     }
+    selected_source_message_ids.update(
+        source_id
+        for edge in selected_knowledge_edges
+        for source_id in edge.source_message_ids
+    )
+    selected_source_message_ids.update(
+        link.source_message_id
+        for link in selected_entity_links
+        if link.source_message_id
+    )
     selected_message_visibility = tuple(
         repositories.list_message_visibility(
             save_id,

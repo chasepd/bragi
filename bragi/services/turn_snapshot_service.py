@@ -54,6 +54,7 @@ _MAX_SNAPSHOT_MANIFEST_ENTRIES = 10_000
 _MAX_SNAPSHOT_IMPORT_REFERENCE_WORK = 50_000
 _MAX_SNAPSHOT_IMPORT_REFERENCED_BYTES = 128 * 1024 * 1024
 _MAX_SNAPSHOT_OBJECT_JSON_NODES = 100_000
+_MAX_SNAPSHOT_TOTAL_JSON_NODES = 2_000_000
 _MAX_SNAPSHOT_OBJECT_JSON_DEPTH = 128
 SNAPSHOT_ENCODING = "zlib-json-v1"
 
@@ -546,6 +547,7 @@ class TurnSnapshotService:
                 save_id=save_id
             )
             self.repositories.ensure_context_observation_curation_states(save_id)
+            self.repositories.require_continuity_index_full_rebuild(save_id)
             _remove_snapshot_safety_transition_records(
                 self.repositories.connection,
                 save_id=save_id,
@@ -1587,8 +1589,17 @@ class _SnapshotRemapper:
     ) -> object:
         if not isinstance(value, str) or source_type is None:
             return value
+        if source_type in {"message", "messages"}:
+            source_refs = [
+                source_ref.strip()
+                for source_ref in value.split(",")
+                if source_ref.strip()
+            ]
+            return ",".join(
+                str(self._mapped_source_ref(source_ref))
+                for source_ref in source_refs
+            )
         direct_tables = {
-            "message": "messages",
             "character_voice": "characters",
             "open_obligation": "active_threads",
             "character_text_thread": "character_text_threads",
@@ -2887,6 +2898,17 @@ def _decode_exported_object(row: Mapping[str, object]) -> object:
 
 
 def _decode_exported_snapshot_object(row: Mapping[str, object]) -> tuple[str, object]:
+    kind, value, _node_count = _decode_exported_snapshot_object_with_node_count(
+        row,
+    )
+    return kind, value
+
+
+def _decode_exported_snapshot_object_with_node_count(
+    row: Mapping[str, object],
+    *,
+    max_json_nodes: int = _MAX_SNAPSHOT_OBJECT_JSON_NODES,
+) -> tuple[str, object, int]:
     object_hash = _text(row, "object_hash")
     kind = _text(row, "kind")
     encoding = _text(row, "encoding")
@@ -2909,9 +2931,9 @@ def _decode_exported_snapshot_object(row: Mapping[str, object]) -> tuple[str, ob
         ):
             raise ValueError(f"Snapshot object size mismatch: {object_hash}")
         payload += decompressor.flush()
-        validate_json_structure(
+        node_count = validate_json_structure(
             payload,
-            max_nodes=_MAX_SNAPSHOT_OBJECT_JSON_NODES,
+            max_nodes=min(_MAX_SNAPSHOT_OBJECT_JSON_NODES, max_json_nodes),
             max_depth=_MAX_SNAPSHOT_OBJECT_JSON_DEPTH,
         )
         value = json.loads(payload.decode("utf-8"))
@@ -2928,7 +2950,7 @@ def _decode_exported_snapshot_object(row: Mapping[str, object]) -> tuple[str, ob
     actual_hash = _snapshot_object_hash(kind=kind, payload=payload)
     if actual_hash != object_hash:
         raise ValueError(f"Snapshot object hash mismatch: {object_hash}")
-    return kind, value
+    return kind, value, node_count
 
 
 def _validate_exported_snapshot_rows(
@@ -2948,6 +2970,8 @@ def _validate_exported_snapshot_rows(
 
     raw_objects_by_hash: dict[str, dict[str, object]] = {}
     objects_by_hash: dict[str, tuple[str, object]] = {}
+    json_node_budget = [_MAX_SNAPSHOT_TOTAL_JSON_NODES]
+    validated_nested_json: set[str] = set()
     object_sizes_by_hash: dict[str, int] = {}
     total_uncompressed_size = 0
     for object_row in object_rows:
@@ -2964,6 +2988,7 @@ def _validate_exported_snapshot_rows(
         object_sizes_by_hash[object_hash] = declared_size
 
     total_referenced_bytes = 0
+    total_manifest_reference_work = 0
     validated_table_signatures: set[str] = set()
     referenced_object_hashes: set[str] = set()
     unique_referenced_row_hashes: set[str] = set()
@@ -2977,6 +3002,7 @@ def _validate_exported_snapshot_rows(
             objects_by_hash,
             root_hash,
             expected_kind="snapshot_manifest",
+            json_node_budget=json_node_budget,
         )
         if (
             not isinstance(manifest, Mapping)
@@ -3030,16 +3056,32 @@ def _validate_exported_snapshot_rows(
                         raise ValueError(
                             "Snapshot manifests reference too much row data"
                         )
+                total_manifest_reference_work += 1
+                if (
+                    total_manifest_reference_work
+                    > _MAX_SNAPSHOT_IMPORT_REFERENCE_WORK
+                ):
+                    raise ValueError(
+                        "Snapshot manifests contain too many row references"
+                    )
                 value = _required_decoded_exported_snapshot_object(
                     raw_objects_by_hash,
                     objects_by_hash,
                     object_hash,
                     expected_kind=f"row:{table_name}",
+                    json_node_budget=json_node_budget,
                 )
                 if not isinstance(value, Mapping):
                     raise ValueError(
                         f"Snapshot row object is not a row: {object_hash}"
                     )
+                _validate_snapshot_nested_json_columns(
+                    table_name,
+                    value,
+                    json_node_budget=json_node_budget,
+                    validated_nested_json=validated_nested_json,
+                    object_hash=object_hash,
+                )
     unreferenced_hashes = set(raw_objects_by_hash) - referenced_object_hashes
     if unreferenced_hashes:
         raise ValueError("Snapshot bundle contains unreferenced objects")
@@ -3075,20 +3117,62 @@ def _required_decoded_exported_snapshot_object(
     object_hash: str,
     *,
     expected_kind: str,
+    json_node_budget: list[int] | None = None,
 ) -> object:
     if object_hash not in decoded_objects_by_hash:
         try:
             raw_row = raw_objects_by_hash[object_hash]
         except KeyError as exc:
             raise ValueError(f"Missing snapshot object: {object_hash}") from exc
-        decoded_objects_by_hash[object_hash] = (
-            _decode_exported_snapshot_object(raw_row)
+        remaining_nodes = _MAX_SNAPSHOT_OBJECT_JSON_NODES
+        if json_node_budget is not None:
+            remaining_nodes = json_node_budget[0]
+            if remaining_nodes <= 0:
+                raise ValueError("Snapshot JSON contains too many values")
+        kind, value, node_count = _decode_exported_snapshot_object_with_node_count(
+            raw_row,
+            max_json_nodes=remaining_nodes,
         )
+        decoded_objects_by_hash[object_hash] = (kind, value)
+        if json_node_budget is not None:
+            json_node_budget[0] -= node_count
     return _required_exported_snapshot_object(
         decoded_objects_by_hash,
         object_hash,
         expected_kind=expected_kind,
     )
+
+
+def _validate_snapshot_nested_json_columns(
+    table_name: str,
+    value: Mapping[str, object],
+    *,
+    json_node_budget: list[int],
+    validated_nested_json: set[str],
+    object_hash: str,
+) -> None:
+    for column in _JSON_COLUMNS_BY_TABLE.get(table_name, frozenset()):
+        raw_json = value.get(column)
+        if not isinstance(raw_json, str):
+            continue
+        budget_key = f"nested:{object_hash}:{column}"
+        if budget_key in validated_nested_json:
+            continue
+        remaining_nodes = json_node_budget[0]
+        if remaining_nodes <= 0:
+            raise ValueError("Snapshot JSON contains too many values")
+        try:
+            node_count = validate_json_structure(
+                raw_json.encode("utf-8"),
+                max_nodes=remaining_nodes,
+                max_depth=_MAX_SNAPSHOT_OBJECT_JSON_DEPTH,
+            )
+        except JsonSafetyError as exc:
+            raise ValueError(
+                f"Invalid snapshot nested JSON: {table_name}.{column}"
+            ) from exc
+        json_node_budget[0] -= node_count
+        validated_nested_json.add(budget_key)
 
 
 def _required_exported_snapshot_object(
@@ -3138,6 +3222,8 @@ def _snapshot_object_hash(*, kind: str, payload: bytes) -> str:
 def _coalesce_remapped_snapshot_rows(
     table_name: str,
     rows: list[dict[str, object]],
+    *,
+    reject_context_conflicts: bool = True,
 ) -> list[dict[str, object]]:
     coalesced: dict[tuple[object, ...], dict[str, object]] = {}
     for row in rows:
@@ -3161,7 +3247,11 @@ def _coalesce_remapped_snapshot_rows(
         if table_name == "memories":
             _merge_snapshot_memory_rows(existing, row)
         elif table_name == "context_sources":
-            _merge_snapshot_context_source_rows(existing, row)
+            _merge_snapshot_context_source_rows(
+                existing,
+                row,
+                reject_conflict=reject_context_conflicts,
+            )
         elif table_name == "character_knowledge_edges":
             _merge_snapshot_knowledge_edge_rows(existing, row)
         elif table_name == "entity_links":
@@ -3215,6 +3305,7 @@ def _normalize_legacy_snapshot_memories(
             rows[table_name] = _coalesce_remapped_snapshot_rows(
                 table_name,
                 table_rows,
+                reject_context_conflicts=False,
             )
     return {
         table_name: tuple(table_rows)
@@ -3418,6 +3509,8 @@ def _merge_snapshot_proactive_trigger_rows(
 def _merge_snapshot_context_source_rows(
     existing: dict[str, object],
     incoming: Mapping[str, object],
+    *,
+    reject_conflict: bool = True,
 ) -> None:
     existing_active = existing.get("archived_at") is None
     incoming_active = incoming.get("archived_at") is None
@@ -3428,6 +3521,12 @@ def _merge_snapshot_context_source_rows(
         return
     if existing_active and not incoming_active:
         return
+    if not _snapshot_context_source_rows_have_same_content(existing, incoming):
+        if reject_conflict:
+            raise ValueError(
+                "Conflicting context sources share one snapshot identity"
+            )
+        return
     existing["metadata_json"] = _merged_context_source_metadata_json(
         existing.get("metadata_json"),
         incoming.get("metadata_json"),
@@ -3435,6 +3534,23 @@ def _merge_snapshot_context_source_rows(
     existing["token_estimate"] = max(
         int(_snapshot_numeric_value(existing.get("token_estimate"))),
         int(_snapshot_numeric_value(incoming.get("token_estimate"))),
+    )
+
+
+def _snapshot_context_source_rows_have_same_content(
+    first: Mapping[str, object],
+    second: Mapping[str, object],
+) -> bool:
+    return all(
+        first.get(field) == second.get(field)
+        for field in (
+            "title",
+            "body",
+            "scene_snapshot_id",
+            "scene_generation",
+            "created_turn_number",
+            "expires_after_turn_number",
+        )
     )
 
 

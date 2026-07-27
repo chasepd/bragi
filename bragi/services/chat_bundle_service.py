@@ -24,6 +24,7 @@ from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION
 from bragi.persistence.repositories import (
     PersistenceRepositories,
     canonical_claim_fingerprint,
+    validate_context_source_index_budget,
 )
 from bragi.private_files import write_private_bytes
 from bragi.services.action_choice_flags import normalize_legacy_action_choice_scenario
@@ -264,6 +265,17 @@ class ChatBundleService:
             },
         }
         manifest = _manifest_from_payload(manifest_payload)
+        export_json_node_budget = _validate_export_json_budget(
+            manifest_payload,
+            data,
+        )
+        _validate_bundle_data(
+            manifest_payload,
+            data,
+            json_node_budget=export_json_node_budget,
+            allow_retired_scenario=True,
+        )
+        _validate_bundle_context_source_index_budget(data)
 
         _write_bundle_atomically(
             bundle_path=bundle_path,
@@ -1016,6 +1028,7 @@ class ChatBundleService:
     ) -> ImportedChatBundle:
         manifest_payload, data = self._read_bundle(bundle_path)
         _manifest_from_payload(manifest_payload)
+        _validate_bundle_context_source_index_budget(data)
         media_members = _load_media_members(bundle_path, data)
         media_backups: dict[Path, bytes | None] = {}
         repair_tracker = _BundleImportRepairTracker()
@@ -2768,6 +2781,7 @@ class ChatBundleService:
         try:
             validate_zip_directory(bundle_path)
             with zipfile.ZipFile(bundle_path) as bundle:
+                json_node_budget = [_MAX_BUNDLE_JSON_NODES]
                 _validate_no_duplicate_bundle_members(bundle)
                 manifest = _json_object_from_bytes(
                     _read_limited_member(
@@ -2776,6 +2790,7 @@ class ChatBundleService:
                         max_bytes=_MAX_BUNDLE_MANIFEST_JSON_BYTES,
                     ),
                     MANIFEST_NAME,
+                    json_node_budget=json_node_budget,
                 )
                 _validate_manifest_payload(manifest)
                 if not read_data:
@@ -2787,8 +2802,13 @@ class ChatBundleService:
                         max_bytes=_MAX_BUNDLE_DATA_JSON_BYTES,
                     ),
                     DATA_NAME,
+                    json_node_budget=json_node_budget,
                 )
-                _validate_bundle_data(manifest, data)
+                _validate_bundle_data(
+                    manifest,
+                    data,
+                    json_node_budget=json_node_budget,
+                )
                 _validate_bundle_members(bundle, data)
                 return manifest, data
         except (
@@ -3940,10 +3960,88 @@ def _validate_bundle_members(
             raise ChatBundleError(f"Unexpected chat bundle member: {info.filename}")
 
 
+def _validate_bundle_nested_json(
+    data: Mapping[str, object],
+    *,
+    json_node_budget: list[int],
+) -> None:
+    containers: list[Mapping[str, object]] = []
+    for value in data.values():
+        if isinstance(value, Mapping):
+            containers.append(value)
+        elif isinstance(value, list):
+            containers.extend(
+                item for item in value if isinstance(item, Mapping)
+            )
+    for row in containers:
+        for field, value in row.items():
+            if not field.endswith("_json") or not isinstance(value, str):
+                continue
+            if json_node_budget[0] <= 0:
+                raise ChatBundleError("Chat bundle JSON contains too many values")
+            try:
+                node_count = validate_json_structure(
+                    value.encode("utf-8"),
+                    max_nodes=json_node_budget[0],
+                    max_depth=_MAX_BUNDLE_JSON_DEPTH,
+                )
+            except JsonSafetyError as exc:
+                raise ChatBundleError(
+                    f"Chat bundle nested JSON {field} {exc}"
+                ) from exc
+            json_node_budget[0] -= node_count
+
+
+def _validate_bundle_context_source_index_budget(
+    data: Mapping[str, object],
+) -> None:
+    try:
+        validate_context_source_index_budget(
+            _list_of_objects(
+                data.get("context_sources"),
+                "context_sources",
+            )
+        )
+    except ValueError as exc:
+        raise ChatBundleError(str(exc)) from exc
+
+
+def _validate_export_json_budget(
+    manifest: Mapping[str, object],
+    data: Mapping[str, object],
+) -> list[int]:
+    manifest_payload = _dump_json_pretty(manifest).encode("utf-8")
+    data_payload = _dump_json_pretty(data).encode("utf-8")
+    _validate_total_json_size(len(manifest_payload) + len(data_payload))
+    budget = [_MAX_BUNDLE_JSON_NODES]
+    try:
+        for payload in (manifest_payload, data_payload):
+            node_count = validate_json_structure(
+                payload,
+                max_nodes=budget[0],
+                max_depth=_MAX_BUNDLE_JSON_DEPTH,
+            )
+            budget[0] -= node_count
+    except JsonSafetyError as exc:
+        raise ChatBundleError(f"Exported chat bundle JSON {exc}") from exc
+    return budget
+
+
 def _validate_bundle_data(
     manifest: dict[str, object],
     data: dict[str, object],
+    *,
+    json_node_budget: list[int] | None = None,
+    allow_retired_scenario: bool = False,
 ) -> None:
+    _validate_bundle_nested_json(
+        data,
+        json_node_budget=(
+            json_node_budget
+            if json_node_budget is not None
+            else [_MAX_BUNDLE_JSON_NODES]
+        ),
+    )
     total_rows = 0
     for table_name, value in data.items():
         if not isinstance(value, list):
@@ -3983,7 +4081,10 @@ def _validate_bundle_data(
     manifest_counts = _object(manifest.get("counts"), "manifest counts")
     scenario_type = _text(scenario, "type")
     scenario_content = _json_object(scenario, "content_json")
-    if scenario_record_is_retired(scenario_type, scenario_content):
+    if (
+        not allow_retired_scenario
+        and scenario_record_is_retired(scenario_type, scenario_content)
+    ):
         raise ChatBundleError(RETIRED_SCENARIO_REASON)
     if _text(save, "id") != _text(manifest_save, "id"):
         raise ChatBundleError("Chat bundle manifest does not match save data")
@@ -4095,11 +4196,20 @@ def _validate_manifest_payload(payload: dict[str, object]) -> None:
         )
 
 
-def _json_object_from_bytes(payload: bytes, name: str) -> dict[str, object]:
+def _json_object_from_bytes(
+    payload: bytes,
+    name: str,
+    *,
+    json_node_budget: list[int] | None = None,
+) -> dict[str, object]:
     try:
-        validate_json_structure(
+        node_count = validate_json_structure(
             payload,
-            max_nodes=_MAX_BUNDLE_JSON_NODES,
+            max_nodes=(
+                json_node_budget[0]
+                if json_node_budget is not None
+                else _MAX_BUNDLE_JSON_NODES
+            ),
             max_depth=_MAX_BUNDLE_JSON_DEPTH,
         )
     except JsonSafetyError as exc:
@@ -4119,6 +4229,8 @@ def _json_object_from_bytes(payload: bytes, name: str) -> dict[str, object]:
     )
     if not isinstance(loaded, dict):
         raise ChatBundleError(f"{name} must contain a JSON object")
+    if json_node_budget is not None:
+        json_node_budget[0] -= node_count
     return cast(dict[str, object], loaded)
 
 
@@ -5898,6 +6010,10 @@ def _coalesce_import_context_sources(
         elif (existing.get("archived_at") is None) == (
             row.get("archived_at") is None
         ):
+            if not _context_source_rows_have_same_content(existing, row):
+                raise ChatBundleError(
+                    "Conflicting context sources share one imported identity"
+                )
             existing["metadata_json"] = _merged_import_context_source_metadata_json(
                 existing.get("metadata_json"),
                 row.get("metadata_json"),
@@ -5907,6 +6023,23 @@ def _coalesce_import_context_sources(
                 int(_numeric_import_value(row.get("token_estimate"))),
             )
     return list(coalesced.values())
+
+
+def _context_source_rows_have_same_content(
+    first: Mapping[str, object],
+    second: Mapping[str, object],
+) -> bool:
+    return all(
+        first.get(field) == second.get(field)
+        for field in (
+            "title",
+            "body",
+            "scene_snapshot_id",
+            "scene_generation",
+            "created_turn_number",
+            "expires_after_turn_number",
+        )
+    )
 
 
 def _coalesce_import_proactive_triggers(

@@ -15,10 +15,35 @@ MAX_IDENTIFIER_FILTER_IDENTIFIERS = 32_768
 MAX_IDENTIFIER_FILTER_UNCOMPRESSED_BYTES = 8 * (
     MAX_STRUCTURED_IDENTIFIER_INPUT_CHARS + 1
 )
+MAX_NORMALIZED_SEARCH_CHARS = 65_536
+
+
+def _bounded_nfkc_casefold(
+    value: str,
+    *,
+    max_input_chars: int,
+    max_output_chars: int,
+) -> str:
+    normalized_parts: list[str] = []
+    remaining = max_output_chars
+    for start in range(0, min(len(value), max_input_chars), 1024):
+        normalized = unicodedata.normalize(
+            "NFKC",
+            value[start : start + 1024],
+        ).casefold()
+        normalized_parts.append(normalized[:remaining])
+        remaining -= min(len(normalized), remaining)
+        if remaining <= 0:
+            break
+    return "".join(normalized_parts)
 
 
 def unicode_word_terms(value: str) -> tuple[str, ...]:
-    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = _bounded_nfkc_casefold(
+        value,
+        max_input_chars=MAX_NORMALIZED_SEARCH_CHARS,
+        max_output_chars=MAX_NORMALIZED_SEARCH_CHARS,
+    )
     terms: list[str] = []
     current: list[str] = []
     for character in normalized:
@@ -43,10 +68,11 @@ def structured_identifiers(
     max_input_chars: int = MAX_STRUCTURED_IDENTIFIER_INPUT_CHARS,
     max_identifiers: int = MAX_STRUCTURED_IDENTIFIERS,
 ) -> tuple[str, ...]:
-    normalized = unicodedata.normalize(
-        "NFKC",
-        value[:max_input_chars],
-    ).casefold()
+    normalized = _bounded_nfkc_casefold(
+        value,
+        max_input_chars=max_input_chars,
+        max_output_chars=MAX_NORMALIZED_SEARCH_CHARS,
+    )
     identifiers = tuple(
         dict.fromkeys(
             identifier
@@ -128,10 +154,11 @@ def identifier_filter_matches(value: object, identifiers_json: object) -> int:
 
 
 def cjk_lexical_anchors(value: str) -> tuple[str, ...]:
-    normalized = unicodedata.normalize(
-        "NFKC",
-        value[:MAX_CJK_LEXICAL_INPUT_CHARS],
-    ).casefold()
+    normalized = _bounded_nfkc_casefold(
+        value,
+        max_input_chars=MAX_CJK_LEXICAL_INPUT_CHARS,
+        max_output_chars=MAX_CJK_LEXICAL_INPUT_CHARS,
+    )
     runs: list[str] = []
     current: list[str] = []
     current_family = ""

@@ -2401,9 +2401,9 @@ def _source_context_for_evidence_quote(
         else len(searchable_source)
     )
     following = searchable_source[context_end:next_end]
-    if _grounding_adjacent_qualifier(previous):
+    if _grounding_adjacent_fragment_qualifies(previous):
         context = previous + context
-    if _grounding_adjacent_qualifier(following):
+    if _grounding_adjacent_fragment_qualifies(following):
         context += following
     return context
 
@@ -2412,13 +2412,24 @@ def _grounding_sentence_boundary(character: str) -> bool:
     name = unicodedata.name(character, "")
     return (
         character in {".", "!", "?", "\n"}
+        or "FULL STOP" in name
         or "QUESTION" in name
+        or "EXCLAMATION" in name
         or "INTERROBANG" in name
+        or name.endswith("DANDA")
     )
 
 
-def _grounding_adjacent_qualifier(value: str) -> bool:
-    terms = set(_ordered_grounding_terms(value))
+def _grounding_adjacent_fragment_qualifies(value: str) -> bool:
+    ordered_terms = _ordered_grounding_terms(value)
+    raw_terms = _grounding_boundary_terms(value)
+    anaphoric_terms = {"it", "so", "that", "this"}
+    if not (
+        len(ordered_terms) <= 1
+        or bool(set(raw_terms) & anaphoric_terms)
+    ):
+        return False
+    terms = set(ordered_terms)
     qualifier_terms = {
         "allegedly",
         "apparently",
@@ -2428,14 +2439,11 @@ def _grounding_adjacent_qualifier(value: str) -> bool:
         "could",
         "doubt",
         "doubts",
-        "honest",
-        "if",
         "maybe",
         "may",
         "might",
         "perhaps",
         "possibly",
-        "really",
         "reported",
         "rumor",
         "rumour",
@@ -2448,13 +2456,6 @@ def _grounding_adjacent_qualifier(value: str) -> bool:
         terms & qualifier_terms
         or _grounding_denial_conflicts("", value)
         or _grounding_negation_conflicts("", value)
-        or any(
-            (
-                "QUESTION" in unicodedata.name(character, "")
-                or "INTERROBANG" in unicodedata.name(character, "")
-            )
-            for character in value
-        )
     )
 
 
@@ -2465,8 +2466,11 @@ def _compact_grounding_padding(value: str) -> str:
         name = unicodedata.name(character, "")
         semantic_punctuation = (
             character in {".", "!", "?", "~"}
+            or "FULL STOP" in name
             or "QUESTION" in name
+            or "EXCLAMATION" in name
             or "INTERROBANG" in name
+            or name.endswith("DANDA")
             or "NOT SIGN" in name
             or "NEGATION" in name
             or "CROSS MARK" in name
@@ -3905,8 +3909,13 @@ def _curated_decision_is_grounded(
         if decision.action == "durable_memory"
         else (decision.context_body.strip() or observation.claim)
     )
-    return canonical_claim_fingerprint(proposed) == canonical_claim_fingerprint(
-        observation.claim
+    proposed_fingerprint = canonical_claim_fingerprint(proposed)
+    return (
+        proposed_fingerprint == canonical_claim_fingerprint(observation.claim)
+        and any(
+            proposed_fingerprint == canonical_claim_fingerprint(source_text)
+            for source_text in supporting_texts
+        )
     )
 
 

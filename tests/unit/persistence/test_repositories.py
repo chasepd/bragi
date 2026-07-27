@@ -3200,10 +3200,10 @@ def test_restore_memories_merges_active_fingerprint_collision(
         source_type="memory",
     )
     assert source.source_id == archived.id
-    assert source.metadata["source_provenance_groups"] == [
-        [message_id],
-        [visible_message.id],
-    ]
+    assert source.title == "Archived preference"
+    assert source.body == "Mara likes tea."
+    assert source.metadata["source_message_ids"] == [message_id]
+    assert visible_message.id not in source.metadata["source_message_ids"]
     [trigger] = repositories.list_character_text_proactive_triggers(save_id)
     assert trigger.trigger_key == f"memory:{archived.id}"
     assert trigger.source_id == archived.id
@@ -4525,7 +4525,7 @@ def test_repositories_exact_identifier_cannot_be_starved_by_split_matches(
     assert [hit.record for hit in hits] == [target]
 
 
-def test_repositories_filters_exact_identifier_candidates_before_udf(
+def test_repositories_exact_identifier_lookup_does_not_scan_filter_udf(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, _ = _persist_repository_save(repositories)
@@ -4545,7 +4545,7 @@ def test_repositories_filters_exact_identifier_candidates_before_udf(
         return 0
 
     repositories.connection.create_function(
-        "bragi_contains_exact_identifier",
+        "bragi_identifier_filter_matches",
         2,
         count_identifier_checks,
         deterministic=True,

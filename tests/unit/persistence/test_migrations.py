@@ -352,6 +352,68 @@ def test_migrate_database_is_idempotent_for_current_schema(tmp_path: Path) -> No
         )
 
 
+def test_migrate_database_rebuilds_incomplete_exact_identifier_index(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        source = repositories.upsert_context_source(
+            save_id=save.id,
+            source_type="memory",
+            source_id="memory-codes",
+            title="Archive codes",
+            body=" ".join(f"ARCHIVE-{index:03d}" for index in range(257)),
+        )
+        connection.execute(
+            """
+            DELETE FROM context_source_search_index_state
+            WHERE key = 'exact_identifiers_complete_v2'
+            """
+        )
+        connection.execute(
+            """
+            DELETE FROM context_source_exact_identifiers
+            WHERE context_source_id = ?
+            """,
+            (source.id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO context_source_exact_identifiers(
+                context_source_id, save_id, identifier
+            )
+            VALUES (?, ?, 'archive-000')
+            """,
+            (source.id, save.id),
+        )
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM context_source_exact_identifiers
+            WHERE context_source_id = ?
+            """,
+            (source.id,),
+        ).fetchone()[0] == 257
+
+
 def test_migrate_database_upgrades_main_schema_71_context_lifecycle(
     tmp_path: Path,
 ) -> None:
