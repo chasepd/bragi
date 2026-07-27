@@ -34,6 +34,7 @@ TERMINAL_MAINTENANCE_JOB_TYPES = (
     "context_update_retry_drain",
     "guided_context_cleanup",
     "memory_consolidation",
+    "observation_curation_drain",
     "scenario_evolution",
     "state_extraction_retry",
     "state_extraction_retry_drain",

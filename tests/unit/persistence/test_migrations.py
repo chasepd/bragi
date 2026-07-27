@@ -28,6 +28,7 @@ EXPECTED_TABLES = {
     "character_text_threads",
     "characters",
     "context_observations",
+    "context_observation_curation_state",
     "context_source_fts",
     "context_sources",
     "context_update_audit",

@@ -209,6 +209,54 @@ def test_snapshot_restore_preserves_unrated_narration_without_resanitizing(
     assert restored_messages[0].safety_transition == ""
 
 
+def test_snapshot_restores_curation_progress_without_reviving_worker_lease(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The beacon was relit.",
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The beacon was relit.",
+        evidence_quote="The beacon was relit.",
+        source_message_ids=[message.id],
+        scope="durable",
+        confidence=0.9,
+    )
+    claimed = repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="snapshot-worker-secret",
+        lease_seconds=600,
+    )
+    assert [row.id for row in claimed] == [observation.id]
+    service = TurnSnapshotService(repositories)
+    snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    repositories.defer_context_observation_curation(
+        observation.id,
+        lease_token="snapshot-worker-secret",
+        error="temporary failure",
+        retry_after_seconds=60,
+        max_attempts=5,
+    )
+
+    service.restore_save_to_snapshot(save_id=save.id, snapshot_id=snapshot.id)
+
+    state = repositories.get_context_observation_curation_state(observation.id)
+    assert state is not None
+    assert state.attempt_count == 1
+    assert state.lease_token is None
+    assert state.lease_until is None
+    assert state.last_error is None
+    assert state.terminal_outcome is None
+
+
 def test_restore_rolls_back_when_snapshot_row_insert_fails(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -20,6 +20,7 @@ WORLD_SUGGESTION_REVIEW_TASK = "world_suggestion_review"
 STATE_PRUNING_TASK = "state_pruning"
 STATE_EXTRACTION_RETRY_DRAIN_TASK = "state_extraction_retry_drain"
 CONTEXT_UPDATE_RETRY_DRAIN_TASK = "context_update_retry_drain"
+OBSERVATION_CURATION_DRAIN_TASK = "observation_curation_drain"
 CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_TASK = (
     "character_text_world_update_retry_drain"
 )
@@ -46,6 +47,7 @@ WORLD_SUGGESTION_REVIEW_INTERVAL_SECONDS = 60
 STATE_PRUNING_INTERVAL_SECONDS = 60
 STATE_EXTRACTION_RETRY_DRAIN_INTERVAL_SECONDS = 60
 CONTEXT_UPDATE_RETRY_DRAIN_INTERVAL_SECONDS = 60
+OBSERVATION_CURATION_DRAIN_INTERVAL_SECONDS = 60
 CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_INTERVAL_SECONDS = 60
 WORLD_CONTEXT_RETENTION_INTERVAL_SECONDS = 15 * 60
 MEMORY_CONSOLIDATION_INTERVAL_SECONDS = 10 * 60
@@ -459,6 +461,14 @@ def _task_target_save_ids(
         )
         if callable(list_due_reviews):
             return tuple(list_due_reviews(limit=_DUE_ROUTINE_TARGET_LIMIT))
+    if definition.task_type == OBSERVATION_CURATION_DRAIN_TASK:
+        list_due_curation = getattr(
+            repositories,
+            "list_save_ids_with_due_context_observation_curation",
+            None,
+        )
+        if callable(list_due_curation):
+            return tuple(list_due_curation(limit=_DUE_ROUTINE_TARGET_LIMIT))
     retry_job_type = _RETRY_DRAIN_JOB_TYPES.get(definition.task_type)
     if retry_job_type is not None:
         return _save_ids_with_queued_jobs(repositories, job_type=retry_job_type)
@@ -528,6 +538,8 @@ def _scheduled_task_payload(
     retry_job_type = _RETRY_DRAIN_JOB_TYPES.get(definition.task_type)
     if retry_job_type is not None:
         return {"active_save_only": False, "queued_job_type": retry_job_type}
+    if definition.task_type == OBSERVATION_CURATION_DRAIN_TASK:
+        return {"active_save_only": False}
     return {"active_save_only": True}
 
 
@@ -671,6 +683,22 @@ def _context_update_retry_drain_due(repositories: Any, save_id: str) -> bool:
     return any(
         job.type == "context_update_retry" and job.save_id == save_id
         for job in repositories.list_jobs_by_status(("queued",))
+    )
+
+
+def _observation_curation_drain_due(repositories: Any, save_id: str) -> bool:
+    from bragi.services.agentic_context import agentic_context_pipeline_enabled
+
+    if not agentic_context_pipeline_enabled(repositories, save_id=save_id):
+        return False
+    if not _model_preference_configured(
+        repositories,
+        save_id=save_id,
+        purpose="memory_curation",
+    ):
+        return False
+    return bool(
+        repositories.list_eligible_context_observations(save_id, limit=1)
     )
 
 
@@ -948,6 +976,14 @@ _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
         runtime_method="run_context_update_retries",
         event_reason="context_update_retry",
         should_schedule=_context_update_retry_drain_due,
+    ),
+    _MaintenanceTaskDefinition(
+        task_type=OBSERVATION_CURATION_DRAIN_TASK,
+        interval_seconds=OBSERVATION_CURATION_DRAIN_INTERVAL_SECONDS,
+        progress_label="Curating observations",
+        runtime_method="run_observation_curation",
+        event_reason="observation_curation",
+        should_schedule=_observation_curation_drain_due,
     ),
     _MaintenanceTaskDefinition(
         task_type=CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_TASK,

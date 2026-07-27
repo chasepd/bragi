@@ -923,6 +923,8 @@ def _provider_task_for_job_type(job_type: str) -> str | None:
         return "summarization"
     if job_type == "state_extraction_retry_drain":
         return "state_memory"
+    if job_type == "observation_curation_drain":
+        return "memory_curation"
     if job_type in {
         "context_update_retry_drain",
         "character_text_world_update_retry_drain",

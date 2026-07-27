@@ -692,6 +692,32 @@ class ContextObservationRecord:
 
 
 @dataclass(frozen=True)
+class ContextObservationCurationStateRecord:
+    observation_id: str
+    save_id: str
+    attempt_count: int
+    next_eligible_at: str | None
+    lease_token: str | None
+    lease_until: str | None
+    last_error: str | None
+    terminal_outcome: str | None
+    completed_at: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class ContextObservationCurationHealthRecord:
+    pending_count: int
+    eligible_count: int
+    leased_count: int
+    oldest_pending_at: str | None
+    total_attempt_count: int
+    max_attempt_count: int
+    terminal_failure_count: int
+
+
+@dataclass(frozen=True)
 class SummaryRecord:
     id: str
     save_id: str

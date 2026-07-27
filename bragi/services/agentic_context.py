@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass, field, replace
-from typing import Protocol
+from typing import Protocol, TypeVar
+from uuid import uuid4
 
+from bragi.observation_types import OBSERVATION_TYPES, normalize_observation_type
 from bragi.persistence.models import (
     CharacterRecord,
     ContextObservationRecord,
@@ -54,6 +59,17 @@ RESPONSE_VERIFICATION_MODES = frozenset(
 )
 
 OBSERVATION_STATUSES_FOR_CURATION = ("pending",)
+OBSERVATION_EXTRACTION_MAX_ITEMS = 12
+OBSERVATION_CONFIDENCE_TIERS = (0.4, 0.7, 0.9)
+CURATION_BATCH_ITEM_LIMIT = 32
+CURATION_INPUT_TOKEN_BUDGET = 8_000
+CURATION_MAX_OUTPUT_TOKENS = 4_096
+CURATION_LEASE_SECONDS = 10 * 60
+CURATION_MAX_ATTEMPTS = 5
+CURATION_RETRY_DELAYS_SECONDS = (60, 5 * 60, 30 * 60, 2 * 60 * 60)
+
+_MutationResult = TypeVar("_MutationResult")
+_ApplyGuardFactory = Callable[[], AbstractAsyncContextManager[None]]
 
 
 @dataclass(frozen=True)
@@ -95,6 +111,11 @@ class CurationResult:
     accepted_count: int = 0
     discarded_count: int = 0
     confirmation_count: int = 0
+    omitted_count: int = 0
+    deferred_count: int = 0
+    terminal_failure_count: int = 0
+    duplicate_decision_count: int = 0
+    unknown_decision_count: int = 0
     skipped_reason: str = ""
 
 
@@ -446,6 +467,7 @@ class StructuredProviderContextCurator:
                 schema=_curation_schema(observations),
                 messages=_curation_messages(observations),
                 temperature=0.0,
+                max_output_tokens=CURATION_MAX_OUTPUT_TOKENS,
             ),
             task="memory_curation",
             save_id=save_id,
@@ -475,13 +497,34 @@ class StructuredProviderContextCurator:
             source_texts_by_observation=source_texts_by_observation,
             mode=mode,
         )
-        if not any(decision.script_policy_violations for decision in decisions):
+        violating_decisions = tuple(
+            decision for decision in decisions if decision.script_policy_violations
+        )
+        if not violating_decisions:
             return decisions
+        violating_ids = {
+            decision.observation_id for decision in violating_decisions
+        }
+        retry_observations = tuple(
+            observation
+            for observation in observations
+            if observation.id in violating_ids
+        )
+        subset_request = request_with_openrouter_routing(
+            self.repositories,
+            replace(
+                request,
+                schema=_curation_schema(retry_observations),
+                messages=_curation_messages(retry_observations),
+            ),
+            task="memory_curation",
+            save_id=save_id,
+        )
         retry_request = _structured_request_with_script_policy_feedback(
-            request,
+            subset_request,
             tuple(
                 violation
-                for decision in decisions
+                for decision in violating_decisions
                 for violation in decision.script_policy_violations
             ),
         )
@@ -495,13 +538,22 @@ class StructuredProviderContextCurator:
         )
         retry_decisions = _curation_decisions_from_data(
             retry_response.data,
-            observations,
+            retry_observations,
         )
-        return _mark_curation_decision_script_policy_violations(
+        checked_retry_decisions = _mark_curation_decision_script_policy_violations(
             retry_decisions,
-            observations=observations,
+            observations=retry_observations,
             source_texts_by_observation=source_texts_by_observation,
             mode=mode,
+        )
+        retry_by_id = {
+            decision.observation_id: decision for decision in checked_retry_decisions
+        }
+        return tuple(
+            retry_by_id.get(decision.observation_id, decision)
+            if decision.observation_id in violating_ids
+            else decision
+            for decision in decisions
         )
 
 
@@ -511,22 +563,73 @@ class ContextCurationService:
         *,
         repositories: PersistenceRepositories,
         curator: ContextCurator,
+        batch_item_limit: int = CURATION_BATCH_ITEM_LIMIT,
+        input_token_budget: int = CURATION_INPUT_TOKEN_BUDGET,
+        lease_seconds: int = CURATION_LEASE_SECONDS,
+        max_attempts: int = CURATION_MAX_ATTEMPTS,
+        retry_delays_seconds: tuple[int, ...] = CURATION_RETRY_DELAYS_SECONDS,
+        apply_guard: _ApplyGuardFactory | None = None,
     ) -> None:
         self.repositories = repositories
         self.curator = curator
+        self.batch_item_limit = max(1, batch_item_limit)
+        self.input_token_budget = max(1, input_token_budget)
+        self.lease_seconds = max(1, lease_seconds)
+        self.max_attempts = max(1, max_attempts)
+        self.retry_delays_seconds = retry_delays_seconds or (60,)
+        self.apply_guard = apply_guard
 
     async def curate_pending(self, save_id: str) -> CurationResult:
+        eligible = self.repositories.list_eligible_context_observations(
+            save_id,
+            limit=self.batch_item_limit,
+        )
+        selected: list[ContextObservationRecord] = []
+        for observation in eligible:
+            candidate = (*selected, observation)
+            if _curation_request_estimated_tokens(candidate) > self.input_token_budget:
+                break
+            selected.append(observation)
+        if not selected and eligible:
+            lease_token = uuid4().hex
+            claimed = self.repositories.claim_context_observations(
+                (eligible[0].id,),
+                lease_token=lease_token,
+                lease_seconds=self.lease_seconds,
+            )
+            if claimed:
+                await self._apply_mutation(
+                    lambda: self.repositories.complete_context_observation_curation(
+                        claimed[0].id,
+                        lease_token=lease_token,
+                        status="curation_failed",
+                        terminal_outcome="input_budget_exceeded",
+                        metadata={
+                            "curation_failure": {
+                                "reason": "input_budget_exceeded",
+                                "input_token_budget": self.input_token_budget,
+                            }
+                        },
+                    )
+                )
+                return CurationResult(
+                    save_id=save_id,
+                    considered_count=1,
+                    terminal_failure_count=1,
+                )
+        lease_token = uuid4().hex
         all_observations = tuple(
-            self.repositories.list_context_observations(
-                save_id,
-                statuses=OBSERVATION_STATUSES_FOR_CURATION,
+            self.repositories.claim_context_observations(
+                (observation.id for observation in selected),
+                lease_token=lease_token,
+                lease_seconds=self.lease_seconds,
             )
         )
         if not all_observations:
             return CurationResult(
                 save_id=save_id,
                 considered_count=0,
-                skipped_reason="no pending observations",
+                skipped_reason="no eligible observations",
             )
         source_texts_by_observation = _curation_source_texts_by_observation(
             repositories=self.repositories,
@@ -546,17 +649,68 @@ class ContextCurationService:
             if observation in observations:
                 continue
             discarded_count += 1
-            self._mark_observation_evidence_rejected(observation)
+
+            def reject_evidence(
+                selected: ContextObservationRecord = observation,
+            ) -> None:
+                self._mark_observation_evidence_rejected(
+                    selected,
+                    lease_token=lease_token,
+                )
+
+            await self._apply_mutation(
+                reject_evidence
+            )
         if not observations:
             return CurationResult(
                 save_id=save_id,
                 considered_count=len(all_observations),
                 discarded_count=discarded_count,
             )
-        decisions = await self.curator.curate(
-            save_id=save_id,
-            observations=observations,
-        )
+        try:
+            decisions = await self.curator.curate(
+                save_id=save_id,
+                observations=observations,
+            )
+        except asyncio.CancelledError:
+            for observation in observations:
+
+                def defer_cancelled(
+                    selected: ContextObservationRecord = observation,
+                ) -> int:
+                    return self._defer_observation(
+                        selected,
+                        lease_token=lease_token,
+                        error="cancelled",
+                    )
+
+                await self._apply_mutation(
+                    defer_cancelled
+                )
+            raise
+        except Exception:
+            terminal_failure_count = 0
+            for observation in observations:
+
+                def defer_provider_failure(
+                    selected: ContextObservationRecord = observation,
+                ) -> int:
+                    return self._defer_observation(
+                        selected,
+                        lease_token=lease_token,
+                        error="provider_failure",
+                    )
+
+                terminal_failure_count += await self._apply_mutation(
+                    defer_provider_failure
+                )
+            return CurationResult(
+                save_id=save_id,
+                considered_count=len(all_observations),
+                discarded_count=discarded_count,
+                deferred_count=len(observations),
+                terminal_failure_count=terminal_failure_count,
+            )
         mode = script_guard_mode(self.repositories, save_id=save_id)
         decisions = _mark_curation_decision_script_policy_violations(
             decisions,
@@ -567,134 +721,241 @@ class ContextCurationService:
         observations_by_id = {
             observation.id: observation for observation in observations
         }
+        unique_decisions: list[CurationDecision] = []
+        seen_ids: set[str] = set()
+        duplicate_decision_count = 0
+        unknown_decision_count = 0
+        for decision in decisions:
+            if decision.observation_id not in observations_by_id:
+                unknown_decision_count += 1
+                continue
+            if decision.observation_id in seen_ids:
+                duplicate_decision_count += 1
+                continue
+            seen_ids.add(decision.observation_id)
+            unique_decisions.append(decision)
         accepted_count = 0
         confirmation_count = 0
-        for decision in decisions:
+        deferred_count = 0
+        terminal_failure_count = 0
+        for decision in unique_decisions:
             curated_observation: ContextObservationRecord | None = (
                 observations_by_id.get(decision.observation_id)
             )
             if curated_observation is None:
                 continue
-            if decision.script_policy_violations:
-                discarded_count += 1
-                self._mark_observation_script_policy_rejected(
-                    curated_observation,
-                    decision.script_policy_violations,
-                )
-                continue
-            if decision.action == "durable_memory":
-                body = decision.memory_body.strip() or curated_observation.claim
-                if body.strip():
-                    source_message_ids = tuple(curated_observation.source_message_ids)
-                    tags = tuple(decision.tags or curated_observation.tags)
-                    if _curated_memory_exists(
-                        self.repositories,
-                        save_id=save_id,
-                        body=body,
-                        source_message_ids=source_message_ids,
-                    ):
-                        self._mark_observation(
-                            curated_observation,
-                            decision,
-                            "accepted",
-                        )
-                        continue
-                    if manual_memory_confirmation_enabled(
-                        self.repositories,
-                        save_id=save_id,
-                    ):
-                        self._queue_memory_confirmation(
-                            save_id=save_id,
-                            observation=curated_observation,
-                            body=body,
-                            tags=tags,
-                            confidence=decision.confidence,
-                            reason=decision.reason,
-                        )
-                        confirmation_count += 1
-                        self._mark_observation(
-                            curated_observation,
-                            decision,
-                            "needs_confirmation",
-                        )
-                        continue
-                    self.repositories.add_memory(
-                        save_id=save_id,
-                        body=body.strip(),
-                        tags=list(tags),
-                        importance=decision.confidence,
-                        source_message_id=(
-                            curated_observation.source_message_ids[0]
-                            if curated_observation.source_message_ids
-                            else None
-                        ),
-                        source_message_ids=source_message_ids,
-                    )
-                    accepted_count += 1
-                    self._mark_observation(curated_observation, decision, "accepted")
-            elif decision.action in {"save_context", "scene_scratch"}:
-                body = decision.context_body.strip() or curated_observation.claim
-                self.repositories.upsert_context_source(
+
+            def apply_decision(
+                observation: ContextObservationRecord = curated_observation,
+                selected_decision: CurationDecision = decision,
+            ) -> tuple[int, int, int, int, int]:
+                return self._apply_decision(
                     save_id=save_id,
-                    source_type="observation",
-                    source_id=curated_observation.id,
-                    title=(
-                        decision.context_title.strip() or curated_observation.claim
-                    ),
-                    body=body,
-                    metadata={
-                        "observation_id": curated_observation.id,
-                        "observation_type": curated_observation.observation_type,
-                        "fact_type": curated_observation.observation_type,
-                        "scope": curated_observation.scope,
-                        "source_message_ids": (
-                            curated_observation.source_message_ids
-                        ),
-                        "evidence_quote": curated_observation.evidence_quote,
-                        "curation_action": decision.action,
-                        "importance": decision.confidence,
-                    },
+                    observation=observation,
+                    decision=selected_decision,
+                    lease_token=lease_token,
                 )
-                accepted_count += 1
-                self._mark_observation(curated_observation, decision, "accepted")
-            elif decision.action == "needs_confirmation":
-                self.repositories.add_context_update_suggestion(
-                    save_id=save_id,
-                    update_type="review",
-                    entity_type="observation",
-                    entity_id=curated_observation.id,
-                    field_path=decision.action,
-                    proposed_value=_decision_metadata(decision),
-                    reason=decision.reason,
-                    confidence=decision.confidence,
-                    source_message_ids=curated_observation.source_message_ids,
+
+            applied = await self._apply_mutation(
+                apply_decision
+            )
+            accepted_count += applied[0]
+            discarded_count += applied[1]
+            confirmation_count += applied[2]
+            deferred_count += applied[3]
+            terminal_failure_count += applied[4]
+        omitted_ids = set(observations_by_id) - seen_ids
+        for observation_id in omitted_ids:
+            deferred_count += 1
+
+            def defer_missing_decision(
+                selected_id: str = observation_id,
+            ) -> int:
+                return self._defer_observation(
+                    observations_by_id[selected_id],
+                    lease_token=lease_token,
+                    error="missing_decision",
                 )
-                confirmation_count += 1
-                self._mark_observation(
-                    curated_observation,
-                    decision,
-                    "needs_confirmation",
-                )
-            elif decision.action == "discard":
-                discarded_count += 1
-                self._mark_observation(curated_observation, decision, "discarded")
+
+            terminal_failure_count += await self._apply_mutation(
+                defer_missing_decision
+            )
         return CurationResult(
             save_id=save_id,
             considered_count=len(all_observations),
             accepted_count=accepted_count,
             discarded_count=discarded_count,
             confirmation_count=confirmation_count,
+            omitted_count=len(omitted_ids),
+            deferred_count=deferred_count,
+            terminal_failure_count=terminal_failure_count,
+            duplicate_decision_count=duplicate_decision_count,
+            unknown_decision_count=unknown_decision_count,
         )
+
+    async def _apply_mutation(
+        self,
+        mutation: Callable[[], _MutationResult],
+    ) -> _MutationResult:
+        guard = self.apply_guard() if self.apply_guard is not None else nullcontext()
+        async with guard:
+            self.repositories.begin_immediate_transaction()
+            try:
+                result = mutation()
+                self.repositories.commit_transaction()
+            except BaseException:
+                self.repositories.rollback_transaction()
+                raise
+        return result
+
+    def _apply_decision(
+        self,
+        *,
+        save_id: str,
+        observation: ContextObservationRecord,
+        decision: CurationDecision,
+        lease_token: str,
+    ) -> tuple[int, int, int, int, int]:
+        if not self.repositories.owns_context_observation_curation_lease(
+            observation.id,
+            lease_token=lease_token,
+        ):
+            return (0, 0, 0, 0, 0)
+        if decision.script_policy_violations:
+            self._mark_observation_script_policy_rejected(
+                observation,
+                decision.script_policy_violations,
+                lease_token=lease_token,
+            )
+            return (0, 1, 0, 0, 0)
+        if decision.action == "durable_memory":
+            body = decision.memory_body.strip() or observation.claim
+            source_message_ids = tuple(observation.source_message_ids)
+            tags = tuple(decision.tags or observation.tags)
+            if _curated_memory_exists(
+                self.repositories,
+                save_id=save_id,
+                body=body,
+                source_message_ids=source_message_ids,
+            ):
+                self._mark_observation(
+                    observation,
+                    decision,
+                    "accepted",
+                    lease_token=lease_token,
+                )
+                return (0, 0, 0, 0, 0)
+            if manual_memory_confirmation_enabled(
+                self.repositories,
+                save_id=save_id,
+            ):
+                self._queue_memory_confirmation(
+                    save_id=save_id,
+                    observation=observation,
+                    body=body,
+                    tags=tags,
+                    confidence=decision.confidence,
+                    reason=decision.reason,
+                )
+                self._mark_observation(
+                    observation,
+                    decision,
+                    "needs_confirmation",
+                    lease_token=lease_token,
+                )
+                return (0, 0, 1, 0, 0)
+            self.repositories.add_memory(
+                save_id=save_id,
+                body=body.strip(),
+                tags=list(tags),
+                importance=decision.confidence,
+                source_message_id=(
+                    observation.source_message_ids[0]
+                    if observation.source_message_ids
+                    else None
+                ),
+                source_message_ids=source_message_ids,
+            )
+            self._mark_observation(
+                observation,
+                decision,
+                "accepted",
+                lease_token=lease_token,
+            )
+            return (1, 0, 0, 0, 0)
+        if decision.action in {"save_context", "scene_scratch"}:
+            body = decision.context_body.strip() or observation.claim
+            self.repositories.upsert_context_source(
+                save_id=save_id,
+                source_type="observation",
+                source_id=observation.id,
+                title=decision.context_title.strip() or observation.claim,
+                body=body,
+                metadata={
+                    "observation_id": observation.id,
+                    "observation_type": observation.observation_type,
+                    "fact_type": observation.observation_type,
+                    "scope": observation.scope,
+                    "source_message_ids": observation.source_message_ids,
+                    "evidence_quote": observation.evidence_quote,
+                    "curation_action": decision.action,
+                    "importance": decision.confidence,
+                },
+            )
+            self._mark_observation(
+                observation,
+                decision,
+                "accepted",
+                lease_token=lease_token,
+            )
+            return (1, 0, 0, 0, 0)
+        if decision.action == "needs_confirmation":
+            self.repositories.add_context_update_suggestion(
+                save_id=save_id,
+                update_type="review",
+                entity_type="observation",
+                entity_id=observation.id,
+                field_path=decision.action,
+                proposed_value=_decision_metadata(decision),
+                reason=decision.reason,
+                confidence=decision.confidence,
+                source_message_ids=observation.source_message_ids,
+            )
+            self._mark_observation(
+                observation,
+                decision,
+                "needs_confirmation",
+                lease_token=lease_token,
+            )
+            return (0, 0, 1, 0, 0)
+        if decision.action == "discard":
+            self._mark_observation(
+                observation,
+                decision,
+                "discarded",
+                lease_token=lease_token,
+            )
+            return (0, 1, 0, 0, 0)
+        terminal = self._defer_observation(
+            observation,
+            lease_token=lease_token,
+            error="invalid_decision_action",
+        )
+        return (0, 0, 0, 1, terminal)
 
     def _mark_observation(
         self,
         observation: ContextObservationRecord,
         decision: CurationDecision,
         status: str,
+        *,
+        lease_token: str,
     ) -> None:
-        self.repositories.update_context_observation(
+        self.repositories.complete_context_observation_curation(
             observation.id,
+            lease_token=lease_token,
             status=status,
+            terminal_outcome=status,
             metadata={"curation": _decision_metadata(decision)},
         )
 
@@ -702,11 +963,15 @@ class ContextCurationService:
         self,
         observation: ContextObservationRecord,
         violations: tuple[ScriptPolicyViolation, ...],
+        *,
+        lease_token: str,
     ) -> None:
         diagnostic = first_violation_diagnostic(violations)
-        self.repositories.update_context_observation(
+        self.repositories.complete_context_observation_curation(
             observation.id,
+            lease_token=lease_token,
             status="discarded",
+            terminal_outcome="script_policy_rejected",
             metadata={
                 "script_policy_rejected": diagnostic,
                 "curation": {
@@ -721,10 +986,14 @@ class ContextCurationService:
     def _mark_observation_evidence_rejected(
         self,
         observation: ContextObservationRecord,
+        *,
+        lease_token: str,
     ) -> None:
-        self.repositories.update_context_observation(
+        self.repositories.complete_context_observation_curation(
             observation.id,
+            lease_token=lease_token,
             status="discarded",
+            terminal_outcome="evidence_rejected",
             metadata={
                 "evidence_rejected": {
                     "reason": "evidence_quote not found in source messages",
@@ -735,6 +1004,33 @@ class ContextCurationService:
                     "confidence": 0.0,
                 },
             },
+        )
+
+    def _defer_observation(
+        self,
+        observation: ContextObservationRecord,
+        *,
+        lease_token: str,
+        error: str,
+    ) -> int:
+        state = self.repositories.get_context_observation_curation_state(
+            observation.id
+        )
+        attempt_count = state.attempt_count if state is not None else 1
+        retry_index = min(
+            max(0, attempt_count - 1),
+            len(self.retry_delays_seconds) - 1,
+        )
+        updated = self.repositories.defer_context_observation_curation(
+            observation.id,
+            lease_token=lease_token,
+            error=error,
+            retry_after_seconds=self.retry_delays_seconds[retry_index],
+            max_attempts=self.max_attempts,
+        )
+        return int(
+            updated is not None
+            and updated.terminal_outcome == "retry_budget_exhausted"
         )
 
     def _queue_memory_confirmation(
@@ -1115,6 +1411,11 @@ async def _structured_response(
     return await provider.generate_structured_output(request)
 
 
+def _observation_confidence(value: object) -> float:
+    confidence = _float(value)
+    return min(OBSERVATION_CONFIDENCE_TIERS, key=lambda tier: abs(tier - confidence))
+
+
 def _observation_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object]:
     source_schema: dict[str, object] = {"type": "string"}
     message_ids = [message.id for message in messages]
@@ -1126,11 +1427,15 @@ def _observation_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object
         "properties": {
             "observations": {
                 "type": "array",
+                "maxItems": OBSERVATION_EXTRACTION_MAX_ITEMS,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "observation_type": {"type": "string"},
+                        "observation_type": {
+                            "type": "string",
+                            "enum": list(OBSERVATION_TYPES),
+                        },
                         "claim": {"type": "string"},
                         "evidence_quote": {"type": "string"},
                         "source_message_ids": {
@@ -1141,7 +1446,10 @@ def _observation_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object
                             "type": "string",
                             "enum": ["turn", "scene", "save", "durable"],
                         },
-                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "confidence": {
+                            "type": "number",
+                            "enum": list(OBSERVATION_CONFIDENCE_TIERS),
+                        },
                         "tags": {"type": "array", "items": {"type": "string"}},
                     },
                     "required": [
@@ -1170,6 +1478,9 @@ def _observation_messages(
                 "Extract high-recall candidate Bragi observations from the "
                 "completed turn. Use the enforced schema. Do not decide final "
                 "importance. Include only claims with explicit source evidence."
+                " Use confidence 0.4 for tentative evidence, 0.7 for a strongly "
+                "grounded interpretation, and 0.9 only for an explicit, "
+                "unambiguous fact."
                 " A marked narrator safety transition is only an off-screen "
                 "event and elapsed time; do not infer intimate details from it."
             ),
@@ -1188,7 +1499,7 @@ def _observations_from_data(
     allowed_ids = {message.id for message in messages}
     message_bodies_by_id = {message.id: message.body for message in messages}
     observations: list[ExtractedObservation] = []
-    for raw in raw_items:
+    for raw in raw_items[:OBSERVATION_EXTRACTION_MAX_ITEMS]:
         if not isinstance(raw, dict):
             raise ValueError("Observation extraction item must be an object")
         source_ids = tuple(
@@ -1207,13 +1518,14 @@ def _observations_from_data(
             continue
         observations.append(
             ExtractedObservation(
-                observation_type=_string(raw.get("observation_type"))
-                or "observation",
+                observation_type=normalize_observation_type(
+                    _string(raw.get("observation_type"))
+                ),
                 claim=claim,
                 evidence_quote=evidence_quote,
                 source_message_ids=source_ids,
                 scope=_string(raw.get("scope")) or "turn",
-                confidence=_float(raw.get("confidence")),
+                confidence=_observation_confidence(raw.get("confidence")),
                 tags=_string_tuple(raw.get("tags")),
             )
         )
@@ -1303,6 +1615,23 @@ def _curation_messages(
         ),
         ChatMessage(role="user", body=_observations_text(observations)),
     )
+
+
+def _curation_request_estimated_tokens(
+    observations: tuple[ContextObservationRecord, ...],
+) -> int:
+    messages = _curation_messages(observations)
+    payload = json.dumps(
+        {
+            "schema": _curation_schema(observations),
+            "messages": [
+                {"role": message.role, "body": message.body} for message in messages
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return max(1, (len(payload) + 3) // 4)
 
 
 def _curation_decisions_from_data(

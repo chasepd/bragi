@@ -85,6 +85,7 @@ _SNAPSHOT_TABLES: tuple[_SnapshotTable, ...] = (
         order_by="source_type, source_id, rowid",
     ),
     _SnapshotTable("context_observations", active_only=True),
+    _SnapshotTable("context_observation_curation_state"),
     _SnapshotTable("locations", active_only=True),
     _SnapshotTable("characters", active_only=True),
     _SnapshotTable("scene_snapshots"),
@@ -151,6 +152,7 @@ _RESTORE_DELETE_ORDER = (
     "summaries",
     "memories",
     "state_changes",
+    "context_observation_curation_state",
     "context_observations",
     "context_sources",
     "world_state",
@@ -179,6 +181,7 @@ _RESTORE_INSERT_ORDER = (
     "save_loss_outcomes",
     "context_sources",
     "context_observations",
+    "context_observation_curation_state",
     "context_update_suggestions",
     "context_update_audit",
     "entity_links",
@@ -208,6 +211,9 @@ _MESSAGE_REFERENCE_COLUMNS = {
 }
 
 _TABLE_REFERENCE_COLUMNS: dict[str, dict[str, str]] = {
+    "context_observation_curation_state": {
+        "observation_id": "context_observations"
+    },
     "locations": {"parent_location_id": "locations"},
     "characters": {"location_id": "locations"},
     "scene_snapshots": {"current_location_id": "locations"},
@@ -504,6 +510,7 @@ class TurnSnapshotService:
                     rows = _media_rows_parent_first(rows)
                 for row in rows:
                     self._insert_row(table_name, row)
+            self.repositories.ensure_context_observation_curation_states(save_id)
             _remove_snapshot_safety_transition_records(
                 self.repositories.connection,
                 save_id=save_id,
@@ -584,6 +591,7 @@ class TurnSnapshotService:
                             copied_paths=copied_paths,
                         )
                     self._insert_row(table_name, remapped)
+            self.repositories.ensure_context_observation_curation_states(fork_save.id)
             _remove_snapshot_safety_transition_records(
                 self.repositories.connection,
                 save_id=fork_save.id,
@@ -1003,6 +1011,15 @@ class TurnSnapshotService:
                 rows[table.name] = _location_rows_parent_first(table_rows)
             elif table.name == "media_assets":
                 rows[table.name] = _media_rows_parent_first(table_rows)
+            elif table.name == "context_observation_curation_state":
+                rows[table.name] = tuple(
+                    {
+                        **row,
+                        "lease_token": None,
+                        "lease_until": None,
+                    }
+                    for row in table_rows
+                )
             else:
                 rows[table.name] = tuple(table_rows)
         _filter_character_text_snapshot_rows(rows)
@@ -1821,6 +1838,7 @@ def _sanitize_snapshot_rows_for_safety(
         )
     }
     if not transition_ids:
+        _filter_context_observation_curation_snapshot_rows(rows)
         return rows
     message_order = {
         str(row["id"]): index
@@ -1853,7 +1871,19 @@ def _sanitize_snapshot_rows_for_safety(
                 continue
             sanitized_rows.append(row)
         rows[table_name] = tuple(sanitized_rows)
+    _filter_context_observation_curation_snapshot_rows(rows)
     return rows
+
+
+def _filter_context_observation_curation_snapshot_rows(
+    rows: dict[str, tuple[dict[str, object], ...]],
+) -> None:
+    observation_ids = _row_ids(rows.get("context_observations", ()))
+    rows["context_observation_curation_state"] = tuple(
+        row
+        for row in rows.get("context_observation_curation_state", ())
+        if _required_row_ref_active(row, "observation_id", observation_ids)
+    )
 
 
 def _snapshot_media_row_with_unclassified_rating(

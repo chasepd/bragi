@@ -9,9 +9,10 @@ from contextvars import ContextVar
 from pathlib import Path
 
 from bragi.model_tasks import is_retired_model_task
+from bragi.observation_types import normalize_observation_type
 from bragi.private_files import ensure_private_file
 
-CURRENT_SCHEMA_VERSION = 70
+CURRENT_SCHEMA_VERSION = 71
 
 _PRESERVE_SCHEMA_SCRIPT_TRANSACTION: ContextVar[bool] = ContextVar(
     "_PRESERVE_SCHEMA_SCRIPT_TRANSACTION",
@@ -180,6 +181,26 @@ ON context_observations(save_id, status, archived_at);
 
 CREATE INDEX IF NOT EXISTS idx_context_observations_save_created
 ON context_observations(save_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS context_observation_curation_state (
+    observation_id TEXT PRIMARY KEY
+        REFERENCES context_observations(id) ON DELETE CASCADE,
+    save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_eligible_at TEXT,
+    lease_token TEXT,
+    lease_until TEXT,
+    last_error TEXT,
+    terminal_outcome TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_observation_curation_due
+ON context_observation_curation_state(
+    save_id, terminal_outcome, next_eligible_at, lease_until
+);
 
 CREATE TABLE IF NOT EXISTS scene_snapshots (
     id TEXT PRIMARY KEY,
@@ -618,23 +639,30 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 69:
+            if current == 70:
+                _migrate_schema_70_to_71(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 69:
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 68:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 67:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 66:
                 _migrate_schema_66_to_67(connection)
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 65:
                 _migrate_schema_65_to_66(connection)
@@ -642,6 +670,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 64:
                 _migrate_schema_64_to_65(connection)
@@ -650,6 +679,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 63:
                 _migrate_schema_63_to_64(connection)
@@ -659,6 +689,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 62:
                 _migrate_schema_62_to_63(connection)
@@ -669,6 +700,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 61:
                 _migrate_schema_61_to_62(connection)
@@ -680,6 +712,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_67_to_68(connection)
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
+                _migrate_schema_70_to_71(connection)
                 current = CURRENT_SCHEMA_VERSION
             else:
                 raise RuntimeError(
@@ -703,6 +736,7 @@ def migrate_database(database_path: Path | str) -> None:
             )
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
+        _ensure_context_observation_curation_schema(connection)
         _ensure_character_current_clothing_schema(connection)
         _ensure_character_text_schema(connection)
         _ensure_character_text_activity_schema(connection)
@@ -938,6 +972,80 @@ def _ensure_context_observation_schema(connection: sqlite3.Connection) -> None:
         ON context_observations(save_id, created_at, id);
         """
     )
+
+
+def _ensure_context_observation_curation_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    if not _table_exists(connection, "context_observations") or not _table_exists(
+        connection,
+        "saves",
+    ):
+        return
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS context_observation_curation_state (
+            observation_id TEXT PRIMARY KEY
+                REFERENCES context_observations(id) ON DELETE CASCADE,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_eligible_at TEXT,
+            lease_token TEXT,
+            lease_until TEXT,
+            last_error TEXT,
+            terminal_outcome TEXT,
+            completed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_observation_curation_due
+        ON context_observation_curation_state(
+            save_id, terminal_outcome, next_eligible_at, lease_until
+        );
+        """,
+    )
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO context_observation_curation_state(
+            observation_id, save_id, terminal_outcome, completed_at
+        )
+        SELECT
+            id,
+            save_id,
+            CASE WHEN status = 'pending' THEN NULL ELSE status END,
+            CASE WHEN status = 'pending' THEN NULL ELSE updated_at END
+        FROM context_observations
+        """
+    )
+    for observation_id, observation_type, metadata_json in connection.execute(
+        "SELECT id, observation_type, metadata_json FROM context_observations"
+    ).fetchall():
+        original_type = str(observation_type)
+        normalized_type = normalize_observation_type(original_type)
+        if normalized_type == original_type:
+            continue
+        try:
+            metadata = json.loads(str(metadata_json))
+        except (TypeError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata.setdefault("original_observation_type", original_type)
+        connection.execute(
+            """
+            UPDATE context_observations
+            SET observation_type = ?, metadata_json = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                normalized_type,
+                json.dumps(metadata, sort_keys=True, separators=(",", ":")),
+                observation_id,
+            ),
+        )
 
 
 def _ensure_message_scene_presence_schema(connection: sqlite3.Connection) -> None:
@@ -1623,6 +1731,11 @@ def _migrate_schema_69_to_70(connection: sqlite3.Connection) -> None:
         "TEXT NOT NULL DEFAULT 'unclassified'",
     )
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (70)")
+
+
+def _migrate_schema_70_to_71(connection: sqlite3.Connection) -> None:
+    _ensure_context_observation_curation_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (71)")
 
 
 def _remove_retired_model_preferences(connection: sqlite3.Connection) -> None:

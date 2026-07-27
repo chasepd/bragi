@@ -149,6 +149,11 @@ def test_export_save_writes_manifest_data_and_referenced_media(
                 separators=(",", ":"),
             )
         )
+        [curation_state] = data["context_observation_curation_states"]
+        assert curation_state["observation_id"] == OBSERVATION_ID
+        assert curation_state["terminal_outcome"] == "accepted"
+        assert curation_state["lease_token"] is None
+        assert curation_state["lease_until"] is None
 
 
 def test_export_save_uses_consistent_read_snapshot(
@@ -2141,6 +2146,12 @@ def test_import_save_remaps_colliding_ids_and_preserves_bundle_data(
         message_id_map[PLAYER_MESSAGE_ID],
         message_id_map[NARRATOR_MESSAGE_ID],
     ]
+    curation_state = repositories.get_context_observation_curation_state(
+        observations[0].id
+    )
+    assert curation_state is not None
+    assert curation_state.terminal_outcome == "accepted"
+    assert curation_state.lease_token is None
 
     summaries = repositories.list_summaries(imported_save_id)
     assert len(summaries) == 1

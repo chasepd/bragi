@@ -18830,6 +18830,16 @@ describe("frontend helpers", () => {
           summary_count: 2,
           recent_failed_continuity_job_count: 1,
           recent_failed_continuity_jobs_by_type: { context_update: 1 },
+          observation_curation: {
+            pending_count: 4,
+            eligible_count: 3,
+            leased_count: 1,
+            oldest_pending_at: "2026-07-08T11:00:00Z",
+            oldest_pending_age_seconds: 3600,
+            total_attempt_count: 2,
+            max_attempt_count: 1,
+            terminal_failure_count: 0
+          },
           latest_context_search: null,
           latest_chat_prompt: null,
           warnings: [
@@ -18850,6 +18860,7 @@ describe("frontend helpers", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/diagnostics?save_id=save-1", expect.anything());
     expect(screen.getByText("Active Save Health")).toBeInTheDocument();
     expect(await screen.findByText("Stale Pending Suggestions")).toBeInTheDocument();
+    expect(screen.getByText("Pending Observations")).toBeInTheDocument();
     expect(screen.getByText("Scheduler Health")).toBeInTheDocument();
     expect(screen.getByText("World Suggestion Review")).toBeInTheDocument();
     expect(screen.getByText(/review failed/)).toBeInTheDocument();
