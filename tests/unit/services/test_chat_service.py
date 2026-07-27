@@ -67,6 +67,7 @@ from bragi.services.agentic_context import (
     NarratorVerificationResult,
     NpcIntent,
     ObservationResult,
+    PlannerRejection,
     PlayerAgencyConstraint,
     RequiredFact,
     StateCommitCandidate,
@@ -5802,6 +5803,16 @@ def test_plan_owned_post_turn_mode_skips_legacy_inference_for_verified_noop(
         uncertainties=(),
         evidence_source_ids=(),
         state_commit_candidates=(),
+        planner_rejections=(
+            PlannerRejection(
+                candidate_id="narrative_beat:0",
+                candidate_type="narrative_beat",
+                domain="narration",
+                reason="unknown_evidence_source_id",
+                field="evidence_source_ids",
+                rejected_value="message:not-assembled",
+            ),
+        ),
     )
     events: list[str] = []
     provider = ScriptedPostTurnStructuredProvider(
@@ -5856,6 +5867,21 @@ def test_plan_owned_post_turn_mode_skips_legacy_inference_for_verified_noop(
     assert _post_turn_child_status(coordinator, "context") == "skipped"
     coverage = coordinator["result"]["verified_plan_coverage"]
     assert coverage["planned_commit_post_turn_update_needed"] is False
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["proposed_count"] == 0
+    assert planned["rejected_count"] == 0
+    assert planned["planner_rejections"] == [
+        {
+            "candidate_id": "narrative_beat:0",
+            "candidate_type": "narrative_beat",
+            "domain": "narration",
+            "field": "evidence_source_ids",
+            "reason": "unknown_evidence_source_id",
+            "rejected_value": "message:not-assembled",
+        }
+    ]
 
 
 def test_plan_owned_post_turn_mode_falls_back_to_hybrid_for_weak_plan_coverage(

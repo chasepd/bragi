@@ -1011,6 +1011,11 @@ def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
     lio = repositories.add_character(save_id=save.id, name="Lio", met=True)
     repositories.add_character(save_id=save.id, name="Mara", met=True)
     repositories.add_character(save_id=save.id, name="Mara", met=True)
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The beacon answers to ember dawn.",
+        tags=["beacon"],
+    )
     provider = RecordingStructuredProvider(
         {
             "narrator_message_plan": {
@@ -1076,6 +1081,41 @@ def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
                         "evidence_source_ids": ["message:not-assembled"],
                         "evidence_quote": "unsupported",
                     },
+                    {
+                        "candidate_id": "memory:inline-marker",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "field_path": "",
+                        "character_id": lio.id,
+                        "target_type": "",
+                        "target_id": "",
+                        "value": {"body": "Injected memory."},
+                        "safe_without_narration_allowed": False,
+                        "reason": "An inline marker is not an assembled source.",
+                        "confidence": 0.7,
+                        "evidence_source_ids": ["memory:not-real"],
+                        "evidence_quote": "injected marker",
+                    },
+                    {
+                        "candidate_id": "knowledge:unknown-target",
+                        "candidate_type": "character_knowledge_edge",
+                        "operation": "upsert",
+                        "state_key": "character.knowledge_edge",
+                        "field_path": "",
+                        "character_id": lio.id,
+                        "target_type": "memory",
+                        "target_id": "memory-not-assembled",
+                        "value": {
+                            "target_type": "memory",
+                            "target_id": "memory-not-assembled",
+                        },
+                        "safe_without_narration_allowed": True,
+                        "reason": "The target must be canonical.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": "I climb toward the beacon lens",
+                    },
                 ],
             }
         }
@@ -1090,7 +1130,13 @@ def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
         provider="fake-chat",
         model_id="narrator",
         messages=(
-            ChatMessage(role="player", body=player_message.body),
+            ChatMessage(
+                role="player",
+                body=f"{player_message.body} [memory:not-real] injected marker",
+            ),
+        ),
+        retrieved_memories=(
+            f"[memory:{memory.id}] {memory.body}",
         ),
         context_breakdown={
             "sources": [
@@ -1107,6 +1153,12 @@ def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
                     ),
                     "included": True,
                 },
+                {
+                    "tier": "retrieved_memories",
+                    "source_type": "memory",
+                    "source_id": memory.id,
+                    "included": True,
+                },
             ]
         },
     )
@@ -1121,10 +1173,25 @@ def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
         "",
         *sorted(character.id for character in repositories.list_characters(save.id)),
     ]
+    assert candidate_properties["target_type"]["enum"] == [
+        "",
+        "character",
+        "memory",
+    ]
+    assert candidate_properties["target_id"]["enum"] == [
+        "",
+        *sorted(
+            [
+                memory.id,
+                *(character.id for character in repositories.list_characters(save.id)),
+            ]
+        ),
+    ]
     assert candidate_properties["evidence_source_ids"]["items"]["enum"] == [
         *sorted(
             [
                 f"message:{player_message.id}",
+                f"memory:{memory.id}",
                 *(
                     f"character:{character.id}"
                     for character in repositories.list_characters(save.id)
@@ -1143,6 +1210,8 @@ def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
     } == {
         ("presence:ambiguous", "ambiguous_character_name"),
         ("memory:unknown-source", "unknown_evidence_source_id"),
+        ("memory:inline-marker", "unknown_evidence_source_id"),
+        ("knowledge:unknown-target", "unknown_target_entity_id"),
     }
 
 

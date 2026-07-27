@@ -40,6 +40,7 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.services.context_assembly import ContextAssemblyService
 from bragi.services.message_correction import MessageCorrectionContext
+from bragi.services.post_turn_inference import VerifiedPostTurnCoverage
 from bragi.services.prompt_inspection import PromptInspectionStore
 
 
@@ -2614,6 +2615,75 @@ def test_update_after_turn_creates_context_records_links_and_audit(
         assert set(row.source_message_ids) <= allowed_source_ids
         assert row.reason
         assert row.confidence > 0
+
+
+def test_update_after_turn_preserves_plan_owned_mood_but_applies_other_domains(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    present_character = repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        source_message_id=player_message.id,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The old scene.",
+        mood="planner-committed tension",
+        present_character_ids=[],
+        source_message_id=narrator_message.id,
+    )
+    extraction = module.ContextUpdateExtraction(
+        locations=(
+            module.ExtractedLocation(
+                name="Beacon Gallery",
+                source_message_id=narrator_message.id,
+                reason="The narrator moved the scene into the gallery.",
+            ),
+        ),
+        scene=module.ExtractedSceneSnapshot(
+            source_message_id=narrator_message.id,
+            current_location_name="Beacon Gallery",
+            situation="Captain Ilyra braces the failing lens.",
+            mood="legacy extractor overwrite",
+            present_character_names=("Captain Ilyra",),
+            reason="The narrator established the new scene.",
+        ),
+        active_threads=(
+            module.ExtractedActiveThread(
+                title="Stabilize the beacon",
+                source_message_id=narrator_message.id,
+                description="The lens may crack.",
+                reason="The failing lens remains unresolved.",
+            ),
+        ),
+    )
+
+    asyncio.run(
+        module.ContextUpdateService(
+            repositories=repositories,
+            extractor=RecordingContextUpdateExtractor(extraction),
+        ).update_after_turn(
+            save_id=save.id,
+            source_message_ids=(player_message.id, narrator_message.id),
+            verified_coverage=VerifiedPostTurnCoverage(
+                scene_snapshot_fields=frozenset({"mood"}),
+                applied_domains=frozenset({"scene_snapshot"}),
+                committed_count=1,
+            ),
+        )
+    )
+
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert snapshot is not None
+    assert snapshot.mood == "planner-committed tension"
+    assert snapshot.situation == "Captain Ilyra braces the failing lens."
+    assert snapshot.present_character_ids == [present_character.id]
+    assert repositories.get_location(snapshot.current_location_id or "") is not None
+    assert [thread.title for thread in repositories.list_active_threads(save.id)] == [
+        "Stabilize the beacon"
+    ]
 
 
 def test_update_after_turn_enriches_scene_created_sparse_location(

@@ -217,6 +217,9 @@ class NarratorMessageSpec:
 class _PlannerInventory:
     source_text_by_id: dict[str, str] = field(default_factory=dict)
     characters: tuple[CharacterRecord, ...] = ()
+    target_entity_ids_by_type: dict[str, frozenset[str]] = field(
+        default_factory=dict
+    )
     enforce_canonical_ids: bool = False
 
 
@@ -814,6 +817,9 @@ class StructuredProviderNarratorPlanner:
                     evidence_source_ids=tuple(inventory.source_text_by_id),
                     character_ids=tuple(
                         sorted(character.id for character in inventory.characters)
+                    ),
+                    target_entity_ids_by_type=(
+                        inventory.target_entity_ids_by_type
                     ),
                 ),
                 messages=_planner_messages(request),
@@ -1530,6 +1536,16 @@ def _structured_request_with_script_policy_feedback(
 
 
 _PLANNER_SOURCE_MARKER = re.compile(r"\[([a-z][a-z0-9_]*):([^\]]+)\]")
+_PLANNER_KNOWLEDGE_TARGET_TYPES = frozenset(
+    {
+        "character",
+        "memory",
+        "scenario_section",
+        "scene_snapshot",
+        "summary",
+        "world_state",
+    }
+)
 
 
 def _planner_inventory(
@@ -1541,6 +1557,7 @@ def _planner_inventory(
     if repositories is None:
         return _PlannerInventory()
     allowed_ids = _included_planner_source_ids(request.context_breakdown)
+    target_entity_ids_by_type = _planner_target_entity_ids(allowed_ids)
     character_ids = {
         source_id.split(":", 1)[1]
         for source_id in allowed_ids
@@ -1558,8 +1575,7 @@ def _planner_inventory(
     for text in request_texts:
         for source_type, source_id in _PLANNER_SOURCE_MARKER.findall(text):
             canonical_id = f"{source_type}:{source_id.strip()}"
-            if source_id.strip():
-                allowed_ids.add(canonical_id)
+            if source_id.strip() and canonical_id in allowed_ids:
                 source_text_by_id[canonical_id] = text
     raw_message_source_ids = request.context_breakdown.get(
         "planner_message_source_ids"
@@ -1595,6 +1611,7 @@ def _planner_inventory(
     return _PlannerInventory(
         source_text_by_id=ordered_source_text,
         characters=characters,
+        target_entity_ids_by_type=target_entity_ids_by_type,
         enforce_canonical_ids=True,
     )
 
@@ -1619,6 +1636,26 @@ def _included_planner_source_ids(
             if source_id.strip()
         )
     return source_ids
+
+
+def _planner_target_entity_ids(
+    source_ids: set[str],
+) -> dict[str, frozenset[str]]:
+    by_type: dict[str, set[str]] = {}
+    for source_id in source_ids:
+        if ":" not in source_id:
+            continue
+        source_type, entity_id = source_id.split(":", 1)
+        target_type = (
+            "character" if source_type == "character_voice" else source_type
+        )
+        if target_type not in _PLANNER_KNOWLEDGE_TARGET_TYPES or not entity_id:
+            continue
+        by_type.setdefault(target_type, set()).add(entity_id)
+    return {
+        target_type: frozenset(entity_ids)
+        for target_type, entity_ids in by_type.items()
+    }
 
 
 def _planner_breakdown_source_texts(request: ChatRequest) -> dict[str, str]:
@@ -1717,15 +1754,35 @@ def _planner_schema(
     *,
     evidence_source_ids: tuple[str, ...] = (),
     character_ids: tuple[str, ...] = (),
+    target_entity_ids_by_type: dict[str, frozenset[str]] | None = None,
 ) -> dict[str, object]:
     string_array = {"type": "array", "items": {"type": "string"}}
     evidence_item: dict[str, object] = {"type": "string"}
     if evidence_source_ids:
         evidence_item["enum"] = list(evidence_source_ids)
     evidence_array = {"type": "array", "items": evidence_item}
-    character_id_schema: dict[str, object] = {"type": "string"}
-    if character_ids:
-        character_id_schema["enum"] = ["", *character_ids]
+    character_id_schema: dict[str, object] = {
+        "type": "string",
+        "enum": ["", *character_ids],
+    }
+    target_entity_ids_by_type = target_entity_ids_by_type or {}
+    target_type_schema: dict[str, object] = {
+        "type": "string",
+        "enum": ["", *sorted(target_entity_ids_by_type)],
+    }
+    target_id_schema: dict[str, object] = {
+        "type": "string",
+        "enum": [
+            "",
+            *sorted(
+                {
+                    entity_id
+                    for entity_ids in target_entity_ids_by_type.values()
+                    for entity_id in entity_ids
+                }
+            ),
+        ],
+    }
     narrative_beat = {
         "type": "object",
         "additionalProperties": False,
@@ -1807,8 +1864,8 @@ def _planner_schema(
             "state_key": {"type": "string"},
             "field_path": {"type": "string"},
             "character_id": character_id_schema,
-            "target_type": {"type": "string"},
-            "target_id": {"type": "string"},
+            "target_type": target_type_schema,
+            "target_id": target_id_schema,
             "value": {"type": "object"},
             "safe_without_narration_allowed": {"type": "boolean"},
             "reason": {"type": "string"},
@@ -1985,6 +2042,13 @@ def _validated_narrator_message_spec(
                     rejected_value=candidate.evidence_quote,
                 )
             )
+            continue
+        target_rejection = _candidate_target_rejection(
+            candidate,
+            target_entity_ids_by_type=inventory.target_entity_ids_by_type,
+        )
+        if target_rejection is not None:
+            rejections.append(target_rejection)
             continue
         resolved_candidate, identity_rejection = _candidate_with_canonical_character(
             candidate,
@@ -2166,6 +2230,32 @@ def _candidate_with_canonical_character(
     if "character_id" in value:
         value["character_id"] = resolved_id
     return replace(candidate, character_id=resolved_id, value=value), None
+
+
+def _candidate_target_rejection(
+    candidate: StateCommitCandidate,
+    *,
+    target_entity_ids_by_type: dict[str, frozenset[str]],
+) -> PlannerRejection | None:
+    if candidate.candidate_type != "character_knowledge_edge":
+        return None
+    target_type = candidate.target_type or _string(candidate.value.get("target_type"))
+    target_id = candidate.target_id or _string(candidate.value.get("target_id"))
+    if target_type not in target_entity_ids_by_type:
+        return _planner_rejection(
+            candidate=candidate,
+            reason="unknown_target_entity_type",
+            field_name="target_type",
+            rejected_value=target_type,
+        )
+    if target_id not in target_entity_ids_by_type[target_type]:
+        return _planner_rejection(
+            candidate=candidate,
+            reason="unknown_target_entity_id",
+            field_name="target_id",
+            rejected_value=target_id,
+        )
+    return None
 
 
 def _resolve_character_id(
