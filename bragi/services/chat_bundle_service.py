@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from bragi import __version__
 from bragi.app_logging import log_event
+from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION
 from bragi.persistence.repositories import (
     PersistenceRepositories,
@@ -2454,7 +2455,9 @@ class ChatBundleService:
         _insert_rows(
             connection,
             "character_text_proactive_triggers",
-            character_text_proactive_triggers,
+            _coalesce_import_proactive_triggers(
+                character_text_proactive_triggers
+            ),
         )
 
         character_contact_states: list[dict[str, object]] = []
@@ -4448,20 +4451,25 @@ def _remapped_character_text_trigger_key(
 ) -> str:
     parts = trigger_key.split(":")
     if len(parts) < 2:
-        return _remapped_imported_id_fragment(trigger_key, mappings)
+        return trigger_key
+    if parts[0] == "ambient_random" and len(parts) >= 3:
+        remapped = list(parts)
+        remapped[1] = _mapped_entity_id(mappings, "message", remapped[1])
+        remapped[2] = _mapped_entity_id(mappings, "character", remapped[2])
+        return ":".join(remapped)
     source_type = {
         "active_thread": "active_thread",
         "dating_route": "dating_route_state",
         "character_intent": "character",
+        "memory": "memory",
+        "memories": "memory",
     }.get(parts[0])
     if source_type is None:
-        return _remapped_imported_id_fragment(trigger_key, mappings)
+        return trigger_key
     remapped = list(parts)
     remapped[1] = _mapped_entity_id(mappings, source_type, remapped[1])
-    remapped[2:] = [
-        _remapped_imported_id_fragment(part, mappings) if part else part
-        for part in remapped[2:]
-    ]
+    if parts[0] in {"active_thread", "character_intent"} and len(parts) >= 3:
+        remapped[2] = _mapped_entity_id(mappings, "message", remapped[2])
     return ":".join(remapped)
 
 
@@ -5852,77 +5860,49 @@ def _coalesce_import_context_sources(
     return list(coalesced.values())
 
 
+def _coalesce_import_proactive_triggers(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    coalesced: dict[tuple[object, object, object], dict[str, object]] = {}
+    for row in rows:
+        key = (
+            row.get("save_id"),
+            row.get("character_id"),
+            row.get("trigger_key"),
+        )
+        existing = coalesced.get(key)
+        if existing is None:
+            coalesced[key] = row
+            continue
+        for field in (
+            "thread_id",
+            "text_message_id",
+            "source_message_id",
+        ):
+            if row.get(field) is not None:
+                existing[field] = row[field]
+        for field in (
+            "trigger_type",
+            "source_type",
+            "source_id",
+            "reason",
+        ):
+            value = row.get(field)
+            if isinstance(value, str) and value:
+                existing[field] = value
+        if row.get("updated_at") is not None:
+            existing["updated_at"] = row["updated_at"]
+    return list(coalesced.values())
+
+
 def _merged_import_context_source_metadata_json(
     first: object,
     second: object,
 ) -> str:
-    metadata: dict[str, object] = {}
-    loaded_metadata: list[dict[str, object]] = []
-    for raw in (first, second):
-        try:
-            loaded = json.loads(str(raw))
-        except (json.JSONDecodeError, TypeError):
-            loaded = {}
-        if isinstance(loaded, dict):
-            typed = cast(dict[str, object], loaded)
-            loaded_metadata.append(typed)
-            metadata.update(typed)
-    for field in (
-        "source_message_ids",
-        "audience_character_ids",
-        "known_by",
-        "tags",
-    ):
-        values: list[str] = []
-        for item in loaded_metadata:
-            raw_values = item.get(field)
-            if not isinstance(raw_values, list):
-                continue
-            values.extend(
-                str(value)
-                for value in raw_values
-                if isinstance(value, str) and value
-            )
-        merged_values = list(dict.fromkeys(values))
-        if (
-            field == "source_message_ids"
-            and len(merged_values)
-            > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS
-        ):
-            raise ChatBundleError(
-                "Merged context source message provenance is too large"
-            )
-        metadata[field] = merged_values
-    groups: list[list[str]] = []
-    for item in loaded_metadata:
-        raw_groups = item.get("source_provenance_groups")
-        if not isinstance(raw_groups, list):
-            continue
-        for raw_group in raw_groups:
-            if not isinstance(raw_group, list):
-                continue
-            group = [
-                str(value)
-                for value in raw_group
-                if isinstance(value, str) and value
-            ]
-            if group and group not in groups:
-                groups.append(group)
-                if len(groups) > _MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS:
-                    raise ChatBundleError(
-                        "Merged context source provenance is too large"
-                    )
-    metadata["source_provenance_groups"] = groups
-    metadata["source_provenance_mode"] = (
-        "all"
-        if any(
-            item.get("source_provenance_mode") == "all"
-            for item in loaded_metadata
-        )
-        else "any"
-    )
-    if any(item.get("requires_audience") is True for item in loaded_metadata):
-        metadata["requires_audience"] = True
+    try:
+        metadata = merge_context_source_metadata(first, second)
+    except ValueError as exc:
+        raise ChatBundleError(str(exc)) from exc
     return _dump_json_compact(metadata)
 
 

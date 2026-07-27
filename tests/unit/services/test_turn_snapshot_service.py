@@ -75,6 +75,59 @@ def test_snapshot_import_coalesces_many_to_one_memory_remaps() -> None:
     ]
 
 
+def test_snapshot_object_decode_rejects_declared_size_bomb() -> None:
+    payload = json.dumps("x" * (1024 * 1024)).encode("utf-8")
+
+    with pytest.raises(ValueError, match="size mismatch"):
+        turn_snapshot_module._decode_exported_snapshot_object(
+            {
+                "object_hash": "object-one",
+                "kind": "table_rows",
+                "encoding": turn_snapshot_module.SNAPSHOT_ENCODING,
+                "payload_base64": base64.b64encode(
+                    zlib.compress(payload)
+                ).decode("ascii"),
+                "uncompressed_size": 16,
+            }
+        )
+
+
+def test_snapshot_object_decode_rejects_oversized_declared_object() -> None:
+    with pytest.raises(ValueError, match="too large"):
+        turn_snapshot_module._decode_exported_snapshot_object(
+            {
+                "object_hash": "object-one",
+                "kind": "table_rows",
+                "encoding": turn_snapshot_module.SNAPSHOT_ENCODING,
+                "payload_base64": "",
+                "uncompressed_size": (
+                    turn_snapshot_module._MAX_SNAPSHOT_OBJECT_UNCOMPRESSED_BYTES
+                    + 1
+                ),
+            }
+        )
+
+
+def test_snapshot_trigger_key_remapping_is_schema_aware() -> None:
+    remapper = turn_snapshot_module._SnapshotRemapper(
+        source_save_id="save-old",
+        target_save_id="save-new",
+        rows_by_table={},
+        id_maps={
+            "messages": {"message-old": "message-new"},
+            "characters": {"character-old": "character-new"},
+            "memories": {"shared-id": "memory-new"},
+        },
+    )
+
+    assert remapper._remap_trigger_key(
+        "ambient_random:message-old:character-old"
+    ) == "ambient_random:message-new:character-new"
+    assert remapper._remap_trigger_key(
+        "character_intent:shared-id:basis"
+    ) == "character_intent:shared-id:basis"
+
+
 def test_legacy_memory_normalization_preserves_other_id_namespaces() -> None:
     rows = turn_snapshot_module._normalize_legacy_snapshot_memories(
         {
@@ -113,6 +166,16 @@ def test_legacy_memory_normalization_preserves_other_id_namespaces() -> None:
                     ),
                 },
             ),
+            "character_text_proactive_triggers": (
+                {
+                    "id": "trigger-one",
+                    "save_id": "save-one",
+                    "character_id": "memory-duplicate",
+                    "trigger_key": "character_intent:memory-duplicate:basis",
+                    "source_type": "character",
+                    "source_id": "memory-duplicate",
+                },
+            ),
         }
     )
 
@@ -131,6 +194,9 @@ def test_legacy_memory_normalization_preserves_other_id_namespaces() -> None:
         "memory:memory-keeper",
         "character:memory-duplicate",
     ]
+    [trigger] = rows["character_text_proactive_triggers"]
+    assert trigger["trigger_key"] == "character_intent:memory-duplicate:basis"
+    assert trigger["source_id"] == "memory-duplicate"
 
 
 def test_legacy_memory_normalization_bounds_merged_provenance() -> None:

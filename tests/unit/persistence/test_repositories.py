@@ -3127,6 +3127,12 @@ def test_restore_memories_merges_active_fingerprint_collision(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, message_id = _persist_repository_save(repositories)
+    visible_message = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Mara confirms the tea preference.",
+    )
     archived = repositories.add_memory(
         save_id=save_id,
         body="Mara likes tea.",
@@ -3140,6 +3146,7 @@ def test_restore_memories_merges_active_fingerprint_collision(
         source_id=archived.id,
         title="Archived preference",
         body=archived.body,
+        metadata={"source_message_ids": [message_id]},
     )
     repositories.archive_memory(archived.id)
     active = repositories.add_memory(
@@ -3154,6 +3161,7 @@ def test_restore_memories_merges_active_fingerprint_collision(
         source_id=active.id,
         title="Replacement preference",
         body=active.body,
+        metadata={"source_message_ids": [visible_message.id]},
     )
     character = repositories.add_character(
         save_id=save_id,
@@ -3191,6 +3199,10 @@ def test_restore_memories_merges_active_fingerprint_collision(
         source_type="memory",
     )
     assert source.source_id == archived.id
+    assert source.metadata["source_provenance_groups"] == [
+        [message_id],
+        [visible_message.id],
+    ]
     [trigger] = repositories.list_character_text_proactive_triggers(save_id)
     assert trigger.trigger_key == f"memory:{archived.id}"
     assert trigger.source_id == archived.id

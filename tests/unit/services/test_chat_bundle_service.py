@@ -21,6 +21,8 @@ from bragi.services.chat_bundle_service import (
     _coalesce_import_context_sources,
     _coalesce_import_entity_links,
     _coalesce_import_knowledge_edges,
+    _coalesce_import_proactive_triggers,
+    _remapped_character_text_trigger_key,
 )
 from bragi.services.director_pressure_service import DIRECTOR_PRESSURE_STATE_KEY
 from bragi.services.generation_settings import MODEL_THINKING_PREFERENCES_SETTING
@@ -146,6 +148,84 @@ def test_legacy_import_rows_coalesce_after_memory_id_remapping() -> None:
         "message-one",
         "message-two",
     ]
+
+
+def test_import_context_sources_keep_legacy_provenance_alternatives() -> None:
+    [source] = _coalesce_import_context_sources(
+        [
+            {
+                "id": "source-one",
+                "save_id": "target-save",
+                "source_type": "memory",
+                "source_id": "merged-memory",
+                "metadata_json": '{"source_message_ids":["message-hidden"]}',
+                "token_estimate": 3,
+                "archived_at": None,
+            },
+            {
+                "id": "source-two",
+                "save_id": "target-save",
+                "source_type": "memory",
+                "source_id": "merged-memory",
+                "metadata_json": '{"source_message_ids":["message-visible"]}',
+                "token_estimate": 4,
+                "archived_at": None,
+            },
+        ]
+    )
+
+    metadata = json.loads(cast(str, source["metadata_json"]))
+    assert metadata["source_provenance_groups"] == [
+        ["message-hidden"],
+        ["message-visible"],
+    ]
+
+
+def test_import_proactive_triggers_coalesce_and_remap_schema_keys() -> None:
+    mappings = {
+        "message": {"message-old": "message-new"},
+        "character": {"character-old": "character-new"},
+        "memory": {
+            "memory-one": "memory-merged",
+            "memory-two": "memory-merged",
+        },
+    }
+    assert _remapped_character_text_trigger_key(
+        "ambient_random:message-old:character-old",
+        mappings,
+    ) == "ambient_random:message-new:character-new"
+    assert _remapped_character_text_trigger_key(
+        "character_intent:memory-one:basis",
+        mappings,
+    ) == "character_intent:memory-one:basis"
+
+    rows = _coalesce_import_proactive_triggers(
+        [
+            {
+                "id": "trigger-one",
+                "save_id": "target-save",
+                "character_id": "character-new",
+                "trigger_key": "memory:memory-merged",
+                "trigger_type": "memory_changed",
+                "source_type": "memory",
+                "source_id": "memory-merged",
+                "reason": "Original reason",
+            },
+            {
+                "id": "trigger-two",
+                "save_id": "target-save",
+                "character_id": "character-new",
+                "trigger_key": "memory:memory-merged",
+                "trigger_type": "memory_changed",
+                "source_type": "memory",
+                "source_id": "memory-merged",
+                "reason": "Replacement reason",
+            },
+        ]
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "Replacement reason"
 
 
 def test_import_knowledge_edges_coalesce_target_aliases_and_scalar_provenance() -> None:

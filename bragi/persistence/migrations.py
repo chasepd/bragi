@@ -12,6 +12,7 @@ from pathlib import Path
 
 from bragi.model_tasks import is_retired_model_task
 from bragi.observation_types import normalize_observation_type
+from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.private_files import ensure_private_file
 from bragi.text_search import cjk_lexical_anchors, unicode_word_terms
 
@@ -2109,6 +2110,45 @@ def _remap_migrated_memory_references(
             (save_id, duplicate_id),
         )
     if _table_exists(connection, "context_sources"):
+        source_rows = connection.execute(
+            """
+            SELECT source_id, metadata_json, token_estimate
+            FROM context_sources
+            WHERE save_id = ? AND source_type = 'memory'
+              AND source_id IN (?, ?) AND archived_at IS NULL
+            """,
+            (save_id, keeper_id, duplicate_id),
+        ).fetchall()
+        sources_by_id = {str(row[0]): row for row in source_rows}
+        keeper_source = sources_by_id.get(keeper_id)
+        duplicate_source = sources_by_id.get(duplicate_id)
+        if keeper_source is not None and duplicate_source is not None:
+            merged_metadata = merge_context_source_metadata(
+                keeper_source[1],
+                duplicate_source[1],
+            )
+            connection.execute(
+                """
+                UPDATE context_sources
+                SET metadata_json = ?, token_estimate = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE save_id = ? AND source_type = 'memory'
+                  AND source_id = ? AND archived_at IS NULL
+                """,
+                (
+                    json.dumps(
+                        merged_metadata,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    max(
+                        int(keeper_source[2] or 0),
+                        int(duplicate_source[2] or 0),
+                    ),
+                    save_id,
+                    keeper_id,
+                ),
+            )
         connection.execute(
             """
             DELETE FROM context_sources AS keeper_source
@@ -2228,12 +2268,21 @@ def _remap_migrated_memory_proactive_triggers(
                     source_type IN ('memory', 'memories')
                     AND source_id = ?
                 )
-                OR trigger_key = ?
-                OR instr(':' || trigger_key || ':', ':' || ? || ':') > 0
+                OR trigger_key = 'memory:' || ?
+                OR instr(trigger_key, 'memory:' || ? || ':') = 1
+                OR trigger_key = 'memories:' || ?
+                OR instr(trigger_key, 'memories:' || ? || ':') = 1
               )
         ORDER BY rowid
         """,
-        (save_id, duplicate_id, duplicate_id, duplicate_id),
+        (
+            save_id,
+            duplicate_id,
+            duplicate_id,
+            duplicate_id,
+            duplicate_id,
+            duplicate_id,
+        ),
     ).fetchall()
     for row in rows:
         (
@@ -2247,10 +2296,14 @@ def _remap_migrated_memory_proactive_triggers(
             source_message_id,
             reason,
         ) = row
-        remapped_key = ":".join(
-            keeper_id if part == duplicate_id else part
-            for part in str(trigger_key).split(":")
-        )
+        key_parts = str(trigger_key).split(":")
+        if (
+            len(key_parts) >= 2
+            and key_parts[0] in {"memory", "memories"}
+            and key_parts[1] == duplicate_id
+        ):
+            key_parts[1] = keeper_id
+        remapped_key = ":".join(key_parts)
         remapped_source_id = (
             keeper_id
             if source_type in {"memory", "memories"}

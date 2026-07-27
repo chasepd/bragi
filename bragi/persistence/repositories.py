@@ -15,6 +15,7 @@ from typing import Any, cast
 from uuid import uuid4
 
 from bragi.observation_types import normalize_observation_type
+from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.persistence.migrations import (
     _remap_migrated_memory_proactive_triggers,
     _remap_migrated_memory_references,
@@ -10531,6 +10532,11 @@ class PersistenceRepositories:
                 )
                 for duplicate in group[1:]:
                     remapped_ids[duplicate.id] = keeper.id
+                    self._merge_active_memory_context_source_conflicts(
+                        save_id=save_id,
+                        keeper_id=keeper.id,
+                        duplicate_id=duplicate.id,
+                    )
                     self._merge_active_memory_knowledge_edge_conflicts(
                         save_id=save_id,
                         keeper_id=keeper.id,
@@ -10720,6 +10726,51 @@ class PersistenceRepositories:
             self.rollback_transaction()
             raise
         return remapped_ids
+
+    def _merge_active_memory_context_source_conflicts(
+        self,
+        *,
+        save_id: str,
+        keeper_id: str,
+        duplicate_id: str,
+    ) -> None:
+        rows = self._fetch_all(
+            """
+            SELECT source_id, metadata_json, token_estimate
+            FROM context_sources
+            WHERE save_id = ? AND source_type = 'memory'
+              AND source_id IN (?, ?) AND archived_at IS NULL
+            """,
+            (save_id, keeper_id, duplicate_id),
+        )
+        rows_by_source_id = {str(row["source_id"]): row for row in rows}
+        keeper = rows_by_source_id.get(keeper_id)
+        duplicate = rows_by_source_id.get(duplicate_id)
+        if keeper is None or duplicate is None:
+            return
+        metadata = merge_context_source_metadata(
+            keeper["metadata_json"],
+            duplicate["metadata_json"],
+        )
+        _validate_context_source_provenance_metadata(metadata)
+        self.connection.execute(
+            """
+            UPDATE context_sources
+            SET metadata_json = ?, token_estimate = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE save_id = ? AND source_type = 'memory'
+              AND source_id = ? AND archived_at IS NULL
+            """,
+            (
+                _dump_json(metadata),
+                max(
+                    int(keeper["token_estimate"] or 0),
+                    int(duplicate["token_estimate"] or 0),
+                ),
+                save_id,
+                keeper_id,
+            ),
+        )
 
     def _merge_active_memory_knowledge_edge_conflicts(
         self,

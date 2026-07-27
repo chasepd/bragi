@@ -46,6 +46,8 @@ from bragi.services.sexual_content_safety import (
 SNAPSHOT_FORMAT = "bragi-turn-snapshot-v1"
 _MAX_SNAPSHOT_PROVENANCE_GROUPS = 64
 _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS = 64
+_MAX_SNAPSHOT_OBJECT_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
+_MAX_SNAPSHOT_TOTAL_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
 SNAPSHOT_ENCODING = "zlib-json-v1"
 
 
@@ -1741,21 +1743,33 @@ class _SnapshotRemapper:
             return value
         parts = value.split(":")
         if len(parts) < 2:
-            return self._remap_string_id(value)
+            return value
+        if parts[0] == "ambient_random" and len(parts) >= 3:
+            remapped = list(parts)
+            mapped_message_id = self._mapped_table_id("messages", remapped[1])
+            mapped_character_id = self._mapped_table_id("characters", remapped[2])
+            if isinstance(mapped_message_id, str):
+                remapped[1] = mapped_message_id
+            if isinstance(mapped_character_id, str):
+                remapped[2] = mapped_character_id
+            return ":".join(remapped)
         table_name = {
             "active_thread": "active_threads",
             "dating_route": "dating_route_states",
             "character_intent": "characters",
+            "memory": "memories",
+            "memories": "memories",
         }.get(parts[0])
         if table_name is None:
-            return self._remap_string_id(value)
+            return value
         remapped = list(parts)
         mapped_entity_id = self._mapped_table_id(table_name, remapped[1])
         if isinstance(mapped_entity_id, str):
             remapped[1] = mapped_entity_id
-        remapped[2:] = [
-            self._remap_string_id(part) if part else part for part in remapped[2:]
-        ]
+        if parts[0] in {"active_thread", "character_intent"} and len(parts) >= 3:
+            mapped_basis = self._mapped_table_id("messages", remapped[2])
+            if isinstance(mapped_basis, str):
+                remapped[2] = mapped_basis
         return ":".join(remapped)
 
 
@@ -2618,8 +2632,23 @@ def _decode_exported_snapshot_object(row: Mapping[str, object]) -> tuple[str, ob
     encoding = _text(row, "encoding")
     if encoding != SNAPSHOT_ENCODING:
         raise ValueError(f"Unsupported snapshot object encoding: {encoding}")
+    declared_size = _int(row, "uncompressed_size")
+    if (
+        declared_size < 0
+        or declared_size > _MAX_SNAPSHOT_OBJECT_UNCOMPRESSED_BYTES
+    ):
+        raise ValueError(f"Snapshot object is too large: {object_hash}")
     try:
-        payload = zlib.decompress(base64.b64decode(_text(row, "payload_base64")))
+        compressed = base64.b64decode(_text(row, "payload_base64"))
+        decompressor = zlib.decompressobj()
+        payload = decompressor.decompress(compressed, declared_size + 1)
+        if (
+            len(payload) > declared_size
+            or decompressor.unconsumed_tail
+            or not decompressor.eof
+        ):
+            raise ValueError(f"Snapshot object size mismatch: {object_hash}")
+        payload += decompressor.flush()
         value = json.loads(payload.decode("utf-8"))
     except (
         binascii.Error,
@@ -2628,7 +2657,7 @@ def _decode_exported_snapshot_object(row: Mapping[str, object]) -> tuple[str, ob
         zlib.error,
     ) as exc:
         raise ValueError(f"Invalid snapshot object payload: {object_hash}") from exc
-    if len(payload) != _int(row, "uncompressed_size"):
+    if len(payload) != declared_size:
         raise ValueError(f"Snapshot object size mismatch: {object_hash}")
     actual_hash = _snapshot_object_hash(kind=kind, payload=payload)
     if actual_hash != object_hash:
@@ -2650,10 +2679,17 @@ def _validate_exported_snapshot_rows(
         _text(row, "root_manifest_hash")
 
     objects_by_hash: dict[str, tuple[str, object]] = {}
+    total_uncompressed_size = 0
     for object_row in object_rows:
         object_hash = _text(object_row, "object_hash")
         if object_hash in objects_by_hash:
             raise ValueError(f"Duplicate snapshot object in bundle: {object_hash}")
+        declared_size = _int(object_row, "uncompressed_size")
+        if declared_size < 0:
+            raise ValueError(f"Snapshot object size is invalid: {object_hash}")
+        total_uncompressed_size += declared_size
+        if total_uncompressed_size > _MAX_SNAPSHOT_TOTAL_UNCOMPRESSED_BYTES:
+            raise ValueError("Snapshot objects are too large")
         objects_by_hash[object_hash] = _decode_exported_snapshot_object(object_row)
 
     for row in snapshots:
@@ -2887,10 +2923,14 @@ def _remap_snapshot_memory_text(
     value: str,
     memory_id_map: Mapping[str, str],
 ) -> str:
-    direct = memory_id_map.get(value)
-    if direct is not None:
-        return direct
-    return ":".join(memory_id_map.get(part, part) for part in value.split(":"))
+    parts = value.split(":")
+    if (
+        len(parts) >= 2
+        and parts[0] in {"memory", "memories"}
+        and parts[1] in memory_id_map
+    ):
+        parts[1] = memory_id_map[parts[1]]
+    return ":".join(parts)
 
 
 def _remap_snapshot_typed_memory_reference(
