@@ -49,7 +49,6 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from bragi.interaction_mode import normalize_interaction_mode
 from bragi_common.media_mime import safe_served_media_mime_type
 from bragi_web.auth_throttle import AuthAttemptThrottle
 from bragi_web.bragi_adapter import (
@@ -6578,10 +6577,11 @@ def _raise_if_invalid_interaction_mode(value: object) -> None:
             status_code=400,
             detail="interaction_mode must be 'roleplay' or 'storyteller'",
         )
-    try:
-        normalize_interaction_mode(value)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if value is not None and value not in {"roleplay", "storyteller"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown interaction mode: {value}",
+        )
 
 
 def _raise_unless_save_diagnostics_allowed(
