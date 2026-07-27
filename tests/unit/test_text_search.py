@@ -57,3 +57,12 @@ def test_unicode_normalization_preserves_middle_after_compatibility_expansion() 
     )
 
     assert "target-9999" in structured_identifiers(value)
+
+
+def test_structured_identifier_bounds_do_not_fabricate_partial_identifier() -> None:
+    value = (" " * 65_520) + "SECRET-42XYZEXTRA"
+
+    identifiers = structured_identifiers(value)
+
+    assert "secret-42xyzextr" not in identifiers
+    assert "secret-42xyzextra" in identifiers

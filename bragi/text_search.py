@@ -67,7 +67,7 @@ def structured_identifiers(
 ) -> tuple[str, ...]:
     normalized = unicodedata.normalize(
         "NFKC",
-        value[:max_input_chars],
+        _bounded_identifier_input(value, max_input_chars=max_input_chars),
     ).casefold()
     identifiers = tuple(
         dict.fromkeys(
@@ -93,6 +93,41 @@ def structured_identifiers(
             )
         )
     )[:max_identifiers]
+
+
+def _bounded_identifier_input(value: str, *, max_input_chars: int) -> str:
+    if max_input_chars <= 0:
+        return ""
+    if len(value) <= max_input_chars:
+        return value
+    edge_chars = max(1, (max_input_chars - 1) // 2)
+    prefix_end = edge_chars
+    if (
+        prefix_end < len(value)
+        and _structured_identifier_character(value[prefix_end - 1])
+        and _structured_identifier_character(value[prefix_end])
+    ):
+        while (
+            prefix_end > 0
+            and _structured_identifier_character(value[prefix_end - 1])
+        ):
+            prefix_end -= 1
+    suffix_start = len(value) - edge_chars
+    if (
+        suffix_start > 0
+        and _structured_identifier_character(value[suffix_start - 1])
+        and _structured_identifier_character(value[suffix_start])
+    ):
+        while (
+            suffix_start < len(value)
+            and _structured_identifier_character(value[suffix_start])
+        ):
+            suffix_start += 1
+    return f"{value[:prefix_end]} {value[suffix_start:]}"
+
+
+def _structured_identifier_character(character: str) -> bool:
+    return character.isalnum() or character in {"-", "_", "."}
 
 
 def structured_identifier_filter(title: str, body: str) -> bytes:

@@ -3480,6 +3480,26 @@ class PersistenceRepositories:
         )
         self.connection.execute(
             """
+            DELETE FROM context_source_normalized_budget_entries
+            WHERE context_source_id = ?
+            """,
+            (record.id,),
+        )
+        _, normalized_text_bytes = _context_source_text_budget_usage(
+            record.title,
+            record.body,
+        )
+        self.connection.execute(
+            """
+            INSERT INTO context_source_normalized_budget_entries(
+                context_source_id, save_id, normalized_text_bytes
+            )
+            VALUES (?, ?, ?)
+            """,
+            (record.id, record.save_id, normalized_text_bytes),
+        )
+        self.connection.execute(
+            """
             DELETE FROM context_source_exact_identifiers
             WHERE context_source_id = ?
             """,
@@ -3509,16 +3529,22 @@ class PersistenceRepositories:
     ) -> None:
         state_row = self.connection.execute(
             """
-            SELECT source_text_bytes, index_rows, index_bytes
+            SELECT source_text_bytes, normalized_text_bytes,
+                   index_rows, index_bytes
             FROM context_source_index_budget_state
             WHERE save_id = ?
             """,
             (record.save_id,),
         ).fetchone()
-        source_text_bytes, indexed_rows, indexed_bytes = (
-            (int(state_row[0]), int(state_row[1]), int(state_row[2]))
+        source_text_bytes, normalized_text_bytes, indexed_rows, indexed_bytes = (
+            (
+                int(state_row[0]),
+                int(state_row[1]),
+                int(state_row[2]),
+                int(state_row[3]),
+            )
             if state_row is not None
-            else (0, 0, 0)
+            else (0, 0, 0, 0)
         )
         existing_source = self.connection.execute(
             """
@@ -3534,17 +3560,30 @@ class PersistenceRepositories:
                 str(existing_source[1] or ""),
             )
             source_text_bytes -= existing_source_bytes
+            existing_normalized_row = self.connection.execute(
+                """
+                SELECT normalized_text_bytes
+                FROM context_source_normalized_budget_entries
+                WHERE context_source_id = ?
+                """,
+                (record.id,),
+            ).fetchone()
+            if existing_normalized_row is not None:
+                normalized_text_bytes -= int(existing_normalized_row[0])
         added_source_bytes, added_normalized_bytes = (
             _context_source_text_budget_usage(record.title, record.body)
         )
         source_text_bytes += added_source_bytes
+        normalized_text_bytes += added_normalized_bytes
         if source_text_bytes > MAX_CONTEXT_SOURCE_TEXT_BYTES_PER_REBUILD:
             raise ValueError("Context source text is too large to rebuild")
-        if (
-            added_normalized_bytes
-            > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD
-        ):
+        if added_normalized_bytes > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD:
             raise ValueError("Normalized context source text is too large")
+        if (
+            normalized_text_bytes
+            > MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD
+        ):
+            raise ValueError("Normalized context source text is too large to rebuild")
         existing_index_rows, existing_index_bytes = self.connection.execute(
             """
             SELECT

@@ -3948,23 +3948,9 @@ def _curated_decision_is_grounded(
         observation.claim
     ):
         return False
-    supporting_contexts = tuple(
-        context
+    return any(
+        _grounding_source_is_losslessly_equivalent(proposed, source_text)
         for source_text in supporting_texts
-        if (
-            context := _source_context_for_evidence_quote(
-                decision.supporting_evidence_quote,
-                source_text,
-            )
-        )
-    )
-    return bool(supporting_contexts) and any(
-        not _grounding_negation_conflicts(proposed, context)
-        and not _grounding_denial_conflicts(proposed, context)
-        and not _grounding_modality_conflicts(proposed, context)
-        and _grounding_context_preserves_claim_boundary(proposed, context)
-        and _grounding_order_is_preserved(proposed, context)
-        for context in supporting_contexts
     )
 
 
@@ -4081,11 +4067,26 @@ def _grounding_context_preserves_claim_boundary(
 ) -> bool:
     if "~~" in context:
         return False
-    if _grounding_semantic_markers(context) != _grounding_semantic_markers(claim):
+    if _grounding_critical_markers(claim) != _grounding_critical_markers(context):
         return False
     claim_terms = _grounding_boundary_terms(claim)
     context_terms = _grounding_boundary_terms(context)
     return bool(claim_terms) and context_terms == claim_terms
+
+
+def _grounding_source_is_losslessly_equivalent(
+    claim: str,
+    source_text: str,
+) -> bool:
+    return bool(
+        not _grounding_negation_conflicts(claim, source_text)
+        and not _grounding_denial_conflicts(claim, source_text)
+        and not _grounding_modality_conflicts(claim, source_text)
+        and _grounding_context_preserves_claim_boundary(claim, source_text)
+        and _grounding_semantic_markers(claim)
+        == _grounding_semantic_markers(source_text)
+        and _grounding_order_is_preserved(claim, source_text)
+    )
 
 
 def _grounding_semantic_markers(value: str) -> tuple[str, ...]:
@@ -4096,8 +4097,33 @@ def _grounding_semantic_markers(value: str) -> tuple[str, ...]:
         character
         for character in normalized
         if (
-            character not in {"'", "’"}
+            character not in {
+                "'",
+                "’",
+                ",",
+                "-",
+                "_",
+                ":",
+                ";",
+                "–",
+                "—",
+            }
             and unicodedata.category(character).startswith(("P", "S"))
+        )
+    )
+
+
+def _grounding_critical_markers(value: str) -> tuple[str, ...]:
+    return tuple(
+        character
+        for character in unicodedata.normalize("NFKC", value)
+        if (
+            character in {"?", "~"}
+            or "QUESTION" in unicodedata.name(character, "")
+            or "INTERROBANG" in unicodedata.name(character, "")
+            or "NOT SIGN" in unicodedata.name(character, "")
+            or "NEGATION" in unicodedata.name(character, "")
+            or "CROSS MARK" in unicodedata.name(character, "")
         )
     )
 

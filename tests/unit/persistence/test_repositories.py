@@ -4782,6 +4782,54 @@ def test_repositories_rejects_source_text_budget_before_persisting_source(
     )
 
 
+def test_repositories_rejects_aggregate_normalized_budget_before_persisting_source(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-existing",
+        title="Existing",
+        body="\ufdfa" * 32,
+    )
+    normalized_bytes = repositories.connection.execute(
+        """
+        SELECT normalized_text_bytes
+        FROM context_source_index_budget_state
+        WHERE save_id = ?
+        """,
+        (save_id,),
+    ).fetchone()[0]
+    monkeypatch.setattr(
+        repositories_module,
+        "MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD",
+        normalized_bytes,
+    )
+
+    with pytest.raises(ValueError, match="Normalized context source text"):
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id="memory-rejected",
+            title="Rejected",
+            body="\ufdfa",
+        )
+
+    assert (
+        repositories.connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM context_sources
+            WHERE save_id = ? AND source_id = 'memory-rejected'
+            """,
+            (save_id,),
+        ).fetchone()[0]
+        == 0
+    )
+
+
 def test_repositories_bounds_index_rebuild_before_writing(
     repositories: PersistenceRepositories,
     monkeypatch: pytest.MonkeyPatch,

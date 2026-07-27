@@ -919,7 +919,7 @@ def test_curated_free_text_must_preserve_the_complete_source_message(
         "Mara has the red key. 2 + 2 = 4.",
     ],
 )
-def test_curated_free_text_accepts_grounded_sentence_in_longer_message(
+def test_curated_free_text_requires_confirmation_for_longer_message(
     source_text: str,
 ) -> None:
     observation = ContextObservationRecord(
@@ -928,6 +928,47 @@ def test_curated_free_text_accepts_grounded_sentence_in_longer_message(
         observation_type="character_fact",
         claim="Mara has the red key.",
         evidence_quote="Mara has the red key",
+        source_message_ids=["message-imported"],
+        scope="durable",
+        status="pending",
+        confidence=0.99,
+        tags=["key"],
+        metadata={},
+    )
+    decision = CurationDecision(
+        observation_id=observation.id,
+        action="durable_memory",
+        reason="Stable fact.",
+        confidence=0.99,
+        memory_body=observation.claim,
+        grounding_status="entailed",
+        supporting_evidence_quote=observation.evidence_quote,
+        supporting_source_message_ids=("message-imported",),
+    )
+
+    assert not agentic_context_module._curated_decision_is_grounded(
+        decision,
+        observation=observation,
+        source_texts=(source_text,),
+    )
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    [
+        "Mara has the red, key.",
+        "Mara has the red-key.",
+    ],
+)
+def test_curated_free_text_allows_benign_internal_punctuation(
+    source_text: str,
+) -> None:
+    observation = ContextObservationRecord(
+        id="observation-imported",
+        save_id="save-imported",
+        observation_type="character_fact",
+        claim="Mara has the red key.",
+        evidence_quote="Mara has the red",
         source_message_ids=["message-imported"],
         scope="durable",
         status="pending",

@@ -4328,13 +4328,6 @@ def _ensure_context_source_search_terms_schema(
             value TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS context_source_index_budget_state (
-            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
-            source_text_bytes INTEGER NOT NULL DEFAULT 0,
-            index_rows INTEGER NOT NULL DEFAULT 0,
-            index_bytes INTEGER NOT NULL DEFAULT 0
-        );
-
         DROP TRIGGER IF EXISTS trg_context_source_budget_insert;
         DROP TRIGGER IF EXISTS trg_context_source_budget_delete;
         DROP TRIGGER IF EXISTS trg_context_source_budget_update;
@@ -4342,7 +4335,27 @@ def _ensure_context_source_search_terms_schema(
         DROP TRIGGER IF EXISTS trg_context_source_term_budget_delete;
         DROP TRIGGER IF EXISTS trg_context_source_identifier_budget_insert;
         DROP TRIGGER IF EXISTS trg_context_source_identifier_budget_delete;
+        DROP TRIGGER IF EXISTS trg_context_source_normalized_budget_insert;
+        DROP TRIGGER IF EXISTS trg_context_source_normalized_budget_delete;
         DROP TRIGGER IF EXISTS trg_context_source_archive_index_cleanup;
+
+        DROP TABLE IF EXISTS context_source_normalized_budget_entries;
+        DROP TABLE IF EXISTS context_source_index_budget_state;
+
+        CREATE TABLE context_source_index_budget_state (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            source_text_bytes INTEGER NOT NULL DEFAULT 0,
+            normalized_text_bytes INTEGER NOT NULL DEFAULT 0,
+            index_rows INTEGER NOT NULL DEFAULT 0,
+            index_bytes INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE context_source_normalized_budget_entries (
+            context_source_id TEXT PRIMARY KEY
+                REFERENCES context_sources(id) ON DELETE CASCADE,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            normalized_text_bytes INTEGER NOT NULL
+        );
 
         DELETE FROM context_source_search_terms
         WHERE context_source_id NOT IN (SELECT id FROM context_sources);
@@ -4366,7 +4379,8 @@ def _ensure_context_source_search_terms_schema(
         DELETE FROM context_source_index_budget_state;
 
         INSERT INTO context_source_index_budget_state(
-            save_id, source_text_bytes, index_rows, index_bytes
+            save_id, source_text_bytes, normalized_text_bytes,
+            index_rows, index_bytes
         )
         SELECT
             save_id,
@@ -4375,15 +4389,17 @@ def _ensure_context_source_search_terms_schema(
                 + LENGTH(CAST(substr(body, 1, 65536) AS BLOB))
             ),
             0,
+            0,
             0
         FROM context_sources
         WHERE archived_at IS NULL
         GROUP BY save_id;
 
         INSERT INTO context_source_index_budget_state(
-            save_id, source_text_bytes, index_rows, index_bytes
+            save_id, source_text_bytes, normalized_text_bytes,
+            index_rows, index_bytes
         )
-        SELECT save_id, 0, COUNT(*), SUM(LENGTH(CAST(value AS BLOB)))
+        SELECT save_id, 0, 0, COUNT(*), SUM(LENGTH(CAST(value AS BLOB)))
         FROM (
             SELECT save_id, term AS value FROM context_source_search_terms
             UNION ALL
@@ -4400,12 +4416,14 @@ def _ensure_context_source_search_terms_schema(
         WHEN NEW.archived_at IS NULL
         BEGIN
             INSERT INTO context_source_index_budget_state(
-                save_id, source_text_bytes, index_rows, index_bytes
+                save_id, source_text_bytes, normalized_text_bytes,
+                index_rows, index_bytes
             )
             VALUES (
                 NEW.save_id,
                 LENGTH(CAST(substr(NEW.title, 1, 65536) AS BLOB))
                     + LENGTH(CAST(substr(NEW.body, 1, 65536) AS BLOB)),
+                0,
                 0,
                 0
             )
@@ -4443,12 +4461,14 @@ def _ensure_context_source_search_terms_schema(
             WHERE save_id = OLD.save_id;
 
             INSERT INTO context_source_index_budget_state(
-                save_id, source_text_bytes, index_rows, index_bytes
+                save_id, source_text_bytes, normalized_text_bytes,
+                index_rows, index_bytes
             )
             SELECT
                 NEW.save_id,
                 LENGTH(CAST(substr(NEW.title, 1, 65536) AS BLOB))
                     + LENGTH(CAST(substr(NEW.body, 1, 65536) AS BLOB)),
+                0,
                 0,
                 0
             WHERE NEW.archived_at IS NULL
@@ -4461,10 +4481,11 @@ def _ensure_context_source_search_terms_schema(
         AFTER INSERT ON context_source_search_terms
         BEGIN
             INSERT INTO context_source_index_budget_state(
-                save_id, source_text_bytes, index_rows, index_bytes
+                save_id, source_text_bytes, normalized_text_bytes,
+                index_rows, index_bytes
             )
             VALUES (
-                NEW.save_id, 0, 1, LENGTH(CAST(NEW.term AS BLOB))
+                NEW.save_id, 0, 0, 1, LENGTH(CAST(NEW.term AS BLOB))
             )
             ON CONFLICT(save_id) DO UPDATE SET
                 index_rows = index_rows + 1,
@@ -4488,10 +4509,11 @@ def _ensure_context_source_search_terms_schema(
         AFTER INSERT ON context_source_exact_identifiers
         BEGIN
             INSERT INTO context_source_index_budget_state(
-                save_id, source_text_bytes, index_rows, index_bytes
+                save_id, source_text_bytes, normalized_text_bytes,
+                index_rows, index_bytes
             )
             VALUES (
-                NEW.save_id, 0, 1, LENGTH(CAST(NEW.identifier AS BLOB))
+                NEW.save_id, 0, 0, 1, LENGTH(CAST(NEW.identifier AS BLOB))
             )
             ON CONFLICT(save_id) DO UPDATE SET
                 index_rows = index_rows + 1,
@@ -4511,6 +4533,30 @@ def _ensure_context_source_search_terms_schema(
             WHERE save_id = OLD.save_id;
         END;
 
+        CREATE TRIGGER trg_context_source_normalized_budget_insert
+        AFTER INSERT ON context_source_normalized_budget_entries
+        BEGIN
+            INSERT INTO context_source_index_budget_state(
+                save_id, source_text_bytes, normalized_text_bytes,
+                index_rows, index_bytes
+            )
+            VALUES (NEW.save_id, 0, NEW.normalized_text_bytes, 0, 0)
+            ON CONFLICT(save_id) DO UPDATE SET
+                normalized_text_bytes = normalized_text_bytes
+                    + excluded.normalized_text_bytes;
+        END;
+
+        CREATE TRIGGER trg_context_source_normalized_budget_delete
+        AFTER DELETE ON context_source_normalized_budget_entries
+        BEGIN
+            UPDATE context_source_index_budget_state
+            SET normalized_text_bytes = MAX(
+                0,
+                normalized_text_bytes - OLD.normalized_text_bytes
+            )
+            WHERE save_id = OLD.save_id;
+        END;
+
         CREATE TRIGGER trg_context_source_archive_index_cleanup
         AFTER UPDATE OF archived_at ON context_sources
         WHEN OLD.archived_at IS NULL AND NEW.archived_at IS NOT NULL
@@ -4519,9 +4565,37 @@ def _ensure_context_source_search_terms_schema(
             WHERE context_source_id = NEW.id;
             DELETE FROM context_source_exact_identifiers
             WHERE context_source_id = NEW.id;
+            DELETE FROM context_source_normalized_budget_entries
+            WHERE context_source_id = NEW.id;
         END;
         """,
     )
+    normalized_budget_rows = connection.execute(
+        """
+        SELECT id, save_id, substr(title, 1, 65536), substr(body, 1, 65536)
+        FROM context_sources
+        WHERE archived_at IS NULL
+        ORDER BY rowid
+        """
+    )
+    for source_id, save_id, title, body in normalized_budget_rows:
+        normalized_bytes = sum(
+            len(
+                unicodedata.normalize("NFKC", str(value or ""))
+                .casefold()
+                .encode("utf-8")
+            )
+            for value in (title, body)
+        )
+        connection.execute(
+            """
+            INSERT INTO context_source_normalized_budget_entries(
+                context_source_id, save_id, normalized_text_bytes
+            )
+            VALUES (?, ?, ?)
+            """,
+            (str(source_id), str(save_id), normalized_bytes),
+        )
     exact_identifier_index_complete = connection.execute(
         """
         SELECT 1
