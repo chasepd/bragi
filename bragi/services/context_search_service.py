@@ -3418,6 +3418,24 @@ def _exact_raw_candidates(
         for candidate in indexed_candidates
     }
     ranked: list[tuple[float, _ContextCandidate]] = []
+    ordinary_query_terms = {
+        "about",
+        "could",
+        "did",
+        "does",
+        "from",
+        "have",
+        "learn",
+        "remember",
+        "tell",
+        "that",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "would",
+    }
     for candidate in candidates:
         if (candidate.source_type, candidate.source_id) in indexed_keys:
             continue
@@ -3426,14 +3444,26 @@ def _exact_raw_candidates(
                 candidate.selection_text or candidate.text
             )
         )
-        overlap_count = len(query_terms & candidate_terms)
-        if overlap_count < min(2, len(query_terms)):
+        overlap_terms = query_terms & candidate_terms
+        overlap_count = len(overlap_terms)
+        distinctive_identifier_match = any(
+            len(term) >= 6 and term not in ordinary_query_terms
+            for term in overlap_terms
+        )
+        if (
+            overlap_count < min(2, len(query_terms))
+            and not distinctive_identifier_match
+        ):
             continue
         coverage = overlap_count / len(candidate_terms)
         short_identifier_match = (
             len(query_terms) <= 2 and overlap_count == len(query_terms)
         )
-        if coverage < 0.5 and not short_identifier_match:
+        if (
+            coverage < 0.5
+            and not short_identifier_match
+            and not distinctive_identifier_match
+        ):
             continue
         ranked.append((coverage + overlap_count, candidate))
     ranked.sort(key=lambda item: item[0], reverse=True)

@@ -2100,6 +2100,66 @@ def test_context_observation_claims_are_exclusive_across_connections(
             connection.close()
 
 
+def test_memory_dedup_is_atomic_across_connections(
+    tmp_path: Path,
+    migrated_database_template: Path,
+) -> None:
+    database_path = tmp_path / "memory-dedup.sqlite3"
+    shutil.copy2(migrated_database_template, database_path)
+    connections = [
+        sqlite3.connect(database_path, timeout=5, check_same_thread=False)
+        for _ in range(2)
+    ]
+    repositories = [PersistenceRepositories(connection) for connection in connections]
+    try:
+        scenario = repositories[0].create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A border keep is cut off by ash storms.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories[0].create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        barrier = threading.Barrier(2)
+        created_ids: list[str | None] = [None, None]
+        errors: list[BaseException] = []
+
+        def add_memory(worker_index: int) -> None:
+            try:
+                barrier.wait()
+                record = repositories[worker_index].add_memory(
+                    save_id=save.id,
+                    body="The moonstone opens the eastern vault.",
+                    tags=[f"worker-{worker_index}"],
+                    source_message_ids=[f"message-{worker_index}"],
+                )
+                created_ids[worker_index] = record.id
+            except BaseException as exc:  # pragma: no cover - asserted in parent
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=add_memory, args=(worker_index,))
+            for worker_index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert created_ids[0] == created_ids[1]
+        [memory] = repositories[0].list_memories(save.id)
+        assert set(memory.tags) == {"worker-0", "worker-1"}
+        assert set(memory.source_message_ids) == {"message-0", "message-1"}
+    finally:
+        for connection in connections:
+            connection.close()
+
+
 def test_expired_context_observation_lease_cannot_complete_or_defer(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -2937,6 +2997,9 @@ def test_repositories_consolidate_duplicates_without_losing_active_references(
         tags=["preference"],
     )
     duplicate_id = "legacy-memory-duplicate"
+    repositories.connection.execute(
+        "DROP INDEX idx_memories_save_claim_fingerprint_active"
+    )
     repositories.connection.execute(
         """
         INSERT INTO memories(

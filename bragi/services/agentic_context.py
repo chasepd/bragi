@@ -1946,6 +1946,7 @@ def _observation_evidence_is_grounded(
     if any(
         _grounding_negation_conflicts(observation.claim, context)
         or _grounding_denial_conflicts(observation.claim, context)
+        or _grounding_modality_conflicts(observation.claim, context)
         for context in source_contexts
     ):
         return False
@@ -2331,6 +2332,7 @@ def _context_observation_evidence_is_grounded(
         and not any(
             _grounding_negation_conflicts(observation.claim, context)
             or _grounding_denial_conflicts(observation.claim, context)
+            or _grounding_modality_conflicts(observation.claim, context)
             for context in source_contexts
         )
         and not _grounding_anchor_conflicts(
@@ -3863,6 +3865,42 @@ def _grounding_denial_conflicts(claim: str, evidence: str) -> bool:
         phrase in normalized_evidence and phrase not in normalized_claim
         for phrase in denial_phrases
     )
+
+
+def _grounding_modality_conflicts(claim: str, evidence: str) -> bool:
+    reporting_terms = {
+        "according",
+        "alleged",
+        "allegedly",
+        "claim",
+        "claimed",
+        "claims",
+        "heard",
+        "hearsay",
+        "reported",
+        "reports",
+        "rumor",
+        "rumored",
+        "rumour",
+        "rumoured",
+        "said",
+        "says",
+    }
+    uncertainty_terms = {
+        "apparently",
+        "could",
+        "maybe",
+        "may",
+        "might",
+        "perhaps",
+        "possibly",
+        "suspected",
+        "uncertain",
+    }
+    claim_terms = set(_ordered_grounding_terms(claim))
+    evidence_terms = set(_ordered_grounding_terms(evidence))
+    modal_terms = reporting_terms | uncertainty_terms
+    return bool((evidence_terms & modal_terms) - claim_terms)
 
 
 def _grounding_anchor_conflicts(proposed: str, observation_claim: str) -> bool:

@@ -595,6 +595,7 @@ def test_migrate_database_upgrades_main_schema_71_context_lifecycle(
             """
         ).fetchone()
         assert index_row is not None
+        assert "CREATE UNIQUE INDEX" in index_row[0]
         assert "WHERE archived_at IS NULL" in index_row[0]
 
 

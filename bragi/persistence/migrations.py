@@ -2039,7 +2039,8 @@ def _migrate_schema_71_to_72(connection: sqlite3.Connection) -> None:
                 )
         connection.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_memories_save_claim_fingerprint_active
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_memories_save_claim_fingerprint_active
             ON memories(save_id, claim_fingerprint)
             WHERE archived_at IS NULL AND claim_fingerprint != ''
             """

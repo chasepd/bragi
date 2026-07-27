@@ -47,6 +47,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from starlette.background import BackgroundTask
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from bragi_common.media_mime import safe_served_media_mime_type
 from bragi_web.auth_throttle import AuthAttemptThrottle
@@ -177,6 +178,9 @@ _SESSION_COOKIE_NAME = "bragi_session"
 _SESSION_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 _BOOTSTRAP_TOKEN_ENV = "BRAGI_WEB_BOOTSTRAP_TOKEN"
 _AUTH_THROTTLED_DETAIL = "Too many authentication attempts; try again later"
+MAX_CHAT_BODY_CHARS = 20_000
+MAX_LOOK_AROUND_QUERY_CHARS = 4_000
+MAX_JSON_REQUEST_BODY_BYTES = 1024 * 1024
 _AUTH_USERNAME_MAX_LENGTH = 128
 _AUTH_PASSWORD_MAX_LENGTH = 1024
 _BOOTSTRAP_SETUP_TOKEN_MAX_LENGTH = 256
@@ -359,13 +363,13 @@ class RegenerateScenarioSectionRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    body: str = ""
+    body: str = Field(default="", max_length=MAX_CHAT_BODY_CHARS)
     speaker_name: str | None = None
     save_id: str | None = None
 
 
 class LookAroundRequest(BaseModel):
-    query: str = ""
+    query: str = Field(default="", max_length=MAX_LOOK_AROUND_QUERY_CHARS)
     save_id: str | None = None
 
 
@@ -612,6 +616,69 @@ class _CharacterReferenceUploadTooLarge(Exception):
         self.max_bytes = max_bytes
 
 
+class _JsonRequestBodyTooLarge(Exception):
+    pass
+
+
+class _JsonRequestBodyLimitMiddleware:
+    def __init__(self, app: ASGIApp, *, max_body_bytes: int) -> None:
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] != "http" or not _is_json_request_scope(scope):
+            await self.app(scope, receive, send)
+            return
+        headers = {key.lower(): value for key, value in scope.get("headers", ())}
+        raw_content_length = headers.get(b"content-length")
+        if raw_content_length is not None:
+            try:
+                content_length = int(raw_content_length)
+            except ValueError:
+                content_length = 0
+            if content_length > self.max_body_bytes:
+                await self._reject(scope, receive, send)
+                return
+
+        received_bytes = 0
+
+        async def limited_receive() -> Message:
+            nonlocal received_bytes
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > self.max_body_bytes:
+                    raise _JsonRequestBodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _JsonRequestBodyTooLarge:
+            await self._reject(scope, receive, send)
+
+    @staticmethod
+    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            {"detail": "Request body too large"},
+            status_code=413,
+        )
+        await response(scope, receive, send)
+
+
+def _is_json_request_scope(scope: Scope) -> bool:
+    headers = {key.lower(): value for key, value in scope.get("headers", ())}
+    raw_content_type = headers.get(b"content-type", b"")
+    if not isinstance(raw_content_type, bytes):
+        return False
+    content_type = raw_content_type.split(b";", 1)[0].strip()
+    return content_type == b"application/json" or content_type.endswith(b"+json")
+
+
 def create_app(state: WebAppState | None = None) -> FastAPI:
     provided_state = state is not None
     app_state = state or create_state()
@@ -633,6 +700,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     close()
 
     app = FastAPI(title="Bragi Web", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(
+        _JsonRequestBodyLimitMiddleware,
+        max_body_bytes=MAX_JSON_REQUEST_BODY_BYTES,
+    )
     app.state.bragi = app_state
     app.dependency_overrides[state_dependency] = lambda: app.state.bragi
     host_security = _host_security_config()

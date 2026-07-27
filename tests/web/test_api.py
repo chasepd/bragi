@@ -7661,6 +7661,40 @@ def test_look_around_post_records_save_id_and_returns_answer_job(
     assert runtime.looks == [("Inspect the brass lens.", "save-1")]
 
 
+def test_chat_and_look_around_reject_oversized_text_inputs(tmp_path: Path) -> None:
+    state = _state_double(tmp_path, _RuntimeDouble())
+    oversized_chat = "x" * (api_app.MAX_CHAT_BODY_CHARS + 1)
+    oversized_query = "x" * (api_app.MAX_LOOK_AROUND_QUERY_CHARS + 1)
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        chat_response = client.post(
+            "/api/chat",
+            json={"body": oversized_chat, "save_id": "save-1"},
+        )
+        look_response = client.post(
+            "/api/chat/look-around",
+            json={"query": oversized_query, "save_id": "save-1"},
+        )
+
+    assert chat_response.status_code == 422
+    assert look_response.status_code == 422
+
+
+def test_json_request_body_limit_rejects_before_validation(tmp_path: Path) -> None:
+    state = _state_double(tmp_path, _RuntimeDouble())
+    oversized_body = b"x" * (api_app.MAX_JSON_REQUEST_BODY_BYTES + 1)
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.post(
+            "/api/chat/look-around",
+            content=oversized_body,
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Request body too large"}
+
+
 def test_look_around_post_returns_answer_markdown_blocks(
     tmp_path: Path,
 ) -> None:

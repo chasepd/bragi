@@ -9655,70 +9655,77 @@ class PersistenceRepositories:
             source_message_ids=source_message_ids,
         )
         resolved_fingerprint = canonical_claim_fingerprint(body)
-        existing = self.get_memory_by_claim_fingerprint(
-            save_id=save_id,
-            claim_fingerprint=resolved_fingerprint,
-        )
-        if existing is not None:
-            return self.update_memory(
-                memory_id=existing.id,
-                body=existing.body,
-                tags=list(dict.fromkeys((*existing.tags, *tags))),
-                importance=max(existing.importance, importance),
-                source_message_ids=list(
-                    dict.fromkeys(
-                        (
-                            *existing.source_message_ids,
-                            *resolved_source_message_ids,
-                        )
-                    )
-                ),
-                source_observation_ids=list(
-                    dict.fromkeys(
-                        (
-                            *existing.source_observation_ids,
-                            *(source_observation_ids or ()),
-                        )
-                    )
-                ),
+        self.begin_immediate_transaction()
+        try:
+            existing = self.get_memory_by_claim_fingerprint(
+                save_id=save_id,
                 claim_fingerprint=resolved_fingerprint,
             )
-        record = MemoryRecord(
-            id=memory_id or _new_id(),
-            save_id=save_id,
-            body=body,
-            tags=tags,
-            importance=importance,
-            source_message_id=source_message_id,
-            source_message_ids=resolved_source_message_ids,
-            claim_fingerprint=resolved_fingerprint,
-            source_observation_ids=_unique_strings(
-                source_observation_ids or ()
-            )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS],
-        )
-        self.connection.execute(
-            """
-            INSERT INTO memories(
-                id, save_id, body, tags_json, importance, source_message_id,
-                source_message_ids_json, claim_fingerprint,
-                source_observation_ids_json
+            if existing is not None:
+                record = self.update_memory(
+                    memory_id=existing.id,
+                    body=existing.body,
+                    tags=list(dict.fromkeys((*existing.tags, *tags))),
+                    importance=max(existing.importance, importance),
+                    source_message_ids=list(
+                        dict.fromkeys(
+                            (
+                                *existing.source_message_ids,
+                                *resolved_source_message_ids,
+                            )
+                        )
+                    ),
+                    source_observation_ids=list(
+                        dict.fromkeys(
+                            (
+                                *existing.source_observation_ids,
+                                *(source_observation_ids or ()),
+                            )
+                        )
+                    ),
+                    claim_fingerprint=resolved_fingerprint,
+                )
+                self.commit_transaction()
+                return record
+            record = MemoryRecord(
+                id=memory_id or _new_id(),
+                save_id=save_id,
+                body=body,
+                tags=tags,
+                importance=importance,
+                source_message_id=source_message_id,
+                source_message_ids=resolved_source_message_ids,
+                claim_fingerprint=resolved_fingerprint,
+                source_observation_ids=_unique_strings(
+                    source_observation_ids or ()
+                )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS],
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                record.id,
-                record.save_id,
-                record.body,
-                _dump_json(record.tags),
-                record.importance,
-                record.source_message_id,
-                _dump_json(record.source_message_ids),
-                record.claim_fingerprint,
-                _dump_json(record.source_observation_ids),
-            ),
-        )
-        self.commit()
-        return record
+            self.connection.execute(
+                """
+                INSERT INTO memories(
+                    id, save_id, body, tags_json, importance, source_message_id,
+                    source_message_ids_json, claim_fingerprint,
+                    source_observation_ids_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    record.save_id,
+                    record.body,
+                    _dump_json(record.tags),
+                    record.importance,
+                    record.source_message_id,
+                    _dump_json(record.source_message_ids),
+                    record.claim_fingerprint,
+                    _dump_json(record.source_observation_ids),
+                ),
+            )
+            self.commit_transaction()
+            return record
+        except BaseException:
+            self.rollback_transaction()
+            raise
 
     def update_memory(
         self,
@@ -14263,18 +14270,37 @@ def _unique_strings(values: list[str] | tuple[str, ...]) -> list[str]:
 def _character_knowledge_edge_from_row(
     row: sqlite3.Row,
 ) -> CharacterKnowledgeEdgeRecord:
+    source_message_ids = _unique_strings(
+        [
+            *_load_list(row["source_message_ids_json"]),
+            *([row["source_message_id"]] if row["source_message_id"] else []),
+        ]
+    )
+    provenance_overflow = (
+        len(source_message_ids) > MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS
+    )
     return CharacterKnowledgeEdgeRecord(
         id=row["id"],
         save_id=row["save_id"],
         character_id=row["character_id"],
         target_type=row["target_type"],
         target_id=row["target_id"],
-        knowledge_state=row["knowledge_state"],
-        acquisition_method=row["acquisition_method"],
+        knowledge_state=(
+            "does_not_know" if provenance_overflow else row["knowledge_state"]
+        ),
+        acquisition_method=(
+            "unknown" if provenance_overflow else row["acquisition_method"]
+        ),
         confidence=row["confidence"],
-        source_message_id=row["source_message_id"],
-        source_message_ids=_load_list(row["source_message_ids_json"]),
-        evidence_quote=row["evidence_quote"],
+        source_message_id=(
+            None if provenance_overflow else row["source_message_id"]
+        ),
+        source_message_ids=[] if provenance_overflow else source_message_ids,
+        evidence_quote=(
+            "Provenance exceeded the safe bound."
+            if provenance_overflow
+            else row["evidence_quote"]
+        ),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         archived_at=row["archived_at"],

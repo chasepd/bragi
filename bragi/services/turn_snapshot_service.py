@@ -34,6 +34,7 @@ from bragi.services.character_text_world_update_service import (
     character_text_source_ref,
     parse_character_text_source_ref,
 )
+from bragi.services.knowledge_boundary import normalized_knowledge_target_type
 from bragi.services.scenario_content_rating import (
     metadata_with_scenario_content_ratings,
 )
@@ -2738,6 +2739,18 @@ def _coalesce_remapped_snapshot_rows(
 ) -> list[dict[str, object]]:
     coalesced: dict[tuple[object, ...], dict[str, object]] = {}
     for row in rows:
+        if table_name == "character_knowledge_edges":
+            row["target_type"] = normalized_knowledge_target_type(
+                str(row.get("target_type", ""))
+            )
+            row["source_message_ids_json"] = (
+                _merged_snapshot_json_string_lists(
+                    row.get("source_message_ids_json"),
+                    "[]",
+                    limit=_MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS,
+                    extra_values=(row.get("source_message_id"),),
+                )
+            )
         key = _snapshot_row_unique_key(table_name, row)
         existing = coalesced.get(key)
         if existing is None:
@@ -2783,7 +2796,7 @@ def _snapshot_row_unique_key(
             table_name,
             row.get("save_id"),
             row.get("character_id"),
-            row.get("target_type"),
+            normalized_knowledge_target_type(str(row.get("target_type", ""))),
             row.get("target_id"),
         )
     return (table_name, row.get("id"))
@@ -2920,6 +2933,10 @@ def _merge_snapshot_knowledge_edge_rows(
         return
     if existing_active and not incoming_active:
         return
+    source_message_ids = (
+        existing.get("source_message_id"),
+        incoming.get("source_message_id"),
+    )
     state_rank = {"knows": 0, "may_know": 1, "does_not_know": 2}
     if state_rank.get(str(incoming.get("knowledge_state")), 1) > state_rank.get(
         str(existing.get("knowledge_state")),
@@ -2940,6 +2957,7 @@ def _merge_snapshot_knowledge_edge_rows(
         existing.get("source_message_ids_json"),
         incoming.get("source_message_ids_json"),
         limit=_MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS,
+        extra_values=source_message_ids,
     )
 
 
@@ -2948,6 +2966,7 @@ def _merged_snapshot_json_string_lists(
     second: object,
     *,
     limit: int | None = None,
+    extra_values: Iterable[object] = (),
 ) -> str:
     values: list[str] = []
     for raw in (first, second):
@@ -2961,6 +2980,9 @@ def _merged_snapshot_json_string_lists(
                 for value in loaded
                 if isinstance(value, str) and value
             )
+    values.extend(
+        str(value) for value in extra_values if isinstance(value, str) and value
+    )
     merged = list(dict.fromkeys(values))
     if limit is not None and len(merged) > limit:
         raise ValueError("Merged snapshot provenance is too large")

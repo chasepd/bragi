@@ -76,36 +76,31 @@ def allowed_character_scoped_targets(
     allowed: dict[tuple[str, str], tuple[str, ...]] = {}
     blocked: set[tuple[str, str]] = set()
     graph_targets: set[tuple[str, str, str]] = set()
+    restrictive_graph_targets = {
+        (
+            edge.character_id,
+            normalized_knowledge_target_type(edge.target_type),
+            edge.target_id,
+        )
+        for edge in character_knowledge_edges
+        if _knowledge_edge_is_prompt_blocked(
+            edge,
+            characters_by_id=characters_by_id,
+            present_ids=present_ids,
+            message_visibility=message_visibility or [],
+        )
+    }
     for edge in character_knowledge_edges:
         target_type = normalized_knowledge_target_type(edge.target_type)
         if target_type not in {"memory", "world_state", "summary", "scenario_section"}:
             continue
         target = (target_type, edge.target_id)
-        graph_targets.add((edge.character_id, *target))
-        if any(
-            not message_visible_to_present_characters(
-                message_id=source_id,
-                present_character_ids=present_ids,
-                message_visibility=message_visibility or [],
-            )
-            for source_id in edge.source_message_ids
-        ):
+        graph_target = (edge.character_id, *target)
+        graph_targets.add(graph_target)
+        if graph_target in restrictive_graph_targets:
             blocked.add(target)
             continue
         character = characters_by_id.get(edge.character_id)
-        if (
-            character is not None
-            and character.is_player_character
-            and knowledge_edge_has_character_text_source(edge)
-        ):
-            blocked.add(target)
-            continue
-        if edge.character_id not in present_ids:
-            blocked.add(target)
-            continue
-        if not knowledge_edge_allows_prompt_use(edge):
-            blocked.add(target)
-            continue
         if character is not None:
             allowed[target] = _append_scope_label(
                 allowed.get(target, ()),
@@ -138,6 +133,43 @@ def allowed_character_scoped_targets(
         else:
             blocked.add(target)
     return ScopedTargets(allowed=allowed, blocked=blocked - set(allowed))
+
+
+def _knowledge_edge_is_prompt_blocked(
+    edge: CharacterKnowledgeEdgeRecord,
+    *,
+    characters_by_id: dict[str, CharacterRecord],
+    present_ids: frozenset[str],
+    message_visibility: list[MessageVisibilityRecord],
+) -> bool:
+    source_message_ids = tuple(
+        dict.fromkeys(
+            (
+                *edge.source_message_ids,
+                *([edge.source_message_id] if edge.source_message_id else []),
+            )
+        )
+    )
+    if any(
+        not message_visible_to_present_characters(
+            message_id=source_id,
+            present_character_ids=present_ids,
+            message_visibility=message_visibility,
+        )
+        for source_id in source_message_ids
+    ):
+        return True
+    character = characters_by_id.get(edge.character_id)
+    if (
+        character is not None
+        and character.is_player_character
+        and knowledge_edge_has_character_text_source(edge)
+    ):
+        return True
+    return (
+        edge.character_id not in present_ids
+        or not knowledge_edge_allows_prompt_use(edge)
+    )
 
 
 def _append_scope_label(existing: tuple[str, ...], label: str) -> tuple[str, ...]:

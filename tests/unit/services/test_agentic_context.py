@@ -560,6 +560,46 @@ def test_persisted_observation_revalidation_rejects_subject_prefix() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("source_text", "evidence_quote", "claim"),
+    [
+        (
+            "Lio said Mara has the red key.",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "The rumor says Mara betrayed Rowan.",
+            "Mara betrayed Rowan",
+            "Mara betrayed Rowan.",
+        ),
+    ],
+)
+def test_persisted_observation_revalidation_rejects_unpreserved_reported_modality(
+    source_text: str,
+    evidence_quote: str,
+    claim: str,
+) -> None:
+    observation = ContextObservationRecord(
+        id="observation-imported",
+        save_id="save-imported",
+        observation_type="character_fact",
+        claim=claim,
+        evidence_quote=evidence_quote,
+        source_message_ids=["message-imported"],
+        scope="durable",
+        status="pending",
+        confidence=0.99,
+        tags=["reported"],
+        metadata={},
+    )
+
+    assert not agentic_context_module._context_observation_evidence_is_grounded(
+        observation,
+        source_texts_by_observation={observation.id: (source_text,)},
+    )
+
+
 def test_observation_service_caps_and_deduplicates_provider_candidates(
     repositories: PersistenceRepositories,
 ) -> None:

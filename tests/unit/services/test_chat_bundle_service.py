@@ -148,6 +148,45 @@ def test_legacy_import_rows_coalesce_after_memory_id_remapping() -> None:
     ]
 
 
+def test_import_knowledge_edges_coalesce_target_aliases_and_scalar_provenance() -> None:
+    edges = _coalesce_import_knowledge_edges(
+        [
+            {
+                "id": "edge-knows",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "state",
+                "target_id": "state-secret",
+                "knowledge_state": "knows",
+                "confidence": 0.9,
+                "source_message_id": "message-visible",
+                "source_message_ids_json": "[]",
+                "archived_at": None,
+            },
+            {
+                "id": "edge-denial",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "world_state",
+                "target_id": "state-secret",
+                "knowledge_state": "does_not_know",
+                "confidence": 0.7,
+                "source_message_id": "message-hidden",
+                "source_message_ids_json": "[]",
+                "archived_at": None,
+            },
+        ]
+    )
+
+    assert len(edges) == 1
+    assert edges[0]["target_type"] == "world_state"
+    assert edges[0]["knowledge_state"] == "does_not_know"
+    assert json.loads(cast(str, edges[0]["source_message_ids_json"])) == [
+        "message-visible",
+        "message-hidden",
+    ]
+
+
 def test_export_save_writes_manifest_data_and_referenced_media(
     repositories: PersistenceRepositories,
     tmp_path: Path,

@@ -47,6 +47,7 @@ from bragi.services.image_style_settings import (
     IMAGE_STYLE_PRESET_SETTING,
     sanitize_image_style_preset,
 )
+from bragi.services.knowledge_boundary import normalized_knowledge_target_type
 from bragi.services.model_preferences import (
     SAVE_MODEL_OVERRIDES_SETTING,
     sanitize_save_model_overrides,
@@ -5952,6 +5953,15 @@ def _coalesce_import_knowledge_edges(
     coalesced: dict[tuple[object, ...], dict[str, object]] = {}
     state_rank = {"knows": 0, "may_know": 1, "does_not_know": 2}
     for row in rows:
+        row["target_type"] = normalized_knowledge_target_type(
+            str(row.get("target_type", ""))
+        )
+        row["source_message_ids_json"] = _merge_json_string_lists(
+            row.get("source_message_ids_json"),
+            "[]",
+            limit=_MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS,
+            extra_values=(row.get("source_message_id"),),
+        )
         key = (
             row.get("save_id"),
             row.get("character_id"),
@@ -5969,6 +5979,10 @@ def _coalesce_import_knowledge_edges(
             continue
         if existing_active and not row_active:
             continue
+        source_message_ids = (
+            existing.get("source_message_id"),
+            row.get("source_message_id"),
+        )
         if state_rank.get(str(row.get("knowledge_state")), 1) > state_rank.get(
             str(existing.get("knowledge_state")),
             1,
@@ -5988,6 +6002,7 @@ def _coalesce_import_knowledge_edges(
             existing.get("source_message_ids_json"),
             row.get("source_message_ids_json"),
             limit=_MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS,
+            extra_values=source_message_ids,
         )
     return list(coalesced.values())
 
@@ -5997,6 +6012,7 @@ def _merge_json_string_lists(
     second: object,
     *,
     limit: int | None = None,
+    extra_values: Iterable[object] = (),
 ) -> str:
     values: list[str] = []
     for raw in (first, second):
@@ -6010,6 +6026,9 @@ def _merge_json_string_lists(
                 for value in loaded
                 if isinstance(value, str) and value
             )
+    values.extend(
+        str(value) for value in extra_values if isinstance(value, str) and value
+    )
     merged = list(dict.fromkeys(values))
     if limit is not None and len(merged) > limit:
         raise ChatBundleError("Merged provenance is too large")

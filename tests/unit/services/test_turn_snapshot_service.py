@@ -75,6 +75,46 @@ def test_snapshot_import_coalesces_many_to_one_memory_remaps() -> None:
     ]
 
 
+def test_snapshot_coalesces_knowledge_aliases_and_scalar_provenance() -> None:
+    rows = _coalesce_remapped_snapshot_rows(
+        "character_knowledge_edges",
+        [
+            {
+                "id": "edge-one",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "state",
+                "target_id": "state-secret",
+                "knowledge_state": "knows",
+                "confidence": 0.9,
+                "source_message_id": "message-visible",
+                "source_message_ids_json": "[]",
+                "archived_at": None,
+            },
+            {
+                "id": "edge-two",
+                "save_id": "target-save",
+                "character_id": "character-one",
+                "target_type": "world_state",
+                "target_id": "state-secret",
+                "knowledge_state": "does_not_know",
+                "confidence": 0.7,
+                "source_message_id": "message-hidden",
+                "source_message_ids_json": "[]",
+                "archived_at": None,
+            },
+        ],
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["target_type"] == "world_state"
+    assert rows[0]["knowledge_state"] == "does_not_know"
+    assert json.loads(str(rows[0]["source_message_ids_json"])) == [
+        "message-visible",
+        "message-hidden",
+    ]
+
+
 def test_snapshot_remaps_colliding_message_provenance_by_field_type() -> None:
     colliding_id = "save-and-message-collision"
     remapper = turn_snapshot_module._SnapshotRemapper(
