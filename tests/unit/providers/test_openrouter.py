@@ -1719,6 +1719,39 @@ def test_openrouter_structured_output_rejects_local_schema_violation() -> None:
     assert len(transport.calls) == 1
 
 
+def test_openrouter_structured_output_types_non_object_schema_violation() -> None:
+    transport = RecordingTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                payload={"choices": [{"message": {"content": "[]"}}]},
+            )
+        ]
+    )
+    secrets = InMemorySecretStore()
+    secrets.set_api_key("openrouter", "or-secret")
+    client = OpenRouterClient(secret_store=secrets, transport=transport)
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            client.generate_structured_output(
+                StructuredOutputRequest(
+                    provider="openrouter",
+                    model_id="openai/gpt-4o-mini",
+                    messages=(ChatMessage(role="user", body="Extract."),),
+                    schema_name="object_contract",
+                    schema={"type": "object", "additionalProperties": False},
+                )
+            )
+        )
+
+    assert (
+        exc_info.value.category
+        == ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID
+    )
+    assert len(transport.calls) == 1
+
+
 def test_openrouter_structured_content_preserves_provider_diagnostics() -> None:
     payload = {
         "choices": [

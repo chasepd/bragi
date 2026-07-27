@@ -1298,6 +1298,39 @@ def test_venice_structured_output_rejects_local_schema_violation() -> None:
     assert len(transport.calls) == 1
 
 
+def test_venice_structured_output_types_non_object_schema_violation() -> None:
+    transport = RecordingTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                payload={"choices": [{"message": {"content": "[]"}}]},
+            )
+        ]
+    )
+    secrets = InMemorySecretStore()
+    secrets.set_api_key("venice", "venice-secret")
+    client = VeniceClient(secret_store=secrets, transport=transport)
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            client.generate_structured_output(
+                StructuredOutputRequest(
+                    provider="venice",
+                    model_id="llama-3.2-3b",
+                    messages=(ChatMessage(role="user", body="Extract."),),
+                    schema_name="object_contract",
+                    schema={"type": "object", "additionalProperties": False},
+                )
+            )
+        )
+
+    assert (
+        exc_info.value.category
+        == ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID
+    )
+    assert len(transport.calls) == 1
+
+
 def test_venice_tool_call_payload_uses_tools_and_preserves_arguments() -> None:
     transport = RecordingTransport(
         [

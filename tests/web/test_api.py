@@ -8421,7 +8421,7 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
         model_id="fake-chat",
         display_name="Fake Chat",
         capabilities=["chat", "structured_output"],
-        context_window=8192,
+        context_window=32768,
     )
     repositories.set_model_preference(
         task="chat",

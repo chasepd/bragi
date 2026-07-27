@@ -52,6 +52,7 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
+from bragi.services.request_budget import budget_tool_call_request
 from bragi.services.tool_call_helpers import (
     accepted_tool_result,
     append_tool_feedback_messages,
@@ -504,6 +505,7 @@ async def _select_character_maintenance_with_tool_fallback(
 ) -> tuple[CharacterMaintenanceDecision, ...]:
     try:
         return await _select_character_maintenance_with_tool_feedback(
+            repositories=repositories,
             provider=provider,
             request=request,
             characters=characters,
@@ -548,6 +550,7 @@ async def _select_character_maintenance_with_tool_fallback(
         )
         try:
             return await _select_character_maintenance_with_tool_feedback(
+                repositories=repositories,
                 provider=fallback_provider,
                 request=fallback_request,
                 characters=characters,
@@ -562,6 +565,7 @@ async def _select_character_maintenance_with_tool_fallback(
 
 async def _select_character_maintenance_with_tool_feedback(
     *,
+    repositories: PersistenceRepositories,
     provider: ToolCallProvider,
     request: ToolCallRequest,
     characters: tuple[CharacterRecord, ...],
@@ -577,9 +581,12 @@ async def _select_character_maintenance_with_tool_feedback(
     last_errors: list[str] = []
 
     for _turn in range(MAX_CHARACTER_MAINTENANCE_TOOL_FEEDBACK_TURNS + 1):
-        response = await provider.generate_tool_calls(
-            replace(request, messages=tuple(messages))
+        turn_request = budget_tool_call_request(
+            repositories,
+            replace(request, messages=tuple(messages)),
+            task="character_registry_maintenance",
         )
+        response = await provider.generate_tool_calls(turn_request)
         errors: list[str] = []
         tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
         for call in response.tool_calls:

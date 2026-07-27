@@ -44,14 +44,14 @@ class SummarizationContextNarratorProvider:
                 model_id="fake-summary",
                 display_name="Fake Summary",
                 capabilities=frozenset({ProviderCapability.CHAT}),
-                context_window=1024,
+                context_window=8192,
             ),
             ProviderModel(
                 provider=self.provider_name,
                 model_id="fake-context",
                 display_name="Fake Context",
                 capabilities=frozenset({ProviderCapability.STRUCTURED_OUTPUT}),
-                context_window=8192,
+                context_window=32768,
             ),
             ProviderModel(
                 provider=self.provider_name,
@@ -63,7 +63,7 @@ class SummarizationContextNarratorProvider:
                         ProviderCapability.STRUCTURED_OUTPUT,
                     }
                 ),
-                context_window=8192,
+                context_window=32768,
             ),
         ]
 
@@ -293,20 +293,20 @@ def test_summarization_persists_summary_before_future_narrator_context(
             model_id="fake-chat",
             display_name="Fake Chat",
             capabilities=["chat"],
-            context_window=8192,
+            context_window=32768,
         )
         repository.save_provider_model(
             provider="fake",
             model_id="fake-context",
             display_name="Fake Context",
             capabilities=["structured_output"],
-            context_window=8192,
+            context_window=32768,
         )
         provider = SummarizationContextNarratorProvider()
         summary_service = SummaryService(
             repositories=repository,
             providers={"fake": provider},
-            threshold=0.01,
+            threshold=0.001,
         )
         context_search = ContextSearchService(
             repositories=repository,

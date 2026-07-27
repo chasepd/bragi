@@ -166,7 +166,7 @@ class RecordingImageProvider:
                         ProviderCapability.STRUCTURED_OUTPUT,
                     }
                 ),
-                context_window=8192,
+                context_window=32768,
             ),
             ProviderModel(
                 provider=self.provider_name,
@@ -233,7 +233,7 @@ class RecordingVisionProvider(RecordingImageProvider):
                         ProviderCapability.STRUCTURED_OUTPUT,
                     }
                 ),
-                context_window=8192,
+                context_window=32768,
             )
         ]
 
@@ -329,7 +329,7 @@ class RecordingVideoProvider(RecordingImageProvider):
                         ProviderCapability.STRUCTURED_OUTPUT,
                     }
                 ),
-                context_window=8192,
+                context_window=32768,
             ),
             ProviderModel(
                 provider=self.provider_name,

@@ -16,7 +16,7 @@ class StructuredOutputValidationError(ValueError):
 
 
 def validate_structured_output(
-    data: dict[str, Any],
+    data: Any,
     *,
     schema: dict[str, Any],
     schema_name: str,
@@ -36,7 +36,6 @@ def validate_structured_output(
         "error_count": len(errors),
         "errors": [
             {
-                "instance_path": _json_path(tuple(error.absolute_path)),
                 "schema_path": _json_path(tuple(error.absolute_schema_path)),
                 "validator": str(error.validator),
                 "message": "Value does not satisfy schema constraint",

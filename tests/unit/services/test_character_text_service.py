@@ -79,7 +79,7 @@ class RecordingTextProvider:
                 model_id="fake-chat",
                 display_name="Fake Chat",
                 capabilities=frozenset({ProviderCapability.CHAT}),
-                context_window=8192,
+                context_window=32768,
             )
         ]
 

@@ -44,6 +44,7 @@ def budget_chat_request(
         model_id=request.model_id,
     )
     if context_window is None:
+        _log_unenforced_budget(request.provider, request.model_id, task)
         return _chat_request_with_budget_diagnostics(
             request,
             {
@@ -51,7 +52,7 @@ def budget_chat_request(
                 "model_context_window": None,
                 "enforced": False,
                 "reason": "no_model_context_window",
-                "still_over_budget": False,
+                "still_over_budget": None,
             },
         )
     return enforce_chat_request_budget(
@@ -82,7 +83,11 @@ def enforce_chat_request_budget(
     )
     if diagnostics["still_over_budget"] is True:
         raise _overflow_error(diagnostics)
-    return _chat_request_with_budget_diagnostics(request, diagnostics)
+    capped_request = replace(
+        request,
+        max_output_tokens=reserved_output_tokens,
+    )
+    return _chat_request_with_budget_diagnostics(capped_request, diagnostics)
 
 
 def budget_structured_output_request(
@@ -153,15 +158,24 @@ def enforce_structured_output_request_budget(
     )
     if diagnostics["still_over_budget"] is True:
         raise _overflow_error(diagnostics)
-    return request
+    return replace(request, max_output_tokens=reserved_output_tokens)
 
 
 def budget_tool_call_request(
-    repositories: PersistenceRepositories,
+    repositories: PersistenceRepositories | None,
     request: ToolCallRequest,
     *,
     task: str,
 ) -> ToolCallRequest:
+    if repositories is None:
+        log_event(
+            "provider.request_budget_unenforced",
+            provider=request.provider,
+            model=request.model_id,
+            task=task,
+            reason="no_repository_context",
+        )
+        return request
     context_window = model_context_window(
         repositories,
         provider=request.provider,
@@ -248,7 +262,7 @@ def enforce_tool_call_request_budget(
     )
     if diagnostics["still_over_budget"] is True:
         raise _overflow_error(diagnostics)
-    return request
+    return replace(request, max_output_tokens=reserved_output_tokens)
 
 
 def model_context_window(

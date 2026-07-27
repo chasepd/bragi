@@ -57,6 +57,7 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
+from bragi.services.request_budget import budget_tool_call_request
 from bragi.services.sexual_content_safety import is_fade_to_black_message
 from bragi.services.state_preservation import preserve_replaced_world_state_memory
 from bragi.services.text_script_policy import (
@@ -456,9 +457,12 @@ class ToolCallingProviderStateExtractor:
         )
 
         for turn in range(MAX_STATE_TOOL_FEEDBACK_TURNS + 1):
-            response = await provider.generate_tool_calls(
-                replace(request, messages=tuple(messages))
+            turn_request = budget_tool_call_request(
+                self.repositories,
+                replace(request, messages=tuple(messages)),
+                task="state_memory",
             )
+            response = await provider.generate_tool_calls(turn_request)
             raw_calls = [_tool_call_diagnostic(call) for call in response.tool_calls]
             errors: list[str] = []
             turn_unsafe_partial_state_keys: set[str] = set()

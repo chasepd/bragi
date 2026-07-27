@@ -405,11 +405,6 @@ class OpenRouterClient:
         )
         raw_metadata = dict(response)
         data = raw_metadata.pop(_STRUCTURED_DATA_METADATA_KEY)
-        if not isinstance(data, dict):
-            raise ProviderError(
-                category=ProviderErrorCategory.PROVIDER_ERROR,
-                message="Structured provider content must be a JSON object",
-            )
         try:
             validate_structured_output(
                 data,
@@ -422,6 +417,22 @@ class OpenRouterClient:
                 message=str(exc),
                 diagnostics=exc.diagnostics,
             ) from exc
+        if not isinstance(data, dict):
+            raise ProviderError(
+                category=ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID,
+                message="Structured provider response violated its JSON Schema",
+                diagnostics={
+                    "schema_name": request.schema_name,
+                    "error_count": 1,
+                    "errors": [
+                        {
+                            "schema_path": "$.type",
+                            "validator": "type",
+                            "message": "Value does not satisfy schema constraint",
+                        }
+                    ],
+                },
+            )
         return StructuredOutputResponse(
             data=data,
             provider=self.provider_name,
@@ -1612,12 +1623,10 @@ def _stream_delta_text(choice: dict[str, Any]) -> str:
     return ""
 
 
-def _parse_structured_content(payload: dict[str, Any]) -> dict[str, Any]:
+def _parse_structured_content(payload: dict[str, Any]) -> Any:
     try:
         content = _chat_content(payload)
         loaded = json.loads(content)
-        if not isinstance(loaded, dict):
-            raise ValueError("Structured provider content must be a JSON object")
         return loaded
     except ProviderError:
         raise

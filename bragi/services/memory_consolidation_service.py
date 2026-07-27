@@ -35,6 +35,7 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
+from bragi.services.request_budget import budget_tool_call_request
 from bragi.services.text_script_policy import (
     DEFAULT_SCRIPT_GUARD_MODE,
     ScriptPolicyViolation,
@@ -260,6 +261,7 @@ class MemoryConsolidationService:
                     ),
                 )
             return await _memory_clusters_with_tool_feedback(
+                repositories=self.repositories,
                 provider=self.provider,
                 request=tool_request,
                 memories=memories,
@@ -568,6 +570,7 @@ async def _memory_clusters_with_tool_fallback(
 ) -> tuple[MemoryConsolidationCluster, ...]:
     try:
         return await _memory_clusters_with_tool_feedback(
+            repositories=repositories,
             provider=provider,
             request=request,
             memories=memories,
@@ -613,6 +616,7 @@ async def _memory_clusters_with_tool_fallback(
         )
         try:
             return await _memory_clusters_with_tool_feedback(
+                repositories=repositories,
                 provider=fallback_provider,
                 request=fallback_request,
                 memories=memories,
@@ -628,6 +632,7 @@ async def _memory_clusters_with_tool_fallback(
 
 async def _memory_clusters_with_tool_feedback(
     *,
+    repositories: PersistenceRepositories,
     provider: ToolCallProvider,
     request: ToolCallRequest,
     memories: tuple[MemoryRecord, ...],
@@ -641,9 +646,12 @@ async def _memory_clusters_with_tool_feedback(
     last_errors: list[str] = []
 
     for _turn in range(MAX_MEMORY_CONSOLIDATION_TOOL_FEEDBACK_TURNS + 1):
-        response = await provider.generate_tool_calls(
-            replace(request, messages=tuple(messages))
+        turn_request = budget_tool_call_request(
+            repositories,
+            replace(request, messages=tuple(messages)),
+            task="context_update",
         )
+        response = await provider.generate_tool_calls(turn_request)
         errors: list[str] = []
         tool_results: list[tuple[ProviderToolCall, dict[str, str]]] = []
         for call in response.tool_calls:

@@ -1042,6 +1042,11 @@ def test_tool_profile_completer_routes_generation_and_enhancement_tasks(
         "request_with_openrouter_routing",
         capture_routing,
     )
+    monkeypatch.setattr(
+        completion,
+        "budget_tool_call_request",
+        lambda _repositories, request, *, task: request,
+    )
     provider = RecordingToolCallProfileProvider([])
     completer = ToolCallingProviderCharacterProfileCompleter(
         provider=provider,
