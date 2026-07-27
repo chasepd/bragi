@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
 from time import perf_counter
 
@@ -21,13 +21,26 @@ from bragi.providers.contracts import (
 )
 from bragi.redaction import redact_text
 from bragi.safety import FADE_TO_BLACK_TRANSITION
+from bragi.services.agentic_context import plan_first_narrator_enabled
+from bragi.services.chat_history_settings import (
+    ChatHistoryWindowSettings,
+    chat_history_window_settings,
+    narrator_planner_chat_history_window_settings,
+)
 from bragi.services.content_rating import effective_content_safety_policy
-from bragi.services.content_safety_service import ContentSafetyService
+from bragi.services.content_safety_service import (
+    ContentSafetyAction,
+    ContentSafetyService,
+)
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.model_preferences import roleplay_model_preference
 from bragi.services.provider_fallbacks import chat_with_fallback
+from bragi.services.request_budget import model_context_window
 from bragi.services.sexual_content_safety import is_fade_to_black_message
 from bragi.services.summary_safety import validate_summary_output
+
+SUMMARY_OUTPUT_TOKEN_RESERVE = 256
+SUMMARY_BATCH_OVERHEAD_TOKENS = 768
 
 
 @dataclass(frozen=True)
@@ -42,6 +55,7 @@ class ContextBudget:
 class PendingMessageEstimate:
     body: str
     token_estimate: int | None = None
+    role: str = "player"
 
 
 @dataclass(frozen=True)
@@ -91,18 +105,18 @@ class SummaryService:
         token_estimate = sum(
             message.token_estimate
             if message.token_estimate is not None
-            else _estimate_tokens(message.body)
+            else estimate_message_body_tokens(message.body)
             for message in messages
         )
         token_estimate += sum(
-            _estimate_tokens(summary_body)
+            estimate_message_body_tokens(summary_body)
             for summary_body in (summary_bodies or [])
         )
         if pending_message is not None:
             token_estimate += (
                 pending_message.token_estimate
                 if pending_message.token_estimate is not None
-                else _estimate_tokens(pending_message.body)
+                else estimate_message_body_tokens(pending_message.body)
             )
         pressure = token_estimate / context_window if context_window else 1.0
         resolved_threshold = self.threshold if threshold is None else threshold
@@ -161,15 +175,22 @@ class SummaryService:
                 default=self.threshold,
             ),
         )
-        covered_messages = self._messages_to_summarize(unsummarized_messages)
+        covered_messages = self._messages_crossing_raw_history_frontier(
+            unsummarized_messages,
+            save_id=save_id,
+            pending_message=pending_message,
+        )
+        frontier_triggered = bool(covered_messages)
+        if not covered_messages and budget.should_summarize:
+            covered_messages = self._messages_to_summarize(unsummarized_messages)
         should_roll_up_summaries = len(summaries) > 1 or (
             bool(summaries)
             and budget.should_summarize
             and not covered_messages
         )
-        if (
-            not should_roll_up_summaries
-            and (not budget.should_summarize or not covered_messages)
+        no_summary_needed = not budget.should_summarize and not frontier_triggered
+        if not should_roll_up_summaries and (
+            not covered_messages or no_summary_needed
         ):
             log_event(
                 "summarization.skipped",
@@ -179,6 +200,7 @@ class SummaryService:
                 context_window=budget.context_window,
                 pressure=budget.pressure,
                 covered_message_count=len(covered_messages),
+                frontier_triggered=frontier_triggered,
             )
             return None
 
@@ -208,7 +230,7 @@ class SummaryService:
         )
         started_at = perf_counter()
         try:
-            generated = await self.generate_summary(
+            generated = await self._generate_summary_for_coverage(
                 save_id=save_id,
                 preference=preference,
                 covered_messages=covered_messages,
@@ -233,6 +255,11 @@ class SummaryService:
                     messages=(),
                 ),
             )
+            if (
+                safety.action is not ContentSafetyAction.ALLOW
+                or safety.transition_applied
+            ):
+                raise ValueError("Summary blocked by content safety")
             generated = replace(
                 generated,
                 body=safety.body,
@@ -271,6 +298,10 @@ class SummaryService:
                 provider=generated.provider,
                 model=generated.model,
                 content_rating=generated.content_rating,
+                source_message_ids=tuple(
+                    message.id for message in covered_messages
+                ),
+                source_summary_ids=tuple(summary.id for summary in summaries),
             )
             for old_summary in summaries:
                 self.repositories.archive_summary(old_summary.id)
@@ -304,6 +335,71 @@ class SummaryService:
             summary_id=summary.id,
         )
         return summary
+
+    async def _generate_summary_for_coverage(
+        self,
+        *,
+        save_id: str,
+        preference: ModelPreferenceRecord,
+        covered_messages: list[MessageRecord],
+        retained_recent_messages: tuple[MessageRecord, ...],
+        prior_summaries: tuple[SummaryRecord, ...],
+        started_at: float,
+    ) -> GeneratedSummary:
+        batch_limit = _summary_batch_token_limit(
+            self.repositories,
+            save_id=save_id,
+            preference=preference,
+        )
+        batches = (
+            (tuple(covered_messages),)
+            if batch_limit is None
+            else tuple(_message_batches(tuple(covered_messages), batch_limit))
+        )
+        if len(batches) <= 1:
+            return await self.generate_summary(
+                save_id=save_id,
+                preference=preference,
+                covered_messages=covered_messages,
+                retained_recent_messages=retained_recent_messages,
+                prior_summaries=prior_summaries,
+                started_at=started_at,
+            )
+
+        rolling_summaries = prior_summaries
+        generated: GeneratedSummary | None = None
+        for index, batch in enumerate(batches, start=1):
+            generated = await self.generate_summary(
+                save_id=save_id,
+                preference=preference,
+                covered_messages=batch,
+                retained_recent_messages=retained_recent_messages,
+                prior_summaries=rolling_summaries,
+                started_at=started_at,
+            )
+            rolling_summaries = (
+                SummaryRecord(
+                    id=f"summary-rollup-batch-{index}",
+                    save_id=save_id,
+                    covers_message_start_id=(
+                        prior_summaries[0].covers_message_start_id
+                        if prior_summaries
+                        else covered_messages[0].id
+                    ),
+                    covers_message_end_id=batch[-1].id,
+                    body=generated.body,
+                    provider=generated.provider,
+                    model=generated.model,
+                    content_rating=generated.content_rating,
+                    source_message_ids=tuple(message.id for message in batch),
+                    source_summary_ids=tuple(
+                        summary.id for summary in rolling_summaries
+                    ),
+                ),
+            )
+        if generated is None:
+            raise ValueError("No summary batches were generated")
+        return generated
 
     async def generate_summary(
         self,
@@ -443,6 +539,47 @@ class SummaryService:
             return []
         return list(messages[: -self.retain_recent_messages])
 
+    def _messages_crossing_raw_history_frontier(
+        self,
+        messages: list[MessageRecord],
+        *,
+        save_id: str,
+        pending_message: PendingMessageEstimate | None,
+    ) -> list[MessageRecord]:
+        if not messages:
+            return []
+        settings = _strictest_raw_history_window_settings(
+            self.repositories,
+            save_id=save_id,
+        )
+        projected = list(messages)
+        if pending_message is not None:
+            projected.append(
+                MessageRecord(
+                    id="__pending_message__",
+                    save_id=save_id,
+                    role=pending_message.role,
+                    body=pending_message.body,
+                    speaker_name=None,
+                    provider=None,
+                    model=None,
+                    token_estimate=pending_message.token_estimate,
+                )
+            )
+        retained_ids = _recent_message_ids_by_role(
+            projected,
+            settings=settings,
+        )
+        retained_indexes = [
+            index
+            for index, message in enumerate(messages)
+            if message.id in retained_ids
+        ]
+        frontier_index = min(retained_indexes) if retained_indexes else len(messages)
+        if frontier_index <= 0:
+            return []
+        return list(messages[:frontier_index])
+
     def _unsummarized_messages(
         self,
         messages: list[MessageRecord],
@@ -458,8 +595,114 @@ class SummaryService:
         return messages[end_index + 1 :]
 
 
-def _estimate_tokens(text: str) -> int:
+def estimate_message_body_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
+
+
+def _summary_batch_token_limit(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    preference: ModelPreferenceRecord,
+) -> int | None:
+    context_window = model_context_window(
+        repositories,
+        provider=preference.provider,
+        model_id=preference.model_id,
+    )
+    if context_window is None:
+        log_event(
+            "summarization.batch_budget_unenforced",
+            save_id=save_id,
+            provider=preference.provider,
+            model=preference.model_id,
+            reason="no_model_context_window",
+        )
+        return None
+    return max(
+        1,
+        context_window - SUMMARY_OUTPUT_TOKEN_RESERVE - SUMMARY_BATCH_OVERHEAD_TOKENS,
+    )
+
+
+def _message_batches(
+    messages: tuple[MessageRecord, ...],
+    token_limit: int,
+) -> Iterator[tuple[MessageRecord, ...]]:
+    batch: list[MessageRecord] = []
+    batch_tokens = 0
+    bounded_limit = max(1, token_limit)
+    for message in messages:
+        message_tokens = _message_token_estimate(message)
+        if batch and batch_tokens + message_tokens > bounded_limit:
+            yield tuple(batch)
+            batch = []
+            batch_tokens = 0
+        batch.append(message)
+        batch_tokens += message_tokens
+    if batch:
+        yield tuple(batch)
+
+
+def _message_token_estimate(message: MessageRecord) -> int:
+    if message.token_estimate is not None:
+        return max(1, message.token_estimate)
+    return estimate_message_body_tokens(message.body)
+
+
+def _strictest_raw_history_window_settings(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+) -> ChatHistoryWindowSettings:
+    prose = chat_history_window_settings(repositories, save_id=save_id)
+    if not plan_first_narrator_enabled(repositories, save_id=save_id):
+        return prose
+    planner = narrator_planner_chat_history_window_settings(
+        repositories,
+        save_id=save_id,
+    )
+    return ChatHistoryWindowSettings(
+        player_messages=min(prose.player_messages, planner.player_messages),
+        narrator_messages=min(prose.narrator_messages, planner.narrator_messages),
+    )
+
+
+def _recent_message_ids_by_role(
+    messages: list[MessageRecord],
+    *,
+    settings: ChatHistoryWindowSettings,
+) -> set[str]:
+    return {
+        message.id
+        for message in (
+            *_last_messages_by_role(
+                messages,
+                role="player",
+                limit=settings.player_messages,
+            ),
+            *_last_messages_by_role(
+                messages,
+                role="narrator",
+                limit=settings.narrator_messages,
+            ),
+        )
+    }
+
+
+def _last_messages_by_role(
+    messages: list[MessageRecord],
+    *,
+    role: str,
+    limit: int,
+) -> tuple[MessageRecord, ...]:
+    if limit <= 0:
+        return ()
+    return tuple(
+        reversed(
+            [message for message in reversed(messages) if message.role == role][:limit]
+        )
+    )
 
 
 def _summary_source_text(message: MessageRecord) -> str:

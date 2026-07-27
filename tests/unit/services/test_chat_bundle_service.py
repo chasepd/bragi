@@ -2170,6 +2170,17 @@ def test_import_save_remaps_context_source_row_id_source(
 ) -> None:
     media_dir = tmp_path / "media"
     save = _seed_bundle_save(repositories, media_dir)
+    prior_summary = repositories.add_summary(
+        summary_id="summary-prior-source",
+        save_id=save.id,
+        covers_message_start_id=PLAYER_MESSAGE_ID,
+        covers_message_end_id=PLAYER_MESSAGE_ID,
+        body="Mara began the beacon approach.",
+        provider="fake-summary-provider",
+        model="fake-summary-model",
+        source_message_ids=(PLAYER_MESSAGE_ID,),
+    )
+    repositories.archive_summary(prior_summary.id)
     summary = repositories.add_summary(
         summary_id="summary-context-source",
         save_id=save.id,
@@ -2178,6 +2189,8 @@ def test_import_save_remaps_context_source_row_id_source(
         body="The beacon warning summary is indexed as context.",
         provider="fake-summary-provider",
         model="fake-summary-model",
+        source_message_ids=(PLAYER_MESSAGE_ID, NARRATOR_MESSAGE_ID),
+        source_summary_ids=("summary-prior-source",),
     )
     repositories.upsert_context_source(
         save_id=save.id,
@@ -2194,6 +2207,7 @@ def test_import_save_remaps_context_source_row_id_source(
 
     imported = service.import_save(bundle_path)
     imported_save_id = _imported_save_id(imported)
+    imported_messages = repositories.list_messages(imported_save_id)
 
     imported_summary = next(
         summary
@@ -2205,6 +2219,21 @@ def test_import_save_remaps_context_source_row_id_source(
         source_type="summary",
     )
     assert imported_summary.id != summary.id
+    assert imported_summary.source_message_ids == (
+        imported_messages[0].id,
+        imported_messages[1].id,
+    )
+    imported_prior_summary = repositories.connection.execute(
+        """
+        SELECT id, archived_at
+        FROM summaries
+        WHERE save_id = ? AND body = ?
+        """,
+        (imported_save_id, prior_summary.body),
+    ).fetchone()
+    assert imported_prior_summary is not None
+    assert imported_prior_summary["archived_at"] is not None
+    assert imported_summary.source_summary_ids == (imported_prior_summary["id"],)
     assert imported_source.source_id == imported_summary.id
 
 

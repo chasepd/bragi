@@ -450,9 +450,10 @@ class ChatBundleService:
                 """
                 SELECT id, save_id, covers_message_start_id,
                        covers_message_end_id, body, provider, model, created_at,
-                       content_rating, archived_at
+                       content_rating, source_message_ids_json,
+                       source_summary_ids_json, archived_at
                 FROM summaries
-                WHERE save_id = ? AND archived_at IS NULL
+                WHERE save_id = ?
                 ORDER BY created_at, rowid
                 """,
                 (save_id,),
@@ -1403,7 +1404,25 @@ class ChatBundleService:
                 provider=_text(row, "provider"),
                 model=_text(row, "model"),
                 content_rating="unclassified",
+                source_message_ids=tuple(
+                    message_id_map[source_id]
+                    for source_id in _optional_json_string_list(
+                        row,
+                        "source_message_ids_json",
+                    )
+                    if source_id in message_id_map
+                ),
+                source_summary_ids=tuple(
+                    summary_id_map[source_id]
+                    for source_id in _optional_json_string_list(
+                        row,
+                        "source_summary_ids_json",
+                    )
+                    if source_id in summary_id_map
+                ),
             )
+            if _optional_text(row, "archived_at") is not None:
+                self.repositories.archive_summary(summary.id)
             summary_id_map[original_id] = summary.id
         imported_id_maps["summary"] = summary_id_map
         imported_id_maps["summaries"] = summary_id_map
@@ -6071,6 +6090,18 @@ def _json_string_list(row: dict[str, object], key: str) -> list[str]:
         isinstance(item, str) for item in loaded
     ):
         raise ChatBundleError(f"Expected JSON string list field: {key}")
+    return cast(list[str], loaded)
+
+
+def _optional_json_string_list(row: dict[str, object], key: str) -> list[str]:
+    value = _optional_text(row, key)
+    if value is None:
+        return []
+    loaded = _json_value(value, key)
+    if not isinstance(loaded, list) or not all(
+        isinstance(item, str) for item in loaded
+    ):
+        raise ChatBundleError(f"Expected optional JSON string list field: {key}")
     return cast(list[str], loaded)
 
 

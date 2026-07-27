@@ -449,8 +449,9 @@ class SaveForkService:
             fork_save_id,
             message_id_map,
             prefix_ids,
-            exclude_archived=True,
+            json_columns=("source_summary_ids_json",),
             message_columns=("covers_message_start_id", "covers_message_end_id"),
+            message_list_columns=("source_message_ids_json",),
         )
         self._copy_table(
             "save_scenario_updates",
@@ -693,6 +694,8 @@ class SaveForkService:
             return self._remap_table_id_list_json(value, "characters")
         if table_name == "active_threads" and column == "related_entities_json":
             return self._remap_related_entities_json(value)
+        if table_name == "summaries" and column == "source_summary_ids_json":
+            return self._remap_table_id_list_json(value, "summaries")
         return _remap_json_text(value, message_id_map)
 
     def _remap_table_id_list_json(

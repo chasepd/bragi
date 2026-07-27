@@ -167,6 +167,8 @@ class SummaryBackfillService:
                 body=rolling_summary.body,
                 provider=rolling_summary.provider,
                 model=rolling_summary.model,
+                source_message_ids=tuple(message.id for message in covered_messages),
+                source_summary_ids=tuple(summary.id for summary in active_summaries),
             )
             for old_summary in active_summaries:
                 self.repositories.archive_summary(old_summary.id)

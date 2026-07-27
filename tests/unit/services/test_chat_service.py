@@ -2181,7 +2181,7 @@ def test_submit_player_turn_persists_messages_and_uses_active_chat_model(
     )
     assert persisted_messages[1].provider == "openrouter"
     assert persisted_messages[1].model == "anthropic/claude-3.5-sonnet"
-    assert persisted_messages[1].token_estimate == 34
+    assert persisted_messages[1].token_estimate == 23
 
 
 def test_submit_player_turn_rolls_back_input_when_snapshot_capture_fails(
@@ -7212,7 +7212,7 @@ def test_submit_player_turn_streams_narrator_drafts_and_persists_final_body(
     persisted_messages = repositories.list_messages(save.id)
     assert persisted_messages[1].id == result.narrator_message.id
     assert persisted_messages[1].body == "The beacon answers."
-    assert persisted_messages[1].token_estimate == 12
+    assert persisted_messages[1].token_estimate == 5
 
 
 def test_rated_streaming_never_publishes_draft_rejected_by_safety_agent(

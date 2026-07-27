@@ -8384,6 +8384,8 @@ def test_repository_updates_and_archives_summaries(
         body="The watch began as the tower beacon started failing.",
         provider="openrouter",
         model="anthropic/claude-sonnet",
+        source_message_ids=(source_message_id,),
+        source_summary_ids=("summary-prior",),
     )
 
     updated = repositories.update_summary(
@@ -8395,6 +8397,8 @@ def test_repository_updates_and_archives_summaries(
     assert updated.body == "The watch began after the beacon lens cracked."
     assert updated.provider == "openrouter"
     assert updated.model == "anthropic/claude-sonnet"
+    assert updated.source_message_ids == (source_message_id,)
+    assert updated.source_summary_ids == ("summary-prior",)
 
     repositories.archive_summary(summary.id)
 

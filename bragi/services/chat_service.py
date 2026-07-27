@@ -239,7 +239,10 @@ from bragi.services.state_service import (
     ToolCallingProviderStateExtractor,
 )
 from bragi.services.summary_safety import validate_summary_output
-from bragi.services.summary_service import PendingMessageEstimate
+from bragi.services.summary_service import (
+    PendingMessageEstimate,
+    estimate_message_body_tokens,
+)
 from bragi.services.text_script_policy import (
     ScriptPolicyViolation,
     allowed_generated_scripts,
@@ -1005,7 +1008,7 @@ class ChatService:
                 save_id=save_id,
                 provider=preference.provider,
                 model_id=preference.model_id,
-                pending_message=PendingMessageEstimate(body=body),
+                pending_message=PendingMessageEstimate(body=body, role="player"),
                 current_user_id=current_user_id,
             )
         except Exception:
@@ -1127,7 +1130,7 @@ class ChatService:
                 save_id=save_id,
                 provider=preference.provider,
                 model_id=preference.model_id,
-                pending_message=PendingMessageEstimate(body=directive),
+                pending_message=PendingMessageEstimate(body=directive, role="system"),
                 current_user_id=current_user_id,
             )
         except Exception:
@@ -2642,7 +2645,10 @@ class ChatService:
                 body=narrator_body,
                 provider=response.provider,
                 model=response.model_id,
-                token_estimate=response.token_usage.get("total"),
+                token_estimate=_completion_or_body_token_estimate(
+                    response.token_usage,
+                    narrator_body,
+                ),
                 safety_transition=completion.safety_transition,
                 content_rating=completion.content_rating,
             )
@@ -10733,6 +10739,20 @@ def _retry_max_attempts(payload: dict[str, object]) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
         return value
     return CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS
+
+
+def _completion_or_body_token_estimate(
+    token_usage: dict[str, int],
+    body: str,
+) -> int:
+    completion_tokens = token_usage.get("completion")
+    if (
+        isinstance(completion_tokens, int)
+        and not isinstance(completion_tokens, bool)
+        and completion_tokens > 0
+    ):
+        return completion_tokens
+    return estimate_message_body_tokens(body)
 
 
 def _non_negative_int(value: object) -> int:

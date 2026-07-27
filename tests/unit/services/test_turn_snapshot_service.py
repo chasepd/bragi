@@ -1172,6 +1172,37 @@ def test_snapshot_remaps_colliding_message_provenance_by_field_type() -> None:
     assert fork_message_id != "fork-save"
 
 
+def test_snapshot_remaps_summary_lineage_ids() -> None:
+    remapper = turn_snapshot_module._SnapshotRemapper(
+        source_save_id="source-save",
+        target_save_id="fork-save",
+        rows_by_table={
+            "messages": ({"id": "message-one"},),
+            "summaries": (
+                {"id": "summary-prior"},
+                {"id": "summary-active"},
+            ),
+        },
+    )
+
+    summary = remapper.remap_row(
+        "summaries",
+        {
+            "id": "summary-active",
+            "save_id": "source-save",
+            "source_message_ids_json": json.dumps(["message-one"]),
+            "source_summary_ids_json": json.dumps(["summary-prior"]),
+        },
+    )
+
+    assert json.loads(str(summary["source_message_ids_json"])) == [
+        remapper.id_maps["messages"]["message-one"]
+    ]
+    assert json.loads(str(summary["source_summary_ids_json"])) == [
+        remapper.id_maps["summaries"]["summary-prior"]
+    ]
+
+
 def test_snapshot_rejects_unknown_context_source_provenance() -> None:
     remapper = turn_snapshot_module._SnapshotRemapper(
         source_save_id="source-save",
