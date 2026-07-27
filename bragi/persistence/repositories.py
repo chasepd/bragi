@@ -13812,7 +13812,11 @@ def _placeholders(count: int) -> str:
 
 def _normalized_graph_target_type(value: str) -> str:
     normalized = value.strip().casefold()
-    return "world_state" if normalized in {"state", "world_state"} else normalized
+    if normalized in {"state", "world_state"}:
+        return "world_state"
+    if normalized in {"memory", "memories"}:
+        return "memory"
+    return normalized
 
 
 def _fts_query_from_terms(
@@ -14248,14 +14252,31 @@ def _context_source_eligibility_sql(
         params.extend(visibility_ids)
     if visibility_character_ids is not None:
         scope_ids_json = _dump_json(sorted(visibility_character_ids))
+        source_target_type_sql = (
+            f"(CASE WHEN {alias}.source_type IN ('state', 'world_state') "
+            "THEN 'world_state' "
+            f"WHEN {alias}.source_type IN ('memory', 'memories') "
+            "THEN 'memory' "
+            f"ELSE {alias}.source_type END)"
+        )
+        edge_target_type_sql = (
+            "(CASE WHEN edge.target_type IN ('state', 'world_state') "
+            "THEN 'world_state' "
+            "WHEN edge.target_type IN ('memory', 'memories') THEN 'memory' "
+            "ELSE edge.target_type END)"
+        )
+        link_target_type_sql = (
+            "(CASE WHEN link.target_type IN ('state', 'world_state') "
+            "THEN 'world_state' "
+            "WHEN link.target_type IN ('memory', 'memories') THEN 'memory' "
+            "ELSE link.target_type END)"
+        )
         target_matches_edge = (
-            f"(edge.target_type = {alias}.source_type OR ("
-            f"{alias}.source_type = 'world_state' AND edge.target_type = 'state')) "
+            f"{edge_target_type_sql} = {source_target_type_sql} "
             f"AND edge.target_id = {alias}.source_id"
         )
         target_matches_link = (
-            f"(link.target_type = {alias}.source_type OR ("
-            f"{alias}.source_type = 'world_state' AND link.target_type = 'state')) "
+            f"{link_target_type_sql} = {source_target_type_sql} "
             f"AND link.target_id = {alias}.source_id"
         )
         clauses.append(
@@ -14316,7 +14337,7 @@ def _context_source_eligibility_sql(
             "WHERE edge.save_id = link.save_id "
             "AND edge.archived_at IS NULL "
             "AND edge.character_id = link.entity_id "
-            "AND edge.target_type = link.target_type "
+            f"AND {edge_target_type_sql} = {link_target_type_sql} "
             "AND edge.target_id = link.target_id"
             ") "
             "AND NOT EXISTS ("

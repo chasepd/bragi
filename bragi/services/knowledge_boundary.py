@@ -251,6 +251,8 @@ def normalized_knowledge_target_type(value: str) -> str:
     normalized = value.strip().casefold()
     if normalized in {"state", "world_state"}:
         return "world_state"
+    if normalized in {"memory", "memories"}:
+        return "memory"
     return normalized
 
 
