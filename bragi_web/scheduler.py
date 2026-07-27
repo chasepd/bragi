@@ -468,7 +468,24 @@ def _task_target_save_ids(
             None,
         )
         if callable(list_due_curation):
-            return tuple(list_due_curation(limit=_DUE_ROUTINE_TARGET_LIMIT))
+            runnable_save_ids: list[str] = []
+            offset = 0
+            while len(runnable_save_ids) < _DUE_ROUTINE_TARGET_LIMIT:
+                page = tuple(
+                    list_due_curation(
+                        limit=_DUE_ROUTINE_TARGET_LIMIT,
+                        offset=offset,
+                    )
+                )
+                if not page:
+                    break
+                for save_id in page:
+                    if _observation_curation_drain_due(repositories, save_id):
+                        _append_unique_save_id(runnable_save_ids, save_id)
+                        if len(runnable_save_ids) >= _DUE_ROUTINE_TARGET_LIMIT:
+                            break
+                offset += len(page)
+            return tuple(runnable_save_ids)
     retry_job_type = _RETRY_DRAIN_JOB_TYPES.get(definition.task_type)
     if retry_job_type is not None:
         return _save_ids_with_queued_jobs(repositories, job_type=retry_job_type)

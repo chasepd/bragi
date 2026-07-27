@@ -1799,6 +1799,10 @@ def _sanitize_snapshot_rows_for_safety(
         table_name: tuple(dict(row) for row in table_rows)
         for table_name, table_rows in rows_by_table.items()
     }
+    rows["context_observation_curation_state"] = tuple(
+        {**row, "lease_token": None, "lease_until": None}
+        for row in rows.get("context_observation_curation_state", ())
+    )
     rows["messages"] = tuple(
         _sanitize_snapshot_message_row(row)
         for row in rows.get("messages", ())
