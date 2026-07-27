@@ -65,9 +65,14 @@ def chat_system_body(request: ChatRequest) -> str:
 
 def rendered_chat_request_text(request: ChatRequest) -> str:
     return "\n\n".join(
-        f"{message['role']}:\n{message['content']}"
+        _provider_message_estimate_text(message)
         for message in provider_chat_messages(request)
     )
+
+
+def _provider_message_estimate_text(message: dict[str, str]) -> str:
+    name = f" name={message['name']}" if "name" in message else ""
+    return f"{message['role']}{name}:\n{message['content']}"
 
 
 def estimate_chat_request_tokens(request: ChatRequest) -> int:

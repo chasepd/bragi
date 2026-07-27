@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 from bragi.persistence.repositories import BragiRepository
+from bragi.providers.chat_rendering import chat_system_body
 from bragi.providers.contracts import (
     ChatRequest,
     ChatResponse,
@@ -71,7 +72,12 @@ class SummarizationContextNarratorProvider:
         self.chat_requests.append(request)
         if request.model_id == "fake-summary":
             self.events.append("summarization")
-            prompt = "\n".join(message.body for message in request.messages)
+            prompt = "\n".join(
+                (
+                    chat_system_body(request),
+                    *(message.body for message in request.messages),
+                )
+            )
             assert "I step onto the ash bridge." in prompt
             assert "A bell rings under the span." in prompt
             assert "scene.location" not in prompt

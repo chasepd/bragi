@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import islice
 from typing import Any
 
 from jsonschema import Draft202012Validator
@@ -23,7 +24,7 @@ def validate_structured_output(
 ) -> None:
     validator = Draft202012Validator(schema)
     errors = sorted(
-        validator.iter_errors(data),
+        islice(validator.iter_errors(data), 21),
         key=lambda error: (
             tuple(str(part) for part in error.absolute_path),
             tuple(str(part) for part in error.absolute_schema_path),

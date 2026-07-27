@@ -83,3 +83,19 @@ def test_validation_diagnostics_do_not_echo_provider_property_names() -> None:
         )
 
     assert provider_property not in repr(exc_info.value.diagnostics)
+
+
+def test_validation_stops_collecting_after_bounded_error_count() -> None:
+    with pytest.raises(StructuredOutputValidationError) as exc_info:
+        validate_structured_output(
+            [17] * 1000,
+            schema={"type": "array", "items": {"type": "string"}},
+            schema_name="bounded_errors",
+        )
+
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics["error_count"] == 21
+    assert diagnostics["errors_truncated"] is True
+    errors = diagnostics["errors"]
+    assert isinstance(errors, list)
+    assert len(errors) == 20
