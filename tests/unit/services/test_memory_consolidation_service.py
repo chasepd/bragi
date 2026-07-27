@@ -138,6 +138,7 @@ def test_consolidation_rewrites_canonical_archives_duplicates_and_unions_sources
     assert result.rewritten_count == 1
     assert result.archived_count == 1
     assert provider.requests[0].schema_name == "memory_consolidation"
+    assert provider.requests[0].max_output_tokens == 1024
     assert [entry.kind for entry in store.entries_for_message(messages[1].id)] == [
         "memory_consolidation"
     ]

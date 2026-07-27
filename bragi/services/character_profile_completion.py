@@ -37,7 +37,10 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
-from bragi.services.request_budget import budget_tool_call_request
+from bragi.services.request_budget import (
+    budget_structured_output_request,
+    budget_tool_call_request,
+)
 from bragi.services.tool_call_helpers import (
     accepted_tool_result,
     append_tool_feedback_messages,
@@ -259,7 +262,11 @@ class StructuredProviderCharacterProfileCompleter:
                 )
             else:
                 response = await self.provider.generate_structured_output(
-                    current_request
+                    budget_structured_output_request(
+                        self.repositories,
+                        current_request,
+                        task="context_update",
+                    )
                 )
             completed = _merge_completed_starters(
                 request.starters,
@@ -323,7 +330,11 @@ class StructuredProviderCharacterProfileCompleter:
                 )
             else:
                 response = await self.provider.generate_structured_output(
-                    current_request
+                    budget_structured_output_request(
+                        self.repositories,
+                        current_request,
+                        task=task,
+                    )
                 )
             try:
                 starters = _validated_generated_starters_from_data(
@@ -403,7 +414,11 @@ class StructuredProviderCharacterProfileCompleter:
                 )
             else:
                 response = await self.provider.generate_structured_output(
-                    current_request
+                    budget_structured_output_request(
+                        self.repositories,
+                        current_request,
+                        task="character_enhancement",
+                    )
                 )
             try:
                 starter = _field_enhancement_from_data(

@@ -90,7 +90,10 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
-from bragi.services.request_budget import budget_tool_call_request
+from bragi.services.request_budget import (
+    budget_structured_output_request,
+    budget_tool_call_request,
+)
 from bragi.services.scene_snapshot_locks import scene_snapshot_field_is_locked
 from bragi.services.sexual_content_safety import is_fade_to_black_message
 from bragi.services.tool_call_helpers import (
@@ -681,7 +684,11 @@ class StructuredProviderContextUpdater:
             )
         else:
             response = await self.provider.generate_structured_output(
-                structured_request
+                budget_structured_output_request(
+                    self.repositories,
+                    structured_request,
+                    task="context_update",
+                )
             )
         extraction = context_update_extraction_from_structured_data(response.data)
         return _filter_structured_extraction_evidence(
@@ -722,7 +729,11 @@ class StructuredProviderContextUpdater:
             )
         else:
             response = await self.provider.generate_structured_output(
-                structured_request
+                budget_structured_output_request(
+                    self.repositories,
+                    structured_request,
+                    task="context_update",
+                )
             )
         return _context_registry_selection_from_structured_data(
             response.data,
@@ -761,7 +772,11 @@ class StructuredProviderContextUpdater:
             )
         else:
             response = await self.provider.generate_structured_output(
-                structured_request
+                budget_structured_output_request(
+                    self.repositories,
+                    structured_request,
+                    task="context_update",
+                )
             )
         return _filter_world_data_enrichment_evidence(
             world_data_enrichment_from_structured_data(response.data),

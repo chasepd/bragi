@@ -50,7 +50,10 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
-from bragi.services.request_budget import budget_tool_call_request
+from bragi.services.request_budget import (
+    budget_structured_output_request,
+    budget_tool_call_request,
+)
 from bragi.services.scene_snapshot_locks import scene_snapshot_field_is_locked
 from bragi.services.tool_call_helpers import (
     accepted_tool_result,
@@ -752,7 +755,13 @@ class ContextCleanupService:
             save_id=save_id,
         )
         if self.providers is None:
-            return await provider.generate_structured_output(request)
+            return await provider.generate_structured_output(
+                budget_structured_output_request(
+                    self.repositories,
+                    request,
+                    task=task,
+                )
+            )
         return await structured_output_with_fallback(
             repositories=self.repositories,
             providers=self.providers,

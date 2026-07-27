@@ -42,7 +42,10 @@ from bragi.services.provider_fallbacks import (
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
 )
-from bragi.services.request_budget import budget_tool_call_request
+from bragi.services.request_budget import (
+    budget_structured_output_request,
+    budget_tool_call_request,
+)
 from bragi.services.sexual_content_safety import is_fade_to_black_message
 from bragi.services.tool_call_helpers import (
     accepted_tool_result,
@@ -276,7 +279,11 @@ class StructuredProviderScenarioEvolver:
         )
         if self.providers is None:
             response = await self.provider.generate_structured_output(
-                structured_request
+                budget_structured_output_request(
+                    repositories,
+                    structured_request,
+                    task="scenario_evolution",
+                )
             )
         else:
             response = await structured_output_with_fallback(

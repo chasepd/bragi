@@ -17,6 +17,7 @@ from bragi.providers.contracts import (
 )
 from bragi.services.openrouter_routing_settings import request_with_openrouter_routing
 from bragi.services.provider_fallbacks import structured_output_with_fallback
+from bragi.services.request_budget import budget_structured_output_request
 from bragi.services.sexual_content_safety import is_fade_to_black_message
 from bragi.services.time_loop_time_policy import TimeLoopTimePolicy
 from bragi.services.world_time_model import (
@@ -173,7 +174,13 @@ class StructuredProviderWorldTimeChecker:
                 save_id=save_id,
             )
         else:
-            response = await self.provider.generate_structured_output(request)
+            response = await self.provider.generate_structured_output(
+                budget_structured_output_request(
+                    self.repositories,
+                    request,
+                    task=WORLD_TIME_TASK,
+                )
+            )
         return _assessment_from_data(response.data)
 
     async def assess_completed_turn(
@@ -213,7 +220,13 @@ class StructuredProviderWorldTimeChecker:
                 save_id=save_id,
             )
         else:
-            response = await self.provider.generate_structured_output(request)
+            response = await self.provider.generate_structured_output(
+                budget_structured_output_request(
+                    self.repositories,
+                    request,
+                    task=WORLD_TIME_TASK,
+                )
+            )
         return _assessment_from_data(response.data)
 
 
