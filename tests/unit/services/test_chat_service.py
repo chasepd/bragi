@@ -12790,7 +12790,7 @@ def test_run_post_turn_jobs_reuses_existing_context_update_retry(
     )
 
 
-def test_update_context_runs_curation_when_continuity_provider_unavailable(
+def test_update_context_observes_without_inline_curation_when_provider_unavailable(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -12853,7 +12853,7 @@ def test_update_context_runs_curation_when_continuity_provider_unavailable(
     )
 
     assert result == "skipped"
-    assert events == ["observation", "curation"]
+    assert events == ["observation"]
 
 
 def test_run_context_update_retries_replays_full_context_after_state_retry(
@@ -12935,7 +12935,7 @@ def test_run_context_update_retries_replays_full_context_after_state_retry(
     completed = asyncio.run(service.run_context_update_retries(save_id=save.id))
 
     assert completed == 1
-    assert events == ["observation", "context_update", "curation"]
+    assert events == ["observation", "context_update"]
     succeeded_retry = next(
         job
         for job in repositories.list_jobs_by_status(("succeeded",))
@@ -18905,7 +18905,7 @@ def test_submit_player_turn_extracts_state_and_memory_with_structured_model(
     assert memories[0].source_message_id == result.narrator_message.id
 
 
-def test_submit_player_turn_uses_state_only_extraction_when_agentic_curation_available(
+def test_submit_player_turn_keeps_direct_memory_without_inline_curation(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -18959,6 +18959,7 @@ def test_submit_player_turn_uses_state_only_extraction_when_agentic_curation_ava
                     "body": "This state-memory fact should not be durable.",
                     "tags": ["duplicate"],
                     "importance": 0.91,
+                    "evidence_quote": "I climb toward the beacon lens.",
                 }
             ],
         },
@@ -18986,19 +18987,18 @@ def test_submit_player_turn_uses_state_only_extraction_when_agentic_curation_ava
         "narrator_chat",
         "state_memory_extraction",
         "fact_observation",
-        "memory_curation",
     ]
     state_request = _only_request_matching(
         provider.structured_output_requests,
         "state",
         "extraction",
     )
-    assert "memories" not in state_request.schema["properties"]
+    assert "memories" in state_request.schema["properties"]
     assert repositories.list_world_state(save.id)[0].value == {
         "name": "Beacon gallery"
     }
     assert [memory.body for memory in repositories.list_memories(save.id)] == [
-        "Mara likes concise, grounded narration."
+        "This state-memory fact should not be durable."
     ]
     state_jobs = [
         job
@@ -19007,7 +19007,7 @@ def test_submit_player_turn_uses_state_only_extraction_when_agentic_curation_ava
     ]
     state_job_result = state_jobs[-1].result
     assert state_job_result is not None
-    assert state_job_result["memory_count"] == 0
+    assert state_job_result["memory_count"] == 1
     assert result.narrator_message.body == (
         "fake narrator: I climb toward the beacon lens."
     )
@@ -19143,12 +19143,9 @@ def test_submit_player_turn_queues_agentic_durable_memory_when_confirmation_enab
 
     assert repositories.list_memories(save.id) == []
     suggestions = repositories.list_context_update_suggestions(save.id)
-    assert len(suggestions) == 1
-    assert suggestions[0].entity_type == "memory"
-    proposed_value = cast(dict[str, Any], suggestions[0].proposed_value)
-    assert proposed_value["body"] == (
-        "Mara likes concise, grounded narration."
-    )
+    assert suggestions == []
+    [observation] = repositories.list_context_observations(save.id)
+    assert observation.status == "pending"
 
 
 def test_submit_player_turn_runs_scenario_evolution_after_state_memory_extraction(
@@ -19919,7 +19916,8 @@ def test_look_around_returns_answer_without_appending_chronicle(
     assert result.latest_narrator_message_id == narrator.id
     assert result.context_observation_id is not None
     [observation] = repositories.list_context_observations(save.id)
-    assert observation.observation_type == "look_around"
+    assert observation.observation_type == "scene_fact"
+    assert observation.metadata["original_observation_type"] == "look_around"
     assert observation.claim == result.answer
     assert observation.source_message_ids == [narrator.id]
     assert observation.metadata["query"] == "Inspect the brass lens."

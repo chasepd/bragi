@@ -16,6 +16,7 @@ _DIAGNOSTIC_JOB_TYPES = (
     "dating_sim_maintenance",
     "guided_context_cleanup",
     "memory_consolidation",
+    "observation_curation_drain",
     "post_turn_jobs",
     "state_extraction_retry",
     "state_extraction_retry_drain",

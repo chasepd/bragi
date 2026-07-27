@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -207,6 +208,50 @@ def test_observation_extractor_returns_evidence_backed_candidates(
     )
 
 
+def test_observation_extractor_normalizes_type_confidence_and_candidate_limit(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    messages = tuple(repositories.list_messages(save.id))
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        "observation_type": "scene_detail",
+                        "claim": f"Candidate {index}",
+                        "evidence_quote": "Keep it grounded",
+                        "source_message_ids": [messages[0].id],
+                        "scope": "scene",
+                        "confidence": 1.0,
+                        "tags": [],
+                    }
+                    for index in range(14)
+                ]
+            }
+        }
+    )
+    extractor = StructuredProviderObservationExtractor(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="observer",
+    )
+
+    observations = asyncio.run(
+        extractor.extract(save_id=save.id, messages=messages)
+    )
+
+    assert len(observations) == 12
+    assert {observation.observation_type for observation in observations} == {
+        "scene_fact"
+    }
+    assert {observation.confidence for observation in observations} == {0.9}
+    schema = provider.structured_output_requests[0].schema
+    observations_schema = schema["properties"]["observations"]
+    assert isinstance(observations_schema, dict)
+    assert observations_schema["maxItems"] == 12
+
+
 def test_observation_service_drops_ungrounded_evidence_quotes(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -382,6 +427,124 @@ def test_context_curation_service_applies_memory_and_context_decisions(
     assert updated_observation.status == "accepted"
 
 
+def test_context_curation_bounds_batch_and_defers_omitted_observations(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, _narrator = repositories.list_messages(save.id)
+    observations = [
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="player_preference",
+            claim=f"Mara prefers grounded narration {index}.",
+            evidence_quote="Keep it grounded",
+            source_message_ids=[player.id],
+            scope="durable",
+            confidence=0.9,
+            tags=["tone"],
+        )
+        for index in range(3)
+    ]
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_curation": {
+                "decisions": [
+                    {
+                        "observation_id": observations[0].id,
+                        "action": "discard",
+                        "reason": "Duplicate preference.",
+                        "confidence": 0.7,
+                        "memory_body": "",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": [],
+                    }
+                ]
+            }
+        }
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+        batch_item_limit=2,
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.considered_count == 2
+    assert result.discarded_count == 1
+    assert result.omitted_count == 1
+    assert result.deferred_count == 1
+    request = provider.structured_output_requests[0]
+    decision_schema = request.schema["properties"]["decisions"]
+    assert isinstance(decision_schema, dict)
+    item_schema = decision_schema["items"]
+    assert isinstance(item_schema, dict)
+    observation_id_schema = item_schema["properties"]["observation_id"]
+    assert isinstance(observation_id_schema, dict)
+    assert observation_id_schema["enum"] == [
+        observations[0].id,
+        observations[1].id,
+    ]
+    omitted_state = repositories.get_context_observation_curation_state(
+        observations[1].id
+    )
+    assert omitted_state is not None
+    assert omitted_state.attempt_count == 1
+    assert omitted_state.last_error == "missing_decision"
+    assert omitted_state.next_eligible_at is not None
+    untouched_state = repositories.get_context_observation_curation_state(
+        observations[2].id
+    )
+    assert untouched_state is not None
+    assert untouched_state.attempt_count == 0
+
+
+def test_context_curation_terminalizes_an_observation_over_input_budget(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, _narrator = repositories.list_messages(save.id)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara prefers grounded narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+        tags=["tone"],
+    )
+    provider = RecordingStructuredProvider(
+        {"context_observation_curation": {"decisions": []}}
+    )
+    service = ContextCurationService(
+        repositories=repositories,
+        curator=StructuredProviderContextCurator(
+            provider=provider,
+            provider_name=provider.provider_name,
+            model_id="curator",
+        ),
+        input_token_budget=1,
+    )
+
+    result = asyncio.run(service.curate_pending(save.id))
+
+    assert result.considered_count == 1
+    assert result.terminal_failure_count == 1
+    assert provider.structured_output_requests == []
+    updated = repositories.get_context_observation(observation.id)
+    assert updated is not None
+    assert updated.status == "curation_failed"
+    state = repositories.get_context_observation_curation_state(observation.id)
+    assert state is not None
+    assert state.terminal_outcome == "input_budget_exceeded"
+
+
 def test_context_curation_rejects_unexpected_generated_script(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -464,6 +627,103 @@ def test_context_curation_rejects_unexpected_generated_script(
         diagnostic = observation.metadata["script_policy_rejected"]
         assert isinstance(diagnostic, Mapping)
         assert diagnostic["script"] == "Han"
+
+
+def test_context_curation_retries_only_script_violating_observations(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, narrator = repositories.list_messages(save.id)
+    memory_observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="player_preference",
+        claim="Mara likes concise narration.",
+        evidence_quote="Keep it grounded",
+        source_message_ids=[player.id],
+        scope="durable",
+        confidence=0.9,
+    )
+    context_observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="open_thread",
+        claim="The red lens warning may return.",
+        evidence_quote="riders in the ash",
+        source_message_ids=[narrator.id],
+        scope="save",
+        confidence=0.8,
+    )
+
+    class SubsetRetryProvider(RecordingStructuredProvider):
+        async def generate_structured_output(
+            self,
+            request: StructuredOutputRequest,
+        ) -> StructuredOutputResponse:
+            self.structured_output_requests.append(request)
+            if len(self.structured_output_requests) == 1:
+                decisions = [
+                    {
+                        "observation_id": memory_observation.id,
+                        "action": "durable_memory",
+                        "reason": "Stable preference.",
+                        "confidence": 0.9,
+                        "memory_body": "Mara likes concise narration.",
+                        "context_title": "",
+                        "context_body": "",
+                        "tags": ["tone"],
+                    },
+                    {
+                        "observation_id": context_observation.id,
+                        "action": "save_context",
+                        "reason": "未来剧情相关。",
+                        "confidence": 0.8,
+                        "memory_body": "",
+                        "context_title": "红色透镜警告",
+                        "context_body": "红色透镜显示灰烬中的骑手。",
+                        "tags": ["beacon"],
+                    },
+                ]
+            else:
+                retry_payload = json.dumps(
+                    {
+                        "schema": request.schema,
+                        "messages": [message.body for message in request.messages],
+                    }
+                )
+                assert memory_observation.id not in retry_payload
+                assert context_observation.id in retry_payload
+                decisions = [
+                    {
+                        "observation_id": context_observation.id,
+                        "action": "save_context",
+                        "reason": "Relevant to a future scene.",
+                        "confidence": 0.8,
+                        "memory_body": "",
+                        "context_title": "Red lens warning",
+                        "context_body": "The red lens warns of riders in the ash.",
+                        "tags": ["beacon"],
+                    }
+                ]
+            return StructuredOutputResponse(
+                data={"decisions": decisions},
+                provider=request.provider,
+                model_id=request.model_id,
+            )
+
+    provider = SubsetRetryProvider({})
+    result = asyncio.run(
+        ContextCurationService(
+            repositories=repositories,
+            curator=StructuredProviderContextCurator(
+                provider=provider,
+                provider_name=provider.provider_name,
+                model_id="curator",
+                repositories=repositories,
+            ),
+        ).curate_pending(save.id)
+    )
+
+    assert result.accepted_count == 2
+    assert len(provider.structured_output_requests) == 2
 
 
 def test_context_curation_service_rejects_custom_curator_unexpected_script(

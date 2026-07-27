@@ -20,6 +20,7 @@ from bragi_web.scheduler import (
     CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_TASK,
     CONTEXT_UPDATE_RETRY_DRAIN_TASK,
     MEMORY_CONSOLIDATION_TASK,
+    OBSERVATION_CURATION_DRAIN_TASK,
     STATE_EXTRACTION_RETRY_DRAIN_TASK,
     STATE_PRUNING_TASK,
     WEB_MAINTENANCE_CHARACTER_REGISTRY_MAINTENANCE_JOB,
@@ -709,6 +710,49 @@ def test_scheduler_drains_context_update_retry_for_inactive_save(
     }
 
 
+def test_scheduler_drains_observation_curation_for_inactive_save(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    active_save_id = _save(repositories, title="Active Save")
+    inactive_save_id = _save(repositories, title="Inactive Save")
+    repositories.set_model_preference(
+        task="memory_curation",
+        provider="fake",
+        model_id="fake-curator",
+    )
+    repositories.add_context_observation(
+        save_id=inactive_save_id,
+        observation_type="event",
+        claim="The beacon was relit.",
+        evidence_quote="The beacon was relit.",
+        source_message_ids=[],
+        scope="durable",
+        confidence=0.9,
+    )
+    runtime = _ReviewRuntime(active_save_id=active_save_id)
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.observation_curation_calls == [inactive_save_id]
+    task = repositories.get_scheduled_task(
+        task_type=OBSERVATION_CURATION_DRAIN_TASK,
+        save_id=inactive_save_id,
+    )
+    assert task is not None
+    assert task.payload["active_save_only"] is False
+
+
 def test_scheduler_drains_inactive_context_retry_while_active_save_job_runs(
     tmp_path: Path,
 ) -> None:
@@ -1275,6 +1319,7 @@ class _ReviewRuntime:
         self.state_pruning_calls: list[str] = []
         self.state_retry_calls: list[str] = []
         self.context_retry_calls: list[str] = []
+        self.observation_curation_calls: list[str] = []
         self.character_text_world_update_retry_calls: list[str] = []
         self.memory_consolidation_calls: list[str] = []
         self.character_maintenance_calls: list[str] = []
@@ -1295,6 +1340,10 @@ class _ReviewRuntime:
 
     async def run_context_update_retries(self, *, active_save_id: str) -> object:
         self.context_retry_calls.append(active_save_id)
+        return {"active_save_id": active_save_id, "completed": 0, "error": None}
+
+    async def run_observation_curation(self, *, active_save_id: str) -> object:
+        self.observation_curation_calls.append(active_save_id)
         return {"active_save_id": active_save_id, "completed": 0, "error": None}
 
     async def run_state_extraction_retries(self, *, active_save_id: str) -> object:

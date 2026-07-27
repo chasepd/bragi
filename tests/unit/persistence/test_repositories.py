@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import threading
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -1865,6 +1866,195 @@ def test_repositories_persist_context_observations_with_source_evidence(
         "observer": "cheap",
         "curation_action": "save_context",
     }
+
+
+def test_repositories_claim_context_observations_in_bounded_fifo_batches(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    observations = [
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="scene_fact",
+            claim=f"Observation {index}",
+        )
+        for index in range(3)
+    ]
+
+    eligible = repositories.list_eligible_context_observations(save.id, limit=2)
+    claimed = repositories.claim_context_observations(
+        [observation.id for observation in eligible],
+        lease_token="worker-one",
+        lease_seconds=600,
+    )
+
+    assert [observation.id for observation in claimed] == [
+        observations[0].id,
+        observations[1].id,
+    ]
+    assert [
+        observation.id
+        for observation in repositories.list_eligible_context_observations(
+            save.id,
+            limit=3,
+        )
+    ] == [observations[2].id]
+    state = repositories.get_context_observation_curation_state(
+        observations[0].id
+    )
+    assert state is not None
+    assert state.attempt_count == 1
+    assert state.lease_token == "worker-one"
+    assert state.lease_until is not None
+
+
+def test_repositories_normalize_observation_type_and_preserve_original(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="npc intent",
+        claim="Lio intends to inspect the lens.",
+        source_message_ids=[],
+    )
+
+    assert observation.observation_type == "character_intent"
+    assert observation.metadata["original_observation_type"] == "npc intent"
+
+
+def test_repositories_fence_stale_context_observation_curation_worker(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="scene_fact",
+        claim="The eastern signal is lit.",
+    )
+    repositories.claim_context_observations(
+        [observation.id],
+        lease_token="current-worker",
+        lease_seconds=600,
+    )
+
+    assert (
+        repositories.complete_context_observation_curation(
+            observation.id,
+            lease_token="stale-worker",
+            status="accepted",
+            terminal_outcome="accepted",
+        )
+        is None
+    )
+    current = repositories.get_context_observation(observation.id)
+    assert current is not None
+    assert current.status == "pending"
+
+    completed = repositories.complete_context_observation_curation(
+        observation.id,
+        lease_token="current-worker",
+        status="accepted",
+        terminal_outcome="accepted",
+    )
+
+    assert completed is not None
+    assert completed.status == "accepted"
+    state = repositories.get_context_observation_curation_state(observation.id)
+    assert state is not None
+    assert state.terminal_outcome == "accepted"
+    assert state.lease_token is None
+
+
+def test_context_observation_claims_are_exclusive_across_connections(
+    tmp_path: Path,
+    migrated_database_template: Path,
+) -> None:
+    database_path = tmp_path / "claims.sqlite3"
+    shutil.copy2(migrated_database_template, database_path)
+    connections = [
+        sqlite3.connect(database_path, timeout=5, check_same_thread=False)
+        for _ in range(2)
+    ]
+    repositories = [PersistenceRepositories(connection) for connection in connections]
+    try:
+        scenario = repositories[0].create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A border keep is cut off by ash storms.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories[0].create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        observations = [
+            repositories[0].add_context_observation(
+                save_id=save.id,
+                observation_type="event",
+                claim=f"Observation {index}",
+            )
+            for index in range(4)
+        ]
+        observation_ids = [observation.id for observation in observations]
+        barrier = threading.Barrier(2)
+        claimed_by_worker: list[list[str]] = [[], []]
+        claim_errors: list[BaseException] = []
+
+        def claim(worker_index: int) -> None:
+            try:
+                barrier.wait()
+                claimed_by_worker[worker_index] = [
+                    observation.id
+                    for observation in repositories[
+                        worker_index
+                    ].claim_context_observations(
+                        observation_ids,
+                        lease_token=f"worker-{worker_index}",
+                        lease_seconds=600,
+                    )
+                ]
+            except BaseException as exc:  # pragma: no cover - asserted in parent
+                claim_errors.append(exc)
+
+        threads = [threading.Thread(target=claim, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert claim_errors == []
+        assert set(claimed_by_worker[0]).isdisjoint(claimed_by_worker[1])
+        assert sorted(claimed_by_worker[0] + claimed_by_worker[1]) == sorted(
+            observation_ids
+        )
+    finally:
+        for connection in connections:
+            connection.close()
 
 
 def test_repositories_archive_context_observations_for_deleted_messages(

@@ -6078,9 +6078,6 @@ class ChatService:
             )
         include_memories = True
         try:
-            include_memories = not self._agentic_memory_curation_available(
-                save_id=save_id,
-            )
             applied = await self._extract_and_apply_state_for_turn(
                 extractor=extractor,
                 save_id=save_id,
@@ -6127,35 +6124,6 @@ class ChatService:
             if pressure is not None:
                 result["provider_pressure"] = pressure.to_result()
             return _PostTurnStepResult(status="failed", result=result)
-
-    def _agentic_memory_curation_available(self, *, save_id: str) -> bool:
-        if not agentic_context_pipeline_enabled(self.repositories, save_id=save_id):
-            return False
-        if self.context_curation_service is not None:
-            return True
-        preference = roleplay_model_preference(
-            repositories=self.repositories,
-            save_id=save_id,
-            purpose="memory_curation",
-        )
-        if preference is None:
-            return False
-        provider = cast(object, self.providers.get(preference.provider))
-        supports_structured_output = (
-            isinstance(provider, StructuredOutputProvider)
-            and _model_supports_structured_output(
-                repositories=self.repositories,
-                provider=preference.provider,
-                model_id=preference.model_id,
-            )
-        )
-        if not supports_structured_output:
-            return False
-        return not known_model_is_unavailable(
-            self.repositories,
-            provider=preference.provider,
-            model_id=preference.model_id,
-        )
 
     async def _observe_if_configured(
         self,
@@ -6204,10 +6172,11 @@ class ChatService:
                 )
         return result
 
-    async def _curate_if_configured(
+    async def run_observation_curation(
         self,
         *,
         save_id: str,
+        apply_guard: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> dict[str, object] | None:
         if not agentic_context_pipeline_enabled(self.repositories, save_id=save_id):
             return None
@@ -6230,40 +6199,14 @@ class ChatService:
                         repositories=self.repositories,
                         providers=self.providers,
                     ),
+                    apply_guard=apply_guard,
                 )
         if curation_service is None:
             result["curation_skipped"] = "no curation model"
         else:
-            try:
-                curated = await curation_service.curate_pending(save_id)
-                result["curation"] = _agentic_result_mapping(curated)
-            except Exception as exc:
-                result["curation_failed"] = True
-                log_error_event(
-                    "chat.memory_curation_failed",
-                    save_id=save_id,
-                    **exception_log_fields(exc),
-                )
+            curated = await curation_service.curate_pending(save_id)
+            result["curation"] = _agentic_result_mapping(curated)
         return result
-
-    async def _observe_and_curate_if_configured(
-        self,
-        *,
-        save_id: str,
-        player_message_id: str,
-        narrator_message_id: str,
-    ) -> dict[str, object] | None:
-        observation = await self._observe_if_configured(
-            save_id=save_id,
-            player_message_id=player_message_id,
-            narrator_message_id=narrator_message_id,
-        )
-        if observation is None:
-            return None
-        curation = await self._curate_if_configured(save_id=save_id)
-        if curation is not None:
-            observation.update(curation)
-        return observation
 
     async def _consolidate_memories_if_configured(
         self,
@@ -6346,16 +6289,6 @@ class ChatService:
             player_message_id=player_message_id,
             narrator_message_id=narrator_message_id,
         )
-        curation_task: asyncio.Task[dict[str, object] | None] | None = None
-
-        async def merge_curation_result() -> None:
-            nonlocal agentic_result
-            curation_result = await self._curate_if_configured(save_id=save_id)
-            if agentic_result is not None and curation_result is not None:
-                agentic_result.update(curation_result)
-            elif curation_result is not None:
-                agentic_result = curation_result
-
         service = self.context_update_service
         preference = roleplay_model_preference(
             repositories=self.repositories,
@@ -6363,7 +6296,6 @@ class ChatService:
             purpose="context_update",
         )
         if service is None and preference is None:
-            await merge_curation_result()
             if agentic_result is not None:
                 return _PostTurnStepResult(
                     status="succeeded",
@@ -6382,7 +6314,6 @@ class ChatService:
                     model=preference.model_id,
                     error="Provider is unavailable",
                 )
-                await merge_curation_result()
                 return "skipped"
             service = self._context_update_service_for_model(
                 provider=provider,
@@ -6400,44 +6331,29 @@ class ChatService:
                         "output or tool calling"
                     ),
                 )
-                await merge_curation_result()
                 return "skipped"
         try:
-            update_task: asyncio.Task[object]
+            update_result: object
             if (
                 isinstance(service, ContextUpdateService)
                 and inference_mode == POST_TURN_INFERENCE_MODE_HYBRID
             ):
-                update_task = asyncio.create_task(
-                    service.update_after_turn(
-                        save_id=save_id,
-                        source_message_ids=(
-                            player_message_id,
-                            narrator_message_id,
-                        ),
-                        verified_coverage=verified_coverage,
-                    )
+                update_result = await service.update_after_turn(
+                    save_id=save_id,
+                    source_message_ids=(
+                        player_message_id,
+                        narrator_message_id,
+                    ),
+                    verified_coverage=verified_coverage,
                 )
             else:
-                update_task = asyncio.create_task(
-                    service.update_after_turn(
-                        save_id=save_id,
-                        source_message_ids=(
-                            player_message_id,
-                            narrator_message_id,
-                        ),
-                    )
+                update_result = await service.update_after_turn(
+                    save_id=save_id,
+                    source_message_ids=(
+                        player_message_id,
+                        narrator_message_id,
+                    ),
                 )
-            await asyncio.sleep(0)
-            curation_task = asyncio.create_task(
-                self._curate_if_configured(save_id=save_id)
-            )
-            update_result = await update_task
-            curation_result = await curation_task
-            if agentic_result is not None and curation_result is not None:
-                agentic_result.update(curation_result)
-            elif curation_result is not None:
-                agentic_result = curation_result
             step_result = self._context_update_step_result(
                 update_result,
                 agentic_result=agentic_result,
@@ -6450,18 +6366,7 @@ class ChatService:
             if step_result is not None:
                 return step_result
             return "succeeded"
-        except asyncio.CancelledError:
-            if curation_task is not None and not curation_task.done():
-                curation_task.cancel()
-                await asyncio.gather(curation_task, return_exceptions=True)
-            raise
         except Exception as exc:
-            if curation_task is not None:
-                curation_result = await curation_task
-                if agentic_result is not None and curation_result is not None:
-                    agentic_result.update(curation_result)
-                elif curation_result is not None:
-                    agentic_result = curation_result
             pressure = provider_pressure_from_exception(exc)
             retry_job = self._ensure_context_update_retry_job(
                 save_id=save_id,
@@ -10330,8 +10235,7 @@ def _context_retry_inference_mode(payload: dict[str, object]) -> str:
 
 
 def _state_retry_include_memories(payload: dict[str, object]) -> bool:
-    value = payload.get("include_memories")
-    return value if isinstance(value, bool) else True
+    return True
 
 
 def _state_retry_inference_mode(payload: dict[str, object]) -> str:

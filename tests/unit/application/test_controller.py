@@ -8893,6 +8893,41 @@ def test_context_update_retry_wait_does_not_block_initial_render_input_save(
     ]
 
 
+def test_observation_curation_runtime_uses_short_apply_guard(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, _ = _persist_runtime_save(repositories, include_messages=False)
+    calls: list[str] = []
+
+    class RecordingCurationChatService:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        async def run_observation_curation(
+            self,
+            *,
+            save_id: str,
+            apply_guard: Callable[[], Any] | None = None,
+        ) -> dict[str, object]:
+            calls.append(save_id)
+            assert apply_guard is not None
+            async with apply_guard():
+                calls.append("applied")
+            return {"curation": {"considered_count": 2}}
+
+    monkeypatch.setattr(runtime, "ChatService", RecordingCurationChatService)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+    controller.load_save(save_id)
+
+    model = asyncio.run(controller.run_observation_curation())
+
+    assert calls == [save_id, "applied"]
+    assert _status_text(model) == "Observation curation finished: 2 considered."
+
+
 def test_state_extraction_retry_wait_does_not_block_initial_render_input_save(
     repositories: PersistenceRepositories,
     tmp_path: Path,

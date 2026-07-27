@@ -477,6 +477,18 @@ class ChatBundleService:
                 """,
                 (save_id,),
             ),
+            "context_observation_curation_states": self._rows(
+                """
+                SELECT observation_id, save_id, attempt_count,
+                       next_eligible_at, NULL AS lease_token,
+                       NULL AS lease_until, last_error, terminal_outcome,
+                       completed_at, created_at, updated_at
+                FROM context_observation_curation_state
+                WHERE save_id = ?
+                ORDER BY created_at, observation_id
+                """,
+                (save_id,),
+            ),
             "scene_snapshots": self._rows(
                 """
                 SELECT id, save_id, current_location_id, situation, objective,
@@ -1335,6 +1347,24 @@ class ChatBundleService:
             observation_id_map[original_id] = observation.id
         imported_id_maps["observation"] = observation_id_map
         imported_id_maps["context_observations"] = observation_id_map
+
+        for row in _list_of_objects(
+            data.get("context_observation_curation_states"),
+            "context_observation_curation_states",
+        ):
+            mapped_observation_id = observation_id_map.get(
+                _text(row, "observation_id")
+            )
+            if mapped_observation_id is None:
+                continue
+            self.repositories.restore_context_observation_curation_state(
+                mapped_observation_id,
+                attempt_count=_optional_int(row, "attempt_count") or 0,
+                next_eligible_at=_optional_text(row, "next_eligible_at"),
+                last_error=_optional_text(row, "last_error"),
+                terminal_outcome=_optional_text(row, "terminal_outcome"),
+                completed_at=_optional_text(row, "completed_at"),
+            )
 
         scenario_update_id_map: dict[str, str] = {}
         for row in _list_of_objects(

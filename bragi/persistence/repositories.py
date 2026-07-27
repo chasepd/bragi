@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, cast
 from uuid import uuid4
 
+from bragi.observation_types import normalize_observation_type
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import (
     ActiveThreadRecord,
@@ -28,6 +29,8 @@ from bragi.persistence.models import (
     CharacterTextProvenanceRecord,
     CharacterTextThreadParticipantRecord,
     CharacterTextThreadRecord,
+    ContextObservationCurationHealthRecord,
+    ContextObservationCurationStateRecord,
     ContextObservationRecord,
     ContextSourceRecord,
     ContextSourceSearchHit,
@@ -174,6 +177,10 @@ _SCHEDULED_TASK_COLUMNS = (
     "id, task_type, save_id, enabled, interval_seconds, next_run_at, lease_until, "
     "last_started_at, last_completed_at, last_job_id, failure_count, payload_json, "
     "result_json, error, created_at, updated_at"
+)
+_CONTEXT_OBSERVATION_CURATION_STATE_COLUMNS = (
+    "observation_id, save_id, attempt_count, next_eligible_at, lease_token, "
+    "lease_until, last_error, terminal_outcome, completed_at, created_at, updated_at"
 )
 _JOB_COLUMNS = (
     "id, save_id, creator_user_id, type, status, payload_json, result_json, error, "
@@ -3215,10 +3222,20 @@ class PersistenceRepositories:
         metadata: dict[str, object] | None = None,
         observation_id: str | None = None,
     ) -> ContextObservationRecord:
+        original_observation_type = observation_type.strip()
+        normalized_observation_type = normalize_observation_type(
+            original_observation_type
+        )
+        normalized_metadata = dict(metadata or {})
+        if normalized_observation_type != original_observation_type:
+            normalized_metadata.setdefault(
+                "original_observation_type",
+                original_observation_type,
+            )
         record = ContextObservationRecord(
             id=observation_id or _new_id(),
             save_id=save_id,
-            observation_type=observation_type.strip() or "observation",
+            observation_type=normalized_observation_type,
             claim=claim.strip(),
             evidence_quote=evidence_quote.strip(),
             source_message_ids=_unique_strings(source_message_ids or ()),
@@ -3226,7 +3243,7 @@ class PersistenceRepositories:
             status=status.strip() or "pending",
             confidence=confidence,
             tags=_unique_strings(tags or ()),
-            metadata=dict(metadata or {}),
+            metadata=normalized_metadata,
         )
         self.connection.execute(
             """
@@ -3249,6 +3266,25 @@ class PersistenceRepositories:
                 record.confidence,
                 _dump_json(record.tags),
                 _dump_json(record.metadata),
+            ),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO context_observation_curation_state(
+                observation_id, save_id, terminal_outcome, completed_at
+            )
+            VALUES (
+                ?, ?,
+                CASE WHEN ? = 'pending' THEN NULL ELSE ? END,
+                CASE WHEN ? = 'pending' THEN NULL ELSE CURRENT_TIMESTAMP END
+            )
+            """,
+            (
+                record.id,
+                record.save_id,
+                record.status,
+                record.status,
+                record.status,
             ),
         )
         self.commit()
@@ -3299,6 +3335,405 @@ class PersistenceRepositories:
             tuple(params),
         )
         return [_context_observation_from_row(row) for row in rows]
+
+    def get_context_observation_curation_state(
+        self,
+        observation_id: str,
+    ) -> ContextObservationCurationStateRecord | None:
+        row = self._fetch_one(
+            f"""
+            SELECT {_CONTEXT_OBSERVATION_CURATION_STATE_COLUMNS}
+            FROM context_observation_curation_state
+            WHERE observation_id = ?
+            """,
+            (observation_id,),
+        )
+        return _context_observation_curation_state_from_row(row) if row else None
+
+    def ensure_context_observation_curation_states(self, save_id: str) -> int:
+        cursor = self.connection.execute(
+            """
+            INSERT OR IGNORE INTO context_observation_curation_state(
+                observation_id, save_id, terminal_outcome, completed_at
+            )
+            SELECT id, save_id,
+                   CASE WHEN status = 'pending' THEN NULL ELSE status END,
+                   CASE WHEN status = 'pending' THEN NULL ELSE CURRENT_TIMESTAMP END
+            FROM context_observations
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        )
+        self.commit()
+        return cursor.rowcount
+
+    def list_eligible_context_observations(
+        self,
+        save_id: str,
+        *,
+        limit: int,
+    ) -> list[ContextObservationRecord]:
+        if limit <= 0:
+            return []
+        rows = self._fetch_all(
+            """
+            SELECT observation.id, observation.save_id,
+                   observation.observation_type, observation.claim,
+                   observation.evidence_quote,
+                   observation.source_message_ids_json, observation.scope,
+                   observation.status, observation.confidence,
+                   observation.tags_json, observation.metadata_json,
+                   observation.created_at, observation.updated_at,
+                   observation.archived_at
+            FROM context_observations observation
+            JOIN context_observation_curation_state curation
+              ON curation.observation_id = observation.id
+            WHERE observation.save_id = ?
+              AND observation.status = 'pending'
+              AND observation.archived_at IS NULL
+              AND curation.terminal_outcome IS NULL
+              AND (
+                  curation.next_eligible_at IS NULL
+                  OR curation.next_eligible_at <= CURRENT_TIMESTAMP
+              )
+              AND (
+                  curation.lease_until IS NULL
+                  OR curation.lease_until <= CURRENT_TIMESTAMP
+              )
+            ORDER BY observation.created_at, observation.rowid
+            LIMIT ?
+            """,
+            (save_id, limit),
+        )
+        return [_context_observation_from_row(row) for row in rows]
+
+    def list_save_ids_with_due_context_observation_curation(
+        self,
+        *,
+        limit: int,
+    ) -> list[str]:
+        if limit <= 0:
+            return []
+        rows = self._fetch_all(
+            """
+            SELECT observation.save_id
+            FROM context_observations observation
+            JOIN context_observation_curation_state curation
+              ON curation.observation_id = observation.id
+            WHERE observation.status = 'pending'
+              AND observation.archived_at IS NULL
+              AND curation.terminal_outcome IS NULL
+              AND (
+                  curation.next_eligible_at IS NULL
+                  OR curation.next_eligible_at <= CURRENT_TIMESTAMP
+              )
+              AND (
+                  curation.lease_until IS NULL
+                  OR curation.lease_until <= CURRENT_TIMESTAMP
+              )
+            GROUP BY observation.save_id
+            ORDER BY MIN(observation.created_at), MIN(observation.rowid)
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [str(row["save_id"]) for row in rows]
+
+    def context_observation_curation_health(
+        self,
+        save_id: str,
+    ) -> ContextObservationCurationHealthRecord:
+        row = self._fetch_one(
+            """
+            SELECT
+                SUM(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL THEN 1 ELSE 0 END)
+                    AS pending_count,
+                SUM(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL
+                    AND (curation.next_eligible_at IS NULL
+                         OR curation.next_eligible_at <= CURRENT_TIMESTAMP)
+                    AND (curation.lease_until IS NULL
+                         OR curation.lease_until <= CURRENT_TIMESTAMP)
+                    THEN 1 ELSE 0 END) AS eligible_count,
+                SUM(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL
+                    AND curation.lease_until > CURRENT_TIMESTAMP
+                    THEN 1 ELSE 0 END) AS leased_count,
+                MIN(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL
+                    THEN observation.created_at END) AS oldest_pending_at,
+                SUM(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL
+                    THEN curation.attempt_count ELSE 0 END) AS total_attempt_count,
+                MAX(CASE WHEN observation.status = 'pending'
+                    AND observation.archived_at IS NULL
+                    AND curation.terminal_outcome IS NULL
+                    THEN curation.attempt_count ELSE 0 END) AS max_attempt_count,
+                SUM(CASE WHEN observation.status = 'curation_failed'
+                    AND observation.archived_at IS NULL
+                    THEN 1 ELSE 0 END) AS terminal_failure_count
+            FROM context_observation_curation_state curation
+            JOIN context_observations observation
+              ON observation.id = curation.observation_id
+            WHERE curation.save_id = ?
+            """,
+            (save_id,),
+        )
+        if row is None:
+            raise RuntimeError("Curation health aggregate returned no row")
+        values = row
+        return ContextObservationCurationHealthRecord(
+            pending_count=int(values["pending_count"] or 0),
+            eligible_count=int(values["eligible_count"] or 0),
+            leased_count=int(values["leased_count"] or 0),
+            oldest_pending_at=(
+                str(values["oldest_pending_at"])
+                if values["oldest_pending_at"] is not None
+                else None
+            ),
+            total_attempt_count=int(values["total_attempt_count"] or 0),
+            max_attempt_count=int(values["max_attempt_count"] or 0),
+            terminal_failure_count=int(values["terminal_failure_count"] or 0),
+        )
+
+    def claim_context_observations(
+        self,
+        observation_ids: Iterable[str],
+        *,
+        lease_token: str,
+        lease_seconds: int,
+    ) -> list[ContextObservationRecord]:
+        ids = tuple(dict.fromkeys(item for item in observation_ids if item))
+        if not ids:
+            return []
+        if not lease_token:
+            raise ValueError("lease_token is required")
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be at least 1")
+        self.begin_immediate_transaction()
+        try:
+            self.connection.execute(
+                f"""
+                UPDATE context_observation_curation_state
+                SET attempt_count = attempt_count + 1,
+                    next_eligible_at = NULL,
+                    lease_token = ?,
+                    lease_until = datetime('now', ?),
+                    last_error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE observation_id IN ({_placeholders(len(ids))})
+                  AND terminal_outcome IS NULL
+                  AND (
+                      next_eligible_at IS NULL
+                      OR next_eligible_at <= CURRENT_TIMESTAMP
+                  )
+                  AND (lease_until IS NULL OR lease_until <= CURRENT_TIMESTAMP)
+                  AND EXISTS (
+                      SELECT 1 FROM context_observations observation
+                      WHERE observation.id = observation_id
+                        AND observation.status = 'pending'
+                        AND observation.archived_at IS NULL
+                  )
+                """,
+                (lease_token, f"+{lease_seconds} seconds", *ids),
+            )
+            rows = self._fetch_all(
+                f"""
+                SELECT id, save_id, observation_type, claim, evidence_quote,
+                       source_message_ids_json, scope, status, confidence,
+                       tags_json, metadata_json, created_at, updated_at, archived_at
+                FROM context_observations
+                WHERE id IN (
+                    SELECT observation_id
+                    FROM context_observation_curation_state
+                    WHERE lease_token = ?
+                      AND observation_id IN ({_placeholders(len(ids))})
+                )
+                """,
+                (lease_token, *ids),
+            )
+            records_by_id = {
+                record.id: record
+                for record in (_context_observation_from_row(row) for row in rows)
+            }
+            claimed = [records_by_id[item] for item in ids if item in records_by_id]
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return claimed
+
+    def owns_context_observation_curation_lease(
+        self,
+        observation_id: str,
+        *,
+        lease_token: str,
+    ) -> bool:
+        return (
+            self._fetch_one(
+                """
+                SELECT 1
+                FROM context_observation_curation_state
+                WHERE observation_id = ?
+                  AND lease_token = ?
+                  AND terminal_outcome IS NULL
+                """,
+                (observation_id, lease_token),
+            )
+            is not None
+        )
+
+    def complete_context_observation_curation(
+        self,
+        observation_id: str,
+        *,
+        lease_token: str,
+        status: str,
+        terminal_outcome: str,
+        metadata: dict[str, object] | None = None,
+    ) -> ContextObservationRecord | None:
+        self.begin_immediate_transaction()
+        try:
+            cursor = self.connection.execute(
+                """
+                UPDATE context_observation_curation_state
+                SET lease_token = NULL,
+                    lease_until = NULL,
+                    next_eligible_at = NULL,
+                    last_error = NULL,
+                    terminal_outcome = ?,
+                    completed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE observation_id = ?
+                  AND lease_token = ?
+                  AND terminal_outcome IS NULL
+                """,
+                (terminal_outcome, observation_id, lease_token),
+            )
+            if cursor.rowcount == 0:
+                self.rollback_transaction()
+                return None
+            updated = self.update_context_observation(
+                observation_id,
+                status=status,
+                metadata=metadata,
+            )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return updated
+
+    def defer_context_observation_curation(
+        self,
+        observation_id: str,
+        *,
+        lease_token: str,
+        error: str,
+        retry_after_seconds: int,
+        max_attempts: int,
+    ) -> ContextObservationCurationStateRecord | None:
+        if retry_after_seconds < 1:
+            raise ValueError("retry_after_seconds must be at least 1")
+        self.begin_immediate_transaction()
+        try:
+            row = self._fetch_one(
+                """
+                SELECT attempt_count
+                FROM context_observation_curation_state
+                WHERE observation_id = ?
+                  AND lease_token = ?
+                  AND terminal_outcome IS NULL
+                """,
+                (observation_id, lease_token),
+            )
+            if row is None:
+                self.rollback_transaction()
+                return None
+            exhausted = int(row["attempt_count"]) >= max(1, max_attempts)
+            safe_error = (redact_text(error) or "")[:240]
+            self.connection.execute(
+                """
+                UPDATE context_observation_curation_state
+                SET lease_token = NULL,
+                    lease_until = NULL,
+                    next_eligible_at = CASE
+                        WHEN ? THEN NULL ELSE datetime('now', ?)
+                    END,
+                    last_error = ?,
+                    terminal_outcome = CASE
+                        WHEN ? THEN 'retry_budget_exhausted' ELSE NULL
+                    END,
+                    completed_at = CASE
+                        WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE observation_id = ? AND lease_token = ?
+                """,
+                (
+                    int(exhausted),
+                    f"+{retry_after_seconds} seconds",
+                    safe_error,
+                    int(exhausted),
+                    int(exhausted),
+                    observation_id,
+                    lease_token,
+                ),
+            )
+            if exhausted:
+                self.update_context_observation(
+                    observation_id,
+                    status="curation_failed",
+                )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return self.get_context_observation_curation_state(observation_id)
+
+    def restore_context_observation_curation_state(
+        self,
+        observation_id: str,
+        *,
+        attempt_count: int = 0,
+        next_eligible_at: str | None = None,
+        last_error: str | None = None,
+        terminal_outcome: str | None = None,
+        completed_at: str | None = None,
+    ) -> ContextObservationCurationStateRecord:
+        self.connection.execute(
+            """
+            UPDATE context_observation_curation_state
+            SET attempt_count = ?,
+                next_eligible_at = ?,
+                lease_token = NULL,
+                lease_until = NULL,
+                last_error = ?,
+                terminal_outcome = ?,
+                completed_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE observation_id = ?
+            """,
+            (
+                max(0, attempt_count),
+                next_eligible_at,
+                (redact_text(last_error) or "")[:240] if last_error else None,
+                terminal_outcome,
+                completed_at,
+                observation_id,
+            ),
+        )
+        self.commit()
+        state = self.get_context_observation_curation_state(observation_id)
+        if state is None:
+            raise ValueError(f"Unknown context observation id: {observation_id}")
+        return state
 
     def update_context_observation(
         self,
@@ -7327,6 +7762,7 @@ class PersistenceRepositories:
                   'context_precompute', 'context_search', 'context_update',
                   'context_update_retry', 'context_update_retry_drain',
                   'guided_context_cleanup', 'memory_consolidation',
+                  'observation_curation_drain',
                   'scenario_evolution', 'state_extraction_retry',
                   'state_extraction_retry_drain', 'state_pruning',
                   'web_maintenance_character_registry_maintenance',
@@ -11003,6 +11439,24 @@ def _context_observation_from_row(row: sqlite3.Row) -> ContextObservationRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         archived_at=row["archived_at"],
+    )
+
+
+def _context_observation_curation_state_from_row(
+    row: sqlite3.Row,
+) -> ContextObservationCurationStateRecord:
+    return ContextObservationCurationStateRecord(
+        observation_id=row["observation_id"],
+        save_id=row["save_id"],
+        attempt_count=row["attempt_count"],
+        next_eligible_at=row["next_eligible_at"],
+        lease_token=row["lease_token"],
+        lease_until=row["lease_until"],
+        last_error=row["last_error"],
+        terminal_outcome=row["terminal_outcome"],
+        completed_at=row["completed_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 
