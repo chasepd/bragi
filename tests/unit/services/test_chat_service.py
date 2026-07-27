@@ -108,6 +108,7 @@ from bragi.services.context_update_service import (
     ContextUpdateExtraction,
     ContextUpdateRequest,
     ContextUpdateService,
+    ExtractedSceneSnapshot,
 )
 from bragi.services.dating_route_profile_service import (
     DATING_ROUTE_PROFILE_TASK,
@@ -134,7 +135,11 @@ from bragi.services.phrase_denylist import (
     GENERATED_PHRASE_DENYLIST_SETTING,
     SAVE_GENERATED_PHRASE_DENYLIST_SETTING,
 )
-from bragi.services.post_turn_inference import POST_TURN_INFERENCE_MODE_SETTING
+from bragi.services.post_turn_inference import (
+    POST_TURN_INFERENCE_MODE_HYBRID,
+    POST_TURN_INFERENCE_MODE_SETTING,
+    VerifiedPostTurnCoverage,
+)
 from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.scenario_evolution_policy import (
     SCENARIO_EVOLUTION_TURN_INTERVAL_SETTING,
@@ -12740,17 +12745,27 @@ def test_run_post_turn_jobs_reuses_existing_context_update_retry(
         context_search_service=None,
         context_update_service=context_update,
     )
+    verified_coverage = VerifiedPostTurnCoverage(
+        source_message_ids=(player_message.id, narrator_message.id),
+        scene_snapshot_fields=frozenset({"mood"}),
+        applied_domains=frozenset({"scene_snapshot"}),
+        committed_count=1,
+    )
 
     async def run_twice() -> tuple[object, object]:
         first = await service._update_context_if_configured(
             save_id=save.id,
             player_message_id=player_message.id,
             narrator_message_id=narrator_message.id,
+            inference_mode=POST_TURN_INFERENCE_MODE_HYBRID,
+            verified_coverage=verified_coverage,
         )
         second = await service._update_context_if_configured(
             save_id=save.id,
             player_message_id=player_message.id,
             narrator_message_id=narrator_message.id,
+            inference_mode=POST_TURN_INFERENCE_MODE_HYBRID,
+            verified_coverage=verified_coverage,
         )
         return first, second
 
@@ -12768,6 +12783,10 @@ def test_run_post_turn_jobs_reuses_existing_context_update_retry(
     assert second_step.status == "failed"
     assert first_step.result["retry_job_id"] == retry_jobs[0].id
     assert second_step.result["retry_job_id"] == retry_jobs[0].id
+    assert retry_jobs[0].payload["effective_post_turn_inference_mode"] == "hybrid"
+    assert retry_jobs[0].payload["verified_plan_coverage"] == (
+        verified_coverage.to_json()
+    )
 
 
 def test_update_context_runs_curation_when_continuity_provider_unavailable(
@@ -13060,6 +13079,92 @@ def test_run_context_update_retries_processes_queued_retry_jobs(
     assert succeeded_retry.result == {
         "source_message_ids": [player_message.id, narrator_message.id]
     }
+
+
+def test_run_context_update_retries_preserves_hybrid_plan_coverage(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I climb toward the beacon lens.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The beacon lens hums awake.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The lens hums.",
+        mood="planner-committed tension",
+        source_message_id=narrator_message.id,
+    )
+    coverage = VerifiedPostTurnCoverage(
+        source_message_ids=(player_message.id, narrator_message.id),
+        scene_snapshot_fields=frozenset({"mood"}),
+        applied_domains=frozenset({"scene_snapshot"}),
+        committed_count=1,
+    )
+    retry_job = repositories.create_job(
+        save_id=save.id,
+        type="context_update_retry",
+        status="queued",
+        payload={
+            "source_message_ids": [player_message.id, narrator_message.id],
+            "reason": "post_turn_context_update_failed",
+            "effective_post_turn_inference_mode": "hybrid",
+            "verified_plan_coverage": coverage.to_json(),
+        },
+    )
+
+    class MoodOverwritingExtractor:
+        async def extract(
+            self,
+            request: ContextUpdateRequest,
+        ) -> ContextUpdateExtraction:
+            return ContextUpdateExtraction(
+                scene=ExtractedSceneSnapshot(
+                    source_message_id=narrator_message.id,
+                    evidence_quote=narrator_message.body,
+                    situation="The lens flares red.",
+                    mood="legacy extractor overwrite",
+                    reason="The completed turn established the scene.",
+                )
+            )
+
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+        context_update_service=ContextUpdateService(
+            repositories=repositories,
+            extractor=MoodOverwritingExtractor(),
+        ),
+    )
+
+    completed = asyncio.run(service.run_context_update_retries(save_id=save.id))
+
+    assert completed == 1
+    assert next(
+        job
+        for job in repositories.list_jobs_by_status(("succeeded",))
+        if job.id == retry_job.id
+    ).result == {
+        "source_message_ids": [player_message.id, narrator_message.id]
+    }
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert snapshot is not None
+    assert snapshot.mood == "planner-committed tension"
+    assert snapshot.situation == "The lens flares red."
 
 
 def test_run_context_update_retries_replaces_scene_presence_rows(
