@@ -185,6 +185,29 @@ def test_multilingual_token_estimation_is_not_latin_character_division() -> None
     )
 
 
+def test_chat_budget_includes_provider_message_names() -> None:
+    unnamed = ChatRequest(
+        provider="fake",
+        model_id="fake-chat",
+        messages=(ChatMessage(role="user", body="Hello."),),
+    )
+    named = ChatRequest(
+        provider="fake",
+        model_id="fake-chat",
+        messages=(
+            ChatMessage(
+                role="user",
+                body="Hello.",
+                speaker_name="a" * 64,
+            ),
+        ),
+    )
+
+    assert estimate_chat_request_tokens(named) >= (
+        estimate_chat_request_tokens(unnamed) + 64
+    )
+
+
 def test_chat_system_body_uses_narrator_turn_directive_caveat_by_default() -> None:
     request = ChatRequest(
         provider="fake",

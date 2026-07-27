@@ -125,7 +125,19 @@ def enforce_structured_output_request_budget(
         ),
     )
     estimated_message_tokens = sum(
-        estimate_text_tokens(f"{message.role}:\n{message.body}") + 4
+        estimate_text_tokens(
+            json.dumps(
+                {
+                    "role": message.role,
+                    "body": message.body,
+                    "speaker_name": message.speaker_name,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+        + 4
         for message in request.messages
     )
     schema_text = json.dumps(

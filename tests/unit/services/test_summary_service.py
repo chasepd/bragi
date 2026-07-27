@@ -11,6 +11,7 @@ import pytest
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import MessageRecord, SaveRecord
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.providers.chat_rendering import chat_system_body
 from bragi.providers.contracts import (
     ChatRequest,
     ChatResponse,
@@ -298,11 +299,9 @@ def test_summary_service_preserves_safe_fade_continuity(
     )
 
     assert summary is not None
-    request_bodies = [
-        message.body for message in provider.chat_requests[0].messages
-    ]
-    assert all("hands slid" not in body for body in request_bodies)
-    assert any("hours later" in body for body in request_bodies)
+    request_prompt = _request_prompt(provider.chat_requests[0])
+    assert "hands slid" not in request_prompt
+    assert "hours later" in request_prompt
     assert "hands slid" not in summary.body
     assert fade.body == (
         "The intimate moment is kept off-screen. Hours later, the next scene begins."
@@ -344,7 +343,7 @@ def test_summary_service_summarizes_older_messages_and_persists_metadata(
     request = provider.chat_requests[0]
     assert request.provider == "fake"
     assert request.model_id == "fake-summary"
-    prompt = "\n".join(message.body for message in request.messages)
+    prompt = _request_prompt(request)
     assert "I step onto the ash bridge." in prompt
     assert "A bell rings under the span." in prompt
     assert "I ask who rang the bell." not in prompt
@@ -510,7 +509,7 @@ def test_summary_service_rolls_prior_summary_into_new_summary(
     assert prior_summary not in active_summaries
 
     assert len(provider.chat_requests) == 1
-    prompt = "\n".join(message.body for message in provider.chat_requests[0].messages)
+    prompt = _request_prompt(provider.chat_requests[0])
     assert prior_summary.body in prompt
     assert messages[0].body not in prompt
     assert messages[1].body not in prompt
@@ -566,7 +565,7 @@ def test_summary_service_counts_single_large_active_summary_as_context_pressure(
     assert summary.body == provider.response_body
 
     assert len(provider.chat_requests) == 1
-    prompt = "\n".join(message.body for message in provider.chat_requests[0].messages)
+    prompt = _request_prompt(provider.chat_requests[0])
     assert prior_summary_body in prompt
     assert messages[0].body not in prompt
     assert messages[1].body not in prompt
@@ -644,7 +643,7 @@ def test_summary_service_rolls_up_multiple_active_summaries_without_message_pres
 
     assert summary is not None
     assert len(provider.chat_requests) == 1
-    prompt = "\n".join(message.body for message in provider.chat_requests[0].messages)
+    prompt = _request_prompt(provider.chat_requests[0])
     assert first_summary.body in prompt
     assert second_summary.body in prompt
     assert messages[0].body not in prompt
@@ -738,7 +737,7 @@ def test_summary_provider_request_instructs_condensing_prior_chronicle(
     )
 
     assert len(provider.chat_requests) == 1
-    prompt = "\n".join(message.body for message in provider.chat_requests[0].messages)
+    prompt = _request_prompt(provider.chat_requests[0])
     normalized_prompt = prompt.lower()
     assert "chronicle" in normalized_prompt
     assert (
@@ -1014,6 +1013,15 @@ def _message(message_id: str, *, token_estimate: int) -> MessageRecord:
         model=None,
         token_estimate=token_estimate,
         deleted_at=None,
+    )
+
+
+def _request_prompt(request: ChatRequest) -> str:
+    return "\n".join(
+        (
+            chat_system_body(request),
+            *(message.body for message in request.messages),
+        )
     )
 
 

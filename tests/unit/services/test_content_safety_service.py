@@ -374,3 +374,37 @@ def test_review_context_does_not_ask_a_chat_model_for_structured_text(
     )
 
     assert provider.structured_output_requests
+
+
+def test_implicit_safety_model_rejects_over_budget_before_dispatch(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="tiny",
+        display_name="Tiny",
+        capabilities=["chat", "structured_output"],
+        context_window=256,
+    )
+    provider = ScriptedSafetyProvider("allow")
+    service = ContentSafetyService(
+        repositories=repositories,
+        providers={"fake": cast(ProviderClient, provider)},
+    )
+
+    result = asyncio.run(
+        service.review_narration(
+            body="Large rated draft. " * 200,
+            content_rating="pg-13",
+            fade_to_black_enabled=True,
+            source_request=ChatRequest(
+                provider="fake",
+                model_id="tiny",
+                messages=(),
+            ),
+        )
+    )
+
+    assert result.action is ContentSafetyAction.BLOCK
+    assert result.category == "safety_agent_error"
+    assert provider.structured_output_requests == []

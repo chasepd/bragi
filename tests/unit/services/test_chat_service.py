@@ -35,6 +35,7 @@ from bragi.persistence.models import (
 )
 from bragi.persistence.paths import StoragePaths
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.providers.chat_rendering import chat_system_body
 from bragi.providers.contracts import (
     ChatMessage,
     ChatRequest,
@@ -18778,8 +18779,12 @@ def test_submit_player_turn_counts_pending_player_message_for_summary_pressure(
     assert summary.covers_message_start_id == older_player.id
     assert summary.covers_message_end_id == older_narrator.id
     assert len(summary_provider.chat_requests) == 1
+    summary_request = summary_provider.chat_requests[0]
     summary_prompt = "\n".join(
-        message.body for message in summary_provider.chat_requests[0].messages
+        (
+            chat_system_body(summary_request),
+            *(message.body for message in summary_request.messages),
+        )
     )
     assert older_player.body in summary_prompt
     assert older_narrator.body in summary_prompt

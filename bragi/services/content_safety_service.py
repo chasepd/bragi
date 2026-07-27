@@ -30,6 +30,7 @@ from bragi.services.model_preferences import (
     roleplay_model_task,
 )
 from bragi.services.provider_fallbacks import structured_output_with_fallback
+from bragi.services.request_budget import budget_structured_output_request
 from bragi.services.sexual_content_safety import (
     CONTENT_FILTER_TRANSITION,
     FADE_TO_BLACK_TRANSITION,
@@ -199,7 +200,13 @@ class ContentSafetyService:
         )
         try:
             response = (
-                await provider_candidate.generate_structured_output(request)
+                await provider_candidate.generate_structured_output(
+                    budget_structured_output_request(
+                        self.repositories,
+                        request,
+                        task=CONTENT_SAFETY_PURPOSE,
+                    )
+                )
                 if implicit_source_model
                 else await structured_output_with_fallback(
                     repositories=self.repositories,
