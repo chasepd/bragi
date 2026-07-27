@@ -144,6 +144,35 @@ def test_restrictive_alias_edge_dominates_for_same_character_and_target() -> Non
     assert ("world_state", target_id) in targets.blocked
 
 
+def test_scoped_targets_fail_closed_when_scene_exceeds_graph_character_limit() -> None:
+    characters = [
+        _character(f"character-{index:02d}", name=f"Character {index}")
+        for index in range(65)
+    ]
+    last_character = characters[-1]
+    target_id = "state-private-to-oversized-scene"
+    snapshot = _scene_snapshot(
+        present_character_ids=[character.id for character in characters]
+    )
+
+    targets = allowed_character_scoped_targets(
+        scene_snapshot=snapshot,
+        characters=characters,
+        character_knowledge_edges=[
+            _knowledge_edge(
+                character_id=last_character.id,
+                target_type="state",
+                target_id=target_id,
+            )
+        ],
+        entity_links=[],
+        latest_player_message="I ask about the private state.",
+    )
+
+    assert ("world_state", target_id) not in targets.allowed
+    assert ("world_state", target_id) in targets.blocked
+
+
 def test_scalar_knowledge_provenance_is_checked_for_visibility() -> None:
     present = _character("character-sienna", name="Sienna")
     snapshot = _scene_snapshot(present_character_ids=[present.id])

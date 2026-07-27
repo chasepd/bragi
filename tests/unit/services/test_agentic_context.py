@@ -583,6 +583,16 @@ def test_persisted_observation_revalidation_rejects_subject_prefix() -> None:
             "the vault is safe",
             "The vault is safe.",
         ),
+        (
+            "Lio believes Rowan left and Mara has the red key.",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "If Lio is honest, then Mara has the red key.",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
     ],
 )
 def test_persisted_observation_revalidation_rejects_unpreserved_reported_modality(
@@ -712,8 +722,8 @@ def test_context_curation_service_applies_memory_and_context_decisions(
     context_observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="open_thread",
-        claim="Riders in the ash.",
-        evidence_quote="riders in the ash",
+        claim="The lens flashes red and shows riders in the ash.",
+        evidence_quote="The lens flashes red and shows riders in the ash",
         source_message_ids=[narrator.id],
         scope="save",
         confidence=0.82,
@@ -740,7 +750,9 @@ def test_context_curation_service_applies_memory_and_context_decisions(
                         "confidence": 0.81,
                         "memory_body": "",
                         "context_title": "Red lens warning",
-                        "context_body": "Riders in the ash.",
+                        "context_body": (
+                            "The lens flashes red and shows riders in the ash."
+                        ),
                         "tags": ["beacon"],
                     },
                 ]
@@ -1100,8 +1112,8 @@ def test_context_curation_rejects_unexpected_generated_script(
     context_observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="open_thread",
-        claim="Riders in the ash.",
-        evidence_quote="riders in the ash",
+        claim="The lens flashes red and shows riders in the ash.",
+        evidence_quote="The lens flashes red and shows riders in the ash",
         source_message_ids=[narrator.id],
         scope="save",
         confidence=0.82,
@@ -1183,8 +1195,8 @@ def test_context_curation_retries_only_script_violating_observations(
     context_observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="open_thread",
-        claim="Riders in the ash.",
-        evidence_quote="riders in the ash",
+        claim="The lens flashes red and shows riders in the ash.",
+        evidence_quote="The lens flashes red and shows riders in the ash",
         source_message_ids=[narrator.id],
         scope="save",
         confidence=0.8,
@@ -1236,7 +1248,9 @@ def test_context_curation_retries_only_script_violating_observations(
                         "confidence": 0.8,
                         "memory_body": "",
                         "context_title": "Red lens warning",
-                        "context_body": "Riders in the ash.",
+                        "context_body": (
+                            "The lens flashes red and shows riders in the ash."
+                        ),
                         "tags": ["beacon"],
                     }
                 ]
@@ -1280,8 +1294,8 @@ def test_context_curation_isolates_script_retry_provider_failure(
     retry_observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="open_thread",
-        claim="Riders in the ash.",
-        evidence_quote="riders in the ash",
+        claim="The lens flashes red and shows riders in the ash.",
+        evidence_quote="The lens flashes red and shows riders in the ash",
         source_message_ids=[narrator.id],
         scope="save",
         confidence=0.8,

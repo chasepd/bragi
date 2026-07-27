@@ -504,6 +504,7 @@ class TurnSnapshotService:
         rows_by_table = _sanitize_snapshot_rows_for_safety(
             self._rows_from_manifest(manifest)
         )
+        rows_by_table = _normalize_legacy_snapshot_memories(rows_by_table)
         raw_active_message_ids = manifest.get("active_message_ids", [])
         if not isinstance(raw_active_message_ids, list):
             raw_active_message_ids = []
@@ -573,6 +574,7 @@ class TurnSnapshotService:
         rows_by_table = _sanitize_snapshot_rows_for_safety(
             self._rows_from_manifest(manifest)
         )
+        rows_by_table = _normalize_legacy_snapshot_memories(rows_by_table)
         remapper = _SnapshotRemapper(
             source_save_id=source_save_id,
             target_save_id=str(uuid4()),
@@ -2762,12 +2764,145 @@ def _coalesce_remapped_snapshot_rows(
             _merge_snapshot_context_source_rows(existing, row)
         elif table_name == "character_knowledge_edges":
             _merge_snapshot_knowledge_edge_rows(existing, row)
+        elif table_name == "entity_links":
+            _merge_snapshot_entity_link_rows(existing, row)
+        elif table_name == "character_text_proactive_triggers":
+            _merge_snapshot_proactive_trigger_rows(existing, row)
         elif (
             existing.get("archived_at") is not None
             and row.get("archived_at") is None
         ):
             coalesced[key] = row
     return list(coalesced.values())
+
+
+def _normalize_legacy_snapshot_memories(
+    rows_by_table: Mapping[str, Iterable[Mapping[str, object]]],
+) -> dict[str, tuple[dict[str, object], ...]]:
+    rows = {
+        table_name: [dict(row) for row in table_rows]
+        for table_name, table_rows in rows_by_table.items()
+    }
+    keepers_by_fingerprint: dict[str, dict[str, object]] = {}
+    memory_id_map: dict[str, str] = {}
+    normalized_memories: list[dict[str, object]] = []
+    for row in rows.get("memories", []):
+        fingerprint = canonical_claim_fingerprint(row.get("body", ""))
+        if row.get("archived_at") is not None or not fingerprint:
+            normalized_memories.append(row)
+            continue
+        row["claim_fingerprint"] = fingerprint
+        keeper = keepers_by_fingerprint.get(fingerprint)
+        if keeper is None:
+            keepers_by_fingerprint[fingerprint] = row
+            normalized_memories.append(row)
+            continue
+        duplicate_id = row.get("id")
+        keeper_id = keeper.get("id")
+        if isinstance(duplicate_id, str) and isinstance(keeper_id, str):
+            memory_id_map[duplicate_id] = keeper_id
+        _merge_snapshot_memory_rows(keeper, row)
+    rows["memories"] = normalized_memories
+
+    if memory_id_map:
+        for table_name, table_rows in rows.items():
+            for row in table_rows:
+                _remap_snapshot_memory_reference(
+                    table_name=table_name,
+                    row=row,
+                    memory_id_map=memory_id_map,
+                )
+            rows[table_name] = _coalesce_remapped_snapshot_rows(
+                table_name,
+                table_rows,
+            )
+    return {
+        table_name: tuple(table_rows)
+        for table_name, table_rows in rows.items()
+    }
+
+
+def _remap_snapshot_memory_reference(
+    *,
+    table_name: str,
+    row: dict[str, object],
+    memory_id_map: Mapping[str, str],
+) -> None:
+    if table_name == "context_sources" and row.get("source_type") == "memory":
+        _remap_snapshot_row_id(row, "source_id", memory_id_map)
+    elif table_name == "entity_links":
+        if row.get("entity_type") in {"memory", "memories"}:
+            _remap_snapshot_row_id(row, "entity_id", memory_id_map)
+        if row.get("target_type") in {"memory", "memories"}:
+            _remap_snapshot_row_id(row, "target_id", memory_id_map)
+    elif table_name in {"context_update_suggestions", "context_update_audit"}:
+        if row.get("entity_type") in {"memory", "memories"}:
+            _remap_snapshot_row_id(row, "entity_id", memory_id_map)
+    elif table_name in {
+        "character_knowledge_edges",
+        "character_text_provenance",
+    }:
+        if row.get("target_type") in {"memory", "memories"}:
+            _remap_snapshot_row_id(row, "target_id", memory_id_map)
+    if table_name == "character_text_proactive_triggers":
+        if row.get("source_type") in {"memory", "memories"}:
+            _remap_snapshot_row_id(row, "source_id", memory_id_map)
+        trigger_key = row.get("trigger_key")
+        if isinstance(trigger_key, str):
+            row["trigger_key"] = _remap_snapshot_memory_text(
+                trigger_key,
+                memory_id_map,
+            )
+    for column in _JSON_COLUMNS_BY_TABLE.get(table_name, frozenset()):
+        value = row.get(column)
+        if not isinstance(value, str):
+            continue
+        try:
+            loaded = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        row[column] = _compact_json(
+            _remap_snapshot_memory_json_value(loaded, memory_id_map)
+        )
+
+
+def _remap_snapshot_row_id(
+    row: dict[str, object],
+    column: str,
+    id_map: Mapping[str, str],
+) -> None:
+    value = row.get(column)
+    if isinstance(value, str):
+        row[column] = id_map.get(value, value)
+
+
+def _remap_snapshot_memory_text(
+    value: str,
+    memory_id_map: Mapping[str, str],
+) -> str:
+    direct = memory_id_map.get(value)
+    if direct is not None:
+        return direct
+    return ":".join(memory_id_map.get(part, part) for part in value.split(":"))
+
+
+def _remap_snapshot_memory_json_value(
+    value: object,
+    memory_id_map: Mapping[str, str],
+) -> object:
+    if isinstance(value, str):
+        return _remap_snapshot_memory_text(value, memory_id_map)
+    if isinstance(value, list):
+        return [
+            _remap_snapshot_memory_json_value(item, memory_id_map)
+            for item in value
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _remap_snapshot_memory_json_value(item, memory_id_map)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _snapshot_row_unique_key(
@@ -2799,6 +2934,13 @@ def _snapshot_row_unique_key(
             normalized_knowledge_target_type(str(row.get("target_type", ""))),
             row.get("target_id"),
         )
+    if table_name == "character_text_proactive_triggers":
+        return (
+            table_name,
+            row.get("save_id"),
+            row.get("character_id"),
+            row.get("trigger_key"),
+        )
     return (table_name, row.get("id"))
 
 
@@ -2819,6 +2961,14 @@ def _merge_snapshot_memory_rows(
                 if field == "tags_json"
                 else _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS
             ),
+            extra_values=(
+                (
+                    existing.get("source_message_id"),
+                    incoming.get("source_message_id"),
+                )
+                if field == "source_message_ids_json"
+                else ()
+            ),
         )
     existing["importance"] = max(
         _snapshot_numeric_value(existing.get("importance")),
@@ -2829,6 +2979,30 @@ def _merge_snapshot_memory_rows(
         and incoming.get("archived_at") is None
     ):
         existing["archived_at"] = None
+
+
+def _merge_snapshot_entity_link_rows(
+    existing: dict[str, object],
+    incoming: Mapping[str, object],
+) -> None:
+    if (
+        existing.get("source_message_id") is None
+        and incoming.get("source_message_id") is not None
+    ):
+        existing["source_message_id"] = incoming["source_message_id"]
+
+
+def _merge_snapshot_proactive_trigger_rows(
+    existing: dict[str, object],
+    incoming: Mapping[str, object],
+) -> None:
+    for field in ("thread_id", "text_message_id", "source_message_id"):
+        if incoming.get(field) is not None:
+            existing[field] = incoming[field]
+    for field in ("source_type", "source_id", "reason"):
+        value = incoming.get(field)
+        if isinstance(value, str) and value:
+            existing[field] = value
 
 
 def _merge_snapshot_context_source_rows(
@@ -2906,6 +3080,32 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
                 groups.append(group)
                 if len(groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS:
                     raise ValueError("Merged snapshot provenance is too large")
+    grouped_source_ids = {
+        source_id
+        for group in groups
+        for source_id in group
+    }
+    raw_source_message_ids = metadata.get("source_message_ids")
+    source_message_ids = (
+        raw_source_message_ids
+        if isinstance(raw_source_message_ids, list)
+        else []
+    )
+    ungrouped_source_ids = [
+        source_id
+        for source_id in (
+            *source_message_ids,
+            metadata.get("source_message_id"),
+            metadata.get("last_seen_message_id"),
+        )
+        if isinstance(source_id, str)
+        and source_id
+        and source_id not in grouped_source_ids
+    ]
+    for source_id in dict.fromkeys(ungrouped_source_ids):
+        groups.append([source_id])
+        if len(groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS:
+            raise ValueError("Merged snapshot provenance is too large")
     metadata["source_provenance_groups"] = groups
     metadata["source_provenance_mode"] = (
         "all"

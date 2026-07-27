@@ -9748,10 +9748,40 @@ class PersistenceRepositories:
         claim_fingerprint: str | None = None,
         clear_source: bool = False,
     ) -> MemoryRecord:
+        self.begin_immediate_transaction()
+        try:
+            record = self._update_memory_in_transaction(
+                memory_id=memory_id,
+                body=body,
+                tags=tags,
+                importance=importance,
+                source_message_ids=source_message_ids,
+                source_observation_ids=source_observation_ids,
+                claim_fingerprint=claim_fingerprint,
+                clear_source=clear_source,
+            )
+            self.commit_transaction()
+            return record
+        except BaseException:
+            self.rollback_transaction()
+            raise
+
+    def _update_memory_in_transaction(
+        self,
+        *,
+        memory_id: str,
+        body: str,
+        tags: list[str],
+        importance: float,
+        source_message_ids: list[str] | tuple[str, ...] | None = None,
+        source_observation_ids: list[str] | tuple[str, ...] | None = None,
+        claim_fingerprint: str | None = None,
+        clear_source: bool = False,
+    ) -> MemoryRecord:
         current = self._fetch_one(
             """
             SELECT save_id, source_message_id, source_message_ids_json,
-                   source_observation_ids_json, claim_fingerprint
+                   source_observation_ids_json, claim_fingerprint, archived_at
             FROM memories
             WHERE id = ?
             """,
@@ -9759,6 +9789,8 @@ class PersistenceRepositories:
         )
         if current is None:
             raise ValueError(f"Unknown memory id: {memory_id}")
+        if current["archived_at"] is not None:
+            raise ValueError(f"Memory is archived: {memory_id}")
         source_message_id = None if clear_source else current["source_message_id"]
         resolved_source_message_ids = (
             []
@@ -9882,7 +9914,7 @@ class PersistenceRepositories:
                     *collision.source_observation_ids,
                 ]
             )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS]
-            self.connection.execute(
+            archived = self.connection.execute(
                 """
                 UPDATE memories
                 SET archived_at = CURRENT_TIMESTAMP,
@@ -9891,7 +9923,9 @@ class PersistenceRepositories:
                 """,
                 (collision.id, save_id),
             )
-            self.connection.execute(
+            if archived.rowcount != 1:
+                raise ValueError("Colliding memory is no longer active")
+            updated = self.connection.execute(
                 """
                 UPDATE memories
                 SET body = ?, tags_json = ?, importance = ?,
@@ -9915,6 +9949,8 @@ class PersistenceRepositories:
                     save_id,
                 ),
             )
+            if updated.rowcount != 1:
+                raise ValueError("Edited memory is no longer active")
             _remap_migrated_memory_references(
                 self.connection,
                 save_id=save_id,
@@ -9954,15 +9990,115 @@ class PersistenceRepositories:
     def restore_memories(self, memory_ids: set[str] | frozenset[str]) -> None:
         if not memory_ids:
             return
-        self.connection.execute(
-            f"""
-            UPDATE memories
-            SET archived_at = NULL, updated_at = CURRENT_TIMESTAMP
-            WHERE id IN ({_placeholders(len(memory_ids))})
-            """,
-            tuple(memory_ids),
-        )
-        self.commit()
+        self.begin_immediate_transaction()
+        try:
+            rows = self._fetch_all(
+                f"""
+                SELECT id, save_id, body, tags_json, importance,
+                       source_message_id, source_message_ids_json,
+                       source_observation_ids_json, archived_at
+                FROM memories
+                WHERE id IN ({_placeholders(len(memory_ids))})
+                ORDER BY created_at, rowid
+                """,
+                tuple(sorted(memory_ids)),
+            )
+            for row in rows:
+                if row["archived_at"] is None:
+                    continue
+                memory_id = str(row["id"])
+                save_id = str(row["save_id"])
+                fingerprint = canonical_claim_fingerprint(row["body"])
+                collision = self.get_memory_by_claim_fingerprint(
+                    save_id=save_id,
+                    claim_fingerprint=fingerprint,
+                )
+                if collision is None or collision.id == memory_id:
+                    restored = self.connection.execute(
+                        """
+                        UPDATE memories
+                        SET claim_fingerprint = ?, archived_at = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND save_id = ?
+                          AND archived_at IS NOT NULL
+                        """,
+                        (fingerprint, memory_id, save_id),
+                    )
+                    if restored.rowcount != 1:
+                        raise ValueError("Memory changed while being restored")
+                    continue
+                source_message_id = (
+                    row["source_message_id"] or collision.source_message_id
+                )
+                source_message_ids = _memory_source_message_ids(
+                    source_message_id=source_message_id,
+                    source_message_ids=list(
+                        dict.fromkeys(
+                            (
+                                *_load_list(row["source_message_ids_json"]),
+                                *collision.source_message_ids,
+                            )
+                        )
+                    ),
+                )
+                observation_ids = _unique_strings(
+                    (
+                        *_load_list(row["source_observation_ids_json"]),
+                        *collision.source_observation_ids,
+                    )
+                )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS]
+                archived = self.connection.execute(
+                    """
+                    UPDATE memories
+                    SET archived_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND save_id = ? AND archived_at IS NULL
+                    """,
+                    (collision.id, save_id),
+                )
+                if archived.rowcount != 1:
+                    raise ValueError("Colliding memory changed while restoring")
+                restored = self.connection.execute(
+                    """
+                    UPDATE memories
+                    SET tags_json = ?, importance = ?, source_message_id = ?,
+                        source_message_ids_json = ?, claim_fingerprint = ?,
+                        source_observation_ids_json = ?, archived_at = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND save_id = ? AND archived_at IS NOT NULL
+                    """,
+                    (
+                        _dump_json(
+                            list(
+                                dict.fromkeys(
+                                    (
+                                        *_load_list(row["tags_json"]),
+                                        *collision.tags,
+                                    )
+                                )
+                            )
+                        ),
+                        max(float(row["importance"]), collision.importance),
+                        source_message_id,
+                        _dump_json(source_message_ids),
+                        fingerprint,
+                        _dump_json(observation_ids),
+                        memory_id,
+                        save_id,
+                    ),
+                )
+                if restored.rowcount != 1:
+                    raise ValueError("Memory changed while being restored")
+                _remap_migrated_memory_references(
+                    self.connection,
+                    save_id=save_id,
+                    duplicate_id=collision.id,
+                    keeper_id=memory_id,
+                )
+            self.commit_transaction()
+        except BaseException:
+            self.rollback_transaction()
+            raise
 
     def list_memories(
         self,

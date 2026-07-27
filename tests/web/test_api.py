@@ -7755,6 +7755,117 @@ def test_request_body_limit_counts_chunked_body_without_content_length() -> None
     assert sent_messages[0]["status"] == 413
 
 
+def test_request_body_limit_counts_chunked_multipart_upload_body() -> None:
+    chunk = b"x" * (
+        (
+            api_app.CHARACTER_REFERENCE_UPLOAD_MAX_BYTES
+            + api_app.MULTIPART_REQUEST_OVERHEAD_BYTES
+        )
+        // 2
+        + 1
+    )
+    request_messages = iter(
+        (
+            {
+                "type": "http.request",
+                "body": chunk,
+                "more_body": True,
+            },
+            {
+                "type": "http.request",
+                "body": chunk,
+                "more_body": False,
+            },
+        )
+    )
+    sent_messages: list[dict[str, object]] = []
+
+    async def receive() -> Any:
+        return next(request_messages)
+
+    async def send(message: Any) -> None:
+        sent_messages.append(message)
+
+    async def consume_body(
+        _scope: Any,
+        receive_body: Any,
+        _send: Any,
+    ) -> None:
+        while True:
+            message = await receive_body()
+            if not message.get("more_body"):
+                return
+
+    middleware = api_app._JsonRequestBodyLimitMiddleware(
+        consume_body,
+        max_body_bytes=api_app.MAX_JSON_REQUEST_BODY_BYTES,
+    )
+    asyncio.run(
+        middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/media/character-reference/upload",
+                "headers": [
+                    (
+                        b"content-type",
+                        b"multipart/form-data; boundary=bragi-test-boundary",
+                    )
+                ],
+            },
+            receive,
+            send,
+        )
+    )
+
+    assert sent_messages[0]["type"] == "http.response.start"
+    assert sent_messages[0]["status"] == 413
+
+
+def test_request_body_limit_rejects_oversized_multipart_content_length() -> None:
+    sent_messages: list[dict[str, object]] = []
+
+    async def receive() -> Any:
+        raise AssertionError("oversized request body should not be read")
+
+    async def send(message: Any) -> None:
+        sent_messages.append(message)
+
+    async def consume_body(
+        _scope: Any,
+        _receive: Any,
+        _send: Any,
+    ) -> None:
+        raise AssertionError("oversized request should not reach the application")
+
+    middleware = api_app._JsonRequestBodyLimitMiddleware(
+        consume_body,
+        max_body_bytes=api_app.MAX_JSON_REQUEST_BODY_BYTES,
+    )
+    request_limit = (
+        api_app.BUNDLE_UPLOAD_MAX_BYTES
+        + api_app.MULTIPART_REQUEST_OVERHEAD_BYTES
+    )
+    asyncio.run(
+        middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/bundles/preview",
+                "headers": [
+                    (b"content-type", b"multipart/form-data; boundary=test"),
+                    (b"content-length", str(request_limit + 1).encode()),
+                ],
+            },
+            receive,
+            send,
+        )
+    )
+
+    assert sent_messages[0]["type"] == "http.response.start"
+    assert sent_messages[0]["status"] == 413
+
+
 def test_look_around_post_returns_answer_markdown_blocks(
     tmp_path: Path,
 ) -> None:

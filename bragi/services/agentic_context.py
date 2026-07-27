@@ -1949,7 +1949,6 @@ def _observation_evidence_is_grounded(
         or _grounding_modality_conflicts(observation.claim, context)
         or not _grounding_context_preserves_claim_boundary(
             observation.claim,
-            observation.evidence_quote,
             context,
         )
         for context in source_contexts
@@ -2340,7 +2339,6 @@ def _context_observation_evidence_is_grounded(
             or _grounding_modality_conflicts(observation.claim, context)
             or not _grounding_context_preserves_claim_boundary(
                 observation.claim,
-                observation.evidence_quote,
                 context,
             )
             for context in source_contexts
@@ -3915,7 +3913,6 @@ def _grounding_modality_conflicts(claim: str, evidence: str) -> bool:
 
 def _grounding_context_preserves_claim_boundary(
     claim: str,
-    evidence_quote: str,
     context: str,
 ) -> bool:
     if not _grounding_order_is_preserved(claim, context):
@@ -3924,16 +3921,7 @@ def _grounding_context_preserves_claim_boundary(
     context_terms = _ordered_grounding_terms(context)
     if context_terms[: len(claim_terms)] == claim_terms:
         return True
-    quote_start = context.casefold().find(evidence_quote.casefold())
-    if quote_start < 0:
-        return False
-    prefix = context[:quote_start].strip().casefold()
-    if not prefix:
-        return True
-    return any(
-        marker in f" {prefix} "
-        for marker in (" and ", " but ", " while ", " then ", ";")
-    )
+    return False
 
 
 def _grounding_anchor_conflicts(proposed: str, observation_claim: str) -> bool:

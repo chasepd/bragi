@@ -75,6 +75,205 @@ def test_snapshot_import_coalesces_many_to_one_memory_remaps() -> None:
     ]
 
 
+def test_legacy_duplicate_memories_restore_and_fork_after_unique_index_repair(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    first_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara likes tea.",
+    )
+    second_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara still likes tea.",
+    )
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Mara",
+    )
+    repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="preference",
+        claim="Mara likes tea.",
+        source_message_ids=[first_message.id],
+        status="accepted",
+        observation_id="observation-one",
+    )
+    repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="preference",
+        claim="Mara still likes tea.",
+        source_message_ids=[second_message.id],
+        status="accepted",
+        observation_id="observation-two",
+    )
+    repositories.connection.execute(
+        "DROP INDEX idx_memories_save_claim_fingerprint_active"
+    )
+    repositories.connection.executemany(
+        """
+        INSERT INTO memories(
+            id, save_id, body, tags_json, importance,
+            source_message_id, source_message_ids_json, claim_fingerprint,
+            source_observation_ids_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, '[]', ?, ?)
+        """,
+        (
+            (
+                "memory-keeper",
+                save.id,
+                "Mara likes tea.",
+                '["mara"]',
+                0.4,
+                first_message.id,
+                "legacy-fingerprint-one",
+                '["observation-one"]',
+            ),
+            (
+                "memory-duplicate",
+                save.id,
+                "mara likes tea",
+                '["tea"]',
+                0.9,
+                second_message.id,
+                "legacy-fingerprint-two",
+                '["observation-two"]',
+            ),
+        ),
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-keeper",
+        title="Tea preference",
+        body="Mara likes tea.",
+        metadata={"source_message_ids": [first_message.id]},
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="memory-duplicate",
+        title="Tea preference duplicate",
+        body="mara likes tea",
+        metadata={"source_message_ids": [second_message.id]},
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=character.id,
+        target_type="memory",
+        target_id="memory-keeper",
+        knowledge_state="knows",
+        source_message_id=first_message.id,
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=character.id,
+        target_type="memory",
+        target_id="memory-duplicate",
+        knowledge_state="does_not_know",
+        source_message_id=second_message.id,
+    )
+    repositories.add_entity_link(
+        save_id=save.id,
+        entity_type="character",
+        entity_id=character.id,
+        target_type="memory",
+        target_id="memory-keeper",
+        relation="knows",
+    )
+    repositories.add_entity_link(
+        save_id=save.id,
+        entity_type="character",
+        entity_id=character.id,
+        target_type="memory",
+        target_id="memory-duplicate",
+        relation="knows",
+        source_message_id=second_message.id,
+    )
+    repositories.connection.executemany(
+        """
+        INSERT INTO character_text_proactive_triggers(
+            id, save_id, character_id, trigger_key, trigger_type,
+            source_type, source_id, source_message_id, reason
+        )
+        VALUES (?, ?, ?, ?, 'memory_changed', 'memory', ?, ?, ?)
+        """,
+        (
+            (
+                "trigger-keeper",
+                save.id,
+                character.id,
+                "memory:memory-keeper",
+                "memory-keeper",
+                first_message.id,
+                "",
+            ),
+            (
+                "trigger-duplicate",
+                save.id,
+                character.id,
+                "memory:memory-duplicate",
+                "memory-duplicate",
+                second_message.id,
+                "Tea preference changed",
+            ),
+        ),
+    )
+    repositories.connection.commit()
+    service = TurnSnapshotService(repositories)
+    snapshot = service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "DELETE FROM memories WHERE save_id = ?",
+        (save.id,),
+    )
+    repositories.connection.execute(
+        """
+        CREATE UNIQUE INDEX idx_memories_save_claim_fingerprint_active
+        ON memories(save_id, claim_fingerprint)
+        WHERE archived_at IS NULL AND claim_fingerprint != ''
+        """
+    )
+    repositories.connection.commit()
+
+    service.restore_save_to_snapshot(save_id=save.id, snapshot_id=snapshot.id)
+    restored = repositories.list_memories(save.id)
+    fork = service.fork_snapshot_to_save(
+        source_save_id=save.id,
+        snapshot_id=snapshot.id,
+        title="Forked legacy snapshot",
+        media_dir=tmp_path / "media",
+    )
+    forked = repositories.list_memories(fork.save.id)
+
+    for save_id, [memory] in ((save.id, restored), (fork.save.id, forked)):
+        assert memory.body == "Mara likes tea."
+        assert memory.tags == ["mara", "tea"]
+        assert memory.importance == 0.9
+        assert memory.claim_fingerprint
+        assert len(memory.source_message_ids) == 2
+        assert len(memory.source_observation_ids) == 2
+        [source] = repositories.list_context_sources(
+            save_id,
+            source_type="memory",
+        )
+        assert source.source_id == memory.id
+        [edge] = repositories.list_character_knowledge_edges(save_id)
+        assert edge.target_id == memory.id
+        assert edge.knowledge_state == "does_not_know"
+        assert len(edge.source_message_ids) == 2
+        [link] = repositories.list_entity_links(save_id)
+        assert link.target_id == memory.id
+        assert link.source_message_id is not None
+        [trigger] = repositories.list_character_text_proactive_triggers(save_id)
+        assert trigger.source_id == memory.id
+        assert trigger.trigger_key == f"memory:{memory.id}"
+        assert trigger.reason == "Tea preference changed"
+
+
 def test_snapshot_coalesces_knowledge_aliases_and_scalar_provenance() -> None:
     rows = _coalesce_remapped_snapshot_rows(
         "character_knowledge_edges",

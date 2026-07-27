@@ -15,6 +15,7 @@ from bragi.services.mention_matching import character_name_is_mentioned
 
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 CHARACTER_TEXT_SOURCE_PREFIX = "character_text_message:"
+MAX_SCOPED_PRESENT_CHARACTER_IDS = 64
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,14 @@ def allowed_character_scoped_targets(
         characters=characters,
         latest_player_message=latest_player_message,
     ).present_character_ids
+    if len(present_ids) > MAX_SCOPED_PRESENT_CHARACTER_IDS:
+        return ScopedTargets(
+            allowed={},
+            blocked=_all_character_scoped_targets(
+                character_knowledge_edges=character_knowledge_edges,
+                entity_links=entity_links,
+            ),
+        )
     allowed: dict[tuple[str, str], tuple[str, ...]] = {}
     blocked: set[tuple[str, str]] = set()
     graph_targets: set[tuple[str, str, str]] = set()
@@ -133,6 +142,27 @@ def allowed_character_scoped_targets(
         else:
             blocked.add(target)
     return ScopedTargets(allowed=allowed, blocked=blocked - set(allowed))
+
+
+def _all_character_scoped_targets(
+    *,
+    character_knowledge_edges: list[CharacterKnowledgeEdgeRecord],
+    entity_links: list[EntityLinkRecord],
+) -> set[tuple[str, str]]:
+    targets = {
+        (normalized_knowledge_target_type(edge.target_type), edge.target_id)
+        for edge in character_knowledge_edges
+    }
+    targets.update(
+        (normalized_knowledge_target_type(link.target_type), link.target_id)
+        for link in entity_links
+        if link.entity_type == "character" and link.relation == "knows"
+    )
+    return {
+        target
+        for target in targets
+        if target[0] in {"memory", "world_state", "summary", "scenario_section"}
+    }
 
 
 def _knowledge_edge_is_prompt_blocked(

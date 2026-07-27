@@ -3123,6 +3123,35 @@ def test_repositories_consolidate_duplicates_without_losing_active_references(
     assert source.title == "Active duplicate source"
 
 
+def test_restore_memories_merges_active_fingerprint_collision(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    archived = repositories.add_memory(
+        save_id=save_id,
+        body="Mara likes tea.",
+        tags=["mara"],
+        importance=0.4,
+        source_message_id=message_id,
+    )
+    repositories.archive_memory(archived.id)
+    active = repositories.add_memory(
+        save_id=save_id,
+        body="mara likes tea",
+        tags=["tea"],
+        importance=0.9,
+    )
+
+    repositories.restore_memories(frozenset({archived.id}))
+
+    [restored] = repositories.list_memories(save_id)
+    assert restored.id == archived.id
+    assert restored.tags == ["mara", "tea"]
+    assert restored.importance == 0.9
+    assert restored.source_message_ids == [message_id]
+    assert repositories.get_memory(save_id, active.id) is None
+
+
 def test_repositories_check_unprotected_character_existence(
     repositories: PersistenceRepositories,
 ) -> None:

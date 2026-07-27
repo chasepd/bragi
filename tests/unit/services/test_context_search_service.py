@@ -659,6 +659,16 @@ def test_exact_raw_candidates_match_short_code_in_natural_query() -> None:
     assert selected == (candidate,)
 
 
+def test_structured_identifier_matching_is_bounded_and_keeps_query_edges() -> None:
+    identifiers = context_search_module._bounded_structured_identifiers(
+        " ".join(f"artifact-{index}" for index in range(100))
+    )
+
+    assert len(identifiers) == 16
+    assert "artifact-0" in identifiers
+    assert "artifact-99" in identifiers
+
+
 def test_context_query_terms_bound_large_raw_inputs_and_keep_tail_terms() -> None:
     query = " ".join(f"noise{index:05d}" for index in range(2_000))
     query = f"{query} moonstone"

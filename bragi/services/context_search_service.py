@@ -110,6 +110,7 @@ INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT = 80
 PROTECTED_CONTEXT_SOURCE_LIMIT = 32
 MAX_CONTEXT_QUERY_CHARS = 8_000
 MAX_CONTEXT_QUERY_TERMS = 64
+MAX_EXACT_RAW_STRUCTURED_IDENTIFIERS = 16
 MAX_CONTEXT_EXACT_PHRASE_CHARS = 512
 MAX_CONTEXT_EXACT_PHRASES = 4
 CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT = 64
@@ -3413,14 +3414,7 @@ def _exact_raw_candidates(
     query_terms = set(_bounded_context_query_terms(latest_player_message))
     if not query_terms or limit <= 0:
         return ()
-    structured_identifiers = {
-        identifier.casefold()
-        for identifier in re.findall(
-            r"(?<!\w)[^\W_]+(?:[-_.][^\W_]+)+(?!\w)",
-            latest_player_message,
-            flags=re.UNICODE,
-        )
-    }
+    structured_identifiers = _bounded_structured_identifiers(latest_player_message)
     indexed_keys = {
         (candidate.source_type, candidate.source_id)
         for candidate in indexed_candidates
@@ -3447,10 +3441,9 @@ def _exact_raw_candidates(
     for candidate in candidates:
         if (candidate.source_type, candidate.source_id) in indexed_keys:
             continue
+        candidate_text = (candidate.selection_text or candidate.text).casefold()
         candidate_terms = set(
-            _bounded_context_query_terms(
-                candidate.selection_text or candidate.text
-            )
+            _bounded_context_query_terms(candidate_text)
         )
         overlap_terms = query_terms & candidate_terms
         overlap_count = len(overlap_terms)
@@ -3458,7 +3451,7 @@ def _exact_raw_candidates(
             len(term) >= 6 and term not in ordinary_query_terms
             for term in overlap_terms
         ) or any(
-            identifier in (candidate.selection_text or candidate.text).casefold()
+            identifier in candidate_text
             for identifier in structured_identifiers
         )
         if (
@@ -3479,6 +3472,25 @@ def _exact_raw_candidates(
         ranked.append((coverage + overlap_count, candidate))
     ranked.sort(key=lambda item: item[0], reverse=True)
     return tuple(candidate for _score, candidate in ranked[:limit])
+
+
+def _bounded_structured_identifiers(text: str) -> tuple[str, ...]:
+    ordered = tuple(
+        dict.fromkeys(
+            identifier.casefold()
+            for identifier in re.findall(
+                r"(?<!\w)[^\W_]+(?:[-_.][^\W_]+)+(?!\w)",
+                _bounded_context_query_text(text),
+                flags=re.UNICODE,
+            )
+        )
+    )
+    if len(ordered) <= MAX_EXACT_RAW_STRUCTURED_IDENTIFIERS:
+        return ordered
+    edge_count = MAX_EXACT_RAW_STRUCTURED_IDENTIFIERS // 2
+    return tuple(
+        dict.fromkeys((*ordered[:edge_count], *ordered[-edge_count:]))
+    )
 
 
 def _known_by_candidate_blocked(

@@ -201,6 +201,7 @@ _PUBLIC_API_PATHS = frozenset(
 BUNDLE_UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024
 BUNDLE_UPLOAD_CHUNK_BYTES = 1024 * 1024
 CHARACTER_REFERENCE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
+MULTIPART_REQUEST_OVERHEAD_BYTES = 2 * 1024 * 1024
 BUNDLE_PREVIEW_TTL_SECONDS = 30 * 60.0
 BUNDLE_PREVIEW_MAX_COUNT = 20
 BUNDLE_PREVIEW_MAX_RETAINED_BYTES = 2 * 1024 * 1024 * 1024
@@ -631,9 +632,13 @@ class _JsonRequestBodyLimitMiddleware:
         receive: Receive,
         send: Send,
     ) -> None:
-        if scope["type"] != "http" or _request_body_limit_exempt(scope):
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+        request_limit = _request_body_limit_bytes(
+            scope,
+            default_limit=self.max_body_bytes,
+        )
         headers = {key.lower(): value for key, value in scope.get("headers", ())}
         raw_content_length = headers.get(b"content-length")
         if raw_content_length is not None:
@@ -641,7 +646,7 @@ class _JsonRequestBodyLimitMiddleware:
                 content_length = int(raw_content_length)
             except ValueError:
                 content_length = 0
-            if content_length > self.max_body_bytes:
+            if content_length > request_limit:
                 await self._reject(scope, receive, send)
                 return
 
@@ -652,7 +657,7 @@ class _JsonRequestBodyLimitMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 received_bytes += len(message.get("body", b""))
-                if received_bytes > self.max_body_bytes:
+                if received_bytes > request_limit:
                     raise _JsonRequestBodyTooLarge
             return message
 
@@ -670,24 +675,28 @@ class _JsonRequestBodyLimitMiddleware:
         await response(scope, receive, send)
 
 
-def _request_body_limit_exempt(scope: Scope) -> bool:
+def _request_body_limit_bytes(scope: Scope, *, default_limit: int) -> int:
     headers = {key.lower(): value for key, value in scope.get("headers", ())}
     raw_content_type = headers.get(b"content-type", b"")
     if not isinstance(raw_content_type, bytes):
-        return False
+        return default_limit
     content_type = raw_content_type.split(b";", 1)[0].strip().lower()
     if content_type != b"multipart/form-data":
-        return False
+        return default_limit
     path = str(scope.get("path", ""))
-    exact_paths = {
+    bundle_paths = {
         "/api/bundles/preview",
         "/api/character-bundles/preview",
-        "/api/character-texts/send-image",
-        "/api/media/character-reference/upload",
         "/api/scenario-bundles/preview",
     }
-    return (
-        path in exact_paths
+    if path in bundle_paths:
+        return BUNDLE_UPLOAD_MAX_BYTES + MULTIPART_REQUEST_OVERHEAD_BYTES
+    image_paths = {
+        "/api/character-texts/send-image",
+        "/api/media/character-reference/upload",
+    }
+    if (
+        path in image_paths
         or (
             path.startswith("/api/character-texts/threads/")
             and path.endswith("/send-image")
@@ -700,7 +709,12 @@ def _request_body_limit_exempt(scope: Scope) -> bool:
             path.startswith("/api/characters/")
             and path.endswith("/reference-image/upload")
         )
-    )
+    ):
+        return (
+            CHARACTER_REFERENCE_UPLOAD_MAX_BYTES
+            + MULTIPART_REQUEST_OVERHEAD_BYTES
+        )
+    return default_limit
 
 
 def create_app(state: WebAppState | None = None) -> FastAPI:
