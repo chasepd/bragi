@@ -22,6 +22,7 @@ from bragi.services.manual_confirmation import manual_memory_confirmation_enable
 from bragi.services.npc_knowledge_audit_service import NpcKnowledgeLeak
 from bragi.services.openrouter_routing_settings import request_with_openrouter_routing
 from bragi.services.provider_fallbacks import structured_output_with_fallback
+from bragi.services.request_budget import budget_structured_output_request
 from bragi.services.sexual_content_safety import is_fade_to_black_message
 from bragi.services.text_script_policy import (
     DEFAULT_SCRIPT_GUARD_MODE,
@@ -1055,7 +1056,13 @@ async def _structured_response(
             task=task,
             save_id=save_id,
         )
-    return await provider.generate_structured_output(request)
+    return await provider.generate_structured_output(
+        budget_structured_output_request(
+            repositories,
+            request,
+            task=task,
+        )
+    )
 
 
 def _observation_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object]:
