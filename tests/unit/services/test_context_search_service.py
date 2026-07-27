@@ -671,6 +671,17 @@ def test_structured_identifier_matching_is_bounded_and_keeps_query_edges() -> No
     assert "artifact-99" in identifiers
 
 
+def test_structured_identifier_matching_preserves_tail_identifier_after_bound() -> None:
+    query = f"{'noise ' * context_search_module.MAX_CONTEXT_QUERY_CHARS} artifact-99"
+
+    bounded = context_search_module._bounded_context_query_text(query)
+    identifiers = context_search_module._bounded_structured_identifiers(query)
+
+    assert len(bounded) == context_search_module.MAX_CONTEXT_QUERY_CHARS
+    assert bounded.endswith("artifact-99")
+    assert "artifact-99" in identifiers
+
+
 def test_context_query_terms_bound_large_raw_inputs_and_keep_tail_terms() -> None:
     query = " ".join(f"noise{index:05d}" for index in range(2_000))
     query = f"{query} moonstone"

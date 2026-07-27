@@ -3865,8 +3865,9 @@ def _ordered_meaningful_query_terms(text: str) -> tuple[str, ...]:
 def _bounded_context_query_text(text: str) -> str:
     if len(text) <= MAX_CONTEXT_QUERY_CHARS:
         return text
-    half = MAX_CONTEXT_QUERY_CHARS // 2
-    return f"{text[:half]} {text[-half:]}"
+    head_chars = MAX_CONTEXT_QUERY_CHARS // 2
+    tail_chars = MAX_CONTEXT_QUERY_CHARS - head_chars - 1
+    return f"{text[:head_chars]} {text[-tail_chars:]}"
 
 
 def _bounded_context_query_terms(text: str) -> tuple[str, ...]:

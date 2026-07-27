@@ -2184,6 +2184,59 @@ def test_submit_player_turn_persists_messages_and_uses_active_chat_model(
     assert persisted_messages[1].token_estimate == 34
 
 
+def test_submit_player_turn_rolls_back_input_when_snapshot_capture_fails(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
+    repositories.set_model_preference(
+        task="chat",
+        provider="openrouter",
+        model_id="anthropic/claude-3.5-sonnet",
+    )
+    provider = RecordingChatProvider("openrouter")
+    service = ChatService(
+        repositories=repositories,
+        providers={"openrouter": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    def fail_snapshot_capture(
+        self: TurnSnapshotService,
+        *,
+        save_id: str,
+        message_id: str,
+        reason: str = "message",
+    ) -> object:
+        raise RuntimeError("snapshot unavailable")
+
+    monkeypatch.setattr(
+        TurnSnapshotService,
+        "capture_message_snapshot",
+        fail_snapshot_capture,
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot unavailable"):
+        asyncio.run(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+            )
+        )
+
+    assert repositories.list_messages(save.id) == []
+    assert provider.chat_requests == []
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_requests", "expected_body"),
     [

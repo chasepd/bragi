@@ -960,16 +960,12 @@ class ChatService:
         stage_started = perf_counter()
         turn_progress.publish("input", "running", "Saving player input")
         try:
-            player_message = self.repositories.append_message(
+            player_message = self._append_message_with_snapshot(
                 save_id=save_id,
                 role="player",
                 speaker_name=speaker_name,
                 body=body,
                 content_rating=player_content_rating,
-            )
-            TurnSnapshotService(self.repositories).capture_message_snapshot(
-                save_id=save_id,
-                message_id=player_message.id,
                 reason="player_message",
             )
         except Exception:
@@ -1086,16 +1082,12 @@ class ChatService:
         stage_started = perf_counter()
         turn_progress.publish("input", "running", "Saving timeskip")
         try:
-            timeskip_message = self.repositories.append_message(
+            timeskip_message = self._append_message_with_snapshot(
                 save_id=save_id,
                 role="system",
                 speaker_name=TIMESKIP_SPEAKER_NAME,
                 body=directive,
                 content_rating=timeskip_content_rating,
-            )
-            TurnSnapshotService(self.repositories).capture_message_snapshot(
-                save_id=save_id,
-                message_id=timeskip_message.id,
                 reason="system_message",
             )
         except Exception:
@@ -1128,6 +1120,36 @@ class ChatService:
                 turn_progress_callback=turn_progress_callback,
                 _turn_progress=turn_progress,
             )
+
+    def _append_message_with_snapshot(
+        self,
+        *,
+        save_id: str,
+        role: str,
+        speaker_name: str | None,
+        body: str,
+        content_rating: str,
+        reason: str,
+    ) -> MessageRecord:
+        self.repositories.begin_immediate_transaction()
+        try:
+            message = self.repositories.append_message(
+                save_id=save_id,
+                role=role,
+                speaker_name=speaker_name,
+                body=body,
+                content_rating=content_rating,
+            )
+            TurnSnapshotService(self.repositories).capture_message_snapshot(
+                save_id=save_id,
+                message_id=message.id,
+                reason=reason,
+            )
+            self.repositories.commit_transaction()
+            return message
+        except BaseException:
+            self.repositories.rollback_transaction()
+            raise
 
     async def look_around(
         self,

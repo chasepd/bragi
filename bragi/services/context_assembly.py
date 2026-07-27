@@ -1418,6 +1418,7 @@ def deterministic_context_sources(
                 source_message_id=source_message_id,
                 message_positions=message_positions,
                 world_state=world_state_records,
+                message_visibility=message_visibility_records,
             )
         )
     return _dedupe_context_sources(tuple(sources))
@@ -1687,6 +1688,7 @@ def _active_participant_state_sources(
     source_message_id: str | None,
     message_positions: dict[str, int] | None,
     world_state: tuple[WorldStateRecord, ...] | list[WorldStateRecord] | None = None,
+    message_visibility: tuple[MessageVisibilityRecord, ...] = (),
 ) -> tuple[ContextSource, ...]:
     if snapshot is None:
         return ()
@@ -1707,6 +1709,12 @@ def _active_participant_state_sources(
             state,
             source_message_id=source_message_id,
             message_positions=message_positions,
+        ):
+            continue
+        if not _source_message_ids_visible_to_active_characters(
+            (state.source_message_id,),
+            active_character_ids=set(snapshot.present_character_ids),
+            message_visibility=message_visibility,
         ):
             continue
         if not _active_participant_state_key_matches(state.key, active_slugs):

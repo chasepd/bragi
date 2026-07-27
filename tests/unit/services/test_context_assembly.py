@@ -1710,6 +1710,59 @@ def test_active_participant_relationship_state_is_deterministic_context(
     assert "Unrelated crypt cataloging" not in current_scene_text
 
 
+def test_active_participant_state_hidden_from_present_scene_is_omitted(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, current_location = _create_context_save(
+        repositories,
+        scenario_id="scenario-hidden-participant-state",
+        save_id="save-hidden-participant-state",
+    )
+    present = repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        aliases=["Ilyra"],
+        role="Watch captain",
+        character_id="character-hidden-participant-ilyra",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=current_location.id,
+        situation="Ilyra watches the bridge.",
+        present_character_ids=[present.id],
+        snapshot_id="snapshot-hidden-participant-state",
+    )
+    hidden_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Ilyra privately learned that Mara betrayed the bridge watch.",
+        message_id="message-hidden-participant-state",
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_message.id,
+        character_id=present.id,
+        visibility="not_visible",
+        source="scene_presence",
+    )
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="character.captain_ilyra.revealed_traits.about_mara",
+        value={"knows": "Ilyra knows Mara betrayed the bridge watch."},
+        category="relationship",
+        source_message_id=hidden_message.id,
+    )
+
+    sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
+
+    participant_text = "\n".join(
+        source.text
+        for source in sources
+        if source.tier == "active_participant_facts"
+    )
+    assert "Ilyra knows Mara betrayed the bridge watch" not in participant_text
+
+
 def test_narrator_context_does_not_render_player_agency_as_npc_guidance(
     repositories: PersistenceRepositories,
 ) -> None:
