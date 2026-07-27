@@ -573,6 +573,16 @@ def test_persisted_observation_revalidation_rejects_subject_prefix() -> None:
             "Mara betrayed Rowan",
             "Mara betrayed Rowan.",
         ),
+        (
+            "Lio told everyone that Mara has the red key.",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "Mara doubts the vault is safe.",
+            "the vault is safe",
+            "The vault is safe.",
+        ),
     ],
 )
 def test_persisted_observation_revalidation_rejects_unpreserved_reported_modality(
@@ -1437,7 +1447,7 @@ def test_context_curation_service_rejects_custom_curator_unexpected_script(
     result = asyncio.run(service.curate_pending(save.id))
 
     assert result.accepted_count == 0
-    assert result.discarded_count == 1
+    assert result.discarded_count == 2
     assert repositories.list_memories(save.id) == []
     updated = repositories.get_context_observation(observation.id)
     assert updated is not None

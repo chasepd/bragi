@@ -643,6 +643,22 @@ def test_exact_raw_candidates_match_distinctive_term_in_natural_query() -> None:
     assert selected == (candidate,)
 
 
+def test_exact_raw_candidates_match_short_code_in_natural_query() -> None:
+    candidate = context_search_module._ContextCandidate(
+        source_type="memory",
+        source_id="memory-a7-natural",
+        text="Only A-7 opens the old river vault.",
+    )
+
+    selected = context_search_module._exact_raw_candidates(
+        (candidate,),
+        indexed_candidates=(),
+        latest_player_message="Where did we learn about A-7?",
+    )
+
+    assert selected == (candidate,)
+
+
 def test_context_query_terms_bound_large_raw_inputs_and_keep_tail_terms() -> None:
     query = " ".join(f"noise{index:05d}" for index in range(2_000))
     query = f"{query} moonstone"

@@ -1121,7 +1121,7 @@ class RecordingAgenticPipelineProvider(RecordingChatProvider):
             data = _structured_payload_with_source_ids(self.state_data, request)
         elif schema_name == "context_observation_extraction":
             self.events.append("fact_observation")
-            source_ids = _observation_source_message_ids(request)
+            source_ids = _observation_source_message_ids(request)[:1]
             data = {
                 "observations": [
                     {

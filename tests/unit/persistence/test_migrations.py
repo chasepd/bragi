@@ -11,7 +11,10 @@ import pytest
 
 from bragi.persistence import migrations
 from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION, migrate_database
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    canonical_claim_fingerprint,
+)
 
 EXPECTED_MIGRATION_VERSIONS = list(range(1, CURRENT_SCHEMA_VERSION + 1))
 
@@ -390,6 +393,9 @@ def test_migrate_database_upgrades_main_schema_71_context_lifecycle(
         )
         duplicate_id = "legacy-duplicate-memory"
         connection.execute(
+            "DROP INDEX idx_memories_save_claim_fingerprint_active"
+        )
+        connection.execute(
             """
             INSERT INTO memories(
                 id, save_id, body, tags_json, importance,
@@ -484,7 +490,6 @@ def test_migrate_database_upgrades_main_schema_71_context_lifecycle(
             before=[],
             after=["tea"],
         )
-        connection.execute("DROP INDEX idx_memories_save_claim_fingerprint_active")
         connection.execute(
             "ALTER TABLE memories DROP COLUMN source_observation_ids_json"
         )
@@ -597,6 +602,77 @@ def test_migrate_database_upgrades_main_schema_71_context_lifecycle(
         assert index_row is not None
         assert "CREATE UNIQUE INDEX" in index_row[0]
         assert "WHERE archived_at IS NULL" in index_row[0]
+
+
+def test_current_schema_repairs_nonunique_memory_fingerprint_index(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Ashfall Keep",
+            premise="A keep in the ash.",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(
+            scenario_id=scenario.id,
+            title="Night Watch",
+        )
+        keeper = repositories.add_memory(
+            save_id=save.id,
+            body="Mara likes tea.",
+            tags=["preference"],
+        )
+        connection.execute(
+            "DROP INDEX idx_memories_save_claim_fingerprint_active"
+        )
+        connection.execute(
+            """
+            CREATE INDEX idx_memories_save_claim_fingerprint_active
+            ON memories(save_id, claim_fingerprint)
+            WHERE archived_at IS NULL AND claim_fingerprint != ''
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO memories(
+                id, save_id, body, tags_json, importance,
+                source_message_ids_json, claim_fingerprint,
+                source_observation_ids_json
+            )
+            VALUES (
+                'duplicate-memory', ?, 'mara likes tea', '["dossier"]', 0.9,
+                '["message-duplicate"]', ?, '[]'
+            )
+            """,
+            (
+                save.id,
+                canonical_claim_fingerprint("mara likes tea"),
+            ),
+        )
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        active_ids = connection.execute(
+            """
+            SELECT id FROM memories
+            WHERE save_id = ? AND archived_at IS NULL
+            """,
+            (save.id,),
+        ).fetchall()
+        assert active_ids == [(keeper.id,)]
+        index_row = next(
+            row
+            for row in connection.execute("PRAGMA index_list('memories')")
+            if row[1] == "idx_memories_save_claim_fingerprint_active"
+        )
+        assert index_row[2] == 1
 
 
 def test_migration_rejects_orphaned_pending_review_suggestions(tmp_path: Path) -> None:

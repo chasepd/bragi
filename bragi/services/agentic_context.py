@@ -1947,6 +1947,11 @@ def _observation_evidence_is_grounded(
         _grounding_negation_conflicts(observation.claim, context)
         or _grounding_denial_conflicts(observation.claim, context)
         or _grounding_modality_conflicts(observation.claim, context)
+        or not _grounding_context_preserves_claim_boundary(
+            observation.claim,
+            observation.evidence_quote,
+            context,
+        )
         for context in source_contexts
     ):
         return False
@@ -2333,6 +2338,11 @@ def _context_observation_evidence_is_grounded(
             _grounding_negation_conflicts(observation.claim, context)
             or _grounding_denial_conflicts(observation.claim, context)
             or _grounding_modality_conflicts(observation.claim, context)
+            or not _grounding_context_preserves_claim_boundary(
+                observation.claim,
+                observation.evidence_quote,
+                context,
+            )
             for context in source_contexts
         )
         and not _grounding_anchor_conflicts(
@@ -3901,6 +3911,29 @@ def _grounding_modality_conflicts(claim: str, evidence: str) -> bool:
     evidence_terms = set(_ordered_grounding_terms(evidence))
     modal_terms = reporting_terms | uncertainty_terms
     return bool((evidence_terms & modal_terms) - claim_terms)
+
+
+def _grounding_context_preserves_claim_boundary(
+    claim: str,
+    evidence_quote: str,
+    context: str,
+) -> bool:
+    if not _grounding_order_is_preserved(claim, context):
+        return False
+    claim_terms = _ordered_grounding_terms(claim)
+    context_terms = _ordered_grounding_terms(context)
+    if context_terms[: len(claim_terms)] == claim_terms:
+        return True
+    quote_start = context.casefold().find(evidence_quote.casefold())
+    if quote_start < 0:
+        return False
+    prefix = context[:quote_start].strip().casefold()
+    if not prefix:
+        return True
+    return any(
+        marker in f" {prefix} "
+        for marker in (" and ", " but ", " while ", " then ", ";")
+    )
 
 
 def _grounding_anchor_conflicts(proposed: str, observation_claim: str) -> bool:

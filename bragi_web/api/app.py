@@ -631,7 +631,7 @@ class _JsonRequestBodyLimitMiddleware:
         receive: Receive,
         send: Send,
     ) -> None:
-        if scope["type"] != "http" or not _is_json_request_scope(scope):
+        if scope["type"] != "http" or _request_body_limit_exempt(scope):
             await self.app(scope, receive, send)
             return
         headers = {key.lower(): value for key, value in scope.get("headers", ())}
@@ -670,13 +670,37 @@ class _JsonRequestBodyLimitMiddleware:
         await response(scope, receive, send)
 
 
-def _is_json_request_scope(scope: Scope) -> bool:
+def _request_body_limit_exempt(scope: Scope) -> bool:
     headers = {key.lower(): value for key, value in scope.get("headers", ())}
     raw_content_type = headers.get(b"content-type", b"")
     if not isinstance(raw_content_type, bytes):
         return False
-    content_type = raw_content_type.split(b";", 1)[0].strip()
-    return content_type == b"application/json" or content_type.endswith(b"+json")
+    content_type = raw_content_type.split(b";", 1)[0].strip().lower()
+    if content_type != b"multipart/form-data":
+        return False
+    path = str(scope.get("path", ""))
+    exact_paths = {
+        "/api/bundles/preview",
+        "/api/character-bundles/preview",
+        "/api/character-texts/send-image",
+        "/api/media/character-reference/upload",
+        "/api/scenario-bundles/preview",
+    }
+    return (
+        path in exact_paths
+        or (
+            path.startswith("/api/character-texts/threads/")
+            and path.endswith("/send-image")
+        )
+        or (
+            path.startswith("/api/scenarios/")
+            and path.endswith("/character-starters/reference-image/upload")
+        )
+        or (
+            path.startswith("/api/characters/")
+            and path.endswith("/reference-image/upload")
+        )
+    )
 
 
 def create_app(state: WebAppState | None = None) -> FastAPI:

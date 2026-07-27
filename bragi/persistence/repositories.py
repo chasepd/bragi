@@ -15,7 +15,10 @@ from typing import Any, cast
 from uuid import uuid4
 
 from bragi.observation_types import normalize_observation_type
-from bragi.persistence.migrations import migrate_database
+from bragi.persistence.migrations import (
+    _remap_migrated_memory_references,
+    migrate_database,
+)
 from bragi.persistence.models import (
     ActiveThreadRecord,
     CharacterContactStateRecord,
@@ -8532,7 +8535,12 @@ class PersistenceRepositories:
                                target_id,
                                scope_class,
                                CASE
-                                   WHEN scope_class = 0 THEN character_id
+                                   WHEN scope_class = 0
+                                     OR character_id IN (
+                                         SELECT CAST(value AS TEXT)
+                                         FROM json_each(?)
+                                     )
+                                   THEN character_id
                                    ELSE ''
                                END
                            ORDER BY updated_at DESC, source_rowid DESC
@@ -8566,6 +8574,7 @@ class PersistenceRepositories:
                 present_ids_json,
                 visibility_ids_json,
                 save_id,
+                present_ids_json,
             ),
         )
         return [_character_knowledge_edge_from_row(row) for row in rows]
@@ -9741,7 +9750,7 @@ class PersistenceRepositories:
     ) -> MemoryRecord:
         current = self._fetch_one(
             """
-            SELECT source_message_id, source_message_ids_json,
+            SELECT save_id, source_message_id, source_message_ids_json,
                    source_observation_ids_json, claim_fingerprint
             FROM memories
             WHERE id = ?
@@ -9773,6 +9782,23 @@ class PersistenceRepositories:
             )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS]
         )
         resolved_fingerprint = canonical_claim_fingerprint(body)
+        save_id = str(current["save_id"])
+        collision = self.get_memory_by_claim_fingerprint(
+            save_id=save_id,
+            claim_fingerprint=resolved_fingerprint,
+        )
+        if collision is not None and collision.id != memory_id:
+            return self._merge_colliding_memory_update(
+                memory_id=memory_id,
+                save_id=save_id,
+                body=body,
+                resolved_fingerprint=resolved_fingerprint,
+                tags=tags,
+                importance=importance,
+                source_message_id=source_message_id,
+                source_message_ids=resolved_source_message_ids,
+                source_observation_ids=resolved_observation_ids,
+            )
         self.connection.execute(
             """
             UPDATE memories
@@ -9820,6 +9846,99 @@ class PersistenceRepositories:
             claim_fingerprint=row["claim_fingerprint"],
             source_observation_ids=_load_list(row["source_observation_ids_json"]),
         )
+
+    def _merge_colliding_memory_update(
+        self,
+        *,
+        memory_id: str,
+        save_id: str,
+        body: str,
+        resolved_fingerprint: str,
+        tags: list[str],
+        importance: float,
+        source_message_id: str | None,
+        source_message_ids: list[str],
+        source_observation_ids: list[str],
+    ) -> MemoryRecord:
+        self.begin_immediate_transaction()
+        try:
+            collision = self.get_memory_by_claim_fingerprint(
+                save_id=save_id,
+                claim_fingerprint=resolved_fingerprint,
+            )
+            if collision is None or collision.id == memory_id:
+                raise RuntimeError("Memory fingerprint collision changed during update")
+            merged_source_message_ids = _memory_source_message_ids(
+                source_message_id=source_message_id or collision.source_message_id,
+                source_message_ids=list(
+                    dict.fromkeys(
+                        (*source_message_ids, *collision.source_message_ids)
+                    )
+                ),
+            )
+            merged_observation_ids = _unique_strings(
+                [
+                    *source_observation_ids,
+                    *collision.source_observation_ids,
+                ]
+            )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS]
+            self.connection.execute(
+                """
+                UPDATE memories
+                SET archived_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND save_id = ?
+                """,
+                (collision.id, save_id),
+            )
+            self.connection.execute(
+                """
+                UPDATE memories
+                SET body = ?, tags_json = ?, importance = ?,
+                    source_message_id = ?,
+                    source_message_ids_json = ?,
+                    claim_fingerprint = ?,
+                    source_observation_ids_json = ?,
+                    updated_at = CURRENT_TIMESTAMP,
+                    archived_at = NULL
+                WHERE id = ? AND save_id = ? AND archived_at IS NULL
+                """,
+                (
+                    body,
+                    _dump_json(list(dict.fromkeys((*tags, *collision.tags)))),
+                    max(collision.importance, importance),
+                    source_message_id or collision.source_message_id,
+                    _dump_json(merged_source_message_ids),
+                    resolved_fingerprint,
+                    _dump_json(merged_observation_ids),
+                    memory_id,
+                    save_id,
+                ),
+            )
+            _remap_migrated_memory_references(
+                self.connection,
+                save_id=save_id,
+                duplicate_id=collision.id,
+                keeper_id=memory_id,
+            )
+            self.connection.execute(
+                """
+                UPDATE context_sources
+                SET archived_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE save_id = ? AND source_type = 'memory'
+                  AND source_id = ?
+                """,
+                (save_id, collision.id),
+            )
+            self.commit_transaction()
+        except BaseException:
+            self.rollback_transaction()
+            raise
+        merged = self.get_memory(save_id, memory_id)
+        if merged is None:
+            raise ValueError("Failed to merge colliding memory update")
+        return merged
 
     def archive_memory(self, memory_id: str) -> None:
         self.connection.execute(

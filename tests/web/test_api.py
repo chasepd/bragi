@@ -7685,14 +7685,74 @@ def test_json_request_body_limit_rejects_before_validation(tmp_path: Path) -> No
     oversized_body = b"x" * (api_app.MAX_JSON_REQUEST_BODY_BYTES + 1)
 
     with TestClient(create_app(cast(WebAppState, state))) as client:
-        response = client.post(
+        json_response = client.post(
             "/api/chat/look-around",
             content=oversized_body,
             headers={"content-type": "application/json"},
         )
+        text_response = client.post(
+            "/api/chat/look-around",
+            content=oversized_body,
+            headers={"content-type": "text/plain"},
+        )
 
-    assert response.status_code == 413
-    assert response.json() == {"detail": "Request body too large"}
+    for response in (json_response, text_response):
+        assert response.status_code == 413
+        assert response.json() == {"detail": "Request body too large"}
+
+
+def test_request_body_limit_counts_chunked_body_without_content_length() -> None:
+    request_messages = iter(
+        (
+            {
+                "type": "http.request",
+                "body": b"x" * 64,
+                "more_body": True,
+            },
+            {
+                "type": "http.request",
+                "body": b"x" * api_app.MAX_JSON_REQUEST_BODY_BYTES,
+                "more_body": False,
+            },
+        )
+    )
+    sent_messages: list[dict[str, object]] = []
+
+    async def receive() -> Any:
+        return next(request_messages)
+
+    async def send(message: Any) -> None:
+        sent_messages.append(message)
+
+    async def consume_body(
+        _scope: Any,
+        receive_body: Any,
+        _send: Any,
+    ) -> None:
+        while True:
+            message = await receive_body()
+            if not message.get("more_body"):
+                return
+
+    middleware = api_app._JsonRequestBodyLimitMiddleware(
+        consume_body,
+        max_body_bytes=api_app.MAX_JSON_REQUEST_BODY_BYTES,
+    )
+    asyncio.run(
+        middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/chat/look-around",
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+    )
+
+    assert sent_messages[0]["type"] == "http.response.start"
+    assert sent_messages[0]["status"] == 413
 
 
 def test_look_around_post_returns_answer_markdown_blocks(

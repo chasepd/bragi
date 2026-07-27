@@ -3413,6 +3413,14 @@ def _exact_raw_candidates(
     query_terms = set(_bounded_context_query_terms(latest_player_message))
     if not query_terms or limit <= 0:
         return ()
+    structured_identifiers = {
+        identifier.casefold()
+        for identifier in re.findall(
+            r"(?<!\w)[^\W_]+(?:[-_.][^\W_]+)+(?!\w)",
+            latest_player_message,
+            flags=re.UNICODE,
+        )
+    }
     indexed_keys = {
         (candidate.source_type, candidate.source_id)
         for candidate in indexed_candidates
@@ -3449,6 +3457,9 @@ def _exact_raw_candidates(
         distinctive_identifier_match = any(
             len(term) >= 6 and term not in ordinary_query_terms
             for term in overlap_terms
+        ) or any(
+            identifier in (candidate.selection_text or candidate.text).casefold()
+            for identifier in structured_identifiers
         )
         if (
             overlap_count < min(2, len(query_terms))

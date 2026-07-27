@@ -760,6 +760,8 @@ def migrate_database(database_path: Path | str) -> None:
                 f"{current} is newer than this Bragi build supports "
                 f"({CURRENT_SCHEMA_VERSION}). Upgrade Bragi before starting."
             )
+        if not _memory_claim_fingerprint_index_is_unique(connection):
+            _migrate_schema_71_to_72(connection)
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
         _ensure_context_observation_curation_schema(connection)
@@ -1357,7 +1359,8 @@ def _ensure_hot_narration_query_indexes(connection: sqlite3.Connection) -> None:
         "memories",
         {"save_id", "claim_fingerprint", "archived_at"},
         """
-        CREATE INDEX IF NOT EXISTS idx_memories_save_claim_fingerprint_active
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_memories_save_claim_fingerprint_active
         ON memories(save_id, claim_fingerprint)
         WHERE archived_at IS NULL AND claim_fingerprint != ''
         """,
@@ -2037,6 +2040,9 @@ def _migrate_schema_71_to_72(connection: sqlite3.Connection) -> None:
                     """,
                     (save_id, *duplicate_ids),
                 )
+        connection.execute(
+            "DROP INDEX IF EXISTS idx_memories_save_claim_fingerprint_active"
+        )
         connection.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS
@@ -4437,6 +4443,18 @@ def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
             (table_name,),
         ).fetchone()
         is not None
+    )
+
+
+def _memory_claim_fingerprint_index_is_unique(
+    connection: sqlite3.Connection,
+) -> bool:
+    if not _table_exists(connection, "memories"):
+        return True
+    return any(
+        str(row[1]) == "idx_memories_save_claim_fingerprint_active"
+        and bool(row[2])
+        for row in connection.execute("PRAGMA index_list('memories')").fetchall()
     )
 
 

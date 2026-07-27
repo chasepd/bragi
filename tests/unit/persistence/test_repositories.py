@@ -2987,6 +2987,43 @@ def test_repositories_count_active_memories(
     assert repositories.list_memories(save_id) == [kept]
 
 
+def test_update_memory_atomically_merges_canonical_collision(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    repositories.add_memory(
+        save_id=save_id,
+        body="Mara likes tea.",
+        tags=["preference"],
+        importance=0.7,
+        source_message_ids=["message-keeper"],
+    )
+    duplicate = repositories.add_memory(
+        save_id=save_id,
+        body="Mara prefers tea.",
+        tags=["dossier"],
+        importance=0.9,
+        source_message_ids=["message-duplicate"],
+    )
+
+    merged = repositories.update_memory(
+        memory_id=duplicate.id,
+        body="mara likes tea",
+        tags=["dossier"],
+        importance=0.9,
+        source_message_ids=["message-duplicate"],
+    )
+
+    assert merged.id == duplicate.id
+    assert set(merged.tags) == {"preference", "dossier"}
+    assert merged.importance == 0.9
+    assert set(merged.source_message_ids) == {
+        "message-keeper",
+        "message-duplicate",
+    }
+    assert repositories.list_memories(save_id) == [merged]
+
+
 def test_repositories_consolidate_duplicates_without_losing_active_references(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -7711,6 +7748,56 @@ def test_narration_graph_normalizes_state_alias_and_bounds_owner_rows(
 
     assert threshold_edge.id in {edge.id for edge in edges}
     assert len(edges) == 8
+
+
+def test_narration_graph_keeps_present_owner_restrictions_across_aliases(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    state = repositories.upsert_world_state(
+        save_id=save_id,
+        key="vault.code",
+        value={"phrase": "ember dawn"},
+        source_message_id=message_id,
+    )
+    first = repositories.add_character(
+        save_id=save_id,
+        name="First Warden",
+    )
+    second = repositories.add_character(
+        save_id=save_id,
+        name="Second Warden",
+    )
+    first_denial = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=first.id,
+        target_type="world_state",
+        target_id=state.id,
+        knowledge_state="does_not_know",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=first.id,
+        target_type="state",
+        target_id=state.id,
+        knowledge_state="knows",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=second.id,
+        target_type="world_state",
+        target_id=state.id,
+        knowledge_state="does_not_know",
+    )
+
+    edges = repositories.list_narration_character_knowledge_edges(
+        save_id,
+        target_keys={("world_state", state.id)},
+        present_character_ids={first.id, second.id},
+        visibility_character_ids={first.id, second.id},
+    )
+
+    assert first_denial.id in {edge.id for edge in edges}
 
 
 def _persist_repository_save(
