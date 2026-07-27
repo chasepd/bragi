@@ -11552,6 +11552,29 @@ def test_scenario_creation_rejects_invalid_interaction_mode(
     assert response.json()["detail"] == "Unknown interaction mode: cinematic"
 
 
+def test_manual_scenario_rejects_non_string_interaction_mode(
+    tmp_path: Path,
+) -> None:
+    with TestClient(
+        create_app(cast(WebAppState, _state_double(tmp_path, _RuntimeDouble())))
+    ) as client:
+        response = client.post(
+            "/api/scenarios/manual",
+            json={
+                "scenario_type": "full_roleplay",
+                "title": "Invalid",
+                "premise": "Invalid",
+                "player_role": "",
+                "interaction_mode": 123,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "interaction_mode must be 'roleplay' or 'storyteller'"
+    )
+
+
 @pytest.mark.parametrize(
     ("path", "payload"),
     [

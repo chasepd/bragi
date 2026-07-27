@@ -6573,8 +6573,13 @@ def _raise_if_retired_scenario_request(
 
 
 def _raise_if_invalid_interaction_mode(value: object) -> None:
+    if value is not None and not isinstance(value, str):
+        raise HTTPException(
+            status_code=400,
+            detail="interaction_mode must be 'roleplay' or 'storyteller'",
+        )
     try:
-        normalize_interaction_mode(value if isinstance(value, str) else None)
+        normalize_interaction_mode(value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

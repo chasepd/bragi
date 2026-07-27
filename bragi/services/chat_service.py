@@ -5516,13 +5516,21 @@ class ChatService:
                 providers=self.providers,
             )
         )
+        save = self.repositories.get_save(save_id)
+        storyteller_mode = (
+            save is not None
+            and save.interaction_mode is InteractionMode.STORYTELLER
+        )
         try:
             return await planner.plan_for_turn(
                 save_id=save_id,
                 player_message_id=player_message_id,
-                apply_presence_updates=not plan_first_narrator_enabled(
-                    self.repositories,
-                    save_id=save_id,
+                apply_presence_updates=(
+                    not storyteller_mode
+                    and not plan_first_narrator_enabled(
+                        self.repositories,
+                        save_id=save_id,
+                    )
                 ),
             )
         except Exception as exc:

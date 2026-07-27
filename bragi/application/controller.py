@@ -1586,13 +1586,14 @@ class BragiRuntime:
                 opening_message_id = message.id
             seeded_character_count = (
                 seed_continuation_characters(
-                repositories=self.repositories,
-                save_id=save.id,
-                metadata=source_metadata or {},
-                source_message_id=opening_message_id,
+                    repositories=self.repositories,
+                    save_id=save.id,
+                    metadata=source_metadata or {},
+                    source_message_id=opening_message_id,
+                    include_player_character=(
+                        normalized_interaction_mode is InteractionMode.ROLEPLAY
+                    ),
                 )
-                if normalized_interaction_mode is InteractionMode.ROLEPLAY
-                else 0
             )
             persisted_scenario = self.repositories.get_scenario(scenario_id)
             seed_content = (
@@ -1609,9 +1610,8 @@ class BragiRuntime:
                 content=seed_content,
                 source_message_id=opening_message_id,
                 media_service=self._media_service(),
-                )
-                if normalized_interaction_mode is InteractionMode.ROLEPLAY
-                else 0
+                interaction_mode=normalized_interaction_mode,
+            )
             )
             seeded_first_contact_state_count = _seed_first_contact_exploration_state(
                 repositories=self.repositories,
@@ -1857,16 +1857,15 @@ class BragiRuntime:
             opening_message_id = message.id
         seeded_character_count = (
             _seed_initial_character_registry(
-            repositories=self.repositories,
-            save_id=save.id,
-            scenario_type=scenario_type,
-            scenario_types=scenario_types,
-            content=content,
-            source_message_id=opening_message_id,
-            media_service=self._media_service(),
+                repositories=self.repositories,
+                save_id=save.id,
+                scenario_type=scenario_type,
+                scenario_types=scenario_types,
+                content=content,
+                source_message_id=opening_message_id,
+                media_service=self._media_service(),
+                interaction_mode=interaction_mode,
             )
-            if interaction_mode is InteractionMode.ROLEPLAY
-            else 0
         )
         seeded_first_contact_state_count = _seed_first_contact_exploration_state(
             repositories=self.repositories,
@@ -2078,13 +2077,14 @@ class BragiRuntime:
             opening_message_id = message.id
         seeded_character_count = (
             seed_continuation_characters(
-            repositories=self.repositories,
-            save_id=save.id,
-            metadata=_scenario_source_metadata(scenario.content_json),
-            source_message_id=opening_message_id,
+                repositories=self.repositories,
+                save_id=save.id,
+                metadata=_scenario_source_metadata(scenario.content_json),
+                source_message_id=opening_message_id,
+                include_player_character=(
+                    save.interaction_mode is InteractionMode.ROLEPLAY
+                ),
             )
-            if save.interaction_mode is InteractionMode.ROLEPLAY
-            else 0
         )
         scenario_type = ScenarioType(scenario.type)
         scenario_content = _scenario_content(scenario.content_json)
@@ -2094,16 +2094,15 @@ class BragiRuntime:
         )
         seeded_character_count += (
             _seed_initial_character_registry(
-            repositories=self.repositories,
-            save_id=save.id,
-            scenario_type=scenario_type,
-            scenario_types=scenario_types,
-            content=scenario_content,
-            source_message_id=opening_message_id,
-            media_service=self._media_service(),
+                repositories=self.repositories,
+                save_id=save.id,
+                scenario_type=scenario_type,
+                scenario_types=scenario_types,
+                content=scenario_content,
+                source_message_id=opening_message_id,
+                media_service=self._media_service(),
+                interaction_mode=save.interaction_mode,
             )
-            if save.interaction_mode is InteractionMode.ROLEPLAY
-            else 0
         )
         seeded_first_contact_state_count = _seed_first_contact_exploration_state(
             repositories=self.repositories,
@@ -7784,6 +7783,7 @@ def _seed_initial_character_registry(
     content: Mapping[str, object],
     source_message_id: str | None,
     media_service: MediaService | None = None,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
 ) -> int:
     content_rating = _scenario_content_mapping_rating(content)
     normalized_genres = scenario_types or (scenario_type,)
@@ -7795,15 +7795,20 @@ def _seed_initial_character_registry(
         scenario_type=starter_type,
         content=content,
     )
-    created_count = _seed_player_character_from_scenario(
-        repositories=repositories,
-        save_id=save_id,
-        content=content,
-        source_message_id=source_message_id,
-        content_rating=content_rating,
-    )
+    created_count = 0
+    if interaction_mode is InteractionMode.ROLEPLAY:
+        created_count = _seed_player_character_from_scenario(
+            repositories=repositories,
+            save_id=save_id,
+            content=content,
+            source_message_id=source_message_id,
+            content_rating=content_rating,
+        )
     if not entries:
-        if ScenarioType.DATING_SIM in normalized_genres:
+        if (
+            interaction_mode is InteractionMode.ROLEPLAY
+            and ScenarioType.DATING_SIM in normalized_genres
+        ):
             DatingRouteService(repositories).seed_routes_for_save(
                 save_id,
                 source_message_id=source_message_id,
@@ -7846,7 +7851,11 @@ def _seed_initial_character_registry(
             motivations=entry.motivations.strip(),
             current_intent=entry.current_intent.strip(),
             boundaries=entry.boundaries.strip(),
-            attitude_toward_player=entry.attitude_toward_player.strip(),
+            attitude_toward_player=(
+                entry.attitude_toward_player.strip()
+                if interaction_mode is InteractionMode.ROLEPLAY
+                else ""
+            ),
             cooperation_conditions=entry.cooperation_conditions.strip(),
             status=entry.status.strip() or "present at scenario start",
             source_message_id=source_message_id,

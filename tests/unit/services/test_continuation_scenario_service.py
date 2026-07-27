@@ -399,6 +399,38 @@ def test_seed_continuation_characters_creates_portable_character_records(
     assert characters[0].source_message_id == opening.id
 
 
+def test_seed_continuation_characters_can_exclude_player_character(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Chapter Two",
+        premise="The ensemble continues.",
+        player_role="",
+        content={},
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Chapter Two")
+
+    created = seed_continuation_characters(
+        repositories=repositories,
+        save_id=save.id,
+        source_message_id=None,
+        include_player_character=False,
+        metadata={
+            "character_continuity": [
+                {"name": "Legacy Avatar", "is_player_character": True},
+                {"name": "Captain Ilyra", "is_player_character": False},
+            ]
+        },
+    )
+
+    assert created == 1
+    assert [character.name for character in repositories.list_characters(save.id)] == [
+        "Captain Ilyra"
+    ]
+
+
 def _create_continuation_save(
     repositories: PersistenceRepositories,
 ) -> tuple[str, str]:

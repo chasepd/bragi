@@ -384,6 +384,7 @@ def seed_continuation_characters(
     save_id: str,
     metadata: Mapping[str, object],
     source_message_id: str | None,
+    include_player_character: bool = True,
 ) -> int:
     content_rating = metadata.get("content_rating")
     normalized_content_rating = (
@@ -405,6 +406,8 @@ def seed_continuation_characters(
         if not isinstance(raw_item, dict):
             continue
         item = cast(dict[str, object], raw_item)
+        if not include_player_character and item.get("is_player_character") is True:
+            continue
         name = _text(item.get("name"))
         key = _character_key(name)
         if not key or key in existing_keys:
@@ -755,6 +758,7 @@ def _character_metadata(character: CharacterRecord) -> dict[str, object]:
         "cooperation_conditions": character.cooperation_conditions,
         "status": character.status,
         "private_notes": character.private_notes,
+        "is_player_character": character.is_player_character,
     }
 
 

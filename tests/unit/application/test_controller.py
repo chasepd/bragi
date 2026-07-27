@@ -5819,8 +5819,10 @@ def test_start_saved_scenario_seeds_registry_from_character_starters(
         title="Glass Harbor",
         premise="A drowned harbor rings its bell at low tide.",
         player_role="Harbor warden",
+        interaction_mode=InteractionMode.STORYTELLER,
         content=_rated_scenario_content({
             "opening_message": "The harbor bell rings under the mud.",
+            "player_character_name": "Legacy Avatar",
             "characters": "Legacy NPC",
             "character_starters": [
                 {
@@ -5850,6 +5852,7 @@ def test_start_saved_scenario_seeds_registry_from_character_starters(
     active_save_id = _value(model, "active_save_id")
     characters = repositories.list_characters(active_save_id)
     assert [character.name for character in characters] == ["Captain Ilyra"]
+    assert all(not character.is_player_character for character in characters)
     character = characters[0]
     assert character.aliases == ["Ilyra"]
     assert character.role == "Watch captain"

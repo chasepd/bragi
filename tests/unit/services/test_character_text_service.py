@@ -470,6 +470,16 @@ def test_storyteller_saves_disable_character_texts_even_when_enabled(
         scope_id=save_id,
     )
     service = CharacterTextService(repositories=repositories, providers={})
+    npc = next(
+        character
+        for character in repositories.list_characters(save_id)
+        if not character.is_player_character
+    )
+    thread = repositories.get_or_create_character_text_thread(
+        save_id=save_id,
+        character_id=npc.id,
+        title=npc.name,
+    )
 
     assert service.is_enabled(save_id) is False
     with pytest.raises(
@@ -478,12 +488,12 @@ def test_storyteller_saves_disable_character_texts_even_when_enabled(
     ):
         service.prepare_spontaneous_text(
             save_id=save_id,
-            character_id=next(
-                character.id
-                for character in repositories.list_characters(save_id)
-                if not character.is_player_character
-            ),
+            character_id=npc.id,
         )
+    with pytest.raises(ValueError, match="unavailable in storyteller mode"):
+        service.get_thread_model(save_id=save_id, thread_id=thread.id)
+    with pytest.raises(ValueError, match="unavailable in storyteller mode"):
+        service.mark_thread_read(save_id=save_id, thread_id=thread.id)
 
 
 def test_send_text_persists_side_channel_messages_without_chronicle_append(

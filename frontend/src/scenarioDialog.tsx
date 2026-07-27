@@ -326,8 +326,16 @@ export function ScenarioDialog({
               : form.action_choices_enabled
           })}
           options={[
-            { value: "roleplay", label: "Roleplay" },
-            { value: "storyteller", label: "Storyteller" }
+            {
+              value: "roleplay",
+              label: "Roleplay",
+              disabled: mode === "draft" && draft !== null
+            },
+            {
+              value: "storyteller",
+              label: "Storyteller",
+              disabled: mode === "draft" && draft !== null
+            }
           ]}
         />
         <label className="toggle-row compact-toggle">

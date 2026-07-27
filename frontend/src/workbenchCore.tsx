@@ -3087,6 +3087,9 @@ function Workbench({
       scenario_type: scenarioType,
       scenario_types: normalizedScenarioTypes(scenarioType, scenario.scenario_types),
       action_choices_enabled: Boolean(scenario.action_choices_enabled),
+      interaction_mode: definition.scenario?.interaction_mode
+        ?? scenario.interaction_mode
+        ?? "roleplay",
       seed: prompt
     });
     setDraftInitialMode("draft");
@@ -6813,7 +6816,13 @@ function RightPanel({
   }
   return (
     <React.Suspense fallback={<RightPanelFallback title="Settings" icon={<Settings size={18} />} />}>
-      <LazySettingsPanel runJob={runJob} activeSaveId={readOnly ? null : model?.active_save_id ?? null} currentUser={effectiveCurrentUser} onContentSafetyChanged={onContentSafetyChanged} />
+      <LazySettingsPanel
+        runJob={runJob}
+        activeSaveId={readOnly ? null : model?.active_save_id ?? null}
+        storytellerMode={model?.interaction_mode === "storyteller"}
+        currentUser={effectiveCurrentUser}
+        onContentSafetyChanged={onContentSafetyChanged}
+      />
     </React.Suspense>
   );
 }
@@ -7452,13 +7461,23 @@ function ScenarioStructuredEditor({
     setNewSectionKey("");
     setError("");
   };
+  const hiddenSectionIds = core.interaction_mode === "storyteller"
+    ? new Set(["player_character_profile", "choice_style"])
+    : new Set<string>();
   const visibleGroups = groups
     .map((group) => ({
       ...group,
-      section_ids: group.section_ids.filter((sectionId) => sectionByKey(sectionId))
+      section_ids: group.section_ids.filter(
+        (sectionId) => sectionByKey(sectionId) && !hiddenSectionIds.has(sectionId)
+      )
     }))
     .filter((group) => group.section_ids.length > 0);
-  const customSections = sections.filter((section) => !knownSectionIds.has(section.key));
+  const customSections = sections.filter(
+    (section) => (
+      !knownSectionIds.has(section.key)
+      && !hiddenSectionIds.has(section.key)
+    )
+  );
   const submit = async () => {
     if (hasPendingStarterImageOperation) {
       setError("Wait for reference image updates to finish before saving.");

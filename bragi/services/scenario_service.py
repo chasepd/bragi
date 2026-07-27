@@ -1657,11 +1657,19 @@ def _generation_instruction(
             "consequences transparent in prose."
         )
     elif scenario_type is ScenarioType.DATING_SIM:
-        scope = (
-            " For dating sim scenarios, create a central player character and a "
-            "cast of romance options with distinct romantic routes, while "
-            "preserving player agency and avoiding a predetermined choice."
-        )
+        if interaction_mode is InteractionMode.STORYTELLER:
+            scope = (
+                " For dating sim scenarios, create an ensemble cast with "
+                "distinct relationships, attractions, conflicts, and possible "
+                "romantic developments. Every character is narrator-controlled; "
+                "do not create player-relative routes or a central player avatar."
+            )
+        else:
+            scope = (
+                " For dating sim scenarios, create a central player character and "
+                "a cast of romance options with distinct romantic routes, while "
+                "preserving player agency and avoiding a predetermined choice."
+            )
     else:
         scope = (
             " For choose your own adventure scenarios, write vivid book-like "

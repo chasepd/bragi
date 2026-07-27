@@ -12715,6 +12715,7 @@ describe("frontend helpers", () => {
     );
 
     await userEvent.click(screen.getByRole("tab", { name: "AI draft" }));
+    expect(screen.getByRole("tab", { name: "Storyteller" })).toBeDisabled();
     const title = screen.getByLabelText("Title");
     await userEvent.clear(title);
     await userEvent.type(title, "Locally edited old draft");
@@ -15469,7 +15470,8 @@ describe("frontend helpers", () => {
       player_role: "Keeper",
       save_count: 0,
       has_generation_prompt: true,
-      action_choices_enabled: true
+      action_choices_enabled: false,
+      interaction_mode: "storyteller"
     });
     const definitionPayload = {
       active_save_id: null,
@@ -15480,6 +15482,7 @@ describe("frontend helpers", () => {
         premise: "A gate in the fog.",
         player_character_name: "Mara",
         player_role: "Keeper",
+        interaction_mode: "storyteller",
         generation_prompt: "A fog gate romance with action choices.",
         content_sections: [
           ["_scenario_genres", ["full_roleplay", "dating_sim"]],
@@ -15521,7 +15524,12 @@ describe("frontend helpers", () => {
     expect(screen.getByRole("textbox", { name: "Scenario seed" })).toHaveValue(
       "A fog gate romance with action choices.",
     );
-    expect(screen.getByLabelText("Action choices")).toBeChecked();
+    expect(screen.getByRole("tab", { name: "Storyteller" })).toHaveAttribute(
+      "aria-selected",
+      "true"
+    );
+    expect(screen.getByLabelText("Action choices")).not.toBeChecked();
+    expect(screen.getByLabelText("Action choices")).toBeDisabled();
   });
 
   it("imports and exports reusable scenario bundles from the scenario library", async () => {

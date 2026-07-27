@@ -14,6 +14,7 @@ from typing import Any, cast
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import (
     ActiveThreadRecord,
     CharacterKnowledgeEdgeRecord,
@@ -16785,6 +16786,53 @@ def test_submit_player_turn_overlaps_plan_first_character_planning_and_context(
     assert character_planner.apply_presence_updates == [False]
     assert len(narrator_planner.calls) == 1
     assert provider.chat_requests[0].narrator_prompt_mode == "plan_first"
+
+
+def test_storyteller_character_planning_never_applies_direction_presence(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="",
+        content={},
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting(PLAN_FIRST_NARRATOR_SETTING, False)
+    repositories.set_app_setting(CHARACTER_ACTION_PLANNING_ENABLED_SETTING, True)
+
+    class RecordingCharacterPlanner:
+        def __init__(self) -> None:
+            self.apply_presence_updates: list[bool] = []
+
+        async def plan_for_turn(
+            self,
+            *,
+            save_id: str,
+            player_message_id: str,
+            apply_presence_updates: bool = True,
+        ) -> CharacterActionPlanningResult:
+            self.apply_presence_updates.append(apply_presence_updates)
+            return CharacterActionPlanningResult(skipped_reason="test")
+
+    planner = RecordingCharacterPlanner()
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        character_action_planning_service=planner,
+    )
+
+    asyncio.run(
+        service._plan_character_actions_if_configured(
+            save_id=save.id,
+            player_message_id="direction-1",
+        )
+    )
+
+    assert planner.apply_presence_updates == [False]
 
 
 def test_submit_player_turn_feeds_richer_character_assessments_to_planner(

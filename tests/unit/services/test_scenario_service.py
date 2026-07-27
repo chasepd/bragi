@@ -746,6 +746,35 @@ def test_generate_dating_sim_draft_uses_player_sections_without_character_starte
     assert draft.character_starters == ()
 
 
+def test_generate_storyteller_dating_sim_draft_forbids_player_avatar(
+    repositories: PersistenceRepositories,
+) -> None:
+    provider = RecordingScenarioProvider(
+        _provider_response_sections(_dating_sim_sections())
+    )
+    service = ScenarioService(
+        repositories=repositories,
+        provider=provider,
+        provider_name="openrouter",
+        model_id="scenario-drafter",
+    )
+
+    asyncio.run(
+        service.generate_draft(
+            scenario_type=ScenarioType.DATING_SIM,
+            interaction_mode=InteractionMode.STORYTELLER,
+            seed="A seaside summer academy.",
+        )
+    )
+
+    request_text = "\n".join(
+        _request_text(request) for request in provider.chat_requests
+    )
+    assert "Every character is narrator-controlled" in request_text
+    assert "do not create player-relative routes" in request_text
+    assert "create a central player character" not in request_text
+
+
 def test_generate_non_fantasy_draft_does_not_include_starter_name_candidates(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -562,6 +562,10 @@ class CharacterTextService:
         details = self.repositories.load_save_details(save_id)
         return details is not None and details.scenario.type == "dating_sim"
 
+    def raise_unless_enabled(self, save_id: str) -> None:
+        if not self.is_enabled(save_id):
+            raise _character_text_disabled_error(self.repositories, save_id)
+
     def can_player_text_character(self, *, save_id: str, character_id: str) -> bool:
         if not self.is_enabled(save_id):
             return False
@@ -844,6 +848,8 @@ class CharacterTextService:
         return self.build_model(save_id)
 
     def get_thread_model(self, *, save_id: str, thread_id: str) -> CharacterTextThread:
+        if not self.is_enabled(save_id):
+            raise _character_text_disabled_error(self.repositories, save_id)
         thread = self.repositories.get_character_text_thread(
             thread_id=thread_id,
             save_id=save_id,
@@ -918,6 +924,8 @@ class CharacterTextService:
         thread_id: str,
         through_message_id: str | None = None,
     ) -> CharacterTextReadResult:
+        if not self.is_enabled(save_id):
+            raise _character_text_disabled_error(self.repositories, save_id)
         updated = self.repositories.mark_character_text_thread_read(
             save_id=save_id,
             thread_id=thread_id,
