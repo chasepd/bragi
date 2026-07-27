@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import re
 import threading
 from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -61,6 +63,10 @@ SENSITIVE_PROVIDER_RESPONSE_HEADERS = frozenset(
         "www-authenticate",
     }
 )
+_SOURCE_ID_PATTERN = re.compile(
+    r"\[([a-z][a-z0-9_]*:[A-Za-z0-9][A-Za-z0-9._:-]*)\]"
+)
+_MAX_CAPTURED_SOURCE_IDS = 64
 
 
 @dataclass(frozen=True)
@@ -663,10 +669,60 @@ def _safe_started_diagnostics(
         fields["model"] = model
     if schema_name:
         fields["schema_name"] = schema_name
+    if payload is not None:
+        canonical_payload = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        fields["payload_sha256"] = hashlib.sha256(canonical_payload).hexdigest()
+        message_diagnostics = _safe_message_diagnostics(payload)
+        fields.update(message_diagnostics)
     schema_enum_value_count = _schema_enum_value_count_from_payload(payload)
     if schema_enum_value_count is not None:
         fields["schema_enum_value_count"] = schema_enum_value_count
     return fields
+
+
+def _safe_message_diagnostics(payload: dict[str, Any]) -> dict[str, object]:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return {}
+    content_chars = 0
+    source_ids: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            content_chars += len(content)
+            _append_source_ids(source_ids, content)
+        elif isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if not isinstance(text, str):
+                    continue
+                content_chars += len(text)
+                _append_source_ids(source_ids, text)
+    diagnostics: dict[str, object] = {
+        "message_count": len(messages),
+        "message_content_chars": content_chars,
+    }
+    if source_ids:
+        diagnostics["source_ids"] = source_ids
+    return diagnostics
+
+
+def _append_source_ids(source_ids: list[str], text: str) -> None:
+    for source_id in _SOURCE_ID_PATTERN.findall(text):
+        if source_id in source_ids:
+            continue
+        source_ids.append(source_id)
+        if len(source_ids) >= _MAX_CAPTURED_SOURCE_IDS:
+            return
 
 
 def _schema_enum_value_count_from_payload(payload: dict[str, Any] | None) -> int | None:

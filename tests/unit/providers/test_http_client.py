@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import threading
@@ -290,7 +291,12 @@ def test_request_json_logs_safe_started_event_before_opening_request(
     events: list[tuple[str, dict[str, object]]] = []
     payload = {
         "model": "payload-model-secret",
-        "messages": [{"role": "user", "content": "body-secret"}],
+        "messages": [
+            {
+                "role": "user",
+                "content": "body-secret [memory:memory-1]",
+            }
+        ],
     }
 
     def capture_log_event(event_name: str, **fields: object) -> None:
@@ -341,9 +347,15 @@ def test_request_json_logs_safe_started_event_before_opening_request(
         "path": "/v1/chat/completions",
         "timeout": 3.5,
         "payload_bytes": len(json.dumps(payload).encode("utf-8")),
+        "payload_sha256": hashlib.sha256(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest(),
         "provider": "openrouter",
         "task": "chat_completion",
         "model": "safe-model-id",
+        "message_count": 1,
+        "message_content_chars": len("body-secret [memory:memory-1]"),
+        "source_ids": ["memory:memory-1"],
     }
     assert "header-secret" not in repr(fields)
     assert "body-secret" not in repr(fields)

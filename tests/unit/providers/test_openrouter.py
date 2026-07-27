@@ -1006,13 +1006,19 @@ def test_openrouter_chat_posts_contextual_completion_and_parses_usage() -> None:
         "Recent: Mara is pressing the silver latch."
     ) in system_body
     assert "Summary:" in system_body
-    assert system_body.index("Current scene recap:") < system_body.index("Summary:")
-    assert system_body.index("Summary:") < system_body.index("Regeneration feedback:")
-    assert "Character voice profiles:" in system_body
-    assert system_body.index("Character voice profiles:") < system_body.index(
-        "Summary:"
+    assert system_body.index("Summary:") < system_body.index(
+        "Current scene recap:"
     )
-    assert system_body.index("Retrieved state:") < system_body.index("Summary:")
+    assert system_body.index("Current scene recap:") < system_body.index(
+        "Regeneration feedback:"
+    )
+    assert "Character voice profiles:" in system_body
+    assert system_body.index("Summary:") < system_body.index(
+        "Character voice profiles:"
+    )
+    assert system_body.index("Character voice profiles:") < system_body.index(
+        "Retrieved state:"
+    )
     assert "location=archive" in system_body
     assert "Archivist Venn voice: soft, precise" in system_body
     assert "Mara distrusts silver locks." in system_body
@@ -1323,17 +1329,17 @@ def test_openrouter_chat_renders_state_change_and_media_asset_sections() -> None
         "Retrieved media assets:\n"
         "- [media_asset:media-1] Image prompt: gold bridge lights"
     ) in system_body
-    assert system_body.index("Retrieved state:") < system_body.index(
-        "Retrieved state changes:"
+    assert system_body.index("Retrieved memories:") < system_body.index(
+        "Retrieved media assets:"
     )
-    assert system_body.index("Retrieved state changes:") < system_body.index(
+    assert system_body.index("Retrieved media assets:") < system_body.index(
         "Retrieved chronicle:"
     )
     assert system_body.index("Retrieved chronicle:") < system_body.index(
-        "Retrieved memories:"
+        "Retrieved state changes:"
     )
-    assert system_body.index("Retrieved memories:") < system_body.index(
-        "Retrieved media assets:"
+    assert system_body.index("Retrieved state changes:") < system_body.index(
+        "Retrieved state:"
     )
 
 
@@ -1669,6 +1675,50 @@ def test_openrouter_structured_output_sends_reasoning_config() -> None:
     }
 
 
+def test_openrouter_structured_output_rejects_local_schema_violation() -> None:
+    transport = RecordingTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                payload={
+                    "choices": [
+                        {"message": {"content": '{"result":17,"extra":true}'}}
+                    ]
+                },
+            )
+        ]
+    )
+    secrets = InMemorySecretStore()
+    secrets.set_api_key("openrouter", "or-secret")
+    client = OpenRouterClient(secret_store=secrets, transport=transport)
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            client.generate_structured_output(
+                StructuredOutputRequest(
+                    provider="openrouter",
+                    model_id="openai/gpt-4o-mini",
+                    messages=(ChatMessage(role="user", body="Extract."),),
+                    schema_name="result_contract",
+                    schema={
+                        "type": "object",
+                        "properties": {"result": {"type": "string"}},
+                        "required": ["result"],
+                        "additionalProperties": False,
+                    },
+                )
+            )
+        )
+
+    assert (
+        exc_info.value.category
+        == ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID
+    )
+    assert exc_info.value.diagnostics["schema_name"] == "result_contract"
+    assert exc_info.value.diagnostics["error_count"] == 2
+    assert len(transport.calls) == 1
+
+
 def test_openrouter_structured_content_preserves_provider_diagnostics() -> None:
     payload = {
         "choices": [
@@ -1760,7 +1810,10 @@ def test_openrouter_structured_output_retries_non_json_success_content(
                     "choices": [
                         {
                             "message": {
-                                "content": '{"state_changes": [], "memories": []}'
+                                "content": (
+                                    '{"state_changes":[],"memories":[],'
+                                    '"metadata":null}'
+                                )
                             }
                         },
                     ],
@@ -1797,7 +1850,11 @@ def test_openrouter_structured_output_retries_non_json_success_content(
         )
     )
 
-    assert response.data == {"state_changes": [], "memories": []}
+    assert response.data == {
+        "state_changes": [],
+        "memories": [],
+        "metadata": None,
+    }
     assert len(transport.calls) == 2
     assert [call["method"] for call in transport.calls] == ["POST", "POST"]
     assert [

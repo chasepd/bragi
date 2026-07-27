@@ -55,6 +55,10 @@ from bragi.providers.retry import (
     call_with_provider_retries,
     retry_metadata_from_provider_error,
 )
+from bragi.providers.structured_output_validation import (
+    StructuredOutputValidationError,
+    validate_structured_output,
+)
 from bragi.providers.tool_calls import (
     parse_tool_call_response,
     tool_definition_payload,
@@ -406,6 +410,18 @@ class OpenRouterClient:
                 category=ProviderErrorCategory.PROVIDER_ERROR,
                 message="Structured provider content must be a JSON object",
             )
+        try:
+            validate_structured_output(
+                data,
+                schema=request.schema,
+                schema_name=request.schema_name,
+            )
+        except StructuredOutputValidationError as exc:
+            raise ProviderError(
+                category=ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID,
+                message=str(exc),
+                diagnostics=exc.diagnostics,
+            ) from exc
         return StructuredOutputResponse(
             data=data,
             provider=self.provider_name,

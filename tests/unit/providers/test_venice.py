@@ -1029,11 +1029,15 @@ def test_venice_chat_renders_current_scene_recap_system_section() -> None:
     assert "Keep responses intimate and concrete." in system_body
     assert "Regeneration feedback:" in system_body
     assert "Lean harder into suspicion." in system_body
-    assert system_body.index("Character voice profiles:") < system_body.index(
-        "Summary:"
+    assert system_body.index("Summary:") < system_body.index(
+        "Character voice profiles:"
     )
-    assert system_body.index("Current scene recap:") < system_body.index("Summary:")
-    assert system_body.index("Summary:") < system_body.index("Regeneration feedback:")
+    assert system_body.index("Character voice profiles:") < system_body.index(
+        "Current scene recap:"
+    )
+    assert system_body.index("Current scene recap:") < system_body.index(
+        "Regeneration feedback:"
+    )
     assert messages[1] == {"role": "user", "content": "I stay seated."}
     assert "response_format" not in transport.calls[0]["payload"]
 
@@ -1149,17 +1153,17 @@ def test_venice_chat_renders_state_change_and_media_asset_context_sections() -> 
         "Retrieved media assets:\n"
         "- [media_asset:media-1] Image prompt: gold bridge lights"
     ) in system_body
-    assert system_body.index("Retrieved state:") < system_body.index(
-        "Retrieved state changes:"
+    assert system_body.index("Retrieved memories:") < system_body.index(
+        "Retrieved media assets:"
     )
-    assert system_body.index("Retrieved state changes:") < system_body.index(
+    assert system_body.index("Retrieved media assets:") < system_body.index(
         "Retrieved chronicle:"
     )
     assert system_body.index("Retrieved chronicle:") < system_body.index(
-        "Retrieved memories:"
+        "Retrieved state changes:"
     )
-    assert system_body.index("Retrieved memories:") < system_body.index(
-        "Retrieved media assets:"
+    assert system_body.index("Retrieved state changes:") < system_body.index(
+        "Retrieved state:"
     )
 
 
@@ -1172,7 +1176,10 @@ def test_venice_structured_output_payload_uses_schema_and_json_hint() -> None:
                     "choices": [
                         {
                             "message": {
-                                "content": '{"state_changes": [], "memories": []}'
+                                "content": (
+                                    '{"state_changes":[],"memories":[],'
+                                    '"metadata":null}'
+                                )
                             }
                         },
                     ],
@@ -1214,7 +1221,11 @@ def test_venice_structured_output_payload_uses_schema_and_json_hint() -> None:
         )
     )
 
-    assert response.data == {"state_changes": [], "memories": []}
+    assert response.data == {
+        "state_changes": [],
+        "memories": [],
+        "metadata": None,
+    }
     payload = transport.calls[0]["payload"]
     assert payload["response_format"] == {
         "type": "json_schema",
@@ -1241,6 +1252,50 @@ def test_venice_structured_output_payload_uses_schema_and_json_hint() -> None:
     assert any(
         "json" in str(message["content"]).casefold() for message in payload["messages"]
     )
+
+
+def test_venice_structured_output_rejects_local_schema_violation() -> None:
+    transport = RecordingTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                payload={
+                    "choices": [
+                        {"message": {"content": '{"result":17,"extra":true}'}}
+                    ]
+                },
+            )
+        ]
+    )
+    secrets = InMemorySecretStore()
+    secrets.set_api_key("venice", "venice-secret")
+    client = VeniceClient(secret_store=secrets, transport=transport)
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            client.generate_structured_output(
+                StructuredOutputRequest(
+                    provider="venice",
+                    model_id="llama-3.2-3b",
+                    messages=(ChatMessage(role="user", body="Extract."),),
+                    schema_name="result_contract",
+                    schema={
+                        "type": "object",
+                        "properties": {"result": {"type": "string"}},
+                        "required": ["result"],
+                        "additionalProperties": False,
+                    },
+                )
+            )
+        )
+
+    assert (
+        exc_info.value.category
+        == ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID
+    )
+    assert exc_info.value.diagnostics["schema_name"] == "result_contract"
+    assert exc_info.value.diagnostics["error_count"] == 2
+    assert len(transport.calls) == 1
 
 
 def test_venice_tool_call_payload_uses_tools_and_preserves_arguments() -> None:

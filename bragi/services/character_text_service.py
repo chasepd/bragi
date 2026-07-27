@@ -39,6 +39,7 @@ from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     CHAT_TURN_DIRECTIVE_PURPOSE_CHARACTER_TEXT,
     ChatMessage,
+    ChatPromptPurpose,
     ChatRequest,
     ChatResponse,
     ProviderClient,
@@ -107,6 +108,7 @@ from bragi.services.phrase_denylist import (
     summarize_phrase_policy_violations,
 )
 from bragi.services.provider_fallbacks import structured_output_with_fallback
+from bragi.services.request_budget import budget_chat_request
 from bragi.services.sexual_content_safety import is_fade_to_black_message
 from bragi.services.text_script_policy import (
     ScriptPolicyViolation,
@@ -1303,6 +1305,7 @@ class CharacterTextService:
             request = ChatRequest(
                 provider=preference.provider,
                 model_id=preference.model_id,
+                prompt_purpose=ChatPromptPurpose.CHARACTER_TEXT,
                 messages=_group_history_chat_messages(
                     save_id=save_id,
                     repositories=self.repositories,
@@ -1644,6 +1647,7 @@ class CharacterTextService:
         request = ChatRequest(
             provider=preference.provider,
             model_id=preference.model_id,
+            prompt_purpose=ChatPromptPurpose.CHARACTER_TEXT,
             messages=history_messages,
             response_style_section=CHARACTER_TEXT_RESPONSE_STYLE_SECTION,
             scenario_instructions="\n\n".join(
@@ -1864,6 +1868,11 @@ class CharacterTextService:
         response: ChatResponse | None = None
         body = ""
         for attempt in range(1, GENERATED_PHRASE_GUARD_MAX_ATTEMPTS + 1):
+            current_request = budget_chat_request(
+                self.repositories,
+                current_request,
+                task="character_text",
+            )
             response = await chat(current_request)
             body = _validated_character_text_response_body(response.body)
             script_violations = _character_text_script_violations(
@@ -2114,6 +2123,7 @@ class CharacterTextService:
         request = ChatRequest(
             provider=preference.provider,
             model_id=preference.model_id,
+            prompt_purpose=ChatPromptPurpose.CHARACTER_TEXT,
             messages=history_messages,
             response_style_section=CHARACTER_TEXT_RESPONSE_STYLE_SECTION,
             scenario_instructions="\n\n".join(
@@ -2818,6 +2828,7 @@ class CharacterTextService:
         request = ChatRequest(
             provider=preference.provider,
             model_id=preference.model_id,
+            prompt_purpose=ChatPromptPurpose.CHARACTER_TEXT,
             messages=history_messages,
             response_style_section=CHARACTER_TEXT_RESPONSE_STYLE_SECTION,
             scenario_instructions="\n\n".join(

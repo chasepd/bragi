@@ -51,7 +51,7 @@ class SummarizationContextNarratorProvider:
                 model_id="fake-context",
                 display_name="Fake Context",
                 capabilities=frozenset({ProviderCapability.STRUCTURED_OUTPUT}),
-                context_window=1024,
+                context_window=8192,
             ),
             ProviderModel(
                 provider=self.provider_name,
@@ -300,7 +300,7 @@ def test_summarization_persists_summary_before_future_narrator_context(
             model_id="fake-context",
             display_name="Fake Context",
             capabilities=["structured_output"],
-            context_window=1024,
+            context_window=8192,
         )
         provider = SummarizationContextNarratorProvider()
         summary_service = SummaryService(

@@ -47,6 +47,10 @@ from bragi.services.provider_diagnostics import (
     record_provider_error,
     record_provider_response,
 )
+from bragi.services.request_budget import (
+    budget_chat_request,
+    budget_structured_output_request,
+)
 
 CHAT_FALLBACK_ENABLED_SETTING = "chat_fallback_enabled"
 STRUCTURED_OUTPUT_FALLBACK_ENABLED_SETTING = (
@@ -111,6 +115,11 @@ async def chat_with_fallback(
     ):
         raise ValueError(f"Chat model is unavailable: {request.model_id}")
     try:
+        request = budget_chat_request(
+            repositories,
+            request,
+            task=task,
+        )
         response = await provider.chat(request)
     except ProviderError as exc:
         _mark_model_unavailable_for_error(
@@ -171,6 +180,11 @@ async def chat_with_fallback(
             task=task,
         )
         try:
+            fallback = budget_chat_request(
+                repositories,
+                fallback,
+                task=task,
+            )
             response = await providers[fallback.provider].chat(fallback)
         except ProviderError as fallback_exc:
             _mark_model_unavailable_for_error(
@@ -244,6 +258,11 @@ async def chat_with_fallback(
         task=task,
     )
     try:
+        fallback = budget_chat_request(
+            repositories,
+            fallback,
+            task=task,
+        )
         response = await providers[fallback.provider].chat(fallback)
     except ProviderError as fallback_exc:
         _mark_model_unavailable_for_error(
@@ -317,6 +336,11 @@ async def structured_output_with_fallback(
     if model_error is not None:
         raise ValueError(model_error)
     try:
+        request = budget_structured_output_request(
+            repositories,
+            request,
+            task=task,
+        )
         response = await provider.generate_structured_output(request)
     except ProviderError as exc:
         _mark_model_unavailable_for_error(
@@ -400,6 +424,11 @@ async def structured_output_with_fallback(
             task=task,
         )
         try:
+            fallback = budget_structured_output_request(
+                repositories,
+                fallback,
+                task=task,
+            )
             response = await structured_fallback_provider.generate_structured_output(
                 fallback
             )
@@ -649,11 +678,18 @@ def structured_output_fallback_request(
     save_id: str | None,
     task: str,
 ) -> StructuredOutputRequest | None:
-    return _fallback_structured_output_request(
+    fallback = _fallback_structured_output_request(
         repositories=repositories,
         providers=providers,
         request=request,
         save_id=save_id,
+        task=task,
+    )
+    if fallback is None:
+        return None
+    return budget_structured_output_request(
+        repositories,
+        fallback,
         task=task,
     )
 
@@ -821,6 +857,7 @@ def _model_supports(
 def _should_try_fallback_for_error(exc: ProviderError) -> bool:
     return exc.category in {
         ProviderErrorCategory.CONTENT_BLOCKED,
+        ProviderErrorCategory.CONTEXT_LIMIT_EXCEEDED,
         ProviderErrorCategory.MODEL_NOT_FOUND,
         ProviderErrorCategory.RATE_LIMITED,
         ProviderErrorCategory.NETWORK_ERROR,
