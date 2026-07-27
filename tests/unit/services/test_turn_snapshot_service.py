@@ -160,6 +160,36 @@ def test_snapshot_validation_bounds_unique_manifest_reference_work(
         )
 
 
+def test_snapshot_validation_rejects_duplicate_row_object_references() -> None:
+    objects: dict[str, dict[str, object]] = {}
+    row_hash = turn_snapshot_module._add_snapshot_object_export(
+        objects,
+        kind="row:messages",
+        value={"id": "message-one"},
+        created_at=None,
+    )
+    manifest_hash = turn_snapshot_module._add_snapshot_object_export(
+        objects,
+        kind="snapshot_manifest",
+        value={
+            "format": turn_snapshot_module.SNAPSHOT_FORMAT,
+            "tables": {
+                "messages": [
+                    {"id": "message-one", "object_hash": row_hash},
+                    {"id": "message-one-copy", "object_hash": row_hash},
+                ]
+            },
+        },
+        created_at=None,
+    )
+
+    with pytest.raises(ValueError, match="Duplicate snapshot row object"):
+        turn_snapshot_module._validate_exported_snapshot_rows(
+            [{"id": "snapshot-one", "root_manifest_hash": manifest_hash}],
+            objects.values(),
+        )
+
+
 def test_snapshot_trigger_key_remapping_is_schema_aware() -> None:
     remapper = turn_snapshot_module._SnapshotRemapper(
         source_save_id="save-old",
@@ -169,6 +199,7 @@ def test_snapshot_trigger_key_remapping_is_schema_aware() -> None:
             "messages": {"message-old": "message-new"},
             "characters": {"character-old": "character-new"},
             "locations": {"location-old": "location-new"},
+            "scenarios": {"scenario-old": "scenario-new"},
             "memories": {"shared-id": "memory-new"},
         },
     )
@@ -222,6 +253,7 @@ def test_snapshot_json_remapping_updates_known_context_and_media_references() ->
             "messages": {"message-old": "message-new"},
             "characters": {"character-old": "character-new"},
             "locations": {"location-old": "location-new"},
+            "scenarios": {"scenario-old": "scenario-new"},
             "context_observations": {"observation-old": "observation-new"},
             "character_text_messages": {"text-old": "text-new"},
             "media_assets": {
@@ -279,6 +311,45 @@ def test_snapshot_json_remapping_updates_known_context_and_media_references() ->
             "metadata_json": json.dumps({"entity_ids": ["location-old"]}),
         },
     )
+    suggestion = remapper.remap_row(
+        "context_update_suggestions",
+        {
+            "id": "suggestion-old",
+            "save_id": "save-old",
+            "proposed_value_json": json.dumps(
+                {
+                    "source_message_id": "message-old",
+                    "source_observation_id": "observation-old",
+                    "location_id": "location-old",
+                }
+            ),
+        },
+    )
+    director_pressure = remapper.remap_row(
+        "world_state",
+        {
+            "id": "pressure-old",
+            "save_id": "save-old",
+            "key": "story.director_pressure",
+            "value_json": json.dumps(
+                {
+                    "escalation_history": [
+                        {"source_message_id": "message-old"}
+                    ]
+                }
+            ),
+        },
+    )
+    scenario_context = remapper.remap_row(
+        "context_sources",
+        {
+            "id": "scenario-context-old",
+            "save_id": "save-old",
+            "source_type": "scenario_section",
+            "source_id": "scenario:scenario-old:section:lore",
+            "metadata_json": json.dumps({"scenario_id": "scenario-old"}),
+        },
+    )
 
     assert context_source["source_id"] == "observation-new"
     assert json.loads(str(context_source["metadata_json"]))["observation_id"] == (
@@ -290,6 +361,17 @@ def test_snapshot_json_remapping_updates_known_context_and_media_references() ->
     assert json.loads(str(location_state["metadata_json"]))["entity_ids"] == [
         "location-new"
     ]
+    assert json.loads(str(suggestion["proposed_value_json"])) == {
+        "source_message_id": "message-new",
+        "source_observation_id": "observation-new",
+        "location_id": "location-new",
+    }
+    assert json.loads(str(director_pressure["value_json"]))[
+        "escalation_history"
+    ] == [{"source_message_id": "message-new"}]
+    assert json.loads(str(scenario_context["metadata_json"]))["scenario_id"] == (
+        "scenario-new"
+    )
     media_metadata = json.loads(str(media["metadata_json"]))
     assert media_metadata == {
         "request_source_message_id": "text-new",
@@ -843,7 +925,10 @@ def test_snapshot_rejects_unknown_context_source_provenance() -> None:
         },
     )
 
-    with pytest.raises(ValueError, match="unknown provenance source"):
+    with pytest.raises(
+        ValueError,
+        match="unknown (?:provenance source|world_state reference)",
+    ):
         remapper.remap_row(
             "context_sources",
             {

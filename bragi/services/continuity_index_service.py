@@ -467,6 +467,10 @@ class ContinuityIndexService:
             }
         fact_type = _memory_fact_type(memory)
         source_message_ids = tuple(_memory_source_message_ids(memory))
+        provenance_mode = _memory_provenance_mode(
+            memory,
+            observations_by_id=observations_by_id,
+        )
         provenance_groups: list[list[str]] = []
         grouped_source_ids: set[str] = set()
         for observation_id in memory.source_observation_ids[
@@ -489,19 +493,24 @@ class ContinuityIndexService:
             ungrouped_source_ids
             and len(provenance_groups) >= MAX_MEMORY_PROVENANCE_GROUPS
         ):
-            provenance_groups = provenance_groups[
-                : MAX_MEMORY_PROVENANCE_GROUPS - 1
-            ]
-            grouped_source_ids = {
-                source_id
-                for group in provenance_groups
-                for source_id in group
-            }
-            ungrouped_source_ids = [
-                source_id
-                for source_id in source_message_ids
-                if source_id not in grouped_source_ids
-            ]
+            if provenance_mode == "all":
+                target_group = next(
+                    (
+                        group
+                        for group in reversed(provenance_groups)
+                        if len(group) + len(ungrouped_source_ids)
+                        <= MAX_MEMORY_PROVENANCE_GROUP_MEMBERS
+                    ),
+                    None,
+                )
+                if target_group is None:
+                    raise ValueError("Memory provenance is too large to index")
+                target_group.extend(ungrouped_source_ids)
+                ungrouped_source_ids = []
+            else:
+                provenance_groups = provenance_groups[
+                    : MAX_MEMORY_PROVENANCE_GROUPS - 1
+                ]
         if ungrouped_source_ids:
             provenance_groups.append(
                 ungrouped_source_ids[:MAX_MEMORY_PROVENANCE_GROUP_MEMBERS]
@@ -531,10 +540,7 @@ class ContinuityIndexService:
             | {
                 "tags": list(memory.tags),
                 "source_provenance_groups": provenance_groups,
-                "source_provenance_mode": _memory_provenance_mode(
-                    memory,
-                    observations_by_id=observations_by_id,
-                ),
+                "source_provenance_mode": provenance_mode,
             },
             token_estimate=_estimate_tokens(memory.body),
         )

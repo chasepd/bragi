@@ -84,6 +84,9 @@ _MAX_BUNDLE_MEDIA_FILE_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_BUNDLE_MEDIA_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_BUNDLE_MANIFEST_JSON_BYTES = 1024 * 1024
 _MAX_BUNDLE_DATA_JSON_BYTES = 128 * 1024 * 1024
+_MAX_BUNDLE_TABLE_ROWS = 50_000
+_MAX_BUNDLE_TOTAL_ROWS = 100_000
+_MAX_BUNDLE_JSON_OBJECTS = 150_000
 _MAX_BUNDLE_JSON_TOTAL_BYTES = (
     _MAX_BUNDLE_MANIFEST_JSON_BYTES + _MAX_BUNDLE_DATA_JSON_BYTES
 )
@@ -3937,6 +3940,18 @@ def _validate_bundle_data(
     manifest: dict[str, object],
     data: dict[str, object],
 ) -> None:
+    total_rows = 0
+    for table_name, value in data.items():
+        if not isinstance(value, list):
+            continue
+        row_count = len(value)
+        if row_count > _MAX_BUNDLE_TABLE_ROWS:
+            raise ChatBundleError(
+                f"Chat bundle table has too many rows: {table_name}"
+            )
+        total_rows += row_count
+        if total_rows > _MAX_BUNDLE_TOTAL_ROWS:
+            raise ChatBundleError("Chat bundle contains too many rows")
     save = _object(data.get("save"), "save")
     scenario = _object(data.get("scenario"), "scenario")
     messages = _list_of_objects(data.get("messages"), "messages")
@@ -4075,7 +4090,19 @@ def _validate_manifest_payload(payload: dict[str, object]) -> None:
 
 
 def _json_object_from_bytes(payload: bytes, name: str) -> dict[str, object]:
-    loaded = json.loads(payload.decode("utf-8"))
+    object_count = 0
+
+    def bounded_object(value: dict[str, object]) -> dict[str, object]:
+        nonlocal object_count
+        object_count += 1
+        if object_count > _MAX_BUNDLE_JSON_OBJECTS:
+            raise ChatBundleError(f"{name} contains too many objects")
+        return value
+
+    loaded = json.loads(
+        payload.decode("utf-8"),
+        object_hook=bounded_object,
+    )
     if not isinstance(loaded, dict):
         raise ChatBundleError(f"{name} must contain a JSON object")
     return cast(dict[str, object], loaded)

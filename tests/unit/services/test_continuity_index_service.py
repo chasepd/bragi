@@ -586,6 +586,13 @@ def test_continuity_index_reserves_provenance_group_for_scalar_source(
     assert isinstance(groups, list)
     assert len(groups) == 64
     assert any(messages[64] in group for group in groups)
+    grouped_message_ids = {
+        message_id
+        for group in groups
+        if isinstance(group, list)
+        for message_id in group
+    }
+    assert set(messages).issubset(grouped_message_ids)
 
 
 def test_continuity_index_world_state_cap_prefers_recent_ties(

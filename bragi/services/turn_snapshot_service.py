@@ -49,8 +49,9 @@ _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS = 64
 _MAX_SNAPSHOT_OBJECT_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
 _MAX_SNAPSHOT_TOTAL_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
 _MAX_IMPORTED_SNAPSHOT_COUNT = 4_096
-_MAX_SNAPSHOT_MANIFEST_ENTRIES = 100_000
-_MAX_SNAPSHOT_IMPORT_REFERENCE_WORK = 250_000
+_MAX_SNAPSHOT_MANIFEST_ENTRIES = 10_000
+_MAX_SNAPSHOT_IMPORT_REFERENCE_WORK = 50_000
+_MAX_SNAPSHOT_IMPORT_REFERENCED_BYTES = 128 * 1024 * 1024
 SNAPSHOT_ENCODING = "zlib-json-v1"
 
 
@@ -728,32 +729,46 @@ class TurnSnapshotService:
     ) -> int:
         snapshots = [dict(row) for row in snapshot_rows]
         objects = [dict(row) for row in object_rows]
-        self.validate_exported_snapshot_rows(
+        decoded_objects_by_hash = _validate_exported_snapshot_rows(
             snapshot_rows=snapshots,
             object_rows=objects,
         )
-        objects_by_hash = {
-            _text(row, "object_hash"): dict(row) for row in objects
-        }
         if not snapshots:
             return 0
-        root_manifest_hashes = {
-            _text(row, "root_manifest_hash") for row in snapshots
+        manifests_by_hash = {
+            root_hash: _required_exported_snapshot_object(
+                decoded_objects_by_hash,
+                root_hash,
+                expected_kind="snapshot_manifest",
+            )
+            for root_hash in {
+                _text(row, "root_manifest_hash") for row in snapshots
+            }
         }
-        source_rows_by_manifest = {
-            root_manifest_hash: _sanitize_snapshot_rows_for_safety(
+        table_signature_by_manifest = {
+            root_hash: _snapshot_manifest_table_signature(manifest)
+            for root_hash, manifest in manifests_by_hash.items()
+            if isinstance(manifest, Mapping)
+        }
+        representative_manifest_by_signature = {
+            signature: root_hash
+            for root_hash, signature in table_signature_by_manifest.items()
+        }
+        source_rows_by_signature = {
+            signature: _sanitize_snapshot_rows_for_safety(
                 self._rows_from_exported_manifest(
-                    objects_by_hash,
+                    decoded_objects_by_hash,
                     root_manifest_hash,
                 ),
                 quarantine_content_ratings=True,
             )
-            for root_manifest_hash in root_manifest_hashes
+            for signature, root_manifest_hash
+            in representative_manifest_by_signature.items()
         }
         remapper = _SnapshotRemapper(
             source_save_id=source_save_id,
             target_save_id=target_save_id,
-            rows_by_table=_merge_rows_by_table(source_rows_by_manifest.values()),
+            rows_by_table=_merge_rows_by_table(source_rows_by_signature.values()),
             id_maps=id_maps,
             message_id_map=message_id_map,
             media_path_map=media_path_map,
@@ -762,40 +777,48 @@ class TurnSnapshotService:
             _text(row, "id"): str(uuid4()) for row in snapshots
         }
         manifest_hash_map: dict[str, str] = {}
+        remapped_tables_by_signature: dict[
+            str,
+            dict[str, list[dict[str, str]]],
+        ] = {}
         for row in snapshots:
             old_manifest_hash = _text(row, "root_manifest_hash")
             if old_manifest_hash in manifest_hash_map:
                 continue
-            rows_by_table = source_rows_by_manifest[old_manifest_hash]
-            manifest_object = _decode_exported_object(
-                objects_by_hash[old_manifest_hash]
-            )
+            signature = table_signature_by_manifest[old_manifest_hash]
+            rows_by_table = source_rows_by_signature[signature]
+            manifest_object = manifests_by_hash[old_manifest_hash]
             if not isinstance(manifest_object, dict):
                 raise ValueError("Snapshot manifest object is not a JSON object")
             manifest = cast(dict[str, object], manifest_object)
-            remapped_tables: dict[str, list[dict[str, str]]] = {}
-            for table_name, rows in rows_by_table.items():
-                remapped_entries: list[dict[str, str]] = []
-                remapped_rows: list[dict[str, object]] = []
-                for row_data in rows:
-                    remapped_row = remapper.remap_row(table_name, row_data)
-                    if table_name == "messages":
-                        remapped_row = _sanitize_snapshot_message_row(remapped_row)
-                    remapped_rows.append(remapped_row)
-                for remapped_row in _coalesce_remapped_snapshot_rows(
-                    table_name,
-                    remapped_rows,
-                ):
-                    remapped_entries.append(
-                        {
-                            "id": str(remapped_row.get("id", "")),
-                            "object_hash": self._store_object(
-                                kind=f"row:{table_name}",
-                                value=remapped_row,
-                            ),
-                        }
-                    )
-                remapped_tables[table_name] = remapped_entries
+            remapped_tables = remapped_tables_by_signature.get(signature)
+            if remapped_tables is None:
+                remapped_tables = {}
+                for table_name, rows in rows_by_table.items():
+                    remapped_entries: list[dict[str, str]] = []
+                    remapped_rows: list[dict[str, object]] = []
+                    for row_data in rows:
+                        remapped_row = remapper.remap_row(table_name, row_data)
+                        if table_name == "messages":
+                            remapped_row = _sanitize_snapshot_message_row(
+                                remapped_row
+                            )
+                        remapped_rows.append(remapped_row)
+                    for remapped_row in _coalesce_remapped_snapshot_rows(
+                        table_name,
+                        remapped_rows,
+                    ):
+                        remapped_entries.append(
+                            {
+                                "id": str(remapped_row.get("id", "")),
+                                "object_hash": self._store_object(
+                                    kind=f"row:{table_name}",
+                                    value=remapped_row,
+                                ),
+                            }
+                        )
+                    remapped_tables[table_name] = remapped_entries
+                remapped_tables_by_signature[signature] = remapped_tables
             raw_active_message_ids = manifest.get("active_message_ids", [])
             if not isinstance(raw_active_message_ids, list):
                 raw_active_message_ids = []
@@ -1197,10 +1220,14 @@ class TurnSnapshotService:
 
     def _rows_from_exported_manifest(
         self,
-        objects_by_hash: Mapping[str, Mapping[str, object]],
+        objects_by_hash: Mapping[str, tuple[str, object]],
         manifest_hash: str,
     ) -> dict[str, tuple[dict[str, object], ...]]:
-        manifest_object = _decode_exported_object(objects_by_hash[manifest_hash])
+        manifest_object = _required_exported_snapshot_object(
+            objects_by_hash,
+            manifest_hash,
+            expected_kind="snapshot_manifest",
+        )
         if not isinstance(manifest_object, Mapping):
             raise ValueError("Snapshot manifest object is not a JSON object")
         manifest = cast(Mapping[str, object], manifest_object)
@@ -1208,8 +1235,10 @@ class TurnSnapshotService:
         for table_name, entries in _manifest_tables(manifest).items():
             rows: list[dict[str, object]] = []
             for entry in entries:
-                value = _decode_exported_object(
-                    objects_by_hash[_text(entry, "object_hash")]
+                value = _required_exported_snapshot_object(
+                    objects_by_hash,
+                    _text(entry, "object_hash"),
+                    expected_kind=f"row:{table_name}",
                 )
                 if isinstance(value, dict):
                     rows.append(cast(dict[str, object], value))
@@ -1445,7 +1474,10 @@ class _SnapshotRemapper:
                 remapped[column] = self._mapped_message_id(value)
             elif column in _TABLE_REFERENCE_COLUMNS.get(table_name, {}):
                 target_table = _TABLE_REFERENCE_COLUMNS[table_name][column]
-                remapped[column] = self._mapped_table_id(target_table, value)
+                remapped[column] = self._required_mapped_table_id(
+                    target_table,
+                    value,
+                )
             elif table_name == "media_assets" and column in {"path", "thumbnail_path"}:
                 remapped[column] = self._mapped_media_path(
                     row.get("id"),
@@ -1515,7 +1547,7 @@ class _SnapshotRemapper:
 
     def _mapped_message_id(self, value: object) -> object:
         if isinstance(value, str):
-            return self.id_maps["messages"].get(value, value)
+            return self._required_mapped_table_id("messages", value)
         return value
 
     def _mapped_table_id(self, table_name: str, value: object) -> object:
@@ -1523,13 +1555,27 @@ class _SnapshotRemapper:
             return value
         return self.id_maps.get(table_name, {}).get(value, value)
 
+    def _required_mapped_table_id(
+        self,
+        table_name: str,
+        value: object,
+    ) -> object:
+        if not isinstance(value, str):
+            return value
+        mapped = self.id_maps.get(table_name, {}).get(value)
+        if mapped is None:
+            raise ValueError(
+                f"Snapshot has unknown {table_name} reference: {value}"
+            )
+        return mapped
+
     def _mapped_entity_id(self, entity_type: str | None, value: object) -> object:
         if not isinstance(value, str) or entity_type is None:
             return value
         table_name = _ENTITY_TABLES.get(entity_type)
         if table_name is None:
-            return self.id_maps["messages"].get(value, value)
-        return self._mapped_table_id(table_name, value)
+            return value
+        return self._required_mapped_table_id(table_name, value)
 
     def _mapped_context_source_id(
         self,
@@ -1544,7 +1590,10 @@ class _SnapshotRemapper:
             "character_text_thread": "character_text_threads",
         }
         if source_type in direct_tables:
-            return self._mapped_table_id(direct_tables[source_type], value)
+            return self._required_mapped_table_id(
+                direct_tables[source_type],
+                value,
+            )
         if source_type == "scenario_section":
             match = re.fullmatch(r"scenario:([^:]+):section:(.+)", value)
             if match is None:
@@ -1552,9 +1601,10 @@ class _SnapshotRemapper:
             scenario_id = self._mapped_table_id("scenarios", match.group(1))
             return f"scenario:{scenario_id}:section:{match.group(2)}"
         if source_type == "world_state" and value.startswith("location:"):
+            location_id = value.removeprefix("location:")
             return (
                 "location:"
-                f"{self._mapped_table_id('locations', value.removeprefix('location:'))}"
+                f"{self._required_mapped_table_id('locations', location_id)}"
             )
         if source_type == "memory":
             mapped_memory_id = self._mapped_table_id("memories", value)
@@ -1564,12 +1614,12 @@ class _SnapshotRemapper:
                 character_id = value.removeprefix("character_profile:")
                 return (
                     "character_profile:"
-                    f"{self._mapped_table_id('characters', character_id)}"
+                    f"{self._required_mapped_table_id('characters', character_id)}"
                 )
             match = re.fullmatch(r"relationship:([^:]+):(.+)", value)
             if match is not None:
                 character_id = str(
-                    self._mapped_table_id(
+                    self._required_mapped_table_id(
                         "characters",
                         match.group(1),
                     )
@@ -1607,6 +1657,17 @@ class _SnapshotRemapper:
             return _compact_json(self._remap_related_entities(raw))
         if table_name == "locations" and column == "connections_json":
             return _compact_json(self._remap_id_list(raw, "locations"))
+        if (
+            table_name == "world_state"
+            and column == "value_json"
+            and row.get("key") == "story.director_pressure"
+        ):
+            return _compact_json(self._remap_director_pressure_value(raw))
+        if (
+            table_name == "context_update_suggestions"
+            and column == "proposed_value_json"
+        ):
+            return _compact_json(self._remap_suggestion_value(raw))
         if column == "source_message_ids_json":
             return _compact_json(self._remap_source_ref_list(raw))
         if table_name == "context_sources" and column == "metadata_json":
@@ -1634,9 +1695,70 @@ class _SnapshotRemapper:
         if not isinstance(raw, list):
             return raw
         return [
-            self._mapped_table_id(table_name, item) if isinstance(item, str) else item
+            self._required_mapped_table_id(table_name, item)
+            if isinstance(item, str)
+            else item
             for item in raw
         ]
+
+    def _remap_director_pressure_value(self, raw: object) -> object:
+        if not isinstance(raw, dict):
+            return raw
+        remapped = dict(raw)
+        history = raw.get("escalation_history")
+        if not isinstance(history, list):
+            return remapped
+        remapped_history: list[object] = []
+        for item in history:
+            if not isinstance(item, dict):
+                remapped_history.append(item)
+                continue
+            entry = dict(item)
+            source_message_id = entry.get("source_message_id")
+            if isinstance(source_message_id, str) and source_message_id:
+                entry["source_message_id"] = self._required_mapped_table_id(
+                    "messages",
+                    source_message_id,
+                )
+            remapped_history.append(entry)
+        remapped["escalation_history"] = remapped_history
+        return remapped
+
+    def _remap_suggestion_value(self, raw: object) -> object:
+        if not isinstance(raw, dict):
+            return raw
+        remapped = dict(raw)
+        source_message_id = raw.get("source_message_id")
+        if isinstance(source_message_id, str) and source_message_id:
+            remapped["source_message_id"] = self._required_mapped_table_id(
+                "messages",
+                source_message_id,
+            )
+        source_message_ids = raw.get("source_message_ids")
+        if isinstance(source_message_ids, list):
+            remapped["source_message_ids"] = self._remap_source_ref_list(
+                source_message_ids
+            )
+        for field in ("source_observation_id",):
+            value = raw.get(field)
+            if isinstance(value, str) and value:
+                remapped[field] = self._required_mapped_table_id(
+                    "context_observations",
+                    value,
+                )
+        source_observation_ids = raw.get("source_observation_ids")
+        if isinstance(source_observation_ids, list):
+            remapped["source_observation_ids"] = self._remap_id_list(
+                source_observation_ids,
+                "context_observations",
+            )
+        location_id = raw.get("location_id")
+        if isinstance(location_id, str) and location_id:
+            remapped["location_id"] = self._required_mapped_table_id(
+                "locations",
+                location_id,
+            )
+        return remapped
 
     def _remap_related_entities(self, raw: object) -> object:
         if not isinstance(raw, list):
@@ -1763,7 +1885,7 @@ class _SnapshotRemapper:
             ]
         thread_id = raw.get("thread_id")
         if isinstance(thread_id, str) and source_type == "character_text_thread":
-            remapped["thread_id"] = self._mapped_table_id(
+            remapped["thread_id"] = self._required_mapped_table_id(
                 "character_text_threads",
                 thread_id,
             )
@@ -1772,6 +1894,12 @@ class _SnapshotRemapper:
             remapped["observation_id"] = self._mapped_table_id(
                 "context_observations",
                 observation_id,
+            )
+        scenario_id = raw.get("scenario_id")
+        if isinstance(scenario_id, str):
+            remapped["scenario_id"] = self._mapped_table_id(
+                "scenarios",
+                scenario_id,
             )
         return remapped
 
@@ -1783,13 +1911,13 @@ class _SnapshotRemapper:
     ) -> object:
         if source_type == "memory" and isinstance(source_id, str):
             if source_id.startswith(("character_profile:", "relationship:")):
-                return self._mapped_table_id("characters", value)
+                return self._required_mapped_table_id("characters", value)
         if (
             source_type == "world_state"
             and isinstance(source_id, str)
             and source_id.startswith("location:")
         ):
-            return self._mapped_table_id("locations", value)
+            return self._required_mapped_table_id("locations", value)
         direct_tables = {
             "character_voice": "characters",
             "open_obligation": "active_threads",
@@ -1797,7 +1925,7 @@ class _SnapshotRemapper:
         }
         table_name = direct_tables.get(source_type)
         if table_name is not None:
-            return self._mapped_table_id(table_name, value)
+            return self._required_mapped_table_id(table_name, value)
         return self._mapped_context_source_id(source_type, value)
 
     def _remap_known_metadata_ids(self, value: object) -> object:
@@ -1825,13 +1953,26 @@ class _SnapshotRemapper:
                 table_name = id_fields.get(key)
                 list_table_name = id_list_fields.get(key)
                 if key == "request_source_message_id":
-                    mapped_message_id = self._mapped_table_id("messages", item)
-                    remapped[key] = self._mapped_table_id(
-                        "character_text_messages",
-                        mapped_message_id,
-                    )
+                    if isinstance(item, str):
+                        mapped_message_id = self.id_maps.get("messages", {}).get(item)
+                        mapped_text_message_id = self.id_maps.get(
+                            "character_text_messages",
+                            {},
+                        ).get(item)
+                        mapped = mapped_message_id or mapped_text_message_id
+                        if mapped is None:
+                            raise ValueError(
+                                "Snapshot has unknown request source message "
+                                f"reference: {item}"
+                            )
+                        remapped[key] = mapped
+                    else:
+                        remapped[key] = item
                 elif table_name is not None:
-                    remapped[key] = self._mapped_table_id(table_name, item)
+                    remapped[key] = self._required_mapped_table_id(
+                        table_name,
+                        item,
+                    )
                 elif list_table_name is not None:
                     remapped[key] = self._remap_id_list(item, list_table_name)
                 else:
@@ -2769,7 +2910,7 @@ def _decode_exported_snapshot_object(row: Mapping[str, object]) -> tuple[str, ob
 def _validate_exported_snapshot_rows(
     snapshot_rows: Iterable[Mapping[str, object]],
     object_rows: Iterable[Mapping[str, object]],
-) -> None:
+) -> dict[str, tuple[str, object]]:
     snapshots = [dict(row) for row in snapshot_rows]
     if len(snapshots) > _MAX_IMPORTED_SNAPSHOT_COUNT:
         raise ValueError("Snapshot bundle contains too many snapshots")
@@ -2782,6 +2923,7 @@ def _validate_exported_snapshot_rows(
         _text(row, "root_manifest_hash")
 
     objects_by_hash: dict[str, tuple[str, object]] = {}
+    object_sizes_by_hash: dict[str, int] = {}
     total_uncompressed_size = 0
     for object_row in object_rows:
         object_hash = _text(object_row, "object_hash")
@@ -2794,8 +2936,11 @@ def _validate_exported_snapshot_rows(
         if total_uncompressed_size > _MAX_SNAPSHOT_TOTAL_UNCOMPRESSED_BYTES:
             raise ValueError("Snapshot objects are too large")
         objects_by_hash[object_hash] = _decode_exported_snapshot_object(object_row)
+        object_sizes_by_hash[object_hash] = declared_size
 
     total_manifest_entries = 0
+    total_referenced_bytes = 0
+    validated_table_signatures: set[str] = set()
     root_hashes = {
         _text(row, "root_manifest_hash") for row in snapshots
     }
@@ -2813,7 +2958,12 @@ def _validate_exported_snapshot_rows(
         raw_tables = manifest.get("tables")
         if not isinstance(raw_tables, Mapping):
             raise ValueError(f"Snapshot manifest is missing table entries: {root_hash}")
+        table_signature = _snapshot_manifest_table_signature(manifest)
+        if table_signature in validated_table_signatures:
+            continue
+        validated_table_signatures.add(table_signature)
         manifest_entry_count = 0
+        seen_row_object_hashes: set[str] = set()
         for table_name, entries in raw_tables.items():
             if table_name not in _TABLES_BY_NAME:
                 raise ValueError(f"Unknown snapshot table in manifest: {table_name}")
@@ -2829,6 +2979,19 @@ def _validate_exported_snapshot_rows(
                 if not isinstance(entry, Mapping):
                     raise ValueError(f"Snapshot table entry is invalid: {table_name}")
                 object_hash = _text(entry, "object_hash")
+                if object_hash in seen_row_object_hashes:
+                    raise ValueError(
+                        f"Duplicate snapshot row object reference: {object_hash}"
+                    )
+                seen_row_object_hashes.add(object_hash)
+                total_referenced_bytes += object_sizes_by_hash.get(object_hash, 0)
+                if (
+                    total_referenced_bytes
+                    > _MAX_SNAPSHOT_IMPORT_REFERENCED_BYTES
+                ):
+                    raise ValueError(
+                        "Snapshot manifests reference too much row data"
+                    )
                 value = _required_exported_snapshot_object(
                     objects_by_hash,
                     object_hash,
@@ -2838,6 +3001,13 @@ def _validate_exported_snapshot_rows(
                     raise ValueError(
                         f"Snapshot row object is not a row: {object_hash}"
                     )
+    return objects_by_hash
+
+
+def _snapshot_manifest_table_signature(manifest: Mapping[str, object]) -> str:
+    return sha256(
+        _canonical_json_bytes(manifest.get("tables", {}))
+    ).hexdigest()
 
 
 def _required_exported_snapshot_object(

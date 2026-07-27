@@ -4563,6 +4563,39 @@ def test_repositories_filters_exact_identifier_candidates_before_udf(
     assert calls == 0
 
 
+def test_repositories_indexes_exact_identifier_at_source_tail(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    target = repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-tail-code",
+        title="Archive codes",
+        body=(
+            " ".join(f"ARCHIVE-{index:03d}" for index in range(129))
+            + " TARGET-9999"
+        ),
+    )
+    repositories.upsert_context_source(
+        save_id=save_id,
+        source_type="memory",
+        source_id="memory-split-code",
+        title="Nearby split code",
+        body="TARGET 9999 is written without the separator.",
+    )
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms={"target", "9999"},
+        source_types={"memory"},
+        limit=1,
+        exact_identifiers=("TARGET-9999",),
+    )
+
+    assert [hit.record for hit in hits] == [target]
+
+
 def test_repositories_bounds_index_rebuild_before_writing(
     repositories: PersistenceRepositories,
     monkeypatch: pytest.MonkeyPatch,

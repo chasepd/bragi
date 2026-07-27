@@ -24,7 +24,8 @@ CURRENT_SCHEMA_VERSION = 72
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 128
-_MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 250_000
+_MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 500_000
+_MAX_CONTEXT_INDEX_TEXT_CHARS_PER_REBUILD = 32 * 1024 * 1024
 _MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
 _MAX_MEMORY_PROVENANCE_IDS = 64
 
@@ -1047,6 +1048,17 @@ def _ensure_context_observation_curation_schema(
         );
         """,
     )
+    total_text_chars = int(
+        connection.execute(
+            """
+            SELECT COALESCE(SUM(LENGTH(title) + LENGTH(body)), 0)
+            FROM context_sources
+            WHERE archived_at IS NULL
+            """
+        ).fetchone()[0]
+    )
+    if total_text_chars > _MAX_CONTEXT_INDEX_TEXT_CHARS_PER_REBUILD:
+        raise RuntimeError("Context source text is too large to index")
     connection.execute(
         """
         INSERT OR IGNORE INTO context_observation_curation_state(
@@ -4404,7 +4416,7 @@ def _migration_context_source_exact_identifiers(
     title: str,
     body: str,
 ) -> tuple[str, ...]:
-    return tuple(
+    identifiers = tuple(
         dict.fromkeys(
             (
                 *structured_identifiers(
@@ -4417,7 +4429,14 @@ def _migration_context_source_exact_identifiers(
                 ),
             )
         )
-    )[:_MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS]
+    )
+    if len(identifiers) <= _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS:
+        return identifiers
+    edge_count = _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS // 2
+    return (
+        *identifiers[:edge_count],
+        *identifiers[-edge_count:],
+    )
 
 
 def _ensure_message_context_revision_schema(connection: sqlite3.Connection) -> None:

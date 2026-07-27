@@ -630,9 +630,17 @@ class CharacterTextRevisionService:
         value: dict[str, object] | None,
     ) -> None:
         if target_type == "active_thread":
-            self._apply_reconciled_active_thread(target_id=target_id, value=value)
+            self._apply_reconciled_active_thread(
+                save_id=save_id,
+                target_id=target_id,
+                value=value,
+            )
         elif target_type == "character":
-            self._apply_reconciled_character(target_id=target_id, value=value)
+            self._apply_reconciled_character(
+                save_id=save_id,
+                target_id=target_id,
+                value=value,
+            )
         elif target_type == "dating_route_state":
             self._apply_reconciled_route(
                 save_id=save_id,
@@ -649,9 +657,16 @@ class CharacterTextRevisionService:
     def _apply_reconciled_active_thread(
         self,
         *,
+        save_id: str,
         target_id: str,
         value: dict[str, object] | None,
     ) -> None:
+        owner_row = self.repositories.connection.execute(
+            "SELECT save_id FROM active_threads WHERE id = ?",
+            (target_id,),
+        ).fetchone()
+        if owner_row is None or str(owner_row["save_id"]) != save_id:
+            return
         if value is None:
             self.repositories.archive_active_thread(target_id)
             return
@@ -678,13 +693,14 @@ class CharacterTextRevisionService:
     def _apply_reconciled_character(
         self,
         *,
+        save_id: str,
         target_id: str,
         value: dict[str, object] | None,
     ) -> None:
         if value is None:
             return
         character = self.repositories.get_character(target_id)
-        if character is None:
+        if character is None or character.save_id != save_id:
             return
         self.repositories.update_character(
             replace(

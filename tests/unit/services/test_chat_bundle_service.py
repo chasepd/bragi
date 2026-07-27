@@ -17,6 +17,7 @@ from bragi.persistence.repositories import (
     PersistenceRepositories,
     canonical_claim_fingerprint,
 )
+from bragi.services import chat_bundle_service as chat_bundle_module
 from bragi.services.chat_bundle_service import (
     _coalesce_import_context_sources,
     _coalesce_import_entity_links,
@@ -148,6 +149,36 @@ def test_legacy_import_rows_coalesce_after_memory_id_remapping() -> None:
         "message-one",
         "message-two",
     ]
+
+
+def test_bundle_validation_rejects_table_row_bomb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(chat_bundle_module, "_MAX_BUNDLE_TABLE_ROWS", 1)
+
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="table has too many rows",
+    ):
+        chat_bundle_module._validate_bundle_data(
+            {},
+            {"message_action_choices": [{}, {}]},
+        )
+
+
+def test_bundle_json_decode_stops_at_object_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(chat_bundle_module, "_MAX_BUNDLE_JSON_OBJECTS", 1)
+
+    with pytest.raises(
+        chat_bundle_module.ChatBundleError,
+        match="contains too many objects",
+    ):
+        chat_bundle_module._json_object_from_bytes(
+            b'{"rows":[{},{}]}',
+            "data.json",
+        )
 
 
 def test_import_context_sources_keep_legacy_provenance_alternatives() -> None:

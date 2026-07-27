@@ -107,7 +107,8 @@ MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 MAX_CONTEXT_SOURCE_INDEX_TERMS = 256
 MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 128
-MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 250_000
+MAX_CONTEXT_INDEX_ROWS_PER_REBUILD = 500_000
+MAX_CONTEXT_INDEX_TEXT_CHARS_PER_REBUILD = 32 * 1024 * 1024
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
@@ -3457,30 +3458,52 @@ class PersistenceRepositories:
         )
 
     def rebuild_context_source_search_terms(self, save_id: str) -> None:
-        rows = self.list_context_sources(save_id)
-        prepared_indexes: list[
-            tuple[ContextSourceRecord, tuple[str, ...], tuple[str, ...]]
-        ] = []
-        for record in rows:
-            terms = _context_source_search_terms(record.title, record.body)
-            identifiers = _context_source_exact_identifiers(
-                record.title,
-                record.body,
-            )
-            prepared_indexes.append((record, terms, identifiers))
-        indexed_rows = sum(
-            len(terms) + max(1, len(identifiers))
-            for _record, terms, identifiers in prepared_indexes
+        total_text_chars = int(
+            self.connection.execute(
+                """
+                SELECT COALESCE(SUM(LENGTH(title) + LENGTH(body)), 0)
+                FROM context_sources
+                WHERE save_id = ? AND archived_at IS NULL
+                """,
+                (save_id,),
+            ).fetchone()[0]
         )
-        if indexed_rows > MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
-            raise ValueError("Context source index is too large to rebuild")
-        for record, terms, identifiers in prepared_indexes:
-            self._replace_context_source_search_terms(
-                record,
-                terms=terms,
-                identifiers=identifiers,
+        if total_text_chars > MAX_CONTEXT_INDEX_TEXT_CHARS_PER_REBUILD:
+            raise ValueError("Context source text is too large to index")
+        self.begin_transaction()
+        try:
+            indexed_rows = 0
+            rows = self.connection.execute(
+                """
+                SELECT id, save_id, source_type, source_id, title, body,
+                       metadata_json, token_estimate, scene_snapshot_id,
+                       scene_generation, created_turn_number,
+                       expires_after_turn_number
+                FROM context_sources
+                WHERE save_id = ? AND archived_at IS NULL
+                ORDER BY rowid
+                """,
+                (save_id,),
             )
-        self.commit()
+            for row in rows:
+                record = _context_source_from_row(row)
+                terms = _context_source_search_terms(record.title, record.body)
+                identifiers = _context_source_exact_identifiers(
+                    record.title,
+                    record.body,
+                )
+                indexed_rows += len(terms) + max(1, len(identifiers))
+                if indexed_rows > MAX_CONTEXT_INDEX_ROWS_PER_REBUILD:
+                    raise ValueError("Context source index is too large to rebuild")
+                self._replace_context_source_search_terms(
+                    record,
+                    terms=terms,
+                    identifiers=identifiers,
+                )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
 
     def get_context_source(self, context_source_id: str) -> ContextSourceRecord | None:
         row = self._fetch_one(
@@ -13408,7 +13431,7 @@ def _context_source_exact_identifiers(
     title: str,
     body: str,
 ) -> tuple[str, ...]:
-    return tuple(
+    identifiers = tuple(
         dict.fromkeys(
             (
                 *structured_identifiers(
@@ -13421,7 +13444,14 @@ def _context_source_exact_identifiers(
                 ),
             )
         )
-    )[:MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS]
+    )
+    if len(identifiers) <= MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS:
+        return identifiers
+    edge_count = MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS // 2
+    return (
+        *identifiers[:edge_count],
+        *identifiers[-edge_count:],
+    )
 
 
 def _validate_context_source_provenance_metadata(

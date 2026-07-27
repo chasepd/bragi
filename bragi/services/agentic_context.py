@@ -2366,18 +2366,7 @@ def _source_context_for_evidence_quote(
         return source_body
     quote_end = quote_start + len(evidence_quote)
     context_start = max(0, quote_start - 240)
-    preceding_boundaries = (
-        source_body.rfind(separator, context_start, quote_start)
-        for separator in (".", "!", "?", "\n")
-    )
-    preceding_boundary = max(preceding_boundaries, default=-1)
-    if preceding_boundary >= context_start:
-        context_start = preceding_boundary + 1
     context_end = min(len(source_body), quote_end + 240)
-    for separator in (".", "!", "?", "\n"):
-        separator_index = source_body.find(separator, quote_end)
-        if separator_index >= 0:
-            context_end = min(context_end, separator_index + 1)
     return source_body[context_start:context_end]
 
 
@@ -3916,10 +3905,15 @@ def _grounding_context_preserves_claim_boundary(
     claim: str,
     context: str,
 ) -> bool:
+    if "~~" in context:
+        return False
     if any(
         (
             "QUESTION" in unicodedata.name(character, "")
             or "INTERROBANG" in unicodedata.name(character, "")
+            or "NOT SIGN" in unicodedata.name(character, "")
+            or "NEGATION" in unicodedata.name(character, "")
+            or "CROSS MARK" in unicodedata.name(character, "")
         )
         for character in context
     ):
