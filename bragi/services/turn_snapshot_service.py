@@ -3046,6 +3046,7 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
             typed = cast(dict[str, object], loaded)
             loaded_metadata.append(typed)
             metadata.update(typed)
+    provenance_overflow = False
     for field in (
         "source_message_ids",
         "audience_character_ids",
@@ -3067,10 +3068,67 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
             field == "source_message_ids"
             and len(merged_values) > _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS
         ):
-            raise ValueError("Merged snapshot provenance is too large")
+            provenance_overflow = True
         metadata[field] = merged_values
+    groups = _snapshot_context_source_provenance_groups(loaded_metadata)
+    if (
+        len(groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS
+        or any(
+            len(group) > _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS
+            for group in groups
+        )
+    ):
+        provenance_overflow = True
+    provenance_metadata = loaded_metadata
+    if provenance_overflow:
+        provenance_metadata = loaded_metadata[:1]
+        first_metadata = provenance_metadata[0] if provenance_metadata else {}
+        raw_source_ids = first_metadata.get("source_message_ids")
+        source_ids = (
+            [
+                str(value)
+                for value in raw_source_ids
+                if isinstance(value, str) and value
+            ]
+            if isinstance(raw_source_ids, list)
+            else []
+        )
+        groups = _snapshot_context_source_provenance_groups(provenance_metadata)
+        if (
+            len(source_ids) > _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS
+            or len(groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS
+            or any(
+                len(group) > _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS
+                for group in groups
+            )
+        ):
+            raise ValueError("Snapshot provenance is too large")
+        metadata["source_message_ids"] = source_ids
+        for field in ("source_message_id", "last_seen_message_id"):
+            value = first_metadata.get(field)
+            if isinstance(value, str) and value:
+                metadata[field] = value
+            else:
+                metadata.pop(field, None)
+    metadata["source_provenance_groups"] = groups
+    metadata["source_provenance_mode"] = (
+        "all"
+        if any(
+            item.get("source_provenance_mode") == "all"
+            for item in provenance_metadata
+        )
+        else "any"
+    )
+    if any(item.get("requires_audience") is True for item in loaded_metadata):
+        metadata["requires_audience"] = True
+    return _compact_json(metadata)
+
+
+def _snapshot_context_source_provenance_groups(
+    metadata_items: Iterable[Mapping[str, object]],
+) -> list[list[str]]:
     groups: list[list[str]] = []
-    for item in loaded_metadata:
+    for item in metadata_items:
         raw_groups = item.get("source_provenance_groups")
         item_groups: list[list[str]] = []
         if isinstance(raw_groups, list):
@@ -3113,20 +3171,7 @@ def _merged_context_source_metadata_json(first: object, second: object) -> str:
         for group in item_groups:
             if group not in groups:
                 groups.append(group)
-        if len(groups) > _MAX_SNAPSHOT_PROVENANCE_GROUPS:
-            raise ValueError("Merged snapshot provenance is too large")
-    metadata["source_provenance_groups"] = groups
-    metadata["source_provenance_mode"] = (
-        "all"
-        if any(
-            item.get("source_provenance_mode") == "all"
-            for item in loaded_metadata
-        )
-        else "any"
-    )
-    if any(item.get("requires_audience") is True for item in loaded_metadata):
-        metadata["requires_audience"] = True
-    return _compact_json(metadata)
+    return groups
 
 
 def _merge_snapshot_knowledge_edge_rows(

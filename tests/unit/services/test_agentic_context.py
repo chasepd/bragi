@@ -619,6 +619,26 @@ def test_persisted_observation_revalidation_rejects_subject_prefix() -> None:
             "Mara has the red key.",
         ),
         (
+            "Mara has the red key, and this remains unconfirmed.",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "Mara has the red key, while this remains unverified.",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "Mara has the red key, and that is merely speculation.",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
+            "Mara has the red key, and Lio doubts it.",
+            "Mara has the red key",
+            "Mara has the red key.",
+        ),
+        (
             "Mara has the red key?",
             "Mara has the red key",
             "Mara has the red key.",
@@ -2125,6 +2145,11 @@ def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
 ) -> None:
     save = _seed_save(repositories)
     player_message = repositories.list_messages(save.id)[0]
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="Keep it grounded while I climb toward the beacon lens.",
+    )
     lio = repositories.add_character(save_id=save.id, name="Lio", met=True)
     repositories.add_character(save_id=save.id, name="Mara", met=True)
     repositories.add_character(save_id=save.id, name="Mara", met=True)
@@ -2797,7 +2822,7 @@ def _seed_save(repositories: PersistenceRepositories) -> SaveRecord:
         save_id=save.id,
         role="player",
         speaker_name="Mara",
-        body="Keep it grounded while I climb toward the beacon lens.",
+        body="Keep it grounded.",
     )
     repositories.append_message(
         save_id=save.id,
@@ -2823,8 +2848,8 @@ def test_context_curation_binds_scene_scratch_to_scene_and_turn_ttl(
     observation = repositories.add_context_observation(
         save_id=save.id,
         observation_type="scene_detail",
-        claim="The lens flashes red.",
-        evidence_quote="lens flashes red",
+        claim="The lens flashes red and shows riders in the ash.",
+        evidence_quote="The lens flashes red and shows riders in the ash",
         source_message_ids=[narrator.id],
         scope="scene",
         confidence=0.82,
@@ -2841,7 +2866,9 @@ def test_context_curation_binds_scene_scratch_to_scene_and_turn_ttl(
                         "confidence": 0.81,
                         "memory_body": "",
                         "context_title": "Flashing lens",
-                        "context_body": "The lens flashes red.",
+                        "context_body": (
+                            "The lens flashes red and shows riders in the ash."
+                        ),
                         "tags": ["beacon"],
                     }
                 ]

@@ -3920,40 +3920,7 @@ def _grounding_context_preserves_claim_boundary(
         return False
     claim_terms = _ordered_grounding_terms(claim)
     context_terms = _ordered_grounding_terms(context)
-    if not claim_terms:
-        return False
-    if context_terms[: len(claim_terms)] != claim_terms:
-        return False
-    context_tokens = re.findall(
-        r"[^\W_]+",
-        context.casefold(),
-        flags=re.UNICODE,
-    )
-    significant_indexes = [
-        index
-        for index, term in enumerate(context_tokens)
-        if term not in _GROUNDING_IGNORED_TERMS
-    ]
-    if len(significant_indexes) < len(claim_terms):
-        return False
-    suffix_terms = context_tokens[
-        significant_indexes[len(claim_terms) - 1] + 1 :
-    ]
-    if not suffix_terms:
-        return True
-    if suffix_terms[0] not in {"and", "while"}:
-        return False
-    unsafe_suffix_terms = {
-        "believe",
-        "believed",
-        "believes",
-        "honest",
-        "if",
-        "or",
-        "supposedly",
-        "unless",
-    }
-    return not bool(set(suffix_terms) & unsafe_suffix_terms)
+    return bool(claim_terms) and context_terms == claim_terms
 
 
 def _grounding_anchor_conflicts(proposed: str, observation_claim: str) -> bool:

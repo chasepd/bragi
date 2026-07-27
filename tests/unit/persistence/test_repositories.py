@@ -4486,6 +4486,13 @@ def test_repositories_exact_identifier_cannot_be_starved_by_split_matches(
             title=f"Split tokens {index:02d}",
             body=f"A 7 appears in newer record {index:02d}.",
         )
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id=f"memory-a7-longer-{index:02d}",
+            title=f"Longer identifier {index:02d}",
+            body=f"Only A-7.{index:02d} opens the newer vault.",
+        )
     repositories.upsert_context_source(
         save_id=save_id,
         source_type="memory",
@@ -4503,6 +4510,46 @@ def test_repositories_exact_identifier_cannot_be_starved_by_split_matches(
     )
 
     assert [hit.record for hit in hits] == [target]
+
+
+def test_repositories_filters_exact_identifier_candidates_before_udf(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    for index in range(50):
+        repositories.upsert_context_source(
+            save_id=save_id,
+            source_type="memory",
+            source_id=f"memory-hidden-{index:02d}",
+            title=f"Hidden split code {index:02d}",
+            body="A 7 appears in a private maintenance record.",
+            metadata={"known_by": ["Lio"]},
+        )
+    calls = 0
+
+    def count_identifier_checks(_value: object, _identifier: object) -> int:
+        nonlocal calls
+        calls += 1
+        return 0
+
+    repositories.connection.create_function(
+        "bragi_contains_exact_identifier",
+        2,
+        count_identifier_checks,
+        deterministic=True,
+    )
+
+    hits = repositories.search_context_sources(
+        save_id,
+        query_terms={"a", "7"},
+        source_types={"memory"},
+        limit=1,
+        allowed_owner_names={"mara"},
+        exact_identifiers=("A-7",),
+    )
+
+    assert hits == []
+    assert calls == 0
 
 
 def test_repositories_mixed_unicode_match_all_requires_ascii_terms(

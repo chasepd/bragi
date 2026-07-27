@@ -100,6 +100,7 @@ MAX_KNOWLEDGE_EDGE_SOURCE_MESSAGE_IDS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
 MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
+MAX_CONTEXT_EXACT_IDENTIFIER_CHARS = 512
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
@@ -3639,17 +3640,13 @@ class PersistenceRepositories:
             match_all=match_all,
         )
         phrase_match_query = _fts_query_from_exact_phrases(exact_phrases)
-        bounded_exact_identifiers = tuple(
-            dict.fromkeys(
-                identifier
-                for identifier in exact_identifiers[:16]
-                if identifier.strip()
-            )
+        exact_identifier_specs = _context_source_exact_identifier_specs(
+            exact_identifiers
         )
         if (
             not match_query
             and not phrase_match_query
-            and not bounded_exact_identifiers
+            and not exact_identifier_specs
         ):
             return []
         source_type_values = tuple(dict.fromkeys(str(item) for item in source_types))
@@ -3738,52 +3735,89 @@ class PersistenceRepositories:
         exact_identifier_rows = (
             self._fetch_all(
                 f"""
+                WITH identifier_specs(spec) AS MATERIALIZED (
+                    SELECT value
+                    FROM json_each(?)
+                ),
+                eligible_identifier_candidates AS MATERIALIZED (
+                    SELECT
+                        context_sources.id,
+                        context_sources.save_id,
+                        context_sources.source_type,
+                        context_sources.source_id,
+                        context_sources.title,
+                        context_sources.body,
+                        context_sources.metadata_json,
+                        context_sources.token_estimate,
+                        context_sources.scene_snapshot_id,
+                        context_sources.scene_generation,
+                        context_sources.created_turn_number,
+                        context_sources.expires_after_turn_number,
+                        context_sources.created_at,
+                        context_sources.rowid AS source_rowid,
+                        CAST(
+                            json_extract(identifier_specs.spec, '$.identifier')
+                            AS TEXT
+                        ) AS identifier
+                    FROM identifier_specs
+                    JOIN context_source_search_terms anchor_terms
+                      ON anchor_terms.save_id = ?
+                     AND anchor_terms.term = CAST(
+                            json_extract(identifier_specs.spec, '$.anchor')
+                            AS TEXT
+                         )
+                    JOIN context_sources
+                      ON context_sources.id = anchor_terms.context_source_id
+                    WHERE context_sources.archived_at IS NULL
+                      AND context_sources.source_type IN (
+                          {_placeholders(len(source_type_values))}
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM json_each(
+                              json_extract(identifier_specs.spec, '$.terms')
+                          ) required_term
+                          WHERE NOT EXISTS (
+                              SELECT 1
+                              FROM context_source_search_terms indexed_term
+                              WHERE indexed_term.context_source_id =
+                                    context_sources.id
+                                AND indexed_term.term =
+                                    CAST(required_term.value AS TEXT)
+                          )
+                      )
+                      {eligibility_sql}
+                )
                 SELECT
-                    context_sources.id,
-                    context_sources.save_id,
-                    context_sources.source_type,
-                    context_sources.source_id,
-                    context_sources.title,
-                    context_sources.body,
-                    context_sources.metadata_json,
-                    context_sources.token_estimate,
-                    context_sources.scene_snapshot_id,
-                    context_sources.scene_generation,
-                    context_sources.created_turn_number,
-                    context_sources.expires_after_turn_number,
+                    id,
+                    save_id,
+                    source_type,
+                    source_id,
+                    title,
+                    body,
+                    metadata_json,
+                    token_estimate,
+                    scene_snapshot_id,
+                    scene_generation,
+                    created_turn_number,
+                    expires_after_turn_number,
                     -1000.0 AS bm25_rank
-                FROM context_sources
-                WHERE context_sources.save_id = ?
-                  AND context_sources.archived_at IS NULL
-                  AND context_sources.source_type IN (
-                      {_placeholders(len(source_type_values))}
-                  )
-                  AND EXISTS (
-                      SELECT 1
-                      FROM json_each(?) identifier
-                      WHERE bragi_contains_exact_identifier(
-                                context_sources.title,
-                                CAST(identifier.value AS TEXT)
-                            ) = 1
-                         OR bragi_contains_exact_identifier(
-                                context_sources.body,
-                                CAST(identifier.value AS TEXT)
-                            ) = 1
-                  )
-                  {eligibility_sql}
-                ORDER BY context_sources.created_at DESC,
-                         context_sources.rowid DESC
+                FROM eligible_identifier_candidates
+                WHERE bragi_contains_exact_identifier(title, identifier) = 1
+                   OR bragi_contains_exact_identifier(body, identifier) = 1
+                GROUP BY id
+                ORDER BY MAX(created_at) DESC, MAX(source_rowid) DESC
                 LIMIT ?
                 """,
                 (
+                    _dump_json(exact_identifier_specs),
                     save_id,
                     *source_type_values,
-                    _dump_json(bounded_exact_identifiers),
                     *eligibility_params,
                     limit,
                 ),
             )
-            if bounded_exact_identifiers
+            if exact_identifier_specs
             else []
         )
         exact_phrase_rows = (
@@ -13241,6 +13275,40 @@ def _normalized_search_text(value: object) -> str:
     return unicodedata.normalize("NFKC", str(value)).casefold()
 
 
+def _context_source_exact_identifier_specs(
+    identifiers: tuple[str, ...],
+) -> tuple[dict[str, object], ...]:
+    specs: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for value in identifiers[:16]:
+        identifier = _normalized_search_text(value).strip()
+        if (
+            not identifier
+            or len(identifier) > MAX_CONTEXT_EXACT_IDENTIFIER_CHARS
+            or identifier in seen
+        ):
+            continue
+        terms = tuple(dict.fromkeys(unicode_word_terms(identifier)))
+        if not terms:
+            continue
+        seen.add(identifier)
+        anchor = max(
+            enumerate(terms),
+            key=lambda indexed_term: (
+                len(indexed_term[1]),
+                indexed_term[0],
+            ),
+        )[1]
+        specs.append(
+            {
+                "identifier": identifier,
+                "anchor": anchor,
+                "terms": terms,
+            }
+        )
+    return tuple(specs)
+
+
 def _contains_exact_structured_identifier(
     value: object,
     identifier: object,
@@ -13263,7 +13331,22 @@ def _contains_exact_structured_identifier(
         after_is_word = end < len(text) and (
             text[end].isalnum() or text[end] == "_"
         )
-        if not before_is_word and not after_is_word:
+        before_continues_identifier = (
+            index > 1
+            and text[index - 1] in {"-", ".", "_"}
+            and text[index - 2].isalnum()
+        )
+        after_continues_identifier = (
+            end + 1 < len(text)
+            and text[end] in {"-", ".", "_"}
+            and text[end + 1].isalnum()
+        )
+        if (
+            not before_is_word
+            and not after_is_word
+            and not before_continues_identifier
+            and not after_continues_identifier
+        ):
             return 1
         start = index + 1
 

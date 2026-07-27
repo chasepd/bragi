@@ -1178,7 +1178,6 @@ def _indexed_context_source_retrieval(
         current_scene_generation=current_scene_generation,
         current_turn_number=current_turn_number,
         blocked_source_keys=scoped_targets.blocked,
-        exact_identifiers=exact_identifiers,
     )
     hits = tuple(
         {

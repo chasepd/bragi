@@ -172,6 +172,62 @@ def test_legacy_memory_normalization_bounds_merged_provenance() -> None:
     assert len(json.loads(str(memory["source_observation_ids_json"]))) == 40
 
 
+def test_legacy_memory_normalization_bounds_context_source_provenance() -> None:
+    first_source_ids = [f"message-{index:02d}" for index in range(40)]
+    second_source_ids = [f"message-{index:02d}" for index in range(40, 80)]
+    rows = turn_snapshot_module._normalize_legacy_snapshot_memories(
+        {
+            "memories": (
+                {
+                    "id": "memory-keeper",
+                    "body": "Mara likes tea.",
+                    "tags_json": "[]",
+                    "importance": 0.4,
+                    "source_message_ids_json": json.dumps(first_source_ids),
+                    "source_observation_ids_json": "[]",
+                    "archived_at": None,
+                },
+                {
+                    "id": "memory-duplicate",
+                    "body": "mara likes tea",
+                    "tags_json": "[]",
+                    "importance": 0.9,
+                    "source_message_ids_json": json.dumps(second_source_ids),
+                    "source_observation_ids_json": "[]",
+                    "archived_at": None,
+                },
+            ),
+            "context_sources": (
+                {
+                    "id": "source-keeper",
+                    "save_id": "save-one",
+                    "source_type": "memory",
+                    "source_id": "memory-keeper",
+                    "metadata_json": json.dumps(
+                        {"source_message_ids": first_source_ids}
+                    ),
+                    "archived_at": None,
+                },
+                {
+                    "id": "source-duplicate",
+                    "save_id": "save-one",
+                    "source_type": "memory",
+                    "source_id": "memory-duplicate",
+                    "metadata_json": json.dumps(
+                        {"source_message_ids": second_source_ids}
+                    ),
+                    "archived_at": None,
+                },
+            ),
+        }
+    )
+
+    [source] = rows["context_sources"]
+    metadata = json.loads(str(source["metadata_json"]))
+    assert metadata["source_message_ids"] == first_source_ids
+    assert metadata["source_provenance_groups"] == [first_source_ids]
+
+
 def test_snapshot_context_source_merge_keeps_legacy_sources_in_one_group() -> None:
     merged = json.loads(
         turn_snapshot_module._merged_context_source_metadata_json(
