@@ -128,6 +128,7 @@ INDEXED_CONTEXT_SOURCE_TYPES = frozenset(
         "scenario_section",
         "world_state",
         "memory",
+        "memories",
         "observation",
         "character_voice",
     }
@@ -3600,7 +3601,10 @@ def _indexed_candidate_source_type(
         ):
             return "observation"
         return None
-    if record.source_type in {
+    normalized_source_type = (
+        "memory" if record.source_type == "memories" else record.source_type
+    )
+    if normalized_source_type in {
         "character_text_thread",
         "open_obligation",
         "scenario_section",
@@ -3608,7 +3612,7 @@ def _indexed_candidate_source_type(
         "memory",
         "character_voice",
     }:
-        return record.source_type
+        return normalized_source_type
     return None
 
 

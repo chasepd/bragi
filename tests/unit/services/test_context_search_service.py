@@ -4629,6 +4629,70 @@ def test_context_search_indexes_exact_memory_beyond_previous_default_bound(
     assert [item.source_id for item in result.selected_memories] == [target.id]
 
 
+def test_context_search_indexes_legacy_plural_memory_source(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    source_message = next(
+        message
+        for message in repositories.list_messages(save.id)
+        if message.role == "narrator"
+    )
+    target = repositories.add_memory(
+        save_id=save.id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["ledger"],
+        importance=0.1,
+        source_message_id=source_message.id,
+    )
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memories",
+        source_id=target.id,
+        title="Moonstone ledger memory",
+        body=target.body,
+        metadata={"fact_type": "memory", "source_message_ids": [source_message.id]},
+    )
+    for index in range(520):
+        repositories.add_memory(
+            save_id=save.id,
+            body=f"High-priority bridge watch record {index:03d}.",
+            tags=["routine"],
+            importance=1.0,
+            source_message_id=source_message.id,
+        )
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="Which memory explains what opens the cobalt ledger?",
+    )
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": target.id,
+                    "relevance_note": "The legacy indexed memory answers the query.",
+                }
+            ]
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    prompt = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    assert target.body in prompt
+    assert [item.source_id for item in result.selected_memories] == [target.id]
+
+
 def test_context_search_retrieves_short_code_memory_beyond_raw_bound(
     repositories: PersistenceRepositories,
 ) -> None:

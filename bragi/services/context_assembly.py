@@ -1232,6 +1232,20 @@ def deterministic_context_sources(
         if active_threads is not None
         else tuple(repositories.list_active_threads(save_id))
     )
+    present_character_ids = (
+        set(snapshot.present_character_ids) if snapshot is not None else set()
+    )
+    if message_visibility is not None:
+        message_visibility_records = tuple(message_visibility)
+    elif present_character_ids:
+        message_visibility_records = tuple(
+            repositories.list_message_visibility(
+                save_id,
+                character_ids=present_character_ids,
+            )
+        )
+    else:
+        message_visibility_records = ()
     world_state_records = (
         list(world_state)
         if world_state is not None
@@ -1262,6 +1276,11 @@ def deterministic_context_sources(
             thread,
             source_message_id=source_message_id,
             message_positions=message_positions,
+        )
+        if _active_thread_source_visible_to_present_characters(
+            thread,
+            present_character_ids=present_character_ids,
+            message_visibility=message_visibility_records,
         )
     ]
     threads = _context_active_threads(
@@ -1384,7 +1403,7 @@ def deterministic_context_sources(
             world_state=world_state_records,
             summaries=summaries,
             characters=tuple(character_records),
-            message_visibility=message_visibility,
+            message_visibility=message_visibility_records,
             always_include=mode == "narrator",
         )
     )
@@ -1904,17 +1923,7 @@ def _active_linked_fact_sources(
         for entity_type, entity_id in active_entities
         if entity_type == "character"
     }
-    if message_visibility is not None:
-        visibility_records = tuple(message_visibility)
-    elif active_character_ids:
-        visibility_records = tuple(
-            repositories.list_message_visibility(
-                save_id,
-                character_ids=active_character_ids,
-            )
-        )
-    else:
-        visibility_records = ()
+    visibility_records = tuple(message_visibility or ())
     link_records = (
         tuple(entity_links)
         if entity_links is not None
@@ -1984,12 +1993,25 @@ def _active_linked_fact_sources(
             source_message_id=source_message_id,
             message_positions=message_positions,
         )
+        if _source_message_ids_visible_to_active_characters(
+            (
+                *memory.source_message_ids,
+                *([memory.source_message_id] if memory.source_message_id else []),
+            ),
+            active_character_ids=active_character_ids,
+            message_visibility=visibility_records,
+        )
     }
     state_by_id = {
         state.id: state
         for state in world_state_records
         if not (
             active_thread_records_exist and is_open_threads_aggregate_key(state.key)
+        )
+        if _source_message_ids_visible_to_active_characters(
+            (state.source_message_id,),
+            active_character_ids=active_character_ids,
+            message_visibility=visibility_records,
         )
         if _record_is_at_or_before(
             state,
@@ -2001,6 +2023,11 @@ def _active_linked_fact_sources(
         summary.id: summary
         for summary in summary_records
         if validate_summary_output(summary.body).accepted
+        if _source_message_ids_visible_to_active_characters(
+            (summary.covers_message_start_id, summary.covers_message_end_id),
+            active_character_ids=active_character_ids,
+            message_visibility=visibility_records,
+        )
         if _summary_is_at_or_before(
             summary,
             source_message_id=source_message_id,
@@ -2291,21 +2318,51 @@ def _knowledge_edge_source_visible_to_active_characters(
     active_character_ids: set[str],
     message_visibility: tuple[MessageVisibilityRecord, ...],
 ) -> bool:
-    source_message_ids = tuple(
-        dict.fromkeys(
-            (
-                *edge.source_message_ids,
-                *([edge.source_message_id] if edge.source_message_id else []),
-            )
-        )
+    return _source_message_ids_visible_to_active_characters(
+        (
+            *edge.source_message_ids,
+            *([edge.source_message_id] if edge.source_message_id else []),
+        ),
+        active_character_ids=active_character_ids,
+        message_visibility=message_visibility,
+    )
+
+
+def _active_thread_source_visible_to_present_characters(
+    thread: ActiveThreadRecord,
+    *,
+    present_character_ids: set[str],
+    message_visibility: tuple[MessageVisibilityRecord, ...],
+) -> bool:
+    return _source_message_ids_visible_to_active_characters(
+        (
+            thread.source_message_id,
+            thread.first_seen_message_id,
+            thread.last_updated_message_id,
+        ),
+        active_character_ids=present_character_ids,
+        message_visibility=message_visibility,
+    )
+
+
+def _source_message_ids_visible_to_active_characters(
+    source_message_ids: tuple[str | None, ...],
+    *,
+    active_character_ids: set[str],
+    message_visibility: tuple[MessageVisibilityRecord, ...],
+) -> bool:
+    if not active_character_ids:
+        return True
+    unique_source_message_ids = tuple(
+        dict.fromkeys(source_id for source_id in source_message_ids if source_id)
     )
     return all(
         message_visible_to_present_characters(
             message_id=source_message_id,
             present_character_ids=frozenset(active_character_ids),
-            message_visibility=list(message_visibility),
+            message_visibility=[*message_visibility],
         )
-        for source_message_id in source_message_ids
+        for source_message_id in unique_source_message_ids
     )
 
 
@@ -2317,10 +2374,10 @@ def _link_source_visible_to_active_characters(
 ) -> bool:
     if link.source_message_id is None:
         return True
-    return message_visible_to_present_characters(
-        message_id=link.source_message_id,
-        present_character_ids=frozenset(active_character_ids),
-        message_visibility=list(message_visibility),
+    return _source_message_ids_visible_to_active_characters(
+        (link.source_message_id,),
+        active_character_ids=active_character_ids,
+        message_visibility=message_visibility,
     )
 
 
