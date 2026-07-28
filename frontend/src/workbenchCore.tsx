@@ -3224,7 +3224,11 @@ function Workbench({
             appliedRuntimeResult = true;
             client.setQueryData<RuntimeModel>(
               runtimeQueryKey(done.save_id ?? activeSaveIdRef.current),
-              (current) => current?.action_choices?.generation_job?.id === done.id
+              (current) => current?.action_choices
+                && (
+                  !current.action_choices.generation_job
+                  || current.action_choices.generation_job.id === done.id
+                )
                 ? {
                   ...current,
                   action_choices: {
@@ -3602,6 +3606,7 @@ function Workbench({
             runJob={runJob}
             activeSaveId={activeSaveId}
             actionChoices={model?.action_choices ?? null}
+            generationActive={pendingJobs.some(({ job }) => job.type === "action_choice_generate")}
             pendingAfterMessageId={pendingAfterMessageId}
             onPendingMessage={setPendingMessage}
           />
@@ -6588,6 +6593,7 @@ function CyoaActionPicker({
   runJob,
   activeSaveId,
   actionChoices,
+  generationActive = false,
   pendingAfterMessageId = null,
   onPendingMessage
 }: {
@@ -6595,6 +6601,7 @@ function CyoaActionPicker({
   runJob: RunJob;
   activeSaveId: string | null;
   actionChoices: RuntimeModel["action_choices"];
+  generationActive?: boolean;
   pendingAfterMessageId?: string | null;
   onPendingMessage: (message: PendingChronicleMessage | null) => void;
 }) {
@@ -6648,12 +6655,12 @@ function CyoaActionPicker({
   }, [activeSaveId, actionChoices?.narrator_message_id]);
 
   const choices = [...(actionChoices?.choices ?? [])].sort((left, right) => left.ordinal - right.ordinal);
-  const generationActive = Boolean(actionChoices?.generation_job);
-  const customActionLabel = generationActive ? "Generating choices..." : "Write your own";
+  const choicesGenerating = generationActive || Boolean(actionChoices?.generation_job);
+  const customActionLabel = choicesGenerating ? "Generating choices..." : "Write your own";
   const submitBusy = submittingSaveId === activeSaveId || submittingSaveIdRef.current === activeSaveId;
   const regenerateBusy = regenerate.isPending;
-  const canSubmit = !disabled && !submitBusy && !generationActive;
-  const canRegenerate = !disabled && !submitBusy && !regenerateBusy && !generationActive && Boolean(activeSaveId && actionChoices?.narrator_message_id);
+  const canSubmit = !disabled && !submitBusy && !choicesGenerating;
+  const canRegenerate = !disabled && !submitBusy && !regenerateBusy && !choicesGenerating && Boolean(activeSaveId && actionChoices?.narrator_message_id);
   const submitBody = (body: string) => {
     const submittedBody = body.trim();
     if (!canSubmit || !submittedBody) return;
@@ -6695,7 +6702,7 @@ function CyoaActionPicker({
           <button
             type="button"
             className="cyoa-custom-toggle"
-            disabled={disabled || submitBusy || generationActive}
+            disabled={disabled || submitBusy || choicesGenerating}
             aria-label={customActionLabel}
             aria-live="polite"
             aria-expanded={manualOpen}

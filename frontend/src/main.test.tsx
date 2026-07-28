@@ -15006,6 +15006,19 @@ describe("frontend helpers", () => {
     );
     if (!jobSource) throw new Error("opening action choice job watcher was not created");
     act(() => {
+      client.setQueriesData<RuntimeModel>(
+        { queryKey: ["runtime"] },
+        (current) => current?.action_choices ? {
+          ...current,
+          action_choices: {
+            ...current.action_choices,
+            generation_job: null
+          }
+        } : current
+      );
+    });
+    expect(screen.getByRole("button", { name: "Generating choices..." })).toBeDisabled();
+    act(() => {
       jobSource.dispatch("done", {
         ...generationJob,
         status: "failed",
