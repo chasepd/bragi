@@ -7,9 +7,10 @@ from dataclasses import dataclass
 
 from bragi.persistence.models import JobRecord
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.retry_policy import DEFERRED_WORK_MAX_ATTEMPTS
 
 PROVIDER_PRESSURE_COOLDOWN_SECONDS = 15 * 60
-CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS = 3
+CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS = DEFERRED_WORK_MAX_ATTEMPTS
 CONTEXT_UPDATE_RETRY_DRAIN_LIMIT = 3
 
 _PRESSURE_CATEGORIES = frozenset(

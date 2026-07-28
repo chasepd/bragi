@@ -337,7 +337,11 @@ class SequenceToolCallProvider:
         self.tool_call_requests.append(request)
         if not self.responses:
             raise AssertionError("unexpected tool-call request")
-        response = self.responses.pop(0)
+        response = (
+            self.responses[0]
+            if len(self.responses) == 1
+            else self.responses.pop(0)
+        )
         if isinstance(response, Exception):
             raise response
         return ToolCallResponse(
@@ -2234,7 +2238,7 @@ def test_tool_calling_context_update_rejects_ungrounded_evidence_quote(
         asyncio.run(updater.extract(request))
 
     assert "evidence_quote not found" in str(exc_info.value)
-    assert len(provider.tool_call_requests) == 3
+    assert len(provider.tool_call_requests) == 7
     retry_messages = provider.tool_call_requests[1].messages
     assert any(
         "Call exactly one tool again" in message.body
@@ -2360,7 +2364,7 @@ def test_tool_calling_context_update_uses_tool_fallback_after_feedback_exhaustio
 
     extraction = asyncio.run(updater.extract(request))
 
-    assert len(primary.tool_call_requests) == 3
+    assert len(primary.tool_call_requests) == 7
     assert len(fallback.tool_call_requests) == 1
     assert extraction.scene is not None
     assert extraction.scene.situation == "The fallback model extracts the scene."

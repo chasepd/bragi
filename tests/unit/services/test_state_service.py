@@ -83,7 +83,11 @@ class SequenceToolCallProvider:
         if not self.responses:
             raise AssertionError("unexpected tool-call request")
         return ToolCallResponse(
-            tool_calls=self.responses.pop(0),
+            tool_calls=(
+                self.responses[0]
+                if len(self.responses) == 1
+                else self.responses.pop(0)
+            ),
             body="",
             provider=request.provider,
             model_id=request.model_id,
@@ -1616,7 +1620,7 @@ def test_tool_calling_state_extractor_keeps_independent_valid_calls_after_bad_qu
     assert jobs[-1]["status"] == "succeeded"
     diagnostics = jobs[-1]["result"]["tool_diagnostics"]
     assert diagnostics["partial_success"] is True
-    assert diagnostics["retry_count"] == 3
+    assert diagnostics["retry_count"] == 7
     assert [call["id"] for call in diagnostics["accepted_calls"]] == [
         "state-call-1"
     ]
@@ -1868,7 +1872,7 @@ def test_tool_calling_state_extractor_rejects_invalid_source_message_id(
         )
 
     assert "source_message_id is not in the completed turn" in str(exc_info.value)
-    assert len(provider.tool_call_requests) == 3
+    assert len(provider.tool_call_requests) == 7
 
 
 def test_tool_calling_state_extractor_rejects_malformed_tool_args(

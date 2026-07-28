@@ -79,6 +79,7 @@ from bragi.persistence.models import (
     WorldStateRecord,
 )
 from bragi.redaction import redact_text
+from bragi.retry_policy import DEFERRED_WORK_MAX_ATTEMPTS
 from bragi.safety import normalize_message_safety
 from bragi.text_search import (
     MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS,
@@ -5013,7 +5014,7 @@ class PersistenceRepositories:
         *,
         lease_token: str,
         lease_seconds: int,
-        max_attempts: int = 5,
+        max_attempts: int = DEFERRED_WORK_MAX_ATTEMPTS,
     ) -> list[ContextObservationRecord]:
         ids = tuple(dict.fromkeys(item for item in observation_ids if item))
         if not ids:

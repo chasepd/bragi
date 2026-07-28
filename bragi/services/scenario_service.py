@@ -20,6 +20,7 @@ from bragi.providers.contracts import (
     ProviderClient,
 )
 from bragi.redaction import redact_text
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.action_choice_flags import (
     content_with_action_choices_enabled,
     normalize_legacy_action_choice_scenario,
@@ -1360,7 +1361,9 @@ class ScenarioService:
             section_id=section_id,
             text=section_value,
         )
-        if repeated_names:
+        for _attempt in range(1, MODEL_OUTPUT_MAX_ATTEMPTS):
+            if not repeated_names:
+                break
             retry_request = replace(
                 request,
                 messages=(
@@ -1397,9 +1400,12 @@ class ScenarioService:
                 fade_to_black_enabled=content_safety.fade_to_black_enabled,
                 roleplay_type=scenario_type.value,
             )
-            return ScenarioSectionGenerationResult(
-                body=retry_safety.body,
-                minimum_rating=retry_safety.reviewed_content_rating,
+            section_value = retry_safety.body
+            safety = retry_safety
+            repeated_names = repeated_first_names_for_section(
+                scenario_type=scenario_types or (scenario_type,),
+                section_id=section_id,
+                text=section_value,
             )
         return ScenarioSectionGenerationResult(
             body=section_value,

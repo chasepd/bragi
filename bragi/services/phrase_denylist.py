@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 
 GENERATED_PHRASE_DENYLIST_SETTING = "generated_phrase_denylist"
 SAVE_GENERATED_PHRASE_DENYLIST_SETTING = "save_generated_phrase_denylist"
@@ -13,7 +14,7 @@ DEFAULT_GENERATED_PHRASE_DENYLIST = (
     "That's not nothing",
     "that's actually everything",
 )
-GENERATED_PHRASE_GUARD_MAX_ATTEMPTS = 4
+GENERATED_PHRASE_GUARD_MAX_ATTEMPTS = MODEL_OUTPUT_MAX_ATTEMPTS
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _QUOTE_TRANSLATION = str.maketrans(

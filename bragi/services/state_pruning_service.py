@@ -31,6 +31,7 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.redaction import redact_text
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.model_capabilities import (
     STRUCTURED_OUTPUT_CAPABILITIES,
@@ -60,7 +61,7 @@ from bragi.services.tool_call_helpers import (
 
 RECENT_MESSAGE_LIMIT = 24
 STATE_PRUNING_BATCH_SIZE = 40
-MAX_STATE_PRUNING_TOOL_FEEDBACK_TURNS = 2
+MAX_STATE_PRUNING_TOOL_FEEDBACK_TURNS = MODEL_OUTPUT_MAX_ATTEMPTS - 1
 
 
 @dataclass(frozen=True)

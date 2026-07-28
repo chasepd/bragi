@@ -31,6 +31,7 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.structured_schema import normalize_strict_json_schema
 from bragi.redaction import redact_text
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.manual_confirmation import (
     manual_memory_confirmation_enabled,
@@ -77,7 +78,7 @@ from bragi.services.tool_call_helpers import (
     validate_tool_arguments_shape,
 )
 
-MAX_STATE_TOOL_FEEDBACK_TURNS = 2
+MAX_STATE_TOOL_FEEDBACK_TURNS = MODEL_OUTPUT_MAX_ATTEMPTS - 1
 _FORMAT_NORMALIZED_QUOTE_TRANSLATION = str.maketrans(
     {
         "\u2018": "'",

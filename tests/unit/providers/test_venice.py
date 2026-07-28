@@ -1459,7 +1459,7 @@ def test_venice_structured_output_retries_empty_success_content(
     assert [call["method"] for call in transport.calls] == ["POST", "POST"]
     retry_metadata = response.raw_metadata["_bragi_retry"]
     assert retry_metadata["attempt_count"] == 2
-    assert retry_metadata["max_attempts"] == 3
+    assert retry_metadata["max_attempts"] == 7
     assert len(retry_progress) == 1
 
     attempts = retry_metadata["attempts"]
@@ -1509,8 +1509,8 @@ def test_venice_structured_output_enforces_async_transport_timeout(
 
     assert exc_info.value.category == ProviderErrorCategory.NETWORK_ERROR
     assert "timed out" in exc_info.value.message
-    assert exc_info.value.retry_attempt_count == 3
-    assert exc_info.value.max_retry_attempts == 3
+    assert exc_info.value.retry_attempt_count == 7
+    assert exc_info.value.max_retry_attempts == 7
 
 
 def test_venice_chat_content_preserves_provider_diagnostics(
@@ -1703,7 +1703,7 @@ def test_venice_chat_retries_transient_failure_and_records_metadata(
     assert [call["method"] for call in transport.calls] == ["POST", "POST"]
     retry_metadata = response.raw_metadata["_bragi_retry"]
     assert retry_metadata["attempt_count"] == 2
-    assert retry_metadata["max_attempts"] == 3
+    assert retry_metadata["max_attempts"] == 7
 
     attempts = retry_metadata["attempts"]
     assert len(attempts) == 2

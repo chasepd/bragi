@@ -7,6 +7,8 @@ import pytest
 
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.retry import (
+    DEFAULT_PROVIDER_ATTEMPTS,
+    MAX_BACKOFF_SECONDS,
     call_with_provider_retries,
     is_transient_provider_error,
 )
@@ -217,6 +219,52 @@ def test_call_with_provider_retries_uses_longer_delay_for_rate_limits(
         )
 
         assert sleeps == [2.0]
+
+    asyncio.run(run())
+
+
+def test_quality_first_provider_retry_defaults() -> None:
+    assert DEFAULT_PROVIDER_ATTEMPTS == 7
+    assert MAX_BACKOFF_SECONDS == 30.0
+
+
+def test_default_provider_retry_budget_allows_success_on_seventh_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        attempt_count = 0
+
+        async def operation() -> dict[str, object]:
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count < 7:
+                raise ProviderError(
+                    ProviderErrorCategory.NETWORK_ERROR,
+                    "temporary outage",
+                )
+            return {"body": "recovered"}
+
+        monkeypatch.setattr("bragi.providers.retry.asyncio.sleep", _no_sleep)
+        monkeypatch.setattr("bragi.providers.retry._retry_delay", lambda **_: 0.0)
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_error_event",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_event",
+            lambda *_args, **_kwargs: None,
+        )
+
+        result = await call_with_provider_retries(
+            operation,
+            provider="fake",
+            task="chat",
+        )
+
+        assert attempt_count == 7
+        retry = cast(dict[str, Any], result["_bragi_retry"])
+        assert retry["attempt_count"] == 7
+        assert retry["max_attempts"] == 7
 
     asyncio.run(run())
 

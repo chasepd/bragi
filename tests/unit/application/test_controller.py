@@ -5398,22 +5398,9 @@ def test_runtime_rejects_agency_enhancement_without_evidence(
                     "name": "Mara",
                     "boundaries": "Will not abandon the tower.",
                 },
-            },
-            {
-                "field_name": "boundaries",
-                "character": {
-                    "name": "Mara",
-                    "boundaries": "Will not abandon the tower.",
-                },
-            },
-            {
-                "field_name": "boundaries",
-                "character": {
-                    "name": "Mara",
-                    "boundaries": "Will not abandon the tower.",
-                },
-            },
+            }
         ]
+        * 7
     )
     controller = _runtime_controller(runtime, repositories, tmp_path, provider=provider)
     scenario = repositories.create_scenario(

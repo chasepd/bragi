@@ -249,7 +249,11 @@ class SequenceToolContextProvider(RecordingStructuredContextProvider):
         self.tool_call_requests.append(request)
         if not self.responses:
             raise AssertionError("unexpected tool-call request")
-        response = self.responses.pop(0)
+        response = (
+            self.responses[0]
+            if len(self.responses) == 1
+            else self.responses.pop(0)
+        )
         if isinstance(response, Exception):
             raise response
         return ToolCallResponse(
@@ -1730,7 +1734,7 @@ def test_context_search_tool_feedback_exhaustion_preserves_accepted_calls(
         service.search(save_id=save.id, player_message_id=player_message.id)
     )
 
-    assert len(provider.tool_call_requests) == 3
+    assert len(provider.tool_call_requests) == 7
     assert [item.source_id for item in result.selected_memories] == [memory.id]
     assert [item.relevance_note for item in result.selected_memories] == [
         "The promise shapes Mara's next choice.",
@@ -1774,7 +1778,7 @@ def test_context_search_tool_feedback_exhaustion_without_accepted_calls_uses_fal
         service.search(save_id=save.id, player_message_id=player_message.id)
     )
 
-    assert len(provider.tool_call_requests) == 3
+    assert len(provider.tool_call_requests) == 7
     assert [item.source_id for item in result.selected_state] == [state.id]
     assert result.selected_state[0].relevance_note == (
         "Selected by deterministic fallback after empty context selection."

@@ -50,13 +50,14 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.http_client import SAFE_PROVIDER_RESPONSE_HEADERS
 from bragi.redaction import redact_text
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.action_choice_flags import scenario_action_choices_enabled
 from bragi.services.action_choice_service import (
     ActionChoiceService,
     PreparedActionChoiceGeneration,
 )
 from bragi.services.agentic_context import (
-    RESPONSE_VERIFICATION_MODE_RETRY_ONCE,
+    RESPONSE_VERIFICATION_MODE_RETRY,
     ContextCurationService,
     NarratorCommitDecision,
     NarratorMessageSpec,
@@ -312,8 +313,6 @@ POST_TURN_PROVIDER_TASKS = {
     "scenario": "scenario_evolution",
     "image": "image_generation",
 }
-POST_TURN_CONTEXT_UPDATE_BUDGET_SECONDS = 60.0
-POST_TURN_BACKGROUND_CATCHUP_TIMEOUT_SECONDS = 120.0
 STATE_EXTRACTION_RETRY_JOB_TYPE = "state_extraction_retry"
 STATE_EXTRACTION_RETRY_MAX_ATTEMPTS = CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS
 STATE_EXTRACTION_RETRY_DRAIN_LIMIT = CONTEXT_UPDATE_RETRY_DRAIN_LIMIT
@@ -2506,6 +2505,55 @@ class ChatService:
                 classification="npc_knowledge_audit_failed",
             )
             raise ValueError(error)
+        # Verifier and NPC-audit regenerations happen after the first deterministic
+        # guards, so give their output the same repair budget instead of failing a
+        # turn immediately when a later quality check reintroduces a violation.
+        final_script_guard_result = await self._retry_narrator_for_script_policy(
+            save_id=save_id,
+            fallback_request_base=base_request,
+            completion=completion,
+            response=response,
+            narrator_body=narrator_body,
+            narrator_stream_callback=stream_callback,
+            retry_progress_callback=retry_progress_callback,
+        )
+        completion = final_script_guard_result.completion
+        response = final_script_guard_result.response
+        narrator_body = final_script_guard_result.narrator_body
+        completion_diagnostics = {
+            **completion_diagnostics,
+            "generated_text_final_script_guard": (
+                final_script_guard_result.diagnostics.get(
+                    "generated_text_script_guard",
+                    {},
+                )
+            ),
+        }
+        if not final_script_guard_result.violations:
+            final_phrase_guard_result = (
+                await self._retry_narrator_for_phrase_denylist(
+                    save_id=save_id,
+                    fallback_request_base=base_request,
+                    completion=completion,
+                    response=response,
+                    narrator_body=narrator_body,
+                    narrator_stream_callback=stream_callback,
+                    retry_progress_callback=retry_progress_callback,
+                    phrase_denylist=phrase_denylist,
+                )
+            )
+            completion = final_phrase_guard_result.completion
+            response = final_phrase_guard_result.response
+            narrator_body = final_phrase_guard_result.narrator_body
+            completion_diagnostics = {
+                **completion_diagnostics,
+                "generated_text_final_phrase_guard": (
+                    final_phrase_guard_result.diagnostics.get(
+                        "generated_text_phrase_guard",
+                        {},
+                    )
+                ),
+            }
         final_script_violations = _narrator_script_policy_violations(
             repositories=self.repositories,
             save_id=save_id,
@@ -2891,17 +2939,7 @@ class ChatService:
         if not pending:
             return
         try:
-            await asyncio.wait_for(
-                asyncio.shield(asyncio.gather(*pending)),
-                timeout=POST_TURN_BACKGROUND_CATCHUP_TIMEOUT_SECONDS,
-            )
-        except TimeoutError:
-            log_event(
-                "chat.background_post_turn_catchup_timed_out",
-                save_id=save_id,
-                pending_post_turn_task_count=len(pending),
-                timeout_seconds=POST_TURN_BACKGROUND_CATCHUP_TIMEOUT_SECONDS,
-            )
+            await asyncio.shield(asyncio.gather(*pending))
         except Exception as exc:
             log_error_event(
                 "chat.background_post_turn_catchup_failed",
@@ -3194,20 +3232,23 @@ class ChatService:
         retry_progress_callback: ProviderRetryProgressCallback | None,
     ) -> _NarratorScriptGuardTurnResult:
         mode = script_guard_mode(self.repositories, save_id=save_id)
-        first_violations = _narrator_script_policy_violations(
+        violations = _narrator_script_policy_violations(
             repositories=self.repositories,
             save_id=save_id,
             fallback_request_base=fallback_request_base,
             narrator_body=narrator_body,
         )
+        first_violations = violations
         diagnostics: dict[str, object] = {
             "generated_text_script_guard": {
                 "mode": mode,
+                "attempt_count": 1,
+                "max_attempts": MODEL_OUTPUT_MAX_ATTEMPTS,
                 "auto_retry_used": False,
-                "violation": first_violation_diagnostic(first_violations),
+                "violation": first_violation_diagnostic(violations),
             }
         }
-        if not first_violations:
+        if not violations:
             return _NarratorScriptGuardTurnResult(
                 completion=completion,
                 response=response,
@@ -3219,68 +3260,75 @@ class ChatService:
             save_id=save_id,
             provider=response.provider,
             model=response.model_id,
-            **first_violation_diagnostic(first_violations),
+            **first_violation_diagnostic(violations),
         )
-        retry_feedback = _script_guard_retry_feedback(first_violations)
-        retry_base = replace(
-            fallback_request_base,
-            regeneration_feedback=_combine_regeneration_feedback(
-                fallback_request_base.regeneration_feedback,
-                retry_feedback,
-            ),
-            retry_progress_callback=retry_progress_callback,
-        )
-        retry_request = request_with_openrouter_routing(
-            self.repositories,
-            _apply_final_prompt_budget(
-                retry_base,
-                model_context_window=_model_context_window(
-                    repositories=self.repositories,
-                    provider=retry_base.provider,
-                    model_id=retry_base.model_id,
+        current_completion = completion
+        current_response = response
+        current_body = narrator_body
+        for attempt in range(2, MODEL_OUTPUT_MAX_ATTEMPTS + 1):
+            retry_base = replace(
+                fallback_request_base,
+                regeneration_feedback=_combine_regeneration_feedback(
+                    fallback_request_base.regeneration_feedback,
+                    _script_guard_retry_feedback(violations),
                 ),
-            ),
-            task="chat",
-            save_id=save_id,
-        )
-        retry_completion = await self._complete_chat_with_optional_fallback(
-            save_id=save_id,
-            request=retry_request,
-            fallback_request_base=retry_base,
-            narrator_stream_callback=narrator_stream_callback,
-            apply_narrator_content_safety=True,
-        )
-        retry_response = retry_completion.response
-        retry_body = retry_response.body.strip()
-        retry_violations = _narrator_script_policy_violations(
-            repositories=self.repositories,
-            save_id=save_id,
-            fallback_request_base=fallback_request_base,
-            narrator_body=retry_body,
-        )
-        diagnostics = {
-            "generated_text_script_guard": {
-                "mode": mode,
-                "auto_retry_used": True,
-                "first": first_violation_diagnostic(first_violations),
-                "retry": first_violation_diagnostic(retry_violations),
-                "retry_passed": not retry_violations,
+                retry_progress_callback=retry_progress_callback,
+            )
+            retry_request = request_with_openrouter_routing(
+                self.repositories,
+                _apply_final_prompt_budget(
+                    retry_base,
+                    model_context_window=_model_context_window(
+                        repositories=self.repositories,
+                        provider=retry_base.provider,
+                        model_id=retry_base.model_id,
+                    ),
+                ),
+                task="chat",
+                save_id=save_id,
+            )
+            current_completion = await self._complete_chat_with_optional_fallback(
+                save_id=save_id,
+                request=retry_request,
+                fallback_request_base=retry_base,
+                narrator_stream_callback=narrator_stream_callback,
+                apply_narrator_content_safety=True,
+            )
+            current_response = current_completion.response
+            current_body = current_response.body.strip()
+            violations = _narrator_script_policy_violations(
+                repositories=self.repositories,
+                save_id=save_id,
+                fallback_request_base=fallback_request_base,
+                narrator_body=current_body,
+            )
+            diagnostics = {
+                "generated_text_script_guard": {
+                    "mode": mode,
+                    "attempt_count": attempt,
+                    "max_attempts": MODEL_OUTPUT_MAX_ATTEMPTS,
+                    "auto_retry_used": True,
+                    "first": first_violation_diagnostic(first_violations),
+                    "retry": first_violation_diagnostic(violations),
+                    "retry_passed": not violations,
+                }
             }
-        }
-        if retry_violations:
+            if not violations:
+                break
             log_debug_event(
                 "chat.narrator_script_guard_retry_violation",
                 save_id=save_id,
-                provider=retry_response.provider,
-                model=retry_response.model_id,
-                **first_violation_diagnostic(retry_violations),
+                provider=current_response.provider,
+                model=current_response.model_id,
+                attempt=attempt,
+                **first_violation_diagnostic(violations),
             )
         return _NarratorScriptGuardTurnResult(
-            completion=retry_completion,
-            response=retry_response,
-            narrator_body=retry_body,
+            completion=current_completion,
+            response=current_response,
+            narrator_body=current_body,
             diagnostics=diagnostics,
-            violations=retry_violations,
+            violations=violations,
         )
 
     async def _audit_npc_knowledge_with_retry(
@@ -3357,68 +3405,71 @@ class ChatService:
                     }
                 },
             )
-        retry_feedback = _npc_knowledge_retry_feedback(first_audit)
-        retry_base = replace(
-            fallback_request_base,
-            regeneration_feedback=_combine_regeneration_feedback(
-                fallback_request_base.regeneration_feedback,
-                retry_feedback,
-            ),
-        )
-        retry_request = request_with_openrouter_routing(
-            self.repositories,
-            _apply_final_prompt_budget(
-                retry_base,
-                model_context_window=_model_context_window(
-                    repositories=self.repositories,
-                    provider=retry_base.provider,
-                    model_id=retry_base.model_id,
+        current_completion = completion
+        current_response = response
+        current_body = narrator_body
+        current_audit = first_audit
+        attempt_count = 1
+        retry_empty = False
+        for attempt in range(2, MODEL_OUTPUT_MAX_ATTEMPTS + 1):
+            retry_base = replace(
+                fallback_request_base,
+                regeneration_feedback=_combine_regeneration_feedback(
+                    fallback_request_base.regeneration_feedback,
+                    _npc_knowledge_retry_feedback(current_audit),
                 ),
-            ),
-            task="chat",
-            save_id=save_id,
-        )
-        retry_completion = await self._complete_chat_with_optional_fallback(
-            save_id=save_id,
-            request=retry_request,
-            fallback_request_base=retry_base,
-            narrator_stream_callback=narrator_stream_callback,
-            apply_narrator_content_safety=True,
-        )
-        retry_response = retry_completion.response
-        retry_body = retry_response.body.strip()
-        if not retry_body:
-            return _NpcKnowledgeAuditTurnResult(
-                completion=completion,
-                response=response,
-                narrator_body=narrator_body,
-                suspicious=True,
-                diagnostics={
-                    "npc_knowledge_audit": {
-                        "first": first_audit.to_json(),
-                        "auto_retry_used": True,
-                        "retry_empty": True,
-                        "suspicious": True,
-                    }
-                },
             )
-        second_audit = await self._run_npc_knowledge_audit(
-            save_id=save_id,
-            player_message=player_message,
-            narrator_body=retry_body,
-            request=audit_source_request,
-        )
-        suspicious = second_audit.suspicious
+            retry_request = request_with_openrouter_routing(
+                self.repositories,
+                _apply_final_prompt_budget(
+                    retry_base,
+                    model_context_window=_model_context_window(
+                        repositories=self.repositories,
+                        provider=retry_base.provider,
+                        model_id=retry_base.model_id,
+                    ),
+                ),
+                task="chat",
+                save_id=save_id,
+            )
+            retry_completion = await self._complete_chat_with_optional_fallback(
+                save_id=save_id,
+                request=retry_request,
+                fallback_request_base=retry_base,
+                narrator_stream_callback=narrator_stream_callback,
+                apply_narrator_content_safety=True,
+            )
+            retry_response = retry_completion.response
+            retry_body = retry_response.body.strip()
+            attempt_count = attempt
+            if not retry_body:
+                retry_empty = True
+                break
+            current_completion = retry_completion
+            current_response = retry_response
+            current_body = retry_body
+            current_audit = await self._run_npc_knowledge_audit(
+                save_id=save_id,
+                player_message=player_message,
+                narrator_body=current_body,
+                request=audit_source_request,
+            )
+            if not current_audit.leaks:
+                break
+        suspicious = bool(current_audit.leaks) or current_audit.suspicious
         return _NpcKnowledgeAuditTurnResult(
-            completion=retry_completion,
-            response=retry_response,
-            narrator_body=retry_body,
+            completion=current_completion,
+            response=current_response,
+            narrator_body=current_body,
             suspicious=suspicious,
             diagnostics={
                 "npc_knowledge_audit": {
                     "first": first_audit.to_json(),
-                    "second": second_audit.to_json(),
+                    "second": current_audit.to_json(),
+                    "attempt_count": attempt_count,
+                    "max_attempts": MODEL_OUTPUT_MAX_ATTEMPTS,
                     "auto_retry_used": True,
+                    "retry_empty": retry_empty,
                     "suspicious": suspicious,
                 }
             },
@@ -4136,45 +4187,7 @@ class ChatService:
                     **current_pressure.to_result(),
                 )
                 return "skipped_provider_pressure"
-            if name != "context":
-                return await run_step(name, callback)
-            budget_started = perf_counter()
-            try:
-                return await asyncio.wait_for(
-                    run_step(name, callback),
-                    timeout=POST_TURN_CONTEXT_UPDATE_BUDGET_SECONDS,
-                )
-            except TimeoutError:
-                retry_job = self._ensure_context_update_retry_job(
-                    save_id=save_id,
-                    source_message_ids=canonical_source_message_ids,
-                    reason="post_turn_context_update_timeout",
-                    inference_mode=inference_mode,
-                    verified_coverage=verified_coverage,
-                    turn_revision=boundary,
-                )
-                step_results[name] = {
-                    "deferred": True,
-                    "deferred_reason": "timeout",
-                    "retry_job_id": retry_job.id,
-                    "source_message_ids": list(canonical_source_message_ids),
-                    "timeout_seconds": POST_TURN_CONTEXT_UPDATE_BUDGET_SECONDS,
-                }
-                publish(name, "deferred")
-                record_step(
-                    name,
-                    "deferred",
-                    budget_started,
-                    metadata=step_results[name],
-                )
-                log_event(
-                    "chat.post_turn_context_update_deferred_timeout",
-                    save_id=save_id,
-                    coordinator_job_id=coordinator.id,
-                    retry_job_id=retry_job.id,
-                    timeout_seconds=POST_TURN_CONTEXT_UPDATE_BUDGET_SECONDS,
-                )
-                return "deferred"
+            return await run_step(name, callback)
 
         log_event(
             "chat.post_turn_jobs_started",
@@ -5910,6 +5923,7 @@ class ChatService:
         narrator_stream_callback: NarratorStreamCallback | None,
         retry_progress_callback: ProviderRetryProgressCallback | None,
         narration_snapshot: NarrationContextSnapshot | None = None,
+        attempt_count: int = 1,
     ) -> _NarratorVerificationTurnResult:
         if narrator_spec is None or not agentic_context_pipeline_enabled(
             self.repositories,
@@ -5963,11 +5977,13 @@ class ChatService:
             )
         )
         diagnostics: dict[str, object] = {
-            "narrator_verifier": _narrator_verifier_diagnostics(result)
+            "narrator_verifier": _narrator_verifier_diagnostics(result),
+            "narrator_verifier_attempt_count": attempt_count,
+            "narrator_verifier_max_attempts": MODEL_OUTPUT_MAX_ATTEMPTS,
         }
         mode = response_verification_mode(self.repositories, save_id=save_id)
         retry_for_verification = (
-            mode == RESPONSE_VERIFICATION_MODE_RETRY_ONCE
+            mode == RESPONSE_VERIFICATION_MODE_RETRY
             and (
                 not result.passed
                 or bool(result.npc_passivity_issues)
@@ -5975,7 +5991,11 @@ class ChatService:
             )
         )
         retry_for_npc = bool(first_audit.leaks)
-        if not retry_for_verification and not retry_for_npc:
+        if (
+            not retry_for_verification
+            and not retry_for_npc
+            or attempt_count >= MODEL_OUTPUT_MAX_ATTEMPTS
+        ):
             return _NarratorVerificationTurnResult(
                 diagnostics=diagnostics,
                 npc_audit_result=_NpcKnowledgeAuditTurnResult(
@@ -6071,74 +6091,57 @@ class ChatService:
                 diagnostics=diagnostics,
                 npc_audit_result=npc_audit_result,
             )
-        commit_candidates_present = bool(narrator_spec.state_commit_candidates)
-        if not audit_enabled and not retry_for_npc and not commit_candidates_present:
-            return _NarratorVerificationTurnResult(
-                diagnostics=diagnostics,
-                retry_completion=retry_completion,
-                retry_response=retry_response,
-                retry_body=retry_body,
-            )
-        second_result: NarratorVerificationResult | None = None
-        second_audit = NpcKnowledgeAuditResult(
-            enabled=audit_enabled,
-            skipped_reason="" if audit_enabled else "no_npc_dialogue_or_reference",
-        )
-        try:
-            second_result = await verifier.verify(
-                save_id=save_id,
-                source_request=retry_verification_source_request,
-                spec=narrator_spec,
-                narrator_body=retry_body,
-            )
-            diagnostics["narrator_verifier_second"] = (
-                _narrator_verifier_diagnostics(second_result)
-            )
-            second_audit = (
-                _npc_knowledge_audit_from_verifier(second_result)
-                if audit_enabled or second_result.npc_knowledge_leaks
-                else second_audit
-            )
-        except Exception as exc:
-            log_error_event(
-                "chat.narrator_verification_failed",
-                save_id=save_id,
-                **exception_log_fields(exc),
-            )
-            diagnostics["narrator_verifier_second_failed"] = True
-            if not retry_for_npc:
-                return _NarratorVerificationTurnResult(
-                    diagnostics=diagnostics,
-                    retry_completion=retry_completion,
-                    retry_response=retry_response,
-                    retry_body=retry_body,
-                )
-            second_audit = NpcKnowledgeAuditResult(
-                enabled=True,
-                error=_safe_error_text(exc),
-            )
-        npc_audit_result = _NpcKnowledgeAuditTurnResult(
+        subsequent = await self._verify_narrator_message_if_configured(
+            save_id=save_id,
+            player_message=player_message,
+            verification_source_request=retry_verification_source_request,
+            fallback_request_base=fallback_request_base,
+            narrator_spec=narrator_spec,
             completion=retry_completion,
             response=retry_response,
             narrator_body=retry_body,
-            suspicious=second_audit.suspicious,
-            diagnostics={
-                "npc_knowledge_audit": {
-                    "source": "narrator_verifier",
-                    "first": first_audit.to_json(),
-                    "second": second_audit.to_json(),
-                    "auto_retry_used": retry_for_npc,
-                    "suspicious": second_audit.suspicious,
-                }
-            },
+            narrator_stream_callback=narrator_stream_callback,
+            retry_progress_callback=retry_progress_callback,
+            narration_snapshot=narration_snapshot,
+            attempt_count=attempt_count + 1,
         )
+        latest_verifier = subsequent.diagnostics.get("narrator_verifier")
+        merged_diagnostics = {
+            **diagnostics,
+            **subsequent.diagnostics,
+            "narrator_verifier_retry_used": True,
+        }
+        if isinstance(latest_verifier, dict):
+            merged_diagnostics["narrator_verifier_second"] = latest_verifier
+        npc_audit_result = subsequent.npc_audit_result
+        if npc_audit_result is not None:
+            latest_audit = npc_audit_result.diagnostics.get("npc_knowledge_audit")
+            latest_audit_payload = (
+                latest_audit.get("first")
+                if isinstance(latest_audit, dict)
+                else None
+            )
+            npc_audit_result = replace(
+                npc_audit_result,
+                diagnostics={
+                    "npc_knowledge_audit": {
+                        "source": "narrator_verifier",
+                        "first": first_audit.to_json(),
+                        "second": latest_audit_payload,
+                        "attempt_count": attempt_count + 1,
+                        "max_attempts": MODEL_OUTPUT_MAX_ATTEMPTS,
+                        "auto_retry_used": True,
+                        "suspicious": npc_audit_result.suspicious,
+                    }
+                },
+            )
         return _NarratorVerificationTurnResult(
-            diagnostics=diagnostics,
-            retry_completion=retry_completion,
-            retry_response=retry_response,
-            retry_body=retry_body,
+            diagnostics=merged_diagnostics,
+            retry_completion=subsequent.retry_completion or retry_completion,
+            retry_response=subsequent.retry_response or retry_response,
+            retry_body=subsequent.retry_body or retry_body,
             npc_audit_result=npc_audit_result,
-            verification_result=second_result,
+            verification_result=subsequent.verification_result,
         )
 
     def _narrator_planner_for_save(
@@ -10824,7 +10827,7 @@ def _retry_attempt(payload: dict[str, object]) -> int:
 def _retry_max_attempts(payload: dict[str, object]) -> int:
     value = payload.get("max_retry_attempts")
     if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
-        return value
+        return max(value, CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS)
     return CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS
 
 

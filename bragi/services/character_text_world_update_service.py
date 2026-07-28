@@ -24,6 +24,7 @@ from bragi.providers.contracts import (
     StructuredOutputRequest,
 )
 from bragi.redaction import redact_text
+from bragi.retry_policy import DEFERRED_WORK_MAX_ATTEMPTS
 from bragi.services.character_text_context import (
     canonical_character_text_context_messages,
     character_text_audience_character_ids,
@@ -40,7 +41,7 @@ from bragi.services.provider_fallbacks import structured_output_with_fallback
 CHARACTER_TEXT_WORLD_UPDATE_JOB_TYPE = "character_text_world_update"
 CHARACTER_TEXT_WORLD_UPDATE_RETRY_JOB_TYPE = "character_text_world_update_retry"
 CHARACTER_TEXT_SOURCE_PREFIX = "character_text_message:"
-_MAX_RETRY_ATTEMPTS = 3
+_MAX_RETRY_ATTEMPTS = DEFERRED_WORK_MAX_ATTEMPTS
 _RETRY_DRAIN_LIMIT = 3
 _MAX_PRIOR_THREAD_CONTEXT_MESSAGES = 12
 
@@ -1003,7 +1004,9 @@ def _retry_attempt(payload: dict[str, object]) -> int:
 
 def _retry_max_attempts(payload: dict[str, object]) -> int:
     value = payload.get("max_retry_attempts", _MAX_RETRY_ATTEMPTS)
-    return value if isinstance(value, int) and value > 0 else _MAX_RETRY_ATTEMPTS
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        return _MAX_RETRY_ATTEMPTS
+    return max(value, _MAX_RETRY_ATTEMPTS)
 
 
 def _text_update_scope(

@@ -1947,9 +1947,7 @@ class CharacterTextService:
                 identity=identity,
                 retry=attempt > 1,
             )
-            max_attempts = (
-                GENERATED_PHRASE_GUARD_MAX_ATTEMPTS if phrase_violations else 2
-            )
+            max_attempts = GENERATED_PHRASE_GUARD_MAX_ATTEMPTS
             if attempt >= max_attempts:
                 break
             self.repositories.update_character_text_delivery(
