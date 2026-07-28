@@ -117,6 +117,51 @@ def test_action_choice_service_requests_structured_four_choice_schema_and_persis
     assert "numbering" in request.messages[0].body
 
 
+def test_action_choice_service_forwards_retry_progress_callback(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, narrator_id = _create_cyoa_save(repositories)
+    _save_model(
+        repositories,
+        model_id="fake-chat",
+        capabilities=["structured_output"],
+    )
+    provider = FakeProviderClient(
+        structured_output={
+            "choices": [
+                {"body": "Follow the lantern trail."},
+                {"body": "Question the bridge keeper."},
+                {"body": "Wait for the fog to lift."},
+                {"body": "Search the abandoned cart."},
+            ]
+        }
+    )
+    repositories.set_model_preference(
+        task=CHARACTER_ACTION_PLANNING_TASK,
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    def retry_progress(_progress: object) -> None:
+        return
+
+    asyncio.run(
+        ActionChoiceService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).generate_for_message(
+            save_id=save_id,
+            narrator_message_id=narrator_id,
+            retry_progress_callback=retry_progress,
+        )
+    )
+
+    assert (
+        provider.structured_output_requests[0].retry_progress_callback
+        is retry_progress
+    )
+
+
 def test_action_choice_service_skips_storyteller_saves(
     repositories: PersistenceRepositories,
 ) -> None:

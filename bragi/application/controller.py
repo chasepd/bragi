@@ -995,6 +995,7 @@ class BragiRuntime:
         narrator_message_id: str,
         active_save_id: str | None | object = ...,
         current_user_id: str | None = None,
+        retry_progress_callback: ProviderRetryProgressCallback | None = None,
     ) -> RuntimeModel:
         save_id = (
             self.active_save_id
@@ -1016,6 +1017,7 @@ class BragiRuntime:
                 save_id=save_id,
                 narrator_message_id=narrator_message_id,
                 current_user_id=current_user_id,
+                retry_progress_callback=retry_progress_callback,
             )
         except Exception as exc:  # noqa: BLE001 - provider failures become model errors
             log_error_event(
@@ -1032,6 +1034,10 @@ class BragiRuntime:
             "runtime.action_choice_regenerated",
             save_id=save_id,
             narrator_message_id=narrator_message_id,
+        )
+        TurnSnapshotService(self.repositories).capture_current_head_if_dirty(
+            save_id,
+            reason="action_choices",
         )
         return self.build_model(
             status="Action choices regenerated",
@@ -1491,6 +1497,7 @@ class BragiRuntime:
         owner_user_id: str | None = None,
         remember_process_active_save: bool = True,
         current_user_id: str | None = None,
+        defer_opening_action_choices: bool = False,
     ) -> RuntimeModel:
         try:
             source_metadata = _scenario_source_metadata_without_loss_conditions(
@@ -1685,11 +1692,12 @@ class BragiRuntime:
                 content=seed_content,
                 source_message_id=opening_message_id,
             )
-            await self._generate_opening_action_choices_if_configured(
-                save_id=save.id,
-                opening_message_id=opening_message_id,
-                current_user_id=current_user_id,
-            )
+            if not defer_opening_action_choices:
+                await self._generate_opening_action_choices_if_configured(
+                    save_id=save.id,
+                    opening_message_id=opening_message_id,
+                    current_user_id=current_user_id,
+                )
             TurnSnapshotService(self.repositories).capture_current_head_if_dirty(
                 save.id,
                 reason="opening_message",
@@ -8447,10 +8455,20 @@ def _action_choices_model(
     *,
     save_id: str,
 ) -> ActionChoicesModel | None:
-    choices = repositories.latest_message_action_choices(save_id)
-    if not choices:
+    narrator_message = next(
+        (
+            message
+            for message in reversed(repositories.list_messages(save_id))
+            if message.role == "narrator" and message.deleted_at is None
+        ),
+        None,
+    )
+    if narrator_message is None:
         return None
-    narrator_message_id = choices[0].message_id
+    choices = repositories.list_message_action_choices(
+        save_id,
+        message_id=narrator_message.id,
+    )
     models = tuple(
         ActionChoiceModel(
             choice_id=choice.id,
@@ -8459,12 +8477,12 @@ def _action_choices_model(
             content_rating=choice.content_rating,
         )
         for choice in choices
-        if choice.message_id == narrator_message_id
+        if choice.message_id == narrator_message.id
     )
-    if len(models) != 4:
+    if models and len(models) != 4:
         return None
     return ActionChoicesModel(
-        narrator_message_id=narrator_message_id,
+        narrator_message_id=narrator_message.id,
         choices=models,
     )
 

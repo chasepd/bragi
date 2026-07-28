@@ -3219,7 +3219,28 @@ function Workbench({
         }
         if (appliesToCurrentSave && done.status === "succeeded") options.onSucceeded?.(done.result);
         if (appliesToCurrentSave && done.status === "failed") {
-          options.onFailed?.(done.error || "Background job failed.", done);
+          const error = done.error || "Background job failed.";
+          if (done.type === "action_choice_generate") {
+            appliedRuntimeResult = true;
+            client.setQueryData<RuntimeModel>(
+              runtimeQueryKey(done.save_id ?? activeSaveIdRef.current),
+              (current) => current?.action_choices
+                && (
+                  !current.action_choices.generation_job
+                  || current.action_choices.generation_job.id === done.id
+                )
+                ? {
+                  ...current,
+                  action_choices: {
+                    ...current.action_choices,
+                    generation_job: null,
+                    generation_error: error
+                  }
+                }
+                : current
+            );
+          }
+          options.onFailed?.(error, done);
         }
         if (appliesToCurrentSave) {
           if (options.clearPendingMessages !== false) {
@@ -3316,6 +3337,21 @@ function Workbench({
       runJob(active);
     }
   }, [activeJobs.data?.jobs, runJob]);
+
+  const openingActionChoiceJob = model?.action_choices?.generation_job;
+  useEffect(() => {
+    if (
+      !openingActionChoiceJob
+      || !["queued", "running"].includes(openingActionChoiceJob.status)
+    ) {
+      return;
+    }
+    runJob(openingActionChoiceJob);
+  }, [
+    openingActionChoiceJob?.id,
+    openingActionChoiceJob?.status,
+    runJob
+  ]);
 
   useEffect(() => {
     setTrackedJobs((current) => {
@@ -3570,6 +3606,7 @@ function Workbench({
             runJob={runJob}
             activeSaveId={activeSaveId}
             actionChoices={model?.action_choices ?? null}
+            generationActive={pendingJobs.some(({ job }) => job.type === "action_choice_generate")}
             pendingAfterMessageId={pendingAfterMessageId}
             onPendingMessage={setPendingMessage}
           />
@@ -6556,6 +6593,7 @@ function CyoaActionPicker({
   runJob,
   activeSaveId,
   actionChoices,
+  generationActive = false,
   pendingAfterMessageId = null,
   onPendingMessage
 }: {
@@ -6563,6 +6601,7 @@ function CyoaActionPicker({
   runJob: RunJob;
   activeSaveId: string | null;
   actionChoices: RuntimeModel["action_choices"];
+  generationActive?: boolean;
   pendingAfterMessageId?: string | null;
   onPendingMessage: (message: PendingChronicleMessage | null) => void;
 }) {
@@ -6616,10 +6655,12 @@ function CyoaActionPicker({
   }, [activeSaveId, actionChoices?.narrator_message_id]);
 
   const choices = [...(actionChoices?.choices ?? [])].sort((left, right) => left.ordinal - right.ordinal);
+  const choicesGenerating = generationActive || Boolean(actionChoices?.generation_job);
+  const customActionLabel = choicesGenerating ? "Generating choices..." : "Write your own";
   const submitBusy = submittingSaveId === activeSaveId || submittingSaveIdRef.current === activeSaveId;
   const regenerateBusy = regenerate.isPending;
-  const canSubmit = !disabled && !submitBusy;
-  const canRegenerate = !disabled && !submitBusy && !regenerateBusy && Boolean(activeSaveId && actionChoices?.narrator_message_id);
+  const canSubmit = !disabled && !submitBusy && !choicesGenerating;
+  const canRegenerate = !disabled && !submitBusy && !regenerateBusy && !choicesGenerating && Boolean(activeSaveId && actionChoices?.narrator_message_id);
   const submitBody = (body: string) => {
     const submittedBody = body.trim();
     if (!canSubmit || !submittedBody) return;
@@ -6661,14 +6702,14 @@ function CyoaActionPicker({
           <button
             type="button"
             className="cyoa-custom-toggle"
-            disabled={disabled || submitBusy}
-            title="Write your own"
-            aria-label="Write your own"
+            disabled={disabled || submitBusy || choicesGenerating}
+            aria-label={customActionLabel}
+            aria-live="polite"
             aria-expanded={manualOpen}
             onClick={() => setManualOpen((current) => !current)}
           >
             <Edit3 size={17} aria-hidden="true" />
-            <span>Write your own</span>
+            <span>{customActionLabel}</span>
           </button>
           {manualOpen ? (
             <form
@@ -6704,6 +6745,7 @@ function CyoaActionPicker({
           </button>
         ) : null}
       </div>
+      {actionChoices?.generation_error ? <InlineNotice className="composer-error">{actionChoices.generation_error}</InlineNotice> : null}
       {submitError ? <InlineNotice className="composer-error">{submitError}</InlineNotice> : null}
     </section>
   );
@@ -9232,6 +9274,7 @@ function isChatJobType(type: string) {
   return type === "chat_turn"
     || type === "look_around"
     || type === "chat_regenerate"
+    || type === "action_choice_generate"
     || type === "action_choice_regenerate"
     || type === "chat_edit"
     || type === "message_edit"

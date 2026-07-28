@@ -21,6 +21,7 @@ from bragi.providers.contracts import (
     ChatMessage,
     ChatRequest,
     ProviderClient,
+    ProviderRetryProgressCallback,
     StructuredOutputProvider,
     StructuredOutputRequest,
 )
@@ -81,12 +82,14 @@ class ActionChoiceService:
         narrator_message_id: str,
         save_details: SaveDetailsRecord | None = None,
         current_user_id: str | None = None,
+        retry_progress_callback: ProviderRetryProgressCallback | None = None,
     ) -> list[MessageActionChoiceRecord]:
         prepared = self.prepare_for_message(
             save_id=save_id,
             narrator_message_id=narrator_message_id,
             save_details=save_details,
             current_user_id=current_user_id,
+            retry_progress_callback=retry_progress_callback,
         )
         if prepared is None:
             return []
@@ -99,6 +102,7 @@ class ActionChoiceService:
         narrator_message_id: str,
         save_details: SaveDetailsRecord | None = None,
         current_user_id: str | None = None,
+        retry_progress_callback: ProviderRetryProgressCallback | None = None,
     ) -> PreparedActionChoiceGeneration | None:
         details = save_details or self.repositories.load_save_details(save_id)
         if details is None:
@@ -166,6 +170,7 @@ class ActionChoiceService:
             ),
             temperature=0.45,
             max_output_tokens=600,
+            retry_progress_callback=retry_progress_callback,
         )
         return PreparedActionChoiceGeneration(
             save_id=save_id,

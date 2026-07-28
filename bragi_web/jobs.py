@@ -901,7 +901,7 @@ def _provider_task_for_job_type(job_type: str) -> str | None:
         "character_text_edit",
     }:
         return "chat"
-    if job_type == "action_choice_regenerate":
+    if job_type in {"action_choice_generate", "action_choice_regenerate"}:
         return "action_choice_generation"
     if job_type in {
         "image_generation",

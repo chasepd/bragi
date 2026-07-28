@@ -47,6 +47,8 @@ export type RuntimeActionChoice = {
 export type RuntimeActionChoices = {
   narrator_message_id: string;
   choices: RuntimeActionChoice[];
+  generation_job?: Job | null;
+  generation_error?: string | null;
 };
 
 export type CharacterTextContact = {
