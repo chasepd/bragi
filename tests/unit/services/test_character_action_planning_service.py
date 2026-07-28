@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
@@ -25,6 +26,9 @@ from bragi.services.character_action_planning_service import (
     CHARACTER_ACTION_PLANNING_MAX_CONCURRENCY_SETTING,
     CHARACTER_ACTION_PLANNING_TASK,
     CharacterActionPlanningService,
+    _character_presence_messages,
+    _planning_characters_for_turn,
+    _planning_evidence_sources,
     character_action_planning_enabled,
     format_character_turn_assessment,
 )
@@ -1386,6 +1390,60 @@ def test_character_action_planning_is_enabled_by_default(
     save_id, _, _ = _create_save_with_characters(repositories)
 
     assert character_action_planning_enabled(repositories, save_id=save_id) is True
+
+
+def test_storyteller_planning_includes_all_characters_and_excludes_direction_evidence(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Ceremony",
+        premise="A rival waits in the wings.",
+        player_role="",
+        content={},
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Act One")
+    rival = repositories.add_character(save_id=save.id, name="The Rival")
+    witness = repositories.add_character(save_id=save.id, name="The Witness")
+    direction = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="Have the rival interrupt the ceremony.",
+    )
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The orchestra prepares for the final movement.",
+    )
+
+    planned = _planning_characters_for_turn(
+        repositories=repositories,
+        save_id=save.id,
+        source_message=direction,
+    )
+    assert {character.id for character in planned} == {rival.id, witness.id}
+    evidence = _planning_evidence_sources(
+        repositories=repositories,
+        save_id=save.id,
+        character=rival,
+        source_message=direction,
+        messages=(direction, narrator),
+    )
+    assert f"message:{direction.id}" not in evidence
+    assert f"message:{narrator.id}" in evidence
+    prompts = _character_presence_messages(
+        repositories=repositories,
+        save_id=save.id,
+        character=rival,
+        source_message=direction,
+        messages=(direction, narrator),
+        evidence_sources=evidence,
+    )
+    prompt = "\n".join(message.body for message in prompts)
+    assert "narrator-controlled character" in prompt
+    assert "non-diegetic story direction" in prompt
+    assert "not canonical evidence" in prompt
 
 
 def test_character_action_planning_can_be_disabled_per_save(

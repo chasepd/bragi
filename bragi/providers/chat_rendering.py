@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bragi.interaction_mode import InteractionMode
 from bragi.providers.contracts import (
     CHAT_TURN_DIRECTIVE_PURPOSE_CHARACTER_TEXT,
     NARRATOR_PROMPT_MODE_PLAN_FIRST,
@@ -13,9 +14,17 @@ from bragi.providers.message_names import provider_message_name
 from bragi.providers.system_prompt import (
     DEFAULT_NPC_KNOWLEDGE_BOUNDARY_SECTION,
     DEFAULT_RESPONSE_STYLE_SECTION,
+    STORYTELLER_INTERACTION_SECTION,
     prose_safety_section,
 )
 from bragi.providers.token_accounting import estimate_text_tokens
+
+_STORY_DIRECTION_PREFIX = (
+    "BEGIN NON-DIEGETIC STORY DIRECTION\n"
+    "The following text guides what the narrator should write. It is not "
+    "in-world dialogue, action, or canonical evidence.\n"
+)
+_STORY_DIRECTION_SUFFIX = "\nEND NON-DIEGETIC STORY DIRECTION"
 
 
 def provider_chat_messages(request: ChatRequest) -> list[dict[str, str]]:
@@ -23,16 +32,32 @@ def provider_chat_messages(request: ChatRequest) -> list[dict[str, str]]:
     system_body = chat_system_body(request)
     if system_body:
         messages.append({"role": "system", "content": system_body})
-    messages.extend(provider_chat_message(message) for message in request.messages)
+    messages.extend(
+        provider_chat_message(
+            message,
+            interaction_mode=request.interaction_mode,
+        )
+        for message in request.messages
+    )
     return messages
 
 
-def provider_chat_message(message: ChatMessage) -> dict[str, str]:
+def provider_chat_message(
+    message: ChatMessage,
+    *,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
+) -> dict[str, str]:
     role = {
         "player": "user",
         "narrator": "assistant",
     }.get(message.role, message.role)
-    payload = {"role": role, "content": message.body}
+    body = message.body
+    if (
+        interaction_mode is InteractionMode.STORYTELLER
+        and message.role == "player"
+    ):
+        body = f"{_STORY_DIRECTION_PREFIX}{body}{_STORY_DIRECTION_SUFFIX}"
+    payload = {"role": role, "content": body}
     safe_name = provider_message_name(message.speaker_name)
     if safe_name and role in {"user", "assistant"}:
         payload["name"] = safe_name
@@ -161,8 +186,14 @@ def _narrator_prompt_mode_section(request: ChatRequest) -> str:
 def _purpose_instruction_sections(request: ChatRequest) -> tuple[str, ...]:
     purpose = _effective_prompt_purpose(request)
     if purpose is ChatPromptPurpose.NARRATOR:
+        mode_sections = (
+            (STORYTELLER_INTERACTION_SECTION,)
+            if request.interaction_mode is InteractionMode.STORYTELLER
+            else ()
+        )
         return (
             request.response_style_section or DEFAULT_RESPONSE_STYLE_SECTION,
+            *mode_sections,
             DEFAULT_NPC_KNOWLEDGE_BOUNDARY_SECTION,
             _narrator_prompt_mode_section(request),
         )

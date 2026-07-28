@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.providers.chat_rendering import (
     chat_system_body,
     estimate_chat_request_tokens,
@@ -484,3 +485,42 @@ def test_chat_system_body_renders_character_action_plans_after_voice() -> None:
         < body.index("Character voice profiles:")
         < body.index("Open obligations:")
     )
+def test_storyteller_prompt_wraps_human_messages_as_non_diegetic_direction() -> None:
+    request = ChatRequest(
+        provider="fake",
+        model_id="fake-chat",
+        messages=(
+            ChatMessage(role="player", body="Have the rival interrupt the ceremony."),
+            ChatMessage(role="narrator", body="The doors burst open."),
+            ChatMessage(role="player", body="Shift to the rival's viewpoint."),
+        ),
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+
+    messages = provider_chat_messages(request)
+
+    assert "Storyteller interaction contract" in messages[0]["content"]
+    assert "control every in-world character" in messages[0]["content"]
+    assert "must not invent a player avatar" in messages[0]["content"]
+    assert (
+        "established canon outranks contradictory direction"
+        in messages[0]["content"]
+    )
+    assert messages[1]["role"] == "user"
+    assert "BEGIN NON-DIEGETIC STORY DIRECTION" in messages[1]["content"]
+    assert "Have the rival interrupt the ceremony." in messages[1]["content"]
+    assert messages[2] == {"role": "assistant", "content": "The doors burst open."}
+    assert "BEGIN NON-DIEGETIC STORY DIRECTION" in messages[3]["content"]
+
+
+def test_roleplay_prompt_and_messages_remain_unchanged() -> None:
+    request = ChatRequest(
+        provider="fake",
+        model_id="fake-chat",
+        messages=(ChatMessage(role="player", body="I open the door."),),
+    )
+
+    messages = provider_chat_messages(request)
+
+    assert "Storyteller interaction contract" not in messages[0]["content"]
+    assert messages[1] == {"role": "user", "content": "I open the door."}

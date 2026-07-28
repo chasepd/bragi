@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.chat_rendering import provider_chat_messages
@@ -152,6 +153,45 @@ def test_generate_draft_uses_shared_prose_safety_prompt(
     assert all(
         DEFAULT_PROSE_SAFETY_SECTION
         in provider_chat_messages(request)[0]["content"]
+        for request in provider.chat_requests
+    )
+
+
+def test_generate_draft_preserves_saved_storyteller_mode(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Ceremony",
+        premise="A rival waits in the wings.",
+        player_role="",
+        content={"opening_message": "The orchestra falls silent."},
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Act One")
+    repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The rival steps through the gallery doors.",
+    )
+    provider = RecordingContinuationProvider()
+    service = ContinuationScenarioService(
+        repositories=repositories,
+        scenario_service=ScenarioService(
+            repositories=repositories,
+            provider=provider,
+            provider_name="fake",
+            model_id="fake-chat",
+        ),
+    )
+
+    draft = asyncio.run(service.generate_draft(save_id=save.id))
+
+    assert draft.interaction_mode is InteractionMode.STORYTELLER
+    assert provider.chat_requests
+    assert all(
+        request.interaction_mode is InteractionMode.STORYTELLER
         for request in provider.chat_requests
     )
 
@@ -357,6 +397,38 @@ def test_seed_continuation_characters_creates_portable_character_records(
     assert characters[0].private_notes == "Knows the bell is a prison."
     assert characters[0].protected_from_maintenance is True
     assert characters[0].source_message_id == opening.id
+
+
+def test_seed_continuation_characters_can_exclude_player_character(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Chapter Two",
+        premise="The ensemble continues.",
+        player_role="",
+        content={},
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Chapter Two")
+
+    created = seed_continuation_characters(
+        repositories=repositories,
+        save_id=save.id,
+        source_message_id=None,
+        include_player_character=False,
+        metadata={
+            "character_continuity": [
+                {"name": "Legacy Avatar", "is_player_character": True},
+                {"name": "Captain Ilyra", "is_player_character": False},
+            ]
+        },
+    )
+
+    assert created == 1
+    assert [character.name for character in repositories.list_characters(save.id)] == [
+        "Captain Ilyra"
+    ]
 
 
 def _create_continuation_save(

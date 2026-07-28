@@ -90,6 +90,12 @@ class CharacterTextRevisionService:
         self.providers = providers
         self.media_service = media_service
 
+    def _raise_unless_enabled(self, save_id: str) -> None:
+        CharacterTextService(
+            repositories=self.repositories,
+            providers=self.providers,
+        ).raise_unless_enabled(save_id)
+
     def edit_text_without_resubmit(
         self,
         *,
@@ -97,6 +103,7 @@ class CharacterTextRevisionService:
         text_message_id: str,
         body: str,
     ) -> CharacterTextEditResult:
+        self._raise_unless_enabled(save_id)
         return self._edit_text_body(
             save_id=save_id,
             text_message_id=text_message_id,
@@ -112,6 +119,7 @@ class CharacterTextRevisionService:
         text_message_id: str,
         body: str,
     ) -> CharacterTextEditResult:
+        self._raise_unless_enabled(save_id)
         return self._edit_text_body(
             save_id=save_id,
             text_message_id=text_message_id,
@@ -128,6 +136,7 @@ class CharacterTextRevisionService:
         body: str,
         current_user_id: str | None,
     ) -> CharacterTextEditResult:
+        self._raise_unless_enabled(save_id)
         policy = effective_content_safety_policy(
             self.repositories,
             user_id=current_user_id,
@@ -158,6 +167,7 @@ class CharacterTextRevisionService:
         body: str,
         current_user_id: str | None = None,
     ) -> CharacterTextResubmitResult:
+        self._raise_unless_enabled(save_id)
         replacement = _replacement_body(body)
         self.repositories.begin_transaction()
         try:
@@ -259,6 +269,7 @@ class CharacterTextRevisionService:
         save_id: str,
         text_message_id: str,
     ) -> CharacterTextDeletionResult:
+        self._raise_unless_enabled(save_id)
         self.repositories.begin_transaction()
         try:
             selected = self._active_text_message(

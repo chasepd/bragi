@@ -8,6 +8,7 @@ from typing import cast
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import MessageRecord, SaveRecord
 from bragi.persistence.repositories import PersistenceRepositories
@@ -401,6 +402,38 @@ def test_summary_service_summarizes_older_messages_and_persists_metadata(
     jobs = _summarization_jobs(repositories, save.id)
     assert jobs[-1]["status"] == "succeeded"
     assert summary.id in jobs[-1]["result_json"]
+
+
+def test_storyteller_summary_advances_over_directions_but_uses_narration_as_evidence(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, messages = _save_with_summary_preference(
+        repositories,
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    provider = RecordingSummaryProvider(
+        response_body="A bell rang under the ash bridge.",
+    )
+    service = SummaryService(
+        repositories=repositories,
+        providers={"fake": provider},
+        threshold=0.50,
+    )
+
+    summary = asyncio.run(
+        service.summarize_if_needed(
+            save_id=save.id,
+            context_window=180,
+        )
+    )
+
+    assert summary is not None
+    assert summary.covers_message_start_id == messages[0].id
+    assert summary.covers_message_end_id == messages[1].id
+    assert summary.source_message_ids == (messages[1].id,)
+    prompt = _request_prompt(provider.chat_requests[0])
+    assert "A bell rings under the span." in prompt
+    assert "I step onto the ash bridge." not in prompt
 
 
 def test_summary_service_prompts_for_factual_continuity_ledger(
@@ -1079,12 +1112,15 @@ def test_summary_service_marks_job_failed_when_configured_provider_is_missing(
 
 def _save_with_summary_preference(
     repositories: PersistenceRepositories,
+    *,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
 ) -> tuple[SaveRecord, list[MessageRecord]]:
     scenario = repositories.create_scenario(
         type="full_roleplay",
         title="Bridge of Cinders",
         premise="A bridge remembers every oath broken on it.",
         player_role="Oathkeeper",
+        interaction_mode=interaction_mode,
         content={"starting_scene": "Cinders drift over the bridge stones."},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Crossing")

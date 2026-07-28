@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, cast
 from uuid import uuid4
 
+from bragi.interaction_mode import InteractionMode, normalize_interaction_mode
 from bragi.observation_types import normalize_observation_type
 from bragi.persistence.context_provenance import merge_context_source_metadata
 from bragi.persistence.migrations import (
@@ -598,7 +599,9 @@ class PersistenceRepositories:
         player_role: str,
         content: dict[str, object],
         scenario_id: str | None = None,
+        interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
     ) -> ScenarioRecord:
+        normalized_interaction_mode = normalize_interaction_mode(interaction_mode)
         record = ScenarioRecord(
             id=scenario_id or _new_id(),
             type=type,
@@ -606,11 +609,14 @@ class PersistenceRepositories:
             premise=premise,
             player_role=player_role,
             content_json=_dump_json(content),
+            interaction_mode=normalized_interaction_mode,
         )
         self.connection.execute(
             """
-            INSERT INTO scenarios(id, type, title, premise, player_role, content_json)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO scenarios(
+                id, type, title, premise, player_role, interaction_mode, content_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -618,6 +624,7 @@ class PersistenceRepositories:
                 record.title,
                 record.premise,
                 record.player_role,
+                record.interaction_mode.value,
                 record.content_json,
             ),
         )
@@ -635,9 +642,16 @@ class PersistenceRepositories:
         save_id: str | None = None,
         custom_instructions: str = "",
         owner_user_id: str | None = None,
+        interaction_mode: InteractionMode | str | None = None,
     ) -> SaveRecord:
         if owner_user_id is not None and self.get_user(owner_user_id) is None:
             raise ValueError(f"Unknown user id: {owner_user_id}")
+        scenario = self.get_scenario(scenario_id)
+        if scenario is None:
+            raise ValueError(f"Unknown scenario id: {scenario_id}")
+        normalized_interaction_mode = normalize_interaction_mode(
+            scenario.interaction_mode if interaction_mode is None else interaction_mode
+        )
         record = SaveRecord(
             id=save_id or _new_id(),
             scenario_id=scenario_id,
@@ -645,13 +659,15 @@ class PersistenceRepositories:
             active=True,
             custom_instructions=custom_instructions.strip(),
             owner_user_id=owner_user_id,
+            interaction_mode=normalized_interaction_mode,
         )
         self.connection.execute(
             """
             INSERT INTO saves(
-                id, scenario_id, title, active, custom_instructions, owner_user_id
+                id, scenario_id, title, active, custom_instructions, owner_user_id,
+                interaction_mode
             )
-            VALUES (?, ?, ?, 1, ?, ?)
+            VALUES (?, ?, ?, 1, ?, ?, ?)
             """,
             (
                 record.id,
@@ -659,6 +675,7 @@ class PersistenceRepositories:
                 record.title,
                 record.custom_instructions,
                 record.owner_user_id,
+                record.interaction_mode.value,
             ),
         )
         self.commit()
@@ -677,6 +694,7 @@ class PersistenceRepositories:
                 saves.title,
                 saves.active,
                 saves.custom_instructions,
+                saves.interaction_mode,
                 saves.owner_user_id,
                 saves.created_at,
                 saves.updated_at,
@@ -702,6 +720,7 @@ class PersistenceRepositories:
             SELECT DISTINCT
                 saves.id, saves.scenario_id, saves.title, saves.active,
                 saves.custom_instructions, saves.owner_user_id,
+                saves.interaction_mode,
                 saves.created_at, saves.updated_at, saves.last_opened_at,
                 scenarios.title AS scenario_title
             FROM saves
@@ -859,19 +878,21 @@ class PersistenceRepositories:
     def get_scenario(self, scenario_id: str) -> ScenarioRecord | None:
         row = self._fetch_one(
             """
-            SELECT id, type, title, premise, player_role, content_json,
+            SELECT id, type, title, premise, player_role, interaction_mode,
+                   content_json,
                    created_at, updated_at
             FROM scenarios
             WHERE id = ?
             """,
             (scenario_id,),
         )
-        return ScenarioRecord(**dict(row)) if row else None
+        return _scenario_from_row(row) if row else None
 
     def list_scenarios(self) -> list[ScenarioRecord]:
         rows = self._fetch_all(
             """
-            SELECT id, type, title, premise, player_role, content_json,
+            SELECT id, type, title, premise, player_role, interaction_mode,
+                   content_json,
                    created_at, updated_at
             FROM scenarios
             ORDER BY
@@ -881,7 +902,7 @@ class PersistenceRepositories:
             """,
             (),
         )
-        return [ScenarioRecord(**dict(row)) for row in rows]
+        return [_scenario_from_row(row) for row in rows]
 
     def update_scenario(
         self,
@@ -891,11 +912,21 @@ class PersistenceRepositories:
         premise: str,
         player_role: str,
         content: dict[str, object],
+        interaction_mode: InteractionMode | str | None = None,
     ) -> ScenarioRecord:
+        existing = self.get_scenario(scenario_id)
+        if existing is None:
+            raise ValueError(f"Unknown scenario id: {scenario_id}")
+        normalized_interaction_mode = normalize_interaction_mode(
+            existing.interaction_mode
+            if interaction_mode is None
+            else interaction_mode
+        )
         self.connection.execute(
             """
             UPDATE scenarios
             SET title = ?, premise = ?, player_role = ?, content_json = ?,
+                interaction_mode = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
@@ -904,6 +935,7 @@ class PersistenceRepositories:
                 premise,
                 player_role,
                 _dump_json(content),
+                normalized_interaction_mode.value,
                 scenario_id,
             ),
         )
@@ -992,6 +1024,7 @@ class PersistenceRepositories:
                 saves.title,
                 saves.active,
                 saves.custom_instructions,
+                saves.interaction_mode,
                 saves.owner_user_id,
                 saves.created_at,
                 saves.updated_at,
@@ -13776,7 +13809,18 @@ def _save_from_row(row: sqlite3.Row) -> SaveRecord:
         created_at=_row_value(row, "created_at"),
         updated_at=_row_value(row, "updated_at"),
         last_opened_at=_row_value(row, "last_opened_at"),
+        interaction_mode=normalize_interaction_mode(
+            _row_value(row, "interaction_mode")
+        ),
     )
+
+
+def _scenario_from_row(row: sqlite3.Row) -> ScenarioRecord:
+    values = dict(row)
+    values["interaction_mode"] = normalize_interaction_mode(
+        values.get("interaction_mode")
+    )
+    return ScenarioRecord(**values)
 
 
 def _row_value(row: sqlite3.Row, key: str) -> str | None:

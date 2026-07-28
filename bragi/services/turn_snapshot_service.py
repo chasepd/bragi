@@ -624,6 +624,7 @@ class TurnSnapshotService:
                 title=title,
                 custom_instructions=source_save.custom_instructions,
                 owner_user_id=owner_user_id or source_save.owner_user_id,
+                interaction_mode=source_save.interaction_mode,
             )
             for row in rows_by_table.get("messages", ()):
                 self._insert_row(

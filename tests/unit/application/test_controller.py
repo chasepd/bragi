@@ -18,6 +18,7 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import SaveRecord
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
@@ -724,6 +725,44 @@ def test_manual_action_choice_scenario_generates_opening_action_choices(
     ]
     assert provider.structured_requests
     assert _value(model, "error") is None
+
+
+def test_manual_storyteller_scenario_ignores_stale_player_fields_and_choices(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+
+    model = controller.create_manual_scenario(
+        runtime.ManualScenarioInput(
+            scenario_type="full_roleplay",
+            interaction_mode=InteractionMode.STORYTELLER,
+            action_choices_enabled=True,
+            title="The Ceremony",
+            premise="A rival waits in the wings.",
+            player_role="Legacy hero",
+            player_character_name="Legacy avatar",
+            player_character_profile="Legacy profile",
+            opening_message="The orchestra falls silent.",
+        )
+    )
+
+    save_id = _value(model, "active_save_id")
+    assert save_id is not None
+    details = repositories.load_save_details(save_id)
+    assert details is not None
+    assert details.save.interaction_mode is InteractionMode.STORYTELLER
+    assert details.scenario.interaction_mode is InteractionMode.STORYTELLER
+    assert repositories.list_characters(save_id) == []
+    content = json.loads(details.scenario.content_json)
+    assert "player_role" not in content
+    assert "player_character_name" not in content
+    assert "player_character_profile" not in content
+    assert content.get("action_choices_enabled", False) is False
+    assert _value(model, "interaction_mode") is InteractionMode.STORYTELLER
+    assert _value(model, "action_choices") is None
 
 
 def test_save_action_choice_scenario_draft_returns_opening_action_choices(
@@ -5780,8 +5819,10 @@ def test_start_saved_scenario_seeds_registry_from_character_starters(
         title="Glass Harbor",
         premise="A drowned harbor rings its bell at low tide.",
         player_role="Harbor warden",
+        interaction_mode=InteractionMode.STORYTELLER,
         content=_rated_scenario_content({
             "opening_message": "The harbor bell rings under the mud.",
+            "player_character_name": "Legacy Avatar",
             "characters": "Legacy NPC",
             "character_starters": [
                 {
@@ -5811,6 +5852,7 @@ def test_start_saved_scenario_seeds_registry_from_character_starters(
     active_save_id = _value(model, "active_save_id")
     characters = repositories.list_characters(active_save_id)
     assert [character.name for character in characters] == ["Captain Ilyra"]
+    assert all(not character.is_player_character for character in characters)
     character = characters[0]
     assert character.aliases == ["Ilyra"]
     assert character.role == "Watch captain"

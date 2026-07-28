@@ -14,6 +14,7 @@ from bragi.content_rating_instructions import (
     content_rating_exceeds,
     maximum_content_rating,
 )
+from bragi.interaction_mode import InteractionMode, normalize_interaction_mode
 from bragi.persistence.models import (
     ActiveThreadRecord,
     CharacterKnowledgeEdgeRecord,
@@ -73,6 +74,7 @@ class WorldDataScenarioModel:
     content_sections: tuple[tuple[str, str], ...]
     generation_prompt: str | None = None
     character_starters: tuple[ScenarioCharacterStarter, ...] = ()
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
 
 
 @dataclass(frozen=True)
@@ -482,6 +484,7 @@ class ScenarioEdit:
     player_character_name: str = ""
     character_starters: tuple[ScenarioCharacterStarter, ...] = ()
     section_content_ratings: tuple[tuple[str, str], ...] = ()
+    interaction_mode: InteractionMode | str | None = None
 
 
 @dataclass(frozen=True)
@@ -627,6 +630,7 @@ class WorldDataService:
             scenario=_scenario_model_from_record(
                 details.scenario,
                 allowed_rating=self.allowed_content_rating,
+                interaction_mode=active_save.interaction_mode,
             ),
             world_state=tuple(
                 WorldDataStateRow(
@@ -840,8 +844,13 @@ class WorldDataService:
             visible_content,
         ) = _scenario_edit_values(edit, scenario_type=scenario.type)
         scenario_model = _scenario_model_from_record(scenario)
+        interaction_mode = normalize_interaction_mode(
+            edit.interaction_mode
+            if isinstance(edit, ScenarioEdit) and edit.interaction_mode is not None
+            else scenario.interaction_mode
+        )
         linked_save_count = self.repositories.count_saves_for_scenario(scenario_id)
-        if _scenario_values_changed(
+        if interaction_mode != scenario.interaction_mode or _scenario_values_changed(
             scenario=scenario_model,
             title=title,
             premise=premise,
@@ -860,6 +869,7 @@ class WorldDataService:
                 premise=premise,
                 player_role=player_role,
                 content=content,
+                interaction_mode=interaction_mode,
             )
         log_event(
             "world_data.scenario_definition_applied",
@@ -1372,6 +1382,7 @@ def _scenario_id_for_single_save_edit(
             premise=premise,
             player_role=player_role,
             content=content,
+            interaction_mode=scenario.interaction_mode,
         )
         repositories.update_save_scenario(
             save_id=save_id,
@@ -1399,7 +1410,9 @@ def _scenario_model_from_record(
     scenario: ScenarioRecord,
     *,
     allowed_rating: str | None = None,
+    interaction_mode: InteractionMode | None = None,
 ) -> WorldDataScenarioModel:
+    effective_interaction_mode = interaction_mode or scenario.interaction_mode
     if allowed_rating is not None and content_rating_exceeds(
         minimum_rating=scenario_content_rating(scenario.content_json),
         allowed_rating=allowed_rating,
@@ -1412,6 +1425,7 @@ def _scenario_model_from_record(
             player_character_name="",
             player_role=CONTENT_FILTER_TRANSITION,
             content_sections=(),
+            interaction_mode=effective_interaction_mode,
         )
     scenario_content = _scenario_content(scenario.content_json)
     return WorldDataScenarioModel(
@@ -1428,6 +1442,7 @@ def _scenario_model_from_record(
         ),
         generation_prompt=_scenario_generation_prompt(scenario_content),
         character_starters=_scenario_character_starters(scenario_content),
+        interaction_mode=effective_interaction_mode,
     )
 
 
