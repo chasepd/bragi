@@ -253,6 +253,7 @@ from bragi.services.turn_snapshot_service import TurnSnapshotService
 from bragi.services.world_context_retention_service import WorldContextRetentionService
 from bragi.services.world_data_service import WorldDataModel, WorldDataService
 from bragi.services.world_suggestion_review_service import WorldSuggestionReviewService
+from bragi_common.story_continuation import is_story_continuation_message
 
 
 @dataclass(frozen=True)
@@ -605,7 +606,7 @@ class BragiRuntime:
         )
         active_save = _active_save(self.repositories, requested_save_id)
         details = (
-            self.repositories.load_save_details(
+            self.repositories.load_chronicle_details(
                 active_save.id,
                 message_limit=requested_chronicle_message_limit,
             )
@@ -729,7 +730,7 @@ class BragiRuntime:
         )
         active_save = _active_save(self.repositories, requested_save_id)
         details = (
-            self.repositories.load_save_details(
+            self.repositories.load_chronicle_details(
                 active_save.id,
                 message_limit=requested_chronicle_message_limit,
             )
@@ -831,7 +832,7 @@ class BragiRuntime:
         before_message_id: str | None = None,
         limit: int = 80,
     ) -> ChronicleModel:
-        details = self.repositories.load_save_details(
+        details = self.repositories.load_chronicle_details(
             save_id,
             message_limit=limit,
             before_message_id=before_message_id,
@@ -935,7 +936,11 @@ class BragiRuntime:
             save_id=save_id,
             status=status,
             error=error,
-            player_message_id=player_message.id,
+            player_message_id=(
+                None
+                if is_story_continuation_message(player_message)
+                else player_message.id
+            ),
             narrator_message_id=narrator_message.id,
             messages=chronicle.messages,
             action_choices=(

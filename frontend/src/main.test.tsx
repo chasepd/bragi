@@ -1895,6 +1895,62 @@ describe("frontend helpers", () => {
     );
   });
 
+  it("continues a storyteller chronicle without clearing drafted guidance", async () => {
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => path === "/api/chat/continue"
+        ? { id: "job-continue", type: "chat_turn", status: "queued", result: null, error: null }
+        : {}
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const runJob = vi.fn();
+    const onPendingMessage = vi.fn();
+    const { Composer } = await import("./main");
+
+    const { rerender } = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Composer
+          disabled={false}
+          runJob={runJob}
+          activeSaveId="save-1"
+          onPendingMessage={onPendingMessage}
+        />
+      </QueryClientProvider>
+    );
+
+    expect(screen.queryByRole("button", { name: "Continue story" })).not.toBeInTheDocument();
+
+    rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <Composer
+          disabled={false}
+          runJob={runJob}
+          activeSaveId="save-1"
+          onPendingMessage={onPendingMessage}
+          storytellerMode
+        />
+      </QueryClientProvider>
+    );
+
+    const textarea = screen.getByRole("textbox", { name: "Message" });
+    await userEvent.type(textarea, "Bring the rival back in the following scene.");
+    await userEvent.click(screen.getByRole("button", { name: "Continue story" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/chat/continue",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ save_id: "save-1" })
+      })
+    ));
+    expect(textarea).toHaveValue("Bring the rival back in the following scene.");
+    expect(onPendingMessage).not.toHaveBeenCalled();
+    expect(runJob).toHaveBeenCalledWith(expect.objectContaining({
+      id: "job-continue",
+      type: "chat_turn"
+    }));
+  });
+
   it("keeps regenerate feedback open and usable when submission fails", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: false,

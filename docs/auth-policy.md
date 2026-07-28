@@ -130,6 +130,7 @@ or per user/session before using a save ID.
 | `/api/scenarios/draft/character-starters/generate` | Authenticated | Generate draft character starters for the current user; child blocked. |
 | `/api/scenarios/draft/section` | Authenticated | Regenerate draft sections for the current user. |
 | `/api/chat` | Save-scoped | Submit chat only to an accessible save; child allowed for owned or assigned saves. |
+| `/api/chat/continue` | Save-scoped | Continue narration only for an accessible Storyteller-mode save when role policy allows chat. |
 | `/api/chat/look-around` | Save-scoped | Ask side-channel scene questions only for an accessible save; child allowed for owned or assigned saves. |
 | `/api/character-texts/send` | Save-scoped | Send side-channel character texts only to an accessible save when texts are enabled; child allowed for owned or assigned saves. |
 | `/api/character-texts/send-image` | Save-scoped | Send image-bearing side-channel character texts only to an accessible save when texts are enabled and role policy allows chat and media uploads. |

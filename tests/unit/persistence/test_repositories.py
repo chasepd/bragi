@@ -25,6 +25,10 @@ from bragi.services.scenario_evolution_policy import (
     scenario_template_evolution_turn_interval_setting_key,
 )
 from bragi.text_search import cjk_lexical_anchors
+from bragi_common.story_continuation import (
+    STORY_CONTINUATION_DIRECTION,
+    STORY_CONTINUATION_SPEAKER_NAME,
+)
 
 
 @pytest.fixture
@@ -334,6 +338,85 @@ def test_repositories_pages_messages_before_anchor(
     remaining = repositories.list_message_page(save.id, limit=3)
     assert [message.id for message in remaining.messages] == [messages[0].id]
     assert remaining.has_more_before is False
+
+
+def test_repositories_pages_chronicle_without_internal_story_continuations(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="",
+        content={},
+        interaction_mode="storyteller",
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    first_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The orchestra falls silent.",
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name=STORY_CONTINUATION_SPEAKER_NAME,
+        body=STORY_CONTINUATION_DIRECTION,
+    )
+    second_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The rival steps into the aisle.",
+    )
+
+    latest = repositories.list_message_page(
+        save.id,
+        limit=1,
+        chronicle_only=True,
+    )
+    previous = repositories.list_message_page(
+        save.id,
+        before_message_id=second_narrator.id,
+        limit=1,
+        chronicle_only=True,
+    )
+
+    assert [message.id for message in latest.messages] == [second_narrator.id]
+    assert latest.has_more_before is True
+    assert [message.id for message in previous.messages] == [first_narrator.id]
+    assert previous.has_more_before is False
+
+
+def test_chronicle_filters_keep_unnamed_player_with_continuation_text(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="",
+        content={},
+        interaction_mode="storyteller",
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name=None,
+        body=STORY_CONTINUATION_DIRECTION,
+    )
+
+    chronicle = repositories.list_message_page(
+        save.id,
+        chronicle_only=True,
+    )
+    chat_history = repositories.list_chat_history_message_page(save.id)
+
+    assert [message.id for message in chronicle.messages] == [player_message.id]
+    assert [message.id for message in chat_history.messages] == [player_message.id]
+    assert repositories.count_chat_history_messages(save.id) == 1
 
 
 def test_repositories_pages_chat_history_messages_with_sql_filters(

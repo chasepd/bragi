@@ -6445,6 +6445,8 @@ function Composer({
   activeSaveIdRef.current = activeSaveId;
   const submittingSaveIdRef = useRef<string | null | undefined>(undefined);
   const [submittingSaveId, setSubmittingSaveId] = useState<string | null | undefined>(undefined);
+  const continuingSaveIdRef = useRef<string | null | undefined>(undefined);
+  const [continuingSaveId, setContinuingSaveId] = useState<string | null | undefined>(undefined);
   const timeskipSubmittingRef = useRef(false);
   const submit = useMutation({
     mutationFn: (submitted: ChatSubmitVariables) => postJson<Job>("/api/chat", { body: submitted.body, speaker_name: null, save_id: submitted.saveId }),
@@ -6476,6 +6478,24 @@ function Composer({
       timeskipSubmittingRef.current = false;
     }
   });
+  const continueStory = useMutation({
+    mutationFn: (saveId: string | null) => postJson<Job>("/api/chat/continue", { save_id: saveId }),
+    onSuccess: (job, submittedSaveId) => {
+      if (submittedSaveId !== activeSaveIdRef.current) return;
+      setSubmitError("");
+      runJob(job);
+    },
+    onError: (error, submittedSaveId) => {
+      if (submittedSaveId !== activeSaveIdRef.current) return;
+      setSubmitError(error instanceof Error ? error.message : "Could not continue story");
+    },
+    onSettled: (_data, _error, submittedSaveId) => {
+      if (continuingSaveIdRef.current === submittedSaveId) {
+        continuingSaveIdRef.current = undefined;
+        setContinuingSaveId(undefined);
+      }
+    }
+  });
   useEffect(() => {
     setSubmitError("");
     setTimeskipOpen(false);
@@ -6503,14 +6523,16 @@ function Composer({
 
   const submitBusy = submittingSaveId === activeSaveId || submittingSaveIdRef.current === activeSaveId;
   const timeskipBusy = timeskip.isPending || timeskipSubmittingRef.current;
-  const timeskipDisabled = disabled || submitBusy || timeskipBusy;
+  const continueBusy = continuingSaveId === activeSaveId || continuingSaveIdRef.current === activeSaveId;
+  const composerMutationBusy = submitBusy || timeskipBusy || continueBusy;
+  const timeskipDisabled = disabled || composerMutationBusy;
   return (
     <>
       <form
         className="composer"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!disabled && !submitBusy && body.trim()) {
+          if (!disabled && !composerMutationBusy && body.trim()) {
             const submittedBody = body;
             const submittedSaveId = activeSaveId;
             submittingSaveIdRef.current = submittedSaveId;
@@ -6541,6 +6563,28 @@ function Composer({
               );
             })}
           </div>
+          {storytellerMode ? (
+            <div className="storyteller-quick-actions">
+              <button
+                type="button"
+                className="storyteller-continue-button"
+                disabled={disabled || composerMutationBusy}
+                onClick={() => {
+                  continuingSaveIdRef.current = activeSaveId;
+                  setContinuingSaveId(activeSaveId);
+                  setSubmitError("");
+                  continueStory.mutate(activeSaveId);
+                }}
+              >
+                {continueBusy ? (
+                  <Loader2 className="spin" size={15} aria-hidden="true" />
+                ) : (
+                  <BookOpen size={15} aria-hidden="true" />
+                )}
+                {continueBusy ? "Continuing…" : "Continue story"}
+              </button>
+            </div>
+          ) : null}
           <textarea
             ref={textareaRef}
             value={body}
@@ -6566,7 +6610,7 @@ function Composer({
         >
           <Clock size={18} />
         </button>
-        <button className="composer-action-button" disabled={disabled || !body.trim() || submitBusy} title="Send">
+        <button className="composer-action-button" disabled={disabled || !body.trim() || composerMutationBusy} title="Send">
           <Send size={18} />
         </button>
       </form>
