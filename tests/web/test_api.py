@@ -22,6 +22,7 @@ from starlette.requests import Request
 import bragi_web.api.app as api_app
 import bragi_web.runtime as runtime_module
 from bragi.application.controller import BragiRuntime
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence import migrate_database
 from bragi.persistence.models import SaveRecord, UserRecord
 from bragi.persistence.repositories import PersistenceRepositories
@@ -7485,6 +7486,78 @@ def test_chat_post_records_save_id_on_created_job(tmp_path: Path) -> None:
 
     assert created.status_code == 200
     assert created.json()["save_id"] == "save-1"
+
+
+def test_continue_story_submits_server_owned_storyteller_direction(
+    tmp_path: Path,
+) -> None:
+    class RuntimeWithCalls(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.submissions: list[tuple[str, str | None, object]] = []
+
+        async def submit_player_message_for_initial_render(
+            self,
+            *,
+            body: str,
+            speaker_name: str | None,
+            active_save_id: object,
+        ) -> object:
+            self.submissions.append((body, speaker_name, active_save_id))
+            return SimpleNamespace(
+                model=_chat_model("The rival steps into the aisle."),
+                has_post_turn_jobs=False,
+                save_id="save-1",
+                player_message_id="continuation-1",
+                narrator_message_id="narrator-1",
+            )
+
+    runtime = RuntimeWithCalls()
+    state = _state_double(tmp_path, runtime)
+    state.repositories.get_save = lambda _save_id: SimpleNamespace(
+        interaction_mode=InteractionMode.STORYTELLER
+    )
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        created = client.post(
+            "/api/chat/continue",
+            json={"save_id": "save-1"},
+        )
+        assert created.status_code == 200
+        job = _wait_for_terminal_job(
+            client,
+            created.json()["id"],
+            save_id="save-1",
+        )
+
+    assert job["status"] == "succeeded"
+    assert runtime.submissions == [
+        (
+            "Continue the story naturally from the current moment. Choose the "
+            "next logical beat from established canon and unresolved threads, "
+            "keeping the current pace unless the story calls for a transition.",
+            "Bragi Story Continuation",
+            "save-1",
+        )
+    ]
+
+
+def test_continue_story_rejects_roleplay_save(tmp_path: Path) -> None:
+    state = _state_double(tmp_path)
+    state.repositories.get_save = lambda _save_id: SimpleNamespace(
+        interaction_mode=InteractionMode.ROLEPLAY
+    )
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.post(
+            "/api/chat/continue",
+            json={"save_id": "save-1"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Continue story is only available in Storyteller mode."
+    )
 
 
 def test_timeskip_post_records_save_id_on_created_job(tmp_path: Path) -> None:

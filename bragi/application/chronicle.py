@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from bragi.persistence.models import MessageRecord
+from bragi_common.story_continuation import is_story_continuation_message
 
 
 class ChronicleMarkdownBlockKind(StrEnum):
@@ -114,6 +115,11 @@ def build_chronicle_model(
     debug_prompts = debug_prompt_text_by_message_id or {}
     debug_provider_payloads = debug_provider_payload_text_by_message_id or {}
     revision_metadata = revision_metadata_by_message_id or {}
+    visible_messages = tuple(
+        message
+        for message in messages
+        if not is_story_continuation_message(message)
+    )
     rendered_messages = tuple(
         ChronicleMessageModel(
             message_id=message.id,
@@ -161,7 +167,7 @@ def build_chronicle_model(
             ),
             content_rating=message.content_rating,
         )
-        for message in messages
+        for message in visible_messages
     )
     return ChronicleModel(
         messages=rendered_messages,

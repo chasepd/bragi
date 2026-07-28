@@ -50,6 +50,10 @@ from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from bragi_common.media_mime import safe_served_media_mime_type
+from bragi_common.story_continuation import (
+    STORY_CONTINUATION_DIRECTION,
+    STORY_CONTINUATION_SPEAKER_NAME,
+)
 from bragi_web.auth_throttle import AuthAttemptThrottle
 from bragi_web.bragi_adapter import (
     bragi_diagnostics_bindings,
@@ -3330,6 +3334,34 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             worker,
             save_id=submitted_save_id,
             exclusive_key=_chat_turn_exclusive_key(submitted_save_id),
+        )
+
+    @app.post("/api/chat/continue")
+    async def continue_story(
+        payload: SaveScopedRequest,
+        state: StateDep,
+    ) -> dict[str, Any]:
+        async with state.lock.async_access():
+            submitted_save_id = _require_save_id(payload.save_id)
+            _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
+            save = state.repositories.get_save(submitted_save_id)
+            if (
+                save is None
+                or save.interaction_mode != "storyteller"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Continue story is only available in Storyteller mode."
+                    ),
+                )
+        return await submit_chat(
+            ChatRequest(
+                body=STORY_CONTINUATION_DIRECTION,
+                speaker_name=STORY_CONTINUATION_SPEAKER_NAME,
+                save_id=submitted_save_id,
+            ),
+            state,
         )
 
     @app.post("/api/chat/look-around")

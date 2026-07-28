@@ -765,6 +765,52 @@ def test_manual_storyteller_scenario_ignores_stale_player_fields_and_choices(
     assert _value(model, "action_choices") is None
 
 
+def test_story_continuation_delta_exposes_only_narration(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Ceremony",
+        premise="A rival waits in the wings.",
+        player_role="",
+        content={},
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    save = repositories.create_save(
+        scenario_id=scenario.id,
+        title="The Ceremony",
+    )
+    direction = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Bragi Story Continuation",
+        body="Continue the story naturally from the current moment.",
+    )
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The rival steps into the aisle.",
+    )
+
+    delta = controller.build_chat_turn_delta(
+        save_id=save.id,
+        player_message=direction,
+        narrator_message=narrator,
+        status="Turn complete",
+    )
+
+    assert _value(delta, "player_message_id") is None
+    assert [
+        (_value(message, "role"), _value(message, "body"))
+        for message in _value(delta, "messages")
+    ] == [("narrator", "The rival steps into the aisle.")]
+
+
 def test_save_action_choice_scenario_draft_returns_opening_action_choices(
     repositories: PersistenceRepositories,
     tmp_path: Path,

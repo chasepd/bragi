@@ -99,6 +99,7 @@ from bragi_common.media_mime import (
     SUPPORTED_VIDEO_MIME_TYPES,
     canonical_media_mime_type,
 )
+from bragi_common.story_continuation import STORY_CONTINUATION_SPEAKER_NAME
 
 MAX_CONTEXT_SEARCH_TERMS = 64
 MAX_UNICODE_SUBSTRING_TERMS = 32
@@ -1163,6 +1164,49 @@ class PersistenceRepositories:
             save=save,
             scenario=scenario,
             messages=self.list_messages(save_id),
+        )
+
+    def load_chronicle_details(
+        self,
+        save_id: str,
+        *,
+        message_limit: int | None = None,
+        before_message_id: str | None = None,
+    ) -> SaveDetailsRecord | None:
+        save = self.get_save(save_id)
+        if save is None:
+            return None
+        scenario = self.get_scenario(save.scenario_id)
+        if scenario is None:
+            return None
+        scenario = self._effective_scenario_for_save(save_id, scenario)
+        if message_limit is not None:
+            message_page = self.list_message_page(
+                save_id,
+                before_message_id=before_message_id,
+                limit=message_limit,
+                chronicle_only=True,
+            )
+            return SaveDetailsRecord(
+                save=save,
+                scenario=scenario,
+                messages=message_page.messages,
+                has_more_messages_before=message_page.has_more_before,
+            )
+        if before_message_id is not None:
+            raise ValueError("before_message_id requires message_limit")
+        return SaveDetailsRecord(
+            save=save,
+            scenario=scenario,
+            messages=[
+                message
+                for message in self.list_messages(save_id)
+                if not (
+                    message.role == "player"
+                    and message.speaker_name
+                    == STORY_CONTINUATION_SPEAKER_NAME
+                )
+            ],
         )
 
     def context_candidate_revision_token(
@@ -2667,12 +2711,18 @@ class PersistenceRepositories:
         before_message_id: str | None = None,
         limit: int = 80,
         include_deleted: bool = False,
+        chronicle_only: bool = False,
     ) -> MessagePageRecord:
         if limit < 1:
             raise ValueError("Message page limit must be at least 1")
         deleted_filter = "" if include_deleted else "AND deleted_at IS NULL"
+        chronicle_filter = (
+            "AND NOT (role = 'player' AND speaker_name = ?)"
+            if chronicle_only
+            else ""
+        )
         before_filter = ""
-        params: tuple[Any, ...] = (save_id,)
+        params: list[Any] = [save_id]
         if before_message_id is not None:
             before_row = self._fetch_one(
                 f"""
@@ -2685,14 +2735,16 @@ class PersistenceRepositories:
             if before_row is None:
                 raise ValueError(f"Unknown active message id: {before_message_id}")
             before_filter = "AND rowid < ?"
-            params = (save_id, before_row["rowid"])
+            params.append(before_row["rowid"])
+        if chronicle_only:
+            params.append(STORY_CONTINUATION_SPEAKER_NAME)
         rows = self._fetch_all(
             f"""
             SELECT id, save_id, role, body, speaker_name, provider, model,
                    token_estimate, deleted_at, created_at, updated_at,
                    safety_transition, content_rating
             FROM messages
-            WHERE save_id = ? {deleted_filter} {before_filter}
+            WHERE save_id = ? {deleted_filter} {before_filter} {chronicle_filter}
             ORDER BY rowid DESC
             LIMIT ?
             """,
@@ -2716,7 +2768,7 @@ class PersistenceRepositories:
             raise ValueError("Message page limit must be at least 1")
         filter_clause = _chat_history_message_filter_clause(selected_filter)
         before_filter = ""
-        params: tuple[Any, ...] = (save_id,)
+        params: list[Any] = [save_id]
         if before_message_id is not None:
             before_row = self._fetch_one(
                 """
@@ -2729,7 +2781,8 @@ class PersistenceRepositories:
             if before_row is None:
                 raise ValueError(f"Unknown active message id: {before_message_id}")
             before_filter = "AND rowid < ?"
-            params = (save_id, before_row["rowid"])
+            params.append(before_row["rowid"])
+        params.append(STORY_CONTINUATION_SPEAKER_NAME)
         rows = self._fetch_all(
             f"""
             SELECT id, save_id, role, body, speaker_name, provider, model,
@@ -2737,6 +2790,7 @@ class PersistenceRepositories:
                    safety_transition, content_rating
             FROM messages
             WHERE save_id = ? AND deleted_at IS NULL {before_filter}
+              AND NOT (role = 'player' AND speaker_name = ?)
               {filter_clause}
             ORDER BY rowid DESC
             LIMIT ?
@@ -2761,9 +2815,10 @@ class PersistenceRepositories:
             SELECT COUNT(*) AS message_count
             FROM messages
             WHERE save_id = ? AND deleted_at IS NULL
+              AND NOT (role = 'player' AND speaker_name = ?)
               {filter_clause}
             """,
-            (save_id,),
+            (save_id, STORY_CONTINUATION_SPEAKER_NAME),
         )
         return int(row["message_count"]) if row is not None else 0
 

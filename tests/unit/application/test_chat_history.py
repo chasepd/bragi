@@ -13,6 +13,10 @@ from pytest import MonkeyPatch
 
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi_common.story_continuation import (
+    STORY_CONTINUATION_DIRECTION,
+    STORY_CONTINUATION_SPEAKER_NAME,
+)
 
 _MISSING = object()
 
@@ -250,6 +254,12 @@ def _save_with_history_messages(
         role="player",
         speaker_name="Player",
         body="I climb toward the beacon lens.",
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name=STORY_CONTINUATION_SPEAKER_NAME,
+        body=STORY_CONTINUATION_DIRECTION,
     )
     narrator = repositories.append_message(
         save_id=save.id,

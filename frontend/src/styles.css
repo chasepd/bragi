@@ -1226,6 +1226,32 @@ h1 {
   transform: translateY(1px);
 }
 
+.storyteller-quick-actions {
+  display: flex;
+  align-items: center;
+}
+
+.storyteller-continue-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 7px 12px;
+  border-color: rgba(148, 216, 201, 0.52);
+  background:
+    linear-gradient(90deg, rgba(148, 216, 201, 0.16), transparent),
+    rgba(25, 36, 31, 0.94);
+  color: #dff6ee;
+  font-weight: 700;
+}
+
+.storyteller-continue-button:hover:not(:disabled) {
+  border-color: rgba(148, 216, 201, 0.86);
+  background:
+    linear-gradient(90deg, rgba(148, 216, 201, 0.25), transparent),
+    rgba(31, 46, 39, 0.98);
+}
+
 .composer textarea {
   min-height: 72px;
   max-height: 180px;

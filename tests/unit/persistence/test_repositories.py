@@ -336,6 +336,55 @@ def test_repositories_pages_messages_before_anchor(
     assert remaining.has_more_before is False
 
 
+def test_repositories_pages_chronicle_without_internal_story_continuations(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="",
+        content={},
+        interaction_mode="storyteller",
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    first_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The orchestra falls silent.",
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Bragi Story Continuation",
+        body="Continue the story naturally from the current moment.",
+    )
+    second_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The rival steps into the aisle.",
+    )
+
+    latest = repositories.list_message_page(
+        save.id,
+        limit=1,
+        chronicle_only=True,
+    )
+    previous = repositories.list_message_page(
+        save.id,
+        before_message_id=second_narrator.id,
+        limit=1,
+        chronicle_only=True,
+    )
+
+    assert [message.id for message in latest.messages] == [second_narrator.id]
+    assert latest.has_more_before is True
+    assert [message.id for message in previous.messages] == [first_narrator.id]
+    assert previous.has_more_before is False
+
+
 def test_repositories_pages_chat_history_messages_with_sql_filters(
     repositories: PersistenceRepositories,
 ) -> None:

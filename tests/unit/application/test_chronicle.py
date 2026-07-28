@@ -55,6 +55,38 @@ def test_chronicle_model_renders_persisted_message_fields(
     ]
 
 
+def test_chronicle_model_hides_internal_story_continuation_direction(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    chronicle = _import_chronicle_without_gtk(monkeypatch)
+
+    model = chronicle.build_chronicle_model(
+        messages=(
+            _message(
+                role="player",
+                speaker_name="Bragi Story Continuation",
+                body="Continue the story naturally from the current moment.",
+            ),
+            _message(
+                role="narrator",
+                speaker_name="Narrator",
+                body="The orchestra resumes as the rival steps into the aisle.",
+            ),
+        )
+    )
+
+    rendered_messages = list(_value(model, "messages", "items"))
+    assert [
+        (_value(message, "role"), _value(message, "body", "text"))
+        for message in rendered_messages
+    ] == [
+        (
+            "narrator",
+            "The orchestra resumes as the rival steps into the aisle.",
+        )
+    ]
+
+
 def test_chronicle_model_marks_edited_narrator_messages_and_action(
     monkeypatch: MonkeyPatch,
 ) -> None:
