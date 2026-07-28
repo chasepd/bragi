@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from pytest import MonkeyPatch
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import CharacterRecord, DatingRouteStateRecord
 from bragi.persistence.repositories import PersistenceRepositories
@@ -148,6 +149,23 @@ def test_edit_player_text_without_resubmit_updates_body_without_provider(
     assert stale_memory.id not in {
         memory.id for memory in repositories.list_memories(save_id)
     }
+
+
+def test_storyteller_mode_rejects_character_text_revisions(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _thread_id, player_message_id, _reply_id = _seed_text_thread(
+        repositories,
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    service = CharacterTextRevisionService(repositories=repositories, providers={})
+
+    with pytest.raises(ValueError, match="unavailable in storyteller mode"):
+        service.edit_text_without_resubmit(
+            save_id=save_id,
+            text_message_id=player_message_id,
+            body="This must remain unchanged.",
+        )
 
 
 def test_correct_character_text_updates_body_and_revision_trail(
@@ -984,6 +1002,7 @@ def _seed_text_thread(
     repositories: PersistenceRepositories,
     *,
     create_contact_state: bool = True,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
 ) -> tuple[str, str, str, str]:
     scenario = repositories.create_scenario(
         type="dating_sim",
@@ -992,7 +1011,11 @@ def _seed_text_thread(
         player_role="Mira",
         content={"player_character_name": "Mira"},
     )
-    save = repositories.create_save(scenario_id=scenario.id, title="After School")
+    save = repositories.create_save(
+        scenario_id=scenario.id,
+        title="After School",
+        interaction_mode=interaction_mode,
+    )
     player = repositories.add_character(
         save_id=save.id,
         name="Mira",

@@ -11,6 +11,7 @@ from typing import Any, cast
 import pytest
 from pytest import MonkeyPatch
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence import repositories as repositories_module
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import SaveRecord
@@ -401,6 +402,55 @@ def test_import_knowledge_edges_coalesce_target_aliases_and_scalar_provenance() 
         "message-visible",
         "message-hidden",
     ]
+
+
+def test_chat_bundle_round_trips_storyteller_mode_and_defaults_legacy_mode(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(
+        repositories,
+        media_dir,
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    bundle_path = tmp_path / "storyteller.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+
+    with zipfile.ZipFile(bundle_path) as bundle:
+        manifest = json.loads(bundle.read("manifest.json"))
+        data = json.loads(bundle.read("data.json"))
+    assert data["scenario"]["interaction_mode"] == "storyteller"
+    assert data["save"]["interaction_mode"] == "storyteller"
+    imported = service.import_save(bundle_path)
+    imported_save = repositories.get_save(_imported_save_id(imported))
+    assert imported_save is not None
+    assert imported_save.interaction_mode is InteractionMode.STORYTELLER
+
+    del data["scenario"]["interaction_mode"]
+    del data["save"]["interaction_mode"]
+    legacy_path = tmp_path / "legacy-roleplay.bragi-chat"
+    with zipfile.ZipFile(bundle_path) as bundle:
+        members = {
+            name: bundle.read(name)
+            for name in bundle.namelist()
+            if name not in {"manifest.json", "data.json"}
+        }
+    with zipfile.ZipFile(
+        legacy_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as bundle:
+        bundle.writestr("manifest.json", json.dumps(manifest))
+        bundle.writestr("data.json", json.dumps(data))
+        for name, body in members.items():
+            bundle.writestr(name, body)
+    legacy_import = service.import_save(legacy_path)
+    legacy_save = repositories.get_save(_imported_save_id(legacy_import))
+    assert legacy_save is not None
+    assert legacy_save.interaction_mode is InteractionMode.ROLEPLAY
 
 
 def test_export_save_writes_manifest_data_and_referenced_media(
@@ -6213,6 +6263,7 @@ def _seed_bundle_save(
     media_dir: Path,
     *,
     write_media_file: bool = True,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
 ) -> SaveRecord:
     scenario = repositories.create_scenario(
         scenario_id=SCENARIO_ID,
@@ -6220,6 +6271,7 @@ def _seed_bundle_save(
         title="Ashfall Keep",
         premise="A border keep is cut off by ash storms.",
         player_role="Signal warden",
+        interaction_mode=interaction_mode,
         content={
             "opening_message": "The tower bell cracks once.",
             "starting_scene": "The beacon gutters in the tower.",
@@ -6230,6 +6282,7 @@ def _seed_bundle_save(
         scenario_id=scenario.id,
         title="Night Watch",
         custom_instructions="Keep choices brief and grounded.",
+        interaction_mode=interaction_mode,
     )
     repositories.set_app_setting(
         save_scenario_evolution_turn_interval_setting_key(save.id),

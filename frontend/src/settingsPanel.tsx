@@ -260,11 +260,13 @@ function tabUsesFullSettings(tab: SettingsTab): boolean {
 export function SettingsPanel({
   runJob,
   activeSaveId = null,
+  storytellerMode = false,
   currentUser = null,
   onContentSafetyChanged
 }: {
   runJob: RunJob;
   activeSaveId?: string | null;
+  storytellerMode?: boolean;
   currentUser?: CurrentUser | null;
   onContentSafetyChanged?: () => void;
 }) {
@@ -408,6 +410,7 @@ export function SettingsPanel({
         <SaveSettingsControls
           settings={settings.data}
           activeSaveId={activeSaveId}
+          storytellerMode={storytellerMode}
           updateLocal={updateSetting}
           disabled={updateScoped.isPending}
           runJob={runJob}
@@ -2315,6 +2318,7 @@ const ROLEPLAY_TASK_PREFIX_LABELS: readonly [string, string][] = [
 function SaveSettingsControls({
   settings,
   activeSaveId,
+  storytellerMode,
   updateLocal,
   disabled,
   runJob,
@@ -2322,6 +2326,7 @@ function SaveSettingsControls({
 }: {
   settings?: SettingsModel;
   activeSaveId: string | null;
+  storytellerMode: boolean;
   updateLocal: (key: string, value: unknown) => void;
   disabled: boolean;
   runJob: RunJob;
@@ -2381,13 +2386,13 @@ function SaveSettingsControls({
           {settings.character_action_planning_max_concurrency ? (
             <NumberSetting control={settings.character_action_planning_max_concurrency} disabled={saveDisabled} updateLocal={updateLocal} />
           ) : null}
-          {settings.character_texts ? (
+          {!storytellerMode && settings.character_texts ? (
             <ToggleSetting control={settings.character_texts} disabled={saveDisabled} updateLocal={updateLocal} />
           ) : null}
-          {settings.character_text_proactive_random_chance ? (
+          {!storytellerMode && settings.character_text_proactive_random_chance ? (
             <NumberSetting control={settings.character_text_proactive_random_chance} disabled={saveDisabled} updateLocal={updateLocal} />
           ) : null}
-          {settings.character_text_proactive_random_cooldown ? (
+          {!storytellerMode && settings.character_text_proactive_random_cooldown ? (
             <NumberSetting control={settings.character_text_proactive_random_cooldown} disabled={saveDisabled} updateLocal={updateLocal} />
           ) : null}
           {settings.post_turn_inference_mode ? (

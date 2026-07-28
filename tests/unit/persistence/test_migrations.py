@@ -937,6 +937,50 @@ def test_migration_72_to_73_adds_summary_lineage_and_repairs_message_estimates(
         assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
 
 
+def test_migration_73_to_74_adds_roleplay_interaction_mode_defaults(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("ALTER TABLE scenarios DROP COLUMN interaction_mode")
+        connection.execute("ALTER TABLE saves DROP COLUMN interaction_mode")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 74")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        scenario_columns = _column_names(connection, "scenarios")
+        save_columns = _column_names(connection, "saves")
+        assert "interaction_mode" in scenario_columns
+        assert "interaction_mode" in save_columns
+        scenario_id = "legacy-scenario"
+        connection.execute(
+            """
+            INSERT INTO scenarios(
+                id, type, title, premise, player_role, content_json
+            ) VALUES (?, 'full_roleplay', 'Legacy', '', '', '{}')
+            """,
+            (scenario_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO saves(id, scenario_id, title)
+            VALUES ('legacy-save', ?, 'Legacy Save')
+            """,
+            (scenario_id,),
+        )
+        assert connection.execute(
+            "SELECT interaction_mode FROM scenarios WHERE id = ?",
+            (scenario_id,),
+        ).fetchone() == ("roleplay",)
+        assert connection.execute(
+            "SELECT interaction_mode FROM saves WHERE id = 'legacy-save'"
+        ).fetchone() == ("roleplay",)
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
 def test_current_schema_repair_bounds_memory_observation_backfill(
     tmp_path: Path,
 ) -> None:

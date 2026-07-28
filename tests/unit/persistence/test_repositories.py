@@ -12,6 +12,7 @@ from typing import cast
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence import repositories as repositories_module
 from bragi.persistence.repositories import (
     BragiRepository,
@@ -152,6 +153,91 @@ def test_repositories_update_save_title_trims_and_refreshes_list_order(
         renamed_save.id,
         opened_save.id,
     ]
+
+
+def test_repositories_snapshot_scenario_interaction_mode_on_save(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Ceremony",
+        premise="A rival waits in the wings.",
+        player_role="",
+        content={},
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+
+    save = repositories.create_save(
+        scenario_id=scenario.id,
+        title="First Draft",
+    )
+    repositories.update_scenario(
+        scenario_id=scenario.id,
+        title=scenario.title,
+        premise=scenario.premise,
+        player_role=scenario.player_role,
+        content={},
+        interaction_mode=InteractionMode.ROLEPLAY,
+    )
+
+    assert scenario.interaction_mode is InteractionMode.STORYTELLER
+    assert save.interaction_mode is InteractionMode.STORYTELLER
+    loaded_save = repositories.get_save(save.id)
+    assert loaded_save is not None
+    assert loaded_save.interaction_mode is InteractionMode.STORYTELLER
+
+
+def test_repositories_allow_explicit_saved_mode_for_imports_and_forks(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Ceremony",
+        premise="A rival waits in the wings.",
+        player_role="Witness",
+        content={},
+    )
+
+    save = repositories.create_save(
+        scenario_id=scenario.id,
+        title="Imported Draft",
+        interaction_mode="storyteller",
+    )
+
+    assert scenario.interaction_mode is InteractionMode.ROLEPLAY
+    assert save.interaction_mode is InteractionMode.STORYTELLER
+
+
+@pytest.mark.parametrize("target", ["scenario", "save"])
+def test_repositories_reject_unknown_interaction_modes(
+    repositories: PersistenceRepositories,
+    target: str,
+) -> None:
+    if target == "scenario":
+        with pytest.raises(ValueError, match="Unknown interaction mode: cinematic"):
+            repositories.create_scenario(
+                type="full_roleplay",
+                title="Invalid",
+                premise="",
+                player_role="",
+                content={},
+                interaction_mode="cinematic",
+            )
+        return
+
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Valid",
+        premise="",
+        player_role="",
+        content={},
+    )
+    with pytest.raises(ValueError, match="Unknown interaction mode: cinematic"):
+        repositories.create_save(
+            scenario_id=scenario.id,
+            title="Invalid",
+            interaction_mode="cinematic",
+        )
 
 
 def test_repositories_list_save_and_scenario_metadata_for_library(

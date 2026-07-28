@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import MessageRecord
 from bragi.persistence.repositories import PersistenceRepositories
@@ -1323,6 +1324,50 @@ def test_world_time_service_queues_conflict_when_provider_cites_player(
     ]
 
 
+def test_storyteller_world_time_rejects_direction_as_completed_turn_evidence(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id, narrator_message_id = _save_with_completed_turn(
+        repositories,
+        player_body="Advance to evening.",
+        narrator_body="The beacon remains lit in the morning haze.",
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    provider = RecordingStructuredTimeProvider(
+        {
+            "changed": True,
+            "time_of_day": "evening",
+            "day_of_week": "monday",
+            "days_elapsed": 0,
+            "evidence_source_id": player_message_id,
+            "evidence_quote": "Advance to evening",
+            "confidence": 0.95,
+            "reason": "The direction requested an evening scene.",
+        }
+    )
+    service = WorldTimeService(
+        repositories=repositories,
+        checker=StructuredProviderWorldTimeChecker(
+            provider=provider,
+            provider_name="fake",
+            model_id="fake-time",
+        ),
+    )
+
+    result = asyncio.run(
+        service.reconcile_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+        )
+    )
+
+    snapshot = repositories.get_scene_snapshot(save_id)
+    assert snapshot is not None
+    assert result.status != "applied"
+    assert snapshot.time_of_day == "morning"
+
+
 def test_world_time_service_skips_reconciliation_without_checker(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -1629,12 +1674,14 @@ def _save_with_completed_turn(
     *,
     player_body: str,
     narrator_body: str,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
 ) -> tuple[str, str, str]:
     scenario = repositories.create_scenario(
         type="full_roleplay",
         title="Ashfall Keep",
         premise="A border keep is cut off by ash storms.",
         player_role="Signal warden",
+        interaction_mode=interaction_mode,
         content={},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")

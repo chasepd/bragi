@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence import repositories as repositories_module
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import SaveRecord
@@ -1708,7 +1709,10 @@ def test_snapshot_backed_fork_remaps_rows_and_copies_media(
     media_dir = tmp_path / "media"
     media_dir.mkdir()
     media_dir.joinpath("old.png").write_bytes(b"old image")
-    save = _create_save(repositories)
+    save = _create_save(
+        repositories,
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
     service = TurnSnapshotService(repositories)
     service.capture_baseline_snapshot(save.id)
     first = repositories.append_message(
@@ -1811,6 +1815,7 @@ def test_snapshot_backed_fork_remaps_rows_and_copies_media(
     )
 
     fork_messages = repositories.list_messages(result.save.id)
+    assert result.save.interaction_mode is InteractionMode.STORYTELLER
     assert result.message_count == 1
     assert fork_messages[0].id != first.id
     assert fork_messages[0].body == "The tower lens glows red."
@@ -2652,13 +2657,18 @@ def test_export_import_preserves_character_text_snapshot_backed_fork(
     assert trigger.source_id == fork_rowan.id
 
 
-def _create_save(repositories: PersistenceRepositories) -> SaveRecord:
+def _create_save(
+    repositories: PersistenceRepositories,
+    *,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
+) -> SaveRecord:
     scenario = repositories.create_scenario(
         type="full_roleplay",
         title="Ashfall Keep",
         premise="A beacon tower.",
         player_role="Signal warden",
         content={"opening_message": "The lens hums."},
+        interaction_mode=interaction_mode,
     )
     return repositories.create_save(scenario_id=scenario.id, title="Night Watch")
 

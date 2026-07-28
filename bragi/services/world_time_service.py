@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, TypedDict, cast
 
 from bragi.app_logging import exception_log_fields, log_error_event
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import MessageRecord, SceneSnapshotRecord
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
@@ -333,12 +334,25 @@ class WorldTimeService:
                 **exception_log_fields(exc),
             )
             return WorldTimeResult("failed", skipped_reason="checker_failed")
+        save = self.repositories.get_save(save_id)
+        storyteller_mode = (
+            save is not None
+            and save.interaction_mode is InteractionMode.STORYTELLER
+        )
         return self._apply_assessment(
             save_id=save_id,
             snapshot=snapshot,
             assessment=assessment,
-            candidate_messages=(player_message, narrator_message),
-            source_message_ids=(player_message.id, narrator_message.id),
+            candidate_messages=(
+                (narrator_message,)
+                if storyteller_mode
+                else (player_message, narrator_message)
+            ),
+            source_message_ids=(
+                (narrator_message.id,)
+                if storyteller_mode
+                else (player_message.id, narrator_message.id)
+            ),
             policy="completed_turn",
         )
 

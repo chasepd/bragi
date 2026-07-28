@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.migrations import CURRENT_SCHEMA_VERSION, migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
 
@@ -132,6 +133,42 @@ def test_import_scenario_creates_new_id_and_unique_duplicate_title(
         "generation_prompt": "A border keep cut off by ash storms.",
         "content_rating": "unclassified",
     }
+
+
+def test_scenario_bundle_round_trips_storyteller_mode_and_defaults_legacy_mode(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Ceremony",
+        premise="A rival waits in the wings.",
+        player_role="",
+        content={"opening_message": "The orchestra falls silent."},
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    service = _scenario_bundle_service(repositories)
+    bundle_path = tmp_path / "ceremony.bragi-scenario"
+
+    service.export_scenario(scenario.id, bundle_path)
+
+    with zipfile.ZipFile(bundle_path) as bundle:
+        data = json.loads(bundle.read("data.json"))
+    assert data["scenario"]["interaction_mode"] == "storyteller"
+    imported = service.import_scenario(bundle_path)
+    imported_record = repositories.get_scenario(imported.scenario_id)
+    assert imported_record is not None
+    assert imported_record.interaction_mode is InteractionMode.STORYTELLER
+
+    legacy_path = tmp_path / "ceremony-legacy.bragi-scenario"
+    del data["scenario"]["interaction_mode"]
+    with zipfile.ZipFile(bundle_path) as bundle:
+        manifest = json.loads(bundle.read("manifest.json"))
+    _write_bundle(legacy_path, manifest=manifest, data=data)
+    legacy_import = service.import_scenario(legacy_path)
+    legacy_record = repositories.get_scenario(legacy_import.scenario_id)
+    assert legacy_record is not None
+    assert legacy_record.interaction_mode is InteractionMode.ROLEPLAY
 
 
 def test_export_import_scenario_bundle_preserves_starter_reference_images(

@@ -476,6 +476,7 @@ const STARTER_TEXTAREA_FIELDS = [
   ["relationships_json", "Relationships", "relationships"]
 ] as const satisfies readonly (readonly [ScenarioStarterTextField, string, string])[];
 type ScenarioEditorCore = {
+  interaction_mode: "roleplay" | "storyteller";
   title: string;
   premise: string;
   player_character_name: string;
@@ -489,6 +490,7 @@ type ScenarioEditorDraftState = {
 type ScenarioEditorValue = {
   scenario_id?: string;
   scenario_type: string;
+  interaction_mode: "roleplay" | "storyteller";
   title: string;
   premise: string;
   player_character_name: string;
@@ -497,6 +499,7 @@ type ScenarioEditorValue = {
   character_starters: ScenarioEditorStarter[];
 };
 type ScenarioEditPayload = {
+  interaction_mode: "roleplay" | "storyteller";
   title: string;
   premise: string;
   player_character_name: string;
@@ -1242,6 +1245,7 @@ const SCENARIO_TYPE_LABELS: Record<string, string> = {
 type ScenarioForm = {
   scenario_type: string;
   scenario_types: string[];
+  interaction_mode: "roleplay" | "storyteller";
   action_choices_enabled: boolean;
   title: string;
   premise: string;
@@ -1337,12 +1341,13 @@ type ScenarioForm = {
   choice_style: string;
   opening_message: string;
 };
-type ScenarioFormTextField = Exclude<keyof ScenarioForm, "action_choices_enabled" | "scenario_types">;
+type ScenarioFormTextField = Exclude<keyof ScenarioForm, "action_choices_enabled" | "scenario_types" | "interaction_mode">;
 type ScenarioDraftPrefill = {
   scenario_type: string;
   scenario_types: string[];
   action_choices_enabled: boolean;
   seed: string;
+  interaction_mode?: "roleplay" | "storyteller";
 };
 const MANUAL_BASE_SECTION_IDS = new Set(["title", "premise", "player_character_name", "player_role", "opening_message"]);
 const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
@@ -2826,7 +2831,6 @@ function Workbench({
   const [saveSelectionError, setSaveSelectionError] = useState("");
   const [pendingMessage, setPendingMessage] = useState<PendingChronicleMessage | null>(null);
   const [pendingNarratorMessage, setPendingNarratorMessage] = useState<PendingChronicleMessage | null>(null);
-  const [actionChoiceGenerationError, setActionChoiceGenerationError] = useState("");
   const [layout, setLayout] = useState<WorkbenchLayout>(loadWorkbenchLayout);
   const [resizingSide, setResizingSide] = useState<ResizeSide | null>(null);
   const layoutDrag = useRef<{ side: ResizeSide; startX: number; startLayout: WorkbenchLayout } | null>(null);
@@ -3083,6 +3087,9 @@ function Workbench({
       scenario_type: scenarioType,
       scenario_types: normalizedScenarioTypes(scenarioType, scenario.scenario_types),
       action_choices_enabled: Boolean(scenario.action_choices_enabled),
+      interaction_mode: definition.scenario?.interaction_mode
+        ?? scenario.interaction_mode
+        ?? "roleplay",
       seed: prompt
     });
     setDraftInitialMode("draft");
@@ -3212,7 +3219,23 @@ function Workbench({
         }
         if (appliesToCurrentSave && done.status === "succeeded") options.onSucceeded?.(done.result);
         if (appliesToCurrentSave && done.status === "failed") {
-          options.onFailed?.(done.error || "Background job failed.", done);
+          const error = done.error || "Background job failed.";
+          if (done.type === "action_choice_generate") {
+            client.setQueryData<RuntimeModel>(
+              runtimeQueryKey(done.save_id ?? activeSaveIdRef.current),
+              (current) => current?.action_choices?.generation_job?.id === done.id
+                ? {
+                  ...current,
+                  action_choices: {
+                    ...current.action_choices,
+                    generation_job: null,
+                    generation_error: error
+                  }
+                }
+                : current
+            );
+          }
+          options.onFailed?.(error, done);
         }
         if (appliesToCurrentSave) {
           if (options.clearPendingMessages !== false) {
@@ -3283,32 +3306,6 @@ function Workbench({
     });
   };
 
-  const handleOpeningActionChoiceFailure = useCallback((
-    error: string,
-    failedJob: Job
-  ) => {
-    setActionChoiceGenerationError(error);
-    client.setQueryData<RuntimeModel>(
-      runtimeQueryKey(failedJob.save_id ?? activeSaveIdRef.current),
-      (current) => {
-        if (
-          !current?.action_choices
-          || current.action_choices.generation_job?.id !== failedJob.id
-        ) {
-          return current;
-        }
-        return {
-          ...current,
-          action_choices: {
-            ...current.action_choices,
-            generation_job: null,
-            generation_error: error
-          }
-        };
-      }
-    );
-  }, [client]);
-
   useEffect(() => {
     return () => {
       Object.values(jobWatchers.current).forEach((stop) => stop());
@@ -3332,13 +3329,9 @@ function Workbench({
         runJob(active, { applyResult: false, clearPendingMessages: false });
         continue;
       }
-      if (active.type === "action_choice_generate") {
-        runJob(active, { onFailed: handleOpeningActionChoiceFailure });
-        continue;
-      }
       runJob(active);
     }
-  }, [activeJobs.data?.jobs, handleOpeningActionChoiceFailure, runJob]);
+  }, [activeJobs.data?.jobs, runJob]);
 
   const openingActionChoiceJob = model?.action_choices?.generation_job;
   useEffect(() => {
@@ -3348,22 +3341,11 @@ function Workbench({
     ) {
       return;
     }
-    runJob(openingActionChoiceJob, {
-      onFailed: handleOpeningActionChoiceFailure
-    });
+    runJob(openingActionChoiceJob);
   }, [
-    handleOpeningActionChoiceFailure,
     openingActionChoiceJob?.id,
     openingActionChoiceJob?.status,
     runJob
-  ]);
-
-  useEffect(() => {
-    setActionChoiceGenerationError(model?.action_choices?.generation_error ?? "");
-  }, [
-    activeSaveId,
-    model?.action_choices?.generation_error,
-    model?.action_choices?.narrator_message_id
   ]);
 
   useEffect(() => {
@@ -3416,9 +3398,6 @@ function Workbench({
     .filter((tracked) => jobBelongsToActiveSave(tracked.job, activeSaveId))
     .filter((tracked) => tracked.job.type !== "character_text_send")
     .sort((left, right) => (left.job.created_at ?? 0) - (right.job.created_at ?? 0));
-  const actionChoiceGenerationJob = pendingJobs.find(
-    ({ job }) => job.type === "action_choice_generate"
-  );
   const activeSaveChatBlockers = pendingJobs.filter(({ job }) => jobBlocksChatSubmission(job, activeSaveId));
   const backendChatBlocker = chatSubmissionStatus.data?.blocking_job_id
     ? pendingJobs.find((tracked) => tracked.job.id === chatSubmissionStatus.data?.blocking_job_id && isChatJobType(tracked.job.type))
@@ -3616,14 +3595,12 @@ function Workbench({
             }}
           />
         ) : null}
-        {model?.action_choices_enabled ? (
+        {model?.interaction_mode !== "storyteller" && model?.action_choices_enabled ? (
           <CyoaActionPicker
             disabled={chatInputDisabled}
             runJob={runJob}
             activeSaveId={activeSaveId}
             actionChoices={model?.action_choices ?? null}
-            generationStatus={actionChoiceGenerationJob?.progress}
-            generationError={actionChoiceGenerationError}
             pendingAfterMessageId={pendingAfterMessageId}
             onPendingMessage={setPendingMessage}
           />
@@ -3634,6 +3611,7 @@ function Workbench({
             activeSaveId={activeSaveId}
             pendingAfterMessageId={pendingAfterMessageId}
             onPendingMessage={setPendingMessage}
+            storytellerMode={model?.interaction_mode === "storyteller"}
           />
         )}
       </main>
@@ -4993,6 +4971,7 @@ type ChronicleMessageRowProps = {
   pendingJobActionKeys: Set<string>;
   onAction: (actionId: string, message: ChronicleMessage) => void;
   mutationsDisabled?: boolean;
+  storytellerMode?: boolean;
 };
 
 const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
@@ -5001,8 +4980,10 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
   jobActionErrors,
   pendingJobActionKeys,
   onAction,
-  mutationsDisabled = false
+  mutationsDisabled = false,
+  storytellerMode = false
 }: ChronicleMessageRowProps) {
+  const isDirection = storytellerMode && message.role === "player";
   const messageActionErrors = message.actions
     .map((action) => {
       const key = chronicleJobActionKey(message.message_id, action.action_id);
@@ -5010,9 +4991,9 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
     })
     .filter((item) => item.error);
   return (
-    <article className={`message ${message.role}`}>
+    <article className={`message ${isDirection ? "direction" : message.role}`}>
       <header>
-        <span>{message.speaker_name || message.role}</span>
+        <span>{isDirection ? "Direction" : message.speaker_name || message.role}</span>
         {message.revision_count ? <small className="message-edited">Edited</small> : null}
         <div className="message-actions">
           {message.actions.map((action) => {
@@ -5294,6 +5275,7 @@ function Chronicle({
                   jobActionErrors={jobActionErrors}
                   pendingJobActionKeys={pendingJobActionKeys}
                   mutationsDisabled={mutationsDisabled}
+                  storytellerMode={model?.interaction_mode === "storyteller"}
                   onAction={handleChronicleAction}
                 />
               </div>
@@ -6439,13 +6421,15 @@ function Composer({
   runJob,
   activeSaveId,
   pendingAfterMessageId = null,
-  onPendingMessage
+  onPendingMessage,
+  storytellerMode = false
 }: {
   disabled: boolean;
   runJob: RunJob;
   activeSaveId: string | null;
   pendingAfterMessageId?: string | null;
   onPendingMessage: (message: PendingChronicleMessage | null) => void;
+  storytellerMode?: boolean;
 }) {
   const [body, setBody] = useState("");
   const [submitError, setSubmitError] = useState("");
@@ -6561,7 +6545,7 @@ function Composer({
               event.preventDefault();
               applyFormat(actionId, "while-focused");
             }}
-            placeholder="Say what you do..."
+            placeholder={storytellerMode ? "Guide what happens next…" : "Say what you do..."}
             aria-label="Message"
           />
           {submitError ? <InlineNotice className="composer-error">{submitError}</InlineNotice> : null}
@@ -6603,8 +6587,6 @@ function CyoaActionPicker({
   runJob,
   activeSaveId,
   actionChoices,
-  generationStatus = "",
-  generationError = "",
   pendingAfterMessageId = null,
   onPendingMessage
 }: {
@@ -6612,8 +6594,6 @@ function CyoaActionPicker({
   runJob: RunJob;
   activeSaveId: string | null;
   actionChoices: RuntimeModel["action_choices"];
-  generationStatus?: string;
-  generationError?: string;
   pendingAfterMessageId?: string | null;
   onPendingMessage: (message: PendingChronicleMessage | null) => void;
 }) {
@@ -6667,15 +6647,7 @@ function CyoaActionPicker({
   }, [activeSaveId, actionChoices?.narrator_message_id]);
 
   const choices = [...(actionChoices?.choices ?? [])].sort((left, right) => left.ordinal - right.ordinal);
-  const embeddedGenerationActive = Boolean(
-    actionChoices?.generation_job
-    && ["queued", "running"].includes(actionChoices.generation_job.status)
-  );
-  const generationActive = embeddedGenerationActive || Boolean(generationStatus);
-  const displayedGenerationStatus = generationStatus || (
-    embeddedGenerationActive ? "Generating action choices..." : ""
-  );
-  const displayedGenerationError = generationError || actionChoices?.generation_error || "";
+  const generationActive = Boolean(actionChoices?.generation_job);
   const submitBusy = submittingSaveId === activeSaveId || submittingSaveIdRef.current === activeSaveId;
   const regenerateBusy = regenerate.isPending;
   const canSubmit = !disabled && !submitBusy && !generationActive;
@@ -6701,11 +6673,6 @@ function CyoaActionPicker({
 
   return (
     <section className="cyoa-picker" aria-label="Choose your next action">
-      {displayedGenerationStatus ? (
-        <p className="muted" role="status" aria-live="polite">
-          {displayedGenerationStatus}
-        </p>
-      ) : null}
       <ol className="cyoa-choice-list" aria-label="Generated actions" role="list">
         {choices.map((choice, index) => (
           <li key={choice.choice_id} className="cyoa-choice-item" role="listitem">
@@ -6769,7 +6736,7 @@ function CyoaActionPicker({
           </button>
         ) : null}
       </div>
-      {displayedGenerationError ? <InlineNotice className="composer-error">{displayedGenerationError}</InlineNotice> : null}
+      {actionChoices?.generation_error ? <InlineNotice className="composer-error">{actionChoices.generation_error}</InlineNotice> : null}
       {submitError ? <InlineNotice className="composer-error">{submitError}</InlineNotice> : null}
     </section>
   );
@@ -6882,7 +6849,13 @@ function RightPanel({
   }
   return (
     <React.Suspense fallback={<RightPanelFallback title="Settings" icon={<Settings size={18} />} />}>
-      <LazySettingsPanel runJob={runJob} activeSaveId={readOnly ? null : model?.active_save_id ?? null} currentUser={effectiveCurrentUser} onContentSafetyChanged={onContentSafetyChanged} />
+      <LazySettingsPanel
+        runJob={runJob}
+        activeSaveId={readOnly ? null : model?.active_save_id ?? null}
+        storytellerMode={model?.interaction_mode === "storyteller"}
+        currentUser={effectiveCurrentUser}
+        onContentSafetyChanged={onContentSafetyChanged}
+      />
     </React.Suspense>
   );
 }
@@ -6990,6 +6963,7 @@ function scenarioEditorValue(scenario: WorldDataScenario | Record<string, unknow
   return {
     scenario_id: textValue(record.scenario_id),
     scenario_type: textValue(record.scenario_type) || "full_roleplay",
+    interaction_mode: record.interaction_mode === "storyteller" ? "storyteller" : "roleplay",
     title: textValue(record.title),
     premise: textValue(record.premise),
     player_character_name: textValue(record.player_character_name),
@@ -7065,7 +7039,9 @@ function scenarioEditPayload(scenario: ScenarioEditorValue): { edit: ScenarioEdi
   const playerRole = scenario.player_role.trim();
   if (!title) return { error: "Title is required" };
   if (!premise) return { error: "Premise is required" };
-  if (!playerRole) return { error: "Player role is required" };
+  if (scenario.interaction_mode === "roleplay" && !playerRole) {
+    return { error: "Player role is required" };
+  }
   const contentSections: [string, string][] = [];
   const seen = new Set<string>();
   for (const section of scenario.content_sections) {
@@ -7080,6 +7056,7 @@ function scenarioEditPayload(scenario: ScenarioEditorValue): { edit: ScenarioEdi
   if ("error" in starterPayload) return starterPayload;
   return {
     edit: {
+      interaction_mode: scenario.interaction_mode,
       title,
       premise,
       player_character_name: scenario.player_character_name.trim(),
@@ -7194,6 +7171,7 @@ function stableSnapshotValue(value: unknown): unknown {
 function scenarioEditorDraftState(scenario: ScenarioEditorValue): ScenarioEditorDraftState {
   return {
     core: {
+      interaction_mode: scenario.interaction_mode,
       title: scenario.title,
       premise: scenario.premise,
       player_character_name: scenario.player_character_name,
@@ -7384,7 +7362,8 @@ function ScenarioStructuredEditor({
   onCancel,
   saveLabel = "Save scenario",
   onDirtyChange,
-  starterReferenceImages = false
+  starterReferenceImages = false,
+  interactionModeEditable = false
 }: {
   scenario: ScenarioEditorValue;
   onSave: (edit: ScenarioEditPayload) => Promise<void>;
@@ -7392,6 +7371,7 @@ function ScenarioStructuredEditor({
   saveLabel?: string;
   onDirtyChange?: (dirty: boolean) => void;
   starterReferenceImages?: boolean;
+  interactionModeEditable?: boolean;
 }) {
   const initialDraft = scenarioEditorDraftState(scenario);
   const incomingSnapshot = scenarioEditorDraftSnapshot(initialDraft);
@@ -7441,7 +7421,10 @@ function ScenarioStructuredEditor({
   useEffect(() => {
     onDirtyChange?.(hasUnsavedChanges);
   }, [hasUnsavedChanges, onDirtyChange]);
-  const updateCore = (key: keyof typeof core, value: string) => setCore((current) => ({ ...current, [key]: value }));
+  const updateCore = (
+    key: keyof typeof core,
+    value: string
+  ) => setCore((current) => ({ ...current, [key]: value }));
   const updateSectionValue = (sectionId: string, value: string) => {
     setSections((current) => current.map((section) => section.key === sectionId ? { ...section, value } : section));
   };
@@ -7511,13 +7494,23 @@ function ScenarioStructuredEditor({
     setNewSectionKey("");
     setError("");
   };
+  const hiddenSectionIds = core.interaction_mode === "storyteller"
+    ? new Set(["player_character_profile", "choice_style"])
+    : new Set<string>();
   const visibleGroups = groups
     .map((group) => ({
       ...group,
-      section_ids: group.section_ids.filter((sectionId) => sectionByKey(sectionId))
+      section_ids: group.section_ids.filter(
+        (sectionId) => sectionByKey(sectionId) && !hiddenSectionIds.has(sectionId)
+      )
     }))
     .filter((group) => group.section_ids.length > 0);
-  const customSections = sections.filter((section) => !knownSectionIds.has(section.key));
+  const customSections = sections.filter(
+    (section) => (
+      !knownSectionIds.has(section.key)
+      && !hiddenSectionIds.has(section.key)
+    )
+  );
   const submit = async () => {
     if (hasPendingStarterImageOperation) {
       setError("Wait for reference image updates to finish before saving.");
@@ -7579,17 +7572,29 @@ function ScenarioStructuredEditor({
       />
       <div className="scenario-core-grid">
         <label className="field-label">
+          <span>Interaction Mode</span>
+          <select
+            aria-label="Interaction Mode"
+            disabled={!interactionModeEditable}
+            value={core.interaction_mode}
+            onChange={(event) => updateCore("interaction_mode", event.target.value)}
+          >
+            <option value="roleplay">Roleplay</option>
+            <option value="storyteller">Storyteller</option>
+          </select>
+        </label>
+        <label className="field-label">
           <span>Title</span>
           <input required value={core.title} onChange={(event) => updateCore("title", event.target.value)} />
         </label>
-        <label className="field-label">
+        {core.interaction_mode === "roleplay" ? <label className="field-label">
           <span>Player Character</span>
           <input value={core.player_character_name} onChange={(event) => updateCore("player_character_name", event.target.value)} />
-        </label>
-        <label className="field-label">
+        </label> : null}
+        {core.interaction_mode === "roleplay" ? <label className="field-label">
           <span>Player Role</span>
           <input required value={core.player_role} onChange={(event) => updateCore("player_role", event.target.value)} />
-        </label>
+        </label> : null}
         <label className="field-label scenario-premise-field">
           <span>Premise / Setup</span>
           <textarea required value={core.premise} onChange={(event) => updateCore("premise", event.target.value)} />
@@ -7802,6 +7807,7 @@ function ScenarioDefinitionModal({ scenario, onClose, onSaved }: { scenario: Sce
             onCancel={onClose}
             onDirtyChange={setEditorDirty}
             starterReferenceImages
+            interactionModeEditable
             onSave={async (edit) => {
               await postJson(`/api/scenarios/${scenario.scenario_id}/definition`, { edit });
               onSaved();
@@ -9222,7 +9228,6 @@ function jobTypeLabel(type: string) {
     chat_turn: "Chat turn",
     look_around: "Looking around",
     chat_regenerate: "Regenerating message",
-    action_choice_generate: "Generating action choices",
     action_choice_regenerate: "Regenerating options",
     character_text_send: "Sending text",
     character_text_message_edit: "Editing text",

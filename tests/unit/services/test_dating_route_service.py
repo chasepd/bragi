@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.services.dating_route_service import DatingRouteService
@@ -37,6 +38,36 @@ def test_seed_routes_for_dating_sim_existing_romance_characters(
     assert route.completed_interactions == 0
     assert route.dates_completed == 0
     assert route.next_reasonable_step == "build early interest or exchange contact info"
+
+
+def test_storyteller_mode_skips_dating_route_seeding_and_progression(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _player_id, _npc_id = _dating_save_with_romance_option(
+        repositories,
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    service = DatingRouteService(repositories)
+
+    assert service.seed_routes_for_save(save_id) == 0
+    player_message = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        body="Have them exchange numbers.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        body="Mika gives Ren her number.",
+    )
+    result = service.update_after_turn(
+        save_id=save_id,
+        player_message_id=player_message.id,
+        narrator_message_id=narrator_message.id,
+    )
+    assert result.seeded_count == 0
+    assert result.updated_count == 0
+    assert repositories.list_dating_route_states(save_id) == []
 
 
 def test_update_after_turn_advances_explicit_contact_exchange_and_counts_once(
@@ -390,12 +421,15 @@ def test_update_after_turn_uses_current_world_day_index_for_route_anchors(
 
 def _dating_save_with_romance_option(
     repositories: PersistenceRepositories,
+    *,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
 ) -> tuple[str, str, str]:
     scenario = repositories.create_scenario(
         type="dating_sim",
         title="Last Summer",
         premise="A summer of route choices.",
         player_role="Transfer student",
+        interaction_mode=interaction_mode,
         content={
             "player_character_name": "Ren Takahashi",
         },

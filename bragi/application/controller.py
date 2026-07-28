@@ -48,6 +48,7 @@ from bragi.content_rating_instructions import (
     content_rating_exceeds,
     maximum_content_rating,
 )
+from bragi.interaction_mode import InteractionMode, normalize_interaction_mode
 from bragi.persistence.models import (
     CharacterRecord,
     MemoryRecord,
@@ -260,6 +261,7 @@ class ManualScenarioInput:
     title: str
     premise: str
     player_role: str
+    interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY
     player_character_name: str = ""
     worldbuilding: str = ""
     lore: str = ""
@@ -373,6 +375,7 @@ class SaveListItemModel:
     last_opened_at: str | None = None
     supported: bool = True
     unsupported_reason: str | None = None
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
 
 
 @dataclass(frozen=True)
@@ -391,6 +394,7 @@ class SavedScenarioModel:
     action_choices_enabled: bool = False
     supported: bool = True
     unsupported_reason: str | None = None
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
 
 
 @dataclass(frozen=True)
@@ -402,6 +406,7 @@ class ScenarioDraftModel:
     action_choices_enabled: bool = False
     scenario_types: tuple[str, ...] = ()
     character_starters: tuple[dict[str, object], ...] = ()
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
 
 
 @dataclass(frozen=True)
@@ -415,6 +420,7 @@ class ScenarioDraftProgressModel:
     action_choices_enabled: bool = False
     error: str = ""
     scenario_types: tuple[str, ...] = ()
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
 
 
 @dataclass(frozen=True)
@@ -457,6 +463,7 @@ class RuntimeModel:
     failure_text: str | None = None
     status: str | None = None
     error: str | None = None
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
 
 
 @dataclass(frozen=True)
@@ -609,6 +616,7 @@ class BragiRuntime:
         roleplay_save = details is not None and details.scenario.type in ROLEPLAY_TYPES
         action_choices_enabled = (
             details is not None
+            and details.save.interaction_mode is InteractionMode.ROLEPLAY
             and scenario_action_choices_enabled(details.scenario)
         )
         eligible_character_image_message_ids = (
@@ -694,6 +702,11 @@ class BragiRuntime:
             failure_text=None,
             status=status,
             error=error,
+            interaction_mode=(
+                active_save.interaction_mode
+                if active_save is not None
+                else InteractionMode.ROLEPLAY
+            ),
         )
 
     def build_shell_model(
@@ -727,6 +740,7 @@ class BragiRuntime:
         roleplay_save = details is not None and details.scenario.type in ROLEPLAY_TYPES
         action_choices_enabled = (
             details is not None
+            and details.save.interaction_mode is InteractionMode.ROLEPLAY
             and scenario_action_choices_enabled(details.scenario)
         )
         eligible_character_image_message_ids = (
@@ -803,6 +817,11 @@ class BragiRuntime:
             failure_text=None,
             status=status,
             error=error,
+            interaction_mode=(
+                active_save.interaction_mode
+                if active_save is not None
+                else InteractionMode.ROLEPLAY
+            ),
         )
 
     def build_chronicle_page_model(
@@ -1066,6 +1085,7 @@ class BragiRuntime:
         scenario_type: str,
         scenario_types: Iterable[str] | None = None,
         seed: str,
+        interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
         action_choices_enabled: bool = False,
         progress_callback: ScenarioDraftProgressCallback | None = None,
         current_user_id: str | None = None,
@@ -1119,6 +1139,7 @@ class BragiRuntime:
                 scenario_type=scenario_type,
                 scenario_types=scenario_types,
                 seed=text,
+                interaction_mode=interaction_mode,
                 action_choices_enabled=action_choices_enabled,
                 progress_callback=notify_progress,
             )
@@ -1233,6 +1254,7 @@ class BragiRuntime:
         seed: str,
         section_id: str,
         sections: dict[str, str],
+        interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
         action_choices_enabled: bool = False,
         current_user_id: str | None = None,
     ) -> RuntimeModel:
@@ -1265,6 +1287,7 @@ class BragiRuntime:
                 seed=text,
                 section_id=section_id,
                 sections=sections,
+                interaction_mode=interaction_mode,
                 action_choices_enabled=action_choices_enabled,
             )
         except Exception as exc:
@@ -1287,6 +1310,7 @@ class BragiRuntime:
         )
         draft = ScenarioDraft(
             type=draft_type,
+            interaction_mode=normalize_interaction_mode(interaction_mode),
             scenario_types=draft_genres,
             sections=updated_sections,
             metadata=metadata_with_scenario_content_ratings(
@@ -1317,6 +1341,7 @@ class BragiRuntime:
         scenario_type: str,
         scenario_types: Iterable[str] | None = None,
         sections: dict[str, str],
+        interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
         character_starters: Iterable[Mapping[str, object]] | None = None,
         count: int | None = None,
         custom_description: str = "",
@@ -1422,6 +1447,7 @@ class BragiRuntime:
             )
             draft = ScenarioDraft(
                 type=draft_type,
+                interaction_mode=normalize_interaction_mode(interaction_mode),
                 scenario_types=draft_genres,
                 sections=normalized_sections,
                 metadata=metadata_with_scenario_content_ratings(
@@ -1463,6 +1489,7 @@ class BragiRuntime:
         scenario_type: str,
         scenario_types: Iterable[str] | None = None,
         sections: dict[str, str],
+        interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
         character_starters: Iterable[Mapping[str, object]] | None = None,
         action_choices_enabled: bool = False,
         save_title: str = "",
@@ -1475,6 +1502,9 @@ class BragiRuntime:
         try:
             source_metadata = _scenario_source_metadata_without_loss_conditions(
                 source_metadata
+            )
+            normalized_interaction_mode = normalize_interaction_mode(
+                interaction_mode
             )
             draft_type, draft_genres, action_choices_enabled = (
                 normalized_scenario_types_and_flag(
@@ -1527,6 +1557,7 @@ class BragiRuntime:
             )
             draft = ScenarioDraft(
                 type=draft_type,
+                interaction_mode=normalized_interaction_mode,
                 scenario_types=draft_genres,
                 sections=normalized_sections,
                 metadata=source_metadata,
@@ -1560,11 +1591,16 @@ class BragiRuntime:
                     safety_transition=_content_safety_transition(safety),
                 )
                 opening_message_id = message.id
-            seeded_character_count = seed_continuation_characters(
-                repositories=self.repositories,
-                save_id=save.id,
-                metadata=source_metadata or {},
-                source_message_id=opening_message_id,
+            seeded_character_count = (
+                seed_continuation_characters(
+                    repositories=self.repositories,
+                    save_id=save.id,
+                    metadata=source_metadata or {},
+                    source_message_id=opening_message_id,
+                    include_player_character=(
+                        normalized_interaction_mode is InteractionMode.ROLEPLAY
+                    ),
+                )
             )
             persisted_scenario = self.repositories.get_scenario(scenario_id)
             seed_content = (
@@ -1572,7 +1608,8 @@ class BragiRuntime:
                 if persisted_scenario is not None
                 else dict(draft.sections)
             )
-            seeded_character_count += _seed_initial_character_registry(
+            seeded_character_count += (
+                _seed_initial_character_registry(
                 repositories=self.repositories,
                 save_id=save.id,
                 scenario_type=draft.type,
@@ -1580,6 +1617,8 @@ class BragiRuntime:
                 content=seed_content,
                 source_message_id=opening_message_id,
                 media_service=self._media_service(),
+                interaction_mode=normalized_interaction_mode,
+            )
             )
             seeded_first_contact_state_count = _seed_first_contact_exploration_state(
                 repositories=self.repositories,
@@ -1703,6 +1742,7 @@ class BragiRuntime:
         current_user_id: str | None = None,
     ) -> RuntimeModel:
         title = _required_text(scenario.title, "Scenario title")
+        interaction_mode = normalize_interaction_mode(scenario.interaction_mode)
         scenario_type, scenario_types, action_choices_enabled = (
             normalized_scenario_types_and_flag(
                 scenario.scenario_type,
@@ -1716,6 +1756,14 @@ class BragiRuntime:
             scenario=scenario,
             action_choices_enabled=action_choices_enabled,
         )
+        if interaction_mode is InteractionMode.STORYTELLER:
+            for player_section in (
+                "player_character_name",
+                "player_character_profile",
+                "player_role",
+            ):
+                content.pop(player_section, None)
+            content = content_with_action_choices_enabled(content, enabled=False)
         premise, content = normalize_scenario_definition(
             scenario_type=scenario_type,
             premise=_required_text(scenario.premise, "Premise"),
@@ -1767,10 +1815,14 @@ class BragiRuntime:
             )
         title = str(content.get("title", title)).strip() or title
         premise = str(content.get("premise", premise)).strip() or premise
-        player_role = (
-            str(content.get("player_role", scenario.player_role)).strip()
-            or _required_text(scenario.player_role, "Player role")
-        )
+        player_role = str(
+            content.get("player_role", scenario.player_role)
+        ).strip()
+        if interaction_mode is InteractionMode.ROLEPLAY:
+            player_role = player_role or _required_text(
+                scenario.player_role,
+                "Player role",
+            )
         source_metadata = content.get("_source")
         content["_source"] = metadata_with_scenario_content_ratings(
             source_metadata if isinstance(source_metadata, Mapping) else None,
@@ -1785,6 +1837,7 @@ class BragiRuntime:
             premise=premise,
             player_role=player_role,
             content=content,
+            interaction_mode=interaction_mode,
         )
         save = SaveService(self.repositories).create_save(
             scenario_id=record.id,
@@ -1810,14 +1863,17 @@ class BragiRuntime:
                 safety_transition=_content_safety_transition(safety),
             )
             opening_message_id = message.id
-        seeded_character_count = _seed_initial_character_registry(
-            repositories=self.repositories,
-            save_id=save.id,
-            scenario_type=scenario_type,
-            scenario_types=scenario_types,
-            content=content,
-            source_message_id=opening_message_id,
-            media_service=self._media_service(),
+        seeded_character_count = (
+            _seed_initial_character_registry(
+                repositories=self.repositories,
+                save_id=save.id,
+                scenario_type=scenario_type,
+                scenario_types=scenario_types,
+                content=content,
+                source_message_id=opening_message_id,
+                media_service=self._media_service(),
+                interaction_mode=interaction_mode,
+            )
         )
         seeded_first_contact_state_count = _seed_first_contact_exploration_state(
             repositories=self.repositories,
@@ -1891,11 +1947,12 @@ class BragiRuntime:
             content=content,
             source_message_id=opening_message_id,
         )
-        self._generate_opening_action_choices_if_configured_blocking(
-            save_id=save.id,
-            opening_message_id=opening_message_id,
-            current_user_id=current_user_id,
-        )
+        if interaction_mode is InteractionMode.ROLEPLAY:
+            self._generate_opening_action_choices_if_configured_blocking(
+                save_id=save.id,
+                opening_message_id=opening_message_id,
+                current_user_id=current_user_id,
+            )
         TurnSnapshotService(self.repositories).capture_current_head_if_dirty(
             save.id,
             reason="opening_message",
@@ -1967,6 +2024,7 @@ class BragiRuntime:
                     unsupported_reason=(
                         None if supported else RETIRED_SCENARIO_REASON
                     ),
+                    interaction_mode=scenario.interaction_mode,
                 )
             )
         return tuple(scenarios)
@@ -2025,11 +2083,16 @@ class BragiRuntime:
                 safety_transition=_content_safety_transition(safety),
             )
             opening_message_id = message.id
-        seeded_character_count = seed_continuation_characters(
-            repositories=self.repositories,
-            save_id=save.id,
-            metadata=_scenario_source_metadata(scenario.content_json),
-            source_message_id=opening_message_id,
+        seeded_character_count = (
+            seed_continuation_characters(
+                repositories=self.repositories,
+                save_id=save.id,
+                metadata=_scenario_source_metadata(scenario.content_json),
+                source_message_id=opening_message_id,
+                include_player_character=(
+                    save.interaction_mode is InteractionMode.ROLEPLAY
+                ),
+            )
         )
         scenario_type = ScenarioType(scenario.type)
         scenario_content = _scenario_content(scenario.content_json)
@@ -2037,14 +2100,17 @@ class BragiRuntime:
             scenario_type,
             scenario_content,
         )
-        seeded_character_count += _seed_initial_character_registry(
-            repositories=self.repositories,
-            save_id=save.id,
-            scenario_type=scenario_type,
-            scenario_types=scenario_types,
-            content=scenario_content,
-            source_message_id=opening_message_id,
-            media_service=self._media_service(),
+        seeded_character_count += (
+            _seed_initial_character_registry(
+                repositories=self.repositories,
+                save_id=save.id,
+                scenario_type=scenario_type,
+                scenario_types=scenario_types,
+                content=scenario_content,
+                source_message_id=opening_message_id,
+                media_service=self._media_service(),
+                interaction_mode=save.interaction_mode,
+            )
         )
         seeded_first_contact_state_count = _seed_first_contact_exploration_state(
             repositories=self.repositories,
@@ -2118,11 +2184,12 @@ class BragiRuntime:
             content=scenario_content,
             source_message_id=opening_message_id,
         )
-        self._generate_opening_action_choices_if_configured_blocking(
-            save_id=save.id,
-            opening_message_id=opening_message_id,
-            current_user_id=current_user_id,
-        )
+        if save.interaction_mode is InteractionMode.ROLEPLAY:
+            self._generate_opening_action_choices_if_configured_blocking(
+                save_id=save.id,
+                opening_message_id=opening_message_id,
+                current_user_id=current_user_id,
+            )
         TurnSnapshotService(self.repositories).capture_current_head_if_dirty(
             save.id,
             reason="opening_message",
@@ -3362,6 +3429,7 @@ class BragiRuntime:
             scenario_wizard=base.scenario_wizard,
             scenario_draft=ScenarioDraftModel(
                 scenario_type=draft.type.value,
+                interaction_mode=draft.interaction_mode,
                 sections=tuple(draft.sections.items()),
                 regeneration_seed=draft.regeneration_seed,
                 source_metadata=tuple((draft.metadata or {}).items()),
@@ -3375,6 +3443,7 @@ class BragiRuntime:
             model_indicator=base.model_indicator,
             status=base.status,
             error=base.error,
+            interaction_mode=base.interaction_mode,
         )
 
     async def submit_player_message(
@@ -7722,6 +7791,7 @@ def _seed_initial_character_registry(
     content: Mapping[str, object],
     source_message_id: str | None,
     media_service: MediaService | None = None,
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY,
 ) -> int:
     content_rating = _scenario_content_mapping_rating(content)
     normalized_genres = scenario_types or (scenario_type,)
@@ -7733,15 +7803,20 @@ def _seed_initial_character_registry(
         scenario_type=starter_type,
         content=content,
     )
-    created_count = _seed_player_character_from_scenario(
-        repositories=repositories,
-        save_id=save_id,
-        content=content,
-        source_message_id=source_message_id,
-        content_rating=content_rating,
-    )
+    created_count = 0
+    if interaction_mode is InteractionMode.ROLEPLAY:
+        created_count = _seed_player_character_from_scenario(
+            repositories=repositories,
+            save_id=save_id,
+            content=content,
+            source_message_id=source_message_id,
+            content_rating=content_rating,
+        )
     if not entries:
-        if ScenarioType.DATING_SIM in normalized_genres:
+        if (
+            interaction_mode is InteractionMode.ROLEPLAY
+            and ScenarioType.DATING_SIM in normalized_genres
+        ):
             DatingRouteService(repositories).seed_routes_for_save(
                 save_id,
                 source_message_id=source_message_id,
@@ -7784,7 +7859,11 @@ def _seed_initial_character_registry(
             motivations=entry.motivations.strip(),
             current_intent=entry.current_intent.strip(),
             boundaries=entry.boundaries.strip(),
-            attitude_toward_player=entry.attitude_toward_player.strip(),
+            attitude_toward_player=(
+                entry.attitude_toward_player.strip()
+                if interaction_mode is InteractionMode.ROLEPLAY
+                else ""
+            ),
             cooperation_conditions=entry.cooperation_conditions.strip(),
             status=entry.status.strip() or "present at scenario start",
             source_message_id=source_message_id,
@@ -8315,6 +8394,7 @@ def _save_list_item_model(
         last_opened_at=save.last_opened_at,
         supported=supported,
         unsupported_reason=None if supported else RETIRED_SCENARIO_REASON,
+        interaction_mode=save.interaction_mode,
     )
 
 
@@ -9315,6 +9395,7 @@ def _scenario_progress_model(
         action_choices_enabled=progress.action_choices_enabled,
         error=progress.error,
         scenario_types=tuple(genre.value for genre in progress.scenario_types),
+        interaction_mode=progress.interaction_mode,
     )
 
 
@@ -9352,6 +9433,17 @@ def _persist_scenario_draft(
         scenario_types=draft.scenario_types,
         action_choices_enabled=draft.action_choices_enabled,
     )
+    if draft.interaction_mode is InteractionMode.STORYTELLER:
+        required_sections = tuple(
+            section_id
+            for section_id in required_sections
+            if section_id
+            not in {
+                "player_character_name",
+                "player_character_profile",
+                "player_role",
+            }
+        )
     allowed_sections = _scenario_allowed_section_ids(
         draft.type,
         scenario_types=draft.scenario_types,
@@ -9420,7 +9512,8 @@ def _persist_scenario_draft(
         type=draft.type.value,
         title=sections["title"],
         premise=sections.get("premise", ""),
-        player_role=sections["player_role"],
+        player_role=sections.get("player_role", ""),
+        interaction_mode=draft.interaction_mode,
         content=content,
     )
     return scenario.id

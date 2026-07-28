@@ -278,6 +278,36 @@ def test_world_data_service_exposes_generation_prompt_without_editable_source(
     )
 
 
+def test_world_data_service_uses_snapshotted_save_interaction_mode(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    world_data = _import_world_data_service_without_gtk(monkeypatch)
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.update_scenario(
+        scenario_id=scenario.id,
+        title=scenario.title,
+        premise=scenario.premise,
+        player_role=scenario.player_role,
+        content={},
+        interaction_mode="storyteller",
+    )
+
+    model = world_data.WorldDataService(
+        repositories=repositories,
+        active_save_id=save.id,
+    ).build_model()
+
+    assert _value(_value(model, "scenario"), "interaction_mode") == "roleplay"
+
+
 def test_world_data_service_requires_an_active_save_and_returns_empty_state(
     repositories: PersistenceRepositories,
     monkeypatch: MonkeyPatch,

@@ -6,6 +6,7 @@ import json
 import re
 from dataclasses import dataclass
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import (
     CharacterRecord,
     DatingRouteStateRecord,
@@ -43,7 +44,11 @@ class DatingRouteService:
         source_message_id: str | None = None,
     ) -> int:
         details = self.repositories.load_save_details(save_id)
-        if details is None or not _scenario_supports_dating_routes(details.scenario):
+        if (
+            details is None
+            or details.save.interaction_mode is InteractionMode.STORYTELLER
+            or not _scenario_supports_dating_routes(details.scenario)
+        ):
             return 0
         characters = self.repositories.list_characters(save_id)
         player = _player_character(characters)
@@ -99,7 +104,11 @@ class DatingRouteService:
         narrator_message_id: str,
     ) -> DatingRouteUpdateResult:
         details = self.repositories.load_save_details(save_id)
-        if details is None or not _scenario_supports_dating_routes(details.scenario):
+        if (
+            details is None
+            or details.save.interaction_mode is InteractionMode.STORYTELLER
+            or not _scenario_supports_dating_routes(details.scenario)
+        ):
             return DatingRouteUpdateResult()
         messages = {message.id: message for message in details.messages}
         player_message = messages.get(player_message_id)

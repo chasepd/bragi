@@ -8,6 +8,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from bragi.interaction_mode import InteractionMode
 from bragi.providers.structured_schema import normalize_strict_json_schema
 
 
@@ -141,6 +142,7 @@ class ChatRequest:
     provider: str
     model_id: str
     messages: tuple[ChatMessage, ...]
+    interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
     response_style_section: str | None = None
     scenario_instructions: str = ""
     user_narration_guidance: str = ""

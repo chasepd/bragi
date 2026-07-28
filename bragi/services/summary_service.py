@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from time import perf_counter
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import (
     MessageRecord,
     ModelPreferenceRecord,
@@ -203,6 +204,23 @@ class SummaryService:
                 frontier_triggered=frontier_triggered,
             )
             return None
+        save = self.repositories.get_save(save_id)
+        storyteller_mode = (
+            save is not None
+            and save.interaction_mode is InteractionMode.STORYTELLER
+        )
+        evidence_messages = (
+            [message for message in covered_messages if message.role == "narrator"]
+            if storyteller_mode
+            else covered_messages
+        )
+        if covered_messages and not evidence_messages:
+            log_event(
+                "summarization.skipped",
+                save_id=save_id,
+                reason="direction_only_range",
+            )
+            return None
 
         preference = roleplay_model_preference(
             repositories=self.repositories,
@@ -233,9 +251,11 @@ class SummaryService:
             generated = await self._generate_summary_for_coverage(
                 save_id=save_id,
                 preference=preference,
-                covered_messages=covered_messages,
+                covered_messages=evidence_messages,
                 retained_recent_messages=tuple(
-                    unsummarized_messages[len(covered_messages) :]
+                    message
+                    for message in unsummarized_messages[len(covered_messages) :]
+                    if not storyteller_mode or message.role == "narrator"
                 ),
                 prior_summaries=tuple(summaries),
                 started_at=started_at,
@@ -299,7 +319,7 @@ class SummaryService:
                 model=generated.model,
                 content_rating=generated.content_rating,
                 source_message_ids=tuple(
-                    message.id for message in covered_messages
+                    message.id for message in evidence_messages
                 ),
                 source_summary_ids=tuple(summary.id for summary in summaries),
             )

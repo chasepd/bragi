@@ -825,4 +825,5 @@ def _should_try_fallback_for_error(exc: ProviderError) -> bool:
         ProviderErrorCategory.NETWORK_ERROR,
         ProviderErrorCategory.PROVIDER_ERROR,
         ProviderErrorCategory.IMAGE_GENERATION_FAILED,
+        ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID,
     }

@@ -1,3 +1,5 @@
+export type InteractionMode = "roleplay" | "storyteller";
+
 export type RuntimeModel = {
   saves: SaveListItem[];
   active_save_id: string | null;
@@ -21,6 +23,7 @@ export type RuntimeModel = {
   error: string | null;
   scenario_draft?: ScenarioDraft | null;
   scenario_wizard?: ScenarioWizard | null;
+  interaction_mode?: InteractionMode;
 };
 
 export type RuntimeWorldTime = {
@@ -156,6 +159,7 @@ export type SaveListItem = {
   last_opened_at?: string | null;
   supported?: boolean;
   unsupported_reason?: string | null;
+  interaction_mode?: InteractionMode;
 };
 export type SaveEvent = {
   event_id: number;
@@ -178,6 +182,7 @@ export type Scenario = {
   updated_at?: string | null;
   supported?: boolean;
   unsupported_reason?: string | null;
+  interaction_mode?: InteractionMode;
 };
 export type ScenarioContentSection = [string, string];
 export type ScenarioCharacterStarter = {
@@ -221,6 +226,7 @@ export type WorldDataScenario = {
   content_sections: ScenarioContentSection[];
   generation_prompt?: string | null;
   character_starters?: ScenarioCharacterStarter[];
+  interaction_mode?: InteractionMode;
 };
 export type ChronicleMessage = {
   message_id: string;
@@ -315,6 +321,7 @@ export type ScenarioDraft = {
   source_metadata: [string, unknown][];
   action_choices_enabled?: boolean;
   character_starters?: ScenarioCharacterStarter[];
+  interaction_mode?: InteractionMode;
 };
 export type ScenarioWizard = {
   flows: ScenarioWizardFlow[];

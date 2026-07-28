@@ -22,7 +22,7 @@ from bragi.text_search import (
     unicode_word_terms,
 )
 
-CURRENT_SCHEMA_VERSION = 73
+CURRENT_SCHEMA_VERSION = 74
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS scenarios (
     title TEXT NOT NULL,
     premise TEXT NOT NULL DEFAULT '',
     player_role TEXT NOT NULL DEFAULT '',
+    interaction_mode TEXT NOT NULL DEFAULT 'roleplay',
     content_json TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -110,6 +111,7 @@ CREATE TABLE IF NOT EXISTS saves (
     title TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1,
     custom_instructions TEXT NOT NULL DEFAULT '',
+    interaction_mode TEXT NOT NULL DEFAULT 'roleplay',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_opened_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -664,26 +666,38 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 72:
+            if current == 73:
+                _migrate_schema_73_to_74(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 72:
                 _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 71:
                 _migrate_schema_71_to_72(connection)
+                _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 70:
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
+                _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 69:
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
+                _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 68:
                 _migrate_schema_68_to_69(connection)
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
+                _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 67:
                 _migrate_schema_67_to_68(connection)
@@ -691,6 +705,8 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
+                _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 66:
                 _migrate_schema_66_to_67(connection)
@@ -699,6 +715,8 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
+                _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 65:
                 _migrate_schema_65_to_66(connection)
@@ -708,6 +726,8 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
+                _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 64:
                 _migrate_schema_64_to_65(connection)
@@ -718,6 +738,8 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
+                _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 63:
                 _migrate_schema_63_to_64(connection)
@@ -729,6 +751,8 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
+                _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 62:
                 _migrate_schema_62_to_63(connection)
@@ -741,6 +765,8 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
+                _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 61:
                 _migrate_schema_61_to_62(connection)
@@ -754,6 +780,8 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_69_to_70(connection)
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
+                _migrate_schema_72_to_73(connection)
+                _migrate_schema_73_to_74(connection)
                 current = CURRENT_SCHEMA_VERSION
             else:
                 raise RuntimeError(
@@ -782,6 +810,11 @@ def migrate_database(database_path: Path | str) -> None:
             or not _schema_migration_applied(connection, 73)
         ):
             _migrate_schema_72_to_73(connection)
+        if (
+            not _interaction_mode_schema_is_current(connection)
+            or not _schema_migration_applied(connection, 74)
+        ):
+            _migrate_schema_73_to_74(connection)
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
         _ensure_context_observation_curation_schema(connection)
@@ -2080,6 +2113,34 @@ def _migrate_schema_72_to_73(connection: sqlite3.Connection) -> None:
     _ensure_summary_lineage_schema(connection)
     _recompute_message_body_token_estimates(connection)
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (73)")
+
+
+def _migrate_schema_73_to_74(connection: sqlite3.Connection) -> None:
+    _ensure_interaction_mode_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (74)")
+
+
+def _interaction_mode_schema_is_current(connection: sqlite3.Connection) -> bool:
+    return all(
+        not _table_exists(connection, table)
+        or "interaction_mode" in _column_names(connection, table)
+        for table in ("scenarios", "saves")
+    )
+
+
+def _ensure_interaction_mode_schema(connection: sqlite3.Connection) -> None:
+    _add_column_if_missing(
+        connection,
+        "scenarios",
+        "interaction_mode",
+        "TEXT NOT NULL DEFAULT 'roleplay'",
+    )
+    _add_column_if_missing(
+        connection,
+        "saves",
+        "interaction_mode",
+        "TEXT NOT NULL DEFAULT 'roleplay'",
+    )
 
 
 def _summary_lineage_schema_is_current(connection: sqlite3.Connection) -> bool:

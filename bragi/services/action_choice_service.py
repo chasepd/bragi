@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
+from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import (
     CharacterRecord,
     MessageActionChoiceRecord,
@@ -106,6 +107,8 @@ class ActionChoiceService:
         details = save_details or self.repositories.load_save_details(save_id)
         if details is None:
             raise ValueError(f"Unknown save id: {save_id}")
+        if details.save.interaction_mode is InteractionMode.STORYTELLER:
+            return None
         if not scenario_action_choices_enabled(details.scenario):
             return None
         narrator_message = next(
