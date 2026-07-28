@@ -8225,6 +8225,31 @@ describe("frontend helpers", () => {
     expect(screen.queryByRole("separator", { name: "Resize right panel" })).not.toBeInTheDocument();
   });
 
+  it("constrains mobile chronicle content to the viewport", async () => {
+    const nodeFileSystem = "node:fs/promises";
+    const { readFile } = await import(/* @vite-ignore */ nodeFileSystem);
+    const processApi = (globalThis as typeof globalThis & {
+      process: { cwd(): string };
+    }).process;
+    const workspace = processApi.cwd().endsWith("/frontend")
+      ? processApi.cwd().slice(0, -"/frontend".length)
+      : processApi.cwd();
+    const stylesheet = await readFile(`${workspace}/frontend/src/styles.css`, "utf8");
+
+    expect(stylesheet).toMatch(
+      /@media \(max-width: 760px\), \(pointer: coarse\) and \(max-height: 520px\)/
+    );
+    expect(stylesheet).toMatch(
+      /\.mobile-app-shell \.chronicle-scroll\s*\{[^}]*overflow-x:\s*hidden/s
+    );
+    expect(stylesheet).toMatch(
+      /\.mobile-app-shell \.chronicle-virtual-list,\s*\.mobile-app-shell \.chronicle-virtual-row,\s*\.mobile-app-shell \.message\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*100%;[^}]*min-width:\s*0/s
+    );
+    expect(stylesheet).toMatch(
+      /\.mobile-app-shell \.prose\s*\{[^}]*max-width:\s*100%;[^}]*overflow-wrap:\s*anywhere/s
+    );
+  });
+
   it("keeps library access available in the stacked tablet layout", async () => {
     stubWorkbenchMedia((query) => query.includes("1050px"));
     const model = runtimeModel({
