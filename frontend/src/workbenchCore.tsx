@@ -6648,6 +6648,7 @@ function CyoaActionPicker({
 
   const choices = [...(actionChoices?.choices ?? [])].sort((left, right) => left.ordinal - right.ordinal);
   const generationActive = Boolean(actionChoices?.generation_job);
+  const customActionLabel = generationActive ? "Generating choices..." : "Write your own";
   const submitBusy = submittingSaveId === activeSaveId || submittingSaveIdRef.current === activeSaveId;
   const regenerateBusy = regenerate.isPending;
   const canSubmit = !disabled && !submitBusy && !generationActive;
@@ -6694,13 +6695,13 @@ function CyoaActionPicker({
             type="button"
             className="cyoa-custom-toggle"
             disabled={disabled || submitBusy || generationActive}
-            title="Write your own"
-            aria-label="Write your own"
+            aria-label={customActionLabel}
+            aria-live="polite"
             aria-expanded={manualOpen}
             onClick={() => setManualOpen((current) => !current)}
           >
             <Edit3 size={17} aria-hidden="true" />
-            <span>Write your own</span>
+            <span>{customActionLabel}</span>
           </button>
           {manualOpen ? (
             <form

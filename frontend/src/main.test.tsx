@@ -14839,7 +14839,7 @@ describe("frontend helpers", () => {
       </QueryClientProvider>
     );
 
-    expect(screen.getByRole("button", { name: "Write your own" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Generating choices..." })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
   });
 
