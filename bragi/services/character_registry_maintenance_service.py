@@ -28,6 +28,7 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.structured_schema import normalize_strict_json_schema
 from bragi.redaction import redact_text
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.character_locks import normalize_character_locked_fields
 from bragi.services.character_registry_service import (
     CharacterRegistryEdits,
@@ -66,7 +67,7 @@ CHARACTER_MAINTENANCE_CONFIDENCE_THRESHOLD = 0.88
 RECENT_MESSAGE_LIMIT = 24
 CHARACTER_MAINTENANCE_MESSAGE_OVERLAP = 4
 CHARACTER_MAINTENANCE_MEMORY_TEXT_LIMIT = 80
-MAX_CHARACTER_MAINTENANCE_TOOL_FEEDBACK_TURNS = 2
+MAX_CHARACTER_MAINTENANCE_TOOL_FEEDBACK_TURNS = MODEL_OUTPUT_MAX_ATTEMPTS - 1
 
 
 @dataclass(frozen=True)

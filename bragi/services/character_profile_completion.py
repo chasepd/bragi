@@ -21,6 +21,7 @@ from bragi.providers.contracts import (
     ToolDefinition,
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.character_locks import (
     CHARACTER_AGENCY_FIELDS,
     normalize_character_locked_fields,
@@ -84,8 +85,8 @@ CHARACTER_FIELD_ENHANCEMENT_FIELDS = (
     "visual_notes",
     "voice",
 )
-MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS = 2
-MAX_CHARACTER_FIELD_ENHANCEMENT_ATTEMPTS = 3
+MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS = MODEL_OUTPUT_MAX_ATTEMPTS - 1
+MAX_CHARACTER_FIELD_ENHANCEMENT_ATTEMPTS = MODEL_OUTPUT_MAX_ATTEMPTS
 CHARACTER_STARTER_OUTPUT_TOKENS_PER_CHARACTER = 1024
 RELATIONSHIP_ENTRY_TARGET_KEYS = (
     "name",

@@ -232,7 +232,6 @@ _POST_TURN_PROGRESS_JOB_ORDER = (
     "scenario",
     "image",
 )
-POST_TURN_BACKGROUND_CATCHUP_TIMEOUT_SECONDS = 120.0
 _CHAT_TURN_PROGRESS_JOB_ORDER = (
     "submission",
     "history",
@@ -8954,34 +8953,11 @@ async def _wait_for_background_post_turn_catchup(
         {
             "status": "waiting",
             "job_ids": [job.id for job in active_jobs],
-            "timeout_seconds": POST_TURN_BACKGROUND_CATCHUP_TIMEOUT_SECONDS,
         },
     )
-    deadline = asyncio.get_running_loop().time() + (
-        POST_TURN_BACKGROUND_CATCHUP_TIMEOUT_SECONDS
-    )
     for task in tasks:
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            await handle.event(
-                "post_turn_catchup",
-                {
-                    "status": "timed_out",
-                    "job_ids": [job.id for job in active_jobs],
-                },
-            )
-            return
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
-        except TimeoutError:
-            await handle.event(
-                "post_turn_catchup",
-                {
-                    "status": "timed_out",
-                    "job_ids": [job.id for job in active_jobs],
-                },
-            )
-            return
+            await asyncio.shield(task)
         except Exception as exc:
             await handle.event(
                 "post_turn_catchup",

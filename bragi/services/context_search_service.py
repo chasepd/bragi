@@ -47,6 +47,7 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError
 from bragi.redaction import redact_text
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.context_assembly import scenario_section_candidates
 from bragi.services.continuity_index_service import ContinuityIndexService
 from bragi.services.job_lifecycle import JobLifecycleService
@@ -103,7 +104,7 @@ from bragi.text_search import (
 )
 
 MAX_CONTEXT_SELECTIONS = 16
-MAX_CONTEXT_SEARCH_TOOL_FEEDBACK_TURNS = 2
+MAX_CONTEXT_SEARCH_TOOL_FEEDBACK_TURNS = MODEL_OUTPUT_MAX_ATTEMPTS - 1
 MAX_CONTEXT_CANDIDATE_POOL = 96
 MAX_CONTEXT_CANDIDATE_TEXT_CHARS = 700
 MAX_CONTEXT_RESULT_TEXT_CHARS = 700

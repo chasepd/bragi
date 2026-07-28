@@ -33,6 +33,7 @@ from bragi.providers.contracts import (
     StructuredOutputRequest,
     StructuredOutputResponse,
 )
+from bragi.retry_policy import DEFERRED_WORK_MAX_ATTEMPTS, MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.evidence import quote_matches_source
 from bragi.services.manual_confirmation import manual_memory_confirmation_enabled
 from bragi.services.npc_knowledge_audit_service import NpcKnowledgeLeak
@@ -57,10 +58,12 @@ PLAN_FIRST_NARRATOR_DEFAULT = True
 PLAN_FIRST_NARRATOR_SETTING = "plan_first_narrator_enabled"
 RESPONSE_VERIFICATION_MODE_SETTING = "response_verification_mode"
 RESPONSE_VERIFICATION_MODE_DIAGNOSTIC = "diagnostic"
+RESPONSE_VERIFICATION_MODE_RETRY = "retry"
 RESPONSE_VERIFICATION_MODE_RETRY_ONCE = "retry_once"
 RESPONSE_VERIFICATION_MODES = frozenset(
     {
         RESPONSE_VERIFICATION_MODE_DIAGNOSTIC,
+        RESPONSE_VERIFICATION_MODE_RETRY,
         RESPONSE_VERIFICATION_MODE_RETRY_ONCE,
     }
 )
@@ -73,8 +76,15 @@ CURATION_BATCH_ITEM_LIMIT = 32
 CURATION_INPUT_TOKEN_BUDGET = 8_000
 CURATION_MAX_OUTPUT_TOKENS = 4_096
 CURATION_LEASE_SECONDS = 10 * 60
-CURATION_MAX_ATTEMPTS = 5
-CURATION_RETRY_DELAYS_SECONDS = (60, 5 * 60, 30 * 60, 2 * 60 * 60)
+CURATION_MAX_ATTEMPTS = DEFERRED_WORK_MAX_ATTEMPTS
+CURATION_RETRY_DELAYS_SECONDS = (
+    60,
+    5 * 60,
+    30 * 60,
+    2 * 60 * 60,
+    6 * 60 * 60,
+    24 * 60 * 60,
+)
 
 _MutationResult = TypeVar("_MutationResult")
 _ApplyGuardFactory = Callable[[], AbstractAsyncContextManager[None]]
@@ -356,7 +366,7 @@ class StructuredProviderObservationExtractor:
             else DEFAULT_SCRIPT_GUARD_MODE
         )
         messages_by_id = {message.id: message.body for message in messages}
-        for attempt in range(2):
+        for attempt in range(MODEL_OUTPUT_MAX_ATTEMPTS):
             response = await _structured_response(
                 provider=self.provider,
                 repositories=self.repositories,
@@ -371,7 +381,7 @@ class StructuredProviderObservationExtractor:
                 messages_by_id=messages_by_id,
                 mode=mode,
             )
-            if not rejected or attempt == 1:
+            if not rejected or attempt == MODEL_OUTPUT_MAX_ATTEMPTS - 1:
                 return accepted
             request = _structured_request_with_script_policy_feedback(
                 request,
@@ -556,40 +566,45 @@ class StructuredProviderContextCurator:
                 schema=_curation_schema((observation,)),
                 messages=_curation_messages((observation,)),
             )
-            retry_request = _structured_request_with_script_policy_feedback(
-                subset_request,
-                rejected.script_policy_violations,
-            )
-            if (
-                _structured_request_estimated_tokens(retry_request)
-                > self.input_token_budget
-            ):
-                continue
-            try:
-                retry_response = await _structured_response(
-                    provider=self.provider,
-                    repositories=self.repositories,
-                    providers=self.providers,
-                    request=retry_request,
-                    task="memory_curation",
-                    save_id=save_id,
+            for _attempt in range(1, MODEL_OUTPUT_MAX_ATTEMPTS):
+                retry_request = _structured_request_with_script_policy_feedback(
+                    subset_request,
+                    rejected.script_policy_violations,
                 )
-            except Exception:
-                continue
-            retry_decisions = _curation_decisions_from_data(
-                retry_response.data,
-                (observation,),
-            )
-            checked_retry_decisions = (
-                _mark_curation_decision_script_policy_violations(
-                    retry_decisions,
-                    observations=(observation,),
-                    source_texts_by_observation=source_texts_by_observation,
-                    mode=mode,
+                if (
+                    _structured_request_estimated_tokens(retry_request)
+                    > self.input_token_budget
+                ):
+                    break
+                try:
+                    retry_response = await _structured_response(
+                        provider=self.provider,
+                        repositories=self.repositories,
+                        providers=self.providers,
+                        request=retry_request,
+                        task="memory_curation",
+                        save_id=save_id,
+                    )
+                except Exception:
+                    break
+                retry_decisions = _curation_decisions_from_data(
+                    retry_response.data,
+                    (observation,),
                 )
-            )
-            if checked_retry_decisions:
-                retry_by_id[observation.id] = checked_retry_decisions[0]
+                checked_retry_decisions = (
+                    _mark_curation_decision_script_policy_violations(
+                        retry_decisions,
+                        observations=(observation,),
+                        source_texts_by_observation=source_texts_by_observation,
+                        mode=mode,
+                    )
+                )
+                if not checked_retry_decisions:
+                    break
+                rejected = checked_retry_decisions[0]
+                retry_by_id[observation.id] = rejected
+                if not rejected.script_policy_violations:
+                    break
         return tuple(
             decision
             for decision in (
@@ -1754,9 +1769,11 @@ def response_verification_mode(
         RESPONSE_VERIFICATION_MODE_SETTING,
         save_id=save_id,
     )
-    mode = value if isinstance(value, str) else RESPONSE_VERIFICATION_MODE_DIAGNOSTIC
+    mode = value if isinstance(value, str) else RESPONSE_VERIFICATION_MODE_RETRY
+    if mode == RESPONSE_VERIFICATION_MODE_RETRY_ONCE:
+        return RESPONSE_VERIFICATION_MODE_RETRY
     if mode not in RESPONSE_VERIFICATION_MODES:
-        return RESPONSE_VERIFICATION_MODE_DIAGNOSTIC
+        return RESPONSE_VERIFICATION_MODE_RETRY
     return mode
 
 

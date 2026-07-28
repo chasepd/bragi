@@ -15,10 +15,11 @@ from bragi.providers.contracts import (
     ProviderRetryProgressCallback,
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.retry_policy import PROVIDER_MAX_ATTEMPTS
 
-DEFAULT_PROVIDER_ATTEMPTS = 3
+DEFAULT_PROVIDER_ATTEMPTS = PROVIDER_MAX_ATTEMPTS
 DEFAULT_BACKOFF_SECONDS = 0.4
-MAX_BACKOFF_SECONDS = 4.0
+MAX_BACKOFF_SECONDS = 30.0
 RATE_LIMIT_BACKOFF_MULTIPLIER = 5.0
 _TRANSIENT_CATEGORIES = frozenset(
     {

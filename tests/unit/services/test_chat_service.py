@@ -2354,7 +2354,7 @@ def test_submit_player_turn_applies_phrase_guard_before_persisting_narrator(
     ]
 
 
-def test_submit_player_turn_phrase_guard_fails_after_four_total_attempts(
+def test_submit_player_turn_phrase_guard_fails_after_seven_total_attempts(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -2382,6 +2382,9 @@ def test_submit_player_turn_phrase_guard_fails_after_four_total_attempts(
             "The save-only phrase lands flat.",
             "Still a save-only phrase.",
             "Another save-only phrase.",
+            "Fourth save-only phrase.",
+            "Fifth save-only phrase.",
+            "Sixth save-only phrase.",
             "Final save-only phrase.",
         ),
     )
@@ -2401,12 +2404,12 @@ def test_submit_player_turn_phrase_guard_fails_after_four_total_attempts(
             )
         )
 
-    assert len(provider.chat_requests) == 4
+    assert len(provider.chat_requests) == 7
     persisted = repositories.list_messages(save.id)
     assert [message.role for message in persisted] == ["player"]
 
 
-def test_submit_player_turn_final_guard_rejects_script_violation_from_phrase_retry(
+def test_submit_player_turn_final_guard_repairs_script_violation_from_phrase_retry(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -2439,7 +2442,11 @@ def test_submit_player_turn_final_guard_rejects_script_violation_from_phrase_ret
     )
     provider = SequenceChatProvider(
         "openrouter",
-        ("The save-only phrase lands flat.", "玩家喜欢简洁叙事。"),
+        (
+            "The save-only phrase lands flat.",
+            "玩家喜欢简洁叙事。",
+            "The beacon gutters while Mara reaches the lens.",
+        ),
     )
     service = ChatService(
         repositories=repositories,
@@ -2447,20 +2454,22 @@ def test_submit_player_turn_final_guard_rejects_script_violation_from_phrase_ret
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
 
-    with pytest.raises(ValueError, match="script policy violation"):
-        asyncio.run(
-            service.submit_player_turn(
-                save_id=save.id,
-                body="I climb toward the beacon lens.",
-                speaker_name="Mara",
-                run_post_turn_jobs=False,
-            )
+    result = asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I climb toward the beacon lens.",
+            speaker_name="Mara",
+            run_post_turn_jobs=False,
         )
+    )
 
-    assert len(provider.chat_requests) == 2
+    assert result.narrator_message.body == (
+        "The beacon gutters while Mara reaches the lens."
+    )
+    assert len(provider.chat_requests) == 3
     assert "save-only phrase" in provider.chat_requests[1].regeneration_feedback
     persisted = repositories.list_messages(save.id)
-    assert [message.role for message in persisted] == ["player"]
+    assert [message.role for message in persisted] == ["player", "narrator"]
 
 
 def test_submit_player_turn_final_guard_rejects_phrase_from_verifier_retry(
@@ -2537,7 +2546,7 @@ def test_submit_player_turn_final_guard_rejects_phrase_from_verifier_retry(
             )
         )
 
-    assert len(provider.chat_requests) == 2
+    assert len(provider.chat_requests) == 13
     persisted = repositories.list_messages(save.id)
     assert [message.role for message in persisted] == ["player"]
 
@@ -3298,7 +3307,7 @@ def test_submit_player_turn_uses_response_planning_model_preference(
     assert request.narration_evidence == ("message:latest",)
 
 
-def test_submit_player_turn_retries_once_after_narrator_verifier_failure(
+def test_submit_player_turn_uses_seven_attempts_after_narrator_verifier_failure(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -3363,8 +3372,8 @@ def test_submit_player_turn_retries_once_after_narrator_verifier_failure(
         )
     )
 
-    assert len(provider.chat_requests) == 2
-    assert len(verifier.calls) == 1
+    assert len(provider.chat_requests) == 7
+    assert len(verifier.calls) == 7
     assert verifier.calls[0][0] == save.id
     assert verifier.calls[0][2:] == (spec, "The stair is quiet.")
     assert "The lens burns red." in verifier.calls[0][1].narration_brief
@@ -3375,7 +3384,7 @@ def test_submit_player_turn_retries_once_after_narrator_verifier_failure(
     assert result.narrator_message.body == "The lens burns red above the stair."
 
 
-def test_submit_player_turn_retries_once_after_narrator_passivity_issue(
+def test_submit_player_turn_uses_seven_attempts_after_narrator_passivity_issue(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -3443,7 +3452,7 @@ def test_submit_player_turn_retries_once_after_narrator_passivity_issue(
     assert result.narrator_message.body == (
         "Mara cuts across the stair and demands the beacon key."
     )
-    assert len(provider.chat_requests) == 2
+    assert len(provider.chat_requests) == 7
     retry_feedback = provider.chat_requests[1].regeneration_feedback
     assert "NPC passivity" in retry_feedback
     assert "gives the player space" in retry_feedback
@@ -3768,7 +3777,7 @@ def test_submit_player_turn_runs_proactive_text_after_text_world_retry_terminal(
     assert _post_turn_child_status(coordinator, "proactive_text") == "succeeded"
 
 
-def test_submit_player_turn_retries_once_after_dating_stage_violation(
+def test_submit_player_turn_uses_seven_attempts_after_dating_stage_violation(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, _player_id, _npc_id = _create_dating_chat_save(
@@ -3850,7 +3859,7 @@ def test_submit_player_turn_retries_once_after_dating_stage_violation(
         )
     )
 
-    assert len(provider.chat_requests) == 2
+    assert len(provider.chat_requests) == 7
     assert "Keep Mika to warmth and contact exchange." in (
         provider.chat_requests[1].regeneration_feedback
     )
@@ -6582,7 +6591,7 @@ def test_plan_first_character_presence_remains_tentative_without_verification(
     assert planned["decisions"][0]["reason"] == "verifier_unavailable"
 
 
-def test_submit_player_turn_audits_final_response_after_generic_verifier_retry(
+def test_submit_player_turn_uses_verifier_audit_after_generic_verifier_retry(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -6649,7 +6658,7 @@ def test_submit_player_turn_audits_final_response_after_generic_verifier_retry(
     assert result.narrator_message.body == (
         "Nira says, \"The lens burns red above the stair.\""
     )
-    assert auditor.calls == [(save.id, result.narrator_message.body)]
+    assert auditor.calls == []
 
 
 def test_submit_player_turn_uses_legacy_audit_when_second_verifier_fails(
@@ -6905,8 +6914,8 @@ def test_submit_player_turn_agentic_verifier_hard_fails_when_retry_still_leaks(
             )
         )
 
-    assert len(provider.chat_requests) == 2
-    assert len(verifier.calls) == 2
+    assert len(provider.chat_requests) == 7
+    assert len(verifier.calls) == 7
     assert legacy_auditor.calls == []
     assert [
         message.body
@@ -8877,7 +8886,7 @@ def test_submit_player_turn_soft_fails_by_default_when_retry_still_leaks(
         )
     )
 
-    assert len(provider.chat_requests) == 2
+    assert len(provider.chat_requests) == 7
     assert result.narrator_message.body == (
         "Nira says, \"Still, the archive-code joke happened immediately.\""
     )
@@ -8968,7 +8977,7 @@ def test_submit_player_turn_hard_fails_when_retry_still_leaks(
             )
         )
 
-    assert len(provider.chat_requests) == 2
+    assert len(provider.chat_requests) == 7
     assert context_update.calls == []
     assert [
         message.body
@@ -11687,7 +11696,7 @@ def test_run_post_turn_jobs_records_world_time_reconciliation_metadata(
     assert step_by_name["time_reconciliation"].metadata == result
 
 
-def test_run_post_turn_jobs_defers_context_update_after_budget(
+def test_run_post_turn_jobs_waits_for_context_update_without_outer_timeout(
     repositories: PersistenceRepositories,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11716,53 +11725,46 @@ def test_run_post_turn_jobs_defers_context_update_after_budget(
         providers={},
         context_search_service=None,
     )
-    context_cancelled = asyncio.Event()
+    context_started = asyncio.Event()
+    context_release = asyncio.Event()
 
     async def state_step(**_kwargs: object) -> str:
         return "succeeded"
 
     async def context_step(**_kwargs: object) -> str:
-        try:
-            await asyncio.Future()
-        except asyncio.CancelledError:
-            context_cancelled.set()
-            raise
-        raise AssertionError("context step unexpectedly resumed")
+        context_started.set()
+        await context_release.wait()
+        return "succeeded"
 
     monkeypatch.setattr(service, "_extract_state_and_memory_if_configured", state_step)
     monkeypatch.setattr(service, "_update_context_if_configured", context_step)
-    monkeypatch.setattr(
-        chat_service_module,
-        "POST_TURN_CONTEXT_UPDATE_BUDGET_SECONDS",
-        0.01,
-    )
-
-    asyncio.run(
-        service.run_post_turn_jobs(
-            save_id=save.id,
-            player_message_id=player_message.id,
-            narrator_message_id=narrator_message.id,
+    async def run() -> None:
+        task = asyncio.create_task(
+            service.run_post_turn_jobs(
+                save_id=save.id,
+                player_message_id=player_message.id,
+                narrator_message_id=narrator_message.id,
+            )
         )
-    )
+        await context_started.wait()
+        assert not task.done()
+        context_release.set()
+        await task
 
-    assert context_cancelled.is_set()
+    asyncio.run(run())
+
     job = _post_turn_jobs(repositories, save.id)[0]
-    assert _post_turn_child_status(job, "context") == "deferred"
-    context_result = _post_turn_child_result(job, "context")
-    assert context_result["deferred"] is True
-    assert context_result["deferred_reason"] == "timeout"
+    assert _post_turn_child_status(job, "context") == "succeeded"
     retry_jobs = [
         retry_job
         for retry_job in repositories.list_jobs_by_status(("queued",))
         if retry_job.type == "context_update_retry"
     ]
-    assert [retry.payload["reason"] for retry in retry_jobs] == [
-        "post_turn_context_update_timeout"
-    ]
+    assert retry_jobs == []
     step_by_name = {
         step.name: step for step in repositories.list_job_steps(job["id"])
     }
-    assert step_by_name["context"].status == "deferred"
+    assert step_by_name["context"].status == "succeeded"
 
 
 def test_run_post_turn_jobs_runs_director_after_context_before_later_jobs(
@@ -13714,7 +13716,7 @@ def test_run_context_update_retries_cancels_started_child_jobs(
     assert json.loads(jobs[0]["result_json"]) == {
         "source_message_ids": [player_message.id, narrator_message.id],
         "retry_attempt": 2,
-        "max_retry_attempts": 4,
+        "max_retry_attempts": 7,
     }
     assert jobs[1]["result_json"] is None
     assert [
@@ -13817,8 +13819,8 @@ def test_run_context_update_retries_stops_after_retry_budget_exhausted(
         payload={
             "source_message_ids": [player_message.id, narrator_message.id],
             "reason": "post_turn_context_update_failed",
-            "retry_attempt": 3,
-            "max_retry_attempts": 3,
+            "retry_attempt": 7,
+            "max_retry_attempts": 7,
         },
     )
     context_update = FailingContextUpdateService(
@@ -13860,8 +13862,8 @@ def test_run_context_update_retries_stops_after_retry_budget_exhausted(
     )
     assert failed_retry.result == {
         "source_message_ids": [player_message.id, narrator_message.id],
-        "retry_attempt": 3,
-        "max_retry_attempts": 3,
+        "retry_attempt": 7,
+        "max_retry_attempts": 7,
         "retry_budget_exhausted": True,
         "provider_pressure": {
             "reason": "provider_pressure",

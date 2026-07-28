@@ -7,6 +7,11 @@ performance.
 
 ## Slow Load Or Slow Turns
 
+- Bragi favors answer quality and completion over short latency. Provider calls,
+  model-output repairs, and deferred AI work normally receive up to seven total
+  attempts, with progressively longer delays for provider and background-work
+  failures. A degraded provider can therefore make a turn or maintenance task
+  take substantially longer than a single request.
 - Check Active Save Health for large recent transcript windows, stale pending
   suggestions, empty context search results, or failed continuity jobs.
 - Check Performance for slow job, step, or model averages.
@@ -17,6 +22,10 @@ performance.
 
 - Check Signal Board for provider authentication or retry warnings.
 - Check Job Failures for failed maintenance jobs and retry summaries.
+- Repeated retries can increase provider usage and cost. Use diagnostic response
+  verification only while investigating a verifier problem; it records findings
+  without regenerating the narrator response and is not the normal quality-first
+  mode.
 - Re-enter provider keys from Settings > Providers when storage or
   authentication warnings are present.
 

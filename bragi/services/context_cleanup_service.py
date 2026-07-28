@@ -37,6 +37,7 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.redaction import redact_text
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.active_thread_lifecycle import active_thread_is_prompt_visible
 from bragi.services.character_locks import character_field_is_locked
 from bragi.services.job_lifecycle import JobLifecycleService
@@ -74,7 +75,7 @@ _ACTION_SCAN_NOTE_LIMIT = 60
 _ACTION_SCAN_NOTE_CHAR_LIMIT = 360
 _ACTION_MESSAGE_REFERENCE_LIMIT = 160
 _MIN_ACTION_CONFIDENCE = 0.65
-_MAX_CONTEXT_CLEANUP_TOOL_FEEDBACK_TURNS = 2
+_MAX_CONTEXT_CLEANUP_TOOL_FEEDBACK_TURNS = MODEL_OUTPUT_MAX_ATTEMPTS - 1
 CONTEXT_CLEANUP_TASK = "context_cleanup"
 CONTEXT_CLEANUP_SCAN_TASK = "context_cleanup_scan"
 CONTEXT_CLEANUP_ACTIONS_TASK = "context_cleanup_actions"

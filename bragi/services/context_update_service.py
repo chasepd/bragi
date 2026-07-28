@@ -44,6 +44,7 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.structured_schema import normalize_strict_json_schema
 from bragi.redaction import redact_text
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.active_thread_lifecycle import (
     ACTIVE_THREAD_STATUSES,
     ACTIVE_THREAD_VISIBILITIES,
@@ -191,7 +192,7 @@ MAX_CONTEXT_UPDATE_IDENTITY_THREADS = 80
 CHARACTER_HISTORY_SUMMARY_THRESHOLD_CHARS = 6000
 MAX_SELECTED_PRIOR_CONTEXT_CHARS = 700
 MAX_CONTEXT_UPDATE_CANDIDATE_BODY_CHARS = 420
-MAX_CONTEXT_UPDATE_TOOL_FEEDBACK_TURNS = 2
+MAX_CONTEXT_UPDATE_TOOL_FEEDBACK_TURNS = MODEL_OUTPUT_MAX_ATTEMPTS - 1
 MAX_FOCUSED_SCENE_KNOWN_LOCATIONS = 24
 MAX_FOCUSED_SCENE_KNOWN_CHARACTERS = 32
 MAX_FOCUSED_SCENE_ACTIVE_THREADS = 12

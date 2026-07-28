@@ -2325,7 +2325,7 @@ def test_send_text_fails_when_identity_retry_still_speaks_as_player(
         ("player", "failed"),
     ]
     assert "player character identity" in (messages[0].delivery_error or "")
-    assert len(provider.chat_requests) == 2
+    assert len(provider.chat_requests) == 7
 
 
 def test_send_text_allows_typographic_player_possessive_without_identity_retry(

@@ -112,7 +112,13 @@ class FakeToolSuggestionReviewer:
         request: ToolCallRequest,
     ) -> ToolCallResponse:
         self.requests.append(request)
-        calls = self.responses.popleft() if self.responses else ()
+        calls = (
+            self.responses[0]
+            if len(self.responses) == 1
+            else self.responses.popleft()
+            if self.responses
+            else ()
+        )
         return ToolCallResponse(
             tool_calls=calls,
             body="tool response",
@@ -246,7 +252,7 @@ def test_review_failure_leaves_suggestion_pending_for_future_pass(
     assert suggestion.last_review_error == "provider timed out"
 
 
-def test_review_failure_rejects_after_three_automated_attempts(
+def test_review_failure_rejects_after_seven_automated_attempts(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, _message_id, _location_id, suggestion_id = _pending_location_suggestion(
@@ -260,7 +266,7 @@ def test_review_failure_rejects_after_three_automated_attempts(
         model_id="fake-reviewer",
     )
 
-    for _ in range(3):
+    for _ in range(7):
         asyncio.run(service.review_pending(save_id))
 
     suggestion = repositories.list_context_update_suggestions(save_id)[0]
@@ -691,7 +697,7 @@ def test_tool_review_uses_fallback_after_argument_validation_failure(
 
     assert result.rejected_count == 1
     assert result.deferred_count == 0
-    assert len(primary.requests) == 3
+    assert len(primary.requests) == 7
     assert len(fallback.requests) == 1
     assert fallback.requests[0].provider == "fallback"
     assert fallback.requests[0].model_id == "fallback-tools"

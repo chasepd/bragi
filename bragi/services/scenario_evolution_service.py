@@ -30,6 +30,7 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.structured_schema import normalize_strict_json_schema
 from bragi.redaction import redact_text
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.job_diagnostics import build_job_diagnostic_snapshot
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.openrouter_routing_settings import (
@@ -195,7 +196,7 @@ _SCENARIO_EVOLUTION_SEMANTIC_SKIP_REASONS = frozenset(
     ("no_phase_shift", "turn_level_change")
 )
 SCENARIO_EVOLUTION_SECTION_MAX_CHARS = 1200
-MAX_SCENARIO_EVOLUTION_TOOL_FEEDBACK_TURNS = 2
+MAX_SCENARIO_EVOLUTION_TOOL_FEEDBACK_TURNS = MODEL_OUTPUT_MAX_ATTEMPTS - 1
 
 
 @dataclass(frozen=True)

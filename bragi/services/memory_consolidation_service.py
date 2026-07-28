@@ -23,6 +23,7 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.redaction import redact_text
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.openrouter_routing_settings import (
     request_with_openrouter_routing,
@@ -58,7 +59,7 @@ from bragi.services.tool_call_helpers import (
 MEMORY_CONSOLIDATION_THRESHOLD = 40
 MEMORY_CONSOLIDATION_BATCH_SIZE = 80
 MEMORY_CONSOLIDATION_MIN_CONFIDENCE = 0.85
-MAX_MEMORY_CONSOLIDATION_TOOL_FEEDBACK_TURNS = 2
+MAX_MEMORY_CONSOLIDATION_TOOL_FEEDBACK_TURNS = MODEL_OUTPUT_MAX_ATTEMPTS - 1
 
 _ApplyGuardFactory = Callable[[], AbstractAsyncContextManager[None]]
 

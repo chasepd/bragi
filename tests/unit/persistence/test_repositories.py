@@ -2327,12 +2327,11 @@ def test_repeated_expired_context_observation_leases_exhaust_retry_budget(
         claim="The eastern signal is lit.",
     )
 
-    for attempt in range(5):
+    for attempt in range(7):
         claimed = repositories.claim_context_observations(
             (observation.id,),
             lease_token=f"worker-{attempt}",
             lease_seconds=600,
-            max_attempts=5,
         )
         assert [row.id for row in claimed] == [observation.id]
         repositories.connection.execute(
@@ -2349,11 +2348,10 @@ def test_repeated_expired_context_observation_leases_exhaust_retry_budget(
         (observation.id,),
         lease_token="worker-over-budget",
         lease_seconds=600,
-        max_attempts=5,
     ) == []
     state = repositories.get_context_observation_curation_state(observation.id)
     assert state is not None
-    assert state.attempt_count == 5
+    assert state.attempt_count == 7
     assert state.terminal_outcome == "retry_budget_exhausted"
     updated = repositories.get_context_observation(observation.id)
     assert updated is not None

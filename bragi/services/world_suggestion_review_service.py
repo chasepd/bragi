@@ -26,6 +26,7 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.redaction import redact_text
+from bragi.retry_policy import DEFERRED_WORK_MAX_ATTEMPTS, MODEL_OUTPUT_MAX_ATTEMPTS
 from bragi.services.character_text_world_update_service import (
     parse_character_text_source_ref,
 )
@@ -52,9 +53,16 @@ from bragi.services.world_data_service import WorldDataService
 
 MAX_REVIEW_GROUPS = 24
 MAX_SOURCE_MESSAGE_CHARS = 900
-MAX_WORLD_SUGGESTION_REVIEW_TOOL_FEEDBACK_TURNS = 2
-MAX_AUTOMATED_REVIEW_ATTEMPTS = 3
-REVIEW_RETRY_DELAYS_SECONDS = (5 * 60, 30 * 60)
+MAX_WORLD_SUGGESTION_REVIEW_TOOL_FEEDBACK_TURNS = MODEL_OUTPUT_MAX_ATTEMPTS - 1
+MAX_AUTOMATED_REVIEW_ATTEMPTS = DEFERRED_WORK_MAX_ATTEMPTS
+REVIEW_RETRY_DELAYS_SECONDS = (
+    5 * 60,
+    30 * 60,
+    2 * 60 * 60,
+    6 * 60 * 60,
+    12 * 60 * 60,
+    24 * 60 * 60,
+)
 
 
 class SuggestionReviewProvider(Protocol):

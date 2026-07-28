@@ -477,7 +477,7 @@ def test_structured_starter_generation_bounds_provider_schema_retries() -> None:
                 ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID,
                 "Structured provider response violated its JSON Schema",
             )
-            for _attempt in range(3)
+            for _attempt in range(7)
         ]
     )
     completer = StructuredProviderCharacterProfileCompleter(
@@ -502,7 +502,7 @@ def test_structured_starter_generation_bounds_provider_schema_retries() -> None:
         captured.value.category
         == ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID
     )
-    assert len(provider.requests) == 3
+    assert len(provider.requests) == 7
 
 
 def test_tool_starter_generation_is_disabled() -> None:
@@ -1542,7 +1542,7 @@ def test_structured_field_enhancement_retries_empty_target_field(
                 "model": "fake-structured",
                 "field_name": "appearance",
                 "attempt": 1,
-                "max_attempts": 3,
+                "max_attempts": 7,
                 "validation_failure_count": 1,
                 "error_code": "blank_target_field",
             },
@@ -1554,7 +1554,7 @@ def test_structured_field_enhancement_retries_empty_target_field(
                 "model": "fake-structured",
                 "field_name": "appearance",
                 "attempt": 2,
-                "max_attempts": 3,
+                "max_attempts": 7,
                 "validation_failure_count": 1,
             },
         ),
@@ -1752,7 +1752,7 @@ def test_tool_field_enhancement_retries_empty_target_field(
                 "model": "fake-tool",
                 "field_name": "appearance",
                 "turn": 1,
-                "max_turns": 3,
+                "max_turns": 7,
                 "tool_call_count": 1,
                 "accepted_count": 0,
                 "error_count": 1,
@@ -1767,7 +1767,7 @@ def test_tool_field_enhancement_retries_empty_target_field(
                 "model": "fake-tool",
                 "field_name": "appearance",
                 "turn": 2,
-                "max_turns": 3,
+                "max_turns": 7,
                 "tool_call_count": 1,
                 "accepted_count": 1,
                 "error_count": 0,

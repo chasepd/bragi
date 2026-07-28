@@ -28,6 +28,10 @@ from bragi.services import agentic_context as agentic_context_module
 from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_SETTING,
     PLAN_FIRST_NARRATOR_SETTING,
+    RESPONSE_VERIFICATION_MODE_DIAGNOSTIC,
+    RESPONSE_VERIFICATION_MODE_RETRY,
+    RESPONSE_VERIFICATION_MODE_RETRY_ONCE,
+    RESPONSE_VERIFICATION_MODE_SETTING,
     ContextCurationService,
     CurationDecision,
     DatingRouteStageViolation,
@@ -47,6 +51,7 @@ from bragi.services.agentic_context import (
     format_narrator_message_spec,
     narration_evidence_source_ids,
     plan_first_narrator_enabled,
+    response_verification_mode,
 )
 from bragi.services.npc_knowledge_audit_service import NpcKnowledgeLeak
 
@@ -155,6 +160,51 @@ def test_plan_first_narrator_can_be_disabled_per_save(
     )
 
     assert plan_first_narrator_enabled(repositories, save_id=save.id) is False
+
+
+def test_response_verification_retries_by_default(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+
+    assert (
+        response_verification_mode(repositories, save_id=save.id)
+        == RESPONSE_VERIFICATION_MODE_RETRY
+    )
+
+
+def test_response_verification_preserves_diagnostic_opt_out(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=RESPONSE_VERIFICATION_MODE_SETTING,
+        value=RESPONSE_VERIFICATION_MODE_DIAGNOSTIC,
+    )
+
+    assert (
+        response_verification_mode(repositories, save_id=save.id)
+        == RESPONSE_VERIFICATION_MODE_DIAGNOSTIC
+    )
+
+
+def test_response_verification_maps_legacy_retry_once_to_retry(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=RESPONSE_VERIFICATION_MODE_SETTING,
+        value=RESPONSE_VERIFICATION_MODE_RETRY_ONCE,
+    )
+
+    assert (
+        response_verification_mode(repositories, save_id=save.id)
+        == RESPONSE_VERIFICATION_MODE_RETRY
+    )
 
 
 def test_observation_extractor_returns_evidence_backed_candidates(

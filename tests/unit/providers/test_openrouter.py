@@ -1907,7 +1907,7 @@ def test_openrouter_structured_output_retries_non_json_success_content(
     assert sent_schema["properties"]["metadata"]["type"] == ["string", "null"]
     retry_metadata = response.raw_metadata["_bragi_retry"]
     assert retry_metadata["attempt_count"] == 2
-    assert retry_metadata["max_attempts"] == 3
+    assert retry_metadata["max_attempts"] == 7
     assert len(retry_progress) == 1
 
     attempts = retry_metadata["attempts"]
@@ -1965,9 +1965,9 @@ def test_openrouter_structured_output_enforces_async_transport_timeout(
 
     assert exc_info.value.category == ProviderErrorCategory.NETWORK_ERROR
     assert "timed out" in exc_info.value.message
-    assert exc_info.value.retry_attempt_count == 3
-    assert exc_info.value.max_retry_attempts == 3
-    assert len(transport_calls) == 3
+    assert exc_info.value.retry_attempt_count == 7
+    assert exc_info.value.max_retry_attempts == 7
+    assert len(transport_calls) == 7
     assert all(
         call["kwargs"]["task"] == "structured_output" for call in transport_calls
     )
@@ -2015,7 +2015,7 @@ def test_openrouter_chat_retries_transient_failure_and_records_metadata(
     assert [call["method"] for call in transport.calls] == ["POST", "POST"]
     retry_metadata = response.raw_metadata["_bragi_retry"]
     assert retry_metadata["attempt_count"] == 2
-    assert retry_metadata["max_attempts"] == 3
+    assert retry_metadata["max_attempts"] == 7
 
     attempts = retry_metadata["attempts"]
     assert len(attempts) == 2
@@ -3123,15 +3123,8 @@ def test_openrouter_http_error_uses_provider_error_category(
             JsonHttpResponse(
                 status_code=429,
                 payload={"error": {"message": "slow down"}},
-            ),
-            JsonHttpResponse(
-                status_code=429,
-                payload={"error": {"message": "still slow"}},
-            ),
-            JsonHttpResponse(
-                status_code=429,
-                payload={"error": {"message": "too slow"}},
-            ),
+            )
+            for _attempt in range(7)
         ]
     )
     secrets = InMemorySecretStore()
@@ -3144,7 +3137,7 @@ def test_openrouter_http_error_uses_provider_error_category(
     assert exc_info.value.category == ProviderErrorCategory.RATE_LIMITED
     assert exc_info.value.message == "rate_limited (429)"
     assert exc_info.value.status_code == 429
-    assert exc_info.value.retry_attempt_count == 3
-    assert exc_info.value.max_retry_attempts == 3
+    assert exc_info.value.retry_attempt_count == 7
+    assert exc_info.value.max_retry_attempts == 7
     assert "slow down" not in exc_info.value.message
-    assert len(transport.calls) == 3
+    assert len(transport.calls) == 7
