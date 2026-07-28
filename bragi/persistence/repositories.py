@@ -2717,7 +2717,7 @@ class PersistenceRepositories:
             raise ValueError("Message page limit must be at least 1")
         deleted_filter = "" if include_deleted else "AND deleted_at IS NULL"
         chronicle_filter = (
-            "AND NOT (role = 'player' AND speaker_name = ? AND body = ?)"
+            "AND NOT (role = 'player' AND speaker_name IS ? AND body = ?)"
             if chronicle_only
             else ""
         )
@@ -2800,7 +2800,7 @@ class PersistenceRepositories:
                    safety_transition, content_rating
             FROM messages
             WHERE save_id = ? AND deleted_at IS NULL {before_filter}
-              AND NOT (role = 'player' AND speaker_name = ? AND body = ?)
+              AND NOT (role = 'player' AND speaker_name IS ? AND body = ?)
               {filter_clause}
             ORDER BY rowid DESC
             LIMIT ?
@@ -2825,7 +2825,7 @@ class PersistenceRepositories:
             SELECT COUNT(*) AS message_count
             FROM messages
             WHERE save_id = ? AND deleted_at IS NULL
-              AND NOT (role = 'player' AND speaker_name = ? AND body = ?)
+              AND NOT (role = 'player' AND speaker_name IS ? AND body = ?)
               {filter_clause}
             """,
             (

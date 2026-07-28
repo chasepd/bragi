@@ -389,6 +389,36 @@ def test_repositories_pages_chronicle_without_internal_story_continuations(
     assert previous.has_more_before is False
 
 
+def test_chronicle_filters_keep_unnamed_player_with_continuation_text(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="",
+        content={},
+        interaction_mode="storyteller",
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name=None,
+        body=STORY_CONTINUATION_DIRECTION,
+    )
+
+    chronicle = repositories.list_message_page(
+        save.id,
+        chronicle_only=True,
+    )
+    chat_history = repositories.list_chat_history_message_page(save.id)
+
+    assert [message.id for message in chronicle.messages] == [player_message.id]
+    assert [message.id for message in chat_history.messages] == [player_message.id]
+    assert repositories.count_chat_history_messages(save.id) == 1
+
+
 def test_repositories_pages_chat_history_messages_with_sql_filters(
     repositories: PersistenceRepositories,
 ) -> None:
