@@ -6418,6 +6418,33 @@ class PersistenceRepositories:
             raise ValueError(f"Unknown character id: {character.id}")
         return saved
 
+    def set_character_current_clothing_if_blank_and_unlocked(
+        self,
+        *,
+        save_id: str,
+        character_id: str,
+        current_clothing: str,
+    ) -> CharacterRecord | None:
+        self.connection.execute(
+            """
+            UPDATE characters
+            SET current_clothing = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND save_id = ?
+              AND TRIM(current_clothing) = ''
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM json_each(characters.locked_fields_json) AS locked_field
+                  WHERE locked_field.value = 'current_clothing'
+              )
+            """,
+            (current_clothing, character_id, save_id),
+        )
+        self.commit()
+        character = self.get_character(character_id)
+        if character is None or character.save_id != save_id:
+            return None
+        return character
+
     def get_character(self, character_id: str) -> CharacterRecord | None:
         row = self._fetch_one(
             """

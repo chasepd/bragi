@@ -15,7 +15,12 @@ from typing import Any, NoReturn
 
 import pytest
 
-from bragi.persistence.models import MediaAssetRecord, MessageRecord, SaveRecord
+from bragi.persistence.models import (
+    CharacterRecord,
+    MediaAssetRecord,
+    MessageRecord,
+    SaveRecord,
+)
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.chat_rendering import chat_system_body
 from bragi.providers.contracts import (
@@ -214,6 +219,57 @@ class RecordingImageProvider:
 
     def image_reference_limit(self, model_id: str) -> int:
         return self._image_reference_limit
+
+
+class ClothingRecordingImageProvider(RecordingImageProvider):
+    def __init__(self, clothing_outcomes: list[dict[str, object]]) -> None:
+        super().__init__(image_bytes=_VALID_PNG_BYTES)
+        self.clothing_outcomes = clothing_outcomes
+        self.clothing_requests: list[StructuredOutputRequest] = []
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        if request.schema_name != "image_current_clothing_completion":
+            return await super().generate_structured_output(request)
+        self.clothing_requests.append(request)
+        if not self.clothing_outcomes:
+            raise AssertionError("unexpected current clothing completion request")
+        return StructuredOutputResponse(
+            data=self.clothing_outcomes.pop(0),
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+class ConcurrentEditClothingProvider(ClothingRecordingImageProvider):
+    def __init__(
+        self,
+        *,
+        repositories: PersistenceRepositories,
+        character_id: str,
+        clothing_outcomes: list[dict[str, object]],
+    ) -> None:
+        super().__init__(clothing_outcomes)
+        self.repositories = repositories
+        self.character_id = character_id
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        if request.schema_name == "image_current_clothing_completion":
+            current = self.repositories.get_character(self.character_id)
+            assert current is not None
+            self.repositories.update_character(
+                replace(
+                    current,
+                    role="Concurrently edited role",
+                    locked_fields=[*current.locked_fields, "current_clothing"],
+                )
+            )
+        return await super().generate_structured_output(request)
 
 
 class RecordingVisionProvider(RecordingImageProvider):
@@ -458,7 +514,6 @@ def test_generate_for_message_drafts_prompt_and_persists_asset_and_job(
     for expected_guidance in (
         "visible subject",
         "setting",
-        "what each visible character is wearing",
         "action",
         "facial expression",
         "objects",
@@ -473,6 +528,8 @@ def test_generate_for_message_drafts_prompt_and_persists_asset_and_job(
         "unsupported",
         "internal",
         "future details",
+        "Do not specify character clothing",
+        "Current Clothing",
     ):
         assert expected_guidance in system_text
     chat_context = _chat_request_context(chat_request)
@@ -776,7 +833,11 @@ def test_generate_character_text_character_image_includes_visual_direction(
     save, opening_message, character_id = _full_roleplay_save(repositories)
     character = repositories.get_character(character_id)
     assert character is not None
-    character = replace(character, content_rating="pg-13")
+    character = replace(
+        character,
+        content_rating="pg-13",
+        current_clothing="rain-darkened blue glass robes",
+    )
     repositories.update_character(character)
     thread = repositories.get_or_create_character_text_thread(
         save_id=save.id,
@@ -823,8 +884,8 @@ def test_generate_character_text_character_image_includes_visual_direction(
             character=character,
             visual_prompt=(
                 "Oracle mirror selfie\n\n"
-                "Character visual direction for Oracle of Glass:\n"
-                "Wearing: rain-darkened blue glass robes.\n"
+                "Character visual direction for Oracle of Glass: "
+                "Wearing: repeated stable appearance.\n"
                 "Current action/pose: holding the mirror toward the beads.\n"
                 "Facial expression: small relieved smile."
             ),
@@ -837,11 +898,102 @@ def test_generate_character_text_character_image_includes_visual_direction(
     assert request.source_media_asset_id == reference.id
     assert "Character visual direction for Oracle of Glass" in request.prompt
     assert "Wearing: rain-darkened blue glass robes." in request.prompt
+    assert "Wearing: repeated stable appearance." not in request.prompt
     assert "Current action/pose: holding the mirror toward the beads." in request.prompt
     assert "Facial expression: small relieved smile." in request.prompt
     metadata = json.loads(asset.metadata_json)
     assert metadata["kind"] == "character_text_character_image"
     assert metadata["content_rating"] == "r"
+
+
+def test_generate_character_text_character_image_completes_current_clothing(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, opening_message, character_id = _full_roleplay_save(repositories)
+    character = repositories.get_character(character_id)
+    assert character is not None
+    thread = repositories.get_or_create_character_text_thread(
+        save_id=save.id,
+        character_id=character.id,
+    )
+    text_message = repositories.append_character_text_message(
+        save_id=save.id,
+        thread_id=thread.id,
+        character_id=character.id,
+        sender="character",
+        body="Sending a quick picture before I leave.",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-structured",
+        display_name="Fake Structured",
+        capabilities=["structured_output"],
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-edit",
+        display_name="Fake Edit",
+        capabilities=["image_to_image"],
+    )
+    repositories.set_model_preference(
+        task=roleplay_model_task(
+            roleplay_type="full_roleplay",
+            purpose="response_planning",
+        ),
+        provider="fake",
+        model_id="fake-structured",
+    )
+    repositories.set_model_preference(
+        task="full_roleplay_text_message_image_edit_generation",
+        provider="fake",
+        model_id="fake-edit",
+    )
+    provider = ClothingRecordingImageProvider(
+        [
+            {
+                "characters": [
+                    {
+                        "character_id": character.id,
+                        "current_clothing": "blue glass rain cape",
+                    }
+                ]
+            }
+        ]
+    )
+    media_dir = tmp_path / "media"
+    _persist_character_reference(
+        repositories,
+        media_dir=media_dir,
+        save_id=save.id,
+        source_message_id=opening_message.id,
+        character_id=character.id,
+    )
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=media_dir,
+    )
+
+    asyncio.run(
+        service.generate_character_text_character_image(
+            save_id=save.id,
+            text_message=text_message,
+            character=character,
+            visual_prompt=(
+                "Oracle mirror selfie\n\n"
+                "Character visual direction for Oracle of Glass:\n"
+                "Current action/pose: holding the phone at eye level.\n"
+                "Facial expression: small relieved smile."
+            ),
+            scene_context="Phone thread:\nMara: Send a picture?",
+        )
+    )
+
+    updated = repositories.get_character(character.id)
+    assert updated is not None
+    assert updated.current_clothing == "blue glass rain cape"
+    assert "Wearing: blue glass rain cape." in provider.image_requests[0].prompt
 
 
 def test_generate_character_text_object_image_persists_openrouter_request_alias(
@@ -993,7 +1145,13 @@ def test_generate_scene_image_includes_character_visual_direction_without_refere
         message_id=source_message.id,
         character_id=character.id,
     )
-    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    provider = RecordingImageProvider(
+        _VALID_PNG_BYTES,
+        drafted_prompt=(
+            "cinematic drafted image prompt\n"
+            "Wearing: soot-dark cloak with brass chimes."
+        ),
+    )
     service = MediaService(
         repositories=repositories,
         providers={"fake": provider},
@@ -1014,8 +1172,366 @@ def test_generate_scene_image_includes_character_visual_direction_without_refere
     assert "Character visual direction for Bell Warden" in request.prompt
     assert "Wearing: borrowed green raincoat over a linen shirt." in request.prompt
     assert "Wearing: soot-dark cloak with brass chimes." not in request.prompt
+    assert "what each visible character is wearing" not in chat_system_body(
+        provider.chat_requests[0]
+    )
     assert "Current action/pose: The echo answers from below." in request.prompt
     assert "Facial expression: expression grounded in this moment" in request.prompt
+
+
+def test_generate_scene_image_completes_and_persists_missing_current_clothing(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    source_message = messages[-1]
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Bell Warden",
+        met=True,
+        appearance="Tall, silver-eyed, with white hair.",
+        visual_notes="A brass chime hangs from one wrist.",
+    )
+    _mark_character_present(
+        repositories,
+        save_id=save.id,
+        message_id=source_message.id,
+        character_id=character.id,
+    )
+    repositories.set_app_setting(ROLEPLAY_SHARED_MODE_SETTING, False)
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-structured",
+        display_name="Fake Structured",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task=roleplay_model_task(
+            roleplay_type="full_roleplay",
+            purpose="response_planning",
+        ),
+        provider="fake",
+        model_id="fake-structured",
+    )
+    provider = ClothingRecordingImageProvider(
+        [
+            {
+                "characters": [
+                    {
+                        "character_id": character.id,
+                        "current_clothing": (
+                            "borrowed green raincoat over a linen shirt"
+                        ),
+                    }
+                ]
+            }
+        ]
+    )
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=tmp_path / "media",
+    )
+
+    asyncio.run(
+        service.generate_for_message(
+            save_id=save.id,
+            source_message_id=source_message.id,
+        )
+    )
+
+    updated = repositories.get_character(character.id)
+    assert updated is not None
+    assert updated.current_clothing == (
+        "borrowed green raincoat over a linen shirt"
+    )
+    assert len(provider.clothing_requests) == 1
+    prompt = provider.image_requests[0].prompt
+    assert "Wearing: borrowed green raincoat over a linen shirt." in prompt
+    assert "Wearing: Tall, silver-eyed, with white hair." not in prompt
+    assert "Wearing: A brass chime hangs from one wrist." not in prompt
+
+
+def test_generate_scene_image_retries_invalid_clothing_then_uses_valid_result(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    source_message = messages[-1]
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Bell Warden",
+        met=True,
+        appearance="Tall, silver-eyed, with white hair.",
+    )
+    _mark_character_present(
+        repositories,
+        save_id=save.id,
+        message_id=source_message.id,
+        character_id=character.id,
+    )
+    repositories.set_app_setting(ROLEPLAY_SHARED_MODE_SETTING, False)
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-structured",
+        display_name="Fake Structured",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task=roleplay_model_task(
+            roleplay_type="full_roleplay",
+            purpose="response_planning",
+        ),
+        provider="fake",
+        model_id="fake-structured",
+    )
+    provider = ClothingRecordingImageProvider(
+        [
+            {
+                "characters": [
+                    {
+                        "character_id": character.id,
+                        "current_clothing": f"{character.appearance}.",
+                    }
+                ]
+            },
+            {
+                "characters": [
+                    {
+                        "character_id": character.id,
+                        "current_clothing": "charcoal travel coat",
+                    }
+                ]
+            },
+        ]
+    )
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=tmp_path / "media",
+    )
+
+    asyncio.run(
+        service.generate_for_message(
+            save_id=save.id,
+            source_message_id=source_message.id,
+        )
+    )
+
+    assert len(provider.clothing_requests) == 2
+    assert "Previous structured response was invalid" in (
+        provider.clothing_requests[1].messages[-1].body
+    )
+    assert "Wearing: charcoal travel coat." in provider.image_requests[0].prompt
+
+
+def test_generate_scene_image_preserves_concurrent_character_lock_and_edit(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    source_message = messages[-1]
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Bell Warden",
+        met=True,
+        role="Original role",
+        appearance="Tall, silver-eyed, with white hair.",
+    )
+    _mark_character_present(
+        repositories,
+        save_id=save.id,
+        message_id=source_message.id,
+        character_id=character.id,
+    )
+    repositories.set_app_setting(ROLEPLAY_SHARED_MODE_SETTING, False)
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-structured",
+        display_name="Fake Structured",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task=roleplay_model_task(
+            roleplay_type="full_roleplay",
+            purpose="response_planning",
+        ),
+        provider="fake",
+        model_id="fake-structured",
+    )
+    provider = ClothingRecordingImageProvider(
+        [
+            {
+                "characters": [
+                    {
+                        "character_id": character.id,
+                        "current_clothing": "charcoal travel coat",
+                    }
+                ]
+            }
+        ]
+    )
+    original_update = repositories.set_character_current_clothing_if_blank_and_unlocked
+
+    def update_after_concurrent_lock(
+        *,
+        save_id: str,
+        character_id: str,
+        current_clothing: str,
+    ) -> CharacterRecord | None:
+        current = repositories.get_character(character_id)
+        assert current is not None
+        repositories.update_character(
+            replace(
+                current,
+                role="Concurrently edited role",
+                locked_fields=[*current.locked_fields, "current_clothing"],
+            )
+        )
+        return original_update(
+            save_id=save_id,
+            character_id=character_id,
+            current_clothing=current_clothing,
+        )
+
+    monkeypatch.setattr(
+        repositories,
+        "set_character_current_clothing_if_blank_and_unlocked",
+        update_after_concurrent_lock,
+    )
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=tmp_path / "media",
+    )
+
+    asyncio.run(
+        service.generate_for_message(
+            save_id=save.id,
+            source_message_id=source_message.id,
+        )
+    )
+
+    updated = repositories.get_character(character.id)
+    assert updated is not None
+    assert updated.role == "Concurrently edited role"
+    assert "current_clothing" in updated.locked_fields
+    assert updated.current_clothing == ""
+    assert "Wearing:" not in provider.image_requests[0].prompt
+
+
+def test_generate_scene_image_respects_locked_blank_current_clothing(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    source_message = messages[-1]
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Bell Warden",
+        met=True,
+        appearance="Tall, silver-eyed, with white hair.",
+        locked_fields=["current_clothing"],
+    )
+    _mark_character_present(
+        repositories,
+        save_id=save.id,
+        message_id=source_message.id,
+        character_id=character.id,
+    )
+    repositories.set_app_setting(ROLEPLAY_SHARED_MODE_SETTING, False)
+    repositories.set_model_preference(
+        task=roleplay_model_task(
+            roleplay_type="full_roleplay",
+            purpose="response_planning",
+        ),
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = ClothingRecordingImageProvider([])
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=tmp_path / "media",
+    )
+
+    asyncio.run(
+        service.generate_for_message(
+            save_id=save.id,
+            source_message_id=source_message.id,
+        )
+    )
+
+    assert provider.clothing_requests == []
+    assert "Wearing:" not in provider.image_requests[0].prompt
+    updated = repositories.get_character(character.id)
+    assert updated is not None
+    assert updated.current_clothing == ""
+
+
+def test_generate_scene_image_continues_after_clothing_retry_limit(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    source_message = messages[-1]
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Bell Warden",
+        met=True,
+        appearance="Tall, silver-eyed, with white hair.",
+    )
+    _mark_character_present(
+        repositories,
+        save_id=save.id,
+        message_id=source_message.id,
+        character_id=character.id,
+    )
+    repositories.set_app_setting(ROLEPLAY_SHARED_MODE_SETTING, False)
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-structured",
+        display_name="Fake Structured",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task=roleplay_model_task(
+            roleplay_type="full_roleplay",
+            purpose="response_planning",
+        ),
+        provider="fake",
+        model_id="fake-structured",
+    )
+    invalid: dict[str, object] = {
+        "characters": [
+            {"character_id": character.id, "current_clothing": ""}
+        ]
+    }
+    provider = ClothingRecordingImageProvider(
+        [invalid] * media_service_module.MODEL_OUTPUT_MAX_ATTEMPTS
+    )
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=tmp_path / "media",
+    )
+
+    asyncio.run(
+        service.generate_for_message(
+            save_id=save.id,
+            source_message_id=source_message.id,
+        )
+    )
+
+    assert len(provider.clothing_requests) == (
+        media_service_module.MODEL_OUTPUT_MAX_ATTEMPTS
+    )
+    assert len(provider.image_requests) == 1
+    assert "Wearing:" not in provider.image_requests[0].prompt
+    updated = repositories.get_character(character.id)
+    assert updated is not None
+    assert updated.current_clothing == ""
 
 
 def test_generate_for_message_does_not_persist_unusable_thumbnail_when_scaling_fails(
@@ -6118,10 +6634,7 @@ def test_scene_generation_uses_present_character_reference(
     assert scene_request.source_media_paths == (media_dir / reference.path,)
     assert "Use the attached character reference image" in scene_request.prompt
     assert "Character visual direction for Oracle of Glass" in scene_request.prompt
-    expected_wearing = (
-        "Wearing: Tall, still, mirrored silver eyes, white hair, blue glass robes."
-    )
-    assert expected_wearing in scene_request.prompt
+    assert "Wearing:" not in scene_request.prompt
     assert "Current action/pose: The oracle turns toward the moonlit window." in (
         scene_request.prompt
     )
@@ -6391,10 +6904,7 @@ def test_character_image_generation_uses_reference_image_to_image(
     assert "Do not include other people" in character_request.prompt
     assert "The oracle turns toward the moonlit window" in character_request.prompt
     assert "Character visual direction for Oracle of Glass" in character_request.prompt
-    expected_wearing = (
-        "Wearing: Tall, still, mirrored silver eyes, white hair, blue glass robes."
-    )
-    assert expected_wearing in character_request.prompt
+    assert "Wearing:" not in character_request.prompt
     assert "Current action/pose: The oracle turns toward the moonlit window." in (
         character_request.prompt
     )
@@ -6660,7 +7170,7 @@ def test_character_image_generation_allows_full_roleplay_save(
     assert "Do not include other people" in request.prompt
     assert scene_message.body in request.prompt
     assert "Character visual direction for Mara" in request.prompt
-    assert "Wearing: A storm-cloaked oathkeeper with a brass lantern." in request.prompt
+    assert "Wearing:" not in request.prompt
     assert "Current action/pose: The echo answers from below." in request.prompt
     assert "Facial expression: expression grounded in this moment" in request.prompt
     assert asset.source_media_asset_id == reference.id
@@ -6771,10 +7281,7 @@ def test_character_registry_image_generation_uses_reference_without_message_link
     assert "blue dawn rim light" in request.prompt
     assert "Show only this one character" in request.prompt
     assert "Character visual direction for Oracle of Glass" in request.prompt
-    expected_wearing = (
-        "Wearing: Tall, still, mirrored silver eyes, white hair, blue glass robes."
-    )
-    assert expected_wearing in request.prompt
+    assert "Wearing:" not in request.prompt
     assert "Current action/pose: blue dawn rim light." in request.prompt
     expected_expression = "Facial expression: expression grounded in this moment"
     assert expected_expression in request.prompt

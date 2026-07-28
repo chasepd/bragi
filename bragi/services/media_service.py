@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 import zlib
 from base64 import b64encode
 from collections.abc import Awaitable, Callable, Iterable
@@ -41,6 +42,7 @@ from bragi.providers.contracts import (
     ProviderCapability,
     ProviderClient,
     ProviderRetryProgressCallback,
+    StructuredOutputRequest,
     VideoProvider,
     VideoRequest,
     VideoResponse,
@@ -48,6 +50,8 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.http_client import SAFE_PROVIDER_RESPONSE_HEADERS
 from bragi.redaction import redact_text
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
+from bragi.services.character_locks import character_field_is_locked
 from bragi.services.character_profile_completion import (
     ScenarioCharacterStarter,
     ScenarioStarterReferenceImage,
@@ -103,7 +107,10 @@ from bragi.services.openrouter_routing_settings import (
     openrouter_routing_payload_for_task,
     request_with_openrouter_routing,
 )
-from bragi.services.provider_fallbacks import chat_with_fallback
+from bragi.services.provider_fallbacks import (
+    chat_with_fallback,
+    structured_output_with_fallback,
+)
 from bragi.services.sexual_content_safety import (
     is_fade_to_black_message,
 )
@@ -1295,6 +1302,13 @@ class MediaService:
             save_id=save_id,
             source_message_id=source_message_id,
         )
+        character = (
+            await self._ensure_current_clothing(
+                save_id=save_id,
+                characters=(character,),
+                image_context=scene_context,
+            )
+        )[0]
         prompt = _solo_character_scene_image_prompt(
             character=character,
             character_name=character.name,
@@ -1349,6 +1363,13 @@ class MediaService:
             character_name=character.name,
             origin="character_registry",
         )
+        character = (
+            await self._ensure_current_clothing(
+                save_id=save_id,
+                characters=(character,),
+                image_context=instructions,
+            )
+        )[0]
         prompt = _solo_character_registry_image_prompt(
             character=character,
             character_name=character.name,
@@ -1411,6 +1432,21 @@ class MediaService:
             character_id=character.id,
             character_name=character.name,
             origin="character_text",
+        )
+        character = (
+            await self._ensure_current_clothing(
+                save_id=save_id,
+                characters=(character,),
+                image_context="\n\n".join(
+                    part
+                    for part in (text_message.body, visual_prompt, scene_context)
+                    if part.strip()
+                ),
+            )
+        )[0]
+        visual_prompt = _prompt_with_current_clothing_direction(
+            visual_prompt,
+            character=character,
         )
         prompt = _solo_character_text_image_prompt(
             character=character,
@@ -1792,6 +1828,22 @@ class MediaService:
         )
         if source_message is not None:
             _raise_if_safety_transition_source(source_message)
+        scene_characters = _scene_characters(
+            repositories=self.repositories,
+            save_id=save_id,
+            source_message_id=source_message_id,
+        )
+        await self._ensure_current_clothing(
+            save_id=save_id,
+            characters=scene_characters,
+            image_context=scene_context,
+        )
+        character_visual_directions = _scene_character_visual_directions(
+            repositories=self.repositories,
+            save_id=save_id,
+            source_message_id=source_message_id,
+            action_context=source_message.body if source_message is not None else "",
+        )
         source_media_asset_ids = _normalized_source_media_asset_ids(
             source_media_asset_id,
             source_media_asset_ids,
@@ -1986,6 +2038,142 @@ class MediaService:
             job_context=job_context,
         )
         return asset
+
+    async def _ensure_current_clothing(
+        self,
+        *,
+        save_id: str,
+        characters: tuple[CharacterRecord, ...],
+        image_context: str,
+    ) -> tuple[CharacterRecord, ...]:
+        missing = tuple(
+            character
+            for character in characters
+            if not character.current_clothing.strip()
+            and not character_field_is_locked(
+                character.locked_fields,
+                "current_clothing",
+            )
+        )
+        if not missing:
+            return characters
+        preference = roleplay_model_preference(
+            repositories=self.repositories,
+            save_id=save_id,
+            purpose="response_planning",
+        )
+        if preference is None or preference.provider not in self.providers:
+            log_event(
+                "media.current_clothing_completion_skipped",
+                save_id=save_id,
+                reason="model_unavailable",
+                character_ids=[character.id for character in missing],
+            )
+            return characters
+
+        messages = list(
+            _current_clothing_completion_messages(
+                characters=missing,
+                image_context=image_context,
+            )
+        )
+        request = StructuredOutputRequest(
+            provider=preference.provider,
+            model_id=preference.model_id,
+            schema_name="image_current_clothing_completion",
+            schema=_current_clothing_completion_schema(),
+            messages=tuple(messages),
+            temperature=0.2,
+            max_output_tokens=500,
+        )
+        expected_ids = {character.id for character in missing}
+        last_error = "unknown validation failure"
+        for attempt in range(1, MODEL_OUTPUT_MAX_ATTEMPTS + 1):
+            try:
+                response = await structured_output_with_fallback(
+                    repositories=self.repositories,
+                    providers=self.providers,
+                    request=replace(request, messages=tuple(messages)),
+                    task="response_planning",
+                    save_id=save_id,
+                    diagnostic_context={
+                        "character_ids": sorted(expected_ids),
+                        "attempt": attempt,
+                    },
+                )
+                completed = _current_clothing_from_data(
+                    response.data,
+                    expected_character_ids=expected_ids,
+                    appearance_by_character_id={
+                        character.id: character.appearance for character in missing
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - clothing is auxiliary
+                last_error = str(exc) or exc.__class__.__name__
+                log_event(
+                    "media.current_clothing_completion_attempt_failed",
+                    save_id=save_id,
+                    attempt=attempt,
+                    max_attempts=MODEL_OUTPUT_MAX_ATTEMPTS,
+                    character_ids=sorted(expected_ids),
+                    **exception_log_fields(exc),
+                )
+                if attempt < MODEL_OUTPUT_MAX_ATTEMPTS:
+                    messages.append(
+                        ChatMessage(
+                            role="user",
+                            body=(
+                                "Previous structured response was invalid: "
+                                f"{last_error}. Return one nonblank current_clothing "
+                                "value for every requested character ID and no "
+                                "other IDs."
+                            ),
+                        )
+                    )
+                continue
+
+            updated_by_id: dict[str, CharacterRecord] = {}
+            for character in missing:
+                try:
+                    current = (
+                        self.repositories
+                        .set_character_current_clothing_if_blank_and_unlocked(
+                            save_id=save_id,
+                            character_id=character.id,
+                            current_clothing=completed[character.id],
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - clothing is auxiliary
+                    log_error_event(
+                        "media.current_clothing_persistence_failed",
+                        save_id=save_id,
+                        character_id=character.id,
+                        **exception_log_fields(exc),
+                    )
+                    current = self.repositories.get_character(character.id)
+                if current is not None:
+                    updated_by_id[character.id] = current
+            log_event(
+                "media.current_clothing_completed",
+                save_id=save_id,
+                attempt=attempt,
+                max_attempts=MODEL_OUTPUT_MAX_ATTEMPTS,
+                character_ids=sorted(expected_ids),
+                provider=response.provider,
+                model=response.model_id,
+            )
+            return tuple(
+                updated_by_id.get(character.id, character) for character in characters
+            )
+
+        log_error_event(
+            "media.current_clothing_completion_exhausted",
+            save_id=save_id,
+            max_attempts=MODEL_OUTPUT_MAX_ATTEMPTS,
+            character_ids=sorted(expected_ids),
+            error=redact_text(last_error),
+        )
+        return characters
 
     async def _generate_prompted_image_asset(
         self,
@@ -3825,8 +4013,7 @@ class MediaService:
                             body=(
                                 "Write one concise image-generation prompt for the "
                                 "selected roleplay scene. Include the visible "
-                                "subject, setting, what each visible character is "
-                                "wearing, action or pose, facial expression, "
+                                "subject, setting, action or pose, facial expression, "
                                 "important objects, lighting, weather, time of "
                                 "day, mood, composition, and continuity "
                                 "constraints when "
@@ -3841,8 +4028,10 @@ class MediaService:
                                 "moment without contradicting the selected scene "
                                 "message. Reject unsupported, "
                                 "internal, "
-                                "private, or future details. Return plain prompt "
-                                "text with no explanation."
+                                "private, or future details. Do not specify character "
+                                "clothing or add Wearing directives; the application "
+                                "adds Current Clothing separately. Return plain "
+                                "prompt text with no explanation."
                             ),
                         ),
                     ),
@@ -4771,62 +4960,220 @@ def _scene_character_visual_directions(
     source_message_id: str,
     action_context: str,
 ) -> str:
+    return "\n\n".join(
+        part
+        for character in _scene_characters(
+            repositories=repositories,
+            save_id=save_id,
+            source_message_id=source_message_id,
+        )
+        if (
+            part := _character_visual_direction_block(
+                character,
+                action_context=action_context,
+            )
+        )
+    )
+
+
+def _scene_characters(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    source_message_id: str,
+) -> tuple[CharacterRecord, ...]:
     characters = tuple(repositories.list_characters(save_id))
     if not characters:
-        return ""
+        return ()
     characters_by_id = {character.id: character for character in characters}
-    messages = repositories.list_messages(save_id)
     source_message = _source_message(
-        messages=messages,
+        messages=repositories.list_messages(save_id),
         source_message_id=source_message_id,
     )
     source_text = source_message.body if source_message is not None else ""
-    candidate_ids: list[str] = []
+    selected: list[CharacterRecord] = []
     seen_character_ids: set[str] = set()
-
     for character_id in _present_character_ids_for_message(
         repositories=repositories,
         save_id=save_id,
         source_message_id=source_message_id,
     ):
-        if character_id not in characters_by_id or character_id in seen_character_ids:
+        character = characters_by_id.get(character_id)
+        if character is None or character_id in seen_character_ids:
             continue
-        candidate_ids.append(character_id)
+        selected.append(character)
         seen_character_ids.add(character_id)
-
     for character in characters:
-        if character.id in seen_character_ids:
-            continue
-        if not character_name_is_mentioned(
+        if character.id in seen_character_ids or not character_name_is_mentioned(
             name=character.name,
             aliases=character.aliases,
             text=source_text,
         ):
             continue
-        candidate_ids.append(character.id)
+        selected.append(character)
         seen_character_ids.add(character.id)
+    return tuple(selected)
 
-    parts: list[str] = []
-    for character_id in candidate_ids:
-        candidate_character = characters_by_id.get(character_id)
-        if candidate_character is None:
-            continue
-        parts.append(
-            _character_visual_direction_block(
-                candidate_character,
-                action_context=action_context,
-            )
+
+def _current_clothing_completion_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "characters": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "character_id": {"type": "string"},
+                        "current_clothing": {"type": "string"},
+                    },
+                    "required": ["character_id", "current_clothing"],
+                },
+            }
+        },
+        "required": ["characters"],
+    }
+
+
+def _current_clothing_completion_messages(
+    *,
+    characters: tuple[CharacterRecord, ...],
+    image_context: str,
+) -> tuple[ChatMessage, ...]:
+    character_lines = "\n".join(
+        (
+            f"Character ID: {character.id}\n"
+            f"Name: {character.name}\n"
+            f"Role: {character.role}\n"
+            f"Stable appearance: {character.appearance}\n"
+            f"Visual notes: {character.visual_notes}"
         )
-    return "\n\n".join(part for part in parts if part)
+        for character in characters
+    )
+    return (
+        ChatMessage(
+            role="system",
+            body=(
+                "Complete Current Clothing for characters depicted in a requested "
+                "roleplay image using the enforced response schema. Return exactly "
+                "one entry for every supplied character ID. Describe only the "
+                "current outfit, clothing, armor, uniform, footwear, and worn "
+                "accessories. Prefer clothing explicitly supported by the image "
+                "context. When none is stated, infer a concise plausible outfit "
+                "that fits the moment and character. Do not copy stable physical "
+                "appearance, body, face, hair, eyes, skin, personality, or pose "
+                "into Current Clothing."
+            ),
+        ),
+        ChatMessage(
+            role="user",
+            body=_compact_text(
+                f"Requested image context:\n{image_context}\n\n{character_lines}",
+                max_chars=6000,
+                label="current clothing context",
+            ),
+        ),
+    )
+
+
+def _current_clothing_from_data(
+    data: object,
+    *,
+    expected_character_ids: set[str],
+    appearance_by_character_id: dict[str, str],
+) -> dict[str, str]:
+    if not isinstance(data, dict):
+        raise ValueError("current clothing response must be an object")
+    raw_characters = data.get("characters")
+    if not isinstance(raw_characters, list):
+        raise ValueError("current clothing response must include characters")
+    completed: dict[str, str] = {}
+    for item in raw_characters:
+        if not isinstance(item, dict):
+            raise ValueError("current clothing character entries must be objects")
+        character_id = item.get("character_id")
+        clothing = item.get("current_clothing")
+        if (
+            not isinstance(character_id, str)
+            or character_id not in expected_character_ids
+        ):
+            raise ValueError(
+                "current clothing response contains an unknown character ID"
+            )
+        if character_id in completed:
+            raise ValueError(
+                "current clothing response contains a duplicate character ID"
+            )
+        if not isinstance(clothing, str) or not clothing.strip():
+            raise ValueError("current clothing values must not be blank")
+        normalized_clothing = _normalized_visual_comparison(clothing)
+        normalized_appearance = _normalized_visual_comparison(
+            appearance_by_character_id.get(character_id, "")
+        )
+        if (
+            normalized_appearance
+            and normalized_clothing == normalized_appearance
+        ):
+            raise ValueError(
+                "current clothing must not repeat the stable appearance field"
+            )
+        completed[character_id] = " ".join(clothing.strip().split())
+    if set(completed) != expected_character_ids:
+        raise ValueError("current clothing response is missing requested character IDs")
+    return completed
+
+
+def _normalized_visual_comparison(value: str) -> str:
+    return " ".join(re.findall(r"\w+", value.casefold()))
+
+
+def _prompt_with_current_clothing_direction(
+    prompt: str,
+    *,
+    character: CharacterRecord,
+) -> str:
+    clothing = _visual_direction_field(character.current_clothing)
+    marker = f"Character visual direction for {character.name}:"
+    cleaned_prompt = _without_wearing_directives(prompt)
+    lines = cleaned_prompt.splitlines()
+    if not clothing or marker.casefold() not in cleaned_prompt.casefold():
+        return "\n".join(lines)
+    for index, line in enumerate(lines):
+        if line.strip().casefold() == marker.casefold():
+            lines.insert(
+                index + 1,
+                f"Wearing: {_ensure_terminal_punctuation(clothing)}",
+            )
+            return "\n".join(lines)
+    return "\n".join(
+        (
+            *lines,
+            "",
+            marker,
+            f"Wearing: {_ensure_terminal_punctuation(clothing)}",
+        )
+    )
+
+
+def _without_wearing_directives(value: str) -> str:
+    without_wearing = re.sub(
+        r"(?i)\bwearing\s*:[^\n]*",
+        "",
+        value,
+    )
+    return "\n".join(line.rstrip() for line in without_wearing.splitlines()).strip()
 
 
 def _prompt_with_character_visual_directions(
     prompt: str,
     character_visual_directions: str,
 ) -> str:
+    prompt = _without_wearing_directives(prompt)
     if not character_visual_directions.strip():
         return prompt
-    if _has_character_visual_direction(prompt):
+    if character_visual_directions.strip() in prompt:
         return prompt
     return f"{prompt.strip()}\n\n{character_visual_directions.strip()}"
 
@@ -4854,30 +5201,24 @@ def _character_visual_direction_block(
     )
     action = _visual_direction_field(action_context) or action_fallback
     expression = _visual_direction_field(expression_context) or expression_fallback
+    lines = [f"Character visual direction for {character.name}:"]
+    if wearing:
+        lines.append(f"Wearing: {_ensure_terminal_punctuation(wearing)}")
+    lines.extend(
+        (
+            f"Current action/pose: {_ensure_terminal_punctuation(action)}",
+            f"Facial expression: {_ensure_terminal_punctuation(expression)}",
+        )
+    )
     return _compact_text(
-        "\n".join(
-            (
-                f"Character visual direction for {character.name}:",
-                f"Wearing: {_ensure_terminal_punctuation(wearing)}",
-                f"Current action/pose: {_ensure_terminal_punctuation(action)}",
-                f"Facial expression: {_ensure_terminal_punctuation(expression)}",
-            )
-        ),
+        "\n".join(lines),
         max_chars=_CHARACTER_VISUAL_DIRECTION_MAX_CHARS,
         label="character visual direction",
     )
 
 
 def _character_wearing_direction(character: CharacterRecord) -> str:
-    for value in (
-        character.current_clothing,
-        character.visual_notes,
-        character.appearance,
-    ):
-        text = _visual_direction_field(value)
-        if text:
-            return text
-    return "consistent with established character appearance and current context"
+    return _visual_direction_field(character.current_clothing)
 
 
 def _character_stable_wearing_direction(character: CharacterRecord) -> str:

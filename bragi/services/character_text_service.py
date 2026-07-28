@@ -512,7 +512,6 @@ class _AttachmentDecision:
     kind: str
     visual_prompt: str
     reason: str
-    wearing: str = ""
     current_action: str = ""
     facial_expression: str = ""
 
@@ -4112,7 +4111,6 @@ def _attachment_decision_schema() -> dict[str, object]:
                 "enum": ["none", "character_image", "object_context_image"],
             },
             "visual_prompt": {"type": "string"},
-            "wearing": {"type": "string"},
             "current_action": {"type": "string"},
             "facial_expression": {"type": "string"},
             "reason": {"type": "string"},
@@ -4120,7 +4118,6 @@ def _attachment_decision_schema() -> dict[str, object]:
         "required": [
             "attachment_kind",
             "visual_prompt",
-            "wearing",
             "current_action",
             "facial_expression",
             "reason",
@@ -4183,10 +4180,11 @@ def _attachment_decision_messages(
                 "location detail, food, ticket, note, or scene detail the NPC is "
                 "texting about. The visual prompt must be concise and grounded in "
                 "the provided conversation and local context. For character images, "
-                "also specify what the character is wearing, what the character is "
-                "currently doing or posing as, and the character's facial expression. "
-                "Use concise grounded phrases; leave those fields empty for none or "
-                "object/context images."
+                "Current Clothing is managed separately by the character registry; "
+                "do not create a separate wearing field. Specify what the character "
+                "is currently doing or posing as and the character's facial "
+                "expression. Use concise grounded phrases; leave those fields empty "
+                "for none or object/context images."
             ),
         ),
         ChatMessage(role="user", body=body),
@@ -4206,14 +4204,12 @@ def _attachment_decision_from_data(
     reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
     if kind != "none" and not prompt:
         return None
-    wearing = _string_field(data.get("wearing"))
     current_action = _string_field(data.get("current_action"))
     facial_expression = _string_field(data.get("facial_expression"))
     return _AttachmentDecision(
         kind=kind,
         visual_prompt=prompt,
         reason=reason,
-        wearing=wearing,
         current_action=current_action,
         facial_expression=facial_expression,
     )
@@ -4227,7 +4223,6 @@ def _attachment_visual_prompt(
     if decision.kind != "character_image":
         return decision.visual_prompt
     field_lines = [
-        _detail_line("Wearing", decision.wearing),
         _detail_line("Current action/pose", decision.current_action),
         _detail_line("Facial expression", decision.facial_expression),
     ]
