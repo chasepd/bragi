@@ -14848,6 +14848,7 @@ describe("frontend helpers", () => {
 
   it("clears an embedded opening choice job after terminal failure", async () => {
     const sources = installEventSourceDouble();
+    const client = new QueryClient();
     const regenerationJob = {
       id: "job-opening-choices-retry",
       type: "action_choice_regenerate",
@@ -14880,7 +14881,11 @@ describe("frontend helpers", () => {
         generation_job: generationJob
       })
     });
-    const baseFetch = workbenchFetch([], initialModel);
+    client.setQueryData(
+      ["jobs", "active", "save-1"],
+      { jobs: [generationJob] }
+    );
+    const baseFetch = workbenchFetch([generationJob], initialModel);
     vi.stubGlobal("fetch", vi.fn().mockImplementation(
       (path: string, init?: RequestInit) => (
         path === "/api/action-choices/regenerate"
@@ -14894,7 +14899,7 @@ describe("frontend helpers", () => {
     const { Workbench } = await import("./main");
 
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <QueryClientProvider client={client}>
         <Workbench />
       </QueryClientProvider>
     );

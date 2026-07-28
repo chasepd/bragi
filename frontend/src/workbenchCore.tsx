@@ -3283,6 +3283,32 @@ function Workbench({
     });
   };
 
+  const handleOpeningActionChoiceFailure = useCallback((
+    error: string,
+    failedJob: Job
+  ) => {
+    setActionChoiceGenerationError(error);
+    client.setQueryData<RuntimeModel>(
+      runtimeQueryKey(failedJob.save_id ?? activeSaveIdRef.current),
+      (current) => {
+        if (
+          !current?.action_choices
+          || current.action_choices.generation_job?.id !== failedJob.id
+        ) {
+          return current;
+        }
+        return {
+          ...current,
+          action_choices: {
+            ...current.action_choices,
+            generation_job: null,
+            generation_error: error
+          }
+        };
+      }
+    );
+  }, [client]);
+
   useEffect(() => {
     return () => {
       Object.values(jobWatchers.current).forEach((stop) => stop());
@@ -3306,9 +3332,13 @@ function Workbench({
         runJob(active, { applyResult: false, clearPendingMessages: false });
         continue;
       }
+      if (active.type === "action_choice_generate") {
+        runJob(active, { onFailed: handleOpeningActionChoiceFailure });
+        continue;
+      }
       runJob(active);
     }
-  }, [activeJobs.data?.jobs, runJob]);
+  }, [activeJobs.data?.jobs, handleOpeningActionChoiceFailure, runJob]);
 
   const openingActionChoiceJob = model?.action_choices?.generation_job;
   useEffect(() => {
@@ -3319,30 +3349,14 @@ function Workbench({
       return;
     }
     runJob(openingActionChoiceJob, {
-      onFailed: (error) => {
-        setActionChoiceGenerationError(error);
-        client.setQueryData<RuntimeModel>(
-          runtimeQueryKey(openingActionChoiceJob.save_id ?? activeSaveIdRef.current),
-          (current) => {
-            if (
-              !current?.action_choices
-              || current.action_choices.generation_job?.id !== openingActionChoiceJob.id
-            ) {
-              return current;
-            }
-            return {
-              ...current,
-              action_choices: {
-                ...current.action_choices,
-                generation_job: null,
-                generation_error: error
-              }
-            };
-          }
-        );
-      }
+      onFailed: handleOpeningActionChoiceFailure
     });
-  }, [client, openingActionChoiceJob?.id, openingActionChoiceJob?.status, runJob]);
+  }, [
+    handleOpeningActionChoiceFailure,
+    openingActionChoiceJob?.id,
+    openingActionChoiceJob?.status,
+    runJob
+  ]);
 
   useEffect(() => {
     setActionChoiceGenerationError(model?.action_choices?.generation_error ?? "");
