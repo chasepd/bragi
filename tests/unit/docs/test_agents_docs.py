@@ -39,6 +39,17 @@ def test_agents_points_validation_to_script_without_mimir_worktree_reference() -
     assert "../mimir" not in body
 
 
+def test_agents_leads_with_worktree_and_pr_publication_guidance() -> None:
+    body = _agents_text()
+
+    tdd_index = body.index("use test-driven development")
+    assert body.index("dedicated task worktree") < tdd_index
+    assert body.index("origin/main") < tdd_index
+    assert body.index("when work is completed, open a pr") < tdd_index
+    assert body.index("closes #") < tdd_index
+    assert body.index("refs #") < tdd_index
+
+
 def test_agents_describes_smart_pr_validation_policy() -> None:
     body = _agents_text()
 

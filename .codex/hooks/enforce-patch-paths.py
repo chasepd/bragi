@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Reject apply_patch paths outside the repository.
+"""Reject apply_patch paths outside this repository's registered worktrees.
 
-This keeps Codex patches using repository-relative paths without enforcing any
-test-edit routing.
+This lets Codex edit a dedicated sibling worktree while retaining a boundary
+against patches to unrelated filesystem paths.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -45,23 +46,80 @@ def _patch_paths(command: str) -> list[Path]:
     return paths
 
 
-def _safe_relative_patch_path(path: Path) -> Path | None:
-    if path.is_absolute() or ".." in path.parts:
-        return None
+def _cwd_from_payload(payload: dict[str, object]) -> Path:
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        return Path(cwd).expanduser().resolve()
+    return Path.cwd().resolve()
 
-    repo_root = Path.cwd().resolve()
-    resolved = (repo_root / path).resolve()
+
+def _registered_worktree_roots(repo_root: Path) -> tuple[Path, ...]:
+    repo_root = repo_root.resolve()
+    roots = {repo_root}
     try:
-        return resolved.relative_to(repo_root)
-    except ValueError:
-        return None
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "list",
+                "--porcelain",
+                "-z",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return (repo_root,)
+
+    if result.returncode != 0:
+        return (repo_root,)
+
+    for record in result.stdout.split("\0\0"):
+        fields = record.split("\0")
+        if any(field.startswith("prunable") for field in fields):
+            continue
+        root_field = next(
+            (field for field in fields if field.startswith("worktree ")),
+            None,
+        )
+        if root_field is None:
+            continue
+        roots.add(
+            Path(root_field.removeprefix("worktree ")).expanduser().resolve()
+        )
+    return tuple(sorted(roots, key=str))
+
+
+def _safe_patch_path(
+    path: Path,
+    cwd: Path,
+    worktree_roots: tuple[Path, ...],
+) -> Path | None:
+    expanded = path.expanduser()
+    resolved = (
+        expanded.resolve()
+        if expanded.is_absolute()
+        else (cwd / expanded).resolve()
+    )
+
+    for root in worktree_roots:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        return resolved
+    return None
 
 
 def _unsafe_path_reason(paths: list[Path]) -> str:
     formatted_paths = ", ".join(str(path) for path in paths)
     return (
-        "Patch paths must be relative to the repository and must not contain "
-        f"`..` segments. Unsafe path(s): {formatted_paths}"
+        "Patch paths must resolve inside a registered worktree for this "
+        f"repository. Unsafe path(s): {formatted_paths}"
     )
 
 
@@ -93,10 +151,13 @@ def main() -> int:
     if not isinstance(payload, dict):
         return 0
 
+    cwd = _cwd_from_payload(payload)
+    repo_root = Path(__file__).resolve().parents[2]
+    worktree_roots = _registered_worktree_roots(repo_root)
     unsafe_paths = [
         path
         for path in _patch_paths(_command_from_payload(payload))
-        if _safe_relative_patch_path(path) is None
+        if _safe_patch_path(path, cwd, worktree_roots) is None
     ]
     if unsafe_paths:
         _emit_block(_unsafe_path_reason(unsafe_paths))

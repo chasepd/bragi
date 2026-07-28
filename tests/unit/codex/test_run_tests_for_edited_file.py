@@ -320,6 +320,52 @@ def test_default_mode_queues_mapped_test_target_instead_of_running_pytest(
     assert _read_queued_targets(queue_path) == [str(test_target)]
 
 
+def test_default_mode_queues_patch_target_from_sibling_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "primary"
+    sibling = tmp_path / "task"
+    primary.mkdir()
+    sibling.mkdir()
+    primary_repo, _ = _repo_with_mapped_test(primary)
+    sibling_repo, sibling_test_target = _repo_with_mapped_test(sibling)
+    sibling_source = sibling_repo / "bragi" / "providers" / "contracts.py"
+    nested_cwd = primary_repo / "docs"
+    nested_cwd.mkdir()
+    sibling_source_from_cwd = Path("../../task/bragi/providers/contracts.py")
+    queue_path = tmp_path / "edit-test-queue.txt"
+
+    monkeypatch.setenv("BRAGI_EDIT_TEST_QUEUE", str(queue_path))
+    monkeypatch.delenv("BRAGI_EDIT_TEST_MODE", raising=False)
+    monkeypatch.setattr(
+        hook,
+        "_run_pytest",
+        lambda repo, target: pytest.fail("_run_pytest should not run in queue mode"),
+    )
+
+    _invoke_hook(
+        monkeypatch,
+        {
+            "cwd": str(nested_cwd),
+            "tool_input": {
+                "command": "\n".join(
+                    [
+                        "*** Begin Patch",
+                        f"*** Update File: {sibling_source_from_cwd}",
+                        "@@",
+                        "+pass",
+                        "*** End Patch",
+                    ]
+                )
+            },
+        },
+    )
+
+    assert (nested_cwd / sibling_source_from_cwd).resolve() == sibling_source
+    assert _read_queued_targets(queue_path) == [str(sibling_test_target)]
+
+
 def test_default_mode_queues_explicit_web_test_target(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
