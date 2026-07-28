@@ -6010,6 +6010,45 @@ def test_repositories_list_protected_context_sources(
     assert normal.source_id not in {record.source_id for record in protected}
 
 
+def test_set_character_current_clothing_updates_only_blank_unlocked_field(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, source_message_id = _persist_repository_save(repositories)
+    character = repositories.add_character(
+        save_id=save_id,
+        name="Captain Ilyra",
+        role="Watch captain",
+        source_message_id=source_message_id,
+    )
+
+    updated = repositories.set_character_current_clothing_if_blank_and_unlocked(
+        save_id=save_id,
+        character_id=character.id,
+        current_clothing="Borrowed green raincoat.",
+    )
+
+    assert updated is not None
+    assert updated.current_clothing == "Borrowed green raincoat."
+    assert updated.role == "Watch captain"
+
+    repositories.update_character(
+        replace(
+            updated,
+            current_clothing="",
+            locked_fields=["current_clothing"],
+        )
+    )
+    locked = repositories.set_character_current_clothing_if_blank_and_unlocked(
+        save_id=save_id,
+        character_id=character.id,
+        current_clothing="Charcoal travel coat.",
+    )
+
+    assert locked is not None
+    assert locked.current_clothing == ""
+    assert locked.locked_fields == ["current_clothing"]
+
+
 def test_repositories_persist_normalized_context_registry(
     repositories: PersistenceRepositories,
 ) -> None:

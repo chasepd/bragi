@@ -1560,7 +1560,6 @@ def test_send_text_generates_character_image_attachment_for_npc_reply(
         structured_data=_attachment_decision(
             kind="character_image",
             visual_prompt="Rowan mirror selfie in a patched denim jacket",
-            wearing="patched denim jacket over a faded arcade shirt",
             current_action="taking a mirror selfie",
             facial_expression="guarded half-smile",
         ),
@@ -1587,9 +1586,7 @@ def test_send_text_generates_character_image_attachment_for_npc_reply(
         "Rowan mirror selfie in a patched denim jacket"
     )
     assert "Character visual direction for Rowan" in media.character_calls[0][1]
-    assert "Wearing: patched denim jacket over a faded arcade shirt" in (
-        media.character_calls[0][1]
-    )
+    assert "Wearing:" not in media.character_calls[0][1]
     assert "Current action/pose: taking a mirror selfie" in media.character_calls[0][1]
     assert "Facial expression: guarded half-smile" in media.character_calls[0][1]
     assert "Found my old jacket" in media.character_calls[0][2]
@@ -1600,13 +1597,11 @@ def test_send_text_generates_character_image_attachment_for_npc_reply(
     )
     properties = request.schema["properties"]
     assert isinstance(properties, dict)
-    assert set(properties) >= {
-        "wearing",
-        "current_action",
-        "facial_expression",
-    }
+    assert "wearing" not in properties
+    assert set(properties) >= {"current_action", "facial_expression"}
     system_text = request.messages[0].body
-    assert "what the character is wearing" in system_text
+    assert "what the character is wearing" not in system_text
+    assert "Current Clothing" in system_text
     assert "what the character is currently doing" in system_text
     assert "facial expression" in system_text
     attachment = result.reply.attachments[0]
@@ -5500,14 +5495,12 @@ def _attachment_decision(
     kind: str,
     visual_prompt: str = "",
     reason: str = "grounded in the current text",
-    wearing: str = "",
     current_action: str = "",
     facial_expression: str = "",
 ) -> dict[str, object]:
     return {
         "attachment_kind": kind,
         "visual_prompt": visual_prompt,
-        "wearing": wearing,
         "current_action": current_action,
         "facial_expression": facial_expression,
         "reason": reason,
