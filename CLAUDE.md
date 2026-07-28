@@ -14,41 +14,33 @@ Read these first:
 
 ## Required Workflow
 
+- Before making repository changes, fetch `origin` and create a dedicated task
+  worktree and branch from `origin/main`. Always work in that task worktree;
+  do not make agent-owned changes in the primary checkout.
+- When work is completed, open a PR into `main` unless the user explicitly says
+  not to.
+- When applicable, include `Closes #<issue>` in the PR description when the PR
+  resolves an issue, or `Refs #<issue>` when it relates to an issue without
+  closing it.
+- After submitting a PR, monitor it until CI is green and the PR is mergeable,
+  addressing failures or merge blockers that are in scope.
 - Use test-driven development for application code.
 - Use the project-local `code-review` skill in `.codex/skills/code-review/`
   to self-review code after an agent finishes code changes and before opening a PR.
-- Start feature work from `main`.
-- Use the main repository worktree for agent-owned code changes when it is clean
-  and no other agent is active there.
-- If the main worktree is dirty, has unrelated edits, or another agent is active
-  there, create a separate git worktree for the task. Prefer a sibling directory
-  named for the task or branch, for example `../bragi-issue-52`, created from
-  `main`.
 - Keep agent worktrees isolated: do not edit the same checkout from multiple
   agents at once, and do not share one worktree across unrelated tasks.
-- Before starting in an existing checkout, check `git status --short`; if there
-  are unrelated edits or another agent is active there, create or switch to a
-  dedicated worktree instead of mixing changes.
-- Worktrees may live under `/tmp` when that makes Codex hook/tool path handling
-  cleaner, for example `/tmp/bragi-issue-52`, but still create them from `main`
-  and keep them task-specific.
-- When editing a sibling or `/tmp` worktree, apply manual patches from that
-  worktree root and use repository-relative paths such as `bragi/app.py`.
-  Do not pass absolute paths or `..` paths to `apply_patch`; the PreToolUse hook
-  rejects patch paths like `/tmp/bragi-issue-52/bragi/app.py` and
-  `../bragi-issue-52/bragi/app.py` even when the target worktree itself is valid.
-- Open feature PRs into `main`.
+- Prefer a task-specific sibling directory such as `../bragi-issue-52`; `/tmp`
+  is also acceptable when it makes hook or tool path handling cleaner.
+- Codex hooks allow patch paths that resolve inside any registered worktree for
+  this repository, including absolute and parent-relative paths. Paths outside
+  those worktrees remain blocked.
 - Prefer coherent larger PRs over many tiny PRs because the validation pipeline
   is long. Bundle related fixes or features that can be reviewed together, while
   still avoiding unrelated churn or risky scope creep.
-- When work is completed, open a PR unless the user explicitly says not to.
-- After submitting a PR, agents should monitor it until CI is green and the PR
-  is mergeable, addressing failures or merge blockers that are in scope.
 - Keep the project backlog in GitHub issues.
 - When opening, creating, or editing GitHub issues, preserve user privacy:
   do not include personal details, scrub personal roleplay data, and genericize
   any sample data while keeping enough detail to communicate the issue intent.
-- When a PR closes a GitHub issue, mention that issue in the PR description.
 - Do not commit API keys, generated local databases, logs, or untracked media output.
 - Preserve user changes in the worktree. Do not revert unrelated edits.
 - When adding or changing persisted schemas, structured data, or filesystem data

@@ -98,8 +98,12 @@ def _test_env() -> dict[str, str]:
     }
 
 
+def _cwd_path(cwd: str | None) -> Path:
+    return Path(cwd).expanduser().resolve() if cwd else Path.cwd().resolve()
+
+
 def _repo_root_from_cwd(cwd: str | None) -> Path | None:
-    start = Path(cwd).expanduser().resolve() if cwd else Path.cwd().resolve()
+    start = _cwd_path(cwd)
 
     for directory in (start, *start.parents):
         if (directory / "pyproject.toml").is_file() and (
@@ -170,13 +174,11 @@ def _flush_queued_tests(repo: Path) -> bool:
     return passed
 
 
-def _resolve_candidate(raw: str, repo: Path | None) -> Path:
+def _resolve_candidate(raw: str, cwd: Path) -> Path:
     path = Path(raw).expanduser()
     if path.is_absolute():
         return path.resolve()
-    if repo is not None:
-        return (repo / path).resolve()
-    return path.resolve()
+    return (cwd / path).resolve()
 
 
 def _run_pytest(repo: Path, test_path: Path) -> bool:
@@ -322,9 +324,9 @@ def _run_or_queue_targets(repo: Path, test_targets: list[Path]) -> None:
 
 def main() -> int:
     payload = _payload_from_stdin()
-    repo_from_cwd = _repo_root_from_cwd(
-        str(payload.get("cwd")) if payload.get("cwd") else None
-    )
+    raw_cwd = str(payload.get("cwd")) if payload.get("cwd") else None
+    cwd = _cwd_path(raw_cwd)
+    repo_from_cwd = _repo_root_from_cwd(raw_cwd)
 
     if "--flush" in sys.argv[1:]:
         repo = repo_from_cwd or _repo_root_from_cwd(None)
@@ -342,7 +344,7 @@ def main() -> int:
     targets_by_repo: dict[Path, list[Path]] = {}
     seen_by_repo: dict[Path, set[str]] = {}
     for raw in files:
-        path = _resolve_candidate(raw, repo_from_cwd)
+        path = _resolve_candidate(raw, cwd)
         repo = _repo_root_containing(path) or repo_from_cwd
         if repo is None:
             continue
