@@ -4939,14 +4939,22 @@ h1 {
   .mobile-app-shell .chronicle-scroll {
     min-height: 0;
     overflow: auto;
+    overflow-x: hidden;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
     padding: 16px 12px;
     gap: 12px;
   }
 
-  .message {
+  .mobile-app-shell .chronicle-virtual-list,
+  .mobile-app-shell .chronicle-virtual-row,
+  .mobile-app-shell .message {
+    width: 100%;
     max-width: 100%;
+    min-width: 0;
+  }
+
+  .mobile-app-shell .message {
     padding: 12px 13px;
   }
 
@@ -4959,7 +4967,10 @@ h1 {
     min-width: 36px;
   }
 
-  .prose {
+  .mobile-app-shell .prose {
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
     line-height: 1.56;
   }
 
