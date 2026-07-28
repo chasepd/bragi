@@ -52,6 +52,10 @@ from bragi.services.sexual_content_safety import (
     CONTENT_FILTER_TRANSITION,
     FADE_TO_BLACK_TRANSITION,
 )
+from bragi_common.story_continuation import (
+    STORY_CONTINUATION_DIRECTION,
+    STORY_CONTINUATION_SPEAKER_NAME,
+)
 
 _MISSING = object()
 
@@ -787,8 +791,8 @@ def test_story_continuation_delta_exposes_only_narration(
     direction = repositories.append_message(
         save_id=save.id,
         role="player",
-        speaker_name="Bragi Story Continuation",
-        body="Continue the story naturally from the current moment.",
+        speaker_name=STORY_CONTINUATION_SPEAKER_NAME,
+        body=STORY_CONTINUATION_DIRECTION,
     )
     narrator = repositories.append_message(
         save_id=save.id,

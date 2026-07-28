@@ -21,4 +21,11 @@ def test_story_continuation_marker_requires_player_role_and_internal_speaker() -
     assert is_story_continuation_message(
         SimpleNamespace(role="player", speaker_name="Player")
     ) is False
+    assert is_story_continuation_message(
+        SimpleNamespace(
+            role="player",
+            speaker_name=STORY_CONTINUATION_SPEAKER_NAME,
+            body="A user-authored message",
+        )
+    ) is False
     assert "Continue the story naturally" in STORY_CONTINUATION_DIRECTION

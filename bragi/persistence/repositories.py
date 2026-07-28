@@ -99,7 +99,11 @@ from bragi_common.media_mime import (
     SUPPORTED_VIDEO_MIME_TYPES,
     canonical_media_mime_type,
 )
-from bragi_common.story_continuation import STORY_CONTINUATION_SPEAKER_NAME
+from bragi_common.story_continuation import (
+    STORY_CONTINUATION_DIRECTION,
+    STORY_CONTINUATION_SPEAKER_NAME,
+    is_story_continuation_message,
+)
 
 MAX_CONTEXT_SEARCH_TERMS = 64
 MAX_UNICODE_SUBSTRING_TERMS = 32
@@ -1201,11 +1205,7 @@ class PersistenceRepositories:
             messages=[
                 message
                 for message in self.list_messages(save_id)
-                if not (
-                    message.role == "player"
-                    and message.speaker_name
-                    == STORY_CONTINUATION_SPEAKER_NAME
-                )
+                if not is_story_continuation_message(message)
             ],
         )
 
@@ -2717,7 +2717,7 @@ class PersistenceRepositories:
             raise ValueError("Message page limit must be at least 1")
         deleted_filter = "" if include_deleted else "AND deleted_at IS NULL"
         chronicle_filter = (
-            "AND NOT (role = 'player' AND speaker_name = ?)"
+            "AND NOT (role = 'player' AND speaker_name = ? AND body = ?)"
             if chronicle_only
             else ""
         )
@@ -2737,7 +2737,12 @@ class PersistenceRepositories:
             before_filter = "AND rowid < ?"
             params.append(before_row["rowid"])
         if chronicle_only:
-            params.append(STORY_CONTINUATION_SPEAKER_NAME)
+            params.extend(
+                (
+                    STORY_CONTINUATION_SPEAKER_NAME,
+                    STORY_CONTINUATION_DIRECTION,
+                )
+            )
         rows = self._fetch_all(
             f"""
             SELECT id, save_id, role, body, speaker_name, provider, model,
@@ -2782,7 +2787,12 @@ class PersistenceRepositories:
                 raise ValueError(f"Unknown active message id: {before_message_id}")
             before_filter = "AND rowid < ?"
             params.append(before_row["rowid"])
-        params.append(STORY_CONTINUATION_SPEAKER_NAME)
+        params.extend(
+            (
+                STORY_CONTINUATION_SPEAKER_NAME,
+                STORY_CONTINUATION_DIRECTION,
+            )
+        )
         rows = self._fetch_all(
             f"""
             SELECT id, save_id, role, body, speaker_name, provider, model,
@@ -2790,7 +2800,7 @@ class PersistenceRepositories:
                    safety_transition, content_rating
             FROM messages
             WHERE save_id = ? AND deleted_at IS NULL {before_filter}
-              AND NOT (role = 'player' AND speaker_name = ?)
+              AND NOT (role = 'player' AND speaker_name = ? AND body = ?)
               {filter_clause}
             ORDER BY rowid DESC
             LIMIT ?
@@ -2815,10 +2825,14 @@ class PersistenceRepositories:
             SELECT COUNT(*) AS message_count
             FROM messages
             WHERE save_id = ? AND deleted_at IS NULL
-              AND NOT (role = 'player' AND speaker_name = ?)
+              AND NOT (role = 'player' AND speaker_name = ? AND body = ?)
               {filter_clause}
             """,
-            (save_id, STORY_CONTINUATION_SPEAKER_NAME),
+            (
+                save_id,
+                STORY_CONTINUATION_SPEAKER_NAME,
+                STORY_CONTINUATION_DIRECTION,
+            ),
         )
         return int(row["message_count"]) if row is not None else 0
 

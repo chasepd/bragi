@@ -25,6 +25,10 @@ from bragi.services.scenario_evolution_policy import (
     scenario_template_evolution_turn_interval_setting_key,
 )
 from bragi.text_search import cjk_lexical_anchors
+from bragi_common.story_continuation import (
+    STORY_CONTINUATION_DIRECTION,
+    STORY_CONTINUATION_SPEAKER_NAME,
+)
 
 
 @pytest.fixture
@@ -357,8 +361,8 @@ def test_repositories_pages_chronicle_without_internal_story_continuations(
     repositories.append_message(
         save_id=save.id,
         role="player",
-        speaker_name="Bragi Story Continuation",
-        body="Continue the story naturally from the current moment.",
+        speaker_name=STORY_CONTINUATION_SPEAKER_NAME,
+        body=STORY_CONTINUATION_DIRECTION,
     )
     second_narrator = repositories.append_message(
         save_id=save.id,

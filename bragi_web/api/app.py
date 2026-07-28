@@ -3209,6 +3209,17 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
 
     @app.post("/api/chat")
     async def submit_chat(payload: ChatRequest, state: StateDep) -> dict[str, Any]:
+        if payload.speaker_name == STORY_CONTINUATION_SPEAKER_NAME:
+            raise HTTPException(
+                status_code=400,
+                detail="speaker_name is reserved for internal Storyteller turns",
+            )
+        return await _submit_chat(payload, state)
+
+    async def _submit_chat(
+        payload: ChatRequest,
+        state: StateDep,
+    ) -> dict[str, Any]:
         async with state.lock.async_access():
             submitted_save_id = _require_save_id(payload.save_id)
             _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
@@ -3355,7 +3366,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                         "Continue story is only available in Storyteller mode."
                     ),
                 )
-        return await submit_chat(
+        return await _submit_chat(
             ChatRequest(
                 body=STORY_CONTINUATION_DIRECTION,
                 speaker_name=STORY_CONTINUATION_SPEAKER_NAME,

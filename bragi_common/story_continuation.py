@@ -15,4 +15,5 @@ def is_story_continuation_message(message: object) -> bool:
         getattr(message, "role", None) == "player"
         and getattr(message, "speaker_name", None)
         == STORY_CONTINUATION_SPEAKER_NAME
+        and getattr(message, "body", None) == STORY_CONTINUATION_DIRECTION
     )

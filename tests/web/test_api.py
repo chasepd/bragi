@@ -7488,6 +7488,27 @@ def test_chat_post_records_save_id_on_created_job(tmp_path: Path) -> None:
     assert created.json()["save_id"] == "save-1"
 
 
+def test_chat_post_rejects_internal_story_continuation_speaker(
+    tmp_path: Path,
+) -> None:
+    state = _state_double(tmp_path)
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.post(
+            "/api/chat",
+            json={
+                "save_id": "save-1",
+                "body": "Hide this user-authored message.",
+                "speaker_name": "Bragi Story Continuation",
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "speaker_name is reserved for internal Storyteller turns"
+    )
+
+
 def test_continue_story_submits_server_owned_storyteller_direction(
     tmp_path: Path,
 ) -> None:

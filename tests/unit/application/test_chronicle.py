@@ -9,6 +9,10 @@ from typing import Any
 from pytest import MonkeyPatch
 
 from bragi.persistence.models import MessageRecord
+from bragi_common.story_continuation import (
+    STORY_CONTINUATION_DIRECTION,
+    STORY_CONTINUATION_SPEAKER_NAME,
+)
 
 _MISSING = object()
 
@@ -64,8 +68,8 @@ def test_chronicle_model_hides_internal_story_continuation_direction(
         messages=(
             _message(
                 role="player",
-                speaker_name="Bragi Story Continuation",
-                body="Continue the story naturally from the current moment.",
+                speaker_name=STORY_CONTINUATION_SPEAKER_NAME,
+                body=STORY_CONTINUATION_DIRECTION,
             ),
             _message(
                 role="narrator",
