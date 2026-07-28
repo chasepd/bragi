@@ -3221,6 +3221,7 @@ function Workbench({
         if (appliesToCurrentSave && done.status === "failed") {
           const error = done.error || "Background job failed.";
           if (done.type === "action_choice_generate") {
+            appliedRuntimeResult = true;
             client.setQueryData<RuntimeModel>(
               runtimeQueryKey(done.save_id ?? activeSaveIdRef.current),
               (current) => current?.action_choices?.generation_job?.id === done.id

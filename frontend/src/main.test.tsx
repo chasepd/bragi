@@ -15016,6 +15016,11 @@ describe("frontend helpers", () => {
     expect(await screen.findByText("Action choices could not be generated.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Regenerate options" })).toBeEnabled();
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    });
+    expect(screen.getByText("Action choices could not be generated.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
 
     await userEvent.click(screen.getByRole("button", { name: "Regenerate options" }));
     await waitFor(() => expect(
