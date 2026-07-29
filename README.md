@@ -4,6 +4,8 @@ Bragi is a trusted-LAN web roleplaying workbench. It combines an AI-powered
 chronicle with deterministic local state, memories, summaries, saves, and
 generated scene images.
 
+![Bragi roleplaying chronicle interface](docs/images/bragi-screenshot.png)
+
 The Python backend serves the Bragi API with FastAPI/uvicorn, and the frontend
 is a React/Vite app. The legacy GTK frontend has been retired; `bragi` now
 starts the web experience by default, while `bragi-web` remains as a
