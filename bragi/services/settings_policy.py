@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from bragi.retry_policy import RETRY_COUNT_SETTING
 from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_SETTING,
     PLAN_FIRST_NARRATOR_SETTING,
@@ -93,6 +94,7 @@ _GLOBAL_ADMIN_SCOPED_SETTINGS = frozenset(
         OPENROUTER_ROUTING_PROFILES_SETTING,
         MODEL_ROUTING_PROFILES_SETTING,
         GENERATED_PHRASE_DENYLIST_SETTING,
+        RETRY_COUNT_SETTING,
     }
 )
 _USER_SCOPED_SETTINGS = frozenset(

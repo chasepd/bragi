@@ -2129,6 +2129,59 @@ def test_repositories_claim_context_observations_in_bounded_fifo_batches(
     assert state.lease_until is not None
 
 
+def test_context_observation_curation_keeps_budget_after_setting_change(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting("retry_count", 2)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="scene_fact",
+        claim="The eastern signal is lit.",
+    )
+    original_state = repositories.get_context_observation_curation_state(
+        observation.id
+    )
+    assert original_state is not None
+    assert original_state.max_attempts == 3
+
+    repositories.set_app_setting("retry_count", 0)
+    for attempt in range(3):
+        lease_token = f"snapshot-budget-worker-{attempt}"
+        assert repositories.claim_context_observations(
+            [observation.id],
+            lease_token=lease_token,
+            lease_seconds=600,
+        )
+        repositories.defer_context_observation_curation(
+            observation.id,
+            lease_token=lease_token,
+            error="temporary failure",
+            retry_after_seconds=60,
+        )
+        repositories.connection.execute(
+            """
+            UPDATE context_observation_curation_state
+            SET next_eligible_at = NULL
+            WHERE observation_id = ?
+            """,
+            (observation.id,),
+        )
+        repositories.commit()
+
+    state = repositories.get_context_observation_curation_state(observation.id)
+    assert state is not None
+    assert state.max_attempts == 3
+    assert state.terminal_outcome == "retry_budget_exhausted"
+
+
 def test_repositories_normalize_observation_type_and_preserve_original(
     repositories: PersistenceRepositories,
 ) -> None:

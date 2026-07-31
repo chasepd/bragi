@@ -31,7 +31,7 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.structured_schema import normalize_strict_json_schema
 from bragi.redaction import redact_text
-from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.manual_confirmation import (
     manual_memory_confirmation_enabled,
@@ -463,8 +463,9 @@ class ToolCallingProviderStateExtractor:
             model_id=request.model_id,
             fallback_used=fallback_used,
         )
+        max_attempt_count = configured_max_attempts(self.repositories)
 
-        for turn in range(MAX_STATE_TOOL_FEEDBACK_TURNS + 1):
+        for turn in range(max_attempt_count):
             turn_request = budget_tool_call_request(
                 self.repositories,
                 replace(request, messages=tuple(messages)),

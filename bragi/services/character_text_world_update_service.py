@@ -24,7 +24,7 @@ from bragi.providers.contracts import (
     StructuredOutputRequest,
 )
 from bragi.redaction import redact_text
-from bragi.retry_policy import DEFERRED_WORK_MAX_ATTEMPTS
+from bragi.retry_policy import DEFERRED_WORK_MAX_ATTEMPTS, configured_retry_count
 from bragi.services.character_text_context import (
     canonical_character_text_context_messages,
     character_text_audience_character_ids,
@@ -169,6 +169,11 @@ class CharacterTextWorldUpdateService:
                     model_id=preference.model_id,
                     error=exc,
                 )
+                if retry_job is None:
+                    return CharacterTextWorldUpdateResult(
+                        status="failed",
+                        error=redact_text(str(exc)) or exc.__class__.__name__,
+                    )
                 return CharacterTextWorldUpdateResult(
                     status="retry_queued",
                     retry_job_id=retry_job.id,
@@ -945,7 +950,7 @@ class CharacterTextWorldUpdateService:
         provider: str,
         model_id: str,
         error: Exception,
-    ) -> JobRecord:
+    ) -> JobRecord | None:
         log_error_event(
             "character_text_world_update.failed",
             save_id=save_id,
@@ -953,6 +958,9 @@ class CharacterTextWorldUpdateService:
             model=model_id,
             **exception_log_fields(error),
         )
+        max_retry_count = configured_retry_count(self.repositories)
+        if max_retry_count == 0:
+            return None
         return self.jobs.create_queued(
             save_id=save_id,
             type=CHARACTER_TEXT_WORLD_UPDATE_RETRY_JOB_TYPE,
@@ -961,7 +969,7 @@ class CharacterTextWorldUpdateService:
                 "provider": provider,
                 "model": model_id,
                 "retry_attempt": 1,
-                "max_retry_attempts": _MAX_RETRY_ATTEMPTS,
+                "max_retry_attempts": max_retry_count,
                 "reason": "character_text_world_update_failed",
             },
         )
@@ -1004,9 +1012,9 @@ def _retry_attempt(payload: dict[str, object]) -> int:
 
 def _retry_max_attempts(payload: dict[str, object]) -> int:
     value = payload.get("max_retry_attempts", _MAX_RETRY_ATTEMPTS)
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         return _MAX_RETRY_ATTEMPTS
-    return max(value, _MAX_RETRY_ATTEMPTS)
+    return value
 
 
 def _text_update_scope(

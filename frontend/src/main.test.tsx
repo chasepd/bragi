@@ -248,6 +248,7 @@ function modelSettingsPayload(overrides: Partial<SettingsModel> = {}): SettingsM
     roleplay_shared_models: { setting_key: "roleplay_shared_models", enabled: true },
     roleplay_model_groups: [],
     scenario_section_model_selectors: [],
+    retry_count: { setting_key: "retry_count", value: 6, minimum: 0, maximum: 10, step: 1 },
     ...overrides
   };
 }
@@ -19362,6 +19363,36 @@ describe("frontend helpers", () => {
         { key: "image_generation_frequency", value: 9, save_id: "save-1" },
         { key: "chat_max_output_tokens", value: 3000, save_id: "save-1" }
       ]);
+  });
+
+  it("exposes the admin retry policy in Models and saves it globally", async () => {
+    const fetchMock = settingsFetch(modelSettingsPayload());
+    vi.stubGlobal("fetch", fetchMock);
+    const { SettingsPanel } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <SettingsPanel runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Models" }));
+    const retryToggle = screen.getByRole("button", { name: /retry policy/i });
+    expect(retryToggle).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(retryToggle);
+
+    const retryCount = screen.getByLabelText("Retries after first");
+    expect(retryCount).toHaveValue(6);
+    await userEvent.clear(retryCount);
+    await userEvent.type(retryCount, "2");
+    fireEvent.blur(retryCount);
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/scoped")).toBe(true));
+    const retryCall = fetchMock.mock.calls.find(([path]) => path === "/api/settings/scoped");
+    expect(JSON.parse(String(retryCall?.[1]?.body))).toEqual({
+      key: "retry_count",
+      value: 2
+    });
   });
 
   it("renders provider generation settings with metadata support gates", async () => {

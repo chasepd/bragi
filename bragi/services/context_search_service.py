@@ -47,7 +47,7 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError
 from bragi.redaction import redact_text
-from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.services.context_assembly import scenario_section_candidates
 from bragi.services.continuity_index_service import ContinuityIndexService
 from bragi.services.job_lifecycle import JobLifecycleService
@@ -2627,8 +2627,9 @@ async def _select_context_with_tool_feedback(
     selected_keys: set[tuple[str, str]] = set()
     selected_items: list[SelectedContextItem] = []
     last_errors: list[str] = []
+    max_attempt_count = configured_max_attempts(repositories)
 
-    for _turn in range(MAX_CONTEXT_SEARCH_TOOL_FEEDBACK_TURNS + 1):
+    for _turn in range(max_attempt_count):
         turn_request = budget_tool_call_request(
             repositories,
             replace(request, messages=tuple(messages)),

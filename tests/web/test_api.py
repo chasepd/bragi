@@ -5916,9 +5916,21 @@ def test_settings_api_scopes_settings_and_enforces_roles(
     app = create_app(cast(WebAppState, state))
 
     with (
+        TestClient(app, authenticate=False) as admin_client,
         TestClient(app, authenticate=False) as user_client,
         TestClient(app, authenticate=False) as child_client,
     ):
+        assert admin_client.post(
+            "/api/auth/login",
+            json={"username": "Admin", "password": "correct horse"},
+        ).status_code == 200
+        admin_settings = admin_client.get("/api/settings")
+        admin_retry_saved = admin_client.post(
+            "/api/settings/scoped",
+            json={"key": "retry_count", "value": 99},
+        )
+        admin_updated_settings = admin_client.get("/api/settings")
+
         assert user_client.post(
             "/api/auth/login",
             json={"username": "Mira", "password": "correct horse"},
@@ -5950,6 +5962,10 @@ def test_settings_api_scopes_settings_and_enforces_roles(
         user_admin_setting = user_client.post(
             "/api/settings/scoped",
             json={"key": "chat_fallback_enabled", "value": True},
+        )
+        user_retry_setting = user_client.post(
+            "/api/settings/scoped",
+            json={"key": "retry_count", "value": 2},
         )
         user_provider_key = user_client.post(
             "/api/settings/provider-key",
@@ -5994,6 +6010,17 @@ def test_settings_api_scopes_settings_and_enforces_roles(
         child_local_settings = child_client.get("/api/settings/local")
 
     assert user_settings.status_code == 200
+    assert admin_settings.status_code == 200
+    assert admin_settings.json()["retry_count"] == {
+        "setting_key": "retry_count",
+        "value": 6,
+        "minimum": 0,
+        "maximum": 10,
+        "step": 1,
+    }
+    assert admin_retry_saved.status_code == 200
+    assert admin_updated_settings.status_code == 200
+    assert admin_updated_settings.json()["retry_count"]["value"] == 10
     assert user_settings.json()["visible_sections"] == [
         "save",
         "local",
@@ -6010,6 +6037,7 @@ def test_settings_api_scopes_settings_and_enforces_roles(
     assert user_guidance.status_code == 200
     assert user_other_save.status_code == 404
     assert user_admin_setting.status_code == 403
+    assert user_retry_setting.status_code == 403
     assert user_provider_key.status_code == 403
     assert (
         state.repositories.get_effective_setting(
@@ -6039,6 +6067,7 @@ def test_settings_api_scopes_settings_and_enforces_roles(
         )
         is None
     )
+    assert state.repositories.get_effective_setting("retry_count") == 10
     assert child_settings.status_code == 200
     assert child_settings.json()["visible_sections"] == ["local"]
     assert child_settings.json()["user_narration_guidance"] == {

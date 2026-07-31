@@ -50,7 +50,10 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.http_client import SAFE_PROVIDER_RESPONSE_HEADERS
 from bragi.redaction import redact_text
-from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
+from bragi.retry_policy import (  # noqa: F401 - test compatibility
+    MODEL_OUTPUT_MAX_ATTEMPTS,
+    configured_max_attempts,
+)
 from bragi.services.character_locks import character_field_is_locked
 from bragi.services.character_profile_completion import (
     ScenarioCharacterStarter,
@@ -2088,7 +2091,8 @@ class MediaService:
         )
         expected_ids = {character.id for character in missing}
         last_error = "unknown validation failure"
-        for attempt in range(1, MODEL_OUTPUT_MAX_ATTEMPTS + 1):
+        max_attempt_count = configured_max_attempts(self.repositories)
+        for attempt in range(1, max_attempt_count + 1):
             try:
                 response = await structured_output_with_fallback(
                     repositories=self.repositories,
@@ -2114,11 +2118,11 @@ class MediaService:
                     "media.current_clothing_completion_attempt_failed",
                     save_id=save_id,
                     attempt=attempt,
-                    max_attempts=MODEL_OUTPUT_MAX_ATTEMPTS,
+                    max_attempts=max_attempt_count,
                     character_ids=sorted(expected_ids),
                     **exception_log_fields(exc),
                 )
-                if attempt < MODEL_OUTPUT_MAX_ATTEMPTS:
+                if attempt < max_attempt_count:
                     messages.append(
                         ChatMessage(
                             role="user",
@@ -2157,7 +2161,7 @@ class MediaService:
                 "media.current_clothing_completed",
                 save_id=save_id,
                 attempt=attempt,
-                max_attempts=MODEL_OUTPUT_MAX_ATTEMPTS,
+                max_attempts=max_attempt_count,
                 character_ids=sorted(expected_ids),
                 provider=response.provider,
                 model=response.model_id,
@@ -2169,7 +2173,7 @@ class MediaService:
         log_error_event(
             "media.current_clothing_completion_exhausted",
             save_id=save_id,
-            max_attempts=MODEL_OUTPUT_MAX_ATTEMPTS,
+            max_attempts=max_attempt_count,
             character_ids=sorted(expected_ids),
             error=redact_text(last_error),
         )

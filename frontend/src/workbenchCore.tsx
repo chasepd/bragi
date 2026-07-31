@@ -8853,6 +8853,7 @@ const fallbackSettingLabels: Record<string, string> = {
   post_turn_inference_mode: "Post-Turn Inference Mode",
   npc_knowledge_audit_mode: "NPC Knowledge Audit Mode",
   generated_text_script_guard_mode: "Generated Text Script Guard",
+  retry_count: "Retries after first",
   generated_phrase_denylist: "Global Phrase Denylist",
   save_generated_phrase_denylist: "Save Phrase Denylist",
   narrator_planner_recent_player_message_window: "Planner Player Messages",

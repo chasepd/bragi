@@ -44,7 +44,7 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.structured_schema import normalize_strict_json_schema
 from bragi.redaction import redact_text
-from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.services.active_thread_lifecycle import (
     ACTIVE_THREAD_STATUSES,
     ACTIVE_THREAD_VISIBILITIES,
@@ -1159,8 +1159,9 @@ class ToolCallingProviderContextUpdater:
         selected: list[ContextRegistryItem] = []
         selected_ids: set[str] = set()
         last_errors: list[str] = []
+        max_attempt_count = configured_max_attempts(self.repositories)
 
-        for _turn in range(MAX_CONTEXT_UPDATE_TOOL_FEEDBACK_TURNS + 1):
+        for _turn in range(max_attempt_count):
             turn_request = budget_tool_call_request(
                 self.repositories,
                 replace(request, messages=tuple(messages)),
@@ -1224,8 +1225,9 @@ class ToolCallingProviderContextUpdater:
         thread_enrichments: list[ActiveThreadWorldDataEnrichment] = []
         character_enrichments: list[CharacterWorldDataEnrichment] = []
         last_errors: list[str] = []
+        max_attempt_count = configured_max_attempts(self.repositories)
 
-        for _turn in range(MAX_CONTEXT_UPDATE_TOOL_FEEDBACK_TURNS + 1):
+        for _turn in range(max_attempt_count):
             turn_request = budget_tool_call_request(
                 self.repositories,
                 replace(request, messages=tuple(messages)),
@@ -1305,13 +1307,14 @@ class ToolCallingProviderContextUpdater:
         tool_schemas = {tool.name: tool.parameters for tool in request.tools}
         source_messages_by_id = {message.id: message for message in source_messages}
         last_errors: list[str] = []
+        max_attempt_count = configured_max_attempts(self.repositories)
         diagnostics = _initial_tool_diagnostics(
             provider=request.provider,
             model_id=request.model_id,
             fallback_used=fallback_used,
         )
 
-        for turn in range(MAX_CONTEXT_UPDATE_TOOL_FEEDBACK_TURNS + 1):
+        for turn in range(max_attempt_count):
             turn_request = budget_tool_call_request(
                 self.repositories,
                 replace(request, messages=tuple(messages)),
@@ -1644,8 +1647,9 @@ class ToolCallingFocusedSceneMaintainer:
         tool_schemas = {tool.name: tool.parameters for tool in tool_request.tools}
         accepted: object | None = None
         last_errors: list[str] = []
+        max_attempt_count = configured_max_attempts(self.repositories)
 
-        for turn in range(MAX_CONTEXT_UPDATE_TOOL_FEEDBACK_TURNS + 1):
+        for turn in range(max_attempt_count):
             turn_request = budget_tool_call_request(
                 self.repositories,
                 replace(tool_request, messages=tuple(messages)),

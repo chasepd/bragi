@@ -535,7 +535,7 @@ class ChatBundleService:
                 portable_context_observation_curation_state_row(row)
                 for row in self._rows(
                     """
-                    SELECT observation_id, save_id, attempt_count,
+                    SELECT observation_id, save_id, attempt_count, max_attempts,
                            next_eligible_at, lease_token, lease_until,
                            last_error, terminal_outcome, completed_at,
                            created_at, updated_at
@@ -774,7 +774,8 @@ class ChatBundleService:
                 SELECT id, save_id, update_type, entity_type, entity_id,
                        field_path, proposed_value_json, status, reason,
                        confidence, source_message_ids_json, created_at, resolved_at,
-                       review_attempt_count, next_review_at, last_review_error
+                       review_attempt_count, next_review_at, last_review_error,
+                       max_retry_count
                 FROM context_update_suggestions
                 WHERE save_id = ?
                 ORDER BY created_at, rowid
@@ -1547,6 +1548,7 @@ class ChatBundleService:
             self.repositories.restore_context_observation_curation_state(
                 mapped_observation_id,
                 attempt_count=_optional_int(row, "attempt_count") or 0,
+                max_attempts=_optional_int(row, "max_attempts"),
                 next_eligible_at=_optional_text(row, "next_eligible_at"),
                 last_error=_optional_text(row, "last_error"),
                 terminal_outcome=_optional_text(row, "terminal_outcome"),

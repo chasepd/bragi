@@ -7,7 +7,7 @@ import base64
 import binascii
 import json
 import mimetypes
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from decimal import Decimal, InvalidOperation
 from os import environ
 from pathlib import Path
@@ -64,6 +64,7 @@ from bragi.providers.tool_calls import (
     tool_definition_payload,
     tool_message_payload,
 )
+from bragi.retry_policy import PROVIDER_MAX_ATTEMPTS
 from bragi.services.secrets import SecretStorageError, SecretStore
 
 OPENROUTER_PROVIDER_NAME = "openrouter"
@@ -115,6 +116,7 @@ class OpenRouterClient:
         timeout: float = 60.0,
         video_poll_interval: float = OPENROUTER_VIDEO_POLL_INTERVAL_SECONDS,
         video_timeout: float = OPENROUTER_VIDEO_TIMEOUT_SECONDS,
+        retry_max_attempts: Callable[[], int] | None = None,
     ) -> None:
         self.secret_store = secret_store
         self.base_url = base_url.rstrip("/")
@@ -124,7 +126,13 @@ class OpenRouterClient:
         self.timeout = timeout
         self.video_poll_interval = max(0.0, video_poll_interval)
         self.video_timeout = max(0.0, video_timeout)
+        self.retry_max_attempts = retry_max_attempts
         self._model_output_modalities: dict[str, tuple[str, ...]] = {}
+
+    def _configured_max_attempts(self) -> int:
+        if self.retry_max_attempts is None:
+            return PROVIDER_MAX_ATTEMPTS
+        return max(1, int(self.retry_max_attempts()))
 
     async def validate_config(self) -> ProviderConfigStatus:
         try:
@@ -402,6 +410,7 @@ class OpenRouterClient:
             ),
             provider=self.provider_name,
             task="structured_output",
+            max_attempts=self._configured_max_attempts(),
             retry_progress_callback=request.retry_progress_callback,
         )
         raw_metadata = dict(response)
@@ -516,6 +525,7 @@ class OpenRouterClient:
             ),
             provider=self.provider_name,
             task="model_listing",
+            max_attempts=self._configured_max_attempts(),
         )
 
     async def _post_json(
@@ -538,6 +548,7 @@ class OpenRouterClient:
             ),
             provider=self.provider_name,
             task=task,
+            max_attempts=self._configured_max_attempts(),
             retry_progress_callback=retry_progress_callback,
         )
 
@@ -585,6 +596,7 @@ class OpenRouterClient:
             ),
             provider=self.provider_name,
             task=task,
+            max_attempts=self._configured_max_attempts(),
         )
 
     async def _request_json(

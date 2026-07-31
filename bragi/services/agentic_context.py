@@ -33,7 +33,7 @@ from bragi.providers.contracts import (
     StructuredOutputRequest,
     StructuredOutputResponse,
 )
-from bragi.retry_policy import DEFERRED_WORK_MAX_ATTEMPTS, MODEL_OUTPUT_MAX_ATTEMPTS
+from bragi.retry_policy import configured_max_attempts
 from bragi.services.evidence import quote_matches_source
 from bragi.services.manual_confirmation import manual_memory_confirmation_enabled
 from bragi.services.npc_knowledge_audit_service import NpcKnowledgeLeak
@@ -76,7 +76,6 @@ CURATION_BATCH_ITEM_LIMIT = 32
 CURATION_INPUT_TOKEN_BUDGET = 8_000
 CURATION_MAX_OUTPUT_TOKENS = 4_096
 CURATION_LEASE_SECONDS = 10 * 60
-CURATION_MAX_ATTEMPTS = DEFERRED_WORK_MAX_ATTEMPTS
 CURATION_RETRY_DELAYS_SECONDS = (
     60,
     5 * 60,
@@ -366,7 +365,8 @@ class StructuredProviderObservationExtractor:
             else DEFAULT_SCRIPT_GUARD_MODE
         )
         messages_by_id = {message.id: message.body for message in messages}
-        for attempt in range(MODEL_OUTPUT_MAX_ATTEMPTS):
+        max_attempt_count = configured_max_attempts(self.repositories)
+        for attempt in range(max_attempt_count):
             response = await _structured_response(
                 provider=self.provider,
                 repositories=self.repositories,
@@ -381,7 +381,7 @@ class StructuredProviderObservationExtractor:
                 messages_by_id=messages_by_id,
                 mode=mode,
             )
-            if not rejected or attempt == MODEL_OUTPUT_MAX_ATTEMPTS - 1:
+            if not rejected or attempt == max_attempt_count - 1:
                 return accepted
             request = _structured_request_with_script_policy_feedback(
                 request,
@@ -559,6 +559,7 @@ class StructuredProviderContextCurator:
             if observation.id in violating_ids
         )
         retry_by_id: dict[str, CurationDecision] = {}
+        max_attempt_count = configured_max_attempts(self.repositories)
         for observation in retry_observations:
             rejected = violating_by_id[observation.id]
             subset_request = replace(
@@ -566,7 +567,7 @@ class StructuredProviderContextCurator:
                 schema=_curation_schema((observation,)),
                 messages=_curation_messages((observation,)),
             )
-            for _attempt in range(1, MODEL_OUTPUT_MAX_ATTEMPTS):
+            for _attempt in range(1, max_attempt_count):
                 retry_request = _structured_request_with_script_policy_feedback(
                     subset_request,
                     rejected.script_policy_violations,
@@ -627,7 +628,7 @@ class ContextCurationService:
         input_token_budget: int = CURATION_INPUT_TOKEN_BUDGET,
         lease_seconds: int = CURATION_LEASE_SECONDS,
         lease_renewal_interval_seconds: float | None = None,
-        max_attempts: int = CURATION_MAX_ATTEMPTS,
+        max_attempts: int | None = None,
         retry_delays_seconds: tuple[int, ...] = CURATION_RETRY_DELAYS_SECONDS,
         apply_guard: _ApplyGuardFactory | None = None,
     ) -> None:
@@ -645,7 +646,11 @@ class ContextCurationService:
                 else self.lease_seconds / 3,
             ),
         )
-        self.max_attempts = max(1, max_attempts)
+        self.max_attempts = (
+            None
+            if max_attempts is None
+            else max(1, max_attempts)
+        )
         self.retry_delays_seconds = retry_delays_seconds or (60,)
         self.apply_guard = apply_guard
 

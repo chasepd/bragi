@@ -20,7 +20,7 @@ from bragi.providers.contracts import (
     ProviderClient,
 )
 from bragi.redaction import redact_text
-from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
+from bragi.retry_policy import configured_max_attempts
 from bragi.services.action_choice_flags import (
     content_with_action_choices_enabled,
     normalize_legacy_action_choice_scenario,
@@ -1361,7 +1361,8 @@ class ScenarioService:
             section_id=section_id,
             text=section_value,
         )
-        for _attempt in range(1, MODEL_OUTPUT_MAX_ATTEMPTS):
+        max_attempt_count = configured_max_attempts(self.repositories)
+        for _attempt in range(1, max_attempt_count):
             if not repeated_names:
                 break
             retry_request = replace(
