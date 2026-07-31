@@ -21,7 +21,7 @@ from bragi.providers.contracts import (
     ToolDefinition,
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
-from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.services.character_locks import (
     CHARACTER_AGENCY_FIELDS,
     normalize_character_locked_fields,
@@ -252,7 +252,8 @@ class StructuredProviderCharacterProfileCompleter:
             self.repositories,
             save_id=request.save_id,
         )
-        for _attempt in range(MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS + 1):
+        max_attempt_count = configured_max_attempts(self.repositories)
+        for _attempt in range(max_attempt_count):
             current_request = replace(structured_request, messages=tuple(messages))
             if self.repositories is not None and self.providers is not None:
                 response = await structured_output_with_fallback(
@@ -324,7 +325,8 @@ class StructuredProviderCharacterProfileCompleter:
             self.repositories,
             save_id=request.save_id,
         )
-        for _attempt in range(MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS + 1):
+        max_attempt_count = configured_max_attempts(self.repositories)
+        for _attempt in range(max_attempt_count):
             current_request = replace(structured_request, messages=tuple(messages))
             attempt_error: ProviderError
             try:
@@ -416,7 +418,8 @@ class StructuredProviderCharacterProfileCompleter:
         messages = list(request.messages)
         last_error: ProviderError | None = None
         validation_failure_count = 0
-        for attempt_index in range(MAX_CHARACTER_FIELD_ENHANCEMENT_ATTEMPTS):
+        max_attempt_count = configured_max_attempts(self.repositories)
+        for attempt_index in range(max_attempt_count):
             current_request = replace(request, messages=tuple(messages))
             if self.repositories is not None and self.providers is not None:
                 response = await structured_output_with_fallback(
@@ -459,7 +462,7 @@ class StructuredProviderCharacterProfileCompleter:
                     model=response.model_id,
                     field_name=field_name,
                     attempt=attempt_index + 1,
-                    max_attempts=MAX_CHARACTER_FIELD_ENHANCEMENT_ATTEMPTS,
+                    max_attempts=max_attempt_count,
                     validation_failure_count=validation_failure_count,
                 )
                 return starter
@@ -472,7 +475,7 @@ class StructuredProviderCharacterProfileCompleter:
                     model=response.model_id,
                     field_name=field_name,
                     attempt=attempt_index + 1,
-                    max_attempts=MAX_CHARACTER_FIELD_ENHANCEMENT_ATTEMPTS,
+                    max_attempts=max_attempt_count,
                     validation_failure_count=validation_failure_count,
                     error_code=_field_enhancement_validation_error_code(exc.message),
                 )
@@ -668,7 +671,8 @@ class ToolCallingProviderCharacterProfileCompleter:
         )
         completed_by_key: dict[str, ScenarioCharacterStarter] = {}
         last_errors: list[str] = []
-        for _turn in range(MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS + 1):
+        max_attempt_count = configured_max_attempts(self.repositories)
+        for _turn in range(max_attempt_count):
             turn_request = budget_tool_call_request(
                 self.repositories,
                 replace(request, messages=tuple(messages)),
@@ -720,7 +724,7 @@ class ToolCallingProviderCharacterProfileCompleter:
         tool_schema = request.tools[0].parameters
         last_errors: list[str] = []
         validation_failure_count = 0
-        max_turns = MAX_CHARACTER_PROFILE_TOOL_FEEDBACK_TURNS + 1
+        max_turns = configured_max_attempts(self.repositories)
         for turn_index in range(max_turns):
             turn_request = budget_tool_call_request(
                 self.repositories,

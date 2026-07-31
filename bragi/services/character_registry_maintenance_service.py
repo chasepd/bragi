@@ -28,7 +28,7 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.structured_schema import normalize_strict_json_schema
 from bragi.redaction import redact_text
-from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.services.character_locks import normalize_character_locked_fields
 from bragi.services.character_registry_service import (
     CharacterRegistryEdits,
@@ -581,7 +581,8 @@ async def _select_character_maintenance_with_tool_feedback(
     accepted_keys: set[tuple[str, str, str | None]] = set()
     last_errors: list[str] = []
 
-    for _turn in range(MAX_CHARACTER_MAINTENANCE_TOOL_FEEDBACK_TURNS + 1):
+    max_attempt_count = configured_max_attempts(repositories)
+    for _turn in range(max_attempt_count):
         turn_request = budget_tool_call_request(
             repositories,
             replace(request, messages=tuple(messages)),

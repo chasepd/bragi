@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from bragi.interaction_mode import InteractionMode
+from bragi.retry_policy import DEFAULT_RETRY_COUNT, DEFERRED_WORK_MAX_ATTEMPTS
 
 
 @dataclass(frozen=True)
@@ -641,6 +642,7 @@ class ContextUpdateSuggestionRecord:
     review_attempt_count: int = 0
     next_review_at: str | None = None
     last_review_error: str | None = None
+    max_retry_count: int = DEFAULT_RETRY_COUNT
 
 
 @dataclass(frozen=True)
@@ -715,6 +717,7 @@ class ContextObservationCurationStateRecord:
     completed_at: str | None
     created_at: str
     updated_at: str
+    max_attempts: int = DEFERRED_WORK_MAX_ATTEMPTS
 
 
 @dataclass(frozen=True)

@@ -8,7 +8,7 @@ import binascii
 import ipaddress
 import json
 import mimetypes
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -66,6 +66,7 @@ from bragi.providers.tool_calls import (
     tool_message_payload,
 )
 from bragi.redaction import redact_text
+from bragi.retry_policy import PROVIDER_MAX_ATTEMPTS
 from bragi.services.secrets import SecretStorageError, SecretStore
 
 VENICE_PROVIDER_NAME = "venice"
@@ -116,6 +117,7 @@ class VeniceClient:
         image_timeout: float = VENICE_IMAGE_TIMEOUT_SECONDS,
         video_poll_interval: float = VENICE_VIDEO_POLL_INTERVAL_SECONDS,
         video_timeout: float = VENICE_VIDEO_TIMEOUT_SECONDS,
+        retry_max_attempts: Callable[[], int] | None = None,
     ) -> None:
         self.secret_store = secret_store
         self.base_url = base_url.rstrip("/")
@@ -126,6 +128,12 @@ class VeniceClient:
         self.image_timeout = image_timeout
         self.video_poll_interval = max(0.0, video_poll_interval)
         self.video_timeout = max(0.0, video_timeout)
+        self.retry_max_attempts = retry_max_attempts
+
+    def _configured_max_attempts(self) -> int:
+        if self.retry_max_attempts is None:
+            return PROVIDER_MAX_ATTEMPTS
+        return max(1, int(self.retry_max_attempts()))
 
     async def validate_config(self) -> ProviderConfigStatus:
         try:
@@ -494,6 +502,7 @@ class VeniceClient:
             lambda: self._request_structured_output(payload),
             provider=self.provider_name,
             task="structured_output",
+            max_attempts=self._configured_max_attempts(),
             retry_progress_callback=request.retry_progress_callback,
         )
         raw_metadata = dict(response)
@@ -596,6 +605,7 @@ class VeniceClient:
             ),
             provider=self.provider_name,
             task="model_listing",
+            max_attempts=self._configured_max_attempts(),
         )
 
     async def _post_json(
@@ -617,6 +627,7 @@ class VeniceClient:
             ),
             provider=self.provider_name,
             task=task,
+            max_attempts=self._configured_max_attempts(),
             retry_progress_callback=retry_progress_callback,
         )
 
@@ -709,6 +720,7 @@ class VeniceClient:
             ),
             provider=self.provider_name,
             task=task,
+            max_attempts=self._configured_max_attempts(),
             retry_progress_callback=retry_progress_callback,
         )
 
@@ -730,6 +742,7 @@ class VeniceClient:
             ),
             provider=self.provider_name,
             task=task,
+            max_attempts=self._configured_max_attempts(),
         )
         return _bytes_result_response_and_retry(result)
 
@@ -754,6 +767,7 @@ class VeniceClient:
             ),
             provider=self.provider_name,
             task=task,
+            max_attempts=self._configured_max_attempts(),
         )
         return _bytes_result_response_and_retry(result)
 

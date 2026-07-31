@@ -1,3 +1,4 @@
+from bragi.retry_policy import RETRY_COUNT_SETTING
 from bragi.services.character_text_service import (
     CHARACTER_TEXT_PROACTIVE_RANDOM_CHANCE_SETTING,
     CHARACTER_TEXT_PROACTIVE_RANDOM_COOLDOWN_SETTING,
@@ -83,3 +84,13 @@ def test_phrase_denylist_settings_have_global_and_save_scopes() -> None:
         GENERATED_PHRASE_DENYLIST_SETTING,
     )
     assert role_can_write_scoped_setting("user", SAVE_GENERATED_PHRASE_DENYLIST_SETTING)
+
+
+def test_retry_count_is_global_and_admin_only() -> None:
+    policy = scoped_setting_policy(RETRY_COUNT_SETTING)
+
+    assert policy.scope == "global"
+    assert policy.admin_only is True
+    assert role_can_write_scoped_setting("admin", RETRY_COUNT_SETTING)
+    assert not role_can_write_scoped_setting("user", RETRY_COUNT_SETTING)
+    assert not role_can_write_scoped_setting("child", RETRY_COUNT_SETTING)

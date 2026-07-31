@@ -79,7 +79,10 @@ from bragi.persistence.models import (
     WorldStateRecord,
 )
 from bragi.redaction import redact_text
-from bragi.retry_policy import DEFERRED_WORK_MAX_ATTEMPTS
+from bragi.retry_policy import (
+    configured_max_attempts,
+    configured_retry_count,
+)
 from bragi.safety import normalize_message_safety
 from bragi.text_search import (
     MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS,
@@ -245,7 +248,8 @@ _SCHEDULED_TASK_COLUMNS = (
     "result_json, error, created_at, updated_at"
 )
 _CONTEXT_OBSERVATION_CURATION_STATE_COLUMNS = (
-    "observation_id, save_id, attempt_count, next_eligible_at, lease_token, "
+    "observation_id, save_id, attempt_count, max_attempts, next_eligible_at, "
+    "lease_token, "
     "lease_until, last_error, terminal_outcome, completed_at, created_at, updated_at"
 )
 _JOB_COLUMNS = (
@@ -4815,10 +4819,11 @@ class PersistenceRepositories:
         self.connection.execute(
             """
             INSERT INTO context_observation_curation_state(
-                observation_id, save_id, terminal_outcome, completed_at
+                observation_id, save_id, max_attempts,
+                terminal_outcome, completed_at
             )
             VALUES (
-                ?, ?,
+                ?, ?, ?,
                 CASE WHEN ? = 'pending' THEN NULL ELSE ? END,
                 CASE WHEN ? = 'pending' THEN NULL ELSE CURRENT_TIMESTAMP END
             )
@@ -4826,6 +4831,7 @@ class PersistenceRepositories:
             (
                 record.id,
                 record.save_id,
+                configured_max_attempts(self),
                 record.status,
                 record.status,
                 record.status,
@@ -5083,7 +5089,7 @@ class PersistenceRepositories:
         *,
         lease_token: str,
         lease_seconds: int,
-        max_attempts: int = DEFERRED_WORK_MAX_ATTEMPTS,
+        max_attempts: int | None = None,
     ) -> list[ContextObservationRecord]:
         ids = tuple(dict.fromkeys(item for item in observation_ids if item))
         if not ids:
@@ -5092,7 +5098,7 @@ class PersistenceRepositories:
             raise ValueError("lease_token is required")
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be at least 1")
-        if max_attempts < 1:
+        if max_attempts is not None and max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         self.begin_immediate_transaction()
         try:
@@ -5104,7 +5110,7 @@ class PersistenceRepositories:
                   ON observation.id = curation.observation_id
                 WHERE curation.observation_id IN ({_placeholders(len(ids))})
                   AND curation.terminal_outcome IS NULL
-                  AND curation.attempt_count >= ?
+                  AND curation.attempt_count >= COALESCE(?, curation.max_attempts)
                   AND (
                       curation.next_eligible_at IS NULL
                       OR curation.next_eligible_at <= CURRENT_TIMESTAMP
@@ -5156,7 +5162,7 @@ class PersistenceRepositories:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE observation_id IN ({_placeholders(len(ids))})
                   AND terminal_outcome IS NULL
-                  AND attempt_count < ?
+                  AND attempt_count < COALESCE(?, max_attempts)
                   AND (
                       next_eligible_at IS NULL
                       OR next_eligible_at <= CURRENT_TIMESTAMP
@@ -5169,7 +5175,12 @@ class PersistenceRepositories:
                         AND observation.archived_at IS NULL
                   )
                 """,
-                (lease_token, f"+{lease_seconds} seconds", *ids, max_attempts),
+                (
+                    lease_token,
+                    f"+{lease_seconds} seconds",
+                    *ids,
+                    max_attempts,
+                ),
             )
             rows = self._fetch_all(
                 f"""
@@ -5336,15 +5347,17 @@ class PersistenceRepositories:
         lease_token: str,
         error: str,
         retry_after_seconds: int,
-        max_attempts: int,
+        max_attempts: int | None = None,
     ) -> ContextObservationCurationStateRecord | None:
         if retry_after_seconds < 1:
             raise ValueError("retry_after_seconds must be at least 1")
+        if max_attempts is not None and max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
         self.begin_immediate_transaction()
         try:
             row = self._fetch_one(
                 """
-                SELECT attempt_count
+                SELECT attempt_count, max_attempts
                 FROM context_observation_curation_state
                 WHERE observation_id = ?
                   AND lease_token = ?
@@ -5356,7 +5369,15 @@ class PersistenceRepositories:
             if row is None:
                 self.rollback_transaction()
                 return None
-            exhausted = int(row["attempt_count"]) >= max(1, max_attempts)
+            effective_max_attempts = (
+                max_attempts
+                if max_attempts is not None
+                else int(row["max_attempts"])
+            )
+            exhausted = int(row["attempt_count"]) >= max(
+                1,
+                effective_max_attempts,
+            )
             safe_error = (redact_text(error) or "")[:240]
             cursor = self.connection.execute(
                 """
@@ -5407,6 +5428,7 @@ class PersistenceRepositories:
         observation_id: str,
         *,
         attempt_count: int = 0,
+        max_attempts: int | None = None,
         next_eligible_at: str | None = None,
         last_error: str | None = None,
         terminal_outcome: str | None = None,
@@ -5416,6 +5438,7 @@ class PersistenceRepositories:
             """
             UPDATE context_observation_curation_state
             SET attempt_count = ?,
+                max_attempts = COALESCE(?, max_attempts),
                 next_eligible_at = ?,
                 lease_token = NULL,
                 lease_until = NULL,
@@ -5427,6 +5450,7 @@ class PersistenceRepositories:
             """,
             (
                 max(0, attempt_count),
+                max(1, max_attempts) if max_attempts is not None else None,
                 next_eligible_at,
                 (redact_text(last_error) or "")[:240] if last_error else None,
                 terminal_outcome,
@@ -9902,15 +9926,16 @@ class PersistenceRepositories:
             reason=reason,
             confidence=confidence,
             source_message_ids=list(source_message_ids or []),
+            max_retry_count=configured_retry_count(self),
         )
         self.connection.execute(
             """
             INSERT INTO context_update_suggestions(
                 id, save_id, update_type, entity_type, entity_id, field_path,
                 proposed_value_json, status, reason, confidence,
-                source_message_ids_json
+                source_message_ids_json, max_retry_count
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -9924,6 +9949,7 @@ class PersistenceRepositories:
                 record.reason,
                 record.confidence,
                 _dump_json(record.source_message_ids),
+                record.max_retry_count,
             ),
         )
         self.commit()
@@ -9932,7 +9958,8 @@ class PersistenceRepositories:
             SELECT id, save_id, update_type, entity_type, entity_id, field_path,
                    proposed_value_json, status, reason, confidence,
                    source_message_ids_json, created_at, resolved_at,
-                   review_attempt_count, next_review_at, last_review_error
+                   review_attempt_count, next_review_at, last_review_error,
+                   max_retry_count
             FROM context_update_suggestions
             WHERE id = ?
             """,
@@ -9966,7 +9993,8 @@ class PersistenceRepositories:
             SELECT id, save_id, update_type, entity_type, entity_id, field_path,
                    proposed_value_json, status, reason, confidence,
                    source_message_ids_json, created_at, resolved_at,
-                   review_attempt_count, next_review_at, last_review_error
+                   review_attempt_count, next_review_at, last_review_error,
+                   max_retry_count
             FROM context_update_suggestions
             WHERE save_id = ? {status_filter}
             {order_sql}
@@ -10172,7 +10200,8 @@ class PersistenceRepositories:
             SELECT id, save_id, update_type, entity_type, entity_id, field_path,
                    proposed_value_json, status, reason, confidence,
                    source_message_ids_json, created_at, resolved_at,
-                   review_attempt_count, next_review_at, last_review_error
+                   review_attempt_count, next_review_at, last_review_error,
+                   max_retry_count
             FROM context_update_suggestions
             WHERE id = ?
             """,
@@ -10210,7 +10239,8 @@ class PersistenceRepositories:
             SELECT id, save_id, update_type, entity_type, entity_id, field_path,
                    proposed_value_json, status, reason, confidence,
                    source_message_ids_json, created_at, resolved_at,
-                   review_attempt_count, next_review_at, last_review_error
+                   review_attempt_count, next_review_at, last_review_error,
+                   max_retry_count
             FROM context_update_suggestions
             WHERE id = ?
             """,
@@ -10323,7 +10353,8 @@ class PersistenceRepositories:
             SELECT id, save_id, update_type, entity_type, entity_id, field_path,
                    proposed_value_json, status, reason, confidence,
                    source_message_ids_json, created_at, resolved_at,
-                   review_attempt_count, next_review_at, last_review_error
+                   review_attempt_count, next_review_at, last_review_error,
+                   max_retry_count
             FROM context_update_suggestions
             WHERE save_id = ?
               AND status = 'pending'
@@ -10361,7 +10392,8 @@ class PersistenceRepositories:
             SELECT id, save_id, update_type, entity_type, entity_id, field_path,
                    proposed_value_json, status, reason, confidence,
                    source_message_ids_json, created_at, resolved_at,
-                   review_attempt_count, next_review_at, last_review_error
+                   review_attempt_count, next_review_at, last_review_error,
+                   max_retry_count
             FROM context_update_suggestions
             WHERE id IN ({placeholders})
             ORDER BY created_at, rowid
@@ -15499,6 +15531,7 @@ def _context_update_suggestion_from_row(
         review_attempt_count=row["review_attempt_count"],
         next_review_at=row["next_review_at"],
         last_review_error=row["last_review_error"],
+        max_retry_count=row["max_retry_count"],
     )
 
 
@@ -15554,6 +15587,7 @@ def _context_observation_curation_state_from_row(
         completed_at=row["completed_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        max_attempts=row["max_attempts"],
     )
 
 

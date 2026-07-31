@@ -2027,6 +2027,53 @@ def test_openrouter_chat_retries_transient_failure_and_records_metadata(
     assert isinstance(attempts[1]["duration_ms"], int)
 
 
+def test_openrouter_chat_uses_configured_retry_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("bragi.providers.retry.asyncio.sleep", no_sleep)
+    transport = RecordingTransport(
+        [
+            JsonHttpResponse(
+                status_code=429,
+                payload={"error": {"message": "slow down"}},
+            ),
+            JsonHttpResponse(
+                status_code=200,
+                payload={
+                    "choices": [
+                        {"message": {"content": "The archive door opens."}},
+                    ],
+                },
+            ),
+        ]
+    )
+    secrets = InMemorySecretStore()
+    secrets.set_api_key("openrouter", "or-secret")
+    client = OpenRouterClient(
+        secret_store=secrets,
+        transport=transport,
+        retry_max_attempts=lambda: 2,
+    )
+
+    response = asyncio.run(
+        client.chat(
+            ChatRequest(
+                provider="openrouter",
+                model_id="openai/gpt-4o-mini",
+                messages=(ChatMessage(role="player", body="I test the latch."),),
+            )
+        )
+    )
+
+    assert response.body == "The archive door opens."
+    retry_metadata = response.raw_metadata["_bragi_retry"]
+    assert retry_metadata["max_attempts"] == 2
+    assert retry_metadata["attempt_count"] == 2
+
+
 def test_openrouter_chat_does_not_retry_authentication_failure() -> None:
     transport = RecordingTransport(
         [

@@ -12109,6 +12109,7 @@ def test_run_post_turn_jobs_queues_retry_when_continuity_update_fails(
         content={},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting("retry_count", 2)
     player_message = repositories.append_message(
         save_id=save.id,
         role="player",
@@ -12159,6 +12160,7 @@ def test_run_post_turn_jobs_queues_retry_when_continuity_update_fails(
         if job.type == "context_update_retry"
     ]
     assert [job.id for job in retry_jobs] == [retry_job_id]
+    assert retry_jobs[0].payload["max_retry_attempts"] == 2
     assert retry_jobs[0].payload["source_message_ids"] == [
         player_message.id,
         narrator_message.id,
@@ -12346,6 +12348,7 @@ def test_run_state_extraction_retries_applies_once_and_queues_context_retry(
         content={"starting_scene": "The beacon gutters in the tower."},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting("retry_count", 2)
     player_message = repositories.append_message(
         save_id=save.id,
         role="player",
@@ -12378,7 +12381,7 @@ def test_run_state_extraction_retries_applies_once_and_queues_context_retry(
             "source_message_ids": [player_message.id, narrator_message.id],
             "reason": "post_turn_state_failed",
             "retry_attempt": 1,
-            "max_retry_attempts": 3,
+            "max_retry_attempts": 2,
             "provider": "fake",
             "model": "fake-state-memory",
             "include_memories": True,
@@ -12434,6 +12437,7 @@ def test_run_state_extraction_retries_applies_once_and_queues_context_retry(
     assert len(context_retries) == 1
     assert context_retries[0].payload["reason"] == "state_extraction_retry_succeeded"
     assert context_retries[0].payload["run_full_post_turn_context"] is True
+    assert context_retries[0].payload["max_retry_attempts"] == 2
     assert context_retries[0].payload["source_message_ids"] == [
         player_message.id,
         narrator_message.id,
@@ -12459,7 +12463,7 @@ def test_run_state_extraction_retries_applies_once_and_queues_context_retry(
             "source_message_ids": [player_message.id, narrator_message.id],
             "reason": "post_turn_state_failed",
             "retry_attempt": 1,
-            "max_retry_attempts": 3,
+            "max_retry_attempts": 2,
             "provider": "fake",
             "model": "fake-state-memory",
             "include_memories": True,
@@ -13716,7 +13720,7 @@ def test_run_context_update_retries_cancels_started_child_jobs(
     assert json.loads(jobs[0]["result_json"]) == {
         "source_message_ids": [player_message.id, narrator_message.id],
         "retry_attempt": 2,
-        "max_retry_attempts": 7,
+        "max_retry_attempts": 4,
     }
     assert jobs[1]["result_json"] is None
     assert [

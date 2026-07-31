@@ -13,6 +13,13 @@ from bragi.persistence.models import (
 )
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import ProviderGenerationParameter
+from bragi.retry_policy import (
+    MAX_RETRY_COUNT,
+    MIN_RETRY_COUNT,
+    RETRY_COUNT_SETTING,
+    RETRY_COUNT_STEP,
+    sanitize_retry_count,
+)
 from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_DEFAULT,
     AGENTIC_CONTEXT_PIPELINE_SETTING,
@@ -539,6 +546,7 @@ class SettingsModel:
     roleplay_model_groups: tuple[RoleplayModelGroup, ...]
     scenario_section_model_selectors: tuple[TaskModelSelector, ...]
     model_routing_profiles: ModelRoutingProfilesModel | None
+    retry_count: NumberControl | None
     automatic_summarization: ToggleControl | None
     summarization_context_pressure_threshold: NumberControl | None
     summarization_visibility: ToggleControl | None
@@ -733,6 +741,22 @@ def build_settings_model(
         if is_admin
         else (),
         model_routing_profiles=model_routing_profiles_model(repositories)
+        if is_admin
+        else None,
+        retry_count=NumberControl(
+            setting_key=RETRY_COUNT_SETTING,
+            value=sanitize_retry_count(
+                _setting_value(
+                    repositories,
+                    RETRY_COUNT_SETTING,
+                    active_save_id=None,
+                    current_user_id=None,
+                )
+            ),
+            minimum=MIN_RETRY_COUNT,
+            maximum=MAX_RETRY_COUNT,
+            step=RETRY_COUNT_STEP,
+        )
         if is_admin
         else None,
         automatic_summarization=ToggleControl(

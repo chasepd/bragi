@@ -428,6 +428,7 @@ export type SettingsModel = {
   roleplay_model_groups: RoleplayModelGroup[];
   scenario_section_model_selectors?: TaskModelSelector[];
   model_routing_profiles?: ModelRoutingProfilesSettings;
+  retry_count?: NumberControl;
   automatic_summarization?: ToggleControl;
   summarization_context_pressure_threshold?: NumberControl;
   summarization_visibility?: ToggleControl;

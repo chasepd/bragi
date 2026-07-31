@@ -951,6 +951,14 @@ function ModelSettings({ settings, updateLocal, disabled }: { settings?: Setting
       <ModelRoutingProfileControls settings={settings} />
       <SimpleModelSelectorSettings settings={settings} disabled={disabled} />
       <RoleplaySharedModelSettings settings={settings} updateLocal={updateLocal} disabled={disabled} />
+      {settings.retry_count ? (
+        <AdvancedSettingsSection
+          title="Retry policy"
+          summary="Retries after first attempt."
+        >
+          <NumberSetting control={settings.retry_count} disabled={disabled} updateLocal={updateLocal} />
+        </AdvancedSettingsSection>
+      ) : null}
       {groups.length || fallbacks.length || otherSelectors.length ? (
         <AdvancedSettingsSection
           title="Advanced model routing"

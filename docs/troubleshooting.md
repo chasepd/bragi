@@ -8,10 +8,12 @@ performance.
 ## Slow Load Or Slow Turns
 
 - Bragi favors answer quality and completion over short latency. Provider calls,
-  model-output repairs, and deferred AI work normally receive up to seven total
-  attempts, with progressively longer delays for provider and background-work
-  failures. A degraded provider can therefore make a turn or maintenance task
-  take substantially longer than a single request.
+  model-output repairs, and deferred AI work normally receive one initial
+  attempt plus six retries. Admins can tune the shared retry count in Settings
+  > Models > Retry policy; higher values increase provider usage and latency.
+  Provider and background-work failures also use progressively longer delays, so
+  a degraded provider can make a turn or maintenance task take substantially
+  longer than a single request.
 - Check Active Save Health for large recent transcript windows, stale pending
   suggestions, empty context search results, or failed continuity jobs.
 - Check Performance for slow job, step, or model averages.

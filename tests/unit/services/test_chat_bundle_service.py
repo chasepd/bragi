@@ -550,6 +550,54 @@ def test_export_save_writes_manifest_data_and_referenced_media(
         assert curation_state["lease_until"] is None
 
 
+def test_export_import_preserves_pending_retry_budgets(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.set_app_setting("retry_count", 2)
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="open_thread",
+        claim="The red lens warning is still unresolved.",
+        scope="save",
+        status="pending",
+    )
+    suggestion = repositories.add_context_update_suggestion(
+        save_id=save.id,
+        update_type="field_update",
+        entity_type="save",
+        field_path="custom_instructions",
+        proposed_value="Keep the warning unresolved.",
+        status="pending",
+    )
+    bundle_path = tmp_path / "exports" / "retry-budget.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    repositories.set_app_setting("retry_count", 0)
+    imported = service.import_save(bundle_path)
+    imported_save_id = _imported_save_id(imported)
+    imported_observation = next(
+        item
+        for item in repositories.list_context_observations(imported_save_id)
+        if item.claim == observation.claim
+    )
+    imported_state = repositories.get_context_observation_curation_state(
+        imported_observation.id
+    )
+    assert imported_state is not None
+    assert imported_state.max_attempts == 3
+
+    imported_suggestion = next(
+        item
+        for item in repositories.list_context_update_suggestions(imported_save_id)
+        if item.field_path == suggestion.field_path
+    )
+    assert imported_suggestion.max_retry_count == 2
+
+
 def test_export_rejects_snapshot_that_cannot_be_imported(
     repositories: PersistenceRepositories,
     tmp_path: Path,

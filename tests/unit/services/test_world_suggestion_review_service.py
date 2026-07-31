@@ -280,6 +280,84 @@ def test_review_failure_rejects_after_seven_automated_attempts(
     ]
 
 
+def test_review_failure_uses_configured_retry_count(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.set_app_setting("retry_count", 2)
+    save_id, _message_id, _location_id, suggestion_id = _pending_location_suggestion(
+        repositories
+    )
+    provider = FakeSuggestionReviewer(failure=TimeoutError("provider timed out"))
+    service = WorldSuggestionReviewService(
+        repositories=repositories,
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-reviewer",
+    )
+
+    for _ in range(3):
+        asyncio.run(service.review_pending(save_id))
+
+    suggestion = repositories.list_context_update_suggestions(save_id)[0]
+    assert suggestion.id == suggestion_id
+    assert suggestion.status == "rejected"
+    assert suggestion.next_review_at is None
+
+
+def test_review_failure_reports_zero_retry_budget_as_rejection(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.set_app_setting("retry_count", 0)
+    save_id, _message_id, _location_id, suggestion_id = _pending_location_suggestion(
+        repositories
+    )
+    provider = FakeSuggestionReviewer(failure=TimeoutError("provider timed out"))
+
+    result = asyncio.run(
+        WorldSuggestionReviewService(
+            repositories=repositories,
+            provider=provider,
+            provider_name="fake",
+            model_id="fake-reviewer",
+        ).review_pending(save_id)
+    )
+
+    suggestion = repositories.list_context_update_suggestions(save_id)[0]
+    assert suggestion.id == suggestion_id
+    assert suggestion.status == "rejected"
+    assert result.rejected_count == 1
+    assert result.deferred_count == 0
+
+
+def test_review_failure_keeps_suggestion_retry_budget_after_setting_change(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.set_app_setting("retry_count", 2)
+    save_id, _message_id, _location_id, suggestion_id = _pending_location_suggestion(
+        repositories
+    )
+    provider = FakeSuggestionReviewer(failure=TimeoutError("provider timed out"))
+    service = WorldSuggestionReviewService(
+        repositories=repositories,
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-reviewer",
+    )
+
+    asyncio.run(service.review_pending(save_id))
+    repositories.set_app_setting("retry_count", 0)
+    asyncio.run(service.review_pending(save_id))
+
+    suggestion = repositories.list_context_update_suggestions(save_id)[0]
+    assert suggestion.id == suggestion_id
+    assert suggestion.max_retry_count == 2
+    assert suggestion.status == "pending"
+
+    asyncio.run(service.review_pending(save_id))
+    suggestion = repositories.list_context_update_suggestions(save_id)[0]
+    assert suggestion.status == "rejected"
+
+
 def test_due_only_review_excludes_suggestions_in_backoff(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -209,6 +209,7 @@ CREATE TABLE IF NOT EXISTS context_observation_curation_state (
         REFERENCES context_observations(id) ON DELETE CASCADE,
     save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 7,
     next_eligible_at TEXT,
     lease_token TEXT,
     lease_until TEXT,
@@ -379,6 +380,7 @@ CREATE TABLE IF NOT EXISTS context_update_suggestions (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     resolved_at TEXT,
     review_attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_retry_count INTEGER NOT NULL DEFAULT 6,
     next_review_at TEXT,
     last_review_error TEXT
 );
@@ -1076,6 +1078,7 @@ def _ensure_context_observation_curation_schema(
                 REFERENCES context_observations(id) ON DELETE CASCADE,
             save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
             attempt_count INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 7,
             next_eligible_at TEXT,
             lease_token TEXT,
             lease_until TEXT,
@@ -1091,6 +1094,12 @@ def _ensure_context_observation_curation_schema(
             save_id, terminal_outcome, next_eligible_at, lease_until
         );
         """,
+    )
+    _add_column_if_missing(
+        connection,
+        "context_observation_curation_state",
+        "max_attempts",
+        "INTEGER NOT NULL DEFAULT 7",
     )
     connection.execute(
         """
@@ -2705,6 +2714,12 @@ def _ensure_context_update_suggestion_review_schema(
         "context_update_suggestions",
         "last_review_error",
         "TEXT",
+    )
+    _add_column_if_missing(
+        connection,
+        "context_update_suggestions",
+        "max_retry_count",
+        "INTEGER NOT NULL DEFAULT 6",
     )
     _create_index_if_columns_exist(
         connection,

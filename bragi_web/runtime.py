@@ -467,7 +467,7 @@ def create_state() -> WebAppState:
         # Web servers are often headless. Prefer the private state-dir fallback
         # unless keyring use is explicitly requested.
         secret_store._use_keyring = False  # noqa: SLF001
-    providers = _provider_clients(secret_store)
+    providers = _provider_clients(secret_store, repositories=repositories)
     with repositories.scope():
         JobLifecycleService(
             repositories=cast(Any, repositories),
@@ -562,14 +562,31 @@ def _save_event_visible_to_stream(
     return include_unowned_global and event.owner_user_id is None
 
 
-def _provider_clients(secret_store: Any) -> dict[str, Any]:
+def _provider_clients(
+    secret_store: Any,
+    *,
+    repositories: Any | None = None,
+) -> dict[str, Any]:
+    from bragi.retry_policy import configured_max_attempts
+
     bindings = bragi_runtime_bindings()
+    retry_max_attempts = (
+        (lambda: configured_max_attempts(repositories))
+        if repositories is not None
+        else None
+    )
     if os.environ.get("BRAGI_WEB_FAKE_PROVIDERS") == "1":
         fake = bindings.FakeProviderClient()
         return {"fake": fake, "openrouter": fake, "venice": fake}
     return {
-        "openrouter": bindings.OpenRouterClient(secret_store=secret_store),
-        "venice": bindings.VeniceClient(secret_store=secret_store),
+        "openrouter": bindings.OpenRouterClient(
+            secret_store=secret_store,
+            retry_max_attempts=retry_max_attempts,
+        ),
+        "venice": bindings.VeniceClient(
+            secret_store=secret_store,
+            retry_max_attempts=retry_max_attempts,
+        ),
     }
 
 

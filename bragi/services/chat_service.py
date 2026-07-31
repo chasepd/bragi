@@ -50,7 +50,10 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.http_client import SAFE_PROVIDER_RESPONSE_HEADERS
 from bragi.redaction import redact_text
-from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS
+from bragi.retry_policy import (
+    configured_max_attempts,
+    configured_retry_count,
+)
 from bragi.services.action_choice_flags import scenario_action_choices_enabled
 from bragi.services.action_choice_service import (
     ActionChoiceService,
@@ -194,7 +197,6 @@ from bragi.services.openrouter_routing_settings import (
     request_with_openrouter_routing,
 )
 from bragi.services.phrase_denylist import (
-    GENERATED_PHRASE_GUARD_MAX_ATTEMPTS,
     PhraseDenylistViolation,
     denied_phrase_violations,
     effective_generated_phrase_denylist,
@@ -3127,6 +3129,7 @@ class ChatService:
         current_completion = completion
         current_response = response
         current_body = narrator_body
+        max_attempt_count = configured_max_attempts(self.repositories)
         violations = denied_phrase_violations(
             current_body,
             phrases=phrase_denylist,
@@ -3135,13 +3138,13 @@ class ChatService:
         diagnostics: dict[str, object] = {
             "generated_phrase_denylist_guard": {
                 "phrase_count": len(phrase_denylist),
-                "max_attempts": GENERATED_PHRASE_GUARD_MAX_ATTEMPTS,
+                "max_attempts": max_attempt_count,
                 "attempt_count": 1,
                 "auto_retry_used": False,
                 "violation": first_phrase_violation_diagnostic(violations),
             }
         }
-        for attempt in range(2, GENERATED_PHRASE_GUARD_MAX_ATTEMPTS + 1):
+        for attempt in range(2, max_attempt_count + 1):
             if not violations:
                 return _NarratorPhraseGuardTurnResult(
                     completion=current_completion,
@@ -3196,7 +3199,7 @@ class ChatService:
             diagnostics = {
                 "generated_phrase_denylist_guard": {
                     "phrase_count": len(phrase_denylist),
-                    "max_attempts": GENERATED_PHRASE_GUARD_MAX_ATTEMPTS,
+                    "max_attempts": max_attempt_count,
                     "attempt_count": attempt,
                     "auto_retry_used": True,
                     "retry_passed": not violations,
@@ -3209,7 +3212,7 @@ class ChatService:
                 save_id=save_id,
                 provider=current_response.provider,
                 model=current_response.model_id,
-                attempt=GENERATED_PHRASE_GUARD_MAX_ATTEMPTS,
+                attempt=max_attempt_count,
                 **first_phrase_violation_diagnostic(violations),
             )
         return _NarratorPhraseGuardTurnResult(
@@ -3232,6 +3235,7 @@ class ChatService:
         retry_progress_callback: ProviderRetryProgressCallback | None,
     ) -> _NarratorScriptGuardTurnResult:
         mode = script_guard_mode(self.repositories, save_id=save_id)
+        max_attempt_count = configured_max_attempts(self.repositories)
         violations = _narrator_script_policy_violations(
             repositories=self.repositories,
             save_id=save_id,
@@ -3243,7 +3247,7 @@ class ChatService:
             "generated_text_script_guard": {
                 "mode": mode,
                 "attempt_count": 1,
-                "max_attempts": MODEL_OUTPUT_MAX_ATTEMPTS,
+                "max_attempts": max_attempt_count,
                 "auto_retry_used": False,
                 "violation": first_violation_diagnostic(violations),
             }
@@ -3265,7 +3269,7 @@ class ChatService:
         current_completion = completion
         current_response = response
         current_body = narrator_body
-        for attempt in range(2, MODEL_OUTPUT_MAX_ATTEMPTS + 1):
+        for attempt in range(2, max_attempt_count + 1):
             retry_base = replace(
                 fallback_request_base,
                 regeneration_feedback=_combine_regeneration_feedback(
@@ -3306,7 +3310,7 @@ class ChatService:
                 "generated_text_script_guard": {
                     "mode": mode,
                     "attempt_count": attempt,
-                    "max_attempts": MODEL_OUTPUT_MAX_ATTEMPTS,
+                    "max_attempts": max_attempt_count,
                     "auto_retry_used": True,
                     "first": first_violation_diagnostic(first_violations),
                     "retry": first_violation_diagnostic(violations),
@@ -3408,10 +3412,11 @@ class ChatService:
         current_completion = completion
         current_response = response
         current_body = narrator_body
+        max_attempt_count = configured_max_attempts(self.repositories)
         current_audit = first_audit
         attempt_count = 1
         retry_empty = False
-        for attempt in range(2, MODEL_OUTPUT_MAX_ATTEMPTS + 1):
+        for attempt in range(2, max_attempt_count + 1):
             retry_base = replace(
                 fallback_request_base,
                 regeneration_feedback=_combine_regeneration_feedback(
@@ -3467,7 +3472,7 @@ class ChatService:
                     "first": first_audit.to_json(),
                     "second": current_audit.to_json(),
                     "attempt_count": attempt_count,
-                    "max_attempts": MODEL_OUTPUT_MAX_ATTEMPTS,
+                    "max_attempts": max_attempt_count,
                     "auto_retry_used": True,
                     "retry_empty": retry_empty,
                     "suspicious": suspicious,
@@ -4145,6 +4150,19 @@ class ChatService:
                         verified_coverage=verified_coverage,
                         turn_revision=boundary,
                     )
+                    if retry_job is None:
+                        step_results[name] = {
+                            "skipped_reason": "retry_budget_zero",
+                            "provider_pressure": current_pressure.to_result(),
+                        }
+                        publish(name, "skipped_retry_budget")
+                        record_step(
+                            name,
+                            "skipped_retry_budget",
+                            step_started,
+                            metadata=step_results[name],
+                        )
+                        return "skipped_retry_budget"
                     step_results[name] = {
                         "deferred": True,
                         "deferred_reason": "provider_pressure",
@@ -4551,6 +4569,7 @@ class ChatService:
                     save_id=retry_save_id,
                     source_message_ids=source_message_ids,
                     reason="state_extraction_retry_succeeded",
+                    retry_count=max_retry_attempts,
                     full_post_turn_context=True,
                     inference_mode=inference_mode,
                     verified_coverage=verified_coverage,
@@ -4559,8 +4578,13 @@ class ChatService:
                 already_applied_result: dict[str, object] = {
                     "source_message_ids": list(source_message_ids),
                     "already_applied": True,
-                    "context_retry_job_id": context_retry_job.id,
                 }
+                if context_retry_job is not None:
+                    already_applied_result["context_retry_job_id"] = (
+                        context_retry_job.id
+                    )
+                else:
+                    already_applied_result["retry_budget_exhausted"] = True
                 if explicit_turn_revision:
                     already_applied_result["turn_revision_status"] = (
                         "stale_rebase" if stale_rebase else "current_head"
@@ -4678,6 +4702,7 @@ class ChatService:
                 save_id=retry_save_id,
                 source_message_ids=source_message_ids,
                 reason="state_extraction_retry_succeeded",
+                retry_count=max_retry_attempts,
                 full_post_turn_context=True,
                 inference_mode=inference_mode,
                 verified_coverage=verified_coverage,
@@ -4687,8 +4712,11 @@ class ChatService:
                 "source_message_ids": list(source_message_ids),
                 "state_change_count": len(applied.state_changes),
                 "memory_count": len(applied.memories),
-                "context_retry_job_id": context_retry_job.id,
             }
+            if context_retry_job is not None:
+                success_result["context_retry_job_id"] = context_retry_job.id
+            else:
+                success_result["retry_budget_exhausted"] = True
             if explicit_turn_revision:
                 success_result["turn_revision_status"] = (
                     "stale_rebase" if stale_rebase else "current_head"
@@ -5924,12 +5952,18 @@ class ChatService:
         retry_progress_callback: ProviderRetryProgressCallback | None,
         narration_snapshot: NarrationContextSnapshot | None = None,
         attempt_count: int = 1,
+        max_attempt_count: int | None = None,
     ) -> _NarratorVerificationTurnResult:
         if narrator_spec is None or not agentic_context_pipeline_enabled(
             self.repositories,
             save_id=save_id,
         ):
             return _NarratorVerificationTurnResult(diagnostics={})
+        max_attempt_count = (
+            configured_max_attempts(self.repositories)
+            if max_attempt_count is None
+            else max_attempt_count
+        )
         verifier = self.narrator_verifier or self._narrator_verifier_for_save(save_id)
         if verifier is None:
             return _NarratorVerificationTurnResult(
@@ -5979,7 +6013,7 @@ class ChatService:
         diagnostics: dict[str, object] = {
             "narrator_verifier": _narrator_verifier_diagnostics(result),
             "narrator_verifier_attempt_count": attempt_count,
-            "narrator_verifier_max_attempts": MODEL_OUTPUT_MAX_ATTEMPTS,
+            "narrator_verifier_max_attempts": max_attempt_count,
         }
         mode = response_verification_mode(self.repositories, save_id=save_id)
         retry_for_verification = (
@@ -5994,7 +6028,7 @@ class ChatService:
         if (
             not retry_for_verification
             and not retry_for_npc
-            or attempt_count >= MODEL_OUTPUT_MAX_ATTEMPTS
+            or attempt_count >= max_attempt_count
         ):
             return _NarratorVerificationTurnResult(
                 diagnostics=diagnostics,
@@ -6104,6 +6138,7 @@ class ChatService:
             retry_progress_callback=retry_progress_callback,
             narration_snapshot=narration_snapshot,
             attempt_count=attempt_count + 1,
+            max_attempt_count=max_attempt_count,
         )
         latest_verifier = subsequent.diagnostics.get("narrator_verifier")
         merged_diagnostics = {
@@ -6129,7 +6164,7 @@ class ChatService:
                         "first": first_audit.to_json(),
                         "second": latest_audit_payload,
                         "attempt_count": attempt_count + 1,
-                        "max_attempts": MODEL_OUTPUT_MAX_ATTEMPTS,
+                        "max_attempts": max_attempt_count,
                         "auto_retry_used": True,
                         "suspicious": npc_audit_result.suspicious,
                     }
@@ -6456,7 +6491,7 @@ class ChatService:
             log_error_event(
                 "chat.state_extraction_skipped",
                 save_id=save_id,
-                retry_job_id=retry_job.id,
+                retry_job_id=retry_job.id if retry_job is not None else None,
                 provider=preference.provider,
                 model=preference.model_id,
                 error=(
@@ -6464,18 +6499,23 @@ class ChatService:
                     "or tool calling"
                 ),
             )
-            return _PostTurnStepResult(
-                status="failed",
-                result={
-                    "state_extraction_failed": True,
-                    "failed_reason": "state_extraction_unavailable",
-                    "retry_job_id": retry_job.id,
-                    "source_message_ids": list(source_message_ids),
-                    "retry_attempt": _retry_attempt(retry_job.payload),
-                    "max_retry_attempts": _retry_max_attempts(retry_job.payload),
-                    "verified_plan_coverage": verified_coverage.to_json(),
-                },
-            )
+            unavailable_result: dict[str, object] = {
+                "state_extraction_failed": True,
+                "failed_reason": "state_extraction_unavailable",
+                "source_message_ids": list(source_message_ids),
+                "verified_plan_coverage": verified_coverage.to_json(),
+            }
+            if retry_job is not None:
+                unavailable_result.update(
+                    {
+                        "retry_job_id": retry_job.id,
+                        "retry_attempt": _retry_attempt(retry_job.payload),
+                        "max_retry_attempts": _retry_max_attempts(retry_job.payload),
+                    }
+                )
+            else:
+                unavailable_result["retry_budget_exhausted"] = True
+            return _PostTurnStepResult(status="failed", result=unavailable_result)
         include_memories = True
         try:
             applied = await self._extract_and_apply_state_for_turn(
@@ -6510,22 +6550,29 @@ class ChatService:
             log_error_event(
                 "chat.state_extraction_failed",
                 save_id=save_id,
-                retry_job_id=retry_job.id,
+                retry_job_id=retry_job.id if retry_job is not None else None,
                 provider=preference.provider,
                 model=preference.model_id,
                 **exception_log_fields(exc),
             )
-            result: dict[str, object] = {
+            state_result: dict[str, object] = {
                 "state_extraction_failed": True,
-                "retry_job_id": retry_job.id,
                 "source_message_ids": list(source_message_ids),
-                "retry_attempt": _retry_attempt(retry_job.payload),
-                "max_retry_attempts": _retry_max_attempts(retry_job.payload),
                 "verified_plan_coverage": verified_coverage.to_json(),
             }
+            if retry_job is not None:
+                state_result.update(
+                    {
+                        "retry_job_id": retry_job.id,
+                        "retry_attempt": _retry_attempt(retry_job.payload),
+                        "max_retry_attempts": _retry_max_attempts(retry_job.payload),
+                    }
+                )
+            else:
+                state_result["retry_budget_exhausted"] = True
             if pressure is not None:
-                result["provider_pressure"] = pressure.to_result()
-            return _PostTurnStepResult(status="failed", result=result)
+                state_result["provider_pressure"] = pressure.to_result()
+            return _PostTurnStepResult(status="failed", result=state_result)
 
     async def _observe_if_configured(
         self,
@@ -6790,31 +6837,36 @@ class ChatService:
             log_error_event(
                 "chat.context_update_failed",
                 save_id=save_id,
-                retry_job_id=retry_job.id,
+                retry_job_id=retry_job.id if retry_job is not None else None,
                 provider=preference.provider if preference is not None else None,
                 model=preference.model_id if preference is not None else None,
                 **exception_log_fields(exc),
             )
-            return _PostTurnStepResult(
-                status="failed",
-                result={
+            result: dict[str, object] = {
                     "continuity_update_failed": True,
                     **(
                         {"agentic_context": agentic_result}
                         if agentic_result is not None
                         else {}
                     ),
-                    "retry_job_id": retry_job.id,
                     "source_message_ids": list(source_message_ids),
-                    "retry_attempt": _retry_attempt(retry_job.payload),
-                    "max_retry_attempts": _retry_max_attempts(retry_job.payload),
                     **(
                         {"provider_pressure": pressure.to_result()}
                         if pressure is not None
                         else {}
                     ),
-                },
-            )
+                }
+            if retry_job is not None:
+                result.update(
+                    {
+                        "retry_job_id": retry_job.id,
+                        "retry_attempt": _retry_attempt(retry_job.payload),
+                        "max_retry_attempts": _retry_max_attempts(retry_job.payload),
+                    }
+                )
+            else:
+                result["retry_budget_exhausted"] = True
+            return _PostTurnStepResult(status="failed", result=result)
 
     def _context_update_step_result(
         self,
@@ -6859,11 +6911,14 @@ class ChatService:
         model: str | None = None,
         pressure: ProviderPressure | None = None,
         turn_revision: TurnRevisionBoundary | None = None,
-    ) -> JobRecord:
+    ) -> JobRecord | None:
         existing = self._queued_state_extraction_retry_job(
             save_id=save_id,
             source_message_ids=source_message_ids,
         )
+        retry_count = configured_retry_count(self.repositories)
+        if existing is None and retry_count == 0:
+            return None
         payload = _state_extraction_retry_payload(
             source_message_ids=source_message_ids,
             reason=reason,
@@ -6873,7 +6928,7 @@ class ChatService:
             max_retry_attempts=(
                 _retry_max_attempts(existing.payload)
                 if existing is not None
-                else STATE_EXTRACTION_RETRY_MAX_ATTEMPTS
+                else retry_count
             ),
             include_memories=include_memories,
             inference_mode=inference_mode,
@@ -6978,15 +7033,23 @@ class ChatService:
         provider: str | None = None,
         model: str | None = None,
         pressure: ProviderPressure | None = None,
+        retry_count: int | None = None,
         full_post_turn_context: bool = False,
         inference_mode: str | None = None,
         verified_coverage: VerifiedPostTurnCoverage | None = None,
         turn_revision: TurnRevisionBoundary | None = None,
-    ) -> JobRecord:
+    ) -> JobRecord | None:
         existing = self._queued_context_update_retry_job(
             save_id=save_id,
             source_message_ids=source_message_ids,
         )
+        retry_count = (
+            configured_retry_count(self.repositories)
+            if retry_count is None
+            else max(0, retry_count)
+        )
+        if existing is None and retry_count == 0:
+            return None
         payload = _context_update_retry_payload(
             source_message_ids=source_message_ids,
             reason=reason,
@@ -6996,7 +7059,7 @@ class ChatService:
             max_retry_attempts=(
                 _retry_max_attempts(existing.payload)
                 if existing is not None
-                else CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS
+                else retry_count
             ),
             existing_payload=existing.payload if existing is not None else None,
             provider=provider,
@@ -10826,9 +10889,9 @@ def _retry_attempt(payload: dict[str, object]) -> int:
 
 def _retry_max_attempts(payload: dict[str, object]) -> int:
     value = payload.get("max_retry_attempts")
-    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
-        return max(value, CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS)
-    return CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return max(0, CONTEXT_UPDATE_RETRY_MAX_ATTEMPTS)
 
 
 def _completion_or_body_token_estimate(

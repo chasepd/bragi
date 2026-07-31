@@ -26,7 +26,11 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.redaction import redact_text
-from bragi.retry_policy import DEFERRED_WORK_MAX_ATTEMPTS, MODEL_OUTPUT_MAX_ATTEMPTS
+from bragi.retry_policy import (
+    DEFERRED_WORK_MAX_ATTEMPTS,
+    MODEL_OUTPUT_MAX_ATTEMPTS,
+    configured_max_attempts,
+)
 from bragi.services.character_text_world_update_service import (
     parse_character_text_source_ref,
 )
@@ -177,7 +181,11 @@ class WorldSuggestionReviewService:
             decisions = await self._review_groups(save_id=save_id, groups=groups)
         except Exception as exc:  # noqa: BLE001 - provider boundary
             error = redact_text(str(exc)) or exc.__class__.__name__
-            self._defer_groups(save_id=save_id, groups=groups, reason=error)
+            deferred_from_failure, rejected_from_failure = self._defer_groups(
+                save_id=save_id,
+                groups=groups,
+                reason=error,
+            )
             log_error_event(
                 "world_suggestion_review.failed",
                 save_id=save_id,
@@ -189,8 +197,8 @@ class WorldSuggestionReviewService:
                 save_id=save_id,
                 reviewed_count=len(groups),
                 applied_count=0,
-                rejected_count=preflight_rejected,
-                deferred_count=sum(len(group.suggestions) for group in groups),
+                rejected_count=preflight_rejected + rejected_from_failure,
+                deferred_count=deferred_from_failure,
                 error=error,
             )
 
@@ -202,12 +210,13 @@ class WorldSuggestionReviewService:
         for group in groups:
             decision = decisions_by_id.get(group.review_id)
             if decision is None:
-                self._defer_groups(
+                deferred_from_missing, rejected_from_missing = self._defer_groups(
                     save_id=save_id,
                     groups=(group,),
                     reason="Reviewer returned no decision for this suggestion.",
                 )
-                deferred += len(group.suggestions)
+                deferred += deferred_from_missing
+                rejected += rejected_from_missing
                 continue
             if decision.action == "accept":
                 try:
@@ -238,23 +247,26 @@ class WorldSuggestionReviewService:
                     except Exception as reject_exc:  # noqa: BLE001
                         error = _review_action_error("apply_reject", reject_exc)
                         errors.append(error)
-                        self._defer_groups(
-                            save_id=save_id,
-                            groups=(group,),
-                            reason=(
-                                "Automated apply and rejection deferred: "
-                                f"{error}. Apply error: {apply_error}. "
-                                f"Reviewer reason: {decision.reason}"
-                            ),
+                        deferred_from_apply_reject, rejected_from_apply_reject = (
+                            self._defer_groups(
+                                save_id=save_id,
+                                groups=(group,),
+                                reason=(
+                                    "Automated apply and rejection deferred: "
+                                    f"{error}. Apply error: {apply_error}. "
+                                    f"Reviewer reason: {decision.reason}"
+                                ),
+                            )
                         )
-                        deferred += len(group.suggestions)
+                        deferred += deferred_from_apply_reject
+                        rejected += rejected_from_apply_reject
                         continue
                     rejected += len(group.suggestions)
                     continue
                 except Exception as exc:  # noqa: BLE001 - persistence boundary
                     error = _review_action_error("apply", exc)
                     errors.append(error)
-                    self._defer_groups(
+                    deferred_from_apply, rejected_from_apply = self._defer_groups(
                         save_id=save_id,
                         groups=(group,),
                         reason=(
@@ -262,7 +274,8 @@ class WorldSuggestionReviewService:
                             f"Reviewer reason: {decision.reason}"
                         ),
                     )
-                    deferred += len(group.suggestions)
+                    deferred += deferred_from_apply
+                    rejected += rejected_from_apply
                     continue
                 applied += len(group.suggestions)
                 continue
@@ -280,7 +293,7 @@ class WorldSuggestionReviewService:
                 except Exception as exc:  # noqa: BLE001 - persistence boundary
                     error = _review_action_error("reject", exc)
                     errors.append(error)
-                    self._defer_groups(
+                    deferred_from_reject, rejected_from_reject = self._defer_groups(
                         save_id=save_id,
                         groups=(group,),
                         reason=(
@@ -288,16 +301,18 @@ class WorldSuggestionReviewService:
                             f"Reviewer reason: {decision.reason}"
                         ),
                     )
-                    deferred += len(group.suggestions)
+                    deferred += deferred_from_reject
+                    rejected += rejected_from_reject
                     continue
                 rejected += len(group.suggestions)
                 continue
-            self._defer_groups(
+            deferred_from_unsupported, rejected_from_unsupported = self._defer_groups(
                 save_id=save_id,
                 groups=(group,),
                 reason=f"Reviewer returned unsupported action: {decision.action}",
             )
-            deferred += len(group.suggestions)
+            deferred += deferred_from_unsupported
+            rejected += rejected_from_unsupported
         log_event(
             "world_suggestion_review.completed",
             save_id=save_id,
@@ -472,11 +487,15 @@ class WorldSuggestionReviewService:
         save_id: str,
         groups: tuple[_SuggestionReviewGroup, ...],
         reason: str,
-    ) -> None:
+    ) -> tuple[int, int]:
+        deferred_count = 0
+        rejected_count = 0
         for group in groups:
             for suggestion in group.suggestions:
                 next_attempt = suggestion.review_attempt_count + 1
-                if next_attempt >= MAX_AUTOMATED_REVIEW_ATTEMPTS:
+                max_retry_count = max(0, suggestion.max_retry_count)
+                if next_attempt > max_retry_count:
+                    rejected_count += 1
                     self.repositories.update_context_update_suggestion_status(
                         suggestion.id,
                         status="rejected",
@@ -492,15 +511,18 @@ class WorldSuggestionReviewService:
                         after=suggestion.proposed_value,
                         reason=(
                             "Suggestion rejected after "
-                            f"{MAX_AUTOMATED_REVIEW_ATTEMPTS} failed automated "
-                            f"review attempts: {reason}"
+                            f"{max_retry_count} retries exhausted: {reason}"
                         ),
                         confidence=suggestion.confidence,
                         source_message_ids=suggestion.source_message_ids,
                     )
                     continue
+                deferred_count += 1
                 retry_after_seconds = REVIEW_RETRY_DELAYS_SECONDS[
-                    suggestion.review_attempt_count
+                    min(
+                        suggestion.review_attempt_count,
+                        len(REVIEW_RETRY_DELAYS_SECONDS) - 1,
+                    )
                 ]
                 self.repositories.defer_context_update_suggestion_review(
                     [suggestion.id],
@@ -521,6 +543,7 @@ class WorldSuggestionReviewService:
                         confidence=suggestion.confidence,
                         source_message_ids=suggestion.source_message_ids,
                     )
+        return deferred_count, rejected_count
 
     def _reject_invalid_suggestions(
         self,
@@ -840,8 +863,9 @@ async def _review_groups_with_tool_feedback(
     decisions: list[SuggestionReviewDecision] = []
     decided_review_ids: set[str] = set()
     last_errors: list[str] = []
+    max_attempt_count = configured_max_attempts(repositories)
 
-    for _turn in range(MAX_WORLD_SUGGESTION_REVIEW_TOOL_FEEDBACK_TURNS + 1):
+    for _turn in range(max_attempt_count):
         turn_request = budget_tool_call_request(
             repositories,
             replace(request, messages=tuple(messages)),

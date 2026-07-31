@@ -50,6 +50,7 @@ from bragi.providers.contracts import (
     StructuredOutputRequest,
 )
 from bragi.providers.system_prompt import CHARACTER_TEXT_RESPONSE_STYLE_SECTION
+from bragi.retry_policy import configured_max_attempts
 from bragi.services.active_thread_lifecycle import (
     active_thread_is_prompt_visible,
     normalize_active_thread_visibility,
@@ -101,7 +102,6 @@ from bragi.services.model_preferences import (
 )
 from bragi.services.openrouter_routing_settings import request_with_openrouter_routing
 from bragi.services.phrase_denylist import (
-    GENERATED_PHRASE_GUARD_MAX_ATTEMPTS,
     PhraseDenylistViolation,
     denied_phrase_violations,
     effective_generated_phrase_denylist,
@@ -1891,7 +1891,8 @@ class CharacterTextService:
         identity_violation: _CharacterTextIdentityViolation | None = None
         response: ChatResponse | None = None
         body = ""
-        for attempt in range(1, GENERATED_PHRASE_GUARD_MAX_ATTEMPTS + 1):
+        max_attempts = configured_max_attempts(self.repositories)
+        for attempt in range(1, max_attempts + 1):
             current_request = budget_chat_request(
                 self.repositories,
                 current_request,
@@ -1946,7 +1947,6 @@ class CharacterTextService:
                 identity=identity,
                 retry=attempt > 1,
             )
-            max_attempts = GENERATED_PHRASE_GUARD_MAX_ATTEMPTS
             if attempt >= max_attempts:
                 break
             self.repositories.update_character_text_delivery(
