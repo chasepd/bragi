@@ -18,7 +18,6 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
 from bragi.providers.errors import (
-    PROVIDER_ERROR_MESSAGE_DIAGNOSTIC,
     ProviderError,
     ProviderErrorCategory,
     map_exception_to_category,
@@ -43,8 +42,6 @@ class BinaryHttpResponse:
 
 MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024 * 1024
 PROVIDER_RESPONSE_READ_CHUNK_BYTES = 64 * 1024
-_PROVIDER_ERROR_BODY_MAX_BYTES = 2048
-_PROVIDER_ERROR_MESSAGE_MAX_CHARS = 512
 SAFE_PROVIDER_RESPONSE_HEADERS = frozenset(
     {
         "cf-ray",
@@ -222,10 +219,6 @@ async def request_sse_json(
                     category=category,
                     message=_safe_http_error_message(exc.code),
                     status_code=exc.code,
-                    diagnostics=_provider_error_message_diagnostics(
-                        provider=provider,
-                        error=exc,
-                    ),
                 )
             )
         except URLError as exc:
@@ -393,10 +386,6 @@ def request_json(
             provider=provider,
             error=exc,
         )
-        provider_message_fields = _provider_error_message_diagnostics(
-            provider=provider,
-            error=exc,
-        )
         log_error_event(
             "provider.http_failed",
             method=method,
@@ -413,13 +402,11 @@ def request_json(
                 payload=payload,
             ),
             **venice_error_fields,
-            **provider_message_fields,
         )
         raise ProviderError(
             category=category,
             message=_safe_http_error_message(exc.code),
             status_code=exc.code,
-            diagnostics=provider_message_fields,
         ) from exc
     except URLError as exc:
         log_error_event(
@@ -538,10 +525,6 @@ def request_bytes(
             provider=provider,
             error=exc,
         )
-        provider_message_fields = _provider_error_message_diagnostics(
-            provider=provider,
-            error=exc,
-        )
         log_error_event(
             "provider.http_failed",
             method=method,
@@ -558,13 +541,11 @@ def request_bytes(
                 payload=payload,
             ),
             **venice_error_fields,
-            **provider_message_fields,
         )
         raise ProviderError(
             category=category,
             message=_safe_http_error_message(exc.code),
             status_code=exc.code,
-            diagnostics=provider_message_fields,
         ) from exc
     except URLError as exc:
         log_error_event(
@@ -610,21 +591,10 @@ def request_bytes(
 def ensure_success(response: JsonHttpResponse) -> dict[str, Any]:
     if 200 <= response.status_code < 300:
         return _payload_with_safe_headers(response)
-    # Real transports raise on non-2xx inside request_json/request_bytes, so
-    # this branch only sees non-2xx payloads from fake transports in tests.
-    # The payload is already decoded in memory, so extracting its error message
-    # does not broaden the error-body reading posture.
-    message = _provider_error_message_from_payload(response.payload)
-    diagnostics: dict[str, object] = {}
-    if message:
-        diagnostics[PROVIDER_ERROR_MESSAGE_DIAGNOSTIC] = message[
-            :_PROVIDER_ERROR_MESSAGE_MAX_CHARS
-        ]
     raise ProviderError(
         category=map_http_status_to_category(response.status_code),
         message=_safe_http_error_message(response.status_code),
         status_code=response.status_code,
-        diagnostics=diagnostics,
     )
 
 
@@ -684,60 +654,6 @@ def _venice_http_error_diagnostics(
         ),
         "response_headers": _redacted_response_headers(error.headers),
     }
-
-
-def _provider_error_message_diagnostics(
-    *,
-    provider: str | None,
-    error: HTTPError,
-) -> dict[str, object]:
-    """Capture the provider error message for OpenRouter routing 404s.
-
-    OpenRouter returns 404 with a routing guidance body when no endpoint can
-    currently handle a request. The message distinguishes that transient
-    routing condition from a genuinely unknown model, so the retry layer can
-    keep retrying without billing risk. The body is read only for OpenRouter
-    404s; other providers and statuses keep the existing privacy posture of
-    never reading error bodies.
-    """
-
-    if provider != "openrouter" or error.code != 404:
-        return {}
-    try:
-        raw_body = error.read(_PROVIDER_ERROR_BODY_MAX_BYTES)
-    except Exception:  # noqa: BLE001 - body reading is best effort
-        return {}
-    message = _provider_error_message_from_payload(_safe_decode_error_body(raw_body))
-    if not message:
-        return {}
-    redacted_message = redact_text(message) or message
-    return {
-        PROVIDER_ERROR_MESSAGE_DIAGNOSTIC: redacted_message[
-            :_PROVIDER_ERROR_MESSAGE_MAX_CHARS
-        ]
-    }
-
-
-def _provider_error_message_from_payload(payload: dict[str, Any]) -> str | None:
-    error = payload.get("error")
-    if isinstance(error, dict):
-        message = error.get("message")
-        if isinstance(message, str) and message.strip():
-            return message.strip()
-        return None
-    if isinstance(error, str) and error.strip():
-        return error.strip()
-    return None
-
-
-def _safe_decode_error_body(raw_body: bytes) -> dict[str, Any]:
-    try:
-        payload = json.loads(raw_body)
-    except (ValueError, UnicodeDecodeError):
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-    return payload
 
 
 def _redacted_response_headers(

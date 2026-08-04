@@ -9313,11 +9313,8 @@ def _pending_narrator_message(body: str) -> dict[str, Any]:
 def _provider_retry_status_text(progress: object, task_label: str) -> str:
     next_attempt = getattr(progress, "next_attempt", None)
     max_attempts = getattr(progress, "max_attempts", None)
-    unlimited = getattr(progress, "unlimited", False)
     if next_attempt is None or max_attempts is None:
         return f"Retrying {task_label} request..."
-    if unlimited:
-        return f"Retrying {task_label} request (attempt {next_attempt})..."
     return (
         f"Retrying {task_label} request "
         f"(attempt {next_attempt} of {max_attempts})..."
