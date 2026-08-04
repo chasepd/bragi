@@ -719,6 +719,7 @@ def test_no_endpoints_404_ends_on_different_failure(
         assert attempts == 4
         assert exc_info.value.category is ProviderErrorCategory.AUTHENTICATION_FAILED
         assert exc_info.value.retry_attempt_count == 4
+        assert exc_info.value.diagnostics.get("no_endpoints_retry_terminated") is True
         assert [
             attempt["http_status"]
             for attempt in exc_info.value.retry_attempts

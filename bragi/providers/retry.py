@@ -60,6 +60,9 @@ async def call_with_provider_retries[T](
     deadline_seconds = max(0.0, float(call_deadline_seconds))
     attempt_diagnostics: list[dict[str, object]] = []
     call_started_at = perf_counter()
+    # OpenRouter "no endpoints found" 404s run no inference and bill nothing, so
+    # once one is seen the loop keeps retrying without the attempt budget or the
+    # per-call deadline until it succeeds or the failure type changes.
     unlimited_no_endpoints = False
     attempt = 0
     while True:
@@ -101,6 +104,7 @@ async def call_with_provider_retries[T](
                     category=category,
                     exc=exc,
                     attempt_diagnostics=attempt_diagnostics,
+                    no_endpoints_terminated=True,
                 )
             if (
                 not no_endpoints_attempt
@@ -210,6 +214,9 @@ def is_no_endpoints_routing_error(exc: Exception) -> bool:
     OpenRouter returns this 404 (with the guidance message) when no endpoint
     can currently handle the request. No inference ran and no billing applies,
     so callers may keep retrying without regard for the retry budget.
+
+    The match relies on OpenRouter's message wording; if it changes, behavior
+    degrades safely to the ordinary terminal handling for 404s.
     """
 
     if not isinstance(exc, ProviderError):
@@ -391,6 +398,7 @@ def _raise_retry_exhausted_error(
     category: str,
     exc: Exception,
     attempt_diagnostics: list[dict[str, object]],
+    no_endpoints_terminated: bool = False,
 ) -> NoReturn:
     log_error_event(
         "provider.retry_exhausted",
@@ -403,6 +411,9 @@ def _raise_retry_exhausted_error(
         error=str(exc),
     )
     if isinstance(exc, ProviderError):
+        diagnostics = dict(exc.diagnostics)
+        if no_endpoints_terminated:
+            diagnostics["no_endpoints_retry_terminated"] = True
         raise ProviderError(
             category=exc.category,
             message=exc.message,
@@ -410,6 +421,6 @@ def _raise_retry_exhausted_error(
             retry_attempt_count=attempt,
             max_retry_attempts=max_attempts,
             retry_attempts=tuple(attempt_diagnostics),
-            diagnostics=dict(exc.diagnostics),
+            diagnostics=diagnostics,
         ) from exc
     raise exc

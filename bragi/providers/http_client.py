@@ -610,6 +610,10 @@ def request_bytes(
 def ensure_success(response: JsonHttpResponse) -> dict[str, Any]:
     if 200 <= response.status_code < 300:
         return _payload_with_safe_headers(response)
+    # Real transports raise on non-2xx inside request_json/request_bytes, so
+    # this branch only sees non-2xx payloads from fake transports in tests.
+    # The payload is already decoded in memory, so extracting its error message
+    # does not broaden the error-body reading posture.
     message = _provider_error_message_from_payload(response.payload)
     diagnostics: dict[str, object] = {}
     if message:
@@ -706,8 +710,11 @@ def _provider_error_message_diagnostics(
     message = _provider_error_message_from_payload(_safe_decode_error_body(raw_body))
     if not message:
         return {}
+    redacted_message = redact_text(message) or message
     return {
-        PROVIDER_ERROR_MESSAGE_DIAGNOSTIC: message[:_PROVIDER_ERROR_MESSAGE_MAX_CHARS]
+        PROVIDER_ERROR_MESSAGE_DIAGNOSTIC: redacted_message[
+            :_PROVIDER_ERROR_MESSAGE_MAX_CHARS
+        ]
     }
 
 

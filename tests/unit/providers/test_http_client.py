@@ -845,3 +845,114 @@ def test_ensure_success_includes_provider_error_message_diagnostic() -> None:
         "No endpoints found that can handle the requested parameters"
     )
     assert exc_info.value.message == "model_not_found (404)"
+
+
+def test_ensure_success_includes_string_error_message_diagnostic() -> None:
+    with pytest.raises(ProviderError) as exc_info:
+        ensure_success(
+            JsonHttpResponse(
+                status_code=404,
+                payload={
+                    "error": (
+                        "No endpoints found that can handle the requested parameters"
+                    )
+                },
+            )
+        )
+
+    assert exc_info.value.diagnostics["provider_error_message"] == (
+        "No endpoints found that can handle the requested parameters"
+    )
+
+
+def test_ensure_success_truncates_long_provider_error_message() -> None:
+    with pytest.raises(ProviderError) as exc_info:
+        ensure_success(
+            JsonHttpResponse(
+                status_code=404,
+                payload={
+                    "error": {"message": "x" * 4000},
+                },
+            )
+        )
+
+    diagnostic = exc_info.value.diagnostics["provider_error_message"]
+    assert isinstance(diagnostic, str)
+    assert len(diagnostic) == 512
+
+
+def test_request_sse_json_captures_openrouter_404_error_message_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeOpener:
+        def open(self, *_args: object, **_kwargs: object) -> object:
+            headers: Message[str, str] = Message()
+            raise HTTPError(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                code=404,
+                msg="Not Found",
+                hdrs=headers,
+                fp=io.BytesIO(
+                    b'{"error":{"message":"No endpoints found that can handle '
+                    b'the requested parameters"}}'
+                ),
+            )
+
+    monkeypatch.setattr("bragi.providers.http_client._NO_REDIRECT_OPENER", FakeOpener())
+
+    async def collect_stream() -> None:
+        async for _event in request_sse_json(
+            method="POST",
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={},
+            payload={"stream": True},
+            timeout=5.0,
+            provider="openrouter",
+            task="chat",
+        ):
+            raise AssertionError("stream should not emit an event")
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(collect_stream())
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.diagnostics["provider_error_message"] == (
+        "No endpoints found that can handle the requested parameters"
+    )
+
+
+def test_request_bytes_captures_openrouter_404_error_message_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeOpener:
+        def open(self, *_args: object, **_kwargs: object) -> object:
+            headers: Message[str, str] = Message()
+            raise HTTPError(
+                url="https://openrouter.ai/api/v1/images/generate",
+                code=404,
+                msg="Not Found",
+                hdrs=headers,
+                fp=io.BytesIO(
+                    b'{"error":{"message":"No endpoints found that can handle '
+                    b'the requested parameters"}}'
+                ),
+            )
+
+    monkeypatch.setattr("bragi.providers.http_client._NO_REDIRECT_OPENER", FakeOpener())
+
+    with pytest.raises(ProviderError) as exc_info:
+        request_bytes(
+            method="POST",
+            url="https://openrouter.ai/api/v1/images/generate",
+            headers={},
+            payload={"model": "example/model"},
+            timeout=1.0,
+            provider="openrouter",
+            task="image_generation",
+            model="example/model",
+        )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.diagnostics["provider_error_message"] == (
+        "No endpoints found that can handle the requested parameters"
+    )
