@@ -574,7 +574,6 @@ class VeniceClient:
             "stream": False,
             "tools": [tool_definition_payload(tool) for tool in request.tools],
             "tool_choice": "auto",
-            "parallel_tool_calls": request.parallel_tool_calls,
         }
         if request.temperature is not None:
             payload["temperature"] = request.temperature

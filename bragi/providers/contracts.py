@@ -237,7 +237,6 @@ class ToolCallRequest:
     temperature: float | None = None
     max_output_tokens: int | None = None
     reasoning: ChatReasoningConfig | None = None
-    parallel_tool_calls: bool = True
     openrouter_provider_routing: dict[str, Any] | None = None
     openrouter_app_title: str | None = None
 

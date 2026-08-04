@@ -1882,7 +1882,6 @@ def _focused_scene_time_tool_request(
             ),
         ),
         temperature=0.0,
-        parallel_tool_calls=False,
     )
 
 
@@ -1921,7 +1920,6 @@ def _focused_scene_location_presence_tool_request(
             ),
         ),
         temperature=0.0,
-        parallel_tool_calls=False,
     )
 
 
@@ -1965,7 +1963,6 @@ def _focused_scene_surface_tool_request(
             ),
         ),
         temperature=0.0,
-        parallel_tool_calls=False,
     )
 
 
@@ -2003,7 +2000,6 @@ def _focused_scene_thread_status_tool_request(
             ),
         ),
         temperature=0.0,
-        parallel_tool_calls=False,
     )
 
 
@@ -2050,7 +2046,6 @@ def _focused_character_relationship_tool_request(
             ),
         ),
         temperature=0.0,
-        parallel_tool_calls=False,
     )
 
 
@@ -2091,7 +2086,6 @@ def _focused_character_emotion_tool_request(
             ),
         ),
         temperature=0.0,
-        parallel_tool_calls=False,
     )
 
 

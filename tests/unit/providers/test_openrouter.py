@@ -901,7 +901,7 @@ def test_openrouter_tool_call_payload_uses_tools_and_preserves_arguments() -> No
         }
     ]
     assert payload["tool_choice"] == "auto"
-    assert payload["parallel_tool_calls"] is True
+    assert "parallel_tool_calls" not in payload
     assert payload["max_tokens"] == 400
     assert payload["provider"] == {
         "require_parameters": True,
