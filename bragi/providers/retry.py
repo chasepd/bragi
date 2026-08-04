@@ -15,7 +15,10 @@ from bragi.providers.contracts import (
     ProviderRetryProgressCallback,
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
-from bragi.retry_policy import PROVIDER_MAX_ATTEMPTS
+from bragi.retry_policy import (
+    DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS,
+    PROVIDER_MAX_ATTEMPTS,
+)
 
 DEFAULT_PROVIDER_ATTEMPTS = PROVIDER_MAX_ATTEMPTS
 DEFAULT_BACKOFF_SECONDS = 0.4
@@ -44,10 +47,22 @@ async def call_with_provider_retries[T](
     max_attempts: int = DEFAULT_PROVIDER_ATTEMPTS,
     base_delay: float = DEFAULT_BACKOFF_SECONDS,
     retry_progress_callback: ProviderRetryProgressCallback | None = None,
+    call_deadline_seconds: float = DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS,
 ) -> T:
     attempts = max(1, max_attempts)
+    deadline_seconds = max(0.0, float(call_deadline_seconds))
     attempt_diagnostics: list[dict[str, object]] = []
+    call_started_at = perf_counter()
     for attempt in range(1, attempts + 1):
+        if _elapsed_seconds(call_started_at) > deadline_seconds:
+            raise _deadline_exceeded_error(
+                provider=provider,
+                task=task,
+                attempt=attempt,
+                max_attempts=attempts,
+                deadline_seconds=deadline_seconds,
+                attempt_diagnostics=attempt_diagnostics,
+            )
         started_at = perf_counter()
         try:
             result = await operation()
@@ -61,6 +76,15 @@ async def call_with_provider_retries[T](
                     duration_ms=duration_ms,
                 )
             )
+            if _elapsed_seconds(call_started_at) > deadline_seconds:
+                raise _deadline_exceeded_error(
+                    provider=provider,
+                    task=task,
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    deadline_seconds=deadline_seconds,
+                    attempt_diagnostics=attempt_diagnostics,
+                ) from exc
             if attempt >= attempts or not _is_transient(exc):
                 log_error_event(
                     "provider.retry_exhausted",
@@ -88,6 +112,18 @@ async def call_with_provider_retries[T](
                 base_delay=base_delay,
                 error_category=category,
             )
+            remaining = deadline_seconds - _elapsed_seconds(call_started_at)
+            if remaining <= 0:
+                raise _deadline_exceeded_error(
+                    provider=provider,
+                    task=task,
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    deadline_seconds=deadline_seconds,
+                    attempt_diagnostics=attempt_diagnostics,
+                ) from exc
+            if delay > remaining:
+                delay = remaining
             log_error_event(
                 "provider.retry_scheduled",
                 provider=provider,
@@ -264,3 +300,40 @@ def _publish_retry_progress(
 
 def _elapsed_ms(started_at: float) -> int:
     return int((perf_counter() - started_at) * 1000)
+
+
+def _elapsed_seconds(started_at: float) -> float:
+    return perf_counter() - started_at
+
+
+def _deadline_exceeded_error(
+    *,
+    provider: str,
+    task: str,
+    attempt: int,
+    max_attempts: int,
+    deadline_seconds: float,
+    attempt_diagnostics: list[dict[str, object]],
+) -> ProviderError:
+    log_error_event(
+        "provider.retry_deadline_exceeded",
+        provider=provider,
+        task=task,
+        attempt=attempt,
+        max_attempts=max_attempts,
+        deadline_seconds=deadline_seconds,
+    )
+    return ProviderError(
+        category=ProviderErrorCategory.NETWORK_ERROR,
+        message=(
+            f"Provider call exceeded the global deadline of {deadline_seconds:g}s "
+            f"after {attempt} attempts"
+        ),
+        retry_attempt_count=attempt,
+        max_retry_attempts=max_attempts,
+        retry_attempts=tuple(attempt_diagnostics),
+        diagnostics={
+            "deadline_seconds": deadline_seconds,
+            "deadline_exceeded": True,
+        },
+    )

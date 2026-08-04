@@ -14,10 +14,15 @@ from bragi.persistence.models import (
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import ProviderGenerationParameter
 from bragi.retry_policy import (
+    MAX_PROVIDER_CALL_DEADLINE_SECONDS,
     MAX_RETRY_COUNT,
+    MIN_PROVIDER_CALL_DEADLINE_SECONDS,
     MIN_RETRY_COUNT,
+    PROVIDER_CALL_DEADLINE_SETTING,
+    PROVIDER_CALL_DEADLINE_STEP,
     RETRY_COUNT_SETTING,
     RETRY_COUNT_STEP,
+    sanitize_provider_call_deadline_seconds,
     sanitize_retry_count,
 )
 from bragi.services.agentic_context import (
@@ -547,6 +552,7 @@ class SettingsModel:
     scenario_section_model_selectors: tuple[TaskModelSelector, ...]
     model_routing_profiles: ModelRoutingProfilesModel | None
     retry_count: NumberControl | None
+    provider_call_deadline_seconds: NumberControl | None
     automatic_summarization: ToggleControl | None
     summarization_context_pressure_threshold: NumberControl | None
     summarization_visibility: ToggleControl | None
@@ -756,6 +762,22 @@ def build_settings_model(
             minimum=MIN_RETRY_COUNT,
             maximum=MAX_RETRY_COUNT,
             step=RETRY_COUNT_STEP,
+        )
+        if is_admin
+        else None,
+        provider_call_deadline_seconds=NumberControl(
+            setting_key=PROVIDER_CALL_DEADLINE_SETTING,
+            value=sanitize_provider_call_deadline_seconds(
+                _setting_value(
+                    repositories,
+                    PROVIDER_CALL_DEADLINE_SETTING,
+                    active_save_id=None,
+                    current_user_id=None,
+                )
+            ),
+            minimum=int(MIN_PROVIDER_CALL_DEADLINE_SECONDS),
+            maximum=int(MAX_PROVIDER_CALL_DEADLINE_SECONDS),
+            step=int(PROVIDER_CALL_DEADLINE_STEP),
         )
         if is_admin
         else None,
