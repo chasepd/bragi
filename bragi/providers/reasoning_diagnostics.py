@@ -1,9 +1,9 @@
 """Shared provider-agnostic reasoning diagnostics.
 
-Both the OpenRouter and Venice providers surface reasoning-model output in
-slightly different shapes. The helpers in this module normalize the response
-so callers can detect a "reasoning-only" or "reasoning-truncated" response
-without duplicating the per-provider shape handling.
+Both the OpenRouter and Venice providers surface reasoning-model output in the
+OpenAI-compatible chat-completions shape. The helpers in this module normalize
+the response so callers can detect a "reasoning-only" or "reasoning-truncated"
+response without duplicating the per-provider shape handling.
 """
 
 from __future__ import annotations

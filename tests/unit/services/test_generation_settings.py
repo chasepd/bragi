@@ -427,7 +427,7 @@ def test_model_thinking_off_for_mandatory_model_sends_effort_none(
     )
 
 
-def test_model_thinking_off_for_optional_model_sends_disabled(
+def test_model_thinking_off_for_optional_model_sends_effort_none(
     repositories: PersistenceRepositories,
 ) -> None:
     repositories.save_provider_model(
@@ -456,9 +456,9 @@ def test_model_thinking_off_for_optional_model_sends_disabled(
     )
 
     assert config is not None
-    assert config.enabled is False
+    assert config.effort == "none"
     assert config.exclude is True
-    assert config.effort is None
+    assert config.enabled is None
 
 
 def test_model_thinking_off_propagates_to_structured_output(

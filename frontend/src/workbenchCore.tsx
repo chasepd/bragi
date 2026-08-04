@@ -5537,7 +5537,7 @@ function PendingJobRow({
 }
 
 const LONG_RUNNING_JOB_HINT_SECONDS = 60;
-const CANCEL_STUCK_HINT_SECONDS = 15;
+const CANCEL_STUCK_HINT_TOTAL_SECONDS = 15;
 
 function useLongRunningJobHint(tracked: TrackedJob): string | null {
   const [now, setNow] = useState(() => Date.now());
@@ -5550,7 +5550,7 @@ function useLongRunningJobHint(tracked: TrackedJob): string | null {
   if (!createdAt) return null;
   const elapsedSeconds = Math.max(0, Math.floor((now - createdAt * 1000) / 1000));
   const isCancelling = tracked.progress === "Cancelling";
-  if (isCancelling && elapsedSeconds >= CANCEL_STUCK_HINT_SECONDS) {
+  if (isCancelling && elapsedSeconds >= CANCEL_STUCK_HINT_TOTAL_SECONDS) {
     return "Cancelling. The current provider call cannot be interrupted until it completes; you can keep waiting or close this view.";
   }
   if (elapsedSeconds >= LONG_RUNNING_JOB_HINT_SECONDS) {

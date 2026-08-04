@@ -319,9 +319,7 @@ def model_thinking_reasoning_config(
     if level == THINKING_LEVEL_PROVIDER_DEFAULT:
         return None
     if level == THINKING_LEVEL_OFF:
-        if bool(support.get("mandatory")):
-            return ChatReasoningConfig(effort="none", exclude=True)
-        return ChatReasoningConfig(enabled=False, exclude=True)
+        return ChatReasoningConfig(effort="none", exclude=True)
     if level not in _support_levels(support):
         return None
     return ChatReasoningConfig(effort=level, exclude=True)

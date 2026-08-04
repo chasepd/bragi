@@ -3070,3 +3070,49 @@ def test_venice_http_error_uses_provider_error_category() -> None:
     assert exc_info.value.category == ProviderErrorCategory.AUTHENTICATION_FAILED
     assert exc_info.value.message == "authentication_failed (401)"
     assert "bad key" not in exc_info.value.message
+
+
+def test_venice_chat_diagnoses_reasoning_only_response() -> None:
+    transport = RecordingTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                payload={
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {
+                                "content": "",
+                                "reasoning_details": [{"type": "thinking"}],
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "completion_tokens": 1,
+                        "completion_tokens_details": {"reasoning_tokens": 1500},
+                    },
+                },
+            )
+        ]
+    )
+    secrets = InMemorySecretStore()
+    secrets.set_api_key("venice", "venice-secret")
+    client = VeniceClient(secret_store=secrets, transport=transport)
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            client.chat(
+                ChatRequest(
+                    provider="venice",
+                    model_id="deepseek-v4-flash-0731",
+                    messages=(ChatMessage(role="player", body="Hello?"),),
+                )
+            )
+        )
+
+    assert exc_info.value.category == ProviderErrorCategory.PROVIDER_ERROR
+    assert "reasoning-only response" in exc_info.value.message
+    diagnostics = exc_info.value.diagnostics
+    assert diagnostics.get("finish_reason") == "length"
+    assert diagnostics.get("reasoning_tokens") == 1500
+    assert diagnostics.get("reasoning_detail_types") == ["thinking"]
