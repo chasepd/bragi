@@ -1079,7 +1079,7 @@ def test_structured_state_only_request_omits_memory_schema_and_accepts_absent_me
     )
 
     structured_request = provider.structured_output_requests[0]
-    assert structured_request.max_output_tokens == 1024
+    assert structured_request.max_output_tokens == 2048
     assert "memories" not in structured_request.schema["properties"]
     assert "memories" not in structured_request.schema["required"]
     prompt_text = "\n".join(

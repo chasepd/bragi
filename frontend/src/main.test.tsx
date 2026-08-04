@@ -19924,6 +19924,8 @@ describe("frontend helpers", () => {
       expect(within(section as HTMLElement).getByText(label)).toBeInTheDocument();
       expect(within(section as HTMLElement).getByLabelText(`${label} main model`)).toBeInTheDocument();
       expect(within(section as HTMLElement).getByLabelText(`${label} fallback model`)).toBeInTheDocument();
+      expect(within(section as HTMLElement).getByLabelText(`${label} main thinking level`)).toBeInTheDocument();
+      expect(within(section as HTMLElement).getByLabelText(`${label} fallback thinking level`)).toBeInTheDocument();
     }
   });
 
@@ -19989,6 +19991,103 @@ describe("frontend helpers", () => {
       .filter(([path]) => path === "/api/settings/scoped")
       .map(([, init]) => JSON.parse(String(init.body)));
     expect(scopedCalls).toEqual([]);
+  });
+
+  it("applies simple selector thinking levels to main and fallback tasks", async () => {
+    const chatOptions = [
+      modelOption("text-a", "Text A", ["chat"], "fake", null, modelThinkingSupport()),
+      modelOption("text-b", "Text B", ["chat"], "fake", null, modelThinkingSupport()),
+      modelOption("text-fallback", "Text Fallback", ["chat"], "fake", null, modelThinkingSupport())
+    ];
+    const fetchMock = await renderModelSettings(modelSettingsPayload({
+      task_model_selectors: [
+        modelSelector("chat", chatOptions, "text-a", {
+          thinking: thinkingControl("chat", "provider_default", true, "text-a")
+        }),
+        modelSelector("scenario_generation", chatOptions, "text-a", {
+          thinking: thinkingControl("scenario_generation", "provider_default", true, "text-a")
+        }),
+        modelSelector("summarization", chatOptions, "text-a", {
+          thinking: thinkingControl("summarization", "provider_default", true, "text-a")
+        }),
+        modelSelector("image_prompt", chatOptions, "text-a", {
+          thinking: thinkingControl("image_prompt", "provider_default", true, "text-a")
+        }),
+        modelSelector("narrator_fallback", chatOptions, "text-a", {
+          thinking: thinkingControl("narrator_fallback", "provider_default", true, "text-a")
+        }),
+        modelSelector("chat_fallback", chatOptions, "text-a", {
+          thinking: thinkingControl("chat_fallback", "provider_default", true, "text-a")
+        })
+      ]
+    }));
+
+    const mainSelect = screen.getByLabelText("Prose main model");
+    const row = mainSelect.closest(".model-routing-row");
+    expect(row).not.toBeNull();
+    await userEvent.selectOptions(mainSelect, "fake\u0000text-b");
+    await userEvent.selectOptions(within(row as HTMLElement).getByLabelText("Prose fallback model"), "fake\u0000text-fallback");
+    await userEvent.selectOptions(within(row as HTMLElement).getByLabelText("Prose main thinking level"), "high");
+    await userEvent.selectOptions(within(row as HTMLElement).getByLabelText("Prose fallback thinking level"), "low");
+    await userEvent.click(within(row as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([path]) => path === "/api/settings/model-thinking")).toHaveLength(6));
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/model-thinking")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
+        { task: "chat", provider: "fake", model_id: "text-b", level: "high" },
+        { task: "scenario_generation", provider: "fake", model_id: "text-b", level: "high" },
+        { task: "summarization", provider: "fake", model_id: "text-b", level: "high" },
+        { task: "image_prompt", provider: "fake", model_id: "text-b", level: "high" },
+        { task: "narrator_fallback", provider: "fake", model_id: "text-fallback", level: "low" },
+        { task: "chat_fallback", provider: "fake", model_id: "text-fallback", level: "low" }
+      ]);
+  });
+
+  it("clears simple selector thinking levels when provider default is chosen", async () => {
+    const chatOptions = [
+      modelOption("text-a", "Text A", ["chat"], "fake", null, modelThinkingSupport()),
+      modelOption("text-b", "Text B", ["chat"], "fake", null, modelThinkingSupport())
+    ];
+    const fetchMock = await renderModelSettings(modelSettingsPayload({
+      task_model_selectors: [
+        modelSelector("chat", chatOptions, "text-a", {
+          thinking: thinkingControl("chat", "high", true, "text-a")
+        }),
+        modelSelector("summarization", chatOptions, "text-a", {
+          thinking: thinkingControl("summarization", "high", true, "text-a")
+        })
+      ]
+    }));
+
+    const mainSelect = screen.getByLabelText("Prose main model");
+    const row = mainSelect.closest(".model-routing-row");
+    expect(row).not.toBeNull();
+    await userEvent.selectOptions(mainSelect, "fake\u0000text-b");
+    await userEvent.click(within(row as HTMLElement).getByRole("button", { name: /apply/i }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([path, init]) => (
+      path === "/api/settings/model-thinking/chat" && init?.method === "DELETE"
+    ))).toHaveLength(1));
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([path, init]) => (
+      path === "/api/settings/model-thinking/summarization" && init?.method === "DELETE"
+    ))).toHaveLength(1));
+  });
+
+  it("disables simple selector thinking levels for unsupported or unselected models", async () => {
+    const chatOptions = [modelOption("text-a", "Text A", ["chat"])];
+    await renderModelSettings(modelSettingsPayload({
+      task_model_selectors: [
+        modelSelector("chat", chatOptions, "text-a"),
+        modelSelector("summarization", chatOptions, "text-a")
+      ]
+    }));
+
+    const mainSelect = screen.getByLabelText("Prose main model");
+    const row = mainSelect.closest(".model-routing-row");
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getByLabelText("Prose main thinking level")).toBeDisabled();
+    expect(within(row as HTMLElement).getByLabelText("Prose fallback thinking level")).toBeDisabled();
   });
 
   it("applies the simple structured and tool-call selector to all structured tasks and fallback preferences", async () => {

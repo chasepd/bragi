@@ -3,8 +3,8 @@
     "javascript": {
       "extensions": [".js"],
       "totalRawBytes": 660000,
-      "totalGzipBytes": 178600,
-      "totalBrotliBytes": 154200,
+      "totalGzipBytes": 178800,
+      "totalBrotliBytes": 155000,
       "maxFileRawBytes": 260000,
       "minFileCount": 11,
       "requiredFilePatterns": [

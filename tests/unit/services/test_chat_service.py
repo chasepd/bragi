@@ -8261,7 +8261,7 @@ def test_chat_fallback_filters_unsupported_generation_settings(
     assert primary.chat_requests[0].max_output_tokens == 1800
     assert len(fallback.chat_requests) == 1
     assert fallback.chat_requests[0].temperature is None
-    assert fallback.chat_requests[0].max_output_tokens == 1200
+    assert fallback.chat_requests[0].max_output_tokens == 2048
 
 
 def test_submit_player_turn_includes_save_custom_instructions(
@@ -14842,14 +14842,14 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
-        context_window=6500,
+        context_window=7000,
     )
     repositories.save_provider_model(
         provider="venice",
         model_id="venice/fallback-chat",
         display_name="Venice Fallback Chat",
         capabilities=["chat", "fallback_marker"],
-        context_window=32768,
+        context_window=65536,
     )
     repositories.set_model_preference(
         task="chat",
@@ -14901,13 +14901,13 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
 
     assert primary.chat_requests[0].retrieved_state == ()
     primary_budget = primary.chat_requests[0].context_breakdown["final_prompt_budget"]
-    assert primary_budget["model_context_window"] == 6500
+    assert primary_budget["model_context_window"] == 7000
     assert primary_budget["trimmed"] is True
     assert fallback.chat_requests[0].retrieved_state == (selected_state,)
     fallback_budget = fallback.chat_requests[0].context_breakdown[
         "final_prompt_budget"
     ]
-    assert fallback_budget["model_context_window"] == 32768
+    assert fallback_budget["model_context_window"] == 65536
     assert fallback_budget["trimmed"] is False
 
 

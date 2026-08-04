@@ -2397,7 +2397,7 @@ def test_narrator_planner_returns_message_spec_from_structured_output() -> None:
 
     structured_request = provider.structured_output_requests[0]
     assert structured_request.schema_name == "narrator_message_plan"
-    assert structured_request.max_output_tokens == 1024
+    assert structured_request.max_output_tokens == 2048
     assert "untrusted evidence" in structured_request.messages[0].body
     assert structured_request.messages[1].body.startswith(
         "BEGIN BRAGI UNTRUSTED SOURCE REQUEST DATA"
@@ -2856,7 +2856,7 @@ def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
         ),
     )
     schema = provider.structured_output_requests[0].schema
-    assert provider.structured_output_requests[0].max_output_tokens == 1024
+    assert provider.structured_output_requests[0].max_output_tokens == 2048
     assert "npc_knowledge_leaks" in schema["properties"]
     assert "npc_passivity_issues" in schema["properties"]
     assert "npc_passivity_issues" in schema["required"]
