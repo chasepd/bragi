@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
@@ -37,6 +37,7 @@ from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
     provider_error_with_fallback_skipped_reason,
     recover_tool_call_shape_with_structured_output,
+    shape_switch_diagnostics,
     structured_output_with_fallback,
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
@@ -91,6 +92,7 @@ class MemoryConsolidationResult:
     skipped_reason: str = ""
     batch_count: int = 0
     completed_batch_count: int = 0
+    tool_diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 def _apply_guard_context(
@@ -151,6 +153,7 @@ class MemoryConsolidationService:
         )
         started_at = perf_counter()
         transaction_started = False
+        shape_diagnostics: dict[str, object] = {}
         result: MemoryConsolidationResult
         try:
             batches = _memory_batches(memories, MEMORY_CONSOLIDATION_BATCH_SIZE)
@@ -158,15 +161,13 @@ class MemoryConsolidationService:
                 tuple[tuple[MemoryRecord, ...], tuple[MemoryConsolidationCluster, ...]]
             ] = []
             for batch in batches:
-                batch_clusters.append(
-                    (
-                        batch,
-                        await self._propose_clusters(
-                            save_id=save_id,
-                            memories=batch,
-                        ),
-                    )
+                clusters, batch_diagnostics = await self._propose_clusters(
+                    save_id=save_id,
+                    memories=batch,
                 )
+                batch_clusters.append((batch, clusters))
+                if batch_diagnostics and not shape_diagnostics:
+                    shape_diagnostics = batch_diagnostics
             async with _apply_guard_context(apply_guard):
                 batch_results: list[MemoryConsolidationResult] = []
                 self.repositories.begin_immediate_transaction()
@@ -184,21 +185,22 @@ class MemoryConsolidationService:
                     active_memory_count=len(memories),
                     batch_count=len(batches),
                     batch_results=tuple(batch_results),
+                    tool_diagnostics=shape_diagnostics,
                 )
                 self.repositories.commit_transaction()
                 transaction_started = False
-                self.jobs.succeed(
-                    job.id,
-                    result={
-                        "active_memory_count": result.active_memory_count,
-                        "proposed_cluster_count": result.proposed_cluster_count,
-                        "rewritten_count": result.rewritten_count,
-                        "archived_count": result.archived_count,
-                        "rejected_count": result.rejected_count,
-                        "batch_count": result.batch_count,
-                        "completed_batch_count": result.completed_batch_count,
-                    },
-                )
+                job_result: dict[str, object] = {
+                    "active_memory_count": result.active_memory_count,
+                    "proposed_cluster_count": result.proposed_cluster_count,
+                    "rewritten_count": result.rewritten_count,
+                    "archived_count": result.archived_count,
+                    "rejected_count": result.rejected_count,
+                    "batch_count": result.batch_count,
+                    "completed_batch_count": result.completed_batch_count,
+                }
+                if result.tool_diagnostics:
+                    job_result["tool_diagnostics"] = result.tool_diagnostics
+                self.jobs.succeed(job.id, result=job_result)
         except Exception as exc:
             if transaction_started:
                 self.repositories.rollback_transaction()
@@ -232,7 +234,10 @@ class MemoryConsolidationService:
         *,
         save_id: str,
         memories: tuple[MemoryRecord, ...],
-    ) -> tuple[MemoryConsolidationCluster, ...]:
+    ) -> tuple[
+        tuple[MemoryConsolidationCluster, ...],
+        dict[str, object],
+    ]:
         if self.prefer_tool_calls and isinstance(self.provider, ToolCallProvider):
             tool_request = request_with_openrouter_routing(
                 self.repositories,
@@ -258,7 +263,7 @@ class MemoryConsolidationService:
                 )
             if self.providers is not None:
                 try:
-                    return await _memory_clusters_with_tool_fallback(
+                    clusters = await _memory_clusters_with_tool_fallback(
                         repositories=self.repositories,
                         providers=self.providers,
                         provider=self.provider,
@@ -270,6 +275,7 @@ class MemoryConsolidationService:
                             save_id=save_id,
                         ),
                     )
+                    return clusters, {}
                 except ProviderError as exc:
                     # The tool fallback chain enriches the failing error; the
                     # enriched error reports model_not_found when either the
@@ -278,7 +284,7 @@ class MemoryConsolidationService:
                     # cases.
                     if not provider_error_is_model_not_found(exc):
                         raise
-                    return await recover_tool_call_shape_with_structured_output(
+                    clusters = await recover_tool_call_shape_with_structured_output(
                         error=exc,
                         task="context_update",
                         provider=self.provider_name,
@@ -288,8 +294,15 @@ class MemoryConsolidationService:
                             memories=memories,
                         ),
                     )
+                    return (
+                        clusters,
+                        shape_switch_diagnostics(
+                            provider=self.provider_name,
+                            model_id=self.model_id,
+                        ),
+                    )
             try:
-                return await _memory_clusters_with_tool_feedback(
+                clusters = await _memory_clusters_with_tool_feedback(
                     repositories=self.repositories,
                     provider=self.provider,
                     request=tool_request,
@@ -299,10 +312,11 @@ class MemoryConsolidationService:
                         save_id=save_id,
                     ),
                 )
+                return clusters, {}
             except ProviderError as exc:
                 if not provider_error_is_model_not_found(exc):
                     raise
-                return await recover_tool_call_shape_with_structured_output(
+                clusters = await recover_tool_call_shape_with_structured_output(
                     error=exc,
                     task="context_update",
                     provider=self.provider_name,
@@ -312,11 +326,19 @@ class MemoryConsolidationService:
                         memories=memories,
                     ),
                 )
+                return (
+                    clusters,
+                    shape_switch_diagnostics(
+                        provider=self.provider_name,
+                        model_id=self.model_id,
+                    ),
+                )
 
-        return await self._propose_clusters_structured(
+        clusters = await self._propose_clusters_structured(
             save_id=save_id,
             memories=memories,
         )
+        return clusters, {}
 
     async def _propose_clusters_structured(
         self,
@@ -852,6 +874,7 @@ def _merge_results(
     active_memory_count: int,
     batch_count: int,
     batch_results: tuple[MemoryConsolidationResult, ...],
+    tool_diagnostics: dict[str, object] | None = None,
 ) -> MemoryConsolidationResult:
     return MemoryConsolidationResult(
         save_id=save_id,
@@ -864,6 +887,7 @@ def _merge_results(
         rejected_count=sum(result.rejected_count for result in batch_results),
         batch_count=batch_count,
         completed_batch_count=len(batch_results),
+        tool_diagnostics=dict(tool_diagnostics or {}),
     )
 
 

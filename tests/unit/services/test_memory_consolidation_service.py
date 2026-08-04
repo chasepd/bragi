@@ -135,6 +135,36 @@ class ShapeFailingConsolidationProvider(ShapeSwitchConsolidationProvider):
         )
 
 
+class RateLimitedConsolidationProvider(ShapeSwitchConsolidationProvider):
+    """Tool-capable consolidation provider that rate-limits but structured works."""
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.RATE_LIMITED,
+            "rate limited",
+            status_code=429,
+        )
+
+
+class FailingConsolidationFallbackProvider(FakeToolProvider):
+    provider_name = "fallback"
+
+    def __init__(self, *, error: ProviderError) -> None:
+        super().__init__(responses=[])
+        self.error = error
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_requests.append(request)
+        raise self.error
+
+
 def test_consolidation_rewrites_canonical_archives_duplicates_and_unions_sources(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -489,6 +519,16 @@ def test_consolidation_tool_calls_switch_to_structured_route_on_model_not_found(
     assert result.rewritten_count == 1
     assert result.archived_count == 1
 
+    jobs = _consolidation_jobs(repositories, save.id)
+    assert len(jobs) == 1
+    assert jobs[0]["status"] == "succeeded"
+    result_json = json.loads(jobs[0]["result_json"])
+    assert result_json["tool_diagnostics"] == {
+        "shape_switch": "structured_output",
+        "provider": "fake",
+        "model": "fake-tools",
+    }
+
 
 def test_consolidation_tool_calls_keep_error_when_structured_route_also_fails(
     repositories: PersistenceRepositories,
@@ -518,6 +558,192 @@ def test_consolidation_tool_calls_keep_error_when_structured_route_also_fails(
     assert exc_info.value.fallback_attempted is True
     assert exc_info.value.fallback_provider == "fake"
     assert len(provider.structured_requests) == 1
+
+
+def test_consolidation_recovers_when_tool_fallback_also_model_not_found(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, messages = _save_with_messages(repositories)
+    canonical = repositories.add_memory(
+        save_id=save.id,
+        body="Ilyra trusts Mara with the beacon lens.",
+        tags=["relationship"],
+        importance=0.7,
+        source_message_id=messages[0].id,
+    )
+    duplicate = repositories.add_memory(
+        save_id=save.id,
+        body="Captain Ilyra trusts Mara around the beacon.",
+        tags=["relationship", "ilyra"],
+        importance=0.8,
+        source_message_id=messages[1].id,
+    )
+    _configure_consolidation_tool_fallback(repositories)
+    primary = ShapeSwitchConsolidationProvider(
+        structured_data={
+            "clusters": [
+                {
+                    "canonical_memory_id": canonical.id,
+                    "merged_memory_ids": [duplicate.id],
+                    "body": "Captain Ilyra trusts Mara with the beacon lens.",
+                    "tags": ["relationship"],
+                    "importance": 0.9,
+                    "confidence": 0.95,
+                    "reason": "The memories describe the same relationship.",
+                }
+            ]
+        }
+    )
+    fallback = FailingConsolidationFallbackProvider(
+        error=ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "fallback model not found",
+            status_code=404,
+        )
+    )
+
+    result = asyncio.run(
+        MemoryConsolidationService(
+            repositories=repositories,
+            provider=primary,
+            provider_name="fake",
+            model_id="fake-tools",
+            prefer_tool_calls=True,
+            providers={
+                "fake": cast(Any, primary),
+                "fallback": cast(Any, fallback),
+            },
+        ).consolidate_if_needed(save.id, min_active_memories=1)
+    )
+
+    assert len(primary.tool_requests) == 1
+    assert len(fallback.tool_requests) == 1
+    assert len(primary.structured_requests) == 1
+    assert result.rewritten_count == 1
+
+
+def test_consolidation_recovers_when_tool_fallback_model_missing(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, messages = _save_with_messages(repositories)
+    canonical = repositories.add_memory(
+        save_id=save.id,
+        body="Ilyra trusts Mara with the beacon lens.",
+        tags=["relationship"],
+        importance=0.7,
+        source_message_id=messages[0].id,
+    )
+    duplicate = repositories.add_memory(
+        save_id=save.id,
+        body="Captain Ilyra trusts Mara around the beacon.",
+        tags=["relationship", "ilyra"],
+        importance=0.8,
+        source_message_id=messages[1].id,
+    )
+    _configure_consolidation_tool_fallback(repositories)
+    primary = RateLimitedConsolidationProvider(
+        structured_data={
+            "clusters": [
+                {
+                    "canonical_memory_id": canonical.id,
+                    "merged_memory_ids": [duplicate.id],
+                    "body": "Captain Ilyra trusts Mara with the beacon lens.",
+                    "tags": ["relationship"],
+                    "importance": 0.9,
+                    "confidence": 0.95,
+                    "reason": "The memories describe the same relationship.",
+                }
+            ]
+        }
+    )
+    fallback = FailingConsolidationFallbackProvider(
+        error=ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "fallback model missing",
+            status_code=404,
+        )
+    )
+
+    result = asyncio.run(
+        MemoryConsolidationService(
+            repositories=repositories,
+            provider=primary,
+            provider_name="fake",
+            model_id="fake-tools",
+            prefer_tool_calls=True,
+            providers={
+                "fake": cast(Any, primary),
+                "fallback": cast(Any, fallback),
+            },
+        ).consolidate_if_needed(save.id, min_active_memories=1)
+    )
+
+    assert len(primary.tool_requests) == 1
+    assert len(fallback.tool_requests) == 1
+    assert len(primary.structured_requests) == 1
+    assert result.rewritten_count == 1
+
+
+def test_consolidation_keeps_fallback_result_when_tool_fallback_succeeds(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, messages = _save_with_messages(repositories)
+    canonical = repositories.add_memory(
+        save_id=save.id,
+        body="Ilyra trusts Mara with the beacon lens.",
+        tags=["relationship"],
+        importance=0.7,
+        source_message_id=messages[0].id,
+    )
+    duplicate = repositories.add_memory(
+        save_id=save.id,
+        body="Captain Ilyra trusts Mara around the beacon.",
+        tags=["relationship", "ilyra"],
+        importance=0.8,
+        source_message_id=messages[1].id,
+    )
+    _configure_consolidation_tool_fallback(repositories)
+    primary = ShapeSwitchConsolidationProvider()
+    fallback = FakeToolProvider(
+        responses=[
+            (
+                ProviderToolCall(
+                    id="merge-call",
+                    name="merge_memory_cluster",
+                    arguments_json=json.dumps(
+                        {
+                            "canonical_memory_id": canonical.id,
+                            "merged_memory_ids": [duplicate.id],
+                            "body": "Captain Ilyra trusts Mara with the beacon lens.",
+                            "tags": ["relationship"],
+                            "importance": 0.9,
+                            "confidence": 0.95,
+                            "reason": "The memories describe the same relationship.",
+                        }
+                    ),
+                ),
+            )
+        ]
+    )
+
+    result = asyncio.run(
+        MemoryConsolidationService(
+            repositories=repositories,
+            provider=primary,
+            provider_name="fake",
+            model_id="fake-tools",
+            prefer_tool_calls=True,
+            providers={
+                "fake": cast(Any, primary),
+                "fallback": cast(Any, fallback),
+            },
+        ).consolidate_if_needed(save.id, min_active_memories=1)
+    )
+
+    assert len(primary.tool_requests) == 1
+    assert len(fallback.tool_requests) == 1
+    assert primary.structured_requests == []
+    assert result.rewritten_count == 1
 
 
 def test_consolidation_tool_calls_retry_duplicate_merged_ids(
@@ -912,3 +1138,43 @@ def _save_with_messages(
         ),
     )
     return save, messages
+
+
+def _configure_consolidation_tool_fallback(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.set_app_setting("tool_call_fallback_enabled", True)
+    repositories.set_model_preference(
+        task="tool_call_fallback",
+        provider="fallback",
+        model_id="fallback-tools",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-tools",
+        display_name="Fake Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    repositories.save_provider_model(
+        provider="fallback",
+        model_id="fallback-tools",
+        display_name="Fallback Tools",
+        capabilities=["tool_calling"],
+    )
+
+
+def _consolidation_jobs(
+    repositories: PersistenceRepositories,
+    save_id: str,
+) -> list[sqlite3.Row]:
+    return list(
+        repositories.connection.execute(
+            """
+            SELECT status, result_json, error
+            FROM jobs
+            WHERE save_id = ? AND type = 'memory_consolidation'
+            ORDER BY created_at
+            """,
+            (save_id,),
+        )
+    )

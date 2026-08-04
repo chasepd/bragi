@@ -145,6 +145,36 @@ class ShapeFailingToolProvider(ShapeSwitchToolProvider):
         )
 
 
+class RateLimitedShapeSwitchToolProvider(ShapeSwitchToolProvider):
+    """Tool-capable evolver provider that rate-limits but structured works."""
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.RATE_LIMITED,
+            "rate limited",
+            status_code=429,
+        )
+
+
+class FailingScenarioEvolutionFallbackProvider(FakeToolProvider):
+    provider_name = "fallback"
+
+    def __init__(self, *, error: ProviderError) -> None:
+        super().__init__(responses=[])
+        self.error = error
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_requests.append(request)
+        raise self.error
+
+
 def _create_full_roleplay_save(
     repositories: PersistenceRepositories,
 ) -> tuple[str, str, str]:
@@ -166,6 +196,29 @@ def _create_full_roleplay_save(
         body="The warden climbs to the beacon gallery.",
     )
     return save.id, scenario.id, message.id
+
+
+def _configure_scenario_evolution_tool_fallback(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-tools",
+        display_name="Fake Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    repositories.set_app_setting("tool_call_fallback_enabled", True)
+    repositories.set_model_preference(
+        task="tool_call_fallback",
+        provider="fallback",
+        model_id="fallback-tools",
+    )
+    repositories.save_provider_model(
+        provider="fallback",
+        model_id="fallback-tools",
+        display_name="Fallback Tools",
+        capabilities=["tool_calling"],
+    )
 
 
 def _create_first_contact_save(
@@ -615,7 +668,12 @@ def test_tool_calling_evolver_switches_to_structured_route_on_model_not_found(
                     reason="The location changed during play.",
                     source_message_id=message_id,
                 ),
-            )
+            ),
+            diagnostics={
+                "shape_switch": "structured_output",
+                "provider": "fake",
+                "model": "fake-tools",
+            },
         )
 
     asyncio.run(run())
@@ -652,6 +710,140 @@ def test_tool_calling_evolver_keeps_error_when_structured_route_also_fails(
         assert exc_info.value.fallback_attempted is True
         assert exc_info.value.fallback_provider == "fake"
         assert len(provider.structured_requests) == 1
+
+
+def test_tool_calling_evolver_recovers_when_tool_fallback_also_model_not_found(
+    repositories: PersistenceRepositories,
+) -> None:
+    async def run() -> None:
+        save_id, _scenario_id, message_id = _create_full_roleplay_save(repositories)
+        _configure_scenario_evolution_tool_fallback(repositories)
+        messages = tuple(repositories.list_messages(save_id))
+        primary = ShapeSwitchToolProvider(
+            structured_data={
+                "content": {"current_scene": "The beacon gallery hums."},
+                "reason": "The location changed during play.",
+                "source_message_id": message_id,
+            }
+        )
+        fallback = FailingScenarioEvolutionFallbackProvider(
+            error=ProviderError(
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "fallback model not found",
+                status_code=404,
+            )
+        )
+
+        evolution = await ToolCallingProviderScenarioEvolver(
+            provider=primary,
+            provider_name="fake",
+            model_id="fake-tools",
+            providers={"fake": cast(Any, primary), "fallback": cast(Any, fallback)},
+        ).evolve(
+            ScenarioEvolutionRequest(save_id=save_id, messages=messages),
+            repositories=repositories,
+        )
+
+        assert len(primary.tool_requests) == 1
+        assert len(fallback.tool_requests) == 1
+        assert len(primary.structured_requests) == 1
+        assert evolution.diagnostics["shape_switch"] == "structured_output"
+        assert [update.section_id for update in evolution.updates] == [
+            "current_scene"
+        ]
+
+    asyncio.run(run())
+
+
+def test_tool_calling_evolver_recovers_when_tool_fallback_model_missing(
+    repositories: PersistenceRepositories,
+) -> None:
+    async def run() -> None:
+        save_id, _scenario_id, message_id = _create_full_roleplay_save(repositories)
+        _configure_scenario_evolution_tool_fallback(repositories)
+        messages = tuple(repositories.list_messages(save_id))
+        primary = RateLimitedShapeSwitchToolProvider(
+            structured_data={
+                "content": {"current_scene": "The beacon gallery hums."},
+                "reason": "The location changed during play.",
+                "source_message_id": message_id,
+            }
+        )
+        fallback = FailingScenarioEvolutionFallbackProvider(
+            error=ProviderError(
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "fallback model missing",
+                status_code=404,
+            )
+        )
+
+        evolution = await ToolCallingProviderScenarioEvolver(
+            provider=primary,
+            provider_name="fake",
+            model_id="fake-tools",
+            providers={"fake": cast(Any, primary), "fallback": cast(Any, fallback)},
+        ).evolve(
+            ScenarioEvolutionRequest(save_id=save_id, messages=messages),
+            repositories=repositories,
+        )
+
+        assert len(primary.tool_requests) == 1
+        assert len(fallback.tool_requests) == 1
+        assert len(primary.structured_requests) == 1
+        assert evolution.diagnostics["shape_switch"] == "structured_output"
+        assert [update.section_id for update in evolution.updates] == [
+            "current_scene"
+        ]
+
+    asyncio.run(run())
+
+
+def test_tool_calling_evolver_keeps_fallback_result_when_tool_fallback_succeeds(
+    repositories: PersistenceRepositories,
+) -> None:
+    async def run() -> None:
+        save_id, _scenario_id, message_id = _create_full_roleplay_save(repositories)
+        _configure_scenario_evolution_tool_fallback(repositories)
+        messages = tuple(repositories.list_messages(save_id))
+        primary = ShapeSwitchToolProvider()
+        fallback = FakeToolProvider(
+            responses=[
+                (
+                    ProviderToolCall(
+                        id="evolution-call",
+                        name="update_scenario_section",
+                        arguments_json=json.dumps(
+                            {
+                                "section_id": "current_scene",
+                                "text": "The beacon gallery hums.",
+                                "reason": "The location changed during play.",
+                                "source_message_id": message_id,
+                            }
+                        ),
+                    ),
+                )
+            ]
+        )
+
+        evolution = await ToolCallingProviderScenarioEvolver(
+            provider=primary,
+            provider_name="fake",
+            model_id="fake-tools",
+            providers={"fake": cast(Any, primary), "fallback": cast(Any, fallback)},
+        ).evolve(
+            ScenarioEvolutionRequest(save_id=save_id, messages=messages),
+            repositories=repositories,
+        )
+
+        assert len(primary.tool_requests) == 1
+        assert len(fallback.tool_requests) == 1
+        assert primary.structured_requests == []
+        assert evolution.diagnostics == {}
+        assert [update.section_id for update in evolution.updates] == [
+            "current_scene"
+        ]
+
+    asyncio.run(run())
 
     asyncio.run(run())
 

@@ -59,6 +59,7 @@ from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
     provider_error_with_fallback_skipped_reason,
     recover_tool_call_shape_with_structured_output,
+    shape_switch_diagnostics,
     structured_output_with_fallback,
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
@@ -464,11 +465,10 @@ class ToolCallingProviderStateExtractor:
             extraction = await structured_extractor.extract(request)
             return replace(
                 extraction,
-                tool_diagnostics={
-                    "shape_switch": "structured_output",
-                    "provider": self.provider_name,
-                    "model": self.model_id,
-                },
+                tool_diagnostics=shape_switch_diagnostics(
+                    provider=self.provider_name,
+                    model_id=self.model_id,
+                ),
             )
 
         return await recover_tool_call_shape_with_structured_output(

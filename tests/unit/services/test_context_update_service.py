@@ -401,6 +401,21 @@ class ShapeFailingContextUpdateProvider(ShapeSwitchContextUpdateProvider):
         )
 
 
+class RateLimitedShapeSwitchContextUpdateProvider(ShapeSwitchContextUpdateProvider):
+    """Tool-capable updater that rate-limits but structured output works."""
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_call_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.RATE_LIMITED,
+            "rate limited",
+            status_code=429,
+        )
+
+
 def test_update_after_turn_only_sends_selected_prior_context_to_extractors(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -2464,6 +2479,11 @@ def test_tool_calling_context_updater_switches_to_structured_route_on_model_not_
     assert len(provider.structured_output_requests) == 1
     assert extraction.scene is not None
     assert extraction.scene.situation == "Structured extraction recovers the scene."
+    assert extraction.tool_diagnostics == {
+        "shape_switch": "structured_output",
+        "provider": "primary",
+        "model": "primary-tools",
+    }
 
 
 def test_tool_calling_context_updater_keeps_error_when_structured_route_also_fails(
@@ -2502,6 +2522,182 @@ def test_tool_calling_context_updater_keeps_error_when_structured_route_also_fai
     assert exc_info.value.fallback_attempted is True
     assert exc_info.value.fallback_provider == "primary"
     assert len(provider.structured_output_requests) == 1
+
+
+def test_tool_calling_context_updater_recovers_when_tool_fallback_also_model_not_found(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, _player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="primary",
+        model_id="primary-tools",
+        display_name="Primary Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    _configure_context_update_tool_fallback(repositories)
+    primary = ShapeSwitchContextUpdateProvider(
+        structured_data={
+            "scene": {
+                "source_message_id": narrator_message.id,
+                "evidence_quote": "Captain Ilyra",
+                "situation": "Structured extraction recovers the scene.",
+            }
+        }
+    )
+    fallback = SequenceToolCallProvider(
+        provider_name="fallback",
+        responses=[
+            ProviderError(
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "fallback model not found",
+                status_code=404,
+            )
+        ],
+    )
+    updater = module.ToolCallingProviderContextUpdater(
+        provider=primary,
+        provider_name="primary",
+        model_id="primary-tools",
+        repositories=repositories,
+        providers={"primary": primary, "fallback": fallback},
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(narrator_message,),
+        scene_snapshot=None,
+        locations=(),
+        characters=(),
+        active_threads=(),
+        entity_links=(),
+    )
+
+    extraction = asyncio.run(updater.extract(request))
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(fallback.tool_call_requests) == 1
+    assert len(primary.structured_output_requests) == 1
+    assert extraction.scene is not None
+    assert extraction.scene.situation == "Structured extraction recovers the scene."
+    assert extraction.tool_diagnostics["shape_switch"] == "structured_output"
+
+
+def test_tool_calling_context_updater_recovers_when_tool_fallback_model_missing(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, _player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="primary",
+        model_id="primary-tools",
+        display_name="Primary Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    _configure_context_update_tool_fallback(repositories)
+    primary = RateLimitedShapeSwitchContextUpdateProvider(
+        structured_data={
+            "scene": {
+                "source_message_id": narrator_message.id,
+                "evidence_quote": "Captain Ilyra",
+                "situation": "Structured extraction recovers the scene.",
+            }
+        }
+    )
+    fallback = SequenceToolCallProvider(
+        provider_name="fallback",
+        responses=[
+            ProviderError(
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "fallback model missing",
+                status_code=404,
+            )
+        ],
+    )
+    updater = module.ToolCallingProviderContextUpdater(
+        provider=primary,
+        provider_name="primary",
+        model_id="primary-tools",
+        repositories=repositories,
+        providers={"primary": primary, "fallback": fallback},
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(narrator_message,),
+        scene_snapshot=None,
+        locations=(),
+        characters=(),
+        active_threads=(),
+        entity_links=(),
+    )
+
+    extraction = asyncio.run(updater.extract(request))
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(fallback.tool_call_requests) == 1
+    assert len(primary.structured_output_requests) == 1
+    assert extraction.scene is not None
+    assert extraction.scene.situation == "Structured extraction recovers the scene."
+    assert extraction.tool_diagnostics["shape_switch"] == "structured_output"
+
+
+def test_tool_calling_context_updater_keeps_fallback_result_when_tool_fallback_succeeds(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, _player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="primary",
+        model_id="primary-tools",
+        display_name="Primary Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    _configure_context_update_tool_fallback(repositories)
+    primary = ShapeSwitchContextUpdateProvider()
+    fallback = SequenceToolCallProvider(
+        provider_name="fallback",
+        responses=[
+            (
+                ProviderToolCall(
+                    id="call-scene",
+                    name="update_scene_snapshot",
+                    arguments_json=json.dumps(
+                        {
+                            "source_message_id": narrator_message.id,
+                            "evidence_quote": "beacon gallery",
+                            "current_location_name": "Beacon Gallery",
+                            "situation": "Mara and Ilyra steady the beacon lens.",
+                            "present_character_names": ["Captain Ilyra"],
+                            "confidence": 0.86,
+                        }
+                    ),
+                ),
+            )
+        ],
+    )
+    updater = module.ToolCallingProviderContextUpdater(
+        provider=primary,
+        provider_name="primary",
+        model_id="primary-tools",
+        repositories=repositories,
+        providers={"primary": primary, "fallback": fallback},
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(narrator_message,),
+        scene_snapshot=None,
+        locations=(),
+        characters=(),
+        active_threads=(),
+        entity_links=(),
+    )
+
+    extraction = asyncio.run(updater.extract(request))
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(fallback.tool_call_requests) == 1
+    assert primary.structured_output_requests == []
+    assert extraction.scene is not None
+    assert extraction.scene.situation == "Mara and Ilyra steady the beacon lens."
 
 
 def test_tool_calling_context_updater_select_context_switches_to_structured_route(
@@ -8213,6 +8409,23 @@ def _save_with_completed_turn(
         token_estimate=9,
     )
     return save, player_message, narrator_message
+
+
+def _configure_context_update_tool_fallback(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.set_app_setting("tool_call_fallback_enabled", True)
+    repositories.set_model_preference(
+        task="tool_call_fallback",
+        provider="fallback",
+        model_id="fallback-tools",
+    )
+    repositories.save_provider_model(
+        provider="fallback",
+        model_id="fallback-tools",
+        display_name="Fallback Tools",
+        capabilities=["tool_calling"],
+    )
 
 
 def _count(result: object, name: str) -> int:

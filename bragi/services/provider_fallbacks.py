@@ -834,6 +834,19 @@ def _shape_recovery_wrapped_error(exc: Exception) -> ProviderError:
     )
 
 
+def shape_switch_diagnostics(
+    *,
+    provider: str,
+    model_id: str,
+) -> dict[str, object]:
+    """Diagnostics marker for a recovery through the structured-output route."""
+    return {
+        "shape_switch": "structured_output",
+        "provider": provider,
+        "model": model_id,
+    }
+
+
 def _with_shape_recovery_failure(
     exc: ProviderError,
     *,
