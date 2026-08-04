@@ -5503,12 +5503,16 @@ function PendingJobRow({
   const label = jobTypeLabel(tracked.job.type);
   const progress = tracked.progress || labelize(tracked.job.status);
   const visiblePhases = expanded ? visiblePostTurnPhases(tracked.phases, expandedFull) : [];
+  const longRunningHint = useLongRunningJobHint(tracked);
   return (
     <div className={visiblePhases.length ? "pending-job-row expanded-with-phases" : "pending-job-row"}>
       <Loader2 className="spin" size={15} />
       <div>
         <strong>{label}</strong>
         <span>{progress}</span>
+        {longRunningHint ? (
+          <span className="pending-job-hint">{longRunningHint}</span>
+        ) : null}
         {visiblePhases.length ? (
           <div className="pending-job-phases">
             {visiblePhases.map((phase) => (
@@ -5530,6 +5534,29 @@ function PendingJobRow({
       </button>
     </div>
   );
+}
+
+const LONG_RUNNING_JOB_HINT_SECONDS = 60;
+const CANCEL_STUCK_HINT_SECONDS = 15;
+
+function useLongRunningJobHint(tracked: TrackedJob): string | null {
+  const [now, setNow] = useState(() => Date.now());
+  const createdAt = tracked.job.created_at;
+  useEffect(() => {
+    if (!createdAt) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 5000);
+    return () => window.clearInterval(timer);
+  }, [createdAt]);
+  if (!createdAt) return null;
+  const elapsedSeconds = Math.max(0, Math.floor((now - createdAt * 1000) / 1000));
+  const isCancelling = tracked.progress === "Cancelling";
+  if (isCancelling && elapsedSeconds >= CANCEL_STUCK_HINT_SECONDS) {
+    return "Cancelling. The current provider call cannot be interrupted until it completes; you can keep waiting or close this view.";
+  }
+  if (elapsedSeconds >= LONG_RUNNING_JOB_HINT_SECONDS) {
+    return "This is taking longer than usual. You can cancel and try again.";
+  }
+  return null;
 }
 
 function EmptyState({

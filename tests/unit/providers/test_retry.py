@@ -411,5 +411,121 @@ def test_is_transient_provider_error_classifies_retryable_categories() -> None:
     )
 
 
+def test_call_with_provider_retries_aborts_on_global_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        attempts = 0
+        events: list[tuple[str, dict[str, object]]] = []
+        current_time = {"value": 0.0}
+
+        async def operation() -> object:
+            nonlocal attempts
+            attempts += 1
+            current_time["value"] += 1.0
+            raise ProviderError(
+                ProviderErrorCategory.NETWORK_ERROR,
+                "slow upstream",
+            )
+
+        async def scheduled_sleep(delay: float) -> None:
+            current_time["value"] += delay
+
+        monkeypatch.setattr("bragi.providers.retry.asyncio.sleep", scheduled_sleep)
+        monkeypatch.setattr(
+            "bragi.providers.retry.perf_counter",
+            lambda: current_time["value"],
+        )
+        monkeypatch.setattr(
+            "bragi.providers.retry._retry_delay",
+            lambda **_kwargs: 0.0,
+        )
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_error_event",
+            lambda event_name, **fields: events.append((event_name, fields)),
+        )
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_event",
+            lambda *_args, **_kwargs: None,
+        )
+
+        with pytest.raises(ProviderError) as exc_info:
+            await call_with_provider_retries(
+                operation,
+                provider="fake",
+                task="structured_output",
+                max_attempts=7,
+                call_deadline_seconds=2.5,
+            )
+
+        assert exc_info.value.category is ProviderErrorCategory.NETWORK_ERROR
+        assert "global deadline" in str(exc_info.value)
+        assert exc_info.value.diagnostics.get("deadline_exceeded") is True
+        assert exc_info.value.diagnostics.get("deadline_seconds") == 2.5
+        assert attempts < 7
+        assert any(
+            event_name == "provider.retry_deadline_exceeded"
+            for event_name, _fields in events
+        )
+
+    asyncio.run(run())
+
+
+def test_call_with_provider_retries_clamps_retry_delay_to_deadline_remaining(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        attempts = 0
+        current_time = {"value": 0.0}
+        sleeps: list[float] = []
+
+        async def operation() -> object:
+            nonlocal attempts
+            attempts += 1
+            current_time["value"] += 0.1
+            if attempts < 2:
+                raise ProviderError(
+                    ProviderErrorCategory.NETWORK_ERROR,
+                    "flaky",
+                )
+            return {"body": "ok"}
+
+        async def scheduled_sleep(delay: float) -> None:
+            sleeps.append(delay)
+            current_time["value"] += delay
+
+        monkeypatch.setattr("bragi.providers.retry.asyncio.sleep", scheduled_sleep)
+        monkeypatch.setattr(
+            "bragi.providers.retry.perf_counter",
+            lambda: current_time["value"],
+        )
+        monkeypatch.setattr(
+            "bragi.providers.retry._retry_delay",
+            lambda **_kwargs: 5.0,
+        )
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_error_event",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_event",
+            lambda *_args, **_kwargs: None,
+        )
+
+        result = await call_with_provider_retries(
+            operation,
+            provider="fake",
+            task="chat",
+            max_attempts=5,
+            call_deadline_seconds=2.0,
+        )
+
+        body = cast(dict[str, object], result)["body"]
+        assert body == "ok"
+        assert sleeps[0] == 1.9
+
+    asyncio.run(run())
+
+
 async def _no_sleep(_delay: float) -> None:
     return None

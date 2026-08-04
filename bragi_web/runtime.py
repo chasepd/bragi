@@ -567,11 +567,19 @@ def _provider_clients(
     *,
     repositories: Any | None = None,
 ) -> dict[str, Any]:
-    from bragi.retry_policy import configured_max_attempts
+    from bragi.retry_policy import (
+        configured_max_attempts,
+        configured_provider_call_deadline_seconds,
+    )
 
     bindings = bragi_runtime_bindings()
     retry_max_attempts = (
         (lambda: configured_max_attempts(repositories))
+        if repositories is not None
+        else None
+    )
+    call_deadline_seconds = (
+        (lambda: configured_provider_call_deadline_seconds(repositories))
         if repositories is not None
         else None
     )
@@ -582,10 +590,12 @@ def _provider_clients(
         "openrouter": bindings.OpenRouterClient(
             secret_store=secret_store,
             retry_max_attempts=retry_max_attempts,
+            call_deadline_seconds=call_deadline_seconds,
         ),
         "venice": bindings.VeniceClient(
             secret_store=secret_store,
             retry_max_attempts=retry_max_attempts,
+            call_deadline_seconds=call_deadline_seconds,
         ),
     }
 

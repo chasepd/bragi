@@ -8,7 +8,7 @@ import pytest
 
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
-from bragi.providers.contracts import ChatMessage, ChatRequest
+from bragi.providers.contracts import ChatMessage, ChatRequest, StructuredOutputRequest
 from bragi.services.generation_settings import (
     CHAT_MAX_OUTPUT_TOKENS_ENABLED_SETTING,
     CHAT_MAX_OUTPUT_TOKENS_SETTING,
@@ -382,3 +382,120 @@ def test_openrouter_reasoning_config_reads_model_specific_setting(
         )
         is None
     )
+
+
+def test_model_thinking_off_for_mandatory_model_sends_effort_none(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="venice",
+        model_id="venice-mandatory-reasoning",
+        display_name="Mandatory",
+        capabilities=["chat"],
+        thinking={"levels": ["high", "medium", "low"], "mandatory": True},
+    )
+    repositories.set_app_setting(
+        MODEL_THINKING_PREFERENCES_SETTING,
+        {
+            "chat": {
+                "provider": "venice",
+                "model_id": "venice-mandatory-reasoning",
+                "level": THINKING_LEVEL_OFF,
+            },
+        },
+    )
+
+    config = model_thinking_reasoning_config(
+        repositories,
+        task="chat",
+        provider="venice",
+        model_id="venice-mandatory-reasoning",
+    )
+
+    assert config is not None
+    assert config.effort == "none"
+    assert config.exclude is True
+    assert config.enabled is None
+    assert (
+        model_thinking_preference_level(
+            repositories,
+            task="chat",
+            provider="venice",
+            model_id="venice-mandatory-reasoning",
+        )
+        == THINKING_LEVEL_OFF
+    )
+
+
+def test_model_thinking_off_for_optional_model_sends_disabled(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="optional-reasoning",
+        display_name="Optional",
+        capabilities=["chat"],
+        thinking={"levels": ["high", "low", "none"], "mandatory": False},
+    )
+    repositories.set_app_setting(
+        MODEL_THINKING_PREFERENCES_SETTING,
+        {
+            "chat": {
+                "provider": "openrouter",
+                "model_id": "optional-reasoning",
+                "level": THINKING_LEVEL_OFF,
+            },
+        },
+    )
+
+    config = model_thinking_reasoning_config(
+        repositories,
+        task="chat",
+        provider="openrouter",
+        model_id="optional-reasoning",
+    )
+
+    assert config is not None
+    assert config.enabled is False
+    assert config.exclude is True
+    assert config.effort is None
+
+
+def test_model_thinking_off_propagates_to_structured_output(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="venice",
+        model_id="venice-mandatory-reasoning",
+        display_name="Mandatory",
+        capabilities=["chat"],
+        thinking={"levels": ["high", "medium", "low"], "mandatory": True},
+    )
+    repositories.set_app_setting(
+        MODEL_THINKING_PREFERENCES_SETTING,
+        {
+            "state_memory": {
+                "provider": "venice",
+                "model_id": "venice-mandatory-reasoning",
+                "level": THINKING_LEVEL_OFF,
+            },
+        },
+    )
+    request = StructuredOutputRequest(
+        provider="venice",
+        model_id="venice-mandatory-reasoning",
+        messages=(ChatMessage(role="user", body="extract"),),
+        schema_name="state",
+        schema={"type": "object", "properties": {}},
+    )
+
+    updated = request_with_model_thinking_preference(
+        repositories,
+        request,
+        task="state_memory",
+    )
+
+    assert updated.reasoning is not None
+    assert updated.reasoning.effort == "none"
+    assert updated.reasoning.exclude is True
+    assert updated is not request
