@@ -7,18 +7,14 @@ import random
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from time import perf_counter
-from typing import NoReturn, cast
+from typing import cast
 
 from bragi.app_logging import log_error_event, log_event
 from bragi.providers.contracts import (
     ProviderRetryProgress,
     ProviderRetryProgressCallback,
 )
-from bragi.providers.errors import (
-    PROVIDER_ERROR_MESSAGE_DIAGNOSTIC,
-    ProviderError,
-    ProviderErrorCategory,
-)
+from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.retry_policy import (
     DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS,
     PROVIDER_MAX_ATTEMPTS,
@@ -28,9 +24,6 @@ DEFAULT_PROVIDER_ATTEMPTS = PROVIDER_MAX_ATTEMPTS
 DEFAULT_BACKOFF_SECONDS = 0.4
 MAX_BACKOFF_SECONDS = 30.0
 RATE_LIMIT_BACKOFF_MULTIPLIER = 5.0
-NO_ENDPOINTS_ROUTING_ERROR_MESSAGE = (
-    "No endpoints found that can handle the requested parameters"
-)
 _TRANSIENT_CATEGORIES = frozenset(
     {
         ProviderErrorCategory.NETWORK_ERROR,
@@ -60,18 +53,8 @@ async def call_with_provider_retries[T](
     deadline_seconds = max(0.0, float(call_deadline_seconds))
     attempt_diagnostics: list[dict[str, object]] = []
     call_started_at = perf_counter()
-    # OpenRouter "no endpoints found" 404s run no inference and bill nothing, so
-    # once one is seen the loop keeps retrying without the attempt budget or the
-    # per-call deadline until it succeeds or the failure type changes.
-    unlimited_no_endpoints = False
-    attempt = 0
-    while True:
-        attempt += 1
-        no_endpoints_attempt = False
-        if (
-            not unlimited_no_endpoints
-            and _elapsed_seconds(call_started_at) > deadline_seconds
-        ):
+    for attempt in range(1, attempts + 1):
+        if _elapsed_seconds(call_started_at) > deadline_seconds:
             raise _deadline_exceeded_error(
                 provider=provider,
                 task=task,
@@ -93,23 +76,7 @@ async def call_with_provider_retries[T](
                     duration_ms=duration_ms,
                 )
             )
-            no_endpoints_attempt = is_no_endpoints_routing_error(exc)
-            if unlimited_no_endpoints and not no_endpoints_attempt:
-                _raise_retry_exhausted_error(
-                    provider=provider,
-                    task=task,
-                    attempt=attempt,
-                    max_attempts=attempts,
-                    duration_ms=duration_ms,
-                    category=category,
-                    exc=exc,
-                    attempt_diagnostics=attempt_diagnostics,
-                    no_endpoints_terminated=True,
-                )
-            if (
-                not no_endpoints_attempt
-                and _elapsed_seconds(call_started_at) > deadline_seconds
-            ):
+            if _elapsed_seconds(call_started_at) > deadline_seconds:
                 raise _deadline_exceeded_error(
                     provider=provider,
                     task=task,
@@ -118,37 +85,45 @@ async def call_with_provider_retries[T](
                     deadline_seconds=deadline_seconds,
                     attempt_diagnostics=attempt_diagnostics,
                 ) from exc
-            if not no_endpoints_attempt and (
-                attempt >= attempts or not _is_transient(exc)
-            ):
-                _raise_retry_exhausted_error(
+            if attempt >= attempts or not _is_transient(exc):
+                log_error_event(
+                    "provider.retry_exhausted",
                     provider=provider,
                     task=task,
                     attempt=attempt,
                     max_attempts=attempts,
                     duration_ms=duration_ms,
-                    category=category,
-                    exc=exc,
-                    attempt_diagnostics=attempt_diagnostics,
+                    error_category=category,
+                    error=str(exc),
                 )
+                if isinstance(exc, ProviderError):
+                    raise ProviderError(
+                        category=exc.category,
+                        message=exc.message,
+                        status_code=exc.status_code,
+                        retry_attempt_count=attempt,
+                        max_retry_attempts=attempts,
+                        retry_attempts=tuple(attempt_diagnostics),
+                        diagnostics=dict(exc.diagnostics),
+                    ) from exc
+                raise
             delay = _retry_delay(
                 attempt=attempt,
                 base_delay=base_delay,
                 error_category=category,
             )
-            if not no_endpoints_attempt:
-                remaining = deadline_seconds - _elapsed_seconds(call_started_at)
-                if remaining <= 0:
-                    raise _deadline_exceeded_error(
-                        provider=provider,
-                        task=task,
-                        attempt=attempt,
-                        max_attempts=attempts,
-                        deadline_seconds=deadline_seconds,
-                        attempt_diagnostics=attempt_diagnostics,
-                    ) from exc
-                if delay > remaining:
-                    delay = remaining
+            remaining = deadline_seconds - _elapsed_seconds(call_started_at)
+            if remaining <= 0:
+                raise _deadline_exceeded_error(
+                    provider=provider,
+                    task=task,
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    deadline_seconds=deadline_seconds,
+                    attempt_diagnostics=attempt_diagnostics,
+                ) from exc
+            if delay > remaining:
+                delay = remaining
             log_error_event(
                 "provider.retry_scheduled",
                 provider=provider,
@@ -159,7 +134,6 @@ async def call_with_provider_retries[T](
                 retry_delay_ms=int(delay * 1000),
                 error_category=category,
                 error=str(exc),
-                no_endpoints_routing=no_endpoints_attempt,
             )
             _publish_retry_progress(
                 retry_progress_callback,
@@ -174,12 +148,9 @@ async def call_with_provider_retries[T](
                     http_status=(
                         exc.status_code if isinstance(exc, ProviderError) else None
                     ),
-                    unlimited=no_endpoints_attempt,
                 ),
             )
             await asyncio.sleep(delay)
-            if no_endpoints_attempt:
-                unlimited_no_endpoints = True
             continue
 
         duration_ms = _elapsed_ms(started_at)
@@ -207,27 +178,7 @@ async def call_with_provider_retries[T](
             retry_attempts=tuple(attempt_diagnostics),
         )
 
-
-def is_no_endpoints_routing_error(exc: Exception) -> bool:
-    """Match OpenRouter's transient routing 404 for no available endpoints.
-
-    OpenRouter returns this 404 (with the guidance message) when no endpoint
-    can currently handle the request. No inference ran and no billing applies,
-    so callers may keep retrying without regard for the retry budget.
-
-    The match relies on OpenRouter's message wording; if it changes, behavior
-    degrades safely to the ordinary terminal handling for 404s.
-    """
-
-    if not isinstance(exc, ProviderError):
-        return False
-    if exc.status_code != 404:
-        return False
-    message = exc.diagnostics.get(PROVIDER_ERROR_MESSAGE_DIAGNOSTIC)
-    return (
-        isinstance(message, str)
-        and NO_ENDPOINTS_ROUTING_ERROR_MESSAGE in message
-    )
+    raise AssertionError("provider retry loop exited unexpectedly")
 
 
 def is_transient_provider_error(exc: Exception) -> bool:
@@ -386,41 +337,3 @@ def _deadline_exceeded_error(
             "deadline_exceeded": True,
         },
     )
-
-
-def _raise_retry_exhausted_error(
-    *,
-    provider: str,
-    task: str,
-    attempt: int,
-    max_attempts: int,
-    duration_ms: int,
-    category: str,
-    exc: Exception,
-    attempt_diagnostics: list[dict[str, object]],
-    no_endpoints_terminated: bool = False,
-) -> NoReturn:
-    log_error_event(
-        "provider.retry_exhausted",
-        provider=provider,
-        task=task,
-        attempt=attempt,
-        max_attempts=max_attempts,
-        duration_ms=duration_ms,
-        error_category=category,
-        error=str(exc),
-    )
-    if isinstance(exc, ProviderError):
-        diagnostics = dict(exc.diagnostics)
-        if no_endpoints_terminated:
-            diagnostics["no_endpoints_retry_terminated"] = True
-        raise ProviderError(
-            category=exc.category,
-            message=exc.message,
-            status_code=exc.status_code,
-            retry_attempt_count=attempt,
-            max_retry_attempts=max_attempts,
-            retry_attempts=tuple(attempt_diagnostics),
-            diagnostics=diagnostics,
-        ) from exc
-    raise exc
