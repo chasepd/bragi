@@ -18,6 +18,7 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolCallResponse,
 )
+from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.services.scenario_evolution_service import (
     ScenarioEvolution,
     ScenarioEvolutionRequest,
@@ -91,6 +92,56 @@ class FakeToolProvider:
             body="",
             provider=request.provider,
             model_id=request.model_id,
+        )
+
+
+class ShapeSwitchToolProvider(FakeToolProvider):
+    """Tool-capable evolver provider whose tool calls 404 but structured works."""
+
+    def __init__(
+        self,
+        *,
+        structured_data: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(responses=[])
+        self.structured_data = structured_data or {}
+        self.structured_requests: list[StructuredOutputRequest] = []
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model not found",
+            status_code=404,
+        )
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_requests.append(request)
+        return StructuredOutputResponse(
+            data=self.structured_data,
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+class ShapeFailingToolProvider(ShapeSwitchToolProvider):
+    """Tool-capable evolver provider whose tool and structured calls both 404."""
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model not found",
+            status_code=404,
         )
 
 
@@ -520,6 +571,87 @@ def test_tool_calling_evolver_parses_section_updates(
             "update_scenario_section",
             "skip_scenario_evolution",
         ]
+
+    asyncio.run(run())
+
+
+def test_tool_calling_evolver_switches_to_structured_route_on_model_not_found(
+    repositories: PersistenceRepositories,
+) -> None:
+    async def run() -> None:
+        save_id, _scenario_id, message_id = _create_full_roleplay_save(repositories)
+        repositories.save_provider_model(
+            provider="fake",
+            model_id="fake-tools",
+            display_name="Fake Tools",
+            capabilities=["tool_calling", "structured_output"],
+        )
+        messages = tuple(repositories.list_messages(save_id))
+        provider = ShapeSwitchToolProvider(
+            structured_data={
+                "content": {"current_scene": "The beacon gallery hums."},
+                "reason": "The location changed during play.",
+                "source_message_id": message_id,
+            }
+        )
+
+        evolution = await ToolCallingProviderScenarioEvolver(
+            provider=provider,
+            provider_name="fake",
+            model_id="fake-tools",
+            providers={"fake": cast(Any, provider)},
+        ).evolve(
+            ScenarioEvolutionRequest(save_id=save_id, messages=messages),
+            repositories=repositories,
+        )
+
+        assert len(provider.tool_requests) == 1
+        assert len(provider.structured_requests) == 1
+        assert evolution == ScenarioEvolution(
+            updates=(
+                ScenarioSectionUpdate(
+                    section_id="current_scene",
+                    text="The beacon gallery hums.",
+                    reason="The location changed during play.",
+                    source_message_id=message_id,
+                ),
+            )
+        )
+
+    asyncio.run(run())
+
+
+def test_tool_calling_evolver_keeps_error_when_structured_route_also_fails(
+    repositories: PersistenceRepositories,
+) -> None:
+    async def run() -> None:
+        save_id, _scenario_id, _message_id = _create_full_roleplay_save(
+            repositories
+        )
+        repositories.save_provider_model(
+            provider="fake",
+            model_id="fake-tools",
+            display_name="Fake Tools",
+            capabilities=["tool_calling", "structured_output"],
+        )
+        messages = tuple(repositories.list_messages(save_id))
+        provider = ShapeFailingToolProvider()
+
+        with pytest.raises(ProviderError) as exc_info:
+            await ToolCallingProviderScenarioEvolver(
+                provider=provider,
+                provider_name="fake",
+                model_id="fake-tools",
+                providers={"fake": cast(Any, provider)},
+            ).evolve(
+                ScenarioEvolutionRequest(save_id=save_id, messages=messages),
+                repositories=repositories,
+            )
+
+        assert exc_info.value.category == ProviderErrorCategory.MODEL_NOT_FOUND
+        assert exc_info.value.fallback_attempted is True
+        assert exc_info.value.fallback_provider == "fake"
+        assert len(provider.structured_requests) == 1
 
     asyncio.run(run())
 

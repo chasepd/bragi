@@ -279,6 +279,59 @@ class FallbackToolContextProvider(SequenceToolContextProvider):
         ]
 
 
+class ShapeSwitchToolContextProvider(SequenceToolContextProvider):
+    """Tool-capable provider whose tool calls 404 but structured output works."""
+
+    def __init__(
+        self,
+        *,
+        response_data: dict[str, object] | None = None,
+        expansion_data: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(
+            responses=[
+                ProviderError(
+                    ProviderErrorCategory.MODEL_NOT_FOUND,
+                    "model not found",
+                    status_code=404,
+                )
+            ],
+            expansion_data=expansion_data,
+        )
+        self.response_data = response_data or {"selections": []}
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        if request.schema_name == "context_retrieval_expansion":
+            return await super().generate_structured_output(request)
+        self.structured_output_requests.append(request)
+        return StructuredOutputResponse(
+            data=self.response_data,
+            provider=request.provider,
+            model_id=request.model_id,
+            token_usage={"total": 13},
+        )
+
+
+class ShapeFailingToolContextProvider(ShapeSwitchToolContextProvider):
+    """Tool-capable provider whose tool and structured calls both 404."""
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        if request.schema_name == "context_retrieval_expansion":
+            return await super().generate_structured_output(request)
+        self.structured_output_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model not found",
+            status_code=404,
+        )
+
+
 class ScenarioSectionSelectingProvider(RecordingStructuredContextProvider):
     def __init__(self, *, selected_text: str) -> None:
         super().__init__()
@@ -1995,6 +2048,144 @@ def test_context_search_keeps_missing_tool_fallback_model_available(
     assert job_result["fallback_used"] is False
     assert job_result["error_category"] == ProviderErrorCategory.MODEL_NOT_FOUND.value
     assert job_result["http_status"] == 404
+
+
+def test_context_search_switches_to_structured_route_when_tool_route_model_not_found(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(
+        repositories,
+        model_capabilities=[
+            ProviderCapability.TOOL_CALLING.value,
+            ProviderCapability.STRUCTURED_OUTPUT.value,
+        ],
+    )
+    state = repositories.list_world_state(save.id)[0]
+    _configure_tool_fallback(repositories)
+    primary = ShapeSwitchToolContextProvider(
+        response_data={
+            "selections": [
+                {
+                    "source_type": "world_state",
+                    "source_id": state.id,
+                    "relevance_note": "Selected through the structured route.",
+                }
+            ]
+        }
+    )
+    fallback = FallbackToolContextProvider(
+        responses=[
+            ProviderError(
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "fallback model not found",
+                status_code=404,
+            )
+        ]
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": primary, "fallback": fallback},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(fallback.tool_call_requests) == 1
+    assert len(primary.structured_output_requests) == 1
+    assert [item.source_id for item in result.selected_state] == [state.id]
+    assert result.selected_state[0].relevance_note == (
+        "Selected through the structured route."
+    )
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "shape_fallback"
+    job_result = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    assert job_result["retrieval_degraded"] is True
+    assert job_result["retrieval_recovery"] == "shape_fallback"
+
+
+def test_context_search_switches_to_structured_route_when_tool_fallback_missing(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(
+        repositories,
+        model_capabilities=[
+            ProviderCapability.TOOL_CALLING.value,
+            ProviderCapability.STRUCTURED_OUTPUT.value,
+        ],
+    )
+    state = repositories.list_world_state(save.id)[0]
+    primary = ShapeSwitchToolContextProvider(
+        response_data={
+            "selections": [
+                {
+                    "source_type": "world_state",
+                    "source_id": state.id,
+                    "relevance_note": "Selected through the structured route.",
+                }
+            ]
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": primary},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(primary.structured_output_requests) == 1
+    assert [item.source_id for item in result.selected_state] == [state.id]
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "shape_fallback"
+
+
+def test_context_search_keeps_deterministic_when_structured_shape_recovery_fails(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(
+        repositories,
+        model_capabilities=[
+            ProviderCapability.TOOL_CALLING.value,
+            ProviderCapability.STRUCTURED_OUTPUT.value,
+        ],
+    )
+    state = repositories.list_world_state(save.id)[0]
+    _configure_tool_fallback(repositories)
+    primary = ShapeFailingToolContextProvider()
+    fallback = FallbackToolContextProvider(
+        responses=[
+            ProviderError(
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "fallback model not found",
+                status_code=404,
+            )
+        ]
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": primary, "fallback": fallback},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert len(primary.structured_output_requests) == 1
+    assert [item.source_id for item in result.selected_state] == [state.id]
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "deterministic_fallback"
+    job_result = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    assert job_result["retrieval_degraded"] is True
+    assert job_result["retrieval_recovery"] == "deterministic_fallback"
+    assert job_result["error_category"] == ProviderErrorCategory.MODEL_NOT_FOUND.value
 
 
 def test_context_search_retries_model_after_model_not_found(

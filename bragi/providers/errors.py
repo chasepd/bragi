@@ -60,6 +60,14 @@ def _fallback_details(exc: ProviderError) -> list[str]:
     return details
 
 
+def provider_error_is_model_not_found(exc: Exception | None) -> bool:
+    """Return whether a provider error means the model cannot serve the request."""
+    return (
+        isinstance(exc, ProviderError)
+        and exc.category == ProviderErrorCategory.MODEL_NOT_FOUND
+    )
+
+
 def map_http_status_to_category(status_code: int) -> ProviderErrorCategory:
     if status_code in {401, 403}:
         return ProviderErrorCategory.AUTHENTICATION_FAILED

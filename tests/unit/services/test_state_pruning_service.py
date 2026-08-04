@@ -26,6 +26,7 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolCallResponse,
 )
+from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.services.state_pruning_service import StatePruningService
 
 
@@ -146,6 +147,56 @@ class RecordingToolPruningProvider:
 
     async def generate_image(self, request: ImageRequest) -> ImageResponse:
         raise AssertionError("state pruning must not request image generation")
+
+
+class ShapeSwitchToolPruningProvider(RecordingToolPruningProvider):
+    """Tool-capable pruner whose tool calls 404 but structured output works."""
+
+    def __init__(
+        self,
+        *,
+        structured_data: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(responses=[])
+        self.structured_data = structured_data or {"archives": []}
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_call_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model not found",
+            status_code=404,
+        )
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_output_requests.append(request)
+        return StructuredOutputResponse(
+            data=self.structured_data,
+            provider=request.provider,
+            model_id=request.model_id,
+            token_usage={"total": 17},
+        )
+
+
+class ShapeFailingToolPruningProvider(ShapeSwitchToolPruningProvider):
+    """Tool-capable pruner whose tool and structured calls both 404."""
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_output_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model not found",
+            status_code=404,
+        )
 
 
 class SlowStructuredPruningProvider(RecordingStructuredPruningProvider):
@@ -364,6 +415,79 @@ def test_state_pruning_apply_guard_does_not_wrap_provider_calls(
         "lock:exit",
     ]
     assert lock_depth == 0
+
+
+def test_state_pruning_switches_to_structured_route_on_model_not_found(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _save_with_state_pruning_preference(
+        repositories,
+        model_capabilities=[
+            ProviderCapability.TOOL_CALLING.value,
+            ProviderCapability.STRUCTURED_OUTPUT.value,
+        ],
+    )
+    stale_state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="scene.old_alarm",
+        value={"status": "disabled", "location": "north stair"},
+        category="scene",
+    )
+    provider = ShapeSwitchToolPruningProvider(
+        structured_data={
+            "archives": [
+                {
+                    "world_state_id": stale_state.id,
+                    "key": stale_state.key,
+                    "reason": "The alarm was disabled and superseded.",
+                }
+            ]
+        }
+    )
+
+    result = asyncio.run(
+        StatePruningService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).prune(save_id=save.id)
+    )
+
+    assert len(provider.tool_call_requests) == 1
+    assert len(provider.structured_output_requests) == 1
+    assert [fact.world_state_id for fact in result.archived] == [stale_state.id]
+    assert _archived_at(repositories, stale_state.id) is not None
+
+
+def test_state_pruning_keeps_error_when_structured_route_also_fails(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _save_with_state_pruning_preference(
+        repositories,
+        model_capabilities=[
+            ProviderCapability.TOOL_CALLING.value,
+            ProviderCapability.STRUCTURED_OUTPUT.value,
+        ],
+    )
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="scene.old_alarm",
+        value={"status": "disabled", "location": "north stair"},
+        category="scene",
+    )
+    provider = ShapeFailingToolPruningProvider()
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            StatePruningService(
+                repositories=repositories,
+                providers={"fake": provider},
+            ).prune(save_id=save.id)
+        )
+
+    assert exc_info.value.category == ProviderErrorCategory.MODEL_NOT_FOUND
+    assert exc_info.value.fallback_attempted is True
+    assert exc_info.value.fallback_provider == "fake"
+    assert len(provider.structured_output_requests) == 1
 
 
 def test_state_pruning_prefers_tool_calls_for_tool_capable_model(

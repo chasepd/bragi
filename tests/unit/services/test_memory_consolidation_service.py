@@ -19,6 +19,7 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolCallResponse,
 )
+from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.services.memory_consolidation_service import MemoryConsolidationService
 from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.text_script_policy import (
@@ -82,6 +83,55 @@ class FakeToolProvider:
             body="",
             provider=request.provider,
             model_id=request.model_id,
+        )
+
+
+class ShapeSwitchConsolidationProvider(FakeToolProvider):
+    """Tool-capable consolidation provider whose tool calls 404 but structured works."""
+
+    def __init__(
+        self,
+        *,
+        structured_data: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(responses=[])
+        self.structured_data = structured_data or {"clusters": []}
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model not found",
+            status_code=404,
+        )
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_requests.append(request)
+        return StructuredOutputResponse(
+            data=self.structured_data,
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+class ShapeFailingConsolidationProvider(ShapeSwitchConsolidationProvider):
+    """Tool-capable consolidation provider whose tool and structured calls 404."""
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model not found",
+            status_code=404,
         )
 
 
@@ -388,6 +438,86 @@ def test_consolidation_prefers_tool_calls_when_enabled(
     assert [tool.name for tool in provider.tool_requests[0].tools] == [
         "merge_memory_cluster"
     ]
+
+
+def test_consolidation_tool_calls_switch_to_structured_route_on_model_not_found(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, messages = _save_with_messages(repositories)
+    canonical = repositories.add_memory(
+        save_id=save.id,
+        body="Ilyra trusts Mara with the beacon lens.",
+        tags=["relationship"],
+        importance=0.7,
+        source_message_id=messages[0].id,
+    )
+    duplicate = repositories.add_memory(
+        save_id=save.id,
+        body="Captain Ilyra trusts Mara around the beacon.",
+        tags=["relationship", "ilyra"],
+        importance=0.8,
+        source_message_id=messages[1].id,
+    )
+    provider = ShapeSwitchConsolidationProvider(
+        structured_data={
+            "clusters": [
+                {
+                    "canonical_memory_id": canonical.id,
+                    "merged_memory_ids": [duplicate.id],
+                    "body": "Captain Ilyra trusts Mara with the beacon lens.",
+                    "tags": ["relationship"],
+                    "importance": 0.9,
+                    "confidence": 0.95,
+                    "reason": "The memories describe the same relationship.",
+                }
+            ]
+        }
+    )
+
+    result = asyncio.run(
+        MemoryConsolidationService(
+            repositories=repositories,
+            provider=provider,
+            provider_name="fake",
+            model_id="fake-tools",
+            prefer_tool_calls=True,
+        ).consolidate_if_needed(save.id, min_active_memories=1)
+    )
+
+    assert len(provider.tool_requests) == 1
+    assert len(provider.structured_requests) == 1
+    assert result.rewritten_count == 1
+    assert result.archived_count == 1
+
+
+def test_consolidation_tool_calls_keep_error_when_structured_route_also_fails(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _messages = _save_with_messages(repositories)
+    repositories.add_memory(
+        save_id=save.id,
+        body="Ilyra trusts Mara with the beacon lens.",
+        tags=["relationship"],
+        importance=0.7,
+        source_message_id=repositories.list_messages(save.id)[0].id,
+    )
+    provider = ShapeFailingConsolidationProvider()
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            MemoryConsolidationService(
+                repositories=repositories,
+                provider=provider,
+                provider_name="fake",
+                model_id="fake-tools",
+                prefer_tool_calls=True,
+            ).consolidate_if_needed(save.id, min_active_memories=1)
+        )
+
+    assert exc_info.value.category == ProviderErrorCategory.MODEL_NOT_FOUND
+    assert exc_info.value.fallback_attempted is True
+    assert exc_info.value.fallback_provider == "fake"
+    assert len(provider.structured_requests) == 1
 
 
 def test_consolidation_tool_calls_retry_duplicate_merged_ids(

@@ -6,7 +6,7 @@ import json
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from time import perf_counter
-from typing import Protocol
+from typing import Protocol, cast
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
 from bragi.persistence.models import (
@@ -27,7 +27,11 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolDefinition,
 )
-from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.providers.errors import (
+    ProviderError,
+    ProviderErrorCategory,
+    provider_error_is_model_not_found,
+)
 from bragi.providers.structured_schema import normalize_strict_json_schema
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
@@ -39,6 +43,7 @@ from bragi.services.openrouter_routing_settings import (
 from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
     provider_error_with_fallback_skipped_reason,
+    recover_tool_call_shape_with_structured_output,
     structured_output_with_fallback,
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
@@ -349,22 +354,59 @@ class ToolCallingProviderScenarioEvolver:
             task="scenario_evolution",
             save_id=request.save_id,
         )
-        if self.providers is None:
-            return await _scenario_evolution_with_tool_feedback(
+        try:
+            if self.providers is None:
+                return await _scenario_evolution_with_tool_feedback(
+                    repositories=repositories,
+                    provider=self.provider,
+                    request=tool_request,
+                    allowed_sections=allowed_sections,
+                    source_message_ids=tuple(
+                        message.id for message in request.messages
+                    ),
+                )
+            return await _scenario_evolution_with_tool_fallback(
                 repositories=repositories,
+                providers=self.providers,
                 provider=self.provider,
                 request=tool_request,
+                save_id=request.save_id,
                 allowed_sections=allowed_sections,
-                source_message_ids=tuple(message.id for message in request.messages),
+                source_message_ids=tuple(
+                    message.id for message in request.messages
+                ),
             )
-        return await _scenario_evolution_with_tool_fallback(
-            repositories=repositories,
+        except ProviderError as exc:
+            if not provider_error_is_model_not_found(exc):
+                raise
+            return await self._evolve_via_structured_shape(
+                request=request,
+                repositories=repositories,
+                error=exc,
+            )
+
+    async def _evolve_via_structured_shape(
+        self,
+        *,
+        request: ScenarioEvolutionRequest,
+        repositories: PersistenceRepositories,
+        error: ProviderError,
+    ) -> ScenarioEvolution:
+        structured_evolver = StructuredProviderScenarioEvolver(
+            provider=cast(StructuredOutputProvider, self.provider),
+            provider_name=self.provider_name,
+            model_id=self.model_id,
             providers=self.providers,
-            provider=self.provider,
-            request=tool_request,
-            save_id=request.save_id,
-            allowed_sections=allowed_sections,
-            source_message_ids=tuple(message.id for message in request.messages),
+        )
+        return await recover_tool_call_shape_with_structured_output(
+            error=error,
+            task="scenario_evolution",
+            provider=self.provider_name,
+            model_id=self.model_id,
+            structured_run=lambda: structured_evolver.evolve(
+                request,
+                repositories=repositories,
+            ),
         )
 
 

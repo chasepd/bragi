@@ -29,7 +29,11 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolDefinition,
 )
-from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.providers.errors import (
+    ProviderError,
+    ProviderErrorCategory,
+    provider_error_is_model_not_found,
+)
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.services.job_lifecycle import JobLifecycleService
@@ -46,6 +50,7 @@ from bragi.services.openrouter_routing_settings import (
 from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
     provider_error_with_fallback_skipped_reason,
+    recover_tool_call_shape_with_structured_output,
     structured_output_with_fallback,
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
@@ -553,6 +558,25 @@ async def _select_pruned_state_with_tool_calls(
             save_id=save_id,
             active_state=active_state,
         )
+    except ProviderError as exc:
+        if provider_error_is_model_not_found(exc):
+            return await recover_tool_call_shape_with_structured_output(
+                error=exc,
+                task="state_pruning",
+                provider=provider_name,
+                model_id=model_id,
+                structured_run=lambda: _select_pruned_state(
+                    repositories=repositories,
+                    providers=providers,
+                    provider_name=provider_name,
+                    model_id=model_id,
+                    save_id=save_id,
+                    scenario=scenario,
+                    active_state=active_state,
+                    recent_messages=recent_messages,
+                ),
+            )
+        raise
     except Exception as exc:
         log_error_event(
             "provider.tool_call_failed",
