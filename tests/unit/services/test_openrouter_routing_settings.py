@@ -11,6 +11,7 @@ from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     ChatMessage,
     ChatRequest,
+    ImageDescriptionRequest,
     StructuredOutputRequest,
     ToolCallMessage,
     ToolCallRequest,
@@ -438,6 +439,44 @@ def test_request_with_openrouter_routing_applies_thinking_for_tool_call(
         repositories,
         request,
         task="context_search",
+    )
+
+    assert routed.reasoning is not None
+    assert routed.reasoning.effort == "high"
+    assert routed.reasoning.exclude is True
+
+
+def test_request_with_openrouter_routing_applies_thinking_for_image_description(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        display_name="GPT-5 Mini",
+        capabilities=["chat"],
+        thinking={"levels": ["high", "low"], "mandatory": False},
+    )
+    repositories.set_app_setting(
+        MODEL_THINKING_PREFERENCES_SETTING,
+        {
+            "character_image_description": {
+                "provider": "openrouter",
+                "model_id": "openai/gpt-5-mini",
+                "level": "high",
+            }
+        },
+    )
+    request = ImageDescriptionRequest(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        image_url="https://example.com/scene.png",
+        prompt="Describe this scene.",
+    )
+
+    routed = request_with_openrouter_routing(
+        repositories,
+        request,
+        task="character_image_description",
     )
 
     assert routed.reasoning is not None
