@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -38,6 +38,7 @@ from bragi.services.model_preferences import (
 )
 from bragi.services.provider_fallbacks import (
     chat_with_fallback,
+    provider_error_with_fallback_attempted,
     recover_tool_call_shape_with_structured_output,
     structured_output_with_fallback,
     tool_call_fallback_request,
@@ -1246,6 +1247,95 @@ def test_recover_tool_call_shape_enriches_structured_failure() -> None:
     asyncio.run(run())
 
 
+def test_recover_tool_call_shape_preserves_inner_fallback_identity() -> None:
+    async def run() -> None:
+        inner = provider_error_with_fallback_attempted(
+            ProviderError(
+                ProviderErrorCategory.RATE_LIMITED,
+                "structured fallback rate limited",
+                status_code=429,
+            ),
+            provider="fallback",
+            model_id="fallback-structured",
+        )
+        with pytest.raises(ProviderError) as exc_info:
+            await recover_tool_call_shape_with_structured_output(
+                error=ProviderError(
+                    ProviderErrorCategory.MODEL_NOT_FOUND,
+                    "tool model not found",
+                    status_code=404,
+                ),
+                task="context_search",
+                provider="primary",
+                model_id="primary-tools",
+                structured_run=_raising_structured_run(inner),
+            )
+
+        assert exc_info.value is not inner
+        assert exc_info.value.category == ProviderErrorCategory.RATE_LIMITED
+        assert exc_info.value.fallback_attempted is True
+        assert exc_info.value.fallback_provider == "fallback"
+        assert exc_info.value.fallback_model_id == "fallback-structured"
+        shape_recovery = _shape_recovery_diagnostics(exc_info.value)
+        assert shape_recovery["failed"] is True
+        assert shape_recovery["provider"] == "primary"
+
+    asyncio.run(run())
+
+
+def test_recover_tool_call_shape_wraps_timeout_failure() -> None:
+    async def run() -> None:
+        with pytest.raises(ProviderError) as exc_info:
+            await recover_tool_call_shape_with_structured_output(
+                error=ProviderError(
+                    ProviderErrorCategory.MODEL_NOT_FOUND,
+                    "tool model not found",
+                    status_code=404,
+                ),
+                task="context_search",
+                provider="primary",
+                model_id="primary-tools",
+                structured_run=_raising_structured_run(TimeoutError("boom")),
+            )
+
+        assert exc_info.value.category == ProviderErrorCategory.NETWORK_ERROR
+        assert exc_info.value.fallback_attempted is True
+        assert exc_info.value.fallback_provider == "primary"
+        assert exc_info.value.fallback_model_id == "primary-tools"
+        shape_recovery = _shape_recovery_diagnostics(exc_info.value)
+        assert shape_recovery["failed"] is True
+
+    asyncio.run(run())
+
+
+def test_recover_tool_call_shape_wraps_value_error_failure() -> None:
+    async def run() -> None:
+        with pytest.raises(ProviderError) as exc_info:
+            await recover_tool_call_shape_with_structured_output(
+                error=ProviderError(
+                    ProviderErrorCategory.MODEL_NOT_FOUND,
+                    "tool model not found",
+                    status_code=404,
+                ),
+                task="context_search",
+                provider="primary",
+                model_id="primary-tools",
+                structured_run=_raising_structured_run(
+                    ValueError("provider does not support structured output")
+                ),
+            )
+
+        assert exc_info.value.category == ProviderErrorCategory.PROVIDER_ERROR
+        assert exc_info.value.fallback_attempted is True
+        assert exc_info.value.fallback_provider == "primary"
+        assert exc_info.value.fallback_model_id == "primary-tools"
+        assert "provider does not support structured output" in exc_info.value.message
+        shape_recovery = _shape_recovery_diagnostics(exc_info.value)
+        assert shape_recovery["failed"] is True
+
+    asyncio.run(run())
+
+
 async def _structured_selection(
     provider: RecordingStructuredProvider,
 ) -> dict[str, object]:
@@ -1263,3 +1353,18 @@ async def _structured_selection(
 
 async def _fail_structured_run() -> dict[str, object]:
     raise AssertionError("structured route must not run")
+
+
+def _raising_structured_run(
+    error: Exception,
+) -> Callable[[], Awaitable[dict[str, object]]]:
+    async def run() -> dict[str, object]:
+        raise error
+
+    return run
+
+
+def _shape_recovery_diagnostics(error: ProviderError) -> dict[str, object]:
+    shape_recovery = error.diagnostics["shape_recovery"]
+    assert isinstance(shape_recovery, dict)
+    return shape_recovery

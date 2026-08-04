@@ -559,10 +559,10 @@ async def _select_pruned_state_with_tool_calls(
             active_state=active_state,
         )
     except ProviderError as exc:
-        # The tool fallback chain enriches the failing error, which keeps the
-        # category of whichever attempt ended the tool path (primary or
-        # fallback); either one failing with model_not_found means the tool
-        # shape is unavailable, so recover through the structured route.
+        # The tool fallback chain enriches the failing error; the enriched
+        # error reports model_not_found when either the primary or the
+        # fallback attempt failed with it, so recovering through the
+        # structured route covers both cases.
         if provider_error_is_model_not_found(exc):
             return await recover_tool_call_shape_with_structured_output(
                 error=exc,
@@ -665,11 +665,17 @@ async def _select_pruned_state_with_tool_fallback(
                 active_state=active_state,
             )
         except ProviderError as fallback_exc:
-            raise provider_error_with_fallback_attempted(
+            enriched = provider_error_with_fallback_attempted(
                 fallback_exc,
                 provider=fallback_request.provider,
                 model_id=fallback_request.model_id,
-            ) from fallback_exc
+            )
+            if provider_error_is_model_not_found(exc):
+                enriched = replace(
+                    enriched,
+                    category=ProviderErrorCategory.MODEL_NOT_FOUND,
+                )
+            raise enriched from fallback_exc
 
 
 async def _select_pruned_state_with_tool_feedback(

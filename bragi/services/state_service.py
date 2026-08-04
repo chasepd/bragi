@@ -411,10 +411,21 @@ class ToolCallingProviderStateExtractor:
                     ),
                 )
             except ProviderError as fallback_exc:
-                if provider_error_is_model_not_found(exc):
+                # Recover when either tool attempt ended with model_not_found:
+                # the tool shape is unavailable regardless of which attempt
+                # reported it. The recovery helper re-runs through the
+                # structured-output route when handed a model_not_found error.
+                if provider_error_is_model_not_found(
+                    exc
+                ) or provider_error_is_model_not_found(fallback_exc):
+                    recovery_error = (
+                        exc
+                        if provider_error_is_model_not_found(exc)
+                        else fallback_exc
+                    )
                     return await self._extract_via_structured_shape(
                         request,
-                        error=exc,
+                        error=recovery_error,
                     )
                 raise provider_error_with_fallback_attempted(
                     fallback_exc,
@@ -448,6 +459,8 @@ class ToolCallingProviderStateExtractor:
         )
 
         async def structured_run() -> StateExtraction:
+            if not isinstance(self.provider, StructuredOutputProvider):
+                raise ValueError("State extraction provider lacks structured output")
             extraction = await structured_extractor.extract(request)
             return replace(
                 extraction,
