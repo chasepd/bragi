@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import cast
 
@@ -751,6 +752,65 @@ def _with_fallback_skipped_reason(
         fallback_provider=None,
         fallback_model_id=None,
     )
+
+
+async def recover_tool_call_shape_with_structured_output[T](
+    *,
+    error: ProviderError,
+    task: str,
+    provider: str,
+    model_id: str,
+    structured_run: Callable[[], Awaitable[T]],
+) -> T:
+    """Recover a failed tool-call request through the structured-output route.
+
+    When the tool-call failure means the configured model cannot serve
+    tool-calling requests (HTTP 404 model_not_found from the provider router),
+    rerun the same selection through the structured-output route. Other error
+    categories keep the caller's existing same-shape semantics: the original
+    error is re-raised unchanged. When the structured route also fails, an
+    enriched ProviderError records the structured attempt in the fallback
+    fields.
+    """
+    if error.category is not ProviderErrorCategory.MODEL_NOT_FOUND:
+        raise error
+    log_event(
+        "provider.tool_call_shape_recovery_started",
+        provider=provider,
+        model=model_id,
+        task=task,
+    )
+    try:
+        result = await structured_run()
+    except ProviderError as exc:
+        log_error_event(
+            "provider.tool_call_shape_recovery_failed",
+            provider=provider,
+            model=model_id,
+            task=task,
+            **exception_log_fields(exc),
+        )
+        raise provider_error_with_fallback_attempted(
+            exc,
+            provider=provider,
+            model_id=model_id,
+        ) from exc
+    except (TimeoutError, ValueError, TypeError) as exc:
+        log_error_event(
+            "provider.tool_call_shape_recovery_failed",
+            provider=provider,
+            model=model_id,
+            task=task,
+            **exception_log_fields(exc),
+        )
+        raise
+    log_event(
+        "provider.tool_call_shape_recovery_succeeded",
+        provider=provider,
+        model=model_id,
+        task=task,
+    )
+    return result
 
 
 def provider_error_with_fallback_skipped_reason(

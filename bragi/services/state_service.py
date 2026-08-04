@@ -28,7 +28,11 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolDefinition,
 )
-from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.providers.errors import (
+    ProviderError,
+    ProviderErrorCategory,
+    provider_error_is_model_not_found,
+)
 from bragi.providers.structured_schema import normalize_strict_json_schema
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
@@ -54,6 +58,7 @@ from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
     provider_error_with_fallback_skipped_reason,
+    recover_tool_call_shape_with_structured_output,
     structured_output_with_fallback,
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
@@ -348,6 +353,8 @@ class ToolCallingProviderStateExtractor:
             )
         except ProviderError as exc:
             if self.repositories is None or self.providers is None:
+                if provider_error_is_model_not_found(exc):
+                    return await self._extract_via_structured_shape(request, error=exc)
                 raise
             fallback_request = tool_call_fallback_request(
                 repositories=self.repositories,
@@ -368,6 +375,8 @@ class ToolCallingProviderStateExtractor:
                     task="state_memory",
                     reason=reason,
                 )
+                if provider_error_is_model_not_found(exc):
+                    return await self._extract_via_structured_shape(request, error=exc)
                 raise provider_error_with_fallback_skipped_reason(exc, reason) from exc
             fallback_provider = self.providers[fallback_request.provider]
             if not isinstance(fallback_provider, ToolCallProvider):
@@ -379,6 +388,8 @@ class ToolCallingProviderStateExtractor:
                     task="state_memory",
                     reason=reason,
                 )
+                if provider_error_is_model_not_found(exc):
+                    return await self._extract_via_structured_shape(request, error=exc)
                 raise provider_error_with_fallback_skipped_reason(exc, reason) from exc
             log_event(
                 "provider.tool_call_fallback_started",
@@ -400,6 +411,11 @@ class ToolCallingProviderStateExtractor:
                     ),
                 )
             except ProviderError as fallback_exc:
+                if provider_error_is_model_not_found(exc):
+                    return await self._extract_via_structured_shape(
+                        request,
+                        error=exc,
+                    )
                 raise provider_error_with_fallback_attempted(
                     fallback_exc,
                     provider=fallback_request.provider,
@@ -416,6 +432,39 @@ class ToolCallingProviderStateExtractor:
                     ),
                 )
             return fallback_extraction
+
+    async def _extract_via_structured_shape(
+        self,
+        request: StateExtractionRequest,
+        *,
+        error: ProviderError,
+    ) -> StateExtraction:
+        structured_extractor = StructuredProviderStateExtractor(
+            provider=cast(StructuredOutputProvider, self.provider),
+            provider_name=self.provider_name,
+            model_id=self.model_id,
+            repositories=self.repositories,
+            providers=self.providers,
+        )
+
+        async def structured_run() -> StateExtraction:
+            extraction = await structured_extractor.extract(request)
+            return replace(
+                extraction,
+                tool_diagnostics={
+                    "shape_switch": "structured_output",
+                    "provider": self.provider_name,
+                    "model": self.model_id,
+                },
+            )
+
+        return await recover_tool_call_shape_with_structured_output(
+            error=error,
+            task="state_memory",
+            provider=self.provider_name,
+            model_id=self.model_id,
+            structured_run=structured_run,
+        )
 
     def _capture_tool_call_request(
         self,

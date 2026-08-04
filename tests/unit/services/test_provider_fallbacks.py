@@ -38,6 +38,7 @@ from bragi.services.model_preferences import (
 )
 from bragi.services.provider_fallbacks import (
     chat_with_fallback,
+    recover_tool_call_shape_with_structured_output,
     structured_output_with_fallback,
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
@@ -1158,3 +1159,107 @@ def _tool_call_request() -> ToolCallRequest:
             ),
         ),
     )
+
+
+def test_recover_tool_call_shape_reruns_on_model_not_found() -> None:
+    async def run() -> None:
+        provider = RecordingStructuredProvider(
+            provider_name="primary",
+            response_data={"selections": []},
+        )
+        result = await recover_tool_call_shape_with_structured_output(
+            error=ProviderError(
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "model not found",
+                status_code=404,
+            ),
+            task="context_search",
+            provider="primary",
+            model_id="primary-tools",
+            structured_run=lambda: _structured_selection(provider),
+        )
+
+        assert result == {"selections": []}
+        assert len(provider.structured_output_requests) == 1
+
+    asyncio.run(run())
+
+
+def test_recover_tool_call_shape_skips_other_categories() -> None:
+    async def run() -> None:
+        error = ProviderError(
+            ProviderErrorCategory.RATE_LIMITED,
+            "rate limited",
+            status_code=429,
+        )
+        with pytest.raises(ProviderError) as exc_info:
+            await recover_tool_call_shape_with_structured_output(
+                error=error,
+                task="context_search",
+                provider="primary",
+                model_id="primary-tools",
+                structured_run=lambda: _fail_structured_run(),
+            )
+        assert exc_info.value is error
+
+    asyncio.run(run())
+
+
+def test_recover_tool_call_shape_enriches_structured_failure() -> None:
+    async def run() -> None:
+        provider = RecordingStructuredProvider(
+            provider_name="primary",
+            error=ProviderError(
+                ProviderErrorCategory.MODEL_NOT_FOUND,
+                "structured model not found",
+                status_code=404,
+            ),
+        )
+        with pytest.raises(ProviderError) as exc_info:
+            await recover_tool_call_shape_with_structured_output(
+                error=ProviderError(
+                    ProviderErrorCategory.MODEL_NOT_FOUND,
+                    "tool model not found",
+                    status_code=404,
+                ),
+                task="context_search",
+                provider="primary",
+                model_id="primary-tools",
+                structured_run=lambda: provider.generate_structured_output(
+                    StructuredOutputRequest(
+                        provider="primary",
+                        model_id="primary-tools",
+                        schema_name="context_search_selection",
+                        schema={"type": "object"},
+                        messages=(
+                            ChatMessage(role="user", body="Select context."),
+                        ),
+                    )
+                ),
+            )
+
+        assert exc_info.value.category == ProviderErrorCategory.MODEL_NOT_FOUND
+        assert exc_info.value.fallback_attempted is True
+        assert exc_info.value.fallback_provider == "primary"
+        assert exc_info.value.fallback_model_id == "primary-tools"
+
+    asyncio.run(run())
+
+
+async def _structured_selection(
+    provider: RecordingStructuredProvider,
+) -> dict[str, object]:
+    response = await provider.generate_structured_output(
+        StructuredOutputRequest(
+            provider="primary",
+            model_id="primary-tools",
+            schema_name="context_search_selection",
+            schema={"type": "object"},
+            messages=(ChatMessage(role="user", body="Select context."),),
+        )
+    )
+    return response.data
+
+
+async def _fail_structured_run() -> dict[str, object]:
+    raise AssertionError("structured route must not run")

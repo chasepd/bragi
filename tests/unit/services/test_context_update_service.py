@@ -352,6 +352,55 @@ class SequenceToolCallProvider:
         )
 
 
+class ShapeSwitchContextUpdateProvider(SequenceToolCallProvider):
+    """Tool-capable updater whose tool calls 404 but structured output works."""
+
+    def __init__(
+        self,
+        *,
+        provider_name: str = "primary",
+        structured_data: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(
+            provider_name=provider_name,
+            responses=[
+                ProviderError(
+                    ProviderErrorCategory.MODEL_NOT_FOUND,
+                    "model not found",
+                    status_code=404,
+                )
+            ],
+        )
+        self.structured_data = structured_data or {}
+        self.structured_output_requests: list[StructuredOutputRequest] = []
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_output_requests.append(request)
+        return StructuredOutputResponse(
+            data=self.structured_data,
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+class ShapeFailingContextUpdateProvider(ShapeSwitchContextUpdateProvider):
+    """Tool-capable updater whose tool and structured calls both 404."""
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_output_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model not found",
+            status_code=404,
+        )
+
+
 def test_update_after_turn_only_sends_selected_prior_context_to_extractors(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -2370,6 +2419,151 @@ def test_tool_calling_context_update_uses_tool_fallback_after_feedback_exhaustio
     assert extraction.scene.situation == "The fallback model extracts the scene."
     assert fallback.tool_call_requests[0].provider == "fallback"
     assert fallback.tool_call_requests[0].model_id == "fallback-tools"
+
+
+def test_tool_calling_context_updater_switches_to_structured_route_on_model_not_found(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, _player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="primary",
+        model_id="primary-tools",
+        display_name="Primary Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    provider = ShapeSwitchContextUpdateProvider(
+        structured_data={
+            "scene": {
+                "source_message_id": narrator_message.id,
+                "evidence_quote": "Captain Ilyra",
+                "situation": "Structured extraction recovers the scene.",
+            }
+        }
+    )
+    updater = module.ToolCallingProviderContextUpdater(
+        provider=provider,
+        provider_name="primary",
+        model_id="primary-tools",
+        repositories=repositories,
+        providers={"primary": provider},
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(narrator_message,),
+        scene_snapshot=None,
+        locations=(),
+        characters=(),
+        active_threads=(),
+        entity_links=(),
+    )
+
+    extraction = asyncio.run(updater.extract(request))
+
+    assert len(provider.tool_call_requests) == 1
+    assert len(provider.structured_output_requests) == 1
+    assert extraction.scene is not None
+    assert extraction.scene.situation == "Structured extraction recovers the scene."
+
+
+def test_tool_calling_context_updater_keeps_error_when_structured_route_also_fails(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, _player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="primary",
+        model_id="primary-tools",
+        display_name="Primary Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    provider = ShapeFailingContextUpdateProvider()
+    updater = module.ToolCallingProviderContextUpdater(
+        provider=provider,
+        provider_name="primary",
+        model_id="primary-tools",
+        repositories=repositories,
+        providers={"primary": provider},
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(narrator_message,),
+        scene_snapshot=None,
+        locations=(),
+        characters=(),
+        active_threads=(),
+        entity_links=(),
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(updater.extract(request))
+
+    assert exc_info.value.category == ProviderErrorCategory.MODEL_NOT_FOUND
+    assert exc_info.value.fallback_attempted is True
+    assert exc_info.value.fallback_provider == "primary"
+    assert len(provider.structured_output_requests) == 1
+
+
+def test_tool_calling_context_updater_select_context_switches_to_structured_route(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="primary",
+        model_id="primary-tools",
+        display_name="Primary Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    candidate = module.ContextRegistryItem(
+        context_source_id="context-memory-1",
+        source_type="memory",
+        source_id="memory-1",
+        title="Ilyra promise",
+        body="Captain Ilyra owes Mara a signal flare.",
+        fact_type="promise",
+        importance=0.9,
+    )
+    provider = ShapeSwitchContextUpdateProvider(
+        structured_data={
+            "selections": [
+                {
+                    "context_source_id": candidate.context_source_id,
+                    "relevance_note": "Selected through the structured route.",
+                }
+            ]
+        }
+    )
+    updater = module.ToolCallingProviderContextUpdater(
+        provider=provider,
+        provider_name="primary",
+        model_id="primary-tools",
+        repositories=repositories,
+        providers={"primary": provider},
+    )
+
+    selection = asyncio.run(
+        updater.select_context(
+            module.ContextRegistrySelectionRequest(
+                save_id=save.id,
+                messages=(player_message, narrator_message),
+                scene_snapshot=None,
+                locations=(),
+                characters=(),
+                active_threads=(),
+                candidates=(candidate,),
+            )
+        )
+    )
+
+    assert len(provider.tool_call_requests) == 1
+    assert len(provider.structured_output_requests) == 1
+    assert [item.context_source_id for item in selection.selected_items] == [
+        candidate.context_source_id
+    ]
+    assert selection.selected_items[0].relevance_note == (
+        "Selected through the structured route."
+    )
 
 
 def test_update_after_turn_falls_back_to_deterministic_prior_context_on_selector_error(

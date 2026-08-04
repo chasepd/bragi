@@ -19,7 +19,7 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolCallResponse,
 )
-from bragi.providers.errors import ProviderError
+from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.services.message_correction import MessageCorrectionContext
 from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.state_service import (
@@ -112,6 +112,60 @@ class SequenceStructuredOutputProvider:
             data=self.responses.pop(0),
             provider=request.provider,
             model_id=request.model_id,
+        )
+
+
+class ShapeSwitchToolCallProvider(SequenceToolCallProvider):
+    """Tool-capable state provider whose tool calls 404 but structured works."""
+
+    def __init__(
+        self,
+        *,
+        structured_data: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(responses=[])
+        self.structured_data = structured_data or {
+            "state_changes": [],
+            "memories": [],
+            "conflicts": [],
+        }
+        self.structured_output_requests: list[StructuredOutputRequest] = []
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_call_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model not found",
+            status_code=404,
+        )
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_output_requests.append(request)
+        return StructuredOutputResponse(
+            data=self.structured_data,
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+class ShapeFailingToolCallProvider(ShapeSwitchToolCallProvider):
+    """Tool-capable state provider whose tool and structured calls both 404."""
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_output_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model not found",
+            status_code=404,
         )
 
 
@@ -1915,6 +1969,110 @@ def test_tool_calling_state_extractor_rejects_malformed_tool_args(
         for message in retry_messages
         if message.role == "tool"
     )
+
+
+def test_tool_calling_state_extractor_switches_to_structured_route_on_model_not_found(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-tools",
+        display_name="Fake Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    provider = ShapeSwitchToolCallProvider(
+        structured_data=_grounded_structured_response(
+            player_message,
+            narrator_message,
+        )
+    )
+    extractor = ToolCallingProviderStateExtractor(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-tools",
+        repositories=repositories,
+        providers={"fake": cast(Any, provider)},
+    )
+
+    extraction = asyncio.run(
+        extractor.extract(
+            _state_request(
+                save_id=save.id,
+                messages=(player_message, narrator_message),
+                repositories=repositories,
+            )
+        )
+    )
+
+    assert len(provider.tool_call_requests) == 1
+    assert len(provider.structured_output_requests) == 1
+    assert [change.key for change in extraction.state_changes] == ["scene.location"]
+    assert extraction.tool_diagnostics["shape_switch"] == "structured_output"
+    assert extraction.tool_diagnostics["provider"] == "fake"
+
+
+def test_tool_calling_state_extractor_recovers_without_fallback_infrastructure(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _player_message, narrator_message = _save_with_completed_turn(repositories)
+    provider = ShapeSwitchToolCallProvider()
+    extractor = ToolCallingProviderStateExtractor(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-tools",
+    )
+
+    extraction = asyncio.run(
+        extractor.extract(
+            _state_request(
+                save_id=save.id,
+                messages=(narrator_message,),
+                repositories=repositories,
+            )
+        )
+    )
+
+    assert len(provider.tool_call_requests) == 1
+    assert len(provider.structured_output_requests) == 1
+    assert extraction.state_changes == ()
+    assert extraction.tool_diagnostics["shape_switch"] == "structured_output"
+
+
+def test_tool_calling_state_extractor_keeps_error_when_structured_route_also_fails(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-tools",
+        display_name="Fake Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    provider = ShapeFailingToolCallProvider()
+    extractor = ToolCallingProviderStateExtractor(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-tools",
+        repositories=repositories,
+        providers={"fake": cast(Any, provider)},
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            extractor.extract(
+                _state_request(
+                    save_id=save.id,
+                    messages=(narrator_message,),
+                    repositories=repositories,
+                )
+            )
+        )
+
+    assert exc_info.value.category == ProviderErrorCategory.MODEL_NOT_FOUND
+    assert exc_info.value.fallback_attempted is True
+    assert exc_info.value.fallback_provider == "fake"
+    assert len(provider.structured_output_requests) == 1
 
 
 def test_tool_calling_state_patch_only_changes_supported_keys(

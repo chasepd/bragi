@@ -45,7 +45,7 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolDefinition,
 )
-from bragi.providers.errors import ProviderError
+from bragi.providers.errors import ProviderError, provider_error_is_model_not_found
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.services.context_assembly import scenario_section_candidates
@@ -156,6 +156,7 @@ CONTEXT_SEARCH_SELECTION_TOOL = "select_context_source"
 CONTEXT_RETRIEVAL_EXPANSION_TOOL = "expand_context_retrieval"
 CONTEXT_RETRIEVAL_RECOVERY_PROVIDER_FALLBACK = "provider_fallback"
 CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC = "deterministic_fallback"
+CONTEXT_RETRIEVAL_RECOVERY_SHAPE_FALLBACK = "shape_fallback"
 
 
 @dataclass(frozen=True)
@@ -1993,7 +1994,7 @@ async def _select_context_with_structured_output(
     providers: dict[str, ProviderClient],
     provider_name: str,
     model_id: str,
-    save_id: str,
+    save_id: str | None,
     scenario: ScenarioRecord | None,
     player_message: str,
     candidates: tuple[_ContextCandidate, ...],
@@ -2340,6 +2341,8 @@ async def _select_context_with_tool_calls(
             repositories=repositories,
             providers=providers,
             request=request,
+            scenario=scenario,
+            player_message=player_message,
             candidates=candidates,
             save_id=save_id,
             primary_error=exc,
@@ -2358,6 +2361,8 @@ async def _select_context_with_tool_calls(
             repositories=repositories,
             providers=providers,
             request=request,
+            scenario=scenario,
+            player_message=player_message,
             candidates=candidates,
             save_id=save_id,
             primary_error=exc,
@@ -2417,6 +2422,8 @@ async def _select_context_with_unavailable_tool_route(
         repositories=repositories,
         providers=providers,
         request=request,
+        scenario=scenario,
+        player_message=player_message,
         candidates=candidates,
         save_id=save_id,
         primary_error=None,
@@ -2428,6 +2435,8 @@ async def _recover_context_tool_selection(
     repositories: PersistenceRepositories,
     providers: dict[str, ProviderClient],
     request: ToolCallRequest,
+    scenario: ScenarioRecord | None,
+    player_message: str,
     candidates: tuple[_ContextCandidate, ...],
     save_id: str | None,
     primary_error: Exception | None,
@@ -2461,6 +2470,16 @@ async def _recover_context_tool_selection(
             task="context_search",
             reason=reason,
         )
+        if provider_error_is_model_not_found(primary_error):
+            return await _recover_context_selection_via_structured_shape(
+                repositories=repositories,
+                providers=providers,
+                request=request,
+                scenario=scenario,
+                player_message=player_message,
+                candidates=candidates,
+                save_id=save_id,
+            )
         return _deterministic_context_selection(
             candidates,
             primary_provider=request.provider,
@@ -2478,6 +2497,16 @@ async def _recover_context_tool_selection(
             task="context_search",
             reason=reason,
         )
+        if provider_error_is_model_not_found(primary_error):
+            return await _recover_context_selection_via_structured_shape(
+                repositories=repositories,
+                providers=providers,
+                request=request,
+                scenario=scenario,
+                player_message=player_message,
+                candidates=candidates,
+                save_id=save_id,
+            )
         return _deterministic_context_selection(
             candidates,
             primary_provider=request.provider,
@@ -2526,6 +2555,16 @@ async def _recover_context_tool_selection(
             candidate_count=len(candidates),
             **exception_log_fields(exc),
         )
+        if provider_error_is_model_not_found(primary_error):
+            return await _recover_context_selection_via_structured_shape(
+                repositories=repositories,
+                providers=providers,
+                request=request,
+                scenario=scenario,
+                player_message=player_message,
+                candidates=candidates,
+                save_id=save_id,
+            )
         return _deterministic_context_selection(
             candidates,
             primary_provider=request.provider,
@@ -2568,6 +2607,56 @@ async def _recover_context_tool_selection(
         error_category=_error_category(primary_error),
         http_status=_http_status(primary_error),
     )
+
+
+async def _recover_context_selection_via_structured_shape(
+    *,
+    repositories: PersistenceRepositories,
+    providers: dict[str, ProviderClient],
+    request: ToolCallRequest,
+    scenario: ScenarioRecord | None,
+    player_message: str,
+    candidates: tuple[_ContextCandidate, ...],
+    save_id: str | None,
+) -> _ContextSelectionOutcome:
+    log_event(
+        "provider.tool_call_shape_recovery_started",
+        provider=request.provider,
+        model=request.model_id,
+        task="context_search",
+    )
+    outcome = await _select_context_with_structured_output(
+        repositories=repositories,
+        providers=providers,
+        provider_name=request.provider,
+        model_id=request.model_id,
+        save_id=save_id,
+        scenario=scenario,
+        player_message=player_message,
+        candidates=candidates,
+    )
+    if outcome.result.retrieval_recovery == CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC:
+        log_error_event(
+            "provider.tool_call_shape_recovery_failed",
+            provider=request.provider,
+            model=request.model_id,
+            task="context_search",
+            error_category=outcome.error_category,
+            http_status=outcome.http_status,
+        )
+        return outcome
+    result = replace(
+        outcome.result,
+        retrieval_degraded=True,
+        retrieval_recovery=CONTEXT_RETRIEVAL_RECOVERY_SHAPE_FALLBACK,
+    )
+    log_event(
+        "provider.tool_call_shape_recovery_succeeded",
+        provider=request.provider,
+        model=request.model_id,
+        task="context_search",
+    )
+    return replace(outcome, result=result)
 
 
 def _deterministic_context_selection(

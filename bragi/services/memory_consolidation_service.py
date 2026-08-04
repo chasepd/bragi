@@ -21,7 +21,11 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolDefinition,
 )
-from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.providers.errors import (
+    ProviderError,
+    ProviderErrorCategory,
+    provider_error_is_model_not_found,
+)
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.services.job_lifecycle import JobLifecycleService
@@ -32,6 +36,7 @@ from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
     provider_error_with_fallback_skipped_reason,
+    recover_tool_call_shape_with_structured_output,
     structured_output_with_fallback,
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
@@ -252,29 +257,72 @@ class MemoryConsolidationService:
                     request=tool_request,
                 )
             if self.providers is not None:
-                return await _memory_clusters_with_tool_fallback(
+                try:
+                    return await _memory_clusters_with_tool_fallback(
+                        repositories=self.repositories,
+                        providers=self.providers,
+                        provider=self.provider,
+                        request=tool_request,
+                        save_id=save_id,
+                        memories=memories,
+                        script_guard_mode_value=script_guard_mode(
+                            self.repositories,
+                            save_id=save_id,
+                        ),
+                    )
+                except ProviderError as exc:
+                    # The tool fallback chain enriches the failing error,
+                    # which keeps the category of whichever attempt ended the
+                    # tool path; either one failing with model_not_found means
+                    # the tool shape is unavailable.
+                    if not provider_error_is_model_not_found(exc):
+                        raise
+                    return await recover_tool_call_shape_with_structured_output(
+                        error=exc,
+                        task="context_update",
+                        provider=self.provider_name,
+                        model_id=self.model_id,
+                        structured_run=lambda: self._propose_clusters_structured(
+                            save_id=save_id,
+                            memories=memories,
+                        ),
+                    )
+            try:
+                return await _memory_clusters_with_tool_feedback(
                     repositories=self.repositories,
-                    providers=self.providers,
                     provider=self.provider,
                     request=tool_request,
-                    save_id=save_id,
                     memories=memories,
                     script_guard_mode_value=script_guard_mode(
                         self.repositories,
                         save_id=save_id,
                     ),
                 )
-            return await _memory_clusters_with_tool_feedback(
-                repositories=self.repositories,
-                provider=self.provider,
-                request=tool_request,
-                memories=memories,
-                script_guard_mode_value=script_guard_mode(
-                    self.repositories,
-                    save_id=save_id,
-                ),
-            )
+            except ProviderError as exc:
+                if not provider_error_is_model_not_found(exc):
+                    raise
+                return await recover_tool_call_shape_with_structured_output(
+                    error=exc,
+                    task="context_update",
+                    provider=self.provider_name,
+                    model_id=self.model_id,
+                    structured_run=lambda: self._propose_clusters_structured(
+                        save_id=save_id,
+                        memories=memories,
+                    ),
+                )
 
+        return await self._propose_clusters_structured(
+            save_id=save_id,
+            memories=memories,
+        )
+
+    async def _propose_clusters_structured(
+        self,
+        *,
+        save_id: str,
+        memories: tuple[MemoryRecord, ...],
+    ) -> tuple[MemoryConsolidationCluster, ...]:
         if not isinstance(self.provider, StructuredOutputProvider):
             raise ValueError("Memory consolidation provider lacks structured output")
         structured_request = request_with_openrouter_routing(
