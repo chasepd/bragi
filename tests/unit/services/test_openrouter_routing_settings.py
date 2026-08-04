@@ -8,7 +8,14 @@ import pytest
 
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
-from bragi.providers.contracts import ChatMessage, ChatRequest, StructuredOutputRequest
+from bragi.providers.contracts import (
+    ChatMessage,
+    ChatRequest,
+    StructuredOutputRequest,
+    ToolCallMessage,
+    ToolCallRequest,
+    ToolDefinition,
+)
 from bragi.services.generation_settings import MODEL_THINKING_PREFERENCES_SETTING
 from bragi.services.openrouter_routing_settings import (
     OPENROUTER_ROUTING_PROFILES_SETTING,
@@ -274,7 +281,7 @@ def test_request_with_openrouter_routing_sets_and_clears_provider_payload(
     assert cleared.openrouter_app_title is None
 
 
-def test_request_with_openrouter_routing_applies_model_thinking_preference(
+def test_request_with_openrouter_routing_skips_thinking_for_structured_output(
     repositories: PersistenceRepositories,
 ) -> None:
     repositories.save_provider_model(
@@ -312,9 +319,86 @@ def test_request_with_openrouter_routing_applies_model_thinking_preference(
         task="context_update",
     )
 
+    assert routed.reasoning is None
+
+
+def test_request_with_openrouter_routing_applies_thinking_for_chat(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        display_name="GPT-5 Mini",
+        capabilities=["chat"],
+        thinking={"levels": ["high", "low"], "mandatory": False},
+    )
+    repositories.set_app_setting(
+        MODEL_THINKING_PREFERENCES_SETTING,
+        {
+            "chat": {
+                "provider": "openrouter",
+                "model_id": "openai/gpt-5-mini",
+                "level": "high",
+            }
+        },
+    )
+    request = ChatRequest(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        messages=(ChatMessage(role="player", body="Continue the scene"),),
+    )
+
+    routed = request_with_openrouter_routing(
+        repositories,
+        request,
+        task="chat",
+    )
+
     assert routed.reasoning is not None
     assert routed.reasoning.effort == "high"
     assert routed.reasoning.exclude is True
+
+
+def test_request_with_openrouter_routing_skips_thinking_for_tool_call(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        display_name="GPT-5 Mini",
+        capabilities=["tool_calling"],
+        thinking={"levels": ["high", "low"], "mandatory": False},
+    )
+    repositories.set_app_setting(
+        MODEL_THINKING_PREFERENCES_SETTING,
+        {
+            "context_search": {
+                "provider": "openrouter",
+                "model_id": "openai/gpt-5-mini",
+                "level": "high",
+            }
+        },
+    )
+    request = ToolCallRequest(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        messages=(ToolCallMessage(role="user", body="Select context"),),
+        tools=(
+            ToolDefinition(
+                name="select_context_source",
+                description="Select a context source.",
+                parameters={"type": "object", "properties": {}},
+            ),
+        ),
+    )
+
+    routed = request_with_openrouter_routing(
+        repositories,
+        request,
+        task="context_search",
+    )
+
+    assert routed.reasoning is None
 
 
 def test_openrouter_app_title_for_task_uses_single_app_name() -> None:
