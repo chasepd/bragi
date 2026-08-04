@@ -314,7 +314,15 @@ def request_with_openrouter_routing[
     task: str,
     save_id: str | None = None,
 ) -> OpenRouterRoutableRequest:
-    if repositories is not None and isinstance(request, ChatRequest):
+    if repositories is not None and isinstance(
+        request,
+        (
+            ChatRequest,
+            StructuredOutputRequest,
+            ToolCallRequest,
+            ImageDescriptionRequest,
+        ),
+    ):
         request = request_with_model_thinking_preference(
             repositories,
             request,

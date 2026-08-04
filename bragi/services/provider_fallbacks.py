@@ -26,6 +26,7 @@ from bragi.providers.errors import (
 )
 from bragi.services.generation_settings import (
     chat_request_with_reasoning_override,
+    request_with_model_thinking_preference,
 )
 from bragi.services.model_capabilities import (
     CHAT_CAPABILITIES,
@@ -299,7 +300,12 @@ async def structured_output_with_fallback(
 ) -> StructuredOutputResponse:
     request = request_with_openrouter_routing(
         repositories,
-        request,
+        request_with_model_thinking_preference(
+            repositories,
+            request,
+            task=task,
+            save_id=save_id,
+        ),
         task=task,
         save_id=save_id,
     )
@@ -542,12 +548,17 @@ def _fallback_structured_output_request(
         return None
     return request_with_openrouter_routing(
         repositories,
-        replace(
-            request,
-            provider=preference.provider,
-            model_id=preference.model_id,
-            reasoning=None,
-            openrouter_provider_routing=None,
+        request_with_model_thinking_preference(
+            repositories,
+            replace(
+                request,
+                provider=preference.provider,
+                model_id=preference.model_id,
+                reasoning=None,
+                openrouter_provider_routing=None,
+            ),
+            task=STRUCTURED_OUTPUT_FALLBACK_TASK,
+            save_id=save_id,
         ),
         task=task,
         save_id=save_id,
@@ -580,12 +591,17 @@ def tool_call_fallback_request(
         return None
     fallback = request_with_openrouter_routing(
         repositories,
-        replace(
-            request,
-            provider=preference.provider,
-            model_id=preference.model_id,
-            reasoning=None,
-            openrouter_provider_routing=None,
+        request_with_model_thinking_preference(
+            repositories,
+            replace(
+                request,
+                provider=preference.provider,
+                model_id=preference.model_id,
+                reasoning=None,
+                openrouter_provider_routing=None,
+            ),
+            task=TOOL_CALL_FALLBACK_TASK,
+            save_id=save_id,
         ),
         task=TOOL_CALL_FALLBACK_TASK,
         save_id=save_id,
