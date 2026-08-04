@@ -2450,6 +2450,16 @@ async def _recover_context_tool_selection(
             task="context_search",
         )
     except ProviderError as exc:
+        if provider_error_is_model_not_found(primary_error):
+            return await _recover_context_selection_via_structured_shape(
+                repositories=repositories,
+                providers=providers,
+                request=request,
+                scenario=scenario,
+                player_message=player_message,
+                candidates=candidates,
+                save_id=save_id,
+            )
         return _deterministic_context_selection(
             candidates,
             primary_provider=request.provider,
@@ -2555,7 +2565,11 @@ async def _recover_context_tool_selection(
             candidate_count=len(candidates),
             **exception_log_fields(exc),
         )
-        if provider_error_is_model_not_found(primary_error):
+        # Recover when either tool attempt ended with model_not_found: the
+        # tool shape is unavailable regardless of which attempt reported it.
+        if provider_error_is_model_not_found(
+            primary_error
+        ) or provider_error_is_model_not_found(exc):
             return await _recover_context_selection_via_structured_shape(
                 repositories=repositories,
                 providers=providers,

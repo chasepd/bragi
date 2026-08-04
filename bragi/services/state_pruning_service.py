@@ -6,7 +6,7 @@ import asyncio
 import json
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 from typing import Protocol
 
@@ -51,6 +51,7 @@ from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
     provider_error_with_fallback_skipped_reason,
     recover_tool_call_shape_with_structured_output,
+    shape_switch_diagnostics,
     structured_output_with_fallback,
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
@@ -86,6 +87,7 @@ class StatePruningResult:
     batch_count: int = 0
     completed_batch_count: int = 0
     batch_size: int = STATE_PRUNING_BATCH_SIZE
+    tool_diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 class StatePruningRunner(Protocol):
@@ -130,6 +132,7 @@ class StatePruningService:
         active_state_count = 0
         batch_count = 0
         failed_batch_index: int | None = None
+        shape_diagnostics: dict[str, object] = {}
         job: JobRecord | None = None
         try:
             async with _apply_guard_context(apply_guard):
@@ -200,16 +203,18 @@ class StatePruningService:
             for batch_index, batch in enumerate(state_batches):
                 failed_batch_index = batch_index
                 if supports_tool_calling:
-                    proposed = await _select_pruned_state_with_tool_calls(
-                        repositories=self.repositories,
-                        providers=self.providers,
-                        provider=provider,
-                        provider_name=preference.provider,
-                        model_id=preference.model_id,
-                        save_id=save_id,
-                        scenario=scenario,
-                        active_state=batch,
-                        recent_messages=messages,
+                    proposed, batch_diagnostics = (
+                        await _select_pruned_state_with_tool_calls(
+                            repositories=self.repositories,
+                            providers=self.providers,
+                            provider=provider,
+                            provider_name=preference.provider,
+                            model_id=preference.model_id,
+                            save_id=save_id,
+                            scenario=scenario,
+                            active_state=batch,
+                            recent_messages=messages,
+                        )
                     )
                 else:
                     proposed = await _select_pruned_state(
@@ -222,6 +227,9 @@ class StatePruningService:
                         active_state=batch,
                         recent_messages=messages,
                     )
+                    batch_diagnostics = {}
+                if batch_diagnostics and not shape_diagnostics:
+                    shape_diagnostics = batch_diagnostics
                 batch_results.append(
                     await self._apply_proposals(
                         save_id=save_id,
@@ -238,6 +246,7 @@ class StatePruningService:
                 batch_count=batch_count,
                 completed_batch_count=len(batch_results),
                 batch_size=self.state_batch_size,
+                tool_diagnostics=shape_diagnostics,
             )
         except asyncio.CancelledError:
             if job is not None:
@@ -253,6 +262,7 @@ class StatePruningService:
                             completed_batch_count=len(batch_results),
                             batch_size=self.state_batch_size,
                             failed_batch_index=failed_batch_index,
+                            tool_diagnostics=shape_diagnostics,
                         ),
                     )
             log_event(
@@ -277,6 +287,7 @@ class StatePruningService:
                             completed_batch_count=len(batch_results),
                             batch_size=self.state_batch_size,
                             failed_batch_index=failed_batch_index,
+                            tool_diagnostics=shape_diagnostics,
                         ),
                     )
             log_error_event(
@@ -395,6 +406,7 @@ def _merge_state_pruning_results(
     batch_count: int,
     completed_batch_count: int,
     batch_size: int,
+    tool_diagnostics: dict[str, object] | None = None,
 ) -> StatePruningResult:
     proposed: list[PrunedWorldStateFact] = []
     archived: list[PrunedWorldStateFact] = []
@@ -414,6 +426,7 @@ def _merge_state_pruning_results(
         batch_count=batch_count,
         completed_batch_count=completed_batch_count,
         batch_size=batch_size,
+        tool_diagnostics=dict(tool_diagnostics or {}),
     )
 
 
@@ -529,7 +542,7 @@ async def _select_pruned_state_with_tool_calls(
     scenario: ScenarioRecord | None,
     active_state: tuple[WorldStateRecord, ...],
     recent_messages: tuple[MessageRecord, ...],
-) -> tuple[PrunedWorldStateFact, ...]:
+) -> tuple[tuple[PrunedWorldStateFact, ...], dict[str, object]]:
     if not isinstance(provider, ToolCallProvider):
         raise ValueError("State-pruning provider does not support tool calling")
     started_at = perf_counter()
@@ -559,12 +572,12 @@ async def _select_pruned_state_with_tool_calls(
             active_state=active_state,
         )
     except ProviderError as exc:
-        # The tool fallback chain enriches the failing error, which keeps the
-        # category of whichever attempt ended the tool path (primary or
-        # fallback); either one failing with model_not_found means the tool
-        # shape is unavailable, so recover through the structured route.
+        # The tool fallback chain enriches the failing error; the enriched
+        # error reports model_not_found when either the primary or the
+        # fallback attempt failed with it, so recovering through the
+        # structured route covers both cases.
         if provider_error_is_model_not_found(exc):
-            return await recover_tool_call_shape_with_structured_output(
+            facts = await recover_tool_call_shape_with_structured_output(
                 error=exc,
                 task="state_pruning",
                 provider=provider_name,
@@ -578,6 +591,13 @@ async def _select_pruned_state_with_tool_calls(
                     scenario=scenario,
                     active_state=active_state,
                     recent_messages=recent_messages,
+                ),
+            )
+            return (
+                facts,
+                shape_switch_diagnostics(
+                    provider=provider_name,
+                    model_id=model_id,
                 ),
             )
         raise
@@ -600,7 +620,7 @@ async def _select_pruned_state_with_tool_calls(
         duration_ms=_elapsed_ms(started_at),
         candidate_count=len(active_state),
     )
-    return result
+    return result, {}
 
 
 async def _select_pruned_state_with_tool_fallback(
@@ -665,11 +685,17 @@ async def _select_pruned_state_with_tool_fallback(
                 active_state=active_state,
             )
         except ProviderError as fallback_exc:
-            raise provider_error_with_fallback_attempted(
+            enriched = provider_error_with_fallback_attempted(
                 fallback_exc,
                 provider=fallback_request.provider,
                 model_id=fallback_request.model_id,
-            ) from fallback_exc
+            )
+            if provider_error_is_model_not_found(exc):
+                enriched = replace(
+                    enriched,
+                    category=ProviderErrorCategory.MODEL_NOT_FOUND,
+                )
+            raise enriched from fallback_exc
 
 
 async def _select_pruned_state_with_tool_feedback(
@@ -971,7 +997,7 @@ def _result_json(
     *,
     review_only: bool,
 ) -> dict[str, object]:
-    return {
+    data: dict[str, object] = {
         "active_state_count": result.active_state_count,
         "batch_count": result.batch_count,
         "completed_batch_count": result.completed_batch_count,
@@ -991,6 +1017,9 @@ def _result_json(
             for index, proposal in enumerate(result.proposed)
         ],
     }
+    if result.tool_diagnostics:
+        data["tool_diagnostics"] = result.tool_diagnostics
+    return data
 
 
 def _partial_result_json(
@@ -1002,6 +1031,7 @@ def _partial_result_json(
     completed_batch_count: int,
     batch_size: int,
     failed_batch_index: int | None,
+    tool_diagnostics: dict[str, object] | None = None,
 ) -> dict[str, object]:
     result = _merge_state_pruning_results(
         results,
@@ -1009,6 +1039,7 @@ def _partial_result_json(
         batch_count=batch_count,
         completed_batch_count=completed_batch_count,
         batch_size=batch_size,
+        tool_diagnostics=tool_diagnostics,
     )
     data = _result_json(result, review_only=review_only)
     if failed_batch_index is not None:

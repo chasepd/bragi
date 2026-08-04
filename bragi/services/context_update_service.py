@@ -94,6 +94,7 @@ from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
     provider_error_with_fallback_skipped_reason,
     recover_tool_call_shape_with_structured_output,
+    shape_switch_diagnostics,
     structured_output_with_fallback,
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
@@ -901,6 +902,22 @@ class ToolCallingProviderContextUpdater:
         self.providers = providers
         self.prompt_inspection_store = prompt_inspection_store
 
+    def _structured_extraction_run(
+        self,
+        request: ContextUpdateRequest,
+    ) -> Callable[[], Awaitable[ContextUpdateExtraction]]:
+        async def run() -> ContextUpdateExtraction:
+            extraction = await self._structured_updater().extract(request)
+            return replace(
+                extraction,
+                tool_diagnostics=shape_switch_diagnostics(
+                    provider=self.provider_name,
+                    model_id=self.model_id,
+                ),
+            )
+
+        return run
+
     async def extract(self, request: ContextUpdateRequest) -> ContextUpdateExtraction:
         tool_request = request_with_openrouter_routing(
             self.repositories,
@@ -931,13 +948,12 @@ class ToolCallingProviderContextUpdater:
             )
         except ProviderError as exc:
             if self.repositories is None or self.providers is None:
-                if provider_error_is_model_not_found(exc):
-                    return await self._recover_via_structured_shape(
-                        error=exc,
-                        structured_run=lambda: self._structured_updater().extract(
-                            request
-                        ),
-                    )
+                recovered = await self._recover_via_structured_shape(
+                    error=exc,
+                    structured_run=self._structured_extraction_run(request),
+                )
+                if recovered is not None:
+                    return recovered
                 raise
             fallback_request = tool_call_fallback_request(
                 repositories=self.repositories,
@@ -958,13 +974,12 @@ class ToolCallingProviderContextUpdater:
                     task="context_update",
                     reason=reason,
                 )
-                if provider_error_is_model_not_found(exc):
-                    return await self._recover_via_structured_shape(
-                        error=exc,
-                        structured_run=lambda: self._structured_updater().extract(
-                            request
-                        ),
-                    )
+                recovered = await self._recover_via_structured_shape(
+                    error=exc,
+                    structured_run=self._structured_extraction_run(request),
+                )
+                if recovered is not None:
+                    return recovered
                 raise provider_error_with_fallback_skipped_reason(exc, reason) from exc
             fallback_provider = self.providers[fallback_request.provider]
             if not isinstance(fallback_provider, ToolCallProvider):
@@ -976,13 +991,12 @@ class ToolCallingProviderContextUpdater:
                     task="context_update",
                     reason=reason,
                 )
-                if provider_error_is_model_not_found(exc):
-                    return await self._recover_via_structured_shape(
-                        error=exc,
-                        structured_run=lambda: self._structured_updater().extract(
-                            request
-                        ),
-                    )
+                recovered = await self._recover_via_structured_shape(
+                    error=exc,
+                    structured_run=self._structured_extraction_run(request),
+                )
+                if recovered is not None:
+                    return recovered
                 raise provider_error_with_fallback_skipped_reason(exc, reason) from exc
             log_event(
                 "provider.tool_call_fallback_started",
@@ -1001,13 +1015,19 @@ class ToolCallingProviderContextUpdater:
                     fallback_used=True,
                 )
             except ProviderError as fallback_exc:
-                if provider_error_is_model_not_found(exc):
-                    return await self._recover_via_structured_shape(
-                        error=exc,
-                        structured_run=lambda: self._structured_updater().extract(
-                            request
-                        ),
-                    )
+                # Recover when either tool attempt ended with model_not_found:
+                # the tool shape is unavailable regardless of which attempt
+                # reported it, so hand the model_not_found error to the
+                # structured-output route.
+                recovery_error = (
+                    exc if provider_error_is_model_not_found(exc) else fallback_exc
+                )
+                recovered = await self._recover_via_structured_shape(
+                    error=recovery_error,
+                    structured_run=self._structured_extraction_run(request),
+                )
+                if recovered is not None:
+                    return recovered
                 raise provider_error_with_fallback_attempted(
                     fallback_exc,
                     provider=fallback_request.provider,
@@ -1026,6 +1046,8 @@ class ToolCallingProviderContextUpdater:
             return fallback_extraction
 
     def _structured_updater(self) -> StructuredProviderContextUpdater:
+        if not isinstance(self.provider, StructuredOutputProvider):
+            raise ValueError("Context update provider lacks structured output")
         return StructuredProviderContextUpdater(
             provider=cast(StructuredOutputProvider, self.provider),
             provider_name=self.provider_name,
@@ -1039,8 +1061,13 @@ class ToolCallingProviderContextUpdater:
         self,
         *,
         error: ProviderError,
-        structured_run: Callable[[], Awaitable[T]],
-    ) -> T:
+        structured_run: Callable[[], Awaitable[T]] | None,
+    ) -> T | None:
+        if (
+            structured_run is None
+            or not provider_error_is_model_not_found(error)
+        ):
+            return None
         return await recover_tool_call_shape_with_structured_output(
             error=error,
             task="context_update",
@@ -1144,14 +1171,12 @@ class ToolCallingProviderContextUpdater:
             return await run(self.provider, request, False)
         except ProviderError as exc:
             if self.repositories is None or self.providers is None:
-                if (
-                    provider_error_is_model_not_found(exc)
-                    and structured_run is not None
-                ):
-                    return await self._recover_via_structured_shape(
-                        error=exc,
-                        structured_run=structured_run,
-                    )
+                recovered = await self._recover_via_structured_shape(
+                    error=exc,
+                    structured_run=structured_run,
+                )
+                if recovered is not None:
+                    return recovered
                 raise
             fallback_request = tool_call_fallback_request(
                 repositories=self.repositories,
@@ -1172,14 +1197,12 @@ class ToolCallingProviderContextUpdater:
                     task=task,
                     reason=reason,
                 )
-                if (
-                    provider_error_is_model_not_found(exc)
-                    and structured_run is not None
-                ):
-                    return await self._recover_via_structured_shape(
-                        error=exc,
-                        structured_run=structured_run,
-                    )
+                recovered = await self._recover_via_structured_shape(
+                    error=exc,
+                    structured_run=structured_run,
+                )
+                if recovered is not None:
+                    return recovered
                 raise provider_error_with_fallback_skipped_reason(exc, reason) from exc
             fallback_provider = self.providers[fallback_request.provider]
             if not isinstance(fallback_provider, ToolCallProvider):
@@ -1191,14 +1214,12 @@ class ToolCallingProviderContextUpdater:
                     task=task,
                     reason=reason,
                 )
-                if (
-                    provider_error_is_model_not_found(exc)
-                    and structured_run is not None
-                ):
-                    return await self._recover_via_structured_shape(
-                        error=exc,
-                        structured_run=structured_run,
-                    )
+                recovered = await self._recover_via_structured_shape(
+                    error=exc,
+                    structured_run=structured_run,
+                )
+                if recovered is not None:
+                    return recovered
                 raise provider_error_with_fallback_skipped_reason(exc, reason) from exc
             log_event(
                 "provider.tool_call_fallback_started",
@@ -1209,14 +1230,19 @@ class ToolCallingProviderContextUpdater:
             try:
                 return await run(fallback_provider, fallback_request, True)
             except ProviderError as fallback_exc:
-                if (
-                    provider_error_is_model_not_found(exc)
-                    and structured_run is not None
-                ):
-                    return await self._recover_via_structured_shape(
-                        error=exc,
-                        structured_run=structured_run,
-                    )
+                # Recover when either tool attempt ended with model_not_found:
+                # the tool shape is unavailable regardless of which attempt
+                # reported it, so hand the model_not_found error to the
+                # structured-output route.
+                recovery_error = (
+                    exc if provider_error_is_model_not_found(exc) else fallback_exc
+                )
+                recovered = await self._recover_via_structured_shape(
+                    error=recovery_error,
+                    structured_run=structured_run,
+                )
+                if recovered is not None:
+                    return recovered
                 raise provider_error_with_fallback_attempted(
                     fallback_exc,
                     provider=fallback_request.provider,

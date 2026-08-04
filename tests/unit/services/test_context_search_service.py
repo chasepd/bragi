@@ -1992,24 +1992,36 @@ def test_context_search_uses_deterministic_fallback_when_tool_provider_fails(
     assert job_result["fallback_skipped_reason"] == "no_fallback_model"
 
 
-def test_context_search_keeps_missing_tool_fallback_model_available(
+def test_context_search_recovers_when_tool_fallback_model_missing(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player_message = _save_with_context_search_preference(
         repositories,
-        model_capabilities=[ProviderCapability.TOOL_CALLING.value],
+        model_capabilities=[
+            ProviderCapability.TOOL_CALLING.value,
+            ProviderCapability.STRUCTURED_OUTPUT.value,
+        ],
     )
     state = repositories.list_world_state(save.id)[0]
     _configure_tool_fallback(repositories)
-    primary = SequenceToolContextProvider(
-        responses=[
-            ProviderError(
-                ProviderErrorCategory.RATE_LIMITED,
-                "rate limited",
-                status_code=429,
-            )
-        ]
+    primary = ShapeSwitchToolContextProvider(
+        response_data={
+            "selections": [
+                {
+                    "source_type": "world_state",
+                    "source_id": state.id,
+                    "relevance_note": "Selected through the structured route.",
+                }
+            ]
+        }
     )
+    primary.responses = [
+        ProviderError(
+            ProviderErrorCategory.RATE_LIMITED,
+            "rate limited",
+            status_code=429,
+        )
+    ]
     fallback = FallbackToolContextProvider(
         responses=[
             ProviderError(
@@ -2030,9 +2042,10 @@ def test_context_search_keeps_missing_tool_fallback_model_available(
 
     assert len(primary.tool_call_requests) == 1
     assert len(fallback.tool_call_requests) == 1
+    assert len(primary.structured_output_requests) == 1
     assert [item.source_id for item in result.selected_state] == [state.id]
     assert result.retrieval_degraded is True
-    assert result.retrieval_recovery == "deterministic_fallback"
+    assert result.retrieval_recovery == "shape_fallback"
     assert [
         model.available
         for model in repositories.list_provider_models("fallback")
@@ -2042,12 +2055,56 @@ def test_context_search_keeps_missing_tool_fallback_model_available(
         _context_search_jobs(repositories, save.id)[-1]["result_json"]
     )
     assert job_result["retrieval_degraded"] is True
-    assert job_result["retrieval_recovery"] == "deterministic_fallback"
-    assert job_result["fallback_provider"] == "fallback"
-    assert job_result["fallback_model"] == "fallback-tools"
-    assert job_result["fallback_used"] is False
-    assert job_result["error_category"] == ProviderErrorCategory.MODEL_NOT_FOUND.value
-    assert job_result["http_status"] == 404
+    assert job_result["retrieval_recovery"] == "shape_fallback"
+
+
+def test_context_search_recovers_when_tool_fallback_request_over_budget(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(
+        repositories,
+        model_capabilities=[
+            ProviderCapability.TOOL_CALLING.value,
+            ProviderCapability.STRUCTURED_OUTPUT.value,
+        ],
+    )
+    state = repositories.list_world_state(save.id)[0]
+    _configure_tool_fallback(repositories)
+    repositories.save_provider_model(
+        provider="fallback",
+        model_id="fallback-tools",
+        display_name="Fallback Tools",
+        capabilities=[ProviderCapability.TOOL_CALLING.value],
+        context_window=64,
+    )
+    primary = ShapeSwitchToolContextProvider(
+        response_data={
+            "selections": [
+                {
+                    "source_type": "world_state",
+                    "source_id": state.id,
+                    "relevance_note": "Selected through the structured route.",
+                }
+            ]
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={
+            "fake": primary,
+            "fallback": FallbackToolContextProvider(responses=[]),
+        },
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(primary.structured_output_requests) == 1
+    assert [item.source_id for item in result.selected_state] == [state.id]
+    assert result.retrieval_degraded is True
+    assert result.retrieval_recovery == "shape_fallback"
 
 
 def test_context_search_switches_to_structured_route_when_tool_route_model_not_found(

@@ -19,7 +19,11 @@ from bragi.providers.contracts import (
     ToolCallProvider,
     ToolCallRequest,
 )
-from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.providers.errors import (
+    ProviderError,
+    ProviderErrorCategory,
+    map_exception_to_category,
+)
 from bragi.services.generation_settings import (
     chat_request_with_reasoning_override,
     request_with_model_thinking_preference,
@@ -769,8 +773,11 @@ async def recover_tool_call_shape_with_structured_output[T](
     rerun the same selection through the structured-output route. Other error
     categories keep the caller's existing same-shape semantics: the original
     error is re-raised unchanged. When the structured route also fails, an
-    enriched ProviderError records the structured attempt in the fallback
-    fields.
+    enriched ProviderError records the shape attempt in the fallback fields,
+    keeping any more specific fallback identity the structured route already
+    reported. Non-ProviderError failures from the structured route are wrapped
+    into an enriched ProviderError so callers always see the provider error
+    contract.
     """
     if error.category is not ProviderErrorCategory.MODEL_NOT_FOUND:
         raise error
@@ -790,8 +797,9 @@ async def recover_tool_call_shape_with_structured_output[T](
             task=task,
             **exception_log_fields(exc),
         )
-        raise provider_error_with_fallback_attempted(
+        raise _with_shape_recovery_failure(
             exc,
+            task=task,
             provider=provider,
             model_id=model_id,
         ) from exc
@@ -803,7 +811,12 @@ async def recover_tool_call_shape_with_structured_output[T](
             task=task,
             **exception_log_fields(exc),
         )
-        raise
+        raise _with_shape_recovery_failure(
+            _shape_recovery_wrapped_error(exc),
+            task=task,
+            provider=provider,
+            model_id=model_id,
+        ) from exc
     log_event(
         "provider.tool_call_shape_recovery_succeeded",
         provider=provider,
@@ -811,6 +824,56 @@ async def recover_tool_call_shape_with_structured_output[T](
         task=task,
     )
     return result
+
+
+def _shape_recovery_wrapped_error(exc: Exception) -> ProviderError:
+    return ProviderError(
+        category=map_exception_to_category(exc),
+        message=str(exc) or exc.__class__.__name__,
+    )
+
+
+def shape_switch_diagnostics(
+    *,
+    provider: str,
+    model_id: str,
+) -> dict[str, object]:
+    """Diagnostics marker for a recovery through the structured-output route."""
+    return {
+        "shape_switch": "structured_output",
+        "provider": provider,
+        "model": model_id,
+    }
+
+
+def _with_shape_recovery_failure(
+    exc: ProviderError,
+    *,
+    task: str,
+    provider: str,
+    model_id: str,
+) -> ProviderError:
+    enriched = (
+        exc
+        if exc.fallback_attempted is True
+        else provider_error_with_fallback_attempted(
+            exc,
+            provider=provider,
+            model_id=model_id,
+        )
+    )
+    return replace(
+        enriched,
+        diagnostics={
+            **enriched.diagnostics,
+            "shape_recovery": {
+                "task": task,
+                "provider": provider,
+                "model": model_id,
+                "failed": True,
+            },
+        },
+    )
 
 
 def provider_error_with_fallback_skipped_reason(

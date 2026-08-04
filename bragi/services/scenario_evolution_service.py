@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 from typing import Protocol, cast
 
@@ -44,6 +44,7 @@ from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
     provider_error_with_fallback_skipped_reason,
     recover_tool_call_shape_with_structured_output,
+    shape_switch_diagnostics,
     structured_output_with_fallback,
     tool_call_fallback_request,
     tool_call_fallback_skip_reason,
@@ -216,6 +217,7 @@ class ScenarioSectionUpdate:
 class ScenarioEvolution:
     updates: tuple[ScenarioSectionUpdate, ...] = ()
     skip_reason: str | None = None
+    diagnostics: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -377,11 +379,10 @@ class ToolCallingProviderScenarioEvolver:
                 ),
             )
         except ProviderError as exc:
-            # The tool fallback chain enriches the failing error, which keeps
-            # the category of whichever attempt ended the tool path (primary
-            # or fallback); either one failing with model_not_found means the
-            # tool shape is unavailable, so recover through the structured
-            # route.
+            # The tool fallback chain enriches the failing error; the enriched
+            # error reports model_not_found when either the primary or the
+            # fallback attempt failed with it, so recovering through the
+            # structured route covers both cases.
             if not provider_error_is_model_not_found(exc):
                 raise
             return await self._evolve_via_structured_shape(
@@ -403,15 +404,28 @@ class ToolCallingProviderScenarioEvolver:
             model_id=self.model_id,
             providers=self.providers,
         )
+
+        async def structured_run() -> ScenarioEvolution:
+            if not isinstance(self.provider, StructuredOutputProvider):
+                raise ValueError("Scenario evolution provider lacks structured output")
+            evolution = await structured_evolver.evolve(
+                request,
+                repositories=repositories,
+            )
+            return replace(
+                evolution,
+                diagnostics=shape_switch_diagnostics(
+                    provider=self.provider_name,
+                    model_id=self.model_id,
+                ),
+            )
+
         return await recover_tool_call_shape_with_structured_output(
             error=error,
             task="scenario_evolution",
             provider=self.provider_name,
             model_id=self.model_id,
-            structured_run=lambda: structured_evolver.evolve(
-                request,
-                repositories=repositories,
-            ),
+            structured_run=structured_run,
         )
 
 
@@ -500,6 +514,8 @@ class ScenarioEvolutionService:
             "scenario_update_id": update.id if update is not None else None,
             "section_update_count": len(evolution.updates),
         }
+        if evolution.diagnostics:
+            result["diagnostics"] = evolution.diagnostics
         skip_reason = _evolution_skip_reason(evolution=evolution, update=update)
         if skip_reason is not None:
             result["skip_reason"] = skip_reason
@@ -831,11 +847,17 @@ async def _scenario_evolution_with_tool_fallback(
                 source_message_ids=source_message_ids,
             )
         except ProviderError as fallback_exc:
-            raise provider_error_with_fallback_attempted(
+            enriched = provider_error_with_fallback_attempted(
                 fallback_exc,
                 provider=fallback_request.provider,
                 model_id=fallback_request.model_id,
-            ) from fallback_exc
+            )
+            if provider_error_is_model_not_found(exc):
+                enriched = replace(
+                    enriched,
+                    category=ProviderErrorCategory.MODEL_NOT_FOUND,
+                )
+            raise enriched from fallback_exc
 
 
 async def _scenario_evolution_with_tool_feedback(

@@ -169,6 +169,36 @@ class ShapeFailingToolCallProvider(ShapeSwitchToolCallProvider):
         )
 
 
+class RateLimitedShapeSwitchToolCallProvider(ShapeSwitchToolCallProvider):
+    """Tool-capable state provider whose tool calls rate-limit but structured works."""
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_call_requests.append(request)
+        raise ProviderError(
+            ProviderErrorCategory.RATE_LIMITED,
+            "rate limited",
+            status_code=429,
+        )
+
+
+class FailingToolCallFallbackProvider(SequenceToolCallProvider):
+    provider_name = "fallback"
+
+    def __init__(self, *, error: ProviderError) -> None:
+        super().__init__(responses=[])
+        self.error = error
+
+    async def generate_tool_calls(
+        self,
+        request: ToolCallRequest,
+    ) -> ToolCallResponse:
+        self.tool_call_requests.append(request)
+        raise self.error
+
+
 @pytest.fixture
 def repositories(tmp_path: Path) -> Iterator[PersistenceRepositories]:
     database_path = tmp_path / "bragi.sqlite3"
@@ -2075,6 +2105,168 @@ def test_tool_calling_state_extractor_keeps_error_when_structured_route_also_fai
     assert len(provider.structured_output_requests) == 1
 
 
+def test_tool_calling_state_extractor_recovers_when_tool_fallback_also_model_not_found(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-tools",
+        display_name="Fake Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    _configure_state_tool_fallback(repositories)
+    primary = ShapeSwitchToolCallProvider(
+        structured_data=_grounded_structured_response(
+            player_message,
+            narrator_message,
+        )
+    )
+    fallback = FailingToolCallFallbackProvider(
+        error=ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "fallback model not found",
+            status_code=404,
+        )
+    )
+    extractor = ToolCallingProviderStateExtractor(
+        provider=primary,
+        provider_name="fake",
+        model_id="fake-tools",
+        repositories=repositories,
+        providers={
+            "fake": cast(Any, primary),
+            "fallback": cast(Any, fallback),
+        },
+    )
+
+    extraction = asyncio.run(
+        extractor.extract(
+            _state_request(
+                save_id=save.id,
+                messages=(player_message, narrator_message),
+                repositories=repositories,
+            )
+        )
+    )
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(fallback.tool_call_requests) == 1
+    assert len(primary.structured_output_requests) == 1
+    assert [change.key for change in extraction.state_changes] == ["scene.location"]
+    assert extraction.tool_diagnostics["shape_switch"] == "structured_output"
+
+
+def test_tool_calling_state_extractor_recovers_when_tool_fallback_model_missing(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-tools",
+        display_name="Fake Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    _configure_state_tool_fallback(repositories)
+    primary = RateLimitedShapeSwitchToolCallProvider(
+        structured_data=_grounded_structured_response(
+            player_message,
+            narrator_message,
+        )
+    )
+    fallback = FailingToolCallFallbackProvider(
+        error=ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "fallback model missing",
+            status_code=404,
+        )
+    )
+    extractor = ToolCallingProviderStateExtractor(
+        provider=primary,
+        provider_name="fake",
+        model_id="fake-tools",
+        repositories=repositories,
+        providers={
+            "fake": cast(Any, primary),
+            "fallback": cast(Any, fallback),
+        },
+    )
+
+    extraction = asyncio.run(
+        extractor.extract(
+            _state_request(
+                save_id=save.id,
+                messages=(player_message, narrator_message),
+                repositories=repositories,
+            )
+        )
+    )
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(fallback.tool_call_requests) == 1
+    assert len(primary.structured_output_requests) == 1
+    assert [change.key for change in extraction.state_changes] == ["scene.location"]
+    assert extraction.tool_diagnostics["shape_switch"] == "structured_output"
+
+
+def test_tool_calling_state_extractor_keeps_fallback_result_when_fallback_succeeds(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-tools",
+        display_name="Fake Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    _configure_state_tool_fallback(repositories)
+    primary = ShapeSwitchToolCallProvider()
+    fallback = SequenceToolCallProvider(
+        responses=[
+            (
+                ProviderToolCall(
+                    id="state-call",
+                    name="patch_world_state",
+                    arguments_json=json.dumps(
+                        {
+                            "operation": "upsert",
+                            "key": "scene.location",
+                            "value_patch": {"name": "Beacon lens", "danger": "high"},
+                            "source_message_id": narrator_message.id,
+                            "evidence_quote": "lens flares",
+                        }
+                    ),
+                ),
+            )
+        ]
+    )
+    extractor = ToolCallingProviderStateExtractor(
+        provider=primary,
+        provider_name="fake",
+        model_id="fake-tools",
+        repositories=repositories,
+        providers={
+            "fake": cast(Any, primary),
+            "fallback": cast(Any, fallback),
+        },
+    )
+
+    extraction = asyncio.run(
+        extractor.extract(
+            _state_request(
+                save_id=save.id,
+                messages=(player_message, narrator_message),
+                repositories=repositories,
+            )
+        )
+    )
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(fallback.tool_call_requests) == 1
+    assert primary.structured_output_requests == []
+    assert [change.key for change in extraction.state_changes] == ["scene.location"]
+
+
 def test_tool_calling_state_patch_only_changes_supported_keys(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3094,6 +3286,23 @@ def _state_request(
         save_id=save_id,
         messages=messages,
         current_state=tuple(repositories.list_world_state(save_id)),
+    )
+
+
+def _configure_state_tool_fallback(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.set_app_setting("tool_call_fallback_enabled", True)
+    repositories.set_model_preference(
+        task="tool_call_fallback",
+        provider="fallback",
+        model_id="fallback-tools",
+    )
+    repositories.save_provider_model(
+        provider="fallback",
+        model_id="fallback-tools",
+        display_name="Fallback Tools",
+        capabilities=["tool_calling"],
     )
 
 
