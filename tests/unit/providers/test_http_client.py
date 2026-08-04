@@ -637,3 +637,211 @@ def test_request_binary_suppresses_venice_http_error_body_and_keeps_safe_headers
     assert "request-secret" not in repr(fields)
     assert "private image prompt" not in repr(fields)
     assert "venice-secret" not in repr(fields)
+
+
+def test_request_json_captures_openrouter_404_error_message_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BoundedErrorBody(io.BytesIO):
+        def __init__(self) -> None:
+            super().__init__(
+                b'{"error":{"message":"No endpoints found that can handle the '
+                b'requested parameters. To learn more about provider routing, '
+                b'visit: https://openrouter.ai/docs/guides/routing",'
+                b'"code":404}}'
+            )
+            self.read_sizes: list[int | None] = []
+
+        def read(self, size: int | None = None) -> bytes:
+            self.read_sizes.append(size)
+            return super().read(-1 if size is None else size)
+
+    error_body = BoundedErrorBody()
+
+    class FakeOpener:
+        def open(self, *_args: object, **_kwargs: object) -> object:
+            headers: Message[str, str] = Message()
+            raise HTTPError(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                code=404,
+                msg="Not Found",
+                hdrs=headers,
+                fp=error_body,
+            )
+
+    monkeypatch.setattr("bragi.providers.http_client._NO_REDIRECT_OPENER", FakeOpener())
+
+    with pytest.raises(ProviderError) as exc_info:
+        request_json(
+            method="POST",
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={},
+            payload={"model": "example/model"},
+            timeout=1.0,
+            provider="openrouter",
+            task="tool_calling",
+            model="example/model",
+        )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.diagnostics["provider_error_message"] == (
+        "No endpoints found that can handle the requested parameters. To learn "
+        "more about provider routing, visit: "
+        "https://openrouter.ai/docs/guides/routing"
+    )
+    assert error_body.read_sizes == [2048]
+
+
+def test_request_json_does_not_read_404_body_for_other_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BoundedErrorBody(io.BytesIO):
+        def __init__(self) -> None:
+            super().__init__(
+                b'{"error":{"message":"No endpoints found that can handle the '
+                b'requested parameters"}}'
+            )
+            self.read_sizes: list[int | None] = []
+
+        def read(self, size: int | None = None) -> bytes:
+            self.read_sizes.append(size)
+            return super().read(-1 if size is None else size)
+
+    error_body = BoundedErrorBody()
+
+    class FakeOpener:
+        def open(self, *_args: object, **_kwargs: object) -> object:
+            headers: Message[str, str] = Message()
+            raise HTTPError(
+                url="https://provider.example/api",
+                code=404,
+                msg="Not Found",
+                hdrs=headers,
+                fp=error_body,
+            )
+
+    monkeypatch.setattr("bragi.providers.http_client._NO_REDIRECT_OPENER", FakeOpener())
+
+    with pytest.raises(ProviderError) as exc_info:
+        request_json(
+            method="POST",
+            url="https://provider.example/api",
+            headers={},
+            payload=None,
+            timeout=1.0,
+        )
+
+    assert exc_info.value.status_code == 404
+    assert "provider_error_message" not in exc_info.value.diagnostics
+    assert error_body.read_sizes == []
+
+
+def test_request_json_openrouter_404_non_json_body_has_no_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BoundedErrorBody(io.BytesIO):
+        def __init__(self) -> None:
+            super().__init__(b"Not Found")
+            self.read_sizes: list[int | None] = []
+
+        def read(self, size: int | None = None) -> bytes:
+            self.read_sizes.append(size)
+            return super().read(-1 if size is None else size)
+
+    error_body = BoundedErrorBody()
+
+    class FakeOpener:
+        def open(self, *_args: object, **_kwargs: object) -> object:
+            headers: Message[str, str] = Message()
+            raise HTTPError(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                code=404,
+                msg="Not Found",
+                hdrs=headers,
+                fp=error_body,
+            )
+
+    monkeypatch.setattr("bragi.providers.http_client._NO_REDIRECT_OPENER", FakeOpener())
+
+    with pytest.raises(ProviderError) as exc_info:
+        request_json(
+            method="POST",
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={},
+            payload=None,
+            timeout=1.0,
+            provider="openrouter",
+            task="chat",
+        )
+
+    assert exc_info.value.status_code == 404
+    assert "provider_error_message" not in exc_info.value.diagnostics
+
+
+def test_request_json_openrouter_404_message_also_logged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+
+    def capture_error_event(event_name: str, **fields: object) -> None:
+        events.append((event_name, fields))
+
+    class FakeOpener:
+        def open(self, *_args: object, **_kwargs: object) -> object:
+            headers: Message[str, str] = Message()
+            raise HTTPError(
+                url="https://openrouter.ai/api/v1/chat/completions",
+                code=404,
+                msg="Not Found",
+                hdrs=headers,
+                fp=io.BytesIO(
+                    b'{"error":{"message":"No endpoints found that can handle '
+                    b'the requested parameters"}}'
+                ),
+            )
+
+    monkeypatch.setattr(
+        "bragi.providers.http_client.log_error_event",
+        capture_error_event,
+    )
+    monkeypatch.setattr("bragi.providers.http_client._NO_REDIRECT_OPENER", FakeOpener())
+
+    with pytest.raises(ProviderError):
+        request_json(
+            method="POST",
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={},
+            payload=None,
+            timeout=1.0,
+            provider="openrouter",
+            task="tool_calling",
+        )
+
+    event_name, fields = events[-1]
+    assert event_name == "provider.http_failed"
+    assert fields["provider_error_message"] == (
+        "No endpoints found that can handle the requested parameters"
+    )
+
+
+def test_ensure_success_includes_provider_error_message_diagnostic() -> None:
+    with pytest.raises(ProviderError) as exc_info:
+        ensure_success(
+            JsonHttpResponse(
+                status_code=404,
+                payload={
+                    "error": {
+                        "message": (
+                            "No endpoints found that can handle the requested "
+                            "parameters"
+                        )
+                    }
+                },
+            )
+        )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.diagnostics["provider_error_message"] == (
+        "No endpoints found that can handle the requested parameters"
+    )
+    assert exc_info.value.message == "model_not_found (404)"

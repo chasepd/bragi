@@ -5,11 +5,17 @@ from typing import Any, cast
 
 import pytest
 
-from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.providers.errors import (
+    PROVIDER_ERROR_MESSAGE_DIAGNOSTIC,
+    ProviderError,
+    ProviderErrorCategory,
+)
 from bragi.providers.retry import (
     DEFAULT_PROVIDER_ATTEMPTS,
     MAX_BACKOFF_SECONDS,
+    NO_ENDPOINTS_ROUTING_ERROR_MESSAGE,
     call_with_provider_retries,
+    is_no_endpoints_routing_error,
     is_transient_provider_error,
 )
 
@@ -122,6 +128,7 @@ def test_call_with_provider_retries_reports_progress_before_sleep(
         assert reported.retry_delay_ms == 250
         assert reported.error_category == "rate_limited"
         assert reported.http_status == 429
+        assert reported.unlimited is False
 
     asyncio.run(run())
 
@@ -523,6 +530,241 @@ def test_call_with_provider_retries_clamps_retry_delay_to_deadline_remaining(
         body = cast(dict[str, object], result)["body"]
         assert body == "ok"
         assert sleeps[0] == 1.9
+
+    asyncio.run(run())
+
+
+def _no_endpoints_error() -> ProviderError:
+    return ProviderError(
+        ProviderErrorCategory.MODEL_NOT_FOUND,
+        "model_not_found (404)",
+        status_code=404,
+        diagnostics={
+            PROVIDER_ERROR_MESSAGE_DIAGNOSTIC: (
+                f"{NO_ENDPOINTS_ROUTING_ERROR_MESSAGE}. To learn more about "
+                "provider routing, visit: "
+                "https://openrouter.ai/docs/guides/routing/provider-selection"
+            )
+        },
+    )
+
+
+def test_is_no_endpoints_routing_error_matches_routing_404_only() -> None:
+    assert is_no_endpoints_routing_error(_no_endpoints_error())
+    assert not is_no_endpoints_routing_error(
+        ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model_not_found (404)",
+            status_code=404,
+        )
+    )
+    assert not is_no_endpoints_routing_error(
+        ProviderError(
+            ProviderErrorCategory.MODEL_NOT_FOUND,
+            "model_not_found (404)",
+            status_code=404,
+            diagnostics={PROVIDER_ERROR_MESSAGE_DIAGNOSTIC: "Not Found"},
+        )
+    )
+    assert not is_no_endpoints_routing_error(
+        ProviderError(
+            ProviderErrorCategory.PROVIDER_ERROR,
+            "bad request",
+            status_code=400,
+            diagnostics={
+                PROVIDER_ERROR_MESSAGE_DIAGNOSTIC: NO_ENDPOINTS_ROUTING_ERROR_MESSAGE
+            },
+        )
+    )
+    assert not is_no_endpoints_routing_error(RuntimeError("boom"))
+
+
+def test_no_endpoints_404_keeps_retrying_beyond_attempt_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        attempts = 0
+        sleeps: list[float] = []
+        events: list[tuple[str, dict[str, object]]] = []
+
+        async def operation() -> dict[str, object]:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 10:
+                raise _no_endpoints_error()
+            return {"body": "ok"}
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        monkeypatch.setattr("bragi.providers.retry.asyncio.sleep", fake_sleep)
+        monkeypatch.setattr("bragi.providers.retry._retry_delay", lambda **_: 0.01)
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_error_event",
+            lambda event_name, **fields: events.append((event_name, fields)),
+        )
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_event",
+            lambda event_name, **fields: events.append((event_name, fields)),
+        )
+
+        result = await call_with_provider_retries(
+            operation,
+            provider="openrouter",
+            task="tool_calling",
+            max_attempts=3,
+        )
+
+        assert attempts == 10
+        assert sleeps == [0.01] * 9
+        assert result["body"] == "ok"
+        retry = cast(dict[str, Any], result["_bragi_retry"])
+        assert retry["attempt_count"] == 10
+        assert retry["max_attempts"] == 3
+        scheduled = [
+            fields
+            for event_name, fields in events
+            if event_name == "provider.retry_scheduled"
+        ]
+        assert len(scheduled) == 9
+        assert all(fields.get("no_endpoints_routing") is True for fields in scheduled)
+
+    asyncio.run(run())
+
+
+def test_no_endpoints_404_bypasses_global_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        attempts = 0
+        current_time = {"value": 0.0}
+
+        async def operation() -> dict[str, object]:
+            nonlocal attempts
+            attempts += 1
+            current_time["value"] += 0.5
+            if attempts < 10:
+                raise _no_endpoints_error()
+            return {"body": "ok"}
+
+        async def scheduled_sleep(delay: float) -> None:
+            current_time["value"] += delay
+
+        monkeypatch.setattr("bragi.providers.retry.asyncio.sleep", scheduled_sleep)
+        monkeypatch.setattr(
+            "bragi.providers.retry.perf_counter",
+            lambda: current_time["value"],
+        )
+        monkeypatch.setattr("bragi.providers.retry._retry_delay", lambda **_: 0.0)
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_error_event",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_event",
+            lambda *_args, **_kwargs: None,
+        )
+
+        result = await call_with_provider_retries(
+            operation,
+            provider="openrouter",
+            task="structured_output",
+            max_attempts=7,
+            call_deadline_seconds=2.5,
+        )
+
+        assert attempts == 10
+        assert current_time["value"] > 2.5
+        assert result["body"] == "ok"
+
+    asyncio.run(run())
+
+
+def test_no_endpoints_404_ends_on_different_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        attempts = 0
+
+        async def operation() -> object:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 4:
+                raise _no_endpoints_error()
+            raise ProviderError(
+                ProviderErrorCategory.AUTHENTICATION_FAILED,
+                "bad key",
+                status_code=401,
+            )
+
+        monkeypatch.setattr("bragi.providers.retry.asyncio.sleep", _no_sleep)
+        monkeypatch.setattr("bragi.providers.retry._retry_delay", lambda **_: 0.0)
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_error_event",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_event",
+            lambda *_args, **_kwargs: None,
+        )
+
+        with pytest.raises(ProviderError) as exc_info:
+            await call_with_provider_retries(
+                operation,
+                provider="openrouter",
+                task="tool_calling",
+                max_attempts=2,
+            )
+
+        assert attempts == 4
+        assert exc_info.value.category is ProviderErrorCategory.AUTHENTICATION_FAILED
+        assert exc_info.value.retry_attempt_count == 4
+        assert [
+            attempt["http_status"]
+            for attempt in exc_info.value.retry_attempts
+            if attempt.get("http_status") is not None
+        ] == [404, 404, 404, 401]
+
+    asyncio.run(run())
+
+
+def test_no_endpoints_404_reports_unlimited_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        attempts = 0
+        progress: list[Any] = []
+
+        async def operation() -> dict[str, object]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise _no_endpoints_error()
+            return {"body": "ok"}
+
+        monkeypatch.setattr("bragi.providers.retry.asyncio.sleep", _no_sleep)
+        monkeypatch.setattr("bragi.providers.retry._retry_delay", lambda **_: 0.01)
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_error_event",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_event",
+            lambda *_args, **_kwargs: None,
+        )
+
+        await call_with_provider_retries(
+            operation,
+            provider="openrouter",
+            task="tool_calling",
+            max_attempts=3,
+            retry_progress_callback=progress.append,
+        )
+
+        [reported] = progress
+        assert reported.failed_attempt == 1
+        assert reported.next_attempt == 2
+        assert reported.unlimited is True
 
     asyncio.run(run())
 

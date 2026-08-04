@@ -20,6 +20,9 @@ class ProviderErrorCategory(StrEnum):
     STRUCTURED_OUTPUT_INVALID = "structured_output_invalid"
 
 
+PROVIDER_ERROR_MESSAGE_DIAGNOSTIC = "provider_error_message"
+
+
 @dataclass
 class ProviderError(Exception):
     category: ProviderErrorCategory

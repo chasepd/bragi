@@ -9144,6 +9144,30 @@ def test_chat_turn_skips_duplicate_active_state_pruning_job(tmp_path: Path) -> N
     assert runtime.state_pruning_calls == 0
 
 
+def test_provider_retry_status_text_renders_unlimited_attempts_without_max() -> None:
+    from types import SimpleNamespace as ProgressNamespace
+
+    assert api_app._provider_retry_status_text(  # noqa: SLF001
+        ProgressNamespace(next_attempt=9, max_attempts=7, unlimited=True),
+        "chat",
+    ) == "Retrying chat request (attempt 9)..."
+
+    assert api_app._provider_retry_status_text(  # noqa: SLF001
+        ProgressNamespace(next_attempt=2, max_attempts=3, unlimited=False),
+        "chat",
+    ) == "Retrying chat request (attempt 2 of 3)..."
+
+    assert api_app._provider_retry_status_text(  # noqa: SLF001
+        ProgressNamespace(next_attempt=2, max_attempts=3),
+        "chat",
+    ) == "Retrying chat request (attempt 2 of 3)..."
+
+    assert api_app._provider_retry_status_text(  # noqa: SLF001
+        ProgressNamespace(next_attempt=None, max_attempts=None, unlimited=True),
+        "chat",
+    ) == "Retrying chat request..."
+
+
 def test_provider_retry_progress_events_are_sent_before_sse_done(
     tmp_path: Path,
 ) -> None:

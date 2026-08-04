@@ -132,6 +132,7 @@ class ProviderRetryProgress:
     retry_delay_ms: int
     error_category: str
     http_status: int | None = None
+    unlimited: bool = False
 
 
 ProviderRetryProgressCallback = Callable[[ProviderRetryProgress], None]
