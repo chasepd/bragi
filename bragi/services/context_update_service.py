@@ -934,14 +934,9 @@ class ToolCallingProviderContextUpdater:
                 if provider_error_is_model_not_found(exc):
                     return await self._recover_via_structured_shape(
                         error=exc,
-                        structured_run=lambda: StructuredProviderContextUpdater(
-                            provider=cast(StructuredOutputProvider, self.provider),
-                            provider_name=self.provider_name,
-                            model_id=self.model_id,
-                            repositories=self.repositories,
-                            providers=self.providers,
-                            prompt_inspection_store=self.prompt_inspection_store,
-                        ).extract(request),
+                        structured_run=lambda: self._structured_updater().extract(
+                            request
+                        ),
                     )
                 raise
             fallback_request = tool_call_fallback_request(
@@ -966,14 +961,9 @@ class ToolCallingProviderContextUpdater:
                 if provider_error_is_model_not_found(exc):
                     return await self._recover_via_structured_shape(
                         error=exc,
-                        structured_run=lambda: StructuredProviderContextUpdater(
-                            provider=cast(StructuredOutputProvider, self.provider),
-                            provider_name=self.provider_name,
-                            model_id=self.model_id,
-                            repositories=self.repositories,
-                            providers=self.providers,
-                            prompt_inspection_store=self.prompt_inspection_store,
-                        ).extract(request),
+                        structured_run=lambda: self._structured_updater().extract(
+                            request
+                        ),
                     )
                 raise provider_error_with_fallback_skipped_reason(exc, reason) from exc
             fallback_provider = self.providers[fallback_request.provider]
@@ -989,14 +979,9 @@ class ToolCallingProviderContextUpdater:
                 if provider_error_is_model_not_found(exc):
                     return await self._recover_via_structured_shape(
                         error=exc,
-                        structured_run=lambda: StructuredProviderContextUpdater(
-                            provider=cast(StructuredOutputProvider, self.provider),
-                            provider_name=self.provider_name,
-                            model_id=self.model_id,
-                            repositories=self.repositories,
-                            providers=self.providers,
-                            prompt_inspection_store=self.prompt_inspection_store,
-                        ).extract(request),
+                        structured_run=lambda: self._structured_updater().extract(
+                            request
+                        ),
                     )
                 raise provider_error_with_fallback_skipped_reason(exc, reason) from exc
             log_event(
@@ -1019,14 +1004,9 @@ class ToolCallingProviderContextUpdater:
                 if provider_error_is_model_not_found(exc):
                     return await self._recover_via_structured_shape(
                         error=exc,
-                        structured_run=lambda: StructuredProviderContextUpdater(
-                            provider=cast(StructuredOutputProvider, self.provider),
-                            provider_name=self.provider_name,
-                            model_id=self.model_id,
-                            repositories=self.repositories,
-                            providers=self.providers,
-                            prompt_inspection_store=self.prompt_inspection_store,
-                        ).extract(request),
+                        structured_run=lambda: self._structured_updater().extract(
+                            request
+                        ),
                     )
                 raise provider_error_with_fallback_attempted(
                     fallback_exc,
@@ -1044,6 +1024,16 @@ class ToolCallingProviderContextUpdater:
                     ),
                 )
             return fallback_extraction
+
+    def _structured_updater(self) -> StructuredProviderContextUpdater:
+        return StructuredProviderContextUpdater(
+            provider=cast(StructuredOutputProvider, self.provider),
+            provider_name=self.provider_name,
+            model_id=self.model_id,
+            repositories=self.repositories,
+            providers=self.providers,
+            prompt_inspection_store=self.prompt_inspection_store,
+        )
 
     async def _recover_via_structured_shape[T](
         self,
@@ -1092,14 +1082,9 @@ class ToolCallingProviderContextUpdater:
                     candidates=request.candidates,
                 )
             ),
-            structured_run=lambda: StructuredProviderContextUpdater(
-                provider=cast(StructuredOutputProvider, self.provider),
-                provider_name=self.provider_name,
-                model_id=self.model_id,
-                repositories=self.repositories,
-                providers=self.providers,
-                prompt_inspection_store=self.prompt_inspection_store,
-            ).select_context(request),
+            structured_run=lambda: self._structured_updater().select_context(
+                request
+            ),
         )
 
     async def enrich(
@@ -1137,14 +1122,7 @@ class ToolCallingProviderContextUpdater:
                     characters=request.characters,
                 )
             ),
-            structured_run=lambda: StructuredProviderContextUpdater(
-                provider=cast(StructuredOutputProvider, self.provider),
-                provider_name=self.provider_name,
-                model_id=self.model_id,
-                repositories=self.repositories,
-                providers=self.providers,
-                prompt_inspection_store=self.prompt_inspection_store,
-            ).enrich(request),
+            structured_run=lambda: self._structured_updater().enrich(request),
         )
 
     async def _run_with_tool_fallback[T](

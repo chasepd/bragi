@@ -2012,6 +2012,33 @@ def test_tool_calling_state_extractor_switches_to_structured_route_on_model_not_
     assert extraction.tool_diagnostics["provider"] == "fake"
 
 
+def test_tool_calling_state_extractor_recovers_without_fallback_infrastructure(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _player_message, narrator_message = _save_with_completed_turn(repositories)
+    provider = ShapeSwitchToolCallProvider()
+    extractor = ToolCallingProviderStateExtractor(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-tools",
+    )
+
+    extraction = asyncio.run(
+        extractor.extract(
+            _state_request(
+                save_id=save.id,
+                messages=(narrator_message,),
+                repositories=repositories,
+            )
+        )
+    )
+
+    assert len(provider.tool_call_requests) == 1
+    assert len(provider.structured_output_requests) == 1
+    assert extraction.state_changes == ()
+    assert extraction.tool_diagnostics["shape_switch"] == "structured_output"
+
+
 def test_tool_calling_state_extractor_keeps_error_when_structured_route_also_fails(
     repositories: PersistenceRepositories,
 ) -> None:

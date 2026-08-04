@@ -2479,7 +2479,6 @@ async def _recover_context_tool_selection(
                 player_message=player_message,
                 candidates=candidates,
                 save_id=save_id,
-                tool_error=primary_error,
             )
         return _deterministic_context_selection(
             candidates,
@@ -2507,7 +2506,6 @@ async def _recover_context_tool_selection(
                 player_message=player_message,
                 candidates=candidates,
                 save_id=save_id,
-                tool_error=primary_error,
             )
         return _deterministic_context_selection(
             candidates,
@@ -2566,7 +2564,6 @@ async def _recover_context_tool_selection(
                 player_message=player_message,
                 candidates=candidates,
                 save_id=save_id,
-                tool_error=primary_error,
             )
         return _deterministic_context_selection(
             candidates,
@@ -2621,7 +2618,6 @@ async def _recover_context_selection_via_structured_shape(
     player_message: str,
     candidates: tuple[_ContextCandidate, ...],
     save_id: str | None,
-    tool_error: Exception | None,
 ) -> _ContextSelectionOutcome:
     log_event(
         "provider.tool_call_shape_recovery_started",

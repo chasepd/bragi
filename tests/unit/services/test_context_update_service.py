@@ -2504,6 +2504,68 @@ def test_tool_calling_context_updater_keeps_error_when_structured_route_also_fai
     assert len(provider.structured_output_requests) == 1
 
 
+def test_tool_calling_context_updater_select_context_switches_to_structured_route(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.save_provider_model(
+        provider="primary",
+        model_id="primary-tools",
+        display_name="Primary Tools",
+        capabilities=["tool_calling", "structured_output"],
+    )
+    candidate = module.ContextRegistryItem(
+        context_source_id="context-memory-1",
+        source_type="memory",
+        source_id="memory-1",
+        title="Ilyra promise",
+        body="Captain Ilyra owes Mara a signal flare.",
+        fact_type="promise",
+        importance=0.9,
+    )
+    provider = ShapeSwitchContextUpdateProvider(
+        structured_data={
+            "selections": [
+                {
+                    "context_source_id": candidate.context_source_id,
+                    "relevance_note": "Selected through the structured route.",
+                }
+            ]
+        }
+    )
+    updater = module.ToolCallingProviderContextUpdater(
+        provider=provider,
+        provider_name="primary",
+        model_id="primary-tools",
+        repositories=repositories,
+        providers={"primary": provider},
+    )
+
+    selection = asyncio.run(
+        updater.select_context(
+            module.ContextRegistrySelectionRequest(
+                save_id=save.id,
+                messages=(player_message, narrator_message),
+                scene_snapshot=None,
+                locations=(),
+                characters=(),
+                active_threads=(),
+                candidates=(candidate,),
+            )
+        )
+    )
+
+    assert len(provider.tool_call_requests) == 1
+    assert len(provider.structured_output_requests) == 1
+    assert [item.context_source_id for item in selection.selected_items] == [
+        candidate.context_source_id
+    ]
+    assert selection.selected_items[0].relevance_note == (
+        "Selected through the structured route."
+    )
+
+
 def test_update_after_turn_falls_back_to_deterministic_prior_context_on_selector_error(
     repositories: PersistenceRepositories,
 ) -> None:

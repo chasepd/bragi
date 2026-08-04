@@ -271,6 +271,10 @@ class MemoryConsolidationService:
                         ),
                     )
                 except ProviderError as exc:
+                    # The tool fallback chain enriches the failing error,
+                    # which keeps the category of whichever attempt ended the
+                    # tool path; either one failing with model_not_found means
+                    # the tool shape is unavailable.
                     if not provider_error_is_model_not_found(exc):
                         raise
                     return await recover_tool_call_shape_with_structured_output(

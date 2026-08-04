@@ -377,6 +377,11 @@ class ToolCallingProviderScenarioEvolver:
                 ),
             )
         except ProviderError as exc:
+            # The tool fallback chain enriches the failing error, which keeps
+            # the category of whichever attempt ended the tool path (primary
+            # or fallback); either one failing with model_not_found means the
+            # tool shape is unavailable, so recover through the structured
+            # route.
             if not provider_error_is_model_not_found(exc):
                 raise
             return await self._evolve_via_structured_shape(
