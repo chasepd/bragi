@@ -8954,6 +8954,8 @@ def _run_coroutine_blocking(coroutine: Coroutine[Any, Any, None]) -> None:
 
 def _user_visible_error(exc: Exception) -> str:
     if isinstance(exc, ProviderError):
+        if exc.diagnostics.get("no_endpoints_retry_terminated") is True:
+            return redact_text(str(exc)) or exc.__class__.__name__
         exhausted_attempts = exhausted_retry_attempt_count(exc)
         if exhausted_attempts is not None:
             if exc.category == ProviderErrorCategory.RATE_LIMITED:
