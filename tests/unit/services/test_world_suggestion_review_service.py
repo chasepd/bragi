@@ -169,7 +169,7 @@ def test_review_accepts_and_applies_pending_suggestion(
     assert "directly supports" in audit.reason
     assert provider.chat_requests == []
     assert provider.requests[0].schema_name == "world_suggestion_review"
-    assert provider.requests[0].max_output_tokens == 1024
+    assert provider.requests[0].max_output_tokens == 2048
     prompt = "\n".join(message.body for message in provider.requests[0].messages)
     assert suggestion_id in prompt
     assert "The narrator described the beacon lens change." in prompt

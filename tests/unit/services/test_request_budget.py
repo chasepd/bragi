@@ -218,3 +218,46 @@ def test_structured_and_tool_budgets_set_provider_output_caps() -> None:
 
     assert structured.max_output_tokens == 128
     assert tool.max_output_tokens == 128
+
+
+def test_unknown_task_budgets_apply_default_output_reserves() -> None:
+    chat = enforce_chat_request_budget(
+        ChatRequest(
+            provider="fake",
+            model_id="chat",
+            messages=(ChatMessage(role="user", body="Continue."),),
+        ),
+        model_context_window=8192,
+        task="unknown_task",
+    )
+    structured = enforce_structured_output_request_budget(
+        StructuredOutputRequest(
+            provider="fake",
+            model_id="structured",
+            messages=(ChatMessage(role="user", body="Select."),),
+            schema_name="selection",
+            schema={"type": "object", "additionalProperties": False},
+        ),
+        model_context_window=8192,
+        task="unknown_task",
+    )
+    tool = enforce_tool_call_request_budget(
+        ToolCallRequest(
+            provider="fake",
+            model_id="tools",
+            messages=(ToolCallMessage(role="user", body="Select."),),
+            tools=(
+                ToolDefinition(
+                    name="select",
+                    description="Select.",
+                    parameters={"type": "object", "additionalProperties": False},
+                ),
+            ),
+        ),
+        model_context_window=16384,
+        task="unknown_task",
+    )
+
+    assert chat.max_output_tokens == 2048
+    assert structured.max_output_tokens == 2048
+    assert tool.max_output_tokens == 1024

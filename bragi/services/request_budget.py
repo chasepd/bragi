@@ -18,9 +18,9 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.token_accounting import estimate_text_tokens
 
-DEFAULT_CHAT_OUTPUT_RESERVE = 1024
-DEFAULT_STRUCTURED_OUTPUT_RESERVE = 1024
-DEFAULT_TOOL_CALL_OUTPUT_RESERVE = 512
+DEFAULT_CHAT_OUTPUT_RESERVE = 2048
+DEFAULT_STRUCTURED_OUTPUT_RESERVE = 2048
+DEFAULT_TOOL_CALL_OUTPUT_RESERVE = 1024
 _CHAT_OUTPUT_RESERVES = {
     "character_text": 256,
     "image_prompt": 512,

@@ -79,8 +79,8 @@ def test_chat_generation_settings_sanitize_ranges() -> None:
     assert sanitize_chat_temperature(99.0) == 2.0
     assert sanitize_chat_temperature("nope") == 0.7
     assert sanitize_chat_max_output_tokens(12) == 64
-    assert sanitize_chat_max_output_tokens(99_999) == 4096
-    assert sanitize_chat_max_output_tokens(False) == 1200
+    assert sanitize_chat_max_output_tokens(99_999) == 8192
+    assert sanitize_chat_max_output_tokens(False) == 2048
 
 
 def test_image_generation_dimensions_require_supported_model(

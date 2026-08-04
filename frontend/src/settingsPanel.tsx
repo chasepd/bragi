@@ -996,17 +996,23 @@ function SimpleModelSelectorRow({ group, disabled }: { group: SimpleModelSelecto
   const commonFallbackSelection = commonSelectedModelValue(group.fallbackSelectors, group.fallbackOptions);
   const [mainValue, setMainValue] = useState(commonMainSelection);
   const [fallbackValue, setFallbackValue] = useState(commonFallbackSelection);
+  const [mainThinking, setMainThinking] = useState(commonSelectedThinkingValue(group.mainSelectors, commonMainSelection));
+  const [fallbackThinking, setFallbackThinking] = useState(commonSelectedThinkingValue(group.fallbackSelectors, commonFallbackSelection));
   const [error, setError] = useState("");
 
   useEffect(() => {
     setMainValue(commonMainSelection);
     setFallbackValue(commonFallbackSelection);
+    setMainThinking(commonSelectedThinkingValue(group.mainSelectors, commonMainSelection));
+    setFallbackThinking(commonSelectedThinkingValue(group.fallbackSelectors, commonFallbackSelection));
   }, [commonMainSelection, commonFallbackSelection, group]);
 
   const savePreferences = useMutation({
-    mutationFn: async ({ main, fallback }: { main: string; fallback: string }) => {
+    mutationFn: async ({ main, fallback, mainThinkingLevel, fallbackThinkingLevel }: { main: string; fallback: string; mainThinkingLevel: string; fallbackThinkingLevel: string }) => {
       await saveSimpleModelPreferences(group.mainSelectors, main);
       await saveSimpleModelPreferences(group.fallbackSelectors, fallback);
+      await saveSimpleModelThinking(group.mainSelectors, main, mainThinkingLevel);
+      await saveSimpleModelThinking(group.fallbackSelectors, fallback, fallbackThinkingLevel);
     },
     onSuccess: () => {
       setError("");
@@ -1020,6 +1026,10 @@ function SimpleModelSelectorRow({ group, disabled }: { group: SimpleModelSelecto
 
   const controlsDisabled = disabled || savePreferences.isPending;
   const canApply = Boolean(mainValue || fallbackValue);
+  const mainDraftOption = modelOptionForValue(group.mainOptions, mainValue);
+  const fallbackDraftOption = modelOptionForValue(group.fallbackOptions, fallbackValue);
+  const mainThinkingControl = thinkingControlForModelOption(mainDraftOption, mainThinking, group.label);
+  const fallbackThinkingControl = thinkingControlForModelOption(fallbackDraftOption, fallbackThinking, group.label);
 
   return (
     <div className="model-routing-row">
@@ -1032,8 +1042,17 @@ function SimpleModelSelectorRow({ group, disabled }: { group: SimpleModelSelecto
             mainValue,
             group.mainOptions,
             controlsDisabled || !group.mainSelectors.length || !group.mainOptions.length,
-            setMainValue
+            (value) => {
+              setMainValue(value);
+              setMainThinking(THINKING_LEVEL_PROVIDER_DEFAULT);
+            }
           )}
+          <ThinkingLevelSelect
+            control={mainThinkingControl}
+            label={`${group.label} main thinking level`}
+            disabled={controlsDisabled || !group.mainOptions.length}
+            onChange={setMainThinking}
+          />
         </div>
         <div className="field-label">
           <span>Fallback</span>
@@ -1042,14 +1061,28 @@ function SimpleModelSelectorRow({ group, disabled }: { group: SimpleModelSelecto
             fallbackValue,
             group.fallbackOptions,
             controlsDisabled || !group.fallbackSelectors.length || !group.fallbackOptions.length,
-            setFallbackValue
+            (value) => {
+              setFallbackValue(value);
+              setFallbackThinking(THINKING_LEVEL_PROVIDER_DEFAULT);
+            }
           )}
+          <ThinkingLevelSelect
+            control={fallbackThinkingControl}
+            label={`${group.label} fallback thinking level`}
+            disabled={controlsDisabled || !group.fallbackOptions.length}
+            onChange={setFallbackThinking}
+          />
         </div>
         <button
           type="button"
           className="primary-command compact"
           disabled={controlsDisabled || !canApply}
-          onClick={() => savePreferences.mutate({ main: mainValue, fallback: fallbackValue })}
+          onClick={() => savePreferences.mutate({
+            main: mainValue,
+            fallback: fallbackValue,
+            mainThinkingLevel: mainThinking,
+            fallbackThinkingLevel: fallbackThinking
+          })}
         >
           {savePreferences.isPending ? <Loader2 size={15} /> : <Check size={15} />}
           Apply
@@ -1069,6 +1102,28 @@ async function saveSimpleModelPreferences(selectors: TaskModelSelector[], value:
       provider: preference.provider,
       model_id: preference.model_id
     });
+  }
+  return true;
+}
+
+async function saveSimpleModelThinking(
+  selectors: TaskModelSelector[],
+  value: string,
+  thinkingLevel: string
+): Promise<boolean> {
+  const preference = modelPreferenceFromValue(value);
+  if (!preference || !selectors.length) return false;
+  for (const selector of selectors) {
+    if (thinkingLevel === THINKING_LEVEL_PROVIDER_DEFAULT) {
+      await deleteJson(modelThinkingPreferencePath(selector.task));
+    } else {
+      await postJson("/api/settings/model-thinking", {
+        task: selector.task,
+        provider: preference.provider,
+        model_id: preference.model_id,
+        level: thinkingLevel
+      });
+    }
   }
   return true;
 }

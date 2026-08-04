@@ -1027,7 +1027,7 @@ def test_analyze_and_apply_batches_large_cleanup_target_registry(
         if request.schema_name == "context_cleanup_actions"
     ]
     assert len(action_requests) == 5
-    assert all(request.max_output_tokens == 1024 for request in action_requests)
+    assert all(request.max_output_tokens == 2048 for request in action_requests)
     target_line_counts = [
         sum(
             line.startswith(("- memory ", "- world_state "))
