@@ -19,7 +19,11 @@ from bragi.providers.contracts import (
     ToolCallProvider,
     ToolCallRequest,
 )
-from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.providers.errors import (
+    ProviderError,
+    ProviderErrorCategory,
+    map_exception_to_category,
+)
 from bragi.services.generation_settings import (
     chat_request_with_reasoning_override,
     request_with_model_thinking_preference,
@@ -823,13 +827,8 @@ async def recover_tool_call_shape_with_structured_output[T](
 
 
 def _shape_recovery_wrapped_error(exc: Exception) -> ProviderError:
-    category = (
-        ProviderErrorCategory.NETWORK_ERROR
-        if isinstance(exc, TimeoutError)
-        else ProviderErrorCategory.PROVIDER_ERROR
-    )
     return ProviderError(
-        category=category,
+        category=map_exception_to_category(exc),
         message=str(exc) or exc.__class__.__name__,
     )
 
@@ -870,7 +869,7 @@ def _with_shape_recovery_failure(
             "shape_recovery": {
                 "task": task,
                 "provider": provider,
-                "model_id": model_id,
+                "model": model_id,
                 "failed": True,
             },
         },

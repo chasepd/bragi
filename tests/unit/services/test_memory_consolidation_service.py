@@ -684,6 +684,68 @@ def test_consolidation_recovers_when_tool_fallback_model_missing(
     assert result.rewritten_count == 1
 
 
+def test_consolidation_recovers_when_tool_fallback_rate_limited(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, messages = _save_with_messages(repositories)
+    canonical = repositories.add_memory(
+        save_id=save.id,
+        body="Ilyra trusts Mara with the beacon lens.",
+        tags=["relationship"],
+        importance=0.7,
+        source_message_id=messages[0].id,
+    )
+    duplicate = repositories.add_memory(
+        save_id=save.id,
+        body="Captain Ilyra trusts Mara around the beacon.",
+        tags=["relationship", "ilyra"],
+        importance=0.8,
+        source_message_id=messages[1].id,
+    )
+    _configure_consolidation_tool_fallback(repositories)
+    primary = ShapeSwitchConsolidationProvider(
+        structured_data={
+            "clusters": [
+                {
+                    "canonical_memory_id": canonical.id,
+                    "merged_memory_ids": [duplicate.id],
+                    "body": "Captain Ilyra trusts Mara with the beacon lens.",
+                    "tags": ["relationship"],
+                    "importance": 0.9,
+                    "confidence": 0.95,
+                    "reason": "The memories describe the same relationship.",
+                }
+            ]
+        }
+    )
+    fallback = FailingConsolidationFallbackProvider(
+        error=ProviderError(
+            ProviderErrorCategory.RATE_LIMITED,
+            "rate limited",
+            status_code=429,
+        )
+    )
+
+    result = asyncio.run(
+        MemoryConsolidationService(
+            repositories=repositories,
+            provider=primary,
+            provider_name="fake",
+            model_id="fake-tools",
+            prefer_tool_calls=True,
+            providers={
+                "fake": cast(Any, primary),
+                "fallback": cast(Any, fallback),
+            },
+        ).consolidate_if_needed(save.id, min_active_memories=1)
+    )
+
+    assert len(primary.tool_requests) == 1
+    assert len(fallback.tool_requests) == 1
+    assert len(primary.structured_requests) == 1
+    assert result.rewritten_count == 1
+
+
 def test_consolidation_keeps_fallback_result_when_tool_fallback_succeeds(
     repositories: PersistenceRepositories,
 ) -> None:

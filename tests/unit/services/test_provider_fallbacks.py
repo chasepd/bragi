@@ -1304,6 +1304,7 @@ def test_recover_tool_call_shape_wraps_timeout_failure() -> None:
         assert exc_info.value.fallback_model_id == "primary-tools"
         shape_recovery = _shape_recovery_diagnostics(exc_info.value)
         assert shape_recovery["failed"] is True
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
 
     asyncio.run(run())
 
@@ -1332,6 +1333,7 @@ def test_recover_tool_call_shape_wraps_value_error_failure() -> None:
         assert "provider does not support structured output" in exc_info.value.message
         shape_recovery = _shape_recovery_diagnostics(exc_info.value)
         assert shape_recovery["failed"] is True
+        assert isinstance(exc_info.value.__cause__, ValueError)
 
     asyncio.run(run())
 

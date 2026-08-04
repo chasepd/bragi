@@ -628,6 +628,55 @@ def test_state_pruning_recovers_when_tool_fallback_model_missing(
     assert [fact.world_state_id for fact in result.archived] == [stale_state.id]
 
 
+def test_state_pruning_recovers_when_tool_fallback_rate_limited(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _save_with_state_pruning_preference(
+        repositories,
+        model_capabilities=[
+            ProviderCapability.TOOL_CALLING.value,
+            ProviderCapability.STRUCTURED_OUTPUT.value,
+        ],
+    )
+    stale_state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="scene.old_alarm",
+        value={"status": "disabled", "location": "north stair"},
+        category="scene",
+    )
+    _configure_state_pruning_tool_fallback(repositories)
+    primary = ShapeSwitchToolPruningProvider(
+        structured_data={
+            "archives": [
+                {
+                    "world_state_id": stale_state.id,
+                    "key": stale_state.key,
+                    "reason": "The alarm was disabled and superseded.",
+                }
+            ]
+        }
+    )
+    fallback = FailingToolPruningFallbackProvider(
+        error=ProviderError(
+            ProviderErrorCategory.RATE_LIMITED,
+            "rate limited",
+            status_code=429,
+        )
+    )
+
+    result = asyncio.run(
+        StatePruningService(
+            repositories=repositories,
+            providers={"fake": primary, "fallback": fallback},
+        ).prune(save_id=save.id)
+    )
+
+    assert len(primary.tool_call_requests) == 1
+    assert len(fallback.tool_call_requests) == 1
+    assert len(primary.structured_output_requests) == 1
+    assert [fact.world_state_id for fact in result.archived] == [stale_state.id]
+
+
 def test_state_pruning_keeps_fallback_result_when_tool_fallback_succeeds(
     repositories: PersistenceRepositories,
 ) -> None:

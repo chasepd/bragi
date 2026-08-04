@@ -1046,6 +1046,8 @@ class ToolCallingProviderContextUpdater:
             return fallback_extraction
 
     def _structured_updater(self) -> StructuredProviderContextUpdater:
+        if not isinstance(self.provider, StructuredOutputProvider):
+            raise ValueError("Context update provider lacks structured output")
         return StructuredProviderContextUpdater(
             provider=cast(StructuredOutputProvider, self.provider),
             provider_name=self.provider_name,

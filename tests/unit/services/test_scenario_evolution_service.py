@@ -798,6 +798,49 @@ def test_tool_calling_evolver_recovers_when_tool_fallback_model_missing(
     asyncio.run(run())
 
 
+def test_tool_calling_evolver_recovers_when_tool_fallback_rate_limited(
+    repositories: PersistenceRepositories,
+) -> None:
+    async def run() -> None:
+        save_id, _scenario_id, message_id = _create_full_roleplay_save(repositories)
+        _configure_scenario_evolution_tool_fallback(repositories)
+        messages = tuple(repositories.list_messages(save_id))
+        primary = ShapeSwitchToolProvider(
+            structured_data={
+                "content": {"current_scene": "The beacon gallery hums."},
+                "reason": "The location changed during play.",
+                "source_message_id": message_id,
+            }
+        )
+        fallback = FailingScenarioEvolutionFallbackProvider(
+            error=ProviderError(
+                ProviderErrorCategory.RATE_LIMITED,
+                "rate limited",
+                status_code=429,
+            )
+        )
+
+        evolution = await ToolCallingProviderScenarioEvolver(
+            provider=primary,
+            provider_name="fake",
+            model_id="fake-tools",
+            providers={"fake": cast(Any, primary), "fallback": cast(Any, fallback)},
+        ).evolve(
+            ScenarioEvolutionRequest(save_id=save_id, messages=messages),
+            repositories=repositories,
+        )
+
+        assert len(primary.tool_requests) == 1
+        assert len(fallback.tool_requests) == 1
+        assert len(primary.structured_requests) == 1
+        assert evolution.diagnostics["shape_switch"] == "structured_output"
+        assert [update.section_id for update in evolution.updates] == [
+            "current_scene"
+        ]
+
+    asyncio.run(run())
+
+
 def test_tool_calling_evolver_keeps_fallback_result_when_tool_fallback_succeeds(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -842,8 +885,6 @@ def test_tool_calling_evolver_keeps_fallback_result_when_tool_fallback_succeeds(
         assert [update.section_id for update in evolution.updates] == [
             "current_scene"
         ]
-
-    asyncio.run(run())
 
     asyncio.run(run())
 

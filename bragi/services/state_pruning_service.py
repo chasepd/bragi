@@ -262,6 +262,7 @@ class StatePruningService:
                             completed_batch_count=len(batch_results),
                             batch_size=self.state_batch_size,
                             failed_batch_index=failed_batch_index,
+                            tool_diagnostics=shape_diagnostics,
                         ),
                     )
             log_event(
@@ -286,6 +287,7 @@ class StatePruningService:
                             completed_batch_count=len(batch_results),
                             batch_size=self.state_batch_size,
                             failed_batch_index=failed_batch_index,
+                            tool_diagnostics=shape_diagnostics,
                         ),
                     )
             log_error_event(
@@ -1029,6 +1031,7 @@ def _partial_result_json(
     completed_batch_count: int,
     batch_size: int,
     failed_batch_index: int | None,
+    tool_diagnostics: dict[str, object] | None = None,
 ) -> dict[str, object]:
     result = _merge_state_pruning_results(
         results,
@@ -1036,6 +1039,7 @@ def _partial_result_json(
         batch_count=batch_count,
         completed_batch_count=completed_batch_count,
         batch_size=batch_size,
+        tool_diagnostics=tool_diagnostics,
     )
     data = _result_json(result, review_only=review_only)
     if failed_batch_index is not None:
