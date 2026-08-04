@@ -207,7 +207,6 @@ def test_prompt_inspection_store_captures_tool_call_requests() -> None:
             ),
         ),
         temperature=0.0,
-        parallel_tool_calls=False,
     )
 
     store.capture_tool_call_request(
@@ -224,7 +223,6 @@ def test_prompt_inspection_store_captures_tool_call_requests() -> None:
     assert "record_memory_fact" in rendered
     assert "Tool schema fields: body, source_message_id" in rendered
     assert "Raw requests" in rendered
-    assert '"parallel_tool_calls": false' in rendered
     assert [entry.kind for entry in store.entries_for_message("message-1")] == [
         "state_memory_tool_calls"
     ]

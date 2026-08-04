@@ -1393,7 +1393,7 @@ def test_venice_tool_call_payload_uses_tools_and_preserves_arguments() -> None:
     payload = transport.calls[0]["payload"]
     assert payload["tools"][0]["function"]["name"] == "update_scene_snapshot"
     assert payload["tool_choice"] == "auto"
-    assert payload["parallel_tool_calls"] is True
+    assert "parallel_tool_calls" not in payload
     assert payload["max_completion_tokens"] == 400
     assert response.tool_calls[0].arguments_json == '{"source_message_id":'
 
