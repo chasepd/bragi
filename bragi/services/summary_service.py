@@ -40,7 +40,7 @@ from bragi.services.request_budget import model_context_window
 from bragi.services.sexual_content_safety import is_fade_to_black_message
 from bragi.services.summary_safety import validate_summary_output
 
-SUMMARY_OUTPUT_TOKEN_RESERVE = 256
+SUMMARY_OUTPUT_TOKEN_RESERVE = 10_000
 SUMMARY_BATCH_OVERHEAD_TOKENS = 768
 
 

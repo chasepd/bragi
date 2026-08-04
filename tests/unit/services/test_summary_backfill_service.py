@@ -43,7 +43,7 @@ class SequenceSummaryProvider:
                 model_id="fake-summary",
                 display_name="Fake Summary",
                 capabilities=frozenset({ProviderCapability.CHAT}),
-                context_window=8192,
+                context_window=16_384,
             )
         ]
 
@@ -300,7 +300,7 @@ def _long_save_with_summary_preference(
         model_id="fake-summary",
         display_name="Fake Summary",
         capabilities=["chat"],
-        context_window=8192,
+        context_window=16_384,
     )
     for index in range(1, message_count + 1):
         role = "player" if index % 2 else "narrator"

@@ -390,7 +390,7 @@ class CharacterActionPlanningService:
                 evidence_sources=evidence_sources,
             ),
             temperature=0.2,
-            max_output_tokens=450,
+            max_output_tokens=10_000,
         )
         response = await structured_output_with_fallback(
             repositories=self.repositories,
@@ -447,7 +447,7 @@ class CharacterActionPlanningService:
                 evidence_sources=evidence_sources,
             ),
             temperature=0.2,
-            max_output_tokens=900,
+            max_output_tokens=10_000,
         )
         response = await structured_output_with_fallback(
             repositories=self.repositories,

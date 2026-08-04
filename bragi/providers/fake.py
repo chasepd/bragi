@@ -63,7 +63,7 @@ class FakeProviderClient:
                         ProviderCapability.VISION,
                     }
                 ),
-                context_window=8192,
+                context_window=16_384,
             ),
             ProviderModel(
                 provider=self.provider_name,

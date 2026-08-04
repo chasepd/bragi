@@ -120,7 +120,7 @@ class DatingRouteProfileService:
                 routes=routes,
             ),
             temperature=0.2,
-            max_output_tokens=max(600, 280 * len(routes)),
+            max_output_tokens=max(10_000, 280 * len(routes)),
         )
         response = await structured_output_with_fallback(
             repositories=self.repositories,

@@ -45,7 +45,7 @@ class SummarizationContextNarratorProvider:
                 model_id="fake-summary",
                 display_name="Fake Summary",
                 capabilities=frozenset({ProviderCapability.CHAT}),
-                context_window=8192,
+                context_window=16_384,
             ),
             ProviderModel(
                 provider=self.provider_name,

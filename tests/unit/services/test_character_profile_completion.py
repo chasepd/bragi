@@ -260,7 +260,7 @@ def test_structured_starter_generation_honors_count_and_context() -> None:
     assert [starter.name for starter in starters] == ["Emily Carter", "Lily Chen"]
     request = provider.requests[0]
     assert request.schema_name == "scenario_character_starters"
-    assert request.max_output_tokens == 2048
+    assert request.max_output_tokens == 20_000
     assert "Create exactly 2 new character starters" in request.messages[0].body
     request_body = request.messages[1].body
     assert "Scenario types: dating_sim, heist_infiltration" in request_body
@@ -342,7 +342,7 @@ def test_structured_starter_generation_scales_budget_to_maximum_count() -> None:
 
     assert len(starters) == 12
     request = provider.requests[0]
-    assert request.max_output_tokens == 12_288
+    assert request.max_output_tokens == 120_000
     characters_schema = request.schema["properties"]["characters"]
     assert isinstance(characters_schema, dict)
     assert characters_schema["minItems"] == 12

@@ -472,7 +472,7 @@ def test_summary_service_budgets_summary_output_before_provider_dispatch(
         model_id="fake-summary",
         display_name="Fake Summary",
         capabilities=["chat"],
-        context_window=4096,
+        context_window=16_384,
     )
     provider = RecordingSummaryProvider(
         response_body="Mara crossed the ash bridge and heard the bell below.",
@@ -490,7 +490,7 @@ def test_summary_service_budgets_summary_output_before_provider_dispatch(
         )
     )
 
-    assert provider.chat_requests[0].max_output_tokens == 256
+    assert provider.chat_requests[0].max_output_tokens == 10_000
 
 
 def test_summary_service_batches_summary_source_messages_by_model_window(
@@ -502,7 +502,7 @@ def test_summary_service_batches_summary_source_messages_by_model_window(
         model_id="fake-summary",
         display_name="Fake Summary",
         capabilities=["chat"],
-        context_window=2200,
+        context_window=12_000,
     )
     for message in messages[:2]:
         repositories.connection.execute(

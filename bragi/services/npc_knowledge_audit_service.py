@@ -138,7 +138,7 @@ class NpcKnowledgeAuditService:
                     request=request,
                 ),
                 temperature=0,
-                max_output_tokens=1200,
+                max_output_tokens=10_000,
             ),
             task="npc_knowledge_audit",
             save_id=save_id,

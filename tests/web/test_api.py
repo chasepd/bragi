@@ -5578,7 +5578,7 @@ def test_fake_provider_seed_preserves_existing_model_preferences(
         model_id="custom-chat",
         display_name="Custom Chat",
         capabilities=["chat", "structured_output"],
-        context_window=8192,
+        context_window=16_384,
     )
     repositories.set_model_preference(
         task="chat",

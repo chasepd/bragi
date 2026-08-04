@@ -180,7 +180,7 @@ class DirectorPressureService:
                     previous_state=previous_state,
                 ),
                 temperature=0.2,
-                max_output_tokens=700,
+                max_output_tokens=10_000,
             ),
             task=DIRECTOR_PRESSURE_TASK,
             save_id=save_id,

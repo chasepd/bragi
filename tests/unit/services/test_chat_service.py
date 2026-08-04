@@ -8261,7 +8261,7 @@ def test_chat_fallback_filters_unsupported_generation_settings(
     assert primary.chat_requests[0].max_output_tokens == 1800
     assert len(fallback.chat_requests) == 1
     assert fallback.chat_requests[0].temperature is None
-    assert fallback.chat_requests[0].max_output_tokens == 2048
+    assert fallback.chat_requests[0].max_output_tokens == 10_000
 
 
 def test_submit_player_turn_includes_save_custom_instructions(
@@ -13229,7 +13229,7 @@ def test_observation_curation_reports_configured_provider_unavailable(
         model_id="missing-curator",
         display_name="Missing Curator",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=16_384,
     )
     repositories.set_model_preference(
         task="memory_curation",
@@ -14842,7 +14842,7 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
-        context_window=7000,
+        context_window=16_384,
     )
     repositories.save_provider_model(
         provider="venice",
@@ -14901,7 +14901,7 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
 
     assert primary.chat_requests[0].retrieved_state == ()
     primary_budget = primary.chat_requests[0].context_breakdown["final_prompt_budget"]
-    assert primary_budget["model_context_window"] == 7000
+    assert primary_budget["model_context_window"] == 16_384
     assert primary_budget["trimmed"] is True
     assert fallback.chat_requests[0].retrieved_state == (selected_state,)
     fallback_budget = fallback.chat_requests[0].context_breakdown[
@@ -18286,7 +18286,7 @@ def test_submit_player_turn_final_prompt_budget_trims_baseline_before_retrieval(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
-        context_window=8000,
+        context_window=16_384,
     )
     repositories.set_model_preference(
         task="chat",
@@ -18431,7 +18431,7 @@ def test_submit_player_turn_final_prompt_budget_trims_selected_retrieval(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
-        context_window=8000,
+        context_window=16_384,
     )
     repositories.set_model_preference(
         task="chat",
@@ -19271,7 +19271,7 @@ def test_submit_player_turn_counts_pending_player_message_for_summary_pressure(
         role="player",
         speaker_name="Mara",
         body="I step onto the ash bridge.",
-        token_estimate=40,
+        token_estimate=400,
     )
     older_narrator = repositories.append_message(
         save_id=save.id,
@@ -19280,14 +19280,14 @@ def test_submit_player_turn_counts_pending_player_message_for_summary_pressure(
         body="A bell rings under the span.",
         provider="fake-chat",
         model="fake-chat",
-        token_estimate=40,
+        token_estimate=400,
     )
     recent_player = repositories.append_message(
         save_id=save.id,
         role="player",
         speaker_name="Mara",
         body="I ask who rang the bell.",
-        token_estimate=20,
+        token_estimate=200,
     )
     recent_narrator = repositories.append_message(
         save_id=save.id,
@@ -19296,14 +19296,14 @@ def test_submit_player_turn_counts_pending_player_message_for_summary_pressure(
         body="The echo answers from below.",
         provider="fake-chat",
         model="fake-chat",
-        token_estimate=20,
+        token_estimate=200,
     )
     repositories.save_provider_model(
         provider="fake-chat",
         model_id="fake-chat",
         display_name="Fake Chat",
         capabilities=["chat"],
-        context_window=12000,
+        context_window=16_384,
     )
     repositories.set_model_preference(
         task="chat",

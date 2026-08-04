@@ -616,7 +616,7 @@ def _seed_fake_models_if_requested(
         model_id="fake-chat",
         display_name="Fake Chat",
         capabilities=["chat", "structured_output", "vision"],
-        context_window=8192,
+        context_window=16_384,
     )
     repositories.save_provider_model(
         provider="fake",

@@ -24,8 +24,8 @@ from bragi.services.chat_history_settings import (
 from bragi.services.model_preferences import roleplay_model_preference
 from bragi.services.summary_service import SummaryService
 
-DEFAULT_BACKFILL_CONTEXT_WINDOW = 4096
-DEFAULT_BACKFILL_RESERVED_TOKENS = 512
+DEFAULT_BACKFILL_CONTEXT_WINDOW = 16_384
+DEFAULT_BACKFILL_RESERVED_TOKENS = 10_000
 
 
 @dataclass(frozen=True)
