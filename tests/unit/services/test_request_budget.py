@@ -68,9 +68,9 @@ def test_unknown_windows_still_apply_provider_output_caps() -> None:
         task="context_search",
     )
 
-    assert chat.max_output_tokens == 256
-    assert structured.max_output_tokens == 128
-    assert tool.max_output_tokens == 128
+    assert chat.max_output_tokens == 10_000
+    assert structured.max_output_tokens == 10_000
+    assert tool.max_output_tokens == 10_000
 
 
 def test_chat_budget_rejects_irreducible_core_before_dispatch() -> None:
@@ -104,11 +104,11 @@ def test_chat_budget_sets_provider_output_cap_from_reserve() -> None:
 
     budgeted = enforce_chat_request_budget(
         request,
-        model_context_window=4096,
+        model_context_window=16_384,
         task="character_text",
     )
 
-    assert budgeted.max_output_tokens == 256
+    assert budgeted.max_output_tokens == 10_000
 
 
 def test_structured_budget_reserves_output_and_schema_tokens() -> None:
@@ -196,7 +196,7 @@ def test_structured_and_tool_budgets_set_provider_output_caps() -> None:
             schema_name="selection",
             schema={"type": "object", "additionalProperties": False},
         ),
-        model_context_window=4096,
+        model_context_window=16_384,
         task="context_search",
     )
     tool = enforce_tool_call_request_budget(
@@ -212,12 +212,12 @@ def test_structured_and_tool_budgets_set_provider_output_caps() -> None:
                 ),
             ),
         ),
-        model_context_window=4096,
+        model_context_window=16_384,
         task="context_search",
     )
 
-    assert structured.max_output_tokens == 128
-    assert tool.max_output_tokens == 128
+    assert structured.max_output_tokens == 10_000
+    assert tool.max_output_tokens == 10_000
 
 
 def test_unknown_task_budgets_apply_default_output_reserves() -> None:
@@ -227,7 +227,7 @@ def test_unknown_task_budgets_apply_default_output_reserves() -> None:
             model_id="chat",
             messages=(ChatMessage(role="user", body="Continue."),),
         ),
-        model_context_window=8192,
+        model_context_window=16_384,
         task="unknown_task",
     )
     structured = enforce_structured_output_request_budget(
@@ -238,7 +238,7 @@ def test_unknown_task_budgets_apply_default_output_reserves() -> None:
             schema_name="selection",
             schema={"type": "object", "additionalProperties": False},
         ),
-        model_context_window=8192,
+        model_context_window=16_384,
         task="unknown_task",
     )
     tool = enforce_tool_call_request_budget(
@@ -254,10 +254,10 @@ def test_unknown_task_budgets_apply_default_output_reserves() -> None:
                 ),
             ),
         ),
-        model_context_window=16384,
+        model_context_window=16_384,
         task="unknown_task",
     )
 
-    assert chat.max_output_tokens == 2048
-    assert structured.max_output_tokens == 2048
-    assert tool.max_output_tokens == 1024
+    assert chat.max_output_tokens == 10_000
+    assert structured.max_output_tokens == 10_000
+    assert tool.max_output_tokens == 10_000

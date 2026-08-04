@@ -196,7 +196,7 @@ class ContentSafetyService:
                 ChatMessage(role="player", body=body),
             ),
             temperature=0.0,
-            max_output_tokens=400,
+            max_output_tokens=10_000,
         )
         try:
             response = (

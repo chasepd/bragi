@@ -109,7 +109,7 @@ def test_audit_wraps_player_context_and_draft_as_untrusted_data(
         model_id="audit",
         display_name="Audit",
         capabilities=["structured_output"],
-        context_window=8192,
+        context_window=16_384,
     )
     provider = RecordingStructuredProvider()
     service = NpcKnowledgeAuditService(

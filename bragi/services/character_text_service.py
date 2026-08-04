@@ -2504,10 +2504,12 @@ class CharacterTextService:
                 message=message,
                 history=history,
             ),
-            temperature=0.1,
-            max_output_tokens=400,
+                        temperature=0.1,
+            max_output_tokens=10_000,
         )
         try:
+
+
             response = await structured_output_with_fallback(
                 repositories=self.repositories,
                 providers=cast(dict[str, ProviderClient], self.providers),
@@ -2577,7 +2579,7 @@ class CharacterTextService:
                     participants=participants,
                 ),
                 temperature=0.1,
-                max_output_tokens=400,
+                max_output_tokens=10_000,
             )
             try:
                 response = await structured_output_with_fallback(

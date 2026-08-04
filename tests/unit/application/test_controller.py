@@ -10175,7 +10175,7 @@ def test_run_summary_backfill_compacts_save_and_can_apply_windows(
         model_id="fake-summary",
         display_name="Fake Summary",
         capabilities=[ProviderCapability.CHAT.value],
-        context_window=8192,
+        context_window=16_384,
     )
     repositories.set_scoped_setting(
         scope="save",

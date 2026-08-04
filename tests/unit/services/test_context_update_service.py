@@ -1403,7 +1403,7 @@ def test_structured_context_update_records_inspection_entries_for_narrator(
     assert "Context extraction" in prompt_text
     assert "Raw requests" in prompt_text
     assert provider.requests
-    assert all(request.max_output_tokens == 2048 for request in provider.requests)
+    assert all(request.max_output_tokens == 10_000 for request in provider.requests)
     assert '"schema_name": "context_update_context_selection"' in prompt_text
 
 

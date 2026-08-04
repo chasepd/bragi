@@ -1679,7 +1679,7 @@ class MediaService:
                 text_message=text_message,
             ),
             temperature=0.1,
-            max_output_tokens=500,
+            max_output_tokens=10_000,
             openrouter_app_title=openrouter_app_title_for_task(
                 _CHARACTER_TEXT_UPLOADED_PHOTO_TASK
             ),
@@ -2087,7 +2087,7 @@ class MediaService:
             schema=_current_clothing_completion_schema(),
             messages=tuple(messages),
             temperature=0.2,
-            max_output_tokens=500,
+            max_output_tokens=10_000,
         )
         expected_ids = {character.id for character in missing}
         last_error = "unknown validation failure"
@@ -4041,7 +4041,7 @@ class MediaService:
                     ),
                     current_scene_recap=(scene_context,),
                     temperature=0.4,
-                    max_output_tokens=360,
+                    max_output_tokens=10_000,
                 ),
             )
             prompt = response.body.strip()

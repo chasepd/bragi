@@ -541,7 +541,7 @@ def test_structured_evolver_builds_schema_messages_and_parses_content_updates(
         section_schema = cast(dict[str, Any], update_properties["section_id"])
         source_schema = cast(dict[str, Any], schema["source_message_id"])
         assert request.schema_name == "scenario_evolution"
-        assert request.max_output_tokens == 2048
+        assert request.max_output_tokens == 10_000
         assert change_type_schema["enum"] == [
             "phase_shift",
             "no_phase_shift",

@@ -34,7 +34,7 @@ def test_fake_provider_reports_config_status_and_models() -> None:
             "fake-edit",
         }
         assert models_by_id["fake-chat"].provider == "fake"
-        assert models_by_id["fake-chat"].context_window == 8192
+        assert models_by_id["fake-chat"].context_window == 16_384
         assert ProviderCapability.CHAT in models_by_id["fake-chat"].capabilities
         assert (
             ProviderCapability.MODEL_LISTING

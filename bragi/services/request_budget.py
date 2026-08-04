@@ -18,17 +18,17 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.token_accounting import estimate_text_tokens
 
-DEFAULT_CHAT_OUTPUT_RESERVE = 2048
-DEFAULT_STRUCTURED_OUTPUT_RESERVE = 2048
-DEFAULT_TOOL_CALL_OUTPUT_RESERVE = 1024
+DEFAULT_CHAT_OUTPUT_RESERVE = 10_000
+DEFAULT_STRUCTURED_OUTPUT_RESERVE = 10_000
+DEFAULT_TOOL_CALL_OUTPUT_RESERVE = 10_000
 _CHAT_OUTPUT_RESERVES = {
-    "character_text": 256,
-    "image_prompt": 512,
-    "summarization": 256,
+    "character_text": 10_000,
+    "image_prompt": 10_000,
+    "summarization": 10_000,
 }
 _STRUCTURED_OUTPUT_RESERVES = {
-    "context_search": 128,
-    "narrator_message_verification": 512,
+    "context_search": 10_000,
+    "narrator_message_verification": 10_000,
 }
 
 

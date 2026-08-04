@@ -169,7 +169,7 @@ class ActionChoiceService:
                 narrator_message=narrator_message,
             ),
             temperature=0.45,
-            max_output_tokens=600,
+            max_output_tokens=10_000,
             retry_progress_callback=retry_progress_callback,
         )
         return PreparedActionChoiceGeneration(
