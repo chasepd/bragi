@@ -3,14 +3,20 @@ from dataclasses import dataclass
 import pytest
 
 from bragi.retry_policy import (
+    DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS,
     DEFAULT_RETRY_COUNT,
     DEFERRED_WORK_MAX_ATTEMPTS,
+    MAX_PROVIDER_CALL_DEADLINE_SECONDS,
     MAX_RETRY_COUNT,
+    MIN_PROVIDER_CALL_DEADLINE_SECONDS,
     MIN_RETRY_COUNT,
     MODEL_OUTPUT_MAX_ATTEMPTS,
+    PROVIDER_CALL_DEADLINE_SETTING,
     PROVIDER_MAX_ATTEMPTS,
     configured_max_attempts,
+    configured_provider_call_deadline_seconds,
     configured_retry_count,
+    sanitize_provider_call_deadline_seconds,
     sanitize_retry_count,
 )
 
@@ -18,10 +24,14 @@ from bragi.retry_policy import (
 @dataclass
 class RepositoryFake:
     value: object | None = None
+    deadline_value: object | None = None
 
     def get_effective_setting(self, key: str) -> object | None:
-        assert key == "retry_count"
-        return self.value
+        if key == "retry_count":
+            return self.value
+        if key == PROVIDER_CALL_DEADLINE_SETTING:
+            return self.deadline_value
+        return None
 
 
 def test_quality_first_retry_policy_uses_seven_total_attempts() -> None:
@@ -61,3 +71,44 @@ def test_retry_policy_falls_back_when_repository_lookup_fails() -> None:
             raise RuntimeError("database unavailable")
 
     assert configured_retry_count(BrokenRepository()) == DEFAULT_RETRY_COUNT
+
+
+def test_provider_call_deadline_default_is_one_hundred_twenty_seconds() -> None:
+    assert DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS == 120.0
+    assert configured_provider_call_deadline_seconds() == 120.0
+
+
+def test_provider_call_deadline_reads_repository_setting() -> None:
+    repositories = RepositoryFake(deadline_value=45)
+
+    assert configured_provider_call_deadline_seconds(repositories) == 45.0
+
+
+def test_provider_call_deadline_falls_back_when_repository_lookup_fails() -> None:
+    class BrokenRepository:
+        def get_effective_setting(self, key: str) -> object:
+            raise RuntimeError("database unavailable")
+
+    assert (
+        configured_provider_call_deadline_seconds(BrokenRepository())
+        == DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (True, DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS),
+        ("45", DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS),
+        (1.0, MIN_PROVIDER_CALL_DEADLINE_SECONDS),
+        (
+            MAX_PROVIDER_CALL_DEADLINE_SECONDS + 30.0,
+            MAX_PROVIDER_CALL_DEADLINE_SECONDS,
+        ),
+        (90.0, 90.0),
+    ],
+)
+def test_provider_call_deadline_sanitizes_persisted_values(
+    value: object, expected: float
+) -> None:
+    assert sanitize_provider_call_deadline_seconds(value) == expected

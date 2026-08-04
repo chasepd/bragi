@@ -52,6 +52,11 @@ from bragi.providers.http_client import (
     request_json,
     request_sse_json,
 )
+from bragi.providers.reasoning_diagnostics import (
+    extract_reasoning_signals,
+    is_reasoning_only_chat_response,
+    is_reasoning_truncated_structured_response,
+)
 from bragi.providers.retry import (
     call_with_provider_retries,
     retry_metadata_from_provider_error,
@@ -66,7 +71,10 @@ from bragi.providers.tool_calls import (
     tool_message_payload,
 )
 from bragi.redaction import redact_text
-from bragi.retry_policy import PROVIDER_MAX_ATTEMPTS
+from bragi.retry_policy import (
+    DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS,
+    PROVIDER_MAX_ATTEMPTS,
+)
 from bragi.services.secrets import SecretStorageError, SecretStore
 
 VENICE_PROVIDER_NAME = "venice"
@@ -118,6 +126,7 @@ class VeniceClient:
         video_poll_interval: float = VENICE_VIDEO_POLL_INTERVAL_SECONDS,
         video_timeout: float = VENICE_VIDEO_TIMEOUT_SECONDS,
         retry_max_attempts: Callable[[], int] | None = None,
+        call_deadline_seconds: Callable[[], float] | None = None,
     ) -> None:
         self.secret_store = secret_store
         self.base_url = base_url.rstrip("/")
@@ -129,11 +138,17 @@ class VeniceClient:
         self.video_poll_interval = max(0.0, video_poll_interval)
         self.video_timeout = max(0.0, video_timeout)
         self.retry_max_attempts = retry_max_attempts
+        self.call_deadline_seconds = call_deadline_seconds
 
     def _configured_max_attempts(self) -> int:
         if self.retry_max_attempts is None:
             return PROVIDER_MAX_ATTEMPTS
         return max(1, int(self.retry_max_attempts()))
+
+    def _configured_call_deadline_seconds(self) -> float:
+        if self.call_deadline_seconds is None:
+            return DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS
+        return max(0.0, float(self.call_deadline_seconds()))
 
     async def validate_config(self) -> ProviderConfigStatus:
         try:
@@ -503,10 +518,16 @@ class VeniceClient:
             provider=self.provider_name,
             task="structured_output",
             max_attempts=self._configured_max_attempts(),
+            call_deadline_seconds=self._configured_call_deadline_seconds(),
             retry_progress_callback=request.retry_progress_callback,
         )
         raw_metadata = dict(response)
         data = raw_metadata.pop(_STRUCTURED_DATA_METADATA_KEY)
+        _raise_if_reasoning_truncated(
+            response=response,
+            data=data,
+            schema_name=request.schema_name,
+        )
         try:
             validate_structured_output(
                 data,
@@ -606,6 +627,7 @@ class VeniceClient:
             provider=self.provider_name,
             task="model_listing",
             max_attempts=self._configured_max_attempts(),
+            call_deadline_seconds=self._configured_call_deadline_seconds(),
         )
 
     async def _post_json(
@@ -628,6 +650,7 @@ class VeniceClient:
             provider=self.provider_name,
             task=task,
             max_attempts=self._configured_max_attempts(),
+            call_deadline_seconds=self._configured_call_deadline_seconds(),
             retry_progress_callback=retry_progress_callback,
         )
 
@@ -721,6 +744,7 @@ class VeniceClient:
             provider=self.provider_name,
             task=task,
             max_attempts=self._configured_max_attempts(),
+            call_deadline_seconds=self._configured_call_deadline_seconds(),
             retry_progress_callback=retry_progress_callback,
         )
 
@@ -743,6 +767,7 @@ class VeniceClient:
             provider=self.provider_name,
             task=task,
             max_attempts=self._configured_max_attempts(),
+            call_deadline_seconds=self._configured_call_deadline_seconds(),
         )
         return _bytes_result_response_and_retry(result)
 
@@ -768,6 +793,7 @@ class VeniceClient:
             provider=self.provider_name,
             task=task,
             max_attempts=self._configured_max_attempts(),
+            call_deadline_seconds=self._configured_call_deadline_seconds(),
         )
         return _bytes_result_response_and_retry(result)
 
@@ -1474,6 +1500,37 @@ def _reasoning_effort(config: ChatReasoningConfig | None) -> str | None:
     return None
 
 
+def _raise_if_reasoning_truncated(
+    *,
+    response: dict[str, Any],
+    data: Any,
+    schema_name: str,
+) -> None:
+    if not isinstance(data, dict):
+        return
+    if data:
+        return
+    signals = extract_reasoning_signals(response)
+    if not is_reasoning_truncated_structured_response(signals):
+        return
+    raise ProviderError(
+        category=ProviderErrorCategory.STRUCTURED_OUTPUT_INVALID,
+        message=(
+            "Structured response was truncated; reasoning consumed the output "
+            "budget before any visible JSON was emitted. Increase "
+            "max_output_tokens or disable reasoning for this model."
+        ),
+        diagnostics={
+            "schema_name": schema_name,
+            "finish_reason": signals.finish_reason,
+            "reasoning_tokens": signals.reasoning_tokens,
+            "reasoning_detail_types": list(signals.detail_types),
+            "completion_tokens": signals.completion_tokens,
+            "truncated": True,
+        },
+    )
+
+
 def _venice_thinking_level_support(
     record: dict[str, Any],
 ) -> dict[str, object] | None:
@@ -2032,6 +2089,24 @@ def _chat_content(payload: dict[str, Any]) -> str:
         raise ValueError("Provider chat choice did not include a message")
     content = message.get("content")
     if isinstance(content, str):
+        if content:
+            return content
+        signals = extract_reasoning_signals(payload)
+        if is_reasoning_only_chat_response(signals):
+            raise ProviderError(
+                category=ProviderErrorCategory.PROVIDER_ERROR,
+                message=(
+                    "Provider returned a reasoning-only response with no visible "
+                    "assistant text; increase max_output_tokens or disable/reduce "
+                    "reasoning for this model"
+                ),
+                diagnostics={
+                    "finish_reason": signals.finish_reason,
+                    "reasoning_tokens": signals.reasoning_tokens,
+                    "reasoning_detail_types": list(signals.detail_types),
+                    "completion_tokens": signals.completion_tokens,
+                },
+            )
         return content
     if isinstance(content, list):
         text_parts: list[str] = []
@@ -2042,6 +2117,22 @@ def _chat_content(payload: dict[str, Any]) -> str:
                     text_parts.append(text)
         if text_parts:
             return "".join(text_parts)
+        signals = extract_reasoning_signals(payload)
+        if is_reasoning_only_chat_response(signals):
+            raise ProviderError(
+                category=ProviderErrorCategory.PROVIDER_ERROR,
+                message=(
+                    "Provider returned a reasoning-only response with no visible "
+                    "assistant text; increase max_output_tokens or disable/reduce "
+                    "reasoning for this model"
+                ),
+                diagnostics={
+                    "finish_reason": signals.finish_reason,
+                    "reasoning_tokens": signals.reasoning_tokens,
+                    "reasoning_detail_types": list(signals.detail_types),
+                    "completion_tokens": signals.completion_tokens,
+                },
+            )
     raise ValueError("Provider chat response content must be a string")
 
 

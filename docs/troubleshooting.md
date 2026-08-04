@@ -51,6 +51,59 @@ performance.
   redacted captured prompt and structured provider fields; older jobs may only
   have reconstructed metadata.
 
+## Regenerate Turns Hang On A Reasoning Model
+
+Some chat models are reasoning models that consume the configured
+`max_output_tokens` budget on internal reasoning before emitting any visible
+text. When the reasoning budget exceeds the output budget the model returns an
+empty or near-empty response, the structured-output validation fails, and Bragi
+retries the same call several times before surfacing an error. The result is a
+regenerate turn that appears stuck for several minutes.
+
+Symptom: `Chat Regenerate` stays in the "running" state for more than a minute
+and the diagnostics panel shows repeated
+`provider.generate_structured_output` or `provider.chat` steps for the same
+model, often with `finish_reason: "length"` and `reasoning_tokens` close to the
+output budget.
+
+Verify in the running container or host process:
+
+1. Inspect `job_steps` for the active regenerate job. Look for the
+   `provider_error: Provider returned a reasoning-only response with no visible
+   assistant text…` or `structured_output_invalid: Structured response was
+   truncated; reasoning consumed the output budget before any visible JSON was
+   emitted…` messages, and for completion token counts of one or two digits.
+2. Inspect the open TCP connections from the Bragi process. A single
+   `ESTABLISHED` HTTPS connection to a provider host with all other provider
+   connections in `CLOSE_WAIT` means the process is blocked on a single
+   in-flight call that cannot be cancelled until the upstream responds or the
+   per-call deadline fires.
+
+Mitigations, in order of safety:
+
+1. Cancel the running job from the workbench. Bragi surfaces a
+   "This is taking longer than usual" hint after sixty seconds and a
+   "Cancelling…" hint after the cancel request. The provider call itself
+   cannot be interrupted, but the global per-call deadline (default 120
+   seconds) bounds the total wall time across all retry attempts.
+2. Open Settings → Models and set `chat_fallback` and
+   `structured_output_fallback` to a different model than the primary. If the
+   primary and fallback resolve to the same provider and model, the fallback
+   cannot help when the primary fails. The recommended extraction fallback is
+   Venice `qwen3-5-9b`.
+3. Verify that `model_thinking_preferences` is actually disabling reasoning
+   for the model. The setting translates to `effort: "none"` on both
+   providers, and some providers will silently ignore it if the model's
+   capability discovery marks reasoning as mandatory. If reasoning cannot be
+   disabled for the model, switch the task to a non-reasoning model.
+4. Increase `chat_max_output_tokens` to at least the model's documented
+   reasoning budget. Models that need thousands of reasoning tokens should
+   have a `max_output_tokens` of 4096 or higher to leave room for a visible
+   response.
+5. Lower `provider_call_deadline_seconds` (default 120) to make misbehaving
+   calls fail faster. The deadline is independent of `retry_count` and bounds
+   the total wall time across all attempts, not the per-attempt timeout.
+
 ## Support Bundle Privacy
 
 The Diagnostics panel can copy or download a support bundle. Review it before
