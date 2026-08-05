@@ -1950,6 +1950,52 @@ def test_fork_snapshot_rejects_trailing_message_from_other_save(
     assert save_count == 2
 
 
+def test_fork_snapshot_rejects_archived_trailing_message(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    first = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The tower lens glows red.",
+    )
+    snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=first.id,
+    )
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Keeper",
+        body="I turn the lens.",
+    )
+    repositories.archive_message(player.id)
+    archived = repositories.get_message(
+        save_id=save.id,
+        message_id=player.id,
+        include_deleted=True,
+    )
+    assert archived is not None and archived.deleted_at is not None
+
+    with pytest.raises(
+        ValueError,
+        match="Trailing fork messages must be active source messages",
+    ):
+        service.fork_snapshot_to_save(
+            source_save_id=save.id,
+            snapshot_id=snapshot.id,
+            title="Forked from player message",
+            media_dir=tmp_path / "media",
+            trailing_messages=(archived,),
+        )
+    save_count = repositories.connection.execute(
+        "SELECT COUNT(*) FROM saves"
+    ).fetchone()[0]
+    assert save_count == 1
+
+
 def test_fork_snapshot_appends_trailing_message_after_snapshot(
     repositories: PersistenceRepositories,
     tmp_path: Path,
