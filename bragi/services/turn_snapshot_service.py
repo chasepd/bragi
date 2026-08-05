@@ -496,11 +496,7 @@ class TurnSnapshotService:
         rows_by_table = _sanitize_snapshot_rows_for_safety(
             self._rows_from_manifest(manifest)
         )
-        return tuple(
-            str(row["id"])
-            for row in rows_by_table.get("messages", ())
-            if isinstance(row.get("id"), str)
-        )
+        return _snapshot_message_ids_from_rows(rows_by_table)
 
     def latest_snapshot_before_message(
         self,
@@ -624,17 +620,15 @@ class TurnSnapshotService:
         )
         rows_by_table = _normalize_legacy_snapshot_memories(rows_by_table)
         trailing = tuple(trailing_messages)
-        snapshot_message_ids = {
-            str(row["id"])
-            for row in rows_by_table.get("messages", ())
-            if isinstance(row.get("id"), str)
-        }
+        source_snapshot_message_ids = frozenset(
+            _snapshot_message_ids_from_rows(rows_by_table)
+        )
         for message in trailing:
             if message.save_id != source_save_id or message.deleted_at is not None:
                 raise ValueError(
                     "Trailing fork messages must be active source messages"
                 )
-            if message.id in snapshot_message_ids:
+            if message.id in source_snapshot_message_ids:
                 raise ValueError(
                     "Trailing fork messages must follow the source snapshot"
                 )
@@ -2406,6 +2400,16 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 def _compact_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _snapshot_message_ids_from_rows(
+    rows_by_table: Mapping[str, Iterable[Mapping[str, object]]],
+) -> tuple[str, ...]:
+    return tuple(
+        str(row["id"])
+        for row in rows_by_table.get("messages", ())
+        if isinstance(row.get("id"), str)
+    )
 
 
 def _sanitize_snapshot_message_row(
