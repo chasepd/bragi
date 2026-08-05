@@ -1848,6 +1848,198 @@ def test_snapshot_backed_fork_remaps_rows_and_copies_media(
     assert fork_snapshot.world_time_confidence == 0.93
 
 
+def test_snapshot_message_ids_returns_active_message_ids_in_rowid_order(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    first = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The lantern waits in darkness.",
+    )
+    second = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Keeper",
+        body="I touch the glass.",
+    )
+    snapshot = service.capture_baseline_snapshot(save.id)
+    assert service.snapshot_message_ids(snapshot_id=snapshot.id) == (
+        first.id,
+        second.id,
+    )
+
+    repositories.archive_message(second.id)
+    later_snapshot = service.capture_baseline_snapshot(save.id)
+    assert service.snapshot_message_ids(snapshot_id=later_snapshot.id) == (
+        first.id,
+    )
+
+
+def test_fork_snapshot_rejects_trailing_message_in_source_snapshot(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    first = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The tower lens glows red.",
+    )
+    snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=first.id,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Trailing fork messages must follow the source snapshot",
+    ):
+        service.fork_snapshot_to_save(
+            source_save_id=save.id,
+            snapshot_id=snapshot.id,
+            title="Forked from player message",
+            media_dir=tmp_path / "media",
+            trailing_messages=(first,),
+        )
+    save_count = repositories.connection.execute(
+        "SELECT COUNT(*) FROM saves"
+    ).fetchone()[0]
+    assert save_count == 1
+
+
+def test_fork_snapshot_rejects_trailing_message_from_other_save(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    other = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    first = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The tower lens glows red.",
+    )
+    other_message = repositories.append_message(
+        save_id=other.id,
+        role="player",
+        speaker_name="Keeper",
+        body="I turn the lens.",
+    )
+    snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=first.id,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Trailing fork messages must be active source messages",
+    ):
+        service.fork_snapshot_to_save(
+            source_save_id=save.id,
+            snapshot_id=snapshot.id,
+            title="Forked from player message",
+            media_dir=tmp_path / "media",
+            trailing_messages=(other_message,),
+        )
+    save_count = repositories.connection.execute(
+        "SELECT COUNT(*) FROM saves"
+    ).fetchone()[0]
+    assert save_count == 2
+
+
+def test_fork_snapshot_rejects_archived_trailing_message(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    first = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The tower lens glows red.",
+    )
+    snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=first.id,
+    )
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Keeper",
+        body="I turn the lens.",
+    )
+    repositories.archive_message(player.id)
+    archived = repositories.get_message(
+        save_id=save.id,
+        message_id=player.id,
+        include_deleted=True,
+    )
+    assert archived is not None and archived.deleted_at is not None
+
+    with pytest.raises(
+        ValueError,
+        match="Trailing fork messages must be active source messages",
+    ):
+        service.fork_snapshot_to_save(
+            source_save_id=save.id,
+            snapshot_id=snapshot.id,
+            title="Forked from player message",
+            media_dir=tmp_path / "media",
+            trailing_messages=(archived,),
+        )
+    save_count = repositories.connection.execute(
+        "SELECT COUNT(*) FROM saves"
+    ).fetchone()[0]
+    assert save_count == 1
+
+
+def test_fork_snapshot_appends_trailing_message_after_snapshot(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    first = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The tower lens glows red.",
+    )
+    snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=first.id,
+    )
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Keeper",
+        body="I turn the lens.",
+    )
+
+    result = service.fork_snapshot_to_save(
+        source_save_id=save.id,
+        snapshot_id=snapshot.id,
+        title="Forked from player message",
+        media_dir=tmp_path / "media",
+        trailing_messages=(player,),
+    )
+
+    forked_messages = repositories.list_messages(result.save.id)
+    assert [message.body for message in forked_messages] == [
+        "The tower lens glows red.",
+        "I turn the lens.",
+    ]
+    assert forked_messages[-1].role == "player"
+    assert forked_messages[-1].id != player.id
+    assert result.message_count == 2
+    assert service.latest_snapshot_for_message(
+        save_id=result.save.id,
+        message_id=forked_messages[-1].id,
+    ) is not None
+
+
 def test_snapshot_fork_copies_legacy_normalized_budget_allowance(
     repositories: PersistenceRepositories,
     tmp_path: Path,
