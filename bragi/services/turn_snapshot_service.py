@@ -490,6 +490,18 @@ class TurnSnapshotService:
             return ()
         return tuple(item for item in parsed if isinstance(item, str) and item)
 
+    def snapshot_message_ids(self, *, snapshot_id: str) -> tuple[str, ...]:
+        snapshot = self._get_snapshot(snapshot_id)
+        manifest = self._snapshot_manifest(snapshot)
+        rows_by_table = _sanitize_snapshot_rows_for_safety(
+            self._rows_from_manifest(manifest)
+        )
+        return tuple(
+            str(row["id"])
+            for row in rows_by_table.get("messages", ())
+            if isinstance(row.get("id"), str)
+        )
+
     def latest_snapshot_before_message(
         self,
         *,
@@ -596,6 +608,7 @@ class TurnSnapshotService:
         title: str,
         media_dir: Path,
         owner_user_id: str | None = None,
+        trailing_messages: Iterable[MessageRecord] = (),
     ) -> SnapshotForkResult:
         source_save = self.repositories.get_save(source_save_id)
         if source_save is None:
@@ -610,6 +623,21 @@ class TurnSnapshotService:
             self._rows_from_manifest(manifest)
         )
         rows_by_table = _normalize_legacy_snapshot_memories(rows_by_table)
+        trailing = tuple(trailing_messages)
+        snapshot_message_ids = {
+            str(row["id"])
+            for row in rows_by_table.get("messages", ())
+            if isinstance(row.get("id"), str)
+        }
+        for message in trailing:
+            if message.save_id != source_save_id or message.deleted_at is not None:
+                raise ValueError(
+                    "Trailing fork messages must be active source messages"
+                )
+            if message.id in snapshot_message_ids:
+                raise ValueError(
+                    "Trailing fork messages must follow the source snapshot"
+                )
         remapper = _SnapshotRemapper(
             source_save_id=source_save_id,
             target_save_id=str(uuid4()),
@@ -633,6 +661,22 @@ class TurnSnapshotService:
                         remapper.remap_row("messages", row)
                     ),
                 )
+            forked_trailing_messages = tuple(
+                self.repositories.append_message(
+                    save_id=fork_save.id,
+                    role=message.role,
+                    speaker_name=message.speaker_name,
+                    body=message.body,
+                    provider=message.provider,
+                    model=message.model,
+                    token_estimate=message.token_estimate,
+                    created_at=message.created_at,
+                    updated_at=message.updated_at,
+                    safety_transition=message.safety_transition,
+                    content_rating=message.content_rating,
+                )
+                for message in trailing
+            )
             self.repositories.copy_save_scoped_settings(
                 source_save_id=source_save_id,
                 target_save_id=fork_save.id,
@@ -674,6 +718,12 @@ class TurnSnapshotService:
                 message_id_map=remapper.id_maps["messages"],
                 id_maps=remapper.id_maps,
             )
+            if forked_trailing_messages:
+                self.capture_message_snapshot(
+                    save_id=fork_save.id,
+                    message_id=forked_trailing_messages[-1].id,
+                    reason="fork_trailing_message",
+                )
             self.repositories.commit_transaction()
         except Exception:
             self.repositories.rollback_transaction()
@@ -681,17 +731,18 @@ class TurnSnapshotService:
             raise
 
         media_count = len(rows_by_table.get("media_assets", ()))
+        message_count = len(rows_by_table.get("messages", ())) + len(trailing)
         log_event(
             "save.snapshot_forked",
             source_save_id=source_save_id,
             fork_save_id=fork_save.id,
             snapshot_id=snapshot_id,
-            message_count=len(rows_by_table.get("messages", ())),
+            message_count=message_count,
             media_count=media_count,
         )
         return SnapshotForkResult(
             save=fork_save,
-            message_count=len(rows_by_table.get("messages", ())),
+            message_count=message_count,
             media_count=media_count,
         )
 
