@@ -11,6 +11,7 @@ from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     ChatMessage,
     ChatRequest,
+    ImageDescriptionRequest,
     StructuredOutputRequest,
     ToolCallMessage,
     ToolCallRequest,
@@ -281,7 +282,7 @@ def test_request_with_openrouter_routing_sets_and_clears_provider_payload(
     assert cleared.openrouter_app_title is None
 
 
-def test_request_with_openrouter_routing_skips_thinking_for_structured_output(
+def test_request_with_openrouter_routing_applies_thinking_for_structured_output(
     repositories: PersistenceRepositories,
 ) -> None:
     repositories.save_provider_model(
@@ -290,6 +291,48 @@ def test_request_with_openrouter_routing_skips_thinking_for_structured_output(
         display_name="GPT-5 Mini",
         capabilities=["structured_output"],
         thinking={"levels": ["high", "low"], "mandatory": False},
+    )
+    repositories.set_app_setting(
+        MODEL_THINKING_PREFERENCES_SETTING,
+        {
+            "context_update": {
+                "provider": "openrouter",
+                "model_id": "openai/gpt-5-mini",
+                "level": "high",
+            }
+        },
+    )
+    request = StructuredOutputRequest(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        messages=(ChatMessage(role="player", body="Summarize facts"),),
+        schema_name="facts",
+        schema={
+            "type": "object",
+            "properties": {"facts": {"type": "array", "items": {"type": "string"}}},
+            "required": ["facts"],
+        },
+    )
+
+    routed = request_with_openrouter_routing(
+        repositories,
+        request,
+        task="context_update",
+    )
+
+    assert routed.reasoning is not None
+    assert routed.reasoning.effort == "high"
+    assert routed.reasoning.exclude is True
+
+
+def test_request_with_openrouter_routing_skips_thinking_for_unsupported_model(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        display_name="GPT-5 Mini",
+        capabilities=["structured_output"],
     )
     repositories.set_app_setting(
         MODEL_THINKING_PREFERENCES_SETTING,
@@ -359,7 +402,7 @@ def test_request_with_openrouter_routing_applies_thinking_for_chat(
     assert routed.reasoning.exclude is True
 
 
-def test_request_with_openrouter_routing_skips_thinking_for_tool_call(
+def test_request_with_openrouter_routing_applies_thinking_for_tool_call(
     repositories: PersistenceRepositories,
 ) -> None:
     repositories.save_provider_model(
@@ -398,7 +441,47 @@ def test_request_with_openrouter_routing_skips_thinking_for_tool_call(
         task="context_search",
     )
 
-    assert routed.reasoning is None
+    assert routed.reasoning is not None
+    assert routed.reasoning.effort == "high"
+    assert routed.reasoning.exclude is True
+
+
+def test_request_with_openrouter_routing_applies_thinking_for_image_description(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        display_name="GPT-5 Mini",
+        capabilities=["chat"],
+        thinking={"levels": ["high", "low"], "mandatory": False},
+    )
+    repositories.set_app_setting(
+        MODEL_THINKING_PREFERENCES_SETTING,
+        {
+            "character_image_description": {
+                "provider": "openrouter",
+                "model_id": "openai/gpt-5-mini",
+                "level": "high",
+            }
+        },
+    )
+    request = ImageDescriptionRequest(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        image_url="https://example.com/scene.png",
+        prompt="Describe this scene.",
+    )
+
+    routed = request_with_openrouter_routing(
+        repositories,
+        request,
+        task="character_image_description",
+    )
+
+    assert routed.reasoning is not None
+    assert routed.reasoning.effort == "high"
+    assert routed.reasoning.exclude is True
 
 
 def test_openrouter_app_title_for_task_uses_single_app_name() -> None:
