@@ -79,6 +79,36 @@ class SaveForkService:
                 message_count=result.message_count,
                 media_count=result.media_count,
             )
+        if prefix[-1].role == "player":
+            preceding_snapshot = snapshot_service.latest_snapshot_before_message(
+                save_id=save_id,
+                message_id=message_id,
+            )
+            expected_preceding_ids = tuple(message.id for message in prefix[:-1])
+            if (
+                preceding_snapshot is not None
+                and snapshot_service.snapshot_message_ids(
+                    snapshot_id=preceding_snapshot.id
+                )
+                == expected_preceding_ids
+            ):
+                result = snapshot_service.fork_snapshot_to_save(
+                    source_save_id=save_id,
+                    snapshot_id=preceding_snapshot.id,
+                    title=self._fork_title(
+                        source_save.title,
+                        prefix[-1],
+                        selected_index + 1,
+                    ),
+                    media_dir=media_dir,
+                    owner_user_id=owner_user_id,
+                    trailing_messages=(prefix[-1],),
+                )
+                return SaveForkResult(
+                    save=result.save,
+                    message_count=result.message_count,
+                    media_count=result.media_count,
+                )
         raise ValueError(
             "Forking from this message requires a turn snapshot. "
             "Open the save and advance the chronicle before forking older messages."

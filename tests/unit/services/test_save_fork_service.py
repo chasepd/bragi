@@ -133,3 +133,75 @@ def test_fork_from_player_message_includes_selected_player_message(
     assert forked_prior_summary["archived_at"] is not None
     assert forked_summary.source_message_ids == (forked_player.id,)
     assert forked_summary.source_summary_ids == (forked_prior_summary["id"],)
+
+
+def test_fork_from_player_message_uses_preceding_turn_snapshot(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A beacon tower.",
+        player_role="Keeper",
+        content={},
+    )
+    original = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    snapshot_service = TurnSnapshotService(repositories)
+    snapshot_service.capture_baseline_snapshot(original.id)
+    opening = repositories.append_message(
+        save_id=original.id,
+        role="narrator",
+        body="The lantern waits in darkness.",
+    )
+    repositories.upsert_world_state(
+        save_id=original.id,
+        key="lantern",
+        value={"lit": False},
+        source_message_id=opening.id,
+    )
+    snapshot_service.capture_message_snapshot(
+        save_id=original.id,
+        message_id=opening.id,
+    )
+    player = repositories.append_message(
+        save_id=original.id,
+        role="player",
+        speaker_name="Keeper",
+        body="I touch the glass.",
+    )
+    narrator = repositories.append_message(
+        save_id=original.id,
+        role="narrator",
+        body="It rings softly.",
+    )
+    repositories.upsert_world_state(
+        save_id=original.id,
+        key="lantern",
+        value={"lit": True},
+        source_message_id=narrator.id,
+    )
+    snapshot_service.capture_message_snapshot(
+        save_id=original.id,
+        message_id=narrator.id,
+    )
+
+    result = SaveForkService(repositories).fork_from_message(
+        save_id=original.id,
+        message_id=player.id,
+        media_dir=tmp_path / "media",
+    )
+
+    forked_messages = repositories.list_messages(result.save.id)
+    assert [message.body for message in forked_messages] == [
+        "The lantern waits in darkness.",
+        "I touch the glass.",
+    ]
+    assert forked_messages[-1].role == "player"
+    assert forked_messages[-1].id != player.id
+    assert result.message_count == 2
+    assert repositories.list_world_state(result.save.id)[0].value == {"lit": False}
+    assert snapshot_service.latest_snapshot_for_message(
+        save_id=result.save.id,
+        message_id=forked_messages[-1].id,
+    ) is not None
