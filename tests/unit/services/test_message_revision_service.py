@@ -177,6 +177,90 @@ def test_rollback_keeps_manually_archived_world_state_key_archived(
     assert archived_row["archived_at"] is not None
 
 
+def test_rollback_archives_knowledge_edges_from_deleted_messages(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    seed = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Warden Elian is posted at the lower stair.",
+        provider="fake",
+        model="fake-chat",
+    )
+    repositories.add_character(
+        character_id="elian",
+        save_id=save.id,
+        name="Elian",
+        role="Warden",
+        source_message_id=seed.id,
+    )
+    later_player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I watch the gate.",
+    )
+    later_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Elian shadows the gate in the ash.",
+        provider="fake",
+        model="fake-chat",
+    )
+    stale_edge = repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id="elian",
+        target_type="world_state",
+        target_id="gate.state",
+        source_message_id=later_narrator.id,
+    )
+    stale_json_edge = repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id="elian",
+        target_type="world_state",
+        target_id="gate.other",
+        source_message_ids=[later_narrator.id, seed.id],
+    )
+    unrelated_edge = repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id="elian",
+        target_type="world_state",
+        target_id="beacon.state",
+        source_message_id=seed.id,
+    )
+
+    rollback = MessageRevisionService(repositories).rollback_from_message(
+        save_id=save.id,
+        message_id=later_player.id,
+    )
+
+    assert rollback.archived_character_knowledge_edge_ids == frozenset(
+        {stale_edge.id, stale_json_edge.id}
+    )
+    active_edges = repositories.list_character_knowledge_edges(save.id)
+    assert [edge.id for edge in active_edges] == [unrelated_edge.id]
+    archived_row = repositories.connection.execute(
+        """
+        SELECT archived_at
+        FROM character_knowledge_edges
+        WHERE id = ?
+        """,
+        (stale_edge.id,),
+    ).fetchone()
+    assert archived_row is not None
+    assert archived_row["archived_at"] is not None
+
+
 def test_edit_narrator_message_persists_revision_without_deleting_later_turns(
     repositories: PersistenceRepositories,
 ) -> None:

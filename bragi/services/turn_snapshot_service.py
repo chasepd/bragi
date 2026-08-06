@@ -2485,6 +2485,7 @@ def _sanitize_snapshot_rows_for_safety(
         )
     }
     if not transition_ids:
+        _filter_snapshot_rows_for_unresolved_references(rows)
         _filter_context_observation_curation_snapshot_rows(rows)
         return rows
     message_order = {
@@ -2518,8 +2519,966 @@ def _sanitize_snapshot_rows_for_safety(
                 continue
             sanitized_rows.append(row)
         rows[table_name] = tuple(sanitized_rows)
+    _filter_snapshot_rows_for_unresolved_references(rows)
     _filter_context_observation_curation_snapshot_rows(rows)
     return rows
+
+
+def _filter_snapshot_rows_for_unresolved_references(
+    rows: dict[str, tuple[dict[str, object], ...]],
+) -> None:
+    for _ in range(_MAX_SNAPSHOT_REFERENCE_FILTER_PASSES):
+        active_ids = {
+            table_name: _row_ids(rows.get(table_name, ()))
+            for table_name in _SNAPSHOT_TABLE_NAMES
+        }
+        changed = False
+        for table_name, table_rows in rows.items():
+            if table_name == "messages":
+                continue
+            if table_name in _SNAPSHOT_MESSAGE_SCOPED_TABLES:
+                kept = tuple(
+                    row
+                    for row in table_rows
+                    if not _snapshot_row_has_unresolved_references(
+                        table_name,
+                        row,
+                        active_ids,
+                    )
+                )
+                if len(kept) != len(table_rows):
+                    changed = True
+                    rows[table_name] = kept
+            elif table_name in _SNAPSHOT_KEEP_ENTITY_TABLES:
+                if table_name == "dating_route_states":
+                    kept = tuple(
+                        row
+                        for row in table_rows
+                        if not _snapshot_row_has_unresolved_references(
+                            table_name,
+                            row,
+                            active_ids,
+                        )
+                    )
+                    if len(kept) != len(table_rows):
+                        changed = True
+                        rows[table_name] = kept
+                    continue
+                cleared_rows = tuple(
+                    _clear_snapshot_row_unresolved_references(
+                        table_name,
+                        row,
+                        active_ids,
+                    )
+                    for row in table_rows
+                )
+                if cleared_rows != table_rows:
+                    changed = True
+                    rows[table_name] = cleared_rows
+        if not changed:
+            return
+
+
+_SNAPSHOT_MESSAGE_SCOPED_TABLES = frozenset(
+    {
+        "state_changes",
+        "message_scene_presence",
+        "message_visibility",
+        "message_action_choices",
+        "character_knowledge_edges",
+        "entity_links",
+        "context_update_suggestions",
+        "context_update_audit",
+        "context_observations",
+        "summaries",
+        "save_loss_outcomes",
+        "context_sources",
+        "narrator_phone_activity_cursors",
+        "character_contact_states",
+        "character_text_proactive_triggers",
+    }
+)
+
+_SNAPSHOT_KEEP_ENTITY_TABLES = frozenset(
+    {
+        "characters",
+        "locations",
+        "active_threads",
+        "scene_snapshots",
+        "world_state",
+        "media_assets",
+        "memories",
+        "save_scenario_updates",
+        "save_loss_conditions",
+        "save_loss_condition_changes",
+        "dating_route_states",
+    }
+)
+
+_MAX_SNAPSHOT_REFERENCE_FILTER_PASSES = 8
+
+_JSON_ENTITY_REFERENCE_FIELDS: dict[str, frozenset[str]] = {
+    "scene_snapshots": frozenset({"present_character_ids_json"}),
+    "locations": frozenset({"connections_json"}),
+    "active_threads": frozenset({"related_entities_json"}),
+    "memories": frozenset(
+        {"source_message_ids_json", "source_observation_ids_json"}
+    ),
+    "summaries": frozenset(
+        {"source_message_ids_json", "source_summary_ids_json"}
+    ),
+    "context_update_suggestions": frozenset(
+        {"source_message_ids_json", "proposed_value_json"}
+    ),
+    "context_update_audit": frozenset({"source_message_ids_json"}),
+    "context_observations": frozenset({"source_message_ids_json"}),
+    "character_knowledge_edges": frozenset({"source_message_ids_json"}),
+    "media_assets": frozenset({"metadata_json"}),
+    "context_sources": frozenset({"metadata_json"}),
+    "world_state": frozenset({"value_json"}),
+    "save_scenario_updates": frozenset({"source_message_ids_json"}),
+}
+
+
+def _snapshot_row_has_unresolved_references(
+    table_name: str,
+    row: Mapping[str, object],
+    active_ids: Mapping[str, frozenset[str]],
+) -> bool:
+    for column in _MESSAGE_REFERENCE_COLUMNS:
+        value = row.get(column)
+        if isinstance(value, str) and value and value not in active_ids["messages"]:
+            return True
+    for column, target_table in _TABLE_REFERENCE_COLUMNS.get(table_name, {}).items():
+        value = row.get(column)
+        target_ids = active_ids.get(target_table)
+        if target_ids is None:
+            continue
+        if (
+            isinstance(value, str)
+            and value
+            and value not in target_ids
+        ):
+            return True
+    if _snapshot_row_typed_entity_references_unresolved(
+        table_name,
+        row,
+        active_ids,
+    ):
+        return True
+    for column in _JSON_ENTITY_REFERENCE_FIELDS.get(table_name, frozenset()):
+        raw = row.get(column)
+        if isinstance(raw, str) and not _snapshot_json_reference_field_resolves(
+            table_name,
+            column,
+            raw,
+            row=row,
+            active_ids=active_ids,
+        ):
+            return True
+    return False
+
+
+def _snapshot_row_typed_entity_references_unresolved(
+    table_name: str,
+    row: Mapping[str, object],
+    active_ids: Mapping[str, frozenset[str]],
+) -> bool:
+    typed_columns: tuple[tuple[str, str], ...] = ()
+    if table_name == "entity_links":
+        typed_columns = (("entity_id", "entity_type"), ("target_id", "target_type"))
+    elif table_name in {"context_update_suggestions", "context_update_audit"}:
+        typed_columns = (("entity_id", "entity_type"),)
+    elif table_name == "character_knowledge_edges":
+        typed_columns = (("target_id", "target_type"),)
+    elif table_name == "character_text_proactive_triggers":
+        typed_columns = (("source_id", "source_type"),)
+    elif table_name == "context_sources":
+        return _snapshot_context_source_references_unresolved(
+            row,
+            active_ids,
+        )
+    for id_column, type_column in typed_columns:
+        entity_type = row.get(type_column)
+        value = row.get(id_column)
+        if not isinstance(value, str) or not value:
+            continue
+        target_table = _ENTITY_TABLES.get(
+            entity_type if isinstance(entity_type, str) else ""
+        )
+        if target_table is None:
+            continue
+        target_ids = active_ids.get(target_table)
+        if target_ids is None:
+            continue
+        if value not in target_ids:
+            return True
+    return False
+
+
+def _snapshot_context_source_references_unresolved(
+    row: Mapping[str, object],
+    active_ids: Mapping[str, frozenset[str]],
+) -> bool:
+    source_type = row.get("source_type")
+    source_id = row.get("source_id")
+    if not isinstance(source_type, str) or not isinstance(source_id, str):
+        return False
+    if not source_id:
+        return False
+    if source_type in {"message", "messages"}:
+        return any(
+            ref and not _snapshot_source_ref_resolves(
+                ref,
+                message_ids=active_ids["messages"],
+                text_message_ids=active_ids["character_text_messages"],
+            )
+            for ref in (part.strip() for part in source_id.split(","))
+        )
+    direct_tables = {
+        "character_voice": "characters",
+        "open_obligation": "active_threads",
+        "character_text_thread": "character_text_threads",
+    }
+    if source_type in direct_tables:
+        return source_id not in active_ids[direct_tables[source_type]]
+    if source_type == "scenario_section":
+        return False
+    if source_type == "world_state" and source_id.startswith("location:"):
+        return (
+            source_id.removeprefix("location:")
+            not in active_ids["locations"]
+        )
+    if source_type == "memory":
+        if source_id in active_ids["memories"]:
+            return False
+        if source_id.startswith("character_profile:"):
+            return (
+                source_id.removeprefix("character_profile:")
+                not in active_ids["characters"]
+            )
+        match = re.fullmatch(r"relationship:([^:]+):(.+)", source_id)
+        if match is not None:
+            return match.group(1) not in active_ids["characters"]
+        return True
+    target_table = _ENTITY_TABLES.get(source_type)
+    if target_table is None:
+        return False
+    target_ids = active_ids.get(target_table)
+    if target_ids is None:
+        return False
+    return source_id not in target_ids
+
+
+def _snapshot_json_reference_field_resolves(
+    table_name: str,
+    column: str,
+    raw: str,
+    *,
+    row: Mapping[str, object],
+    active_ids: Mapping[str, frozenset[str]],
+) -> bool:
+    if column == "source_message_ids_json":
+        return _snapshot_json_source_ref_list_resolves(
+            raw,
+            message_ids=active_ids["messages"],
+            text_message_ids=active_ids["character_text_messages"],
+        )
+    if table_name == "world_state" and column == "value_json":
+        if row.get("key") != "story.director_pressure":
+            return True
+        return _snapshot_director_pressure_value_resolves(
+            raw,
+            message_ids=active_ids["messages"],
+            text_message_ids=active_ids["character_text_messages"],
+        )
+    if table_name == "context_sources" and column == "metadata_json":
+        return _snapshot_context_source_metadata_resolves(
+            raw,
+            row=row,
+            active_ids=active_ids,
+        )
+    if table_name == "context_update_suggestions" and column == "proposed_value_json":
+        return _snapshot_suggestion_value_resolves(
+            raw,
+            row=row,
+            active_ids=active_ids,
+        )
+    if table_name == "media_assets" and column == "metadata_json":
+        return _snapshot_media_metadata_resolves(
+            raw,
+            active_ids=active_ids,
+        )
+    if column in {"present_character_ids_json", "connections_json"}:
+        target_table = (
+            "characters" if column == "present_character_ids_json" else "locations"
+        )
+        return _snapshot_json_id_list_resolves(raw, target_table, active_ids)
+    if column == "related_entities_json":
+        return _snapshot_related_entities_resolves(raw, active_ids)
+    if column in {"source_observation_ids_json", "source_summary_ids_json"}:
+        target_table = (
+            "context_observations"
+            if column == "source_observation_ids_json"
+            else "summaries"
+        )
+        return _snapshot_json_id_list_resolves(raw, target_table, active_ids)
+    return True
+
+
+def _snapshot_json_id_list_resolves(
+    raw: str,
+    target_table: str,
+    active_ids: Mapping[str, frozenset[str]],
+) -> bool:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(parsed, list):
+        return False
+    target_ids = active_ids.get(target_table)
+    if target_ids is None:
+        return True
+    return all(
+        isinstance(item, str) and item in target_ids
+        for item in parsed
+    )
+
+
+def _snapshot_related_entities_resolves(
+    raw: str,
+    active_ids: Mapping[str, frozenset[str]],
+) -> bool:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(parsed, list):
+        return False
+    for item in parsed:
+        if not isinstance(item, str):
+            return False
+        entity_type, separator, entity_id = item.partition(":")
+        if not separator:
+            continue
+        target_table = _ENTITY_TABLES.get(entity_type)
+        if target_table is None:
+            continue
+        target_ids = active_ids.get(target_table)
+        if target_ids is None:
+            continue
+        if entity_id not in target_ids:
+            return False
+    return True
+
+
+def _snapshot_json_source_ref_list_resolves(
+    raw: str,
+    *,
+    message_ids: frozenset[str],
+    text_message_ids: frozenset[str],
+) -> bool:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(parsed, list):
+        return False
+    for item in parsed:
+        if not isinstance(item, str) or not item:
+            return False
+        if not _snapshot_source_ref_resolves(
+            item,
+            message_ids=message_ids,
+            text_message_ids=text_message_ids,
+        ):
+            return False
+    return True
+
+
+def _snapshot_source_ref_resolves(
+    source_ref: str,
+    *,
+    message_ids: frozenset[str],
+    text_message_ids: frozenset[str],
+) -> bool:
+    text_message_id = parse_character_text_source_ref(source_ref)
+    if text_message_id is not None:
+        return text_message_id in text_message_ids
+    return source_ref in message_ids
+
+
+def _snapshot_context_source_metadata_resolves(
+    raw: str,
+    *,
+    row: Mapping[str, object],
+    active_ids: Mapping[str, frozenset[str]],
+) -> bool:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return True
+    if not isinstance(parsed, dict):
+        return True
+    message_ids = active_ids["messages"]
+    text_message_ids = active_ids["character_text_messages"]
+    for field in ("source_message_id", "last_seen_message_id"):
+        value = parsed.get(field)
+        if isinstance(value, str) and value and not _snapshot_source_ref_resolves(
+            value,
+            message_ids=message_ids,
+            text_message_ids=text_message_ids,
+        ):
+            return False
+    if "source_message_ids" in parsed and not _snapshot_json_source_ref_list_resolves(
+        json.dumps(parsed["source_message_ids"]),
+        message_ids=message_ids,
+        text_message_ids=text_message_ids,
+    ):
+        return False
+    raw_groups = parsed.get("source_provenance_groups")
+    if raw_groups is not None:
+        if not isinstance(raw_groups, list):
+            return False
+        for group in raw_groups:
+            if not _snapshot_json_source_ref_list_resolves(
+                json.dumps(group),
+                message_ids=message_ids,
+                text_message_ids=text_message_ids,
+            ):
+                return False
+    if "audience_character_ids" in parsed and not _snapshot_json_id_list_resolves(
+        json.dumps(parsed["audience_character_ids"]),
+        "characters",
+        active_ids,
+    ):
+        return False
+    entity_ids = parsed.get("entity_ids")
+    if isinstance(entity_ids, list):
+        source_type = row.get("source_type")
+        source_id = row.get("source_id")
+        for item in entity_ids:
+            if not isinstance(item, str) or not item:
+                return False
+            if not _snapshot_context_metadata_entity_id_resolves(
+                source_type,
+                source_id,
+                item,
+                active_ids,
+            ):
+                return False
+    thread_id = parsed.get("thread_id")
+    if (
+        isinstance(thread_id, str)
+        and row.get("source_type") == "character_text_thread"
+        and thread_id not in active_ids["character_text_threads"]
+    ):
+        return False
+    return True
+
+
+def _snapshot_context_metadata_entity_id_resolves(
+    source_type: object,
+    source_id: object,
+    value: str,
+    active_ids: Mapping[str, frozenset[str]],
+) -> bool:
+    if source_type == "memory" and isinstance(source_id, str):
+        if source_id.startswith(("character_profile:", "relationship:")):
+            return value in active_ids["characters"]
+        return value in active_ids["memories"]
+    if (
+        source_type == "world_state"
+        and isinstance(source_id, str)
+        and source_id.startswith("location:")
+    ):
+        return value in active_ids["locations"]
+    direct_tables = {
+        "character_voice": "characters",
+        "open_obligation": "active_threads",
+        "character_text_thread": "character_text_threads",
+    }
+    table_name = (
+        direct_tables.get(source_type)
+        if isinstance(source_type, str)
+        else None
+    )
+    if table_name is not None:
+        return value in active_ids[table_name]
+    return _snapshot_context_source_id_resolves_typed(
+        source_type,
+        source_id,
+        value,
+        active_ids,
+    )
+
+
+def _snapshot_context_source_id_resolves_typed(
+    source_type: object,
+    source_id: object,
+    value: str,
+    active_ids: Mapping[str, frozenset[str]],
+) -> bool:
+    if source_type in {"message", "messages"}:
+        return value in active_ids["messages"]
+    if source_type == "memory" and isinstance(source_id, str):
+        if source_id.startswith(("character_profile:", "relationship:")):
+            return value in active_ids["characters"]
+        return value in active_ids["memories"]
+    if source_type == "scenario_section":
+        return True
+    if (
+        source_type == "world_state"
+        and isinstance(source_id, str)
+        and source_id.startswith("location:")
+    ):
+        return value in active_ids["locations"]
+    if not isinstance(source_type, str):
+        return True
+    target_table = _ENTITY_TABLES.get(source_type)
+    if target_table is None:
+        return True
+    target_ids = active_ids.get(target_table)
+    if target_ids is None:
+        return True
+    return value in target_ids
+
+
+def _snapshot_suggestion_value_resolves(
+    raw: str,
+    *,
+    row: Mapping[str, object],
+    active_ids: Mapping[str, frozenset[str]],
+) -> bool:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return True
+    if (
+        isinstance(parsed, str)
+        and (
+            row.get("entity_type"),
+            row.get("field_path"),
+        )
+        in {
+            ("character", "location_id"),
+            ("location", "parent_location_id"),
+            ("scene_snapshot", "current_location_id"),
+        }
+    ):
+        return parsed in active_ids["locations"]
+    if not isinstance(parsed, dict):
+        return True
+    source_message_id = parsed.get("source_message_id")
+    if isinstance(source_message_id, str) and source_message_id and not (
+        _snapshot_source_ref_resolves(
+            source_message_id,
+            message_ids=active_ids["messages"],
+            text_message_ids=active_ids["character_text_messages"],
+        )
+    ):
+        return False
+    raw_ids = parsed.get("source_message_ids")
+    if raw_ids is not None and not _snapshot_json_source_ref_list_resolves(
+        json.dumps(raw_ids),
+        message_ids=active_ids["messages"],
+        text_message_ids=active_ids["character_text_messages"],
+    ):
+        return False
+    source_observation_id = parsed.get("source_observation_id")
+    if (
+        isinstance(source_observation_id, str)
+        and source_observation_id
+        and source_observation_id not in active_ids["context_observations"]
+    ):
+        return False
+    raw_observation_ids = parsed.get("source_observation_ids")
+    if raw_observation_ids is not None and not _snapshot_json_id_list_resolves(
+        json.dumps(raw_observation_ids),
+        "context_observations",
+        active_ids,
+    ):
+        return False
+    location_id = parsed.get("location_id")
+    if (
+        isinstance(location_id, str)
+        and location_id
+        and location_id not in active_ids["locations"]
+    ):
+        return False
+    return True
+
+
+def _snapshot_media_metadata_resolves(
+    raw: str,
+    active_ids: Mapping[str, frozenset[str]],
+) -> bool:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return True
+    if isinstance(parsed, list):
+        return all(
+            _snapshot_media_metadata_resolves(
+                json.dumps(item),
+                active_ids,
+            )
+            for item in parsed
+            if isinstance(item, dict)
+        )
+    if not isinstance(parsed, dict):
+        return True
+    id_fields = {
+        "character_id": "characters",
+        "sender_character_id": "characters",
+        "thread_id": "character_text_threads",
+        "text_message_id": "character_text_messages",
+        "source_message_id": "messages",
+        "media_asset_id": "media_assets",
+        "source_media_asset_id": "media_assets",
+        "source_character_reference_asset_id": "media_assets",
+        "source_character_reference_character_id": "characters",
+    }
+    id_list_fields = {
+        "source_media_asset_ids": "media_assets",
+        "source_character_reference_asset_ids": "media_assets",
+        "source_character_reference_character_ids": "characters",
+    }
+    for key, item in parsed.items():
+        target_table = id_fields.get(key)
+        if key == "request_source_message_id":
+            if (
+                isinstance(item, str)
+                and item
+                and item not in active_ids["messages"]
+                and item not in active_ids["character_text_messages"]
+            ):
+                return False
+            continue
+        if target_table is not None:
+            if isinstance(item, str) and item and item not in active_ids[target_table]:
+                return False
+            continue
+        list_target_table = id_list_fields.get(key)
+        if list_target_table is not None and isinstance(item, list):
+            if not _snapshot_json_id_list_resolves(
+                json.dumps(item),
+                list_target_table,
+                active_ids,
+            ):
+                return False
+            continue
+        if isinstance(item, list):
+            for list_item in item:
+                if isinstance(list_item, dict) and not (
+                    _snapshot_media_metadata_resolves(
+                        json.dumps(list_item),
+                        active_ids,
+                    )
+                ):
+                    return False
+            continue
+        if isinstance(item, dict):
+            if not _snapshot_media_metadata_resolves(
+                json.dumps(item),
+                active_ids,
+            ):
+                return False
+    return True
+
+
+def _snapshot_director_pressure_value_resolves(
+    raw: str,
+    *,
+    message_ids: frozenset[str],
+    text_message_ids: frozenset[str],
+) -> bool:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return True
+    if not isinstance(parsed, dict):
+        return True
+    history = parsed.get("escalation_history")
+    if not isinstance(history, list):
+        return True
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        source_message_id = item.get("source_message_id")
+        if not isinstance(source_message_id, str) or not source_message_id:
+            continue
+        if source_message_id not in message_ids:
+            return False
+    return True
+
+
+def _clear_snapshot_row_unresolved_references(
+    table_name: str,
+    row: Mapping[str, object],
+    active_ids: Mapping[str, frozenset[str]],
+) -> dict[str, object]:
+    cleared = dict(row)
+    for column in _MESSAGE_REFERENCE_COLUMNS:
+        value = cleared.get(column)
+        if isinstance(value, str) and value and value not in active_ids["messages"]:
+            cleared[column] = None
+    for column, target_table in _TABLE_REFERENCE_COLUMNS.get(table_name, {}).items():
+        value = cleared.get(column)
+        target_ids = active_ids.get(target_table)
+        if target_ids is None:
+            continue
+        if (
+            isinstance(value, str)
+            and value
+            and value not in target_ids
+        ):
+            cleared[column] = None
+    for column in _JSON_ENTITY_REFERENCE_FIELDS.get(table_name, frozenset()):
+        raw = cleared.get(column)
+        if not isinstance(raw, str):
+            continue
+        if table_name == "world_state" and column == "value_json":
+            if cleared.get("key") == "story.director_pressure":
+                cleared[column] = _prune_snapshot_director_pressure_value(
+                    raw,
+                    message_ids=active_ids["messages"],
+                    text_message_ids=active_ids["character_text_messages"],
+                )
+            continue
+        if column == "source_message_ids_json":
+            cleared[column] = _prune_snapshot_json_source_refs(
+                raw,
+                message_ids=active_ids["messages"],
+                text_message_ids=active_ids["character_text_messages"],
+            )
+            continue
+        if table_name == "media_assets" and column == "metadata_json":
+            cleared[column] = _prune_snapshot_media_metadata(
+                raw,
+                active_ids,
+            )
+            continue
+        if column in {"present_character_ids_json", "connections_json"}:
+            target_table = (
+                "characters"
+                if column == "present_character_ids_json"
+                else "locations"
+            )
+            cleared[column] = _prune_snapshot_json_id_list(
+                raw,
+                target_table,
+                active_ids,
+            )
+            continue
+        if column == "related_entities_json":
+            cleared[column] = _prune_snapshot_related_entities(
+                raw,
+                active_ids,
+            )
+            continue
+        if column in {"source_observation_ids_json", "source_summary_ids_json"}:
+            target_table = (
+                "context_observations"
+                if column == "source_observation_ids_json"
+                else "summaries"
+            )
+            cleared[column] = _prune_snapshot_json_id_list(
+                raw,
+                target_table,
+                active_ids,
+            )
+    return cleared
+
+
+def _prune_snapshot_json_source_refs(
+    raw: str,
+    *,
+    message_ids: frozenset[str],
+    text_message_ids: frozenset[str],
+) -> str:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(parsed, list):
+        return raw
+    pruned = [
+        item
+        for item in parsed
+        if isinstance(item, str)
+        and item
+        and _snapshot_source_ref_resolves(
+            item,
+            message_ids=message_ids,
+            text_message_ids=text_message_ids,
+        )
+    ]
+    return _compact_json(pruned)
+
+
+def _prune_snapshot_json_id_list(
+    raw: str,
+    target_table: str,
+    active_ids: Mapping[str, frozenset[str]],
+) -> str:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(parsed, list):
+        return raw
+    target_ids = active_ids.get(target_table)
+    if target_ids is None:
+        return raw
+    pruned = [
+        item
+        for item in parsed
+        if isinstance(item, str) and item in target_ids
+    ]
+    return _compact_json(pruned)
+
+
+def _prune_snapshot_related_entities(
+    raw: str,
+    active_ids: Mapping[str, frozenset[str]],
+) -> str:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(parsed, list):
+        return raw
+    pruned: list[object] = []
+    for item in parsed:
+        if not isinstance(item, str):
+            pruned.append(item)
+            continue
+        entity_type, separator, entity_id = item.partition(":")
+        if not separator:
+            pruned.append(item)
+            continue
+        target_table = _ENTITY_TABLES.get(entity_type)
+        if target_table is None:
+            pruned.append(item)
+            continue
+        target_ids = active_ids.get(target_table)
+        if target_ids is None or entity_id in target_ids:
+            pruned.append(item)
+    return _compact_json(pruned)
+
+
+def _prune_snapshot_media_metadata(
+    raw: str,
+    active_ids: Mapping[str, frozenset[str]],
+) -> str:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(parsed, dict):
+        return raw
+    id_fields = {
+        "character_id": "characters",
+        "sender_character_id": "characters",
+        "thread_id": "character_text_threads",
+        "text_message_id": "character_text_messages",
+        "source_message_id": "messages",
+        "media_asset_id": "media_assets",
+        "source_media_asset_id": "media_assets",
+        "source_character_reference_asset_id": "media_assets",
+        "source_character_reference_character_id": "characters",
+    }
+    id_list_fields = {
+        "source_media_asset_ids": "media_assets",
+        "source_character_reference_asset_ids": "media_assets",
+        "source_character_reference_character_ids": "characters",
+    }
+    pruned = dict(parsed)
+    for key, item in parsed.items():
+        if key == "request_source_message_id":
+            if (
+                isinstance(item, str)
+                and item
+                and item not in active_ids["messages"]
+                and item not in active_ids["character_text_messages"]
+            ):
+                pruned[key] = None
+            continue
+        target_table = id_fields.get(key)
+        if target_table is not None:
+            if (
+                isinstance(item, str)
+                and item
+                and item not in active_ids[target_table]
+            ):
+                pruned[key] = None
+            continue
+        list_target_table = id_list_fields.get(key)
+        if list_target_table is not None and isinstance(item, list):
+            list_target_ids = active_ids[list_target_table]
+            kept_items = [
+                list_item
+                for list_item in item
+                if isinstance(list_item, str) and list_item in list_target_ids
+            ]
+            if kept_items != item:
+                pruned[key] = kept_items
+            continue
+        if isinstance(item, list):
+            pruned_items = [
+                json.loads(
+                    _prune_snapshot_media_metadata(
+                        json.dumps(list_item),
+                        active_ids,
+                    )
+                )
+                if isinstance(list_item, dict)
+                else list_item
+                for list_item in item
+            ]
+            if pruned_items != item:
+                pruned[key] = pruned_items
+            continue
+        if isinstance(item, dict):
+            pruned[key] = json.loads(
+                _prune_snapshot_media_metadata(
+                    json.dumps(item),
+                    active_ids,
+                )
+            )
+    return _compact_json(pruned)
+
+
+def _prune_snapshot_director_pressure_value(
+    raw: str,
+    *,
+    message_ids: frozenset[str],
+    text_message_ids: frozenset[str],
+) -> str:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if not isinstance(parsed, dict):
+        return raw
+    history = parsed.get("escalation_history")
+    if not isinstance(history, list):
+        return raw
+    pruned_history = [
+        item
+        for item in history
+        if not (
+            isinstance(item, dict)
+            and isinstance(item.get("source_message_id"), str)
+            and item["source_message_id"]
+            and item["source_message_id"] not in message_ids
+        )
+    ]
+    pruned = dict(parsed)
+    pruned["escalation_history"] = pruned_history
+    return _compact_json(pruned)
 
 
 def portable_context_observation_curation_state_row(

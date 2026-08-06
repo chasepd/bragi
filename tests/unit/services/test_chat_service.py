@@ -2185,6 +2185,75 @@ def test_submit_player_turn_persists_messages_and_uses_active_chat_model(
     assert persisted_messages[1].token_estimate == 23
 
 
+def test_persist_turn_message_scene_presence_skips_archived_messages(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    first = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The tower lens glows red.",
+    )
+    repositories.add_character(
+        character_id="mara",
+        save_id=save.id,
+        name="Mara",
+        source_message_id=first.id,
+    )
+    repositories.replace_message_scene_presence(
+        save_id=save.id,
+        message_id=first.id,
+        character_ids=["mara"],
+        source="post_turn_context",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        in_world_time="Monday morning",
+        time_of_day="morning",
+        day_of_week="monday",
+        world_day_index=1,
+        world_time_day_index=1,
+        world_time_day_label="monday",
+        world_time_phase="morning",
+        world_time_clock_minutes=8 * 60 + 30,
+        world_time_period_label="bell watch",
+        world_time_source_message_id=first.id,
+        world_time_confidence=0.9,
+        source_message_id=first.id,
+        present_character_ids=["mara"],
+    )
+    assert len(
+        repositories.list_message_scene_presence(
+            save.id,
+            message_id=first.id,
+        )
+    ) == 1
+    repositories.archive_message(first.id)
+
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+    service._persist_turn_message_scene_presence(
+        save_id=save.id,
+        source_message_ids=(first.id,),
+        source="post_turn_context",
+    )
+
+    assert (
+        repositories.list_message_scene_presence(save.id, message_id=first.id) == []
+    )
+
+
 def test_submit_player_turn_rolls_back_input_when_snapshot_capture_fails(
     repositories: PersistenceRepositories,
     monkeypatch: pytest.MonkeyPatch,

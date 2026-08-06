@@ -1877,6 +1877,742 @@ def test_snapshot_message_ids_returns_active_message_ids_in_rowid_order(
     )
 
 
+def test_snapshot_sanitizer_drops_rows_referencing_missing_messages() -> None:
+    rows = _sanitize_snapshot_rows_for_safety(
+        {
+            "messages": (
+                {"id": "message-one", "role": "narrator", "body": "The lens glows."},
+                {
+                    "id": "message-two",
+                    "role": "player",
+                    "speaker_name": "Mara",
+                    "body": "I look up.",
+                },
+            ),
+            "characters": (
+                {
+                    "id": "mara",
+                    "save_id": "save",
+                    "name": "Mara",
+                    "source_message_id": "message-one",
+                    "first_seen_message_id": "message-one",
+                },
+            ),
+            "state_changes": (
+                {
+                    "id": "change-kept",
+                    "save_id": "save",
+                    "source_message_id": "message-one",
+                    "operation": "upsert",
+                    "state_key": "lens",
+                    "before_json": None,
+                    "after_json": '{"color":"red"}',
+                },
+                {
+                    "id": "change-stale",
+                    "save_id": "save",
+                    "source_message_id": "message-gone",
+                    "operation": "upsert",
+                    "state_key": "lens",
+                    "before_json": None,
+                    "after_json": '{"color":"blue"}',
+                },
+            ),
+            "character_knowledge_edges": (
+                {
+                    "id": "edge-kept",
+                    "save_id": "save",
+                    "character_id": "mara",
+                    "target_type": "world_state",
+                    "target_id": "world-kept",
+                    "knowledge_state": "knows",
+                    "acquisition_method": "inferred",
+                    "confidence": 1.0,
+                    "source_message_id": "message-one",
+                    "source_message_ids_json": '["message-one"]',
+                    "evidence_quote": "lens",
+                    "archived_at": None,
+                },
+                {
+                    "id": "edge-stale",
+                    "save_id": "save",
+                    "character_id": "mara",
+                    "target_type": "world_state",
+                    "target_id": "world-kept",
+                    "knowledge_state": "may_know",
+                    "acquisition_method": "inferred",
+                    "confidence": 0.5,
+                    "source_message_id": "message-gone",
+                    "source_message_ids_json": '["message-one","message-gone"]',
+                    "evidence_quote": "lens",
+                    "archived_at": None,
+                },
+            ),
+            "message_scene_presence": (
+                {
+                    "id": "presence-kept",
+                    "save_id": "save",
+                    "message_id": "message-two",
+                    "character_id": "mara",
+                    "source": "post_turn_context",
+                },
+                {
+                    "id": "presence-stale",
+                    "save_id": "save",
+                    "message_id": "message-gone",
+                    "character_id": "mara",
+                    "source": "post_turn_context",
+                },
+            ),
+            "context_sources": (
+                {
+                    "id": "source-kept",
+                    "save_id": "save",
+                    "source_type": "message",
+                    "source_id": "message-one",
+                    "scope": "turn",
+                    "status": "active",
+                    "archived_at": None,
+                },
+                {
+                    "id": "source-stale",
+                    "save_id": "save",
+                    "source_type": "message",
+                    "source_id": "message-gone",
+                    "scope": "turn",
+                    "status": "active",
+                    "archived_at": None,
+                },
+                {
+                    "id": "source-metadata-stale",
+                    "save_id": "save",
+                    "source_type": "message",
+                    "source_id": "message-one",
+                    "metadata_json": json.dumps({"source_message_id": "message-gone"}),
+                    "scope": "turn",
+                    "status": "active",
+                    "archived_at": None,
+                },
+            ),
+            "world_state": (
+                {
+                    "id": "world-kept",
+                    "save_id": "save",
+                    "key": "lens",
+                    "value_json": '{"color":"red"}',
+                    "source_message_id": "message-one",
+                    "category": "story",
+                    "confidence": 1.0,
+                    "archived_at": None,
+                },
+                {
+                    "id": "world-stale",
+                    "save_id": "save",
+                    "key": "gate",
+                    "value_json": '{"open":true}',
+                    "source_message_id": "message-gone",
+                    "category": "story",
+                    "confidence": 1.0,
+                    "archived_at": None,
+                },
+                {
+                    "id": "world-pressure-stale",
+                    "save_id": "save",
+                    "key": "story.director_pressure",
+                    "value_json": json.dumps(
+                        {"escalation_history": [{"source_message_id": "message-gone"}]}
+                    ),
+                    "source_message_id": "message-one",
+                    "category": "story",
+                    "confidence": 1.0,
+                    "archived_at": None,
+                },
+            ),
+        }
+    )
+
+    assert [row["id"] for row in rows["state_changes"]] == ["change-kept"]
+    assert [row["id"] for row in rows["character_knowledge_edges"]] == ["edge-kept"]
+    assert [row["id"] for row in rows["message_scene_presence"]] == [
+        "presence-kept"
+    ]
+    assert [row["id"] for row in rows["context_sources"]] == ["source-kept"]
+    world_state_rows = rows["world_state"]
+    assert {row["id"] for row in world_state_rows} == {
+        "world-kept",
+        "world-stale",
+        "world-pressure-stale",
+    }
+    stale_world = next(row for row in world_state_rows if row["id"] == "world-stale")
+    assert stale_world["source_message_id"] is None
+    pressure_world = next(
+        row for row in world_state_rows if row["id"] == "world-pressure-stale"
+    )
+    assert json.loads(str(pressure_world["value_json"])) == {
+        "escalation_history": []
+    }
+
+
+def test_snapshot_sanitizer_drops_rows_referencing_archived_entities() -> None:
+    rows = _sanitize_snapshot_rows_for_safety(
+        {
+            "messages": (
+                {"id": "message-one", "role": "narrator", "body": "The lens glows."},
+            ),
+            "characters": (
+                {
+                    "id": "mara",
+                    "save_id": "save",
+                    "name": "Mara",
+                    "source_message_id": "message-one",
+                },
+            ),
+            "memories": (
+                {
+                    "id": "memory-kept",
+                    "save_id": "save",
+                    "body": "kept",
+                    "source_message_ids_json": '["message-one"]',
+                    "archived_at": None,
+                },
+            ),
+            "active_threads": (
+                {
+                    "id": "thread-kept",
+                    "save_id": "save",
+                    "source_message_id": "message-one",
+                },
+            ),
+            "entity_links": (
+                {
+                    "id": "link-kept",
+                    "save_id": "save",
+                    "entity_type": "character",
+                    "entity_id": "mara",
+                    "target_type": "memory",
+                    "target_id": "memory-kept",
+                    "source_message_id": "message-one",
+                },
+                {
+                    "id": "link-stale",
+                    "save_id": "save",
+                    "entity_type": "character",
+                    "entity_id": "mara",
+                    "target_type": "memory",
+                    "target_id": "memory-gone",
+                    "source_message_id": "message-one",
+                },
+            ),
+            "context_update_audit": (
+                {
+                    "id": "audit-stale",
+                    "save_id": "save",
+                    "entity_type": "active_thread",
+                    "entity_id": "thread-gone",
+                    "source_message_ids_json": '["message-one"]',
+                },
+            ),
+            "context_sources": (
+                {
+                    "id": "source-thread-stale",
+                    "save_id": "save",
+                    "source_type": "open_obligation",
+                    "source_id": "thread-gone",
+                    "scope": "turn",
+                    "status": "active",
+                    "archived_at": None,
+                },
+                {
+                    "id": "source-memory-stale",
+                    "save_id": "save",
+                    "source_type": "memory",
+                    "source_id": "memory-gone",
+                    "scope": "turn",
+                    "status": "active",
+                    "archived_at": None,
+                },
+                {
+                    "id": "source-memory-kept",
+                    "save_id": "save",
+                    "source_type": "memory",
+                    "source_id": "memory-kept",
+                    "scope": "turn",
+                    "status": "active",
+                    "archived_at": None,
+                },
+            ),
+            "save_loss_outcomes": (
+                {
+                    "id": "outcome-kept",
+                    "save_id": "save",
+                    "triggering_message_id": "message-one",
+                },
+                {
+                    "id": "outcome-stale",
+                    "save_id": "save",
+                    "triggering_message_id": "message-gone",
+                },
+            ),
+            "scene_snapshots": (
+                {
+                    "id": "scene-kept",
+                    "save_id": "save",
+                    "present_character_ids_json": '["mara","character-gone"]',
+                    "source_message_id": "message-one",
+                },
+            ),
+        }
+    )
+
+    assert [row["id"] for row in rows["entity_links"]] == ["link-kept"]
+    assert [row["id"] for row in rows["context_update_audit"]] == []
+    assert [row["id"] for row in rows["context_sources"]] == [
+        "source-memory-kept"
+    ]
+    assert [row["id"] for row in rows["save_loss_outcomes"]] == ["outcome-kept"]
+    scene = rows["scene_snapshots"][0]
+    assert json.loads(str(scene["present_character_ids_json"])) == ["mara"]
+
+
+def test_snapshot_sanitizer_cascades_drops_through_reference_chain() -> None:
+    rows = _sanitize_snapshot_rows_for_safety(
+        {
+            "messages": (
+                {"id": "message-one", "role": "narrator", "body": "The lens glows."},
+            ),
+            "characters": (
+                {
+                    "id": "mara",
+                    "save_id": "save",
+                    "name": "Mara",
+                    "source_message_id": "message-one",
+                },
+            ),
+            "context_update_suggestions": (
+                {
+                    "id": "suggestion-stale",
+                    "save_id": "save",
+                    "entity_type": "character",
+                    "entity_id": "mara",
+                    "field_path": "location_id",
+                    "proposed_value_json": '"location-gone"',
+                    "source_message_ids_json": '["message-one"]',
+                },
+            ),
+            "context_update_audit": (
+                {
+                    "id": "audit-cascade",
+                    "save_id": "save",
+                    "entity_type": "character",
+                    "entity_id": "mara",
+                    "field_path": "location_id",
+                    "suggestion_id": "suggestion-stale",
+                    "source_message_ids_json": '["message-one"]',
+                },
+            ),
+        }
+    )
+
+    assert [row["id"] for row in rows["context_update_suggestions"]] == []
+    assert [row["id"] for row in rows["context_update_audit"]] == []
+
+
+def test_snapshot_sanitizer_handles_summary_memory_and_metadata_references() -> None:
+    rows = _sanitize_snapshot_rows_for_safety(
+        {
+            "messages": (
+                {"id": "message-one", "role": "narrator", "body": "The lens glows."},
+            ),
+            "memories": (
+                {
+                    "id": "memory-kept",
+                    "save_id": "save",
+                    "body": "kept",
+                    "source_message_ids_json": '["message-one"]',
+                    "source_observation_ids_json": (
+                        '["observation-one","observation-gone"]'
+                    ),
+                    "archived_at": None,
+                },
+            ),
+            "context_observations": (
+                {
+                    "id": "observation-one",
+                    "save_id": "save",
+                    "source_message_ids_json": '["message-one"]',
+                    "archived_at": None,
+                },
+            ),
+            "summaries": (
+                {
+                    "id": "summary-kept",
+                    "save_id": "save",
+                    "covers_message_start_id": "message-one",
+                    "covers_message_end_id": "message-one",
+                    "source_message_ids_json": '["message-one"]',
+                },
+                {
+                    "id": "summary-stale",
+                    "save_id": "save",
+                    "covers_message_start_id": "message-one",
+                    "covers_message_end_id": "message-gone",
+                    "source_message_ids_json": '["message-one"]',
+                },
+            ),
+            "context_sources": (
+                {
+                    "id": "source-entity-stale",
+                    "save_id": "save",
+                    "source_type": "memory",
+                    "source_id": "memory-kept",
+                    "metadata_json": json.dumps(
+                        {"entity_ids": ["character-gone"]}
+                    ),
+                    "scope": "turn",
+                    "status": "active",
+                    "archived_at": None,
+                },
+            ),
+            "context_update_suggestions": (
+                {
+                    "id": "suggestion-location-stale",
+                    "save_id": "save",
+                    "entity_type": "character",
+                    "entity_id": "mara",
+                    "field_path": "location_id",
+                    "proposed_value_json": json.dumps(
+                        {
+                            "location_id": "location-gone",
+                            "source_message_id": "message-one",
+                        }
+                    ),
+                    "source_message_ids_json": '["message-one"]',
+                },
+            ),
+        }
+    )
+
+    memory = rows["memories"][0]
+    assert json.loads(str(memory["source_observation_ids_json"])) == [
+        "observation-one"
+    ]
+    assert [row["id"] for row in rows["summaries"]] == ["summary-kept"]
+    assert [row["id"] for row in rows["context_sources"]] == []
+    assert [row["id"] for row in rows["context_update_suggestions"]] == []
+
+
+def test_snapshot_sanitizer_clears_nested_and_typed_references() -> None:
+    rows = _sanitize_snapshot_rows_for_safety(
+        {
+            "messages": (
+                {"id": "message-one", "role": "narrator", "body": "The lens glows."},
+            ),
+            "characters": (
+                {
+                    "id": "mara",
+                    "save_id": "save",
+                    "name": "Mara",
+                    "source_message_id": "message-one",
+                },
+            ),
+            "active_threads": (
+                {
+                    "id": "thread-kept",
+                    "save_id": "save",
+                    "source_message_id": "message-one",
+                    "related_entities_json": (
+                        '["character:mara","character:character-gone"]'
+                    ),
+                },
+            ),
+            "media_assets": (
+                {
+                    "id": "asset-kept",
+                    "save_id": "save",
+                    "path": "old.png",
+                    "source_message_id": "message-one",
+                    "metadata_json": json.dumps(
+                        {
+                            "decision_reason": "x",
+                            "context": {
+                                "character_id": "character-gone",
+                                "nested": {"character_id": "mara"},
+                            },
+                        }
+                    ),
+                },
+            ),
+            "context_sources": (
+                {
+                    "id": "source-audience-stale",
+                    "save_id": "save",
+                    "source_type": "message",
+                    "source_id": "message-one",
+                    "metadata_json": json.dumps(
+                        {"audience_character_ids": ["mara", "character-gone"]}
+                    ),
+                    "scope": "turn",
+                    "status": "active",
+                    "archived_at": None,
+                },
+            ),
+            "dating_route_states": (
+                {
+                    "id": "route-stale",
+                    "save_id": "save",
+                    "player_character_id": "mara",
+                    "npc_character_id": "npc-gone",
+                    "stage": "met",
+                    "source_message_id": "message-one",
+                },
+            ),
+        }
+    )
+
+    thread = rows["active_threads"][0]
+    assert json.loads(str(thread["related_entities_json"])) == ["character:mara"]
+    asset = rows["media_assets"][0]
+    metadata = json.loads(str(asset["metadata_json"]))
+    assert metadata["context"]["character_id"] is None
+    assert metadata["context"]["nested"]["character_id"] == "mara"
+    assert [row["id"] for row in rows["context_sources"]] == []
+    assert [row["id"] for row in rows["dating_route_states"]] == []
+
+
+def test_snapshot_capture_excludes_rows_referencing_deleted_messages(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    first = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The tower lens glows red.",
+    )
+    repositories.add_state_change(
+        save_id=save.id,
+        operation="upsert",
+        state_key="lens",
+        after_json='{"color":"red"}',
+        source_message_id=first.id,
+    )
+    repositories.add_character(
+        character_id="mara",
+        save_id=save.id,
+        name="Mara",
+        source_message_id=first.id,
+    )
+    lens_state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens",
+        value={"color": "red"},
+        source_message_id=first.id,
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id="mara",
+        target_type="world_state",
+        target_id=lens_state.id,
+        source_message_id=first.id,
+    )
+    repositories.replace_message_scene_presence(
+        save_id=save.id,
+        message_id=first.id,
+        character_ids=["mara"],
+        source="post_turn_context",
+    )
+    service.capture_message_snapshot(save_id=save.id, message_id=first.id)
+
+    second = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I touch the lens.",
+    )
+    repositories.add_state_change(
+        save_id=save.id,
+        operation="upsert",
+        state_key="touch",
+        after_json='{"touched":true}',
+        source_message_id=second.id,
+    )
+    repositories.replace_message_scene_presence(
+        save_id=save.id,
+        message_id=second.id,
+        character_ids=["mara"],
+        source="post_turn_context",
+    )
+    repositories.archive_message(first.id)
+
+    later_snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=second.id,
+    )
+    rows = _snapshot_rows_by_table(repositories, later_snapshot.id)
+    assert service.snapshot_message_ids(snapshot_id=later_snapshot.id) == (
+        second.id,
+    )
+    assert all(
+        row["source_message_id"] != first.id
+        for row in rows["state_changes"]
+        if isinstance(row.get("source_message_id"), str)
+    )
+    assert all(
+        row["source_message_id"] != first.id
+        for row in rows["world_state"]
+        if isinstance(row.get("source_message_id"), str)
+    )
+    assert all(
+        row.get("source_message_id") != first.id
+        for row in rows["character_knowledge_edges"]
+    )
+    assert all(
+        row["message_id"] != first.id for row in rows["message_scene_presence"]
+    )
+
+    result = service.fork_snapshot_to_save(
+        source_save_id=save.id,
+        snapshot_id=later_snapshot.id,
+        title="Fork after lens touch",
+        media_dir=tmp_path / "media",
+    )
+    assert result.message_count == 1
+    fork_rows = repositories.connection.execute(
+        "SELECT source_message_id FROM state_changes WHERE save_id = ?",
+        (result.save.id,),
+    ).fetchall()
+    assert all(
+        row["source_message_id"] != first.id
+        for row in fork_rows
+        if row["source_message_id"] is not None
+    )
+    fork_presence = repositories.connection.execute(
+        "SELECT message_id FROM message_scene_presence WHERE save_id = ?",
+        (result.save.id,),
+    ).fetchall()
+    assert all(row["message_id"] != first.id for row in fork_presence)
+
+
+def test_fork_heals_snapshot_with_unknown_message_references(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    first = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The tower lens glows red.",
+    )
+    message_hash = service._store_object(
+        kind="row:messages",
+        value={
+            "id": first.id,
+            "save_id": save.id,
+            "role": "narrator",
+            "speaker_name": "Narrator",
+            "body": "The tower lens glows red.",
+            "provider": None,
+            "model": None,
+            "token_estimate": 0,
+            "deleted_at": None,
+            "safety_transition": "",
+            "content_rating": "unclassified",
+        },
+    )
+    stale_change_hash = service._store_object(
+        kind="row:state_changes",
+        value={
+            "id": "change-stale",
+            "save_id": save.id,
+            "source_message_id": "ghost-message",
+            "operation": "upsert",
+            "state_key": "lens",
+            "before_json": None,
+            "after_json": '{"color":"red"}',
+        },
+    )
+    stale_presence_hash = service._store_object(
+        kind="row:message_scene_presence",
+        value={
+            "id": "presence-stale",
+            "save_id": save.id,
+            "message_id": "ghost-message",
+            "character_id": "mara",
+            "source": "post_turn_context",
+        },
+    )
+    manifest_hash = service._store_object(
+        kind="snapshot_manifest",
+        value={
+            "format": turn_snapshot_module.SNAPSHOT_FORMAT,
+            "save_id": save.id,
+            "message_id": first.id,
+            "active_message_ids": [first.id],
+            "context_revision": 1,
+            "tables": {
+                "messages": [{"id": first.id, "object_hash": message_hash}],
+                "state_changes": [
+                    {"id": "change-stale", "object_hash": stale_change_hash}
+                ],
+                "message_scene_presence": [
+                    {"id": "presence-stale", "object_hash": stale_presence_hash}
+                ],
+            },
+        },
+    )
+    repositories.connection.execute(
+        """
+        INSERT INTO save_turn_snapshots(
+            id, save_id, message_id, parent_snapshot_id, root_manifest_hash,
+            context_revision, reason
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "broken-snapshot",
+            save.id,
+            first.id,
+            None,
+            manifest_hash,
+            1,
+            "test_broken",
+        ),
+    )
+    repositories.commit()
+
+    result = service.fork_snapshot_to_save(
+        source_save_id=save.id,
+        snapshot_id="broken-snapshot",
+        title="Fork heals stale references",
+        media_dir=tmp_path / "media",
+    )
+
+    assert result.message_count == 1
+    stale_rows = repositories.connection.execute(
+        """
+        SELECT source_message_id
+        FROM state_changes
+        WHERE save_id = ?
+        """,
+        (result.save.id,),
+    ).fetchall()
+    assert stale_rows == []
+    presence_rows = repositories.connection.execute(
+        """
+        SELECT message_id
+        FROM message_scene_presence
+        WHERE save_id = ?
+        """,
+        (result.save.id,),
+    ).fetchall()
+    assert presence_rows == []
+
+
 def test_fork_snapshot_rejects_trailing_message_in_source_snapshot(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -3012,6 +3748,49 @@ def _row_object_count(repositories: PersistenceRepositories) -> int:
         """
     ).fetchone()
     return int(row["count"])
+
+
+def _snapshot_rows_by_table(
+    repositories: PersistenceRepositories,
+    snapshot_id: str,
+) -> dict[str, list[dict[str, object]]]:
+    snapshot_row = repositories.connection.execute(
+        """
+        SELECT root_manifest_hash
+        FROM save_turn_snapshots
+        WHERE id = ?
+        """,
+        (snapshot_id,),
+    ).fetchone()
+    assert snapshot_row is not None
+    manifest_payload = repositories.connection.execute(
+        """
+        SELECT payload
+        FROM save_snapshot_objects
+        WHERE object_hash = ?
+        """,
+        (str(snapshot_row["root_manifest_hash"]),),
+    ).fetchone()
+    assert manifest_payload is not None
+    manifest = json.loads(zlib.decompress(bytes(manifest_payload["payload"])))
+    rows_by_table: dict[str, list[dict[str, object]]] = {}
+    for table_name, entries in manifest["tables"].items():
+        table_rows: list[dict[str, object]] = []
+        for entry in entries:
+            payload = repositories.connection.execute(
+                """
+                SELECT payload
+                FROM save_snapshot_objects
+                WHERE object_hash = ?
+                """,
+                (entry["object_hash"],),
+            ).fetchone()
+            assert payload is not None
+            decoded = json.loads(zlib.decompress(bytes(payload["payload"])))
+            assert isinstance(decoded, dict)
+            table_rows.append(decoded)
+        rows_by_table[str(table_name)] = table_rows
+    return rows_by_table
 
 
 def _assert_snapshot_objects_do_not_store_media_bytes(
