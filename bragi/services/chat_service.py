@@ -5100,7 +5100,9 @@ class ChatService:
             if not source_message_id:
                 continue
             source_message = messages.get(source_message_id)
-            if source_message is not None and is_fade_to_black_message(
+            if source_message is None:
+                continue
+            if is_fade_to_black_message(
                 role=source_message.role,
                 body=source_message.body,
                 safety_transition=source_message.safety_transition,

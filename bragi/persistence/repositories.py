@@ -9425,6 +9425,25 @@ class PersistenceRepositories:
         )
         self.commit()
 
+    def archive_character_knowledge_edges_for_deleted_messages(
+        self,
+        *,
+        save_id: str,
+        message_ids: set[str] | frozenset[str],
+    ) -> frozenset[str]:
+        if not message_ids:
+            return frozenset()
+        archived_ids: set[str] = set()
+        for record in self.list_character_knowledge_edges(save_id):
+            if not _character_knowledge_edge_references_any_message(
+                record,
+                message_ids,
+            ):
+                continue
+            self.archive_character_knowledge_edge(record.id)
+            archived_ids.add(record.id)
+        return frozenset(archived_ids)
+
     def restore_character_knowledge_edges(
         self,
         edge_ids: set[str] | frozenset[str],
@@ -15044,6 +15063,16 @@ def _context_source_references_any_message(
         )
     metadata_source_id = record.metadata.get("source_message_id")
     return isinstance(metadata_source_id, str) and metadata_source_id in message_ids
+
+
+def _character_knowledge_edge_references_any_message(
+    record: CharacterKnowledgeEdgeRecord,
+    message_ids: set[str] | frozenset[str],
+) -> bool:
+    return (
+        record.source_message_id in message_ids
+        or bool(set(record.source_message_ids) & set(message_ids))
+    )
 
 
 def _context_source_from_row(row: sqlite3.Row) -> ContextSourceRecord:

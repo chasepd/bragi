@@ -56,6 +56,7 @@ class RevisionResubmission:
     deleted_entity_links: tuple[EntityLinkRecord, ...] = ()
     scene_snapshot_before_cleanup: SceneSnapshotRecord | None = None
     scene_snapshot_cleanup_changed: bool = False
+    archived_character_knowledge_edge_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ class MessageRollback:
     deleted_entity_links: tuple[EntityLinkRecord, ...]
     scene_snapshot_before_cleanup: SceneSnapshotRecord | None = None
     scene_snapshot_cleanup_changed: bool = False
+    archived_character_knowledge_edge_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,7 @@ class MessageDeletion:
     archived_active_thread_ids: frozenset[str]
     deleted_entity_link_ids: frozenset[str] = frozenset()
     deleted_scene_snapshot_id: str | None = None
+    archived_character_knowledge_edge_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -109,6 +112,7 @@ class _WorldDataContextCleanup:
     deleted_entity_links: tuple[EntityLinkRecord, ...]
     scene_snapshot_before_cleanup: SceneSnapshotRecord | None = None
     scene_snapshot_cleanup_changed: bool = False
+    archived_character_knowledge_edge_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -175,6 +179,9 @@ class MessageRevisionService:
             deleted_entity_links=rollback.deleted_entity_links,
             scene_snapshot_before_cleanup=rollback.scene_snapshot_before_cleanup,
             scene_snapshot_cleanup_changed=rollback.scene_snapshot_cleanup_changed,
+            archived_character_knowledge_edge_ids=(
+                rollback.archived_character_knowledge_edge_ids
+            ),
         )
 
     def edit_and_resubmit_message(
@@ -224,6 +231,9 @@ class MessageRevisionService:
             deleted_entity_links=rollback.deleted_entity_links,
             scene_snapshot_before_cleanup=rollback.scene_snapshot_before_cleanup,
             scene_snapshot_cleanup_changed=rollback.scene_snapshot_cleanup_changed,
+            archived_character_knowledge_edge_ids=(
+                rollback.archived_character_knowledge_edge_ids
+            ),
         )
 
     def edit_narrator_message(
@@ -411,6 +421,9 @@ class MessageRevisionService:
             archived_active_thread_ids=rollback.archived_active_thread_ids,
             deleted_entity_link_ids=rollback.deleted_entity_link_ids,
             deleted_scene_snapshot_id=deleted_scene_snapshot_id,
+            archived_character_knowledge_edge_ids=(
+                rollback.archived_character_knowledge_edge_ids
+            ),
         )
 
     def rollback_from_message(
@@ -488,6 +501,9 @@ class MessageRevisionService:
             deleted_entity_links=cleanup.deleted_entity_links,
             scene_snapshot_before_cleanup=cleanup.scene_snapshot_before_cleanup,
             scene_snapshot_cleanup_changed=cleanup.scene_snapshot_cleanup_changed,
+            archived_character_knowledge_edge_ids=(
+                cleanup.archived_character_knowledge_edge_ids
+            ),
         )
 
     def restore_resubmission(
@@ -566,6 +582,9 @@ class MessageRevisionService:
         self.repositories.restore_locations(revision.archived_location_ids)
         self.repositories.restore_characters(revision.archived_character_ids)
         self.repositories.restore_active_threads(revision.archived_active_thread_ids)
+        self.repositories.restore_character_knowledge_edges(
+            revision.archived_character_knowledge_edge_ids
+        )
         if (
             revision.scene_snapshot_cleanup_changed
             and revision.scene_snapshot_before_cleanup is not None
@@ -814,6 +833,12 @@ class MessageRevisionService:
             save_id=save_id,
             deleted_message_ids=deleted_message_ids,
         )
+        archived_character_knowledge_edge_ids = (
+            self.repositories.archive_character_knowledge_edges_for_deleted_messages(
+                save_id=save_id,
+                message_ids=deleted_message_ids,
+            )
+        )
         snapshot_after_revert = self.repositories.get_scene_snapshot(save_id)
         scene_changed = self._cleanup_scene_snapshot_references(
             save_id=save_id,
@@ -841,6 +866,9 @@ class MessageRevisionService:
                 snapshot_after_revert if scene_changed else None
             ),
             scene_snapshot_cleanup_changed=scene_changed,
+            archived_character_knowledge_edge_ids=(
+                archived_character_knowledge_edge_ids
+            ),
         )
 
     def _restore_missing_protected_characters(

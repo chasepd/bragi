@@ -8969,6 +8969,73 @@ def _persist_repository_save(
     return save.id, message.id
 
 
+def test_archive_character_knowledge_edges_for_deleted_messages(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, message_id = _persist_repository_save(repositories)
+    character = repositories.add_character(
+        save_id=save_id,
+        name="Mara",
+        source_message_id=message_id,
+    )
+    scalar_edge = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="world_state",
+        target_id="gate.state",
+        source_message_id=message_id,
+    )
+    other_message = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Mara",
+        body="I turn the lens.",
+    )
+    json_edge = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="world_state",
+        target_id="gate.other",
+        source_message_ids=[message_id, other_message.id],
+    )
+    unrelated_edge = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="world_state",
+        target_id="beacon.state",
+        source_message_id=other_message.id,
+    )
+    already_archived = repositories.add_character_knowledge_edge(
+        save_id=save_id,
+        character_id=character.id,
+        target_type="world_state",
+        target_id="gate.old",
+        source_message_id=message_id,
+    )
+    repositories.archive_character_knowledge_edge(already_archived.id)
+
+    archived_ids = (
+        repositories.archive_character_knowledge_edges_for_deleted_messages(
+            save_id=save_id,
+            message_ids={message_id},
+        )
+    )
+
+    assert archived_ids == frozenset({scalar_edge.id, json_edge.id})
+    active_edges = repositories.list_character_knowledge_edges(save_id)
+    assert [edge.id for edge in active_edges] == [unrelated_edge.id]
+    archived_rows = repositories.connection.execute(
+        """
+        SELECT id, archived_at
+        FROM character_knowledge_edges
+        WHERE id IN (?, ?, ?)
+        """,
+        (scalar_edge.id, json_edge.id, already_archived.id),
+    ).fetchall()
+    assert len(archived_rows) == 3
+    assert all(row["archived_at"] is not None for row in archived_rows)
+
+
 def _load_content(content_json: str) -> dict[str, object]:
     loaded = json.loads(content_json)
     assert isinstance(loaded, dict)
