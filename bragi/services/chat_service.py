@@ -4494,11 +4494,6 @@ class ChatService:
         if maintenance_failed_jobs:
             coordinator_result["maintenance_degraded"] = True
             coordinator_result["maintenance_failed_jobs"] = maintenance_failed_jobs
-        image_step_result = step_results.get("image") or {}
-        if image_step_result.get("deferred_to_background"):
-            coordinator_result["prepared_automatic_image"] = image_step_result[
-                "prepared_automatic_image"
-            ]
 
         def finalize_current_head_snapshot() -> None:
             if not current_head or not self._turn_revision_is_current_head(boundary):

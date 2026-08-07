@@ -9191,8 +9191,9 @@ async def _queue_deferred_automatic_image_if_prepared(
             worker,
             save_id=save_id,
             creator_user_id=current_user_id,
+            operation_queue_key=f"automatic_image:{save_id}",
         )
-    except (JobRegistryExclusiveKeyError, JobRegistryFullError):
+    except Exception:
         kwargs: dict[str, object] = {
             "save_id": save_id,
             "prepared_automatic_image": prepared_automatic_image,

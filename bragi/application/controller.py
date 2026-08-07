@@ -3675,10 +3675,10 @@ class BragiRuntime:
             finally:
                 if action_choice_task is not None:
                     await action_choice_task
-            prepared = (coordinator_result or {}).get(
-                "prepared_automatic_image"
-            )
-            if isinstance(prepared, dict):
+            prepared = _prepared_image_from_coordinator_result(coordinator_result)
+            if prepared is not None:
+                if len(self._deferred_automatic_image_payloads) > 64:
+                    self._deferred_automatic_image_payloads.clear()
                 self._deferred_automatic_image_payloads[
                     (save_id, narrator_message_id)
                 ] = prepared
@@ -9816,6 +9816,25 @@ def _turn_complete_status(
     if context_trimmed:
         notes.append("context budget trimmed older context")
     return "; ".join(notes)
+
+
+def _prepared_image_from_coordinator_result(
+    coordinator_result: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not coordinator_result:
+        return None
+    for job in cast(Iterable[object], coordinator_result.get("jobs", [])):
+        if not isinstance(job, dict) or job.get("name") != "image":
+            continue
+        result = job.get("result")
+        if not isinstance(result, dict) or not result.get(
+            "deferred_to_background"
+        ):
+            continue
+        candidate = result.get("prepared_automatic_image")
+        if isinstance(candidate, dict):
+            return candidate
+    return None
 
 
 async def _submit_player_turn_with_optional_cancellation(

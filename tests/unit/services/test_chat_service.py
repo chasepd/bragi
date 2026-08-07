@@ -14440,10 +14440,6 @@ def test_run_post_turn_jobs_defers_automatic_image_generation_when_requested(
         image_result["prepared_automatic_image"]["source_message_id"]
         == narrator_message.id
     )
-    assert (
-        coordinator["result"]["prepared_automatic_image"]["source_message_id"]
-        == narrator_message.id
-    )
 
 
 def test_generate_deferred_automatic_image_reconstructs_and_generates(

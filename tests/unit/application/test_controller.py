@@ -9408,7 +9408,18 @@ def test_run_post_turn_jobs_stashes_deferred_image_for_consume(
             narrator_message_id: str,
             defer_image_generation: bool = False,
         ) -> dict[str, object]:
-            return {"prepared_automatic_image": prepared_payload}
+            return {
+                "jobs": [
+                    {
+                        "name": "image",
+                        "status": "queued",
+                        "result": {
+                            "deferred_to_background": True,
+                            "prepared_automatic_image": prepared_payload,
+                        },
+                    }
+                ]
+            }
 
     monkeypatch.setattr(runtime, "ChatService", FakeChatService)
     controller = _runtime_controller(runtime, repositories, tmp_path)
