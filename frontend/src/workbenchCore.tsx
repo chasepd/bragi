@@ -9263,7 +9263,6 @@ function postTurnPhaseLabel(name: string): string {
     submission: "Submitting",
     history: "History check",
     input: "Saving input",
-    time_state: "World time",
     character_planning: "Character planning",
     context_selection: "Context selection",
     prompt: "Prompt prep",

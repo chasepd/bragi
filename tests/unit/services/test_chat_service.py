@@ -2747,7 +2747,6 @@ def test_submit_player_turn_reports_pre_narrator_progress_phases(
     assert status_texts[0] == "Submitting turn"
     assert "Checking history" in status_texts
     assert "Saving player input" in status_texts
-    assert "World time unchanged" in status_texts
     assert "Dating route profile skipped" in status_texts
     assert "Selecting context" in status_texts
     assert "Preparing narrator prompt" in status_texts
@@ -2762,7 +2761,6 @@ def test_submit_player_turn_reports_pre_narrator_progress_phases(
         "submission": "succeeded",
         "history": "succeeded",
         "input": "succeeded",
-        "time_state": "skipped",
         "dating_route_profile": "skipped",
         "character_planning": "skipped",
         "context_selection": "succeeded",
@@ -5131,7 +5129,7 @@ def test_submit_player_turn_skips_scene_snapshot_field_with_ungrounded_evidence(
     assert planned["decisions"][0]["reason"] == "ungrounded_evidence_metadata"
 
 
-def test_submit_player_turn_applies_world_time_before_prompt_context(
+def test_submit_player_turn_defers_world_time_until_post_turn(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -5178,15 +5176,16 @@ def test_submit_player_turn_applies_world_time_before_prompt_context(
         )
     )
 
-    assert events == ["world_time", "context_search"]
+    assert events == ["context_search"]
     assert provider.chat_requests
-    assert "Current world time: Tuesday evening." in "\n".join(
-        provider.chat_requests[0].current_scene_recap
-    )
+    recap = "\n".join(provider.chat_requests[0].current_scene_recap)
+    assert "Current world time: Monday morning." in recap
+    assert "Tuesday evening" not in recap
     snapshot = repositories.get_scene_snapshot(save.id)
     assert snapshot is not None
-    assert snapshot.time_of_day == "evening"
-    assert snapshot.day_of_week == "tuesday"
+    assert snapshot.time_of_day == "morning"
+    assert snapshot.day_of_week == "monday"
+    assert snapshot.in_world_time == "Monday morning"
 
 
 @pytest.mark.parametrize(

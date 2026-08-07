@@ -6384,7 +6384,6 @@ describe("frontend helpers", () => {
               { name: "submission", status: "succeeded" },
               { name: "history", status: "succeeded" },
               { name: "input", status: "succeeded" },
-              { name: "time_state", status: "skipped" },
               { name: "character_planning", status: "skipped" },
               { name: "context_selection", status: "running" },
               { name: "prompt", status: "pending" },
@@ -6403,7 +6402,6 @@ describe("frontend helpers", () => {
     expect(screen.getByText("Submitting")).toBeInTheDocument();
     expect(screen.getByText("History check")).toBeInTheDocument();
     expect(screen.getByText("Saving input")).toBeInTheDocument();
-    expect(screen.getByText("World time")).toBeInTheDocument();
     expect(screen.getByText("Character planning")).toBeInTheDocument();
     expect(screen.getByText("Context selection")).toBeInTheDocument();
     expect(screen.getByText("Prompt prep")).toBeInTheDocument();

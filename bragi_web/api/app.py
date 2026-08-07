@@ -240,7 +240,6 @@ _CHAT_TURN_PROGRESS_JOB_ORDER = (
     "submission",
     "history",
     "input",
-    "time_state",
     "character_planning",
     "context_selection",
     "prompt",

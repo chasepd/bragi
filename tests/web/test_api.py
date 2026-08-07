@@ -8140,7 +8140,7 @@ def test_chat_turn_uses_runtime_pre_narrator_phase_progress(
             turn_progress_callback(
                 _expected_chat_turn_progress(
                     "Selecting context",
-                    succeeded=("submission", "history", "input", "time_state"),
+                    succeeded=("submission", "history", "input"),
                     running="context_selection",
                 )
             )
@@ -8178,7 +8178,7 @@ def test_chat_turn_uses_runtime_pre_narrator_phase_progress(
     assert job["status"] == "running"
     assert job["latest_progress"] == _expected_chat_turn_progress(
         "Selecting context",
-        succeeded=("submission", "history", "input", "time_state"),
+        succeeded=("submission", "history", "input"),
         running="context_selection",
     )
 
@@ -14398,7 +14398,6 @@ _EXPECTED_CHAT_TURN_PHASES = (
     "submission",
     "history",
     "input",
-    "time_state",
     "character_planning",
     "context_selection",
     "prompt",
