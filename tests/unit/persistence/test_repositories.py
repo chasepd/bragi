@@ -5786,13 +5786,6 @@ def test_repositories_summaries_visible_to_characters_batches_visibility(
             public_summary.covers_message_end_id,
         )
     }
-    for start_id, end_id in summaries:
-        assert repositories.summary_visible_to_characters(
-            save_id=save.id,
-            covers_message_start_id=start_id,
-            covers_message_end_id=end_id,
-            character_ids={character.id},
-        ) == ((start_id, end_id) in visible)
 
 
 def test_repositories_summaries_visible_to_characters_without_scoped_characters(

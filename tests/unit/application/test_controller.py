@@ -9349,6 +9349,43 @@ def test_run_post_turn_jobs_forwards_progress_callback_when_supported(
     assert _value(model, "status") == "Turn complete"
 
 
+def test_run_deferred_automatic_image_forwards_payload_and_user(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, _ = _persist_runtime_save(repositories)
+    calls: list[tuple[Mapping[str, object], str | None]] = []
+
+    class FakeChatService:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        async def generate_deferred_automatic_image(
+            self,
+            *,
+            prepared_automatic_image: Mapping[str, object],
+            current_user_id: str | None = None,
+        ) -> str:
+            calls.append((prepared_automatic_image, current_user_id))
+            return "succeeded"
+
+    monkeypatch.setattr(runtime, "ChatService", FakeChatService)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+
+    status = asyncio.run(
+        controller.run_deferred_automatic_image(
+            save_id=save_id,
+            prepared_automatic_image={"source_message_id": "message-1"},
+            current_user_id="user-1",
+        )
+    )
+
+    assert status == "succeeded"
+    assert calls == [({"source_message_id": "message-1"}, "user-1")]
+
+
 def test_run_post_turn_jobs_waits_for_same_save_submit_lock(
     repositories: PersistenceRepositories,
     tmp_path: Path,

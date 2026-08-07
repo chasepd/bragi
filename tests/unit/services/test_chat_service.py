@@ -124,6 +124,7 @@ from bragi.services.director_pressure_service import (
 from bragi.services.generation_settings import (
     OPENROUTER_CHAT_REASONING_OVERRIDES_SETTING,
 )
+from bragi.services.media_service import PreparedAutomaticImage
 from bragi.services.npc_knowledge_audit_service import (
     NPC_KNOWLEDGE_AUDIT_MODE_HARD_FAIL,
     NPC_KNOWLEDGE_AUDIT_MODE_SETTING,
@@ -1867,7 +1868,7 @@ class RecordingPreparedMediaService:
         self.repositories = repositories
         self.events = events
         self.generated = generated
-        self.prepared: list[dict[str, object]] = []
+        self.prepared: list[object] = []
         self.generated_prepared: list[object] = []
         self.prepare_started: asyncio.Event | None = None
 
@@ -1910,20 +1911,7 @@ class RecordingPreparedMediaService:
         raise AssertionError("prepared automatic image path should be used")
 
 
-class BlockingPreparedMediaService:
-    def __init__(
-        self,
-        *,
-        repositories: PersistenceRepositories,
-        events: list[str],
-    ) -> None:
-        self.repositories = repositories
-        self.events = events
-        self.prepared: list[dict[str, object]] = []
-        self.generation_blocks = asyncio.Event()
-        self.release_generation = asyncio.Event()
-        self.generation_completed = asyncio.Event()
-
+class PreparedImageRecordingMediaService(RecordingPreparedMediaService):
     def prepare_automatic_if_due(
         self,
         *,
@@ -1931,37 +1919,17 @@ class BlockingPreparedMediaService:
         source_message_id: str | None = None,
     ) -> object | None:
         self.events.append("automatic_media_prepare")
-        prepared: dict[str, object] = {
-            "save_id": save_id,
-            "source_message_id": source_message_id,
-            "world_state_keys": [
-                state.key for state in self.repositories.list_world_state(save_id)
-            ],
-        }
+        prepared = PreparedAutomaticImage(
+            save_id=save_id,
+            source_message_id=cast(str, source_message_id),
+            scene_context="A red lens hums in the tower.",
+            context_breakdown_json={},
+            provider="fake",
+            model_id="fake-image",
+            narrator_message_count=1,
+        )
         self.prepared.append(prepared)
         return prepared
-
-    async def generate_prepared_automatic(
-        self,
-        prepared: object,
-        *,
-        current_user_id: str | None = None,
-    ) -> object | None:
-        self.events.append("automatic_media_started")
-        self.generation_blocks.set()
-        await self.release_generation.wait()
-        self.events.append("automatic_media")
-        self.generation_completed.set()
-        return prepared
-
-    async def generate_automatic_if_due(
-        self,
-        *,
-        save_id: str,
-        source_message_id: str | None = None,
-        current_user_id: str | None = None,
-    ) -> object:
-        raise AssertionError("prepared automatic image path should be used")
 
 
 class RecordingStatePruningService:
@@ -14441,7 +14409,7 @@ def test_run_post_turn_jobs_defers_automatic_image_generation_when_requested(
         model="fake-chat",
     )
     events: list[str] = []
-    media_service = BlockingPreparedMediaService(
+    media_service = PreparedImageRecordingMediaService(
         repositories=repositories,
         events=events,
     )
@@ -14452,29 +14420,80 @@ def test_run_post_turn_jobs_defers_automatic_image_generation_when_requested(
         media_service=media_service,
     )
 
-    async def run_turn() -> None:
-        await service.run_post_turn_jobs(
+    asyncio.run(
+        service.run_post_turn_jobs(
             save_id=save.id,
             player_message_id=player_message.id,
             narrator_message_id=narrator_message.id,
             defer_image_generation=True,
         )
-        assert media_service.generation_blocks.is_set()
-        assert not media_service.generation_completed.is_set()
-        media_service.release_generation.set()
-        await media_service.generation_completed.wait()
+    )
 
-    asyncio.run(run_turn())
-
-    assert events == [
-        "automatic_media_prepare",
-        "automatic_media_started",
-        "automatic_media",
-    ]
+    assert events == ["automatic_media_prepare"]
+    assert media_service.generated_prepared == []
     coordinator = _post_turn_jobs(repositories, save.id)[-1]
     assert _post_turn_child_status(coordinator, "image") == "queued"
     image_result = _post_turn_child_result(coordinator, "image")
     assert image_result["deferred_to_background"] is True
+    assert (
+        image_result["prepared_automatic_image"]["source_message_id"]
+        == narrator_message.id
+    )
+    assert (
+        coordinator["result"]["prepared_automatic_image"]["source_message_id"]
+        == narrator_message.id
+    )
+
+
+def test_generate_deferred_automatic_image_reconstructs_and_generates(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon lens hums awake.",
+        provider="fake",
+        model="fake-chat",
+    )
+    events: list[str] = []
+    media_service = RecordingPreparedMediaService(
+        repositories=repositories,
+        events=events,
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+        media_service=media_service,
+    )
+    prepared = PreparedAutomaticImage(
+        save_id=save.id,
+        source_message_id=narrator_message.id,
+        scene_context="A red lens hums in the tower.",
+        context_breakdown_json={},
+        provider="fake",
+        model_id="fake-image",
+        narrator_message_count=1,
+    )
+
+    status = asyncio.run(
+        service.generate_deferred_automatic_image(
+            prepared_automatic_image=prepared.to_json(),
+        )
+    )
+
+    assert status == "succeeded"
+    assert events == ["automatic_media"]
+    assert media_service.generated_prepared == [prepared]
 
 
 def test_run_post_turn_jobs_generates_automatic_image_inline_by_default(

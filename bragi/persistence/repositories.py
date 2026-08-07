@@ -11807,56 +11807,6 @@ class PersistenceRepositories:
         )
         return _summary_from_row(row) if row is not None else None
 
-    def summary_visible_to_characters(
-        self,
-        *,
-        save_id: str,
-        covers_message_start_id: str,
-        covers_message_end_id: str,
-        character_ids: set[str] | frozenset[str] | tuple[str, ...],
-    ) -> bool:
-        scoped_character_ids = tuple(sorted(set(character_ids)))
-        if not scoped_character_ids:
-            return True
-        endpoints = self._fetch_all(
-            """
-            SELECT id, rowid AS message_rowid
-            FROM messages
-            WHERE save_id = ? AND id IN (?, ?)
-            """,
-            (save_id, covers_message_start_id, covers_message_end_id),
-        )
-        endpoint_rowids = {
-            str(row["id"]): int(row["message_rowid"]) for row in endpoints
-        }
-        start_rowid = endpoint_rowids.get(covers_message_start_id)
-        end_rowid = endpoint_rowids.get(covers_message_end_id)
-        if start_rowid is None or end_rowid is None:
-            return False
-        hidden = self._fetch_one(
-            f"""
-            SELECT 1
-            FROM message_visibility AS visibility
-            JOIN messages AS message
-              ON message.id = visibility.message_id
-             AND message.save_id = visibility.save_id
-            WHERE visibility.save_id = ?
-              AND visibility.character_id IN (
-                    {_placeholders(len(scoped_character_ids))}
-                  )
-              AND visibility.visibility = 'not_visible'
-              AND message.rowid BETWEEN ? AND ?
-            LIMIT 1
-            """,
-            (
-                save_id,
-                *scoped_character_ids,
-                min(start_rowid, end_rowid),
-                max(start_rowid, end_rowid),
-            ),
-        )
-        return hidden is None
-
     def summaries_visible_to_characters(
         self,
         *,
@@ -12767,6 +12717,26 @@ class PersistenceRepositories:
             tuple(statuses),
         )
         return [_job_from_row(row) for row in rows]
+
+    def latest_succeeded_job_result(
+        self,
+        *,
+        save_id: str,
+        job_type: str,
+    ) -> dict[str, object] | None:
+        row = self._fetch_one(
+            f"""
+            SELECT {_JOB_COLUMNS}
+            FROM jobs
+            WHERE save_id = ? AND type = ? AND status = 'succeeded'
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (save_id, job_type),
+        )
+        if row is None:
+            return None
+        return _job_from_row(row).result
 
     def has_matching_job(
         self,

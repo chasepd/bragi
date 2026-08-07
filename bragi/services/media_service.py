@@ -7,7 +7,7 @@ import json
 import re
 import zlib
 from base64 import b64encode
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -211,6 +211,87 @@ class PreparedAutomaticImage:
     metadata: dict[str, object] | None = None
     request_task: str | None = None
     character_visual_directions: str = ""
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "save_id": self.save_id,
+            "source_message_id": self.source_message_id,
+            "scene_context": self.scene_context,
+            "context_breakdown_json": self.context_breakdown_json,
+            "provider": self.provider,
+            "model_id": self.model_id,
+            "narrator_message_count": self.narrator_message_count,
+            "media_type": self.media_type,
+            "source_media_asset_id": self.source_media_asset_id,
+            "source_media_path": (
+                str(self.source_media_path)
+                if self.source_media_path is not None
+                else None
+            ),
+            "source_media_asset_ids": list(self.source_media_asset_ids),
+            "source_media_paths": [str(path) for path in self.source_media_paths],
+            "metadata": self.metadata,
+            "request_task": self.request_task,
+            "character_visual_directions": self.character_visual_directions,
+        }
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, object]) -> PreparedAutomaticImage:
+        source_media_path = payload.get("source_media_path")
+        source_media_paths = payload.get("source_media_paths") or ()
+        return cls(
+            save_id=str(payload["save_id"]),
+            source_message_id=str(payload["source_message_id"]),
+            scene_context=str(payload["scene_context"]),
+            context_breakdown_json=cast(
+                dict[str, object],
+                dict(cast(Mapping[str, object], payload["context_breakdown_json"])),
+            ),
+            provider=str(payload["provider"]),
+            model_id=str(payload["model_id"]),
+            narrator_message_count=int(cast(int, payload["narrator_message_count"])),
+            media_type=str(payload.get("media_type") or "image"),
+            source_media_asset_id=(
+                str(payload["source_media_asset_id"])
+                if payload.get("source_media_asset_id") is not None
+                else None
+            ),
+            source_media_path=(
+                Path(str(source_media_path))
+                if source_media_path is not None
+                else None
+            ),
+            source_media_asset_ids=tuple(
+                str(asset_id)
+                for asset_id in cast(
+                    Iterable[object],
+                    payload.get("source_media_asset_ids") or (),
+                )
+            ),
+            source_media_paths=tuple(
+                Path(str(path))
+                for path in cast(
+                    Iterable[object],
+                    source_media_paths,
+                )
+            ),
+            metadata=(
+                cast(
+                    dict[str, object] | None,
+                    dict(cast(Mapping[str, object], payload["metadata"])),
+                )
+                if payload.get("metadata") is not None
+                else None
+            ),
+            request_task=(
+                str(payload["request_task"])
+                if payload.get("request_task") is not None
+                else None
+            ),
+            character_visual_directions=str(
+                payload.get("character_visual_directions") or ""
+            ),
+        )
 
 
 @dataclass(frozen=True)

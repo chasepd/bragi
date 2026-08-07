@@ -8703,6 +8703,102 @@ def test_chat_turn_completes_after_initial_render_and_queues_post_turn_job(
     assert post_turn_job["status"] == "succeeded"
 
 
+def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(
+        sqlite3.connect(database_path, check_same_thread=False)
+    )
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower above the ash.",
+        player_role="Keeper",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    repositories.create_save(
+        scenario_id=scenario.id,
+        title="Lantern Keep",
+        save_id="save-1",
+    )
+    lifecycle = JobLifecycleService(repositories=repositories)
+    prepared_payload: dict[str, object] = {
+        "save_id": "save-1",
+        "source_message_id": "narrator-1",
+        "scene_context": "A red lens hums.",
+        "context_breakdown_json": {},
+        "provider": "fake",
+        "model_id": "fake-image",
+        "narrator_message_count": 1,
+    }
+
+    class DeferredImageRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.repositories = repositories
+            self.deferred_calls: list[dict[str, object]] = []
+
+        async def submit_player_message_for_initial_render(
+            self,
+            *,
+            body: str,
+            speaker_name: str | None,
+            active_save_id: object,
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                model=_chat_model("The bell answers."),
+                has_post_turn_jobs=True,
+                save_id="save-1",
+                player_message_id="player-1",
+                narrator_message_id="narrator-1",
+            )
+
+        async def run_post_turn_jobs(
+            self,
+            *,
+            save_id: str,
+            player_message_id: str,
+            narrator_message_id: str,
+            progress_callback: object | None = None,
+            defer_image_generation: bool = False,
+        ) -> dict[str, object]:
+            coordinator = lifecycle.create_running(
+                save_id=save_id,
+                type="post_turn_jobs",
+                payload={},
+            )
+            lifecycle.succeed(
+                coordinator.id,
+                result={"prepared_automatic_image": prepared_payload},
+            )
+            return _chat_model("The world settles.")
+
+        async def run_deferred_automatic_image(
+            self,
+            *,
+            save_id: str,
+            prepared_automatic_image: dict[str, object],
+            current_user_id: str | None = None,
+        ) -> str:
+            self.deferred_calls.append(prepared_automatic_image)
+            return "succeeded"
+
+    runtime = DeferredImageRuntime()
+    state = _state_double(tmp_path, runtime)
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        created = client.post(
+            "/api/chat",
+            json={"body": "Light the beacon", "save_id": "save-1"},
+        )
+        assert created.status_code == 200
+        for _ in range(100):
+            if runtime.deferred_calls:
+                break
+            time.sleep(0.01)
+
+    assert runtime.deferred_calls == [prepared_payload]
+
+
 def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
     class DeltaProvider:
         provider_name = "fake"

@@ -3685,6 +3685,45 @@ class BragiRuntime:
             active_save_id=save_id,
         )
 
+    async def run_deferred_automatic_image(
+        self,
+        *,
+        save_id: str,
+        prepared_automatic_image: Mapping[str, object],
+        current_user_id: str | None = None,
+    ) -> str:
+        chat_service = ChatService(
+            repositories=self.repositories,
+            providers=self.providers,
+            context_search_service=self.context_search_service,
+            summary_service=self._summary_service(),
+            media_service=self._media_service(),
+            prompt_inspection_store=self._prompt_inspection_store_if_enabled(),
+        )
+        kwargs: dict[str, object] = {
+            "prepared_automatic_image": prepared_automatic_image,
+        }
+        parameters = inspect.signature(
+            chat_service.generate_deferred_automatic_image
+        ).parameters
+        if current_user_id is not None and "current_user_id" in parameters:
+            kwargs["current_user_id"] = current_user_id
+        try:
+            return cast(
+                str,
+                await cast(
+                    Any,
+                    chat_service.generate_deferred_automatic_image,
+                )(**kwargs),
+            )
+        except Exception as exc:
+            log_error_event(
+                "runtime.deferred_automatic_image_failed",
+                save_id=save_id,
+                **exception_log_fields(exc),
+            )
+            return "failed"
+
     async def run_state_pruning(
         self,
         *,

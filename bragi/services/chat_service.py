@@ -163,6 +163,7 @@ from bragi.services.maintenance_scheduler import (
     provider_pressure_from_result,
 )
 from bragi.services.manual_confirmation import manual_memory_confirmation_enabled
+from bragi.services.media_service import PreparedAutomaticImage
 from bragi.services.memory_consolidation_service import MemoryConsolidationService
 from bragi.services.mention_matching import character_name_is_mentioned
 from bragi.services.model_capabilities import (
@@ -4491,6 +4492,11 @@ class ChatService:
         if maintenance_failed_jobs:
             coordinator_result["maintenance_degraded"] = True
             coordinator_result["maintenance_failed_jobs"] = maintenance_failed_jobs
+        image_step_result = step_results.get("image") or {}
+        if image_step_result.get("deferred_to_background"):
+            coordinator_result["prepared_automatic_image"] = image_step_result[
+                "prepared_automatic_image"
+            ]
 
         def finalize_current_head_snapshot() -> None:
             if not current_head or not self._turn_revision_is_current_head(boundary):
@@ -6351,64 +6357,49 @@ class ChatService:
     ) -> str | _PostTurnStepResult:
         if prepared_image is None:
             return "skipped"
+        if isinstance(prepared_image, _PostTurnPreparedImageFailure):
+            return "failed"
+        if isinstance(prepared_image, _PostTurnPreparedImageUnsupported):
+            return await self._generate_prepared_automatic_image_if_due(
+                prepared_image,
+                current_user_id=current_user_id,
+            )
         if not defer_image_generation:
             return await self._generate_prepared_automatic_image_if_due(
                 prepared_image,
                 current_user_id=current_user_id,
             )
-        self._spawn_deferred_automatic_image_generation(
-            prepared_image=prepared_image,
-            current_user_id=current_user_id,
-        )
+        to_json = getattr(prepared_image, "to_json", None)
+        if not callable(to_json):
+            return "skipped"
         return _PostTurnStepResult(
             "queued",
             {
                 "deferred_to_background": True,
-                "source_message_id": getattr(prepared_image, "source_message_id", None),
-                "media_type": getattr(prepared_image, "media_type", None),
+                "prepared_automatic_image": to_json(),
             },
         )
 
-    def _spawn_deferred_automatic_image_generation(
+    async def generate_deferred_automatic_image(
         self,
         *,
-        prepared_image: object | None,
-        current_user_id: str | None,
-    ) -> asyncio.Task[str] | None:
-        if prepared_image is None:
-            return None
-
-        async def run_deferred_generation() -> str:
-            return await self._generate_prepared_automatic_image_if_due(
-                prepared_image,
-                current_user_id=current_user_id,
+        prepared_automatic_image: Mapping[str, object],
+        current_user_id: str | None = None,
+    ) -> str:
+        try:
+            prepared = PreparedAutomaticImage.from_json(
+                prepared_automatic_image
             )
-
-        task = asyncio.create_task(run_deferred_generation())
-
-        def generation_done(done_task: asyncio.Task[str]) -> None:
-            try:
-                status = done_task.result()
-            except asyncio.CancelledError:
-                log_event(
-                    "chat.automatic_image_generation_cancelled",
-                    save_id=getattr(prepared_image, "save_id", None),
-                )
-            except Exception as exc:
-                log_error_event(
-                    "chat.automatic_image_failed",
-                    save_id=getattr(prepared_image, "save_id", None),
-                    **exception_log_fields(exc),
-                )
-            else:
-                log_event(
-                    "chat.automatic_image_generation_completed",
-                    save_id=getattr(prepared_image, "save_id", None),
-                    status=status,
-                )
-
-        task.add_done_callback(generation_done)
-        return task
+        except Exception as exc:
+            log_error_event(
+                "chat.deferred_automatic_image_invalid",
+                **exception_log_fields(exc),
+            )
+            return "failed"
+        return await self._generate_prepared_automatic_image_if_due(
+            prepared,
+            current_user_id=current_user_id,
+        )
 
     async def _prune_state_if_configured(self, *, save_id: str) -> str:
         preference = roleplay_model_preference(
