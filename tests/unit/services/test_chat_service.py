@@ -7317,8 +7317,9 @@ def test_submit_timeskip_turn_runs_post_turn_jobs_with_system_source_message(
             player_message_id: str,
             narrator_message_id: str,
             **_kwargs: object,
-        ) -> None:
+        ) -> dict[str, object]:
             post_turn_calls.append((save_id, player_message_id, narrator_message_id))
+            return {}
 
     service = RecordingPostTurnChatService(
         repositories=repositories,

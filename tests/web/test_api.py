@@ -8721,7 +8721,6 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
         title="Lantern Keep",
         save_id="save-1",
     )
-    lifecycle = JobLifecycleService(repositories=repositories)
     prepared_payload: dict[str, object] = {
         "save_id": "save-1",
         "source_message_id": "narrator-1",
@@ -8735,8 +8734,8 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
     class DeferredImageRuntime(_RuntimeDouble):
         def __init__(self) -> None:
             super().__init__()
-            self.repositories = repositories
             self.deferred_calls: list[dict[str, object]] = []
+            self._payloads: dict[tuple[str, str], dict[str, object]] = {}
 
         async def submit_player_message_for_initial_render(
             self,
@@ -8762,16 +8761,16 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
             progress_callback: object | None = None,
             defer_image_generation: bool = False,
         ) -> dict[str, object]:
-            coordinator = lifecycle.create_running(
-                save_id=save_id,
-                type="post_turn_jobs",
-                payload={},
-            )
-            lifecycle.succeed(
-                coordinator.id,
-                result={"prepared_automatic_image": prepared_payload},
-            )
-            return _chat_model("The world settles.")
+            self._payloads[(save_id, narrator_message_id)] = prepared_payload
+            return {"prepared_automatic_image": prepared_payload}
+
+        def consume_deferred_automatic_image(
+            self,
+            *,
+            save_id: str,
+            narrator_message_id: str,
+        ) -> dict[str, object] | None:
+            return self._payloads.pop((save_id, narrator_message_id), None)
 
         async def run_deferred_automatic_image(
             self,

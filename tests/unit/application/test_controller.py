@@ -9386,6 +9386,55 @@ def test_run_deferred_automatic_image_forwards_payload_and_user(
     assert calls == [({"source_message_id": "message-1"}, "user-1")]
 
 
+def test_run_post_turn_jobs_stashes_deferred_image_for_consume(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, narrator_id = _persist_runtime_save(repositories)
+    player_id = repositories.list_messages(save_id)[0].id
+    prepared_payload: dict[str, object] = {"source_message_id": narrator_id}
+
+    class FakeChatService:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        async def run_post_turn_jobs(
+            self,
+            *,
+            save_id: str,
+            player_message_id: str,
+            narrator_message_id: str,
+            defer_image_generation: bool = False,
+        ) -> dict[str, object]:
+            return {"prepared_automatic_image": prepared_payload}
+
+    monkeypatch.setattr(runtime, "ChatService", FakeChatService)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+
+    asyncio.run(
+        controller.run_post_turn_jobs(
+            save_id=save_id,
+            player_message_id=player_id,
+            narrator_message_id=narrator_id,
+            defer_image_generation=True,
+        )
+    )
+
+    assert controller.consume_deferred_automatic_image(
+        save_id=save_id,
+        narrator_message_id=narrator_id,
+    ) == prepared_payload
+    assert (
+        controller.consume_deferred_automatic_image(
+            save_id=save_id,
+            narrator_message_id=narrator_id,
+        )
+        is None
+    )
+
+
 def test_run_post_turn_jobs_waits_for_same_save_submit_lock(
     repositories: PersistenceRepositories,
     tmp_path: Path,

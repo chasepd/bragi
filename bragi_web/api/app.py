@@ -9136,49 +9136,44 @@ async def _run_post_turn_jobs_with_ordered_progress(
         ):
             kwargs["defer_image_generation"] = True
         result = await state.runtime.run_post_turn_jobs(**kwargs)
-        prepared_automatic_image = _latest_prepared_automatic_image(
+        await _queue_deferred_automatic_image_if_prepared(
             state,
             save_id=save_id,
+            narrator_message_id=narrator_message_id,
+            current_user_id=current_user_id,
         )
-        if prepared_automatic_image is not None:
-            await _queue_deferred_automatic_image(
-                state,
-                save_id=save_id,
-                prepared_automatic_image=prepared_automatic_image,
-                current_user_id=current_user_id,
-            )
         return result
     finally:
         progress_queue.put_nowait(done)
         await pump_task
 
 
-def _latest_prepared_automatic_image(
+async def _queue_deferred_automatic_image_if_prepared(
     state: WebAppState,
     *,
     save_id: str,
-) -> dict[str, object] | None:
-    repositories = getattr(state.runtime, "repositories", None)
-    latest_result = getattr(repositories, "latest_succeeded_job_result", None)
-    if not callable(latest_result):
-        return None
-    result = latest_result(save_id=save_id, job_type="post_turn_jobs") or {}
-    candidate = result.get("prepared_automatic_image")
-    if isinstance(candidate, dict):
-        return candidate
-    return None
-
-
-async def _queue_deferred_automatic_image(
-    state: WebAppState,
-    *,
-    save_id: str,
-    prepared_automatic_image: dict[str, object],
+    narrator_message_id: str,
     current_user_id: str | None = None,
 ) -> None:
-    if not callable(
-        getattr(state.runtime, "run_deferred_automatic_image", None)
-    ):
+    consume = getattr(
+        state.runtime,
+        "consume_deferred_automatic_image",
+        None,
+    )
+    if not callable(consume):
+        return
+    prepared_automatic_image = consume(
+        save_id=save_id,
+        narrator_message_id=narrator_message_id,
+    )
+    if prepared_automatic_image is None:
+        return
+    run_deferred = getattr(
+        state.runtime,
+        "run_deferred_automatic_image",
+        None,
+    )
+    if not callable(run_deferred):
         return
 
     async def worker(post_turn_handle: JobHandle) -> Any:
@@ -9186,32 +9181,25 @@ async def _queue_deferred_automatic_image(
             "save_id": save_id,
             "prepared_automatic_image": prepared_automatic_image,
         }
-        if _call_accepts_keyword(
-            state.runtime.run_deferred_automatic_image,
-            "current_user_id",
-        ):
+        if _call_accepts_keyword(run_deferred, "current_user_id"):
             kwargs["current_user_id"] = current_user_id
-        return await state.runtime.run_deferred_automatic_image(**kwargs)
+        return await run_deferred(**kwargs)
 
     try:
         await state.jobs.create(
             "automatic_image_generation",
             worker,
             save_id=save_id,
-            creator_user_id=_owner_user_id_for_request(state),
-            operation_queue_key=_post_turn_operation_queue_key(save_id),
+            creator_user_id=current_user_id,
         )
     except (JobRegistryExclusiveKeyError, JobRegistryFullError):
         kwargs: dict[str, object] = {
             "save_id": save_id,
             "prepared_automatic_image": prepared_automatic_image,
         }
-        if _call_accepts_keyword(
-            state.runtime.run_deferred_automatic_image,
-            "current_user_id",
-        ):
+        if _call_accepts_keyword(run_deferred, "current_user_id"):
             kwargs["current_user_id"] = current_user_id
-        await state.runtime.run_deferred_automatic_image(**kwargs)
+        await run_deferred(**kwargs)
 
 
 def _initial_chat_turn_progress(status_text: str) -> dict[str, object]:

@@ -560,6 +560,9 @@ class BragiRuntime:
         self._maintenance_retry_drain_counts: dict[str, int] = {}
         self._maintenance_retry_drain_guard = threading.Lock()
         self._context_trimmed_narrator_message_ids: set[str] = set()
+        self._deferred_automatic_image_payloads: dict[
+            tuple[str, str], dict[str, object]
+        ] = {}
 
     def cancel_active_chat_turn(self, save_id: str | None = None) -> bool:
         resolved_save_id = self.active_save_id if save_id is None else save_id
@@ -3645,17 +3648,22 @@ class BragiRuntime:
                         **exception_log_fields(exc),
                     )
 
-            async def run_post_turn() -> None:
+            async def run_post_turn() -> dict[str, object]:
                 if "world_update_context" in parameters:
 
                     def context_factory() -> AbstractAsyncContextManager[None]:
                         return self._save_operation_lock(save_id)
 
                     kwargs["world_update_context"] = context_factory
-                    await cast(Any, chat_service.run_post_turn_jobs)(**kwargs)
-                    return
+                    return cast(
+                        dict[str, object],
+                        await cast(Any, chat_service.run_post_turn_jobs)(**kwargs),
+                    )
                 async with self._save_operation_lock(save_id):
-                    await cast(Any, chat_service.run_post_turn_jobs)(**kwargs)
+                    return cast(
+                        dict[str, object],
+                        await cast(Any, chat_service.run_post_turn_jobs)(**kwargs),
+                    )
 
             action_choice_task = (
                 asyncio.create_task(run_prepared_action_choices())
@@ -3663,10 +3671,17 @@ class BragiRuntime:
                 else None
             )
             try:
-                await run_post_turn()
+                coordinator_result = await run_post_turn()
             finally:
                 if action_choice_task is not None:
                     await action_choice_task
+            prepared = (coordinator_result or {}).get(
+                "prepared_automatic_image"
+            )
+            if isinstance(prepared, dict):
+                self._deferred_automatic_image_payloads[
+                    (save_id, narrator_message_id)
+                ] = prepared
         except Exception as exc:
             log_error_event(
                 "runtime.post_turn_jobs_failed",
@@ -3683,6 +3698,17 @@ class BragiRuntime:
                 in self._context_trimmed_narrator_message_ids,
             ),
             active_save_id=save_id,
+        )
+
+    def consume_deferred_automatic_image(
+        self,
+        *,
+        save_id: str,
+        narrator_message_id: str,
+    ) -> dict[str, object] | None:
+        return self._deferred_automatic_image_payloads.pop(
+            (save_id, narrator_message_id),
+            None,
         )
 
     async def run_deferred_automatic_image(

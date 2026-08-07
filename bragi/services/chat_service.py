@@ -939,10 +939,12 @@ class ChatService:
         )
         self.prompt_inspection_store = prompt_inspection_store
         self.debug_prompt_capture = debug_prompt_capture
-        self._background_post_turn_tasks: set[asyncio.Task[None]] = set()
+        self._background_post_turn_tasks: set[
+            asyncio.Task[dict[str, object]]
+        ] = set()
         self._background_post_turn_tasks_by_save: dict[
             str,
-            set[asyncio.Task[None]],
+            set[asyncio.Task[dict[str, object]]],
         ] = {}
 
     async def submit_player_turn(
@@ -2891,7 +2893,7 @@ class ChatService:
                         prepared_action_choices,
                     )
                 )
-        post_turn_task: asyncio.Task[None] | None = None
+        post_turn_task: asyncio.Task[dict[str, object]] | None = None
         if run_post_turn_jobs:
             stage_started = perf_counter()
             post_turn_task = asyncio.create_task(
@@ -2989,7 +2991,7 @@ class ChatService:
         save_id: str,
         player_message_id: str,
         narrator_message_id: str,
-        task: asyncio.Task[None],
+        task: asyncio.Task[dict[str, object]],
         started_at: float,
     ) -> None:
         self._background_post_turn_tasks.add(task)
@@ -3005,7 +3007,7 @@ class ChatService:
             narrator_message_id=narrator_message_id,
         )
 
-        def task_done(done_task: asyncio.Task[None]) -> None:
+        def task_done(done_task: asyncio.Task[dict[str, object]]) -> None:
             self._background_post_turn_tasks.discard(done_task)
             save_tasks.discard(done_task)
             if not save_tasks:
@@ -3918,7 +3920,7 @@ class ChatService:
         verified_coverage: VerifiedPostTurnCoverage | None = None,
         current_user_id: str | None = None,
         defer_image_generation: bool = False,
-    ) -> None:
+    ) -> dict[str, object]:
         boundary = self._coerce_turn_revision(
             turn_revision,
             save_id=save_id,
@@ -4530,6 +4532,7 @@ class ChatService:
             coordinator_job_id=coordinator.id,
             statuses=statuses.copy(),
         )
+        return coordinator_result
 
     def _run_world_context_retention(self, *, save_id: str) -> None:
         try:

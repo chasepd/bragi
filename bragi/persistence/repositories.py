@@ -12718,26 +12718,6 @@ class PersistenceRepositories:
         )
         return [_job_from_row(row) for row in rows]
 
-    def latest_succeeded_job_result(
-        self,
-        *,
-        save_id: str,
-        job_type: str,
-    ) -> dict[str, object] | None:
-        row = self._fetch_one(
-            f"""
-            SELECT {_JOB_COLUMNS}
-            FROM jobs
-            WHERE save_id = ? AND type = ? AND status = 'succeeded'
-            ORDER BY rowid DESC
-            LIMIT 1
-            """,
-            (save_id, job_type),
-        )
-        if row is None:
-            return None
-        return _job_from_row(row).result
-
     def has_matching_job(
         self,
         *,
