@@ -2721,6 +2721,11 @@ def test_narrator_planner_rejects_agency_constraint_restricting_npc_behavior(
 ) -> None:
     save = _seed_save(repositories)
     player_message = repositories.list_messages(save.id)[0]
+    mara = repositories.add_character(
+        save_id=save.id,
+        name="Mara",
+        is_player_character=True,
+    )
     jane = repositories.add_character(save_id=save.id, name="Jane", met=True)
     provider = RecordingStructuredProvider(
         {
@@ -2747,6 +2752,16 @@ def test_narrator_planner_rejects_agency_constraint_restricting_npc_behavior(
                     {
                         "constraint": "Jane cannot leave without permission.",
                         "reason": "Keep the scene open.",
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                    },
+                    {
+                        "constraint": "Jane will not stay for dinner.",
+                        "reason": "The player might expect Jane to stay.",
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                    },
+                    {
+                        "constraint": "Mara must not be forced to trust Jane.",
+                        "reason": "The player has not committed to that trust.",
                         "evidence_source_ids": [f"message:{player_message.id}"],
                     },
                 ],
@@ -2782,6 +2797,11 @@ def test_narrator_planner_rejects_agency_constraint_restricting_npc_behavior(
                 },
                 {
                     "source_type": "character",
+                    "source_id": mara.id,
+                    "included": True,
+                },
+                {
+                    "source_type": "character",
                     "source_id": jane.id,
                     "included": True,
                 },
@@ -2797,6 +2817,11 @@ def test_narrator_planner_rejects_agency_constraint_restricting_npc_behavior(
             reason="The player has not committed to that action.",
             evidence_source_ids=(f"message:{player_message.id}",),
         ),
+        PlayerAgencyConstraint(
+            constraint="Mara must not be forced to trust Jane.",
+            reason="The player has not committed to that trust.",
+            evidence_source_ids=(f"message:{player_message.id}",),
+        ),
     )
     assert {
         (rejection.candidate_id, rejection.reason)
@@ -2804,6 +2829,7 @@ def test_narrator_planner_rejects_agency_constraint_restricting_npc_behavior(
     } == {
         ("agency_constraint:1", "agency_constraint_restricts_npc_behavior"),
         ("agency_constraint:2", "agency_constraint_restricts_npc_behavior"),
+        ("agency_constraint:3", "agency_constraint_restricts_npc_behavior"),
     }
 
 

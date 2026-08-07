@@ -10497,6 +10497,8 @@ def _narrator_verifier_diagnostics(
         "npc_agency_issues": list(result.npc_agency_issues),
         "npc_passivity_issue_count": len(result.npc_passivity_issues),
         "npc_passivity_issues": list(result.npc_passivity_issues),
+        "player_choice_violation_count": len(result.player_choice_violations),
+        "player_choice_violations": list(result.player_choice_violations),
         "dating_route_stage_violation_count": len(
             result.dating_route_stage_violations
         ),

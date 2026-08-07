@@ -3106,6 +3106,15 @@ def _validated_narrator_message_spec(
             }
         )
     )
+    player_names = tuple(
+        sorted(
+            {
+                character.name
+                for character in inventory.characters
+                if character.name and character.is_player_character
+            }
+        )
+    )
     agency_constraints = tuple(
         replace(
             constraint,
@@ -3121,6 +3130,7 @@ def _validated_narrator_message_spec(
         if not _reject_npc_restricting_agency_constraint(
             constraint,
             npc_names=npc_names,
+            player_names=player_names,
             index=index,
             rejections=rejections,
         )
@@ -3139,9 +3149,10 @@ def _validated_narrator_message_spec(
 
 
 _AGENCY_CONSTRAINT_PROHIBITION_RE = re.compile(
-    r"\b(?:must not|mustn'?t|cannot|can'?t|won'?t|may not|should not"
-    r"|shouldn'?t|is not allowed|isn'?t allowed|are not allowed|not allowed to"
-    r"|forbidden|prohibited|not permitted)\b",
+    r"\b(?:must not|mustn'?t|cannot|can'?t|won'?t|will not|would not"
+    r"|wouldn'?t|shall not|shan'?t|may not|should not|shouldn'?t|does not"
+    r"|doesn'?t|do not|don'?t|never|is not allowed|isn'?t allowed"
+    r"|are not allowed|not allowed to|forbidden|prohibited|not permitted)\b",
     re.IGNORECASE,
 )
 
@@ -3150,6 +3161,7 @@ def _reject_npc_restricting_agency_constraint(
     constraint: PlayerAgencyConstraint,
     *,
     npc_names: tuple[str, ...],
+    player_names: tuple[str, ...],
     index: int,
     rejections: list[PlannerRejection],
 ) -> bool:
@@ -3164,6 +3176,15 @@ def _reject_npc_restricting_agency_constraint(
             re.IGNORECASE,
         )
         for name in npc_names
+    ):
+        return False
+    if any(
+        re.search(
+            rf"\b{re.escape(name)}\b",
+            constraint.constraint,
+            re.IGNORECASE,
+        )
+        for name in player_names
     ):
         return False
     rejections.append(

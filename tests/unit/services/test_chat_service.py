@@ -3600,6 +3600,11 @@ def test_submit_player_turn_uses_seven_attempts_after_narrator_player_choice_vio
     retry_feedback = provider.chat_requests[1].regeneration_feedback
     assert "Player-choice violation" in retry_feedback
     assert "decides the player walks away" in retry_feedback
+    job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
+    assert job_result["narrator_verifier"]["player_choice_violation_count"] == 1
+    assert job_result["narrator_verifier"]["player_choice_violations"] == [
+        "The draft decides the player walks away from Jane.",
+    ]
 
 
 def test_submit_player_turn_keeps_early_dating_warmth_without_retry(
