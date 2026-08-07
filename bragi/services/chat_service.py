@@ -10451,6 +10451,11 @@ def _verification_retry_feedback(result: NarratorVerificationResult) -> str:
         lines.append(f"- NPC agency: {issue}")
     for issue in result.npc_passivity_issues[:5]:
         lines.append(f"- NPC passivity: {issue}")
+    for choice_violation in result.player_choice_violations[:5]:
+        lines.append(
+            "- Player-choice violation (narration decided the player "
+            f"character's uncommitted action): {choice_violation}"
+        )
     for violation in result.dating_route_stage_violations[:5]:
         lines.append(
             f"- Dating route stage: {violation.character_name} at "

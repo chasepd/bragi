@@ -408,6 +408,10 @@ def test_chat_system_body_renders_narration_brief_and_observations() -> None:
     assert "Retrieved observations:" in body
     assert "Narration brief:" in body
     assert "Intent: answer the player without moving them." in body
+    assert (
+        "Any player-agency constraints inside bind only the player "
+        "character's uncommitted choices" in body
+    )
     assert "Narration evidence:" in body
     assert "- observation:obs-1" in body
     assert body.index("BEGIN BRAGI CONTEXT DATA") < body.index("Narration brief:")

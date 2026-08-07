@@ -3530,6 +3530,78 @@ def test_submit_player_turn_uses_seven_attempts_after_narrator_passivity_issue(
     assert job_result["narrator_verifier_retry_used"] is True
 
 
+def test_submit_player_turn_uses_seven_attempts_after_narrator_player_choice_violation(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting(
+        RESPONSE_VERIFICATION_MODE_SETTING,
+        RESPONSE_VERIFICATION_MODE_RETRY_ONCE,
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = SequenceChatProvider(
+        "fake",
+        (
+            "Jane stands still and looks at you.",
+            "Jane pulls out of the hug and walks away.",
+        ),
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player's move.",
+        thesis="Jane should react to the hug.",
+        must_say=(),
+        avoid=(),
+        tone="tense and grounded",
+        uncertainties=(),
+        evidence_source_ids=("character:jane",),
+    )
+    verifier = ScriptedNarratorVerifier(
+        NarratorVerificationResult(
+            passed=False,
+            issues=(),
+            player_choice_violations=(
+                "The draft decides the player walks away from Jane.",
+            ),
+            retry_feedback="",
+            confidence=0.88,
+        )
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+        narrator_planner=ScriptedNarratorPlanner(spec),
+        narrator_verifier=verifier,
+    )
+
+    result = asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I hug Jane.",
+            speaker_name="Mara",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    assert result.narrator_message.body == "Jane pulls out of the hug and walks away."
+    assert len(provider.chat_requests) == 7
+    retry_feedback = provider.chat_requests[1].regeneration_feedback
+    assert "Player-choice violation" in retry_feedback
+    assert "decides the player walks away" in retry_feedback
+
+
 def test_submit_player_turn_keeps_early_dating_warmth_without_retry(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -16112,13 +16184,14 @@ def test_submit_player_turn_runs_context_search_before_narrator_and_injects_cont
     assert selected_scenario_text not in request.scenario_instructions
     assert starting_scene_text not in request.scenario_instructions
     assert unselected_scenario_text not in request.scenario_instructions
-    assert "never write dialogue, actions" in request.scenario_instructions
-    assert "Only the user's submitted player messages define" in (
+    assert "write dialogue, actions, thoughts" in request.scenario_instructions
+    assert "user's submitted player messages define what the player" in (
         request.scenario_instructions
     )
-    assert "Preserve player agency by leaving those choices unresolved" in (
+    assert "Preserve player agency by leaving the player character's " in (
         request.scenario_instructions
     )
+    assert "uncommitted choices unresolved" in request.scenario_instructions
     assert "interrupt, demand, refuse, leave, escalate" in (
         request.scenario_instructions
     )

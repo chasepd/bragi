@@ -2483,7 +2483,11 @@ def test_narrator_planner_returns_message_spec_from_structured_output() -> None:
     assert "Narrative beats:" in brief
     assert "1. Mara reaches the beacon gallery." in brief
     assert "Required facts/reveals:" in brief
-    assert "Player-agency constraints:" in brief
+    assert "Player-agency constraints (bind only the player character's " in (
+        brief
+    )
+    assert "NPC and world reactions are not constrained" in brief
+    assert "Mara chooses whether to show the warrant." in brief
     assert "Character intent/action beats:" in brief
     assert "Captain Ilyra" in brief
     assert "id: character:ilyra" in brief
@@ -2712,6 +2716,97 @@ def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
     }
 
 
+def test_narrator_planner_rejects_agency_constraint_restricting_npc_behavior(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player_message = repositories.list_messages(save.id)[0]
+    jane = repositories.add_character(save_id=save.id, name="Jane", met=True)
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_plan": {
+                "intent": "Answer the player move.",
+                "thesis": "The hug changes the scene.",
+                "narrative_beats": [],
+                "required_facts": [],
+                "must_say": [],
+                "avoid": [],
+                "agency_constraints": [
+                    {
+                        "constraint": (
+                            "Mara chooses whether to pull out of the hug."
+                        ),
+                        "reason": "The player has not committed to that action.",
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                    },
+                    {
+                        "constraint": "Jane must not pull out of the hug.",
+                        "reason": "The player might want Jane to stay.",
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                    },
+                    {
+                        "constraint": "Jane cannot leave without permission.",
+                        "reason": "Keep the scene open.",
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                    },
+                ],
+                "tone": "grounded",
+                "uncertainties": [],
+                "evidence_source_ids": [f"message:{player_message.id}"],
+                "npc_intents": [],
+                "state_commit_candidates": [],
+            }
+        }
+    )
+    planner = StructuredProviderNarratorPlanner(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="planner",
+        repositories=repositories,
+    )
+    request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(
+            ChatMessage(
+                role="player",
+                body="I hug Jane.",
+            ),
+        ),
+        context_breakdown={
+            "sources": [
+                {
+                    "source_type": "message",
+                    "source_id": player_message.id,
+                    "included": True,
+                },
+                {
+                    "source_type": "character",
+                    "source_id": jane.id,
+                    "included": True,
+                },
+            ]
+        },
+    )
+
+    spec = asyncio.run(planner.plan(save_id=save.id, request=request))
+
+    assert spec.agency_constraints == (
+        PlayerAgencyConstraint(
+            constraint="Mara chooses whether to pull out of the hug.",
+            reason="The player has not committed to that action.",
+            evidence_source_ids=(f"message:{player_message.id}",),
+        ),
+    )
+    assert {
+        (rejection.candidate_id, rejection.reason)
+        for rejection in spec.planner_rejections
+    } == {
+        ("agency_constraint:1", "agency_constraint_restricts_npc_behavior"),
+        ("agency_constraint:2", "agency_constraint_restricts_npc_behavior"),
+    }
+
+
 def test_narrator_planner_defaults_missing_new_plan_fields() -> None:
     provider = RecordingStructuredProvider(
         {
@@ -2784,6 +2879,9 @@ def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
                 "npc_passivity_issues": [
                     "Mara only gives the player space despite an active alarm."
                 ],
+                "player_choice_violations": [
+                    "The draft decides Mara walks away."
+                ],
                 "npc_knowledge_leaks": [
                     {
                         "speaker_name": "Ilyra",
@@ -2846,6 +2944,9 @@ def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
     assert result.npc_passivity_issues == (
         "Mara only gives the player space despite an active alarm.",
     )
+    assert result.player_choice_violations == (
+        "The draft decides Mara walks away.",
+    )
     assert result.npc_knowledge_leaks == (
         NpcKnowledgeLeak(
             speaker_name="Ilyra",
@@ -2860,6 +2961,9 @@ def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
     assert "npc_knowledge_leaks" in schema["properties"]
     assert "npc_passivity_issues" in schema["properties"]
     assert "npc_passivity_issues" in schema["required"]
+    assert "player_choice_violations" in schema["properties"]
+    assert "player_choice_violations" in schema["required"]
+    assert "null" in schema["properties"]["player_choice_violations"]["type"]
     prompt_text = "\n".join(
         message.body for message in provider.structured_output_requests[0].messages
     )
@@ -2870,6 +2974,10 @@ def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
     assert "NPC knowledge leaks" in prompt_text
     assert "unearned NPC compliance" in prompt_text
     assert "passive NPC/world handling" in prompt_text
+    assert "A player-agency violation is narration that decides or commits" in (
+        prompt_text
+    )
+    assert "never player-agency violations" in prompt_text
     assert "full spectrum" in prompt_text
     assert "hostile" in prompt_text
     assert "unreasonable" in prompt_text
@@ -3161,6 +3269,56 @@ def test_narrator_verifier_passivity_issue_overrides_passed_flag() -> None:
     assert result.passed is False
     assert result.npc_passivity_issues == (
         "Ilyra only waits to see what the player does next.",
+    )
+
+
+def test_narrator_verifier_player_choice_violation_overrides_passed_flag() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.79,
+                "npc_agency_issues": [],
+                "npc_passivity_issues": [],
+                "player_choice_violations": [
+                    "The draft decides Mara pulls away from the hug."
+                ],
+                "npc_knowledge_leaks": [],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I hug Jane."),),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Answer the player move.",
+                thesis="Jane reacts to the hug.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=(),
+            ),
+            narrator_body="Jane pulls out of the hug and walks away.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.player_choice_violations == (
+        "The draft decides Mara pulls away from the hug.",
     )
 
 
