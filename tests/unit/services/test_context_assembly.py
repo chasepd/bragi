@@ -429,200 +429,7 @@ def test_apply_context_budget_relevance_trims_selected_canonical_source() -> Non
     assert breakdown.sources[0].reason == "budget_trimmed"
 
 
-def test_narrator_context_always_includes_current_in_world_time_under_tight_budget(
-    repositories: PersistenceRepositories,
-) -> None:
-    _scenario, save, current_location = _create_context_save(
-        repositories,
-        scenario_id="scenario-current-time-anchor",
-        save_id="save-current-time-anchor",
-    )
-    repositories.upsert_scene_snapshot(
-        save_id=save.id,
-        current_location_id=current_location.id,
-        situation="This verbose situation should be skipped under the tiny budget.",
-        in_world_time="late morning",
-        snapshot_id="snapshot-current-time-anchor",
-    )
-    repositories.set_app_setting("context_budget_mode", CONTEXT_BUDGET_MODE_FIXED_CHARS)
-    repositories.set_app_setting("context_budget_fixed_total_chars", 1)
-
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-
-    assert (
-        "Current world time: late morning. Keep the response consistent with this "
-        "unless the player explicitly advances time."
-    ) in assembled.current_scene_context
-    assert any(
-        "Scene snapshot: situation: This verbose situation" in item
-        for item in assembled.current_scene_context
-    )
-    assert any("Current location:" in item for item in assembled.current_scene_context)
-    included = [
-        (source.source_type, source.source_id, source.included)
-        for source in assembled.breakdown.sources
-    ]
-    assert (
-        "scene_snapshot",
-        "snapshot-current-time-anchor:world_time",
-        True,
-    ) in included
-    assert ("scene_snapshot", "snapshot-current-time-anchor", True) in included
-    assert ("location", current_location.id, True) in included
-
-
-def test_narrator_context_always_includes_structured_world_time_under_tight_budget(
-    repositories: PersistenceRepositories,
-) -> None:
-    _scenario, save, current_location = _create_context_save(
-        repositories,
-        scenario_id="scenario-structured-time-anchor",
-        save_id="save-structured-time-anchor",
-    )
-    repositories.upsert_scene_snapshot(
-        save_id=save.id,
-        current_location_id=current_location.id,
-        situation="This verbose situation should be skipped under the tiny budget.",
-        in_world_time="Monday morning",
-        time_of_day="evening",
-        day_of_week="tuesday",
-        world_day_index=2,
-        snapshot_id="snapshot-structured-time-anchor",
-    )
-    repositories.set_app_setting("context_budget_mode", CONTEXT_BUDGET_MODE_FIXED_CHARS)
-    repositories.set_app_setting("context_budget_fixed_total_chars", 1)
-
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-
-    assert (
-        "Current world time: Tuesday evening; world day index 2. Keep the "
-        "response consistent with this unless the player explicitly advances time."
-    ) in assembled.current_scene_context
-    assert not any("Monday morning" in item for item in assembled.current_scene_context)
-    included = [
-        (source.source_type, source.source_id, source.included)
-        for source in assembled.breakdown.sources
-    ]
-    assert (
-        "scene_snapshot",
-        "snapshot-structured-time-anchor:world_time",
-        True,
-    ) in included
-
-
-def test_narrator_context_preserves_matching_legacy_world_time_detail(
-    repositories: PersistenceRepositories,
-) -> None:
-    _scenario, save, current_location = _create_context_save(
-        repositories,
-        scenario_id="scenario-rich-time-anchor",
-        save_id="save-rich-time-anchor",
-    )
-    repositories.upsert_scene_snapshot(
-        save_id=save.id,
-        current_location_id=current_location.id,
-        situation="This verbose situation should be skipped under the tiny budget.",
-        in_world_time="Tuesday evening",
-        time_of_day="evening",
-        day_of_week="tuesday",
-        world_day_index=2,
-        snapshot_id="snapshot-rich-time-anchor",
-    )
-    repositories.connection.execute(
-        """
-        UPDATE scene_snapshots
-        SET in_world_time = 'Tuesday evening after class'
-        WHERE id = 'snapshot-rich-time-anchor'
-        """
-    )
-    repositories.set_app_setting("context_budget_mode", CONTEXT_BUDGET_MODE_FIXED_CHARS)
-    repositories.set_app_setting("context_budget_fixed_total_chars", 1)
-
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-
-    assert (
-        "Current world time: Tuesday evening after class; world day index 2. Keep "
-        "the response consistent with this unless the player explicitly advances "
-        "time."
-    ) in assembled.current_scene_context
-
-
-def test_narrator_context_always_includes_present_dating_route_anchor(
-    repositories: PersistenceRepositories,
-) -> None:
-    scenario = repositories.create_scenario(
-        type="dating_sim",
-        title="Last Summer",
-        premise="A summer of route choices.",
-        player_role="Transfer student",
-        content={},
-        scenario_id="scenario-dating-route-anchor",
-    )
-    save = repositories.create_save(
-        scenario_id=scenario.id,
-        title="Summer Save",
-        save_id="save-dating-route-anchor",
-    )
-    player = repositories.add_character(
-        save_id=save.id,
-        name="Lio Takahashi",
-        is_player_character=True,
-        met=True,
-    )
-    npc = repositories.add_character(
-        save_id=save.id,
-        name="Mika Arai",
-        relationships={player.name: "romance option for Lio Takahashi"},
-        met=True,
-    )
-    repositories.upsert_scene_snapshot(
-        save_id=save.id,
-        present_character_ids=[npc.id],
-        world_day_index=2,
-        snapshot_id="snapshot-dating-route-anchor",
-    )
-    repositories.upsert_dating_route_state(
-        save_id=save.id,
-        player_character_id=player.id,
-        npc_character_id=npc.id,
-        stage="contact_exchanged",
-        first_met_world_day_index=0,
-        last_interaction_world_day_index=2,
-        completed_interactions=1,
-        dates_completed=0,
-        interest_level="curious",
-        trust_level="guarded",
-        comfort_with_intimacy="none yet",
-        pacing_preference="slow burn",
-        known_boundaries=["no instant commitment"],
-        next_reasonable_step="schedule a first date",
-        route_id="route-mika",
-    )
-    repositories.set_app_setting("context_budget_mode", CONTEXT_BUDGET_MODE_FIXED_CHARS)
-    repositories.set_app_setting("context_budget_fixed_total_chars", 1)
-
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-
-    route_context = "\n".join(assembled.current_scene_context)
-    assert "Dating route pacing for Mika Arai" in route_context
-    assert "stage: contact exchanged" in route_context
-    assert "known for 2 in-world days" in route_context
-    assert "completed interactions: 1" in route_context
-    assert "interest: curious" in route_context
-    assert "trust: guarded" in route_context
-    assert "comfort with intimacy: none yet" in route_context
-    assert "next plausible step: schedule a first date" in route_context
-    assert "max plausible escalation: follow-up interaction" in route_context
-    assert "needs explicit support: guarded vulnerability" in route_context
-    assert "premature now: exclusivity or commitment language" in route_context
-    included = [
-        (source.source_type, source.source_id, source.included)
-        for source in assembled.breakdown.sources
-    ]
-    assert ("dating_route_state", "route-mika", True) in included
-
-
-def test_narrator_context_includes_pending_review_suggestions_but_image_does_not(
+def test_image_scene_context_excludes_pending_review_suggestions(
     repositories: PersistenceRepositories,
 ) -> None:
     _scenario, save, current_location = _create_context_save(
@@ -638,7 +445,7 @@ def test_narrator_context_includes_pending_review_suggestions_but_image_does_not
         provider="fake",
         model="fake-chat",
     )
-    suggestion = repositories.add_context_update_suggestion(
+    repositories.add_context_update_suggestion(
         save_id=save.id,
         update_type="update",
         entity_type="world_state",
@@ -655,25 +462,10 @@ def test_narrator_context_includes_pending_review_suggestions_but_image_does_not
         situation="The red lens ticks under stress.",
     )
 
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-    narrator_context = "\n".join(assembled.current_scene_context)
     image_context, image_breakdown = ContextAssemblyService(
         repositories
     ).build_image_scene_context(save_id=save.id)
 
-    assert "Pending review (not canon yet)" in narrator_context
-    assert "update world_state/state-storm-mood storm.mood" in narrator_context
-    assert '"mood": "wary"' in narrator_context
-    assert "confidence=91%" in narrator_context
-    assert source_message.id not in narrator_context
-    assert "The narrator described the storm as wary" not in narrator_context
-    assert any(
-        source.tier == "pending_context_suggestions"
-        and source.source_type == "context_update_suggestion"
-        and source.source_id == suggestion.id
-        and source.included
-        for source in assembled.breakdown.sources
-    )
     assert "Pending review" not in image_context
     assert all(
         source.tier != "pending_context_suggestions"
@@ -822,14 +614,8 @@ def test_pending_context_suggestion_sources_exclude_non_pending_rows(
         repositories=repositories,
         save_id=save.id,
     )
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-    narrator_context = "\n".join(assembled.current_scene_context)
 
     assert [source.source_id for source in sources] == ["suggestion-pending"]
-    assert "storm.pending" in narrator_context
-    assert "storm.applied" not in narrator_context
-    assert "storm.rejected" not in narrator_context
-    assert "storm.dismissed" not in narrator_context
 
 
 def test_deterministic_context_sources_include_active_linked_facts(
@@ -1012,23 +798,6 @@ def test_deterministic_context_sources_include_active_linked_facts(
     ):
         assert excluded not in active_linked_text
 
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-    current_scene_text = "\n".join(assembled.current_scene_context)
-    for expected in (
-        active_memory_text,
-        active_world_state_text,
-        active_summary_text,
-        active_scenario_text,
-    ):
-        assert expected in current_scene_text
-    for excluded in (
-        inactive_memory_text,
-        inactive_world_state_key,
-        inactive_summary_text,
-        inactive_scenario_text,
-    ):
-        assert excluded not in current_scene_text
-
 
 def test_narrator_context_includes_rich_present_character_details(
     repositories: PersistenceRepositories,
@@ -1096,8 +865,13 @@ def test_narrator_context_includes_rich_present_character_details(
         snapshot_id="snapshot-rich-present-character",
     )
 
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-    current_scene_text = "\n".join(assembled.current_scene_context)
+    current_scene_text = "\n".join(
+        source.text
+        for source in deterministic_context_sources(
+            repositories=repositories,
+            save_id=save.id,
+        )
+    )
 
     for expected in (
         "Captain Ilyra (aliases: Ashknife, Glass-Eye)",
@@ -1703,18 +1477,6 @@ def test_active_participant_relationship_state_is_deterministic_context(
         active_emotion.id,
     }
 
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-    current_scene_text = "\n".join(assembled.current_scene_context)
-    assert "Ilyra already watched Mara kill the ash raiders" in current_scene_text
-    assert "trusts her with the beacon rifle" in current_scene_text
-    assert "Plain warnings before clever plans" in current_scene_text
-    assert "Will not abandon wounded watch members" in current_scene_text
-    assert "Captain Ilyra's current emotional state is Wary but warming to Mara" in (
-        current_scene_text
-    )
-    assert "Lio heard only rumors" not in current_scene_text
-    assert "Unrelated crypt cataloging" not in current_scene_text
-
 
 def test_active_participant_state_hidden_from_present_scene_is_omitted(
     repositories: PersistenceRepositories,
@@ -1796,8 +1558,13 @@ def test_narrator_context_does_not_render_player_agency_as_npc_guidance(
         snapshot_id="snapshot-player-agency-context",
     )
 
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-    current_scene_text = "\n".join(assembled.current_scene_context)
+    current_scene_text = "\n".join(
+        source.text
+        for source in deterministic_context_sources(
+            repositories=repositories,
+            save_id=save.id,
+        )
+    )
 
     assert "Mara" in current_scene_text
     assert "goals: Find the red lens failsafe." not in current_scene_text
@@ -1969,16 +1736,11 @@ def test_resolved_and_abandoned_threads_are_excluded_from_context(
             save_id=save.id,
         )
     )
-    narrator_text = "\n".join(
-        ContextAssemblyService(repositories)
-        .assemble_narrator_context(save.id)
-        .current_scene_context
-    )
     image_context, _breakdown = ContextAssemblyService(
         repositories
     ).build_image_scene_context(save_id=save.id)
 
-    for context_text in (deterministic_text, narrator_text, image_context):
+    for context_text in (deterministic_text, image_context):
         assert "Stabilize the red lens" in context_text
         assert (
             "The active thread description keeps the cracked lens alive."
@@ -2086,14 +1848,12 @@ def test_deterministic_context_sources_include_survival_expedition_state(
     )
 
     sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
     source_text = "\n".join(source.text for source in sources)
-    narrator_context = "\n".join(assembled.current_scene_context)
 
     assert "Current expedition state" in source_text
-    assert "expedition.resources: summary: Food: 2 days" in narrator_context
-    assert "expedition.progress: summary: 18 of 80 miles" in narrator_context
-    assert "inventory.unrelated" not in narrator_context
+    assert "expedition.resources: summary: Food: 2 days" in source_text
+    assert "expedition.progress: summary: 18 of 80 miles" in source_text
+    assert "inventory.unrelated" not in source_text
 
 
 def test_deterministic_context_sources_include_first_contact_state(
@@ -2133,15 +1893,13 @@ def test_deterministic_context_sources_include_first_contact_state(
     )
 
     sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
     source_text = "\n".join(source.text for source in sources)
-    narrator_context = "\n".join(assembled.current_scene_context)
 
     assert "Current first-contact state" in source_text
-    assert "contact.translation: summary: Three descending pulses" in narrator_context
-    assert "contact.hazards: summary: Thermal fissures" in narrator_context
-    assert "sample.spores.contamination_risk: status: quarantined" in narrator_context
-    assert "inventory.unrelated" not in narrator_context
+    assert "contact.translation: summary: Three descending pulses" in source_text
+    assert "contact.hazards: summary: Thermal fissures" in source_text
+    assert "sample.spores.contamination_risk: status: quarantined" in source_text
+    assert "inventory.unrelated" not in source_text
 
 
 def test_deterministic_context_sources_include_heist_state(
@@ -2175,16 +1933,14 @@ def test_deterministic_context_sources_include_heist_state(
     )
 
     sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
     source_text = "\n".join(source.text for source in sources)
-    narrator_context = "\n".join(assembled.current_scene_context)
 
     assert "Current heist state" in source_text
-    assert "heist.security: summary: Clockwork cameras active" in narrator_context
-    assert "heist.alert:" in narrator_context
-    assert "level: suspicious" in narrator_context
-    assert "alarm: inactive" in narrator_context
-    assert "security.unrelated" not in narrator_context
+    assert "heist.security: summary: Clockwork cameras active" in source_text
+    assert "heist.alert:" in source_text
+    assert "level: suspicious" in source_text
+    assert "alarm: inactive" in source_text
+    assert "security.unrelated" not in source_text
 
 
 def test_deterministic_context_sources_include_time_loop_state(
@@ -2230,16 +1986,14 @@ def test_deterministic_context_sources_include_time_loop_state(
     )
 
     sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
     source_text = "\n".join(source.text for source in sources)
-    narrator_context = "\n".join(assembled.current_scene_context)
 
     assert "Current time-loop state" in source_text
-    assert "loop.knowledge: summary: Tower code" in narrator_context
-    assert "loop.npc_memory: summary: NPCs reset" in narrator_context
-    assert "loop iteration 2" in narrator_context
-    assert "current_time" not in narrator_context
-    assert "memory.unrelated" not in narrator_context
+    assert "loop.knowledge: summary: Tower code" in source_text
+    assert "loop.npc_memory: summary: NPCs reset" in source_text
+    assert "loop iteration 2" in source_text
+    assert "current_time" not in source_text
+    assert "memory.unrelated" not in source_text
 
 
 def test_deterministic_context_sources_include_political_intrigue_state(
@@ -2279,15 +2033,13 @@ def test_deterministic_context_sources_include_political_intrigue_state(
     )
 
     sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
     source_text = "\n".join(source.text for source in sources)
-    narrator_context = "\n".join(assembled.current_scene_context)
 
     assert "Current political intrigue state" in source_text
-    assert "intrigue.standing: summary: Reformers trust Mara" in narrator_context
-    assert "intrigue.obligations: summary: Orro owes Mara" in narrator_context
-    assert "faction.harbor_guild.standing: toward_mara: ally" in narrator_context
-    assert "memory.unrelated" not in narrator_context
+    assert "intrigue.standing: summary: Reformers trust Mara" in source_text
+    assert "intrigue.obligations: summary: Orro owes Mara" in source_text
+    assert "faction.harbor_guild.standing: toward_mara: ally" in source_text
+    assert "memory.unrelated" not in source_text
 
 
 def _create_context_save(

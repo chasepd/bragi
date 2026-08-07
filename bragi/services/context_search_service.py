@@ -8,8 +8,6 @@ import re
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from hashlib import sha256
-from threading import Lock
 from time import perf_counter
 from typing import cast
 
@@ -53,6 +51,7 @@ from bragi.services.continuity_index_service import ContinuityIndexService
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.knowledge_boundary import (
     ScopedTargets,
+    TurnCharacterScope,
     allowed_character_scoped_targets,
     character_scope_for_turn,
     message_visible_to_present_characters,
@@ -268,13 +267,6 @@ class _IndexedContextSourceRetrieval:
 
 
 @dataclass(frozen=True)
-class _NextTurnContextCacheEntry:
-    fingerprint: str
-    snapshot: NarrationContextSnapshot
-    digest: str
-
-
-@dataclass(frozen=True)
 class _ContextSelectionOutcome:
     result: ContextSearchResult
     fallback_allowed: bool = False
@@ -301,140 +293,6 @@ class ContextSearchService:
         self.repositories = repositories
         self.providers = providers
         self.jobs = JobLifecycleService(repositories=repositories)
-        self._next_turn_cache: dict[str, _NextTurnContextCacheEntry] = {}
-        self._next_turn_cache_lock = Lock()
-
-    def precompute_next_turn(self, save_id: str) -> None:
-        started_at = perf_counter()
-        job = self.jobs.create_running(
-            save_id=save_id,
-            type="context_precompute",
-            payload={"scope": "next_turn_context_candidates"},
-        )
-        try:
-            details = self.repositories.load_save_details(
-                save_id,
-                message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
-            )
-            if details is not None:
-                _sync_continuity_index_for_search(self.repositories, save_id)
-            initial_fingerprint = self.repositories.context_candidate_revision_token(
-                save_id
-            )
-            snapshot = load_narration_context_snapshot(
-                self.repositories,
-                save_id=save_id,
-                details=details,
-                include_context_sources=False,
-                raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
-            )
-            if snapshot is None:
-                raise ValueError(f"Unknown save id: {save_id}")
-            retrieved_sources = _indexed_context_source_retrieval(
-                self.repositories,
-                save_id=save_id,
-                latest_player_message="",
-                scene_snapshot=snapshot.scene_snapshot,
-                characters=list(snapshot.characters),
-                character_knowledge_edges=list(snapshot.character_knowledge_edges),
-                entity_links=list(snapshot.entity_links),
-                message_visibility=list(snapshot.message_visibility),
-            )
-            candidate_observations = _observations_with_indexed_sources(
-                self.repositories,
-                save_id=save_id,
-                observations=snapshot.observations,
-                context_sources=retrieved_sources.records,
-            )
-            candidates = _next_turn_context_candidates(
-                scenario=snapshot.details.scenario,
-                scene_snapshot=snapshot.scene_snapshot,
-                characters=list(snapshot.characters),
-                character_knowledge_edges=list(snapshot.character_knowledge_edges),
-                message_visibility=list(snapshot.message_visibility),
-                entity_links=list(snapshot.entity_links),
-                world_state=list(snapshot.world_state),
-                world_state_for_scope=list(snapshot.world_state_for_scope),
-                state_changes=list(snapshot.state_changes),
-                media_assets=list(snapshot.media_assets),
-                memories=list(snapshot.memories),
-                summaries=list(snapshot.summaries),
-                observations=list(candidate_observations),
-                context_sources=list(retrieved_sources.records),
-                recent_messages=snapshot.details.messages,
-                include_missing_raw_candidates=False,
-            )
-            final_fingerprint = self.repositories.context_candidate_revision_token(
-                save_id
-            )
-            cache_digest = _candidate_digest(candidates)
-            cache_status = "stored"
-            if initial_fingerprint != final_fingerprint:
-                cache_status = "skipped_stale"
-                with self._next_turn_cache_lock:
-                    existing = self._next_turn_cache.get(save_id)
-                    if (
-                        existing is not None
-                        and existing.fingerprint != final_fingerprint
-                    ):
-                        self._next_turn_cache.pop(save_id, None)
-            else:
-                with self._next_turn_cache_lock:
-                    self._next_turn_cache[save_id] = _NextTurnContextCacheEntry(
-                        fingerprint=final_fingerprint,
-                        snapshot=snapshot,
-                        digest=cache_digest,
-                    )
-            result = {
-                "scope": "next_turn_context_candidates",
-                "cache_status": cache_status,
-                "candidate_count": len(candidates),
-                "source_type_counts": _source_type_counts_json(candidates),
-                "indexed_candidate_count": sum(
-                    1 for candidate in candidates if candidate.source_type != "message"
-                ),
-                "continuity_floor_candidate_count": sum(
-                    1 for candidate in candidates if candidate.continuity_critical
-                ),
-                "continuity_floor_source_type_counts": _source_type_counts_json(
-                    tuple(
-                        candidate
-                        for candidate in candidates
-                        if candidate.continuity_critical
-                    )
-                ),
-                "cache_digest": cache_digest,
-                "duration_ms": _elapsed_ms(started_at),
-                **retrieved_sources.diagnostics,
-            }
-        except asyncio.CancelledError:
-            try:
-                self.jobs.cancel(job.id, error="Context search cancelled")
-            except ValueError:
-                pass
-            raise
-        except Exception as exc:
-            self.jobs.fail(
-                job.id,
-                error=redact_text(str(exc)) or exc.__class__.__name__,
-            )
-            log_error_event(
-                "job.failed",
-                job_id=job.id,
-                job_type=job.type,
-                save_id=save_id,
-                **exception_log_fields(exc),
-            )
-            raise
-        self.jobs.succeed(job.id, result=result)
-        log_event(
-            "job.succeeded",
-            job_id=job.id,
-            job_type=job.type,
-            save_id=save_id,
-            cache_status=result["cache_status"],
-            candidate_count=result["candidate_count"],
-        )
 
     async def search(
         self,
@@ -508,188 +366,77 @@ class ContextSearchService:
             )
             scenario = details.scenario if details is not None else None
             player_message = _message_body(messages, player_message_id)
-            cache_entry = (
-                self._valid_next_turn_cache(
-                    save_id,
-                    player_message_id=player_message_id,
-                )
-                if focus_message is None
-                else None
-            )
-            continuity_index_synced = False
             narration_snapshot: NarrationContextSnapshot | None = None
-            if cache_entry is None:
-                _sync_continuity_index_for_search(self.repositories, save_id)
-                continuity_index_synced = True
-                narration_snapshot = load_narration_context_snapshot(
-                    self.repositories,
-                    save_id=save_id,
-                    details=details,
-                    include_context_sources=False,
-                    raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
-                )
-                if narration_snapshot is None:
-                    raise ValueError(f"Unknown save id: {save_id}")
-                messages = _context_search_visible_messages(
-                    self.repositories,
-                    save_id=save_id,
-                    scene_snapshot=narration_snapshot.scene_snapshot,
-                    required_messages=tuple(
-                        message
-                        for message in messages
-                        if message.id == player_message_id
-                    ),
-                )
-                retrieved_sources = await _retrieve_indexed_context_sources(
-                    self.repositories,
-                    provider=provider,
-                    provider_name=preference.provider,
-                    model_id=preference.model_id,
-                    save_id=save_id,
-                    latest_player_message=player_message,
-                    scene_snapshot=narration_snapshot.scene_snapshot,
-                    characters=list(narration_snapshot.characters),
-                    character_knowledge_edges=list(
-                        narration_snapshot.character_knowledge_edges
-                    ),
-                    entity_links=list(narration_snapshot.entity_links),
-                    recent_messages=messages,
-                    message_visibility=list(narration_snapshot.message_visibility),
-                )
-                candidate_observations = _observations_with_indexed_sources(
-                    self.repositories,
-                    save_id=save_id,
-                    observations=narration_snapshot.observations,
-                    context_sources=retrieved_sources.records,
-                )
-                candidate_set = _context_candidate_set(
-                    scenario=scenario,
-                    scene_snapshot=narration_snapshot.scene_snapshot,
-                    characters=list(narration_snapshot.characters),
-                    character_knowledge_edges=list(
-                        narration_snapshot.character_knowledge_edges
-                    ),
-                    message_visibility=list(narration_snapshot.message_visibility),
-                    entity_links=list(narration_snapshot.entity_links),
-                    world_state=list(narration_snapshot.world_state),
-                    world_state_for_scope=(
-                        list(narration_snapshot.world_state_for_scope)
-                    ),
-                    state_changes=list(narration_snapshot.state_changes),
-                    media_assets=list(narration_snapshot.media_assets),
-                    memories=list(narration_snapshot.memories),
-                    summaries=list(narration_snapshot.summaries),
-                    observations=list(candidate_observations),
-                    context_sources=list(retrieved_sources.records),
-                    recent_messages=messages,
-                    player_message_id=player_message_id,
-                    include_missing_raw_candidates=False,
-                    retrieval_diagnostics=retrieved_sources.diagnostics,
-                )
-                candidates = candidate_set.candidates
-                candidate_diagnostics = candidate_set.diagnostics
-                cache_status = "miss"
-            else:
-                fresh_pending_suggestions = tuple(
-                    self.repositories.list_context_update_suggestions(
-                        save_id,
-                        status="pending",
-                        limit=RAW_CONTEXT_RECORD_LIMIT,
-                    )
-                )
-                pending_source_message_ids = {
-                    source_id
-                    for suggestion in fresh_pending_suggestions
-                    for source_id in suggestion.source_message_ids
-                }
-                present_character_ids = (
-                    set(cache_entry.snapshot.scene_snapshot.present_character_ids)
-                    if cache_entry.snapshot.scene_snapshot is not None
-                    else set()
-                )
-                refreshed_pending_visibility = tuple(
-                    self.repositories.list_message_visibility(
-                        save_id,
-                        character_ids=present_character_ids,
-                        message_ids=pending_source_message_ids,
-                    )
-                )
-                snapshot = replace(
-                    cache_entry.snapshot,
-                    details=details,
-                    pending_context_suggestions=fresh_pending_suggestions,
-                    message_visibility=tuple(
-                        visibility
-                        for visibility in cache_entry.snapshot.message_visibility
-                        if visibility.message_id not in pending_source_message_ids
-                    ),
-                )
-                snapshot = replace(
-                    snapshot,
-                    message_visibility=(
-                        *snapshot.message_visibility,
-                        *refreshed_pending_visibility,
-                    ),
-                )
-                narration_snapshot = snapshot
-                messages = _context_search_visible_messages(
-                    self.repositories,
-                    save_id=save_id,
-                    scene_snapshot=snapshot.scene_snapshot,
-                    required_messages=tuple(
-                        message
-                        for message in messages
-                        if message.id == player_message_id
-                    ),
-                )
-                retrieved_sources = await _retrieve_indexed_context_sources(
-                    self.repositories,
-                    provider=provider,
-                    provider_name=preference.provider,
-                    model_id=preference.model_id,
-                    save_id=save_id,
-                    latest_player_message=player_message,
-                    scene_snapshot=snapshot.scene_snapshot,
-                    characters=list(snapshot.characters),
-                    character_knowledge_edges=list(
-                        snapshot.character_knowledge_edges
-                    ),
-                    entity_links=list(snapshot.entity_links),
-                    recent_messages=messages,
-                    message_visibility=list(snapshot.message_visibility),
-                )
-                candidate_observations = _observations_with_indexed_sources(
-                    self.repositories,
-                    save_id=save_id,
-                    observations=snapshot.observations,
-                    context_sources=retrieved_sources.records,
-                )
-                candidate_set = _context_candidate_set(
-                    scenario=scenario,
-                    scene_snapshot=snapshot.scene_snapshot,
-                    characters=list(snapshot.characters),
-                    character_knowledge_edges=list(
-                        snapshot.character_knowledge_edges
-                    ),
-                    message_visibility=list(snapshot.message_visibility),
-                    entity_links=list(snapshot.entity_links),
-                    world_state=list(snapshot.world_state),
-                    world_state_for_scope=list(snapshot.world_state_for_scope),
-                    state_changes=list(snapshot.state_changes),
-                    media_assets=list(snapshot.media_assets),
-                    memories=list(snapshot.memories),
-                    summaries=list(snapshot.summaries),
-                    observations=list(candidate_observations),
-                    context_sources=list(retrieved_sources.records),
-                    recent_messages=messages,
-                    player_message_id=player_message_id,
-                    include_missing_raw_candidates=False,
-                    retrieval_diagnostics=retrieved_sources.diagnostics,
-                )
-                candidates = candidate_set.candidates
-                candidate_diagnostics = candidate_set.diagnostics
-                cache_status = "hit"
-                continuity_index_synced = True
+            _sync_continuity_index_for_search(self.repositories, save_id)
+            continuity_index_synced = True
+            narration_snapshot = load_narration_context_snapshot(
+                self.repositories,
+                save_id=save_id,
+                details=details,
+                include_context_sources=False,
+                raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
+            )
+            if narration_snapshot is None:
+                raise ValueError(f"Unknown save id: {save_id}")
+            messages = _context_search_visible_messages(
+                self.repositories,
+                save_id=save_id,
+                scene_snapshot=narration_snapshot.scene_snapshot,
+                required_messages=tuple(
+                    message
+                    for message in messages
+                    if message.id == player_message_id
+                ),
+            )
+            retrieved_sources = await _retrieve_indexed_context_sources(
+                self.repositories,
+                provider=provider,
+                provider_name=preference.provider,
+                model_id=preference.model_id,
+                save_id=save_id,
+                latest_player_message=player_message,
+                scene_snapshot=narration_snapshot.scene_snapshot,
+                characters=list(narration_snapshot.characters),
+                character_knowledge_edges=list(
+                    narration_snapshot.character_knowledge_edges
+                ),
+                entity_links=list(narration_snapshot.entity_links),
+                recent_messages=messages,
+                message_visibility=list(narration_snapshot.message_visibility),
+            )
+            candidate_observations = _observations_with_indexed_sources(
+                self.repositories,
+                save_id=save_id,
+                observations=narration_snapshot.observations,
+                context_sources=retrieved_sources.records,
+            )
+            candidate_set = _context_candidate_set(
+                scenario=scenario,
+                scene_snapshot=narration_snapshot.scene_snapshot,
+                characters=list(narration_snapshot.characters),
+                character_knowledge_edges=list(
+                    narration_snapshot.character_knowledge_edges
+                ),
+                message_visibility=list(narration_snapshot.message_visibility),
+                entity_links=list(narration_snapshot.entity_links),
+                world_state=list(narration_snapshot.world_state),
+                world_state_for_scope=(
+                    list(narration_snapshot.world_state_for_scope)
+                ),
+                state_changes=list(narration_snapshot.state_changes),
+                media_assets=list(narration_snapshot.media_assets),
+                memories=list(narration_snapshot.memories),
+                summaries=list(narration_snapshot.summaries),
+                observations=list(candidate_observations),
+                context_sources=list(retrieved_sources.records),
+                recent_messages=messages,
+                player_message_id=player_message_id,
+                include_missing_raw_candidates=False,
+                retrieval_diagnostics=retrieved_sources.diagnostics,
+            )
+            candidates = candidate_set.candidates
+            candidate_diagnostics = candidate_set.diagnostics
+            cache_status = "miss"
             log_event(
                 "context_search.candidates_built",
                 save_id=save_id,
@@ -942,28 +689,6 @@ class ContextSearchService:
         )
         return result
 
-    def _valid_next_turn_cache(
-        self,
-        save_id: str,
-        *,
-        player_message_id: str,
-    ) -> _NextTurnContextCacheEntry | None:
-        with self._next_turn_cache_lock:
-            entry = self._next_turn_cache.get(save_id)
-        if entry is None:
-            return None
-        if entry.fingerprint == self.repositories.context_candidate_revision_token(
-            save_id,
-            ignored_message_id=player_message_id,
-        ):
-            return entry
-        with self._next_turn_cache_lock:
-            current_entry = self._next_turn_cache.get(save_id)
-            if current_entry is entry:
-                self._next_turn_cache.pop(save_id, None)
-        log_event("context_search.precompute_cache_stale", save_id=save_id)
-        return None
-
 
 def _sync_continuity_index_for_search(
     repositories: PersistenceRepositories,
@@ -1207,7 +932,21 @@ def _snapshot_contains_selected_items(
     )
 
 
-def _indexed_context_source_retrieval(
+@dataclass(frozen=True)
+class _IndexedContextSourceRetrievalPrelude:
+    latest_player_message: str
+    turn_scope: TurnCharacterScope
+    allowed_owner_names: frozenset[str]
+    blocked_source_keys: frozenset[tuple[str, str]]
+    current_turn_number: int
+    reference_character_ids: frozenset[str]
+    current_scene_snapshot_id: str | None
+    current_scene_generation: int | None
+    protected: tuple[ContextSourceRecord, ...]
+    curated: tuple[ContextSourceRecord, ...]
+
+
+def _indexed_context_source_retrieval_prelude(
     repositories: PersistenceRepositories,
     *,
     save_id: str,
@@ -1217,21 +956,7 @@ def _indexed_context_source_retrieval(
     character_knowledge_edges: list[CharacterKnowledgeEdgeRecord],
     entity_links: list[EntityLinkRecord],
     message_visibility: list[MessageVisibilityRecord],
-    additional_query_terms: tuple[str, ...] = (),
-) -> _IndexedContextSourceRetrieval:
-    started_at = perf_counter()
-    query_text = _bounded_context_query_text(
-        " ".join((latest_player_message, *additional_query_terms))
-    )
-    query_terms = list(_bounded_context_query_terms(query_text))
-    exact_phrases = tuple(
-        dict.fromkeys(
-            phrase.strip()[:MAX_CONTEXT_EXACT_PHRASE_CHARS]
-            for phrase in (latest_player_message, *additional_query_terms)
-            if " " in phrase.strip()
-        )
-    )[:MAX_CONTEXT_EXACT_PHRASES]
-    exact_identifiers = _bounded_structured_identifiers(query_text)
+) -> _IndexedContextSourceRetrievalPrelude:
     turn_scope = character_scope_for_turn(
         scene_snapshot=scene_snapshot,
         characters=characters,
@@ -1281,18 +1006,57 @@ def _indexed_context_source_retrieval(
         current_turn_number=current_turn_number,
         blocked_source_keys=scoped_targets.blocked,
     )
+    curated = repositories.list_curated_observation_source_markers(
+        save_id,
+        limit=RAW_CONTEXT_RECORD_LIMIT,
+    )
+    return _IndexedContextSourceRetrievalPrelude(
+        latest_player_message=latest_player_message,
+        turn_scope=turn_scope,
+        allowed_owner_names=frozenset(allowed_owner_names),
+        blocked_source_keys=frozenset(scoped_targets.blocked),
+        current_turn_number=current_turn_number,
+        reference_character_ids=frozenset(reference_character_ids),
+        current_scene_snapshot_id=current_scene_snapshot_id,
+        current_scene_generation=current_scene_generation,
+        protected=tuple(protected),
+        curated=tuple(curated),
+    )
+
+
+def _indexed_context_source_search_pass(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    prelude: _IndexedContextSourceRetrievalPrelude,
+    additional_query_terms: tuple[str, ...] = (),
+) -> _IndexedContextSourceRetrieval:
+    started_at = perf_counter()
+    query_text = _bounded_context_query_text(
+        " ".join((prelude.latest_player_message, *additional_query_terms))
+    )
+    query_terms = list(_bounded_context_query_terms(query_text))
+    exact_phrases = tuple(
+        dict.fromkeys(
+            phrase.strip()[:MAX_CONTEXT_EXACT_PHRASE_CHARS]
+            for phrase in (prelude.latest_player_message, *additional_query_terms)
+            if " " in phrase.strip()
+        )
+    )[:MAX_CONTEXT_EXACT_PHRASES]
+    exact_identifiers = _bounded_structured_identifiers(query_text)
+    scoped_present_ids = set(prelude.turn_scope.present_character_ids)
     exact_hits = repositories.search_context_sources(
         save_id,
         query_terms=query_terms,
         source_types=INDEXED_CONTEXT_SOURCE_TYPES,
         limit=min(24, INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT),
-        allowed_owner_names=allowed_owner_names,
-        reference_character_ids=reference_character_ids,
-        visibility_character_ids=set(turn_scope.present_character_ids),
-        current_scene_snapshot_id=current_scene_snapshot_id,
-        current_scene_generation=current_scene_generation,
-        current_turn_number=current_turn_number,
-        blocked_source_keys=scoped_targets.blocked,
+        allowed_owner_names=prelude.allowed_owner_names,
+        reference_character_ids=prelude.reference_character_ids,
+        visibility_character_ids=scoped_present_ids,
+        current_scene_snapshot_id=prelude.current_scene_snapshot_id,
+        current_scene_generation=prelude.current_scene_generation,
+        current_turn_number=prelude.current_turn_number,
+        blocked_source_keys=prelude.blocked_source_keys,
         match_all=True,
         exact_phrases=exact_phrases,
         exact_identifiers=exact_identifiers,
@@ -1302,13 +1066,13 @@ def _indexed_context_source_retrieval(
         query_terms=query_terms,
         source_types=INDEXED_CONTEXT_SOURCE_TYPES,
         limit=INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT,
-        allowed_owner_names=allowed_owner_names,
-        reference_character_ids=reference_character_ids,
-        visibility_character_ids=set(turn_scope.present_character_ids),
-        current_scene_snapshot_id=current_scene_snapshot_id,
-        current_scene_generation=current_scene_generation,
-        current_turn_number=current_turn_number,
-        blocked_source_keys=scoped_targets.blocked,
+        allowed_owner_names=prelude.allowed_owner_names,
+        reference_character_ids=prelude.reference_character_ids,
+        visibility_character_ids=scoped_present_ids,
+        current_scene_snapshot_id=prelude.current_scene_snapshot_id,
+        current_scene_generation=prelude.current_scene_generation,
+        current_turn_number=prelude.current_turn_number,
+        blocked_source_keys=prelude.blocked_source_keys,
     )
     hits = tuple(
         {
@@ -1318,7 +1082,7 @@ def _indexed_context_source_retrieval(
     )
     records: list[ContextSourceRecord] = []
     seen_ids: set[str] = set()
-    for record in protected:
+    for record in prelude.protected:
         if record.id in seen_ids:
             continue
         seen_ids.add(record.id)
@@ -1328,10 +1092,7 @@ def _indexed_context_source_retrieval(
             continue
         seen_ids.add(hit.record.id)
         records.append(hit.record)
-    for record in repositories.list_curated_observation_source_markers(
-        save_id,
-        limit=RAW_CONTEXT_RECORD_LIMIT,
-    ):
+    for record in prelude.curated:
         if (
             record.id in seen_ids
             or record.metadata.get("curation_action")
@@ -1351,7 +1112,7 @@ def _indexed_context_source_retrieval(
             "indexed_retrieval_enabled": True,
             "indexed_retrieval_query_term_count": len(query_terms),
             "indexed_retrieval_hit_count": len(hits),
-            "protected_context_source_count": len(protected),
+            "protected_context_source_count": len(prelude.protected),
             "indexed_retrieval_duration_ms": _elapsed_ms(started_at),
             "first_pass_source_type_counts": _context_source_type_counts(records),
         },
@@ -1373,7 +1134,7 @@ async def _retrieve_indexed_context_sources(
     recent_messages: list[MessageRecord],
     message_visibility: list[MessageVisibilityRecord],
 ) -> _IndexedContextSourceRetrieval:
-    initial = _indexed_context_source_retrieval(
+    prelude = _indexed_context_source_retrieval_prelude(
         repositories,
         save_id=save_id,
         latest_player_message=latest_player_message,
@@ -1382,6 +1143,11 @@ async def _retrieve_indexed_context_sources(
         character_knowledge_edges=character_knowledge_edges,
         entity_links=entity_links,
         message_visibility=message_visibility,
+    )
+    initial = _indexed_context_source_search_pass(
+        repositories,
+        save_id=save_id,
+        prelude=prelude,
     )
     if not latest_player_message.strip():
         return initial
@@ -1431,15 +1197,10 @@ async def _retrieve_indexed_context_sources(
         return initial
     if not expanded_terms:
         return initial
-    expanded = _indexed_context_source_retrieval(
+    expanded = _indexed_context_source_search_pass(
         repositories,
         save_id=save_id,
-        latest_player_message=latest_player_message,
-        scene_snapshot=scene_snapshot,
-        characters=characters,
-        character_knowledge_edges=character_knowledge_edges,
-        entity_links=entity_links,
-        message_visibility=message_visibility,
+        prelude=prelude,
         additional_query_terms=expanded_terms,
     )
     return replace(
@@ -1944,47 +1705,6 @@ def _context_candidate_set(
             curated_observation_source_ids=curated_observation_source_ids,
             retrieval_diagnostics=retrieval_diagnostics,
         ),
-    )
-
-
-def _next_turn_context_candidates(
-    *,
-    scenario: ScenarioRecord | None,
-    world_state: list[WorldStateRecord],
-    world_state_for_scope: list[WorldStateRecord] | None = None,
-    state_changes: list[StateChangeRecord],
-    media_assets: list[MediaAssetRecord],
-    memories: list[MemoryRecord],
-    summaries: list[SummaryRecord],
-    observations: list[ContextObservationRecord] | None = None,
-    context_sources: list[ContextSourceRecord] | None = None,
-    recent_messages: list[MessageRecord],
-    scene_snapshot: SceneSnapshotRecord | None = None,
-    characters: list[CharacterRecord] | None = None,
-    character_knowledge_edges: list[CharacterKnowledgeEdgeRecord] | None = None,
-    message_visibility: list[MessageVisibilityRecord] | None = None,
-    entity_links: list[EntityLinkRecord] | None = None,
-    include_missing_raw_candidates: bool = True,
-) -> tuple[_ContextCandidate, ...]:
-    return _context_candidates(
-        scenario=scenario,
-        scene_snapshot=scene_snapshot,
-        characters=characters,
-        character_knowledge_edges=character_knowledge_edges,
-        message_visibility=message_visibility,
-        entity_links=entity_links,
-        world_state=world_state,
-        world_state_for_scope=world_state_for_scope,
-        state_changes=state_changes,
-        media_assets=media_assets,
-        memories=memories,
-        summaries=summaries,
-        observations=observations,
-        context_sources=context_sources,
-        recent_messages=recent_messages,
-        player_message_id="",
-        active_message_ids={message.id for message in recent_messages},
-        include_missing_raw_candidates=include_missing_raw_candidates,
     )
 
 
@@ -3459,33 +3179,6 @@ def _source_type_counts_json(
 
 def _counter_json(counter: Counter[str]) -> dict[str, int]:
     return {key: counter[key] for key in sorted(counter)}
-
-
-def _candidate_digest(candidates: tuple[_ContextCandidate, ...]) -> str:
-    return _json_digest(
-        [
-            {
-                "source_type": candidate.source_type,
-                "source_id": candidate.source_id,
-                "text_hash": _text_digest(candidate.text),
-                "selection_text_hash": _text_digest(candidate.selection_text or ""),
-                "continuity_critical": candidate.continuity_critical,
-            }
-            for candidate in candidates
-        ]
-    )
-
-
-def _json_digest(value: object) -> str:
-    return sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode(
-            "utf-8"
-        )
-    ).hexdigest()
-
-
-def _text_digest(value: str) -> str:
-    return sha256(value.encode("utf-8")).hexdigest()
 
 
 def _scenario_context_text(scenario: ScenarioRecord | None) -> str:

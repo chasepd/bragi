@@ -163,6 +163,7 @@ from bragi.services.maintenance_scheduler import (
     provider_pressure_from_result,
 )
 from bragi.services.manual_confirmation import manual_memory_confirmation_enabled
+from bragi.services.media_service import PreparedAutomaticImage
 from bragi.services.memory_consolidation_service import MemoryConsolidationService
 from bragi.services.mention_matching import character_name_is_mentioned
 from bragi.services.model_capabilities import (
@@ -938,10 +939,12 @@ class ChatService:
         )
         self.prompt_inspection_store = prompt_inspection_store
         self.debug_prompt_capture = debug_prompt_capture
-        self._background_post_turn_tasks: set[asyncio.Task[None]] = set()
+        self._background_post_turn_tasks: set[
+            asyncio.Task[dict[str, object]]
+        ] = set()
         self._background_post_turn_tasks_by_save: dict[
             str,
-            set[asyncio.Task[None]],
+            set[asyncio.Task[dict[str, object]]],
         ] = {}
 
     async def submit_player_turn(
@@ -1321,6 +1324,11 @@ class ChatService:
                     messages=messages,
                     context_result=context_result,
                     player_message=focus_message,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    characters=list(narration_snapshot.characters),
+                    message_visibility=list(
+                        narration_snapshot.message_visibility
+                    ),
                 ),
                 scenario_instructions=budgeted_context.scenario_instructions,
                 user_narration_guidance=_user_narration_guidance(
@@ -1452,7 +1460,10 @@ class ChatService:
         )
         if preference is None:
             raise ValueError("No chat model preference configured")
-        details = self.repositories.load_save_details(save_id)
+        details = self.repositories.load_save_details(
+            save_id,
+            message_limit=RAW_CONTEXT_RECORD_LIMIT,
+        )
         messages = details.messages if details is not None else []
         player_message = next(
             (
@@ -1463,6 +1474,20 @@ class ChatService:
             ),
             None,
         )
+        if player_message is None and details is not None:
+            player_message = next(
+                (
+                    message
+                    for message in (
+                        self.repositories.get_message(
+                            save_id=save_id,
+                            message_id=player_message_id,
+                        ),
+                    )
+                    if message is not None and message.role == source_message_role
+                ),
+                None,
+            )
         if player_message is None:
             raise ValueError(f"Unknown active source message id: {player_message_id}")
         if log_turn_started:
@@ -1963,6 +1988,11 @@ class ChatService:
                     context_result=context_result,
                     player_message=player_message,
                     settings=prose_history_settings,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    characters=list(narration_snapshot.characters),
+                    message_visibility=list(
+                        narration_snapshot.message_visibility
+                    ),
                 ),
                 scenario_instructions=budgeted_context.scenario_instructions,
                 user_narration_guidance=_user_narration_guidance(
@@ -2021,6 +2051,11 @@ class ChatService:
                     context_result=context_result,
                     player_message=player_message,
                     settings=planner_history_settings,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    characters=list(narration_snapshot.characters),
+                    message_visibility=list(
+                        narration_snapshot.message_visibility
+                    ),
                 ),
                 scenario_instructions=(
                     planner_budgeted_context.scenario_instructions
@@ -2858,7 +2893,7 @@ class ChatService:
                         prepared_action_choices,
                     )
                 )
-        post_turn_task: asyncio.Task[None] | None = None
+        post_turn_task: asyncio.Task[dict[str, object]] | None = None
         if run_post_turn_jobs:
             stage_started = perf_counter()
             post_turn_task = asyncio.create_task(
@@ -2956,7 +2991,7 @@ class ChatService:
         save_id: str,
         player_message_id: str,
         narrator_message_id: str,
-        task: asyncio.Task[None],
+        task: asyncio.Task[dict[str, object]],
         started_at: float,
     ) -> None:
         self._background_post_turn_tasks.add(task)
@@ -2972,7 +3007,7 @@ class ChatService:
             narrator_message_id=narrator_message_id,
         )
 
-        def task_done(done_task: asyncio.Task[None]) -> None:
+        def task_done(done_task: asyncio.Task[dict[str, object]]) -> None:
             self._background_post_turn_tasks.discard(done_task)
             save_tasks.discard(done_task)
             if not save_tasks:
@@ -3884,7 +3919,8 @@ class ChatService:
         world_update_context: PostTurnWorldUpdateContext | None = None,
         verified_coverage: VerifiedPostTurnCoverage | None = None,
         current_user_id: str | None = None,
-    ) -> None:
+        defer_image_generation: bool = False,
+    ) -> dict[str, object]:
         boundary = self._coerce_turn_revision(
             turn_revision,
             save_id=save_id,
@@ -4264,8 +4300,9 @@ class ChatService:
                 player_message_id=player_message_id,
                 narrator_message_id=narrator_message_id,
             ),
-            "image": lambda: self._generate_prepared_automatic_image_if_due(
-                prepared_image,
+            "image": lambda: self._generate_automatic_image_after_turn_step(
+                prepared_image=prepared_image,
+                defer_image_generation=defer_image_generation,
                 current_user_id=current_user_id,
             ),
         }
@@ -4490,6 +4527,7 @@ class ChatService:
             coordinator_job_id=coordinator.id,
             statuses=statuses.copy(),
         )
+        return coordinator_result
 
     def _run_world_context_retention(self, *, save_id: str) -> None:
         try:
@@ -6308,6 +6346,59 @@ class ChatService:
             )
             return "failed"
 
+    async def _generate_automatic_image_after_turn_step(
+        self,
+        *,
+        prepared_image: object | None,
+        defer_image_generation: bool,
+        current_user_id: str | None,
+    ) -> str | _PostTurnStepResult:
+        if prepared_image is None:
+            return "skipped"
+        if isinstance(prepared_image, _PostTurnPreparedImageFailure):
+            return "failed"
+        if isinstance(prepared_image, _PostTurnPreparedImageUnsupported):
+            return await self._generate_prepared_automatic_image_if_due(
+                prepared_image,
+                current_user_id=current_user_id,
+            )
+        if not defer_image_generation:
+            return await self._generate_prepared_automatic_image_if_due(
+                prepared_image,
+                current_user_id=current_user_id,
+            )
+        to_json = getattr(prepared_image, "to_json", None)
+        if not callable(to_json):
+            return "skipped"
+        return _PostTurnStepResult(
+            "queued",
+            {
+                "deferred_to_background": True,
+                "prepared_automatic_image": to_json(),
+            },
+        )
+
+    async def generate_deferred_automatic_image(
+        self,
+        *,
+        prepared_automatic_image: Mapping[str, object],
+        current_user_id: str | None = None,
+    ) -> str:
+        try:
+            prepared = PreparedAutomaticImage.from_json(
+                prepared_automatic_image
+            )
+        except Exception as exc:
+            log_error_event(
+                "chat.deferred_automatic_image_invalid",
+                **exception_log_fields(exc),
+            )
+            return "failed"
+        return await self._generate_prepared_automatic_image_if_due(
+            prepared,
+            current_user_id=current_user_id,
+        )
+
     async def _prune_state_if_configured(self, *, save_id: str) -> str:
         preference = roleplay_model_preference(
             repositories=self.repositories,
@@ -7567,19 +7658,36 @@ def _narrator_messages(
     context_result: ContextSearchResult,
     player_message: MessageRecord,
     settings: ChatHistoryWindowSettings | None = None,
+    scene_snapshot: SceneSnapshotRecord | None = None,
+    characters: list[CharacterRecord] | None = None,
+    message_visibility: list[MessageVisibilityRecord] | None = None,
 ) -> tuple[ChatMessage, ...]:
+    snapshot = (
+        scene_snapshot
+        if scene_snapshot is not None
+        else repositories.get_scene_snapshot(player_message.save_id)
+    )
+    character_records = (
+        characters
+        if characters is not None
+        else repositories.list_characters(player_message.save_id)
+    )
     turn_scope = character_scope_for_turn(
-        scene_snapshot=repositories.get_scene_snapshot(player_message.save_id),
-        characters=repositories.list_characters(player_message.save_id),
+        scene_snapshot=snapshot,
+        characters=character_records,
         latest_player_message=player_message.body,
     )
-    message_visibility = (
-        repositories.list_message_visibility(
-            player_message.save_id,
-            character_ids=turn_scope.present_character_ids,
+    visibility_records = (
+        message_visibility
+        if message_visibility is not None
+        else (
+            repositories.list_message_visibility(
+                player_message.save_id,
+                character_ids=turn_scope.present_character_ids,
+            )
+            if turn_scope.present_character_ids
+            else []
         )
-        if turn_scope.present_character_ids
-        else []
     )
     prior_messages = [
         message
@@ -7588,7 +7696,7 @@ def _narrator_messages(
         if message_visible_to_present_characters(
             message_id=message.id,
             present_character_ids=turn_scope.present_character_ids,
-            message_visibility=message_visibility,
+            message_visibility=visibility_records,
         )
     ]
     baseline_ids = _recent_transcript_message_ids(
@@ -9817,14 +9925,22 @@ def _budgeted_narrator_context(
         if narration_snapshot is not None
         else tuple(repositories.list_summaries(save_id))
     )
+    present_character_ids = frozenset(
+        snapshot.present_character_ids if snapshot is not None else ()
+    )
+    visible_summary_keys = repositories.summaries_visible_to_characters(
+        save_id=save_id,
+        summaries=tuple(
+            (summary.covers_message_start_id, summary.covers_message_end_id)
+            for summary in summary_records
+        ),
+        character_ids=present_character_ids,
+    )
     visible_summary_records = tuple(
         summary
         for summary in summary_records
-        if _summary_visible_to_present_characters(
-            repositories=repositories,
-            summary=summary,
-            scene_snapshot=snapshot,
-        )
+        if (summary.covers_message_start_id, summary.covers_message_end_id)
+        in visible_summary_keys
     )
     deterministic_sources = deterministic_context_sources(
         repositories=repositories,
@@ -10638,23 +10754,6 @@ def _latest_summary_sources(
             reason="latest rolling summary",
             always_include=True,
         ),
-    )
-
-
-def _summary_visible_to_present_characters(
-    *,
-    repositories: PersistenceRepositories,
-    summary: SummaryRecord,
-    scene_snapshot: SceneSnapshotRecord | None,
-) -> bool:
-    present_character_ids = frozenset(
-        scene_snapshot.present_character_ids if scene_snapshot is not None else ()
-    )
-    return repositories.summary_visible_to_characters(
-        save_id=summary.save_id,
-        covers_message_start_id=summary.covers_message_start_id,
-        covers_message_end_id=summary.covers_message_end_id,
-        character_ids=present_character_ids,
     )
 
 

@@ -560,6 +560,9 @@ class BragiRuntime:
         self._maintenance_retry_drain_counts: dict[str, int] = {}
         self._maintenance_retry_drain_guard = threading.Lock()
         self._context_trimmed_narrator_message_ids: set[str] = set()
+        self._deferred_automatic_image_payloads: dict[
+            tuple[str, str], dict[str, object]
+        ] = {}
 
     def cancel_active_chat_turn(self, save_id: str | None = None) -> bool:
         resolved_save_id = self.active_save_id if save_id is None else save_id
@@ -3598,6 +3601,7 @@ class BragiRuntime:
         progress_callback: PostTurnProgressCallback | None = None,
         prepared_action_choices: PreparedActionChoiceGeneration | None = None,
         current_user_id: str | None = None,
+        defer_image_generation: bool = False,
     ) -> RuntimeModel:
         try:
             chat_service = ChatService(
@@ -3620,6 +3624,8 @@ class BragiRuntime:
                 kwargs["progress_callback"] = progress_callback
             if "current_user_id" in parameters:
                 kwargs["current_user_id"] = current_user_id
+            if defer_image_generation and "defer_image_generation" in parameters:
+                kwargs["defer_image_generation"] = True
 
             async def run_prepared_action_choices() -> None:
                 if prepared_action_choices is None:
@@ -3642,17 +3648,22 @@ class BragiRuntime:
                         **exception_log_fields(exc),
                     )
 
-            async def run_post_turn() -> None:
+            async def run_post_turn() -> dict[str, object]:
                 if "world_update_context" in parameters:
 
                     def context_factory() -> AbstractAsyncContextManager[None]:
                         return self._save_operation_lock(save_id)
 
                     kwargs["world_update_context"] = context_factory
-                    await cast(Any, chat_service.run_post_turn_jobs)(**kwargs)
-                    return
+                    return cast(
+                        dict[str, object],
+                        await cast(Any, chat_service.run_post_turn_jobs)(**kwargs),
+                    )
                 async with self._save_operation_lock(save_id):
-                    await cast(Any, chat_service.run_post_turn_jobs)(**kwargs)
+                    return cast(
+                        dict[str, object],
+                        await cast(Any, chat_service.run_post_turn_jobs)(**kwargs),
+                    )
 
             action_choice_task = (
                 asyncio.create_task(run_prepared_action_choices())
@@ -3660,10 +3671,17 @@ class BragiRuntime:
                 else None
             )
             try:
-                await run_post_turn()
+                coordinator_result = await run_post_turn()
             finally:
                 if action_choice_task is not None:
                     await action_choice_task
+            prepared = _prepared_image_from_coordinator_result(coordinator_result)
+            if prepared is not None:
+                if len(self._deferred_automatic_image_payloads) > 64:
+                    self._deferred_automatic_image_payloads.clear()
+                self._deferred_automatic_image_payloads[
+                    (save_id, narrator_message_id)
+                ] = prepared
         except Exception as exc:
             log_error_event(
                 "runtime.post_turn_jobs_failed",
@@ -3681,6 +3699,56 @@ class BragiRuntime:
             ),
             active_save_id=save_id,
         )
+
+    def consume_deferred_automatic_image(
+        self,
+        *,
+        save_id: str,
+        narrator_message_id: str,
+    ) -> dict[str, object] | None:
+        return self._deferred_automatic_image_payloads.pop(
+            (save_id, narrator_message_id),
+            None,
+        )
+
+    async def run_deferred_automatic_image(
+        self,
+        *,
+        save_id: str,
+        prepared_automatic_image: Mapping[str, object],
+        current_user_id: str | None = None,
+    ) -> str:
+        chat_service = ChatService(
+            repositories=self.repositories,
+            providers=self.providers,
+            context_search_service=self.context_search_service,
+            summary_service=self._summary_service(),
+            media_service=self._media_service(),
+            prompt_inspection_store=self._prompt_inspection_store_if_enabled(),
+        )
+        kwargs: dict[str, object] = {
+            "prepared_automatic_image": prepared_automatic_image,
+        }
+        parameters = inspect.signature(
+            chat_service.generate_deferred_automatic_image
+        ).parameters
+        if current_user_id is not None and "current_user_id" in parameters:
+            kwargs["current_user_id"] = current_user_id
+        try:
+            return cast(
+                str,
+                await cast(
+                    Any,
+                    chat_service.generate_deferred_automatic_image,
+                )(**kwargs),
+            )
+        except Exception as exc:
+            log_error_event(
+                "runtime.deferred_automatic_image_failed",
+                save_id=save_id,
+                **exception_log_fields(exc),
+            )
+            return "failed"
 
     async def run_state_pruning(
         self,
@@ -4128,22 +4196,6 @@ class BragiRuntime:
         )
         return self.build_model(status=status, active_save_id=save_id)
 
-    async def precompute_next_turn_context(self, save_id: str) -> None:
-        try:
-            precompute = getattr(
-                self.context_search_service,
-                "precompute_next_turn",
-                None,
-            )
-            if callable(precompute):
-                precompute(save_id)
-        except Exception as exc:
-            log_error_event(
-                "runtime.context_precompute_failed",
-                save_id=save_id,
-                **exception_log_fields(exc),
-            )
-
     async def run_context_cleanup(
         self,
         *,
@@ -4212,7 +4264,6 @@ class BragiRuntime:
 
         await self._run_manual_memory_consolidation(save_id, preference=preference)
         maintenance_status = await self._run_manual_character_maintenance(save_id)
-        await self.precompute_next_turn_context(save_id)
         status = (
             "Context cleanup finished: "
             f"{result.applied_actions} changes applied, "
@@ -9765,6 +9816,25 @@ def _turn_complete_status(
     if context_trimmed:
         notes.append("context budget trimmed older context")
     return "; ".join(notes)
+
+
+def _prepared_image_from_coordinator_result(
+    coordinator_result: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if not coordinator_result:
+        return None
+    for job in cast(Iterable[object], coordinator_result.get("jobs", [])):
+        if not isinstance(job, dict) or job.get("name") != "image":
+            continue
+        result = job.get("result")
+        if not isinstance(result, dict) or not result.get(
+            "deferred_to_background"
+        ):
+            continue
+        candidate = result.get("prepared_automatic_image")
+        if isinstance(candidate, dict):
+            return candidate
+    return None
 
 
 async def _submit_player_turn_with_optional_cancellation(

@@ -38,7 +38,7 @@ from bragi.providers.contracts import (
     ToolCallResponse,
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
-from bragi.services.context_assembly import ContextAssemblyService
+from bragi.services.context_assembly import deterministic_context_sources
 from bragi.services.message_correction import MessageCorrectionContext
 from bragi.services.post_turn_inference import VerifiedPostTurnCoverage
 from bragi.services.prompt_inspection import PromptInspectionStore
@@ -3992,11 +3992,16 @@ def test_update_after_turn_clears_scene_local_context_after_location_change(
     assert audit_by_field["hazards"].after == []
     assert audit_by_field["present_character_ids"].after == []
 
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-    current_scene_text = "\n".join(assembled.current_scene_context)
-    assert "signal horn" not in current_scene_text
-    assert "red-hot glass" not in current_scene_text
-    assert "focused on the failing beacon lens" not in current_scene_text
+    scene_text = "\n".join(
+        source.text
+        for source in deterministic_context_sources(
+            repositories=repositories,
+            save_id=save.id,
+        )
+    )
+    assert "signal horn" not in scene_text
+    assert "red-hot glass" not in scene_text
+    assert "focused on the failing beacon lens" not in scene_text
 
 
 def test_update_after_turn_skips_ambiguous_short_character_name(
@@ -5217,10 +5222,15 @@ def test_update_after_turn_clears_scene_current_lists_when_empty(
     assert snapshot is not None
     assert snapshot.nearby_objects == []
     assert snapshot.hazards == []
-    assembled = ContextAssemblyService(repositories).assemble_narrator_context(save.id)
-    current_scene_text = "\n".join(assembled.current_scene_context)
-    assert "signal horn" not in current_scene_text
-    assert "red-hot glass" not in current_scene_text
+    scene_text = "\n".join(
+        source.text
+        for source in deterministic_context_sources(
+            repositories=repositories,
+            save_id=save.id,
+        )
+    )
+    assert "signal horn" not in scene_text
+    assert "red-hot glass" not in scene_text
 
 
 def test_context_update_prompt_guides_conservative_scene_time_extraction() -> None:

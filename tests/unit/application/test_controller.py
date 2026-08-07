@@ -9349,6 +9349,103 @@ def test_run_post_turn_jobs_forwards_progress_callback_when_supported(
     assert _value(model, "status") == "Turn complete"
 
 
+def test_run_deferred_automatic_image_forwards_payload_and_user(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, _ = _persist_runtime_save(repositories)
+    calls: list[tuple[Mapping[str, object], str | None]] = []
+
+    class FakeChatService:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        async def generate_deferred_automatic_image(
+            self,
+            *,
+            prepared_automatic_image: Mapping[str, object],
+            current_user_id: str | None = None,
+        ) -> str:
+            calls.append((prepared_automatic_image, current_user_id))
+            return "succeeded"
+
+    monkeypatch.setattr(runtime, "ChatService", FakeChatService)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+
+    status = asyncio.run(
+        controller.run_deferred_automatic_image(
+            save_id=save_id,
+            prepared_automatic_image={"source_message_id": "message-1"},
+            current_user_id="user-1",
+        )
+    )
+
+    assert status == "succeeded"
+    assert calls == [({"source_message_id": "message-1"}, "user-1")]
+
+
+def test_run_post_turn_jobs_stashes_deferred_image_for_consume(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, narrator_id = _persist_runtime_save(repositories)
+    player_id = repositories.list_messages(save_id)[0].id
+    prepared_payload: dict[str, object] = {"source_message_id": narrator_id}
+
+    class FakeChatService:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        async def run_post_turn_jobs(
+            self,
+            *,
+            save_id: str,
+            player_message_id: str,
+            narrator_message_id: str,
+            defer_image_generation: bool = False,
+        ) -> dict[str, object]:
+            return {
+                "jobs": [
+                    {
+                        "name": "image",
+                        "status": "queued",
+                        "result": {
+                            "deferred_to_background": True,
+                            "prepared_automatic_image": prepared_payload,
+                        },
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(runtime, "ChatService", FakeChatService)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+
+    asyncio.run(
+        controller.run_post_turn_jobs(
+            save_id=save_id,
+            player_message_id=player_id,
+            narrator_message_id=narrator_id,
+            defer_image_generation=True,
+        )
+    )
+
+    assert controller.consume_deferred_automatic_image(
+        save_id=save_id,
+        narrator_message_id=narrator_id,
+    ) == prepared_payload
+    assert (
+        controller.consume_deferred_automatic_image(
+            save_id=save_id,
+            narrator_message_id=narrator_id,
+        )
+        is None
+    )
+
+
 def test_run_post_turn_jobs_waits_for_same_save_submit_lock(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -10359,40 +10456,6 @@ def test_run_context_cleanup_rejects_missing_catalog_row_for_selected_model(
     assert provider.structured_requests == []
 
 
-def test_run_context_cleanup_reports_success_and_precomputes_context(
-    repositories: PersistenceRepositories,
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    runtime = _import_runtime_without_gtk(monkeypatch)
-    save_id, _ = _persist_runtime_save(repositories)
-    _configure_context_cleanup_model(repositories)
-    provider = RuntimeStructuredCleanupProvider([{"notes": []}, {"actions": []}])
-    controller = _runtime_controller(
-        runtime,
-        repositories,
-        tmp_path,
-        provider=provider,
-    )
-    precomputed_save_ids: list[str] = []
-
-    async def precompute(save_id: str) -> None:
-        precomputed_save_ids.append(save_id)
-
-    controller.precompute_next_turn_context = precompute
-    controller.load_save(save_id)
-
-    model = asyncio.run(controller.run_context_cleanup())
-
-    assert _error_text(model) == ""
-    assert "Context cleanup finished" in _status_text(model)
-    assert precomputed_save_ids == [save_id]
-    assert [request.schema_name for request in provider.structured_requests] == [
-        "context_cleanup_scan",
-        "context_cleanup_actions",
-    ]
-
-
 def test_run_context_cleanup_uses_phase_specific_model_preferences(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -10650,7 +10713,6 @@ def test_run_context_cleanup_locks_apply_and_finalize_after_provider_calls(
         tmp_path,
         provider=provider,
     )
-    precomputed_save_ids: list[str] = []
 
     original_begin_immediate_transaction = (
         repositories.begin_immediate_transaction
@@ -10703,10 +10765,6 @@ def test_run_context_cleanup_locks_apply_and_finalize_after_provider_calls(
             error=error,
         )
 
-    async def precompute(save_id: str) -> None:
-        assert lock_depth == 0
-        precomputed_save_ids.append(save_id)
-
     monkeypatch.setattr(
         repositories,
         "begin_immediate_transaction",
@@ -10714,14 +10772,12 @@ def test_run_context_cleanup_locks_apply_and_finalize_after_provider_calls(
     )
     monkeypatch.setattr(repositories, "update_job", update_job)
     monkeypatch.setattr(controller, "_save_operation_lock", save_operation_lock)
-    controller.precompute_next_turn_context = precompute
     controller.load_save(save_id)
 
     model = asyncio.run(controller.run_context_cleanup())
 
     assert _error_text(model) == ""
     assert "Context cleanup finished" in _status_text(model)
-    assert precomputed_save_ids == [save_id]
     assert repositories.list_memories(save_id) == []
     assert [request.schema_name for request in provider.structured_requests] == [
         "context_cleanup_scan",

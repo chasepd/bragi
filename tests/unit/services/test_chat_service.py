@@ -124,6 +124,7 @@ from bragi.services.director_pressure_service import (
 from bragi.services.generation_settings import (
     OPENROUTER_CHAT_REASONING_OVERRIDES_SETTING,
 )
+from bragi.services.media_service import PreparedAutomaticImage
 from bragi.services.npc_knowledge_audit_service import (
     NPC_KNOWLEDGE_AUDIT_MODE_HARD_FAIL,
     NPC_KNOWLEDGE_AUDIT_MODE_SETTING,
@@ -1867,7 +1868,7 @@ class RecordingPreparedMediaService:
         self.repositories = repositories
         self.events = events
         self.generated = generated
-        self.prepared: list[dict[str, object]] = []
+        self.prepared: list[object] = []
         self.generated_prepared: list[object] = []
         self.prepare_started: asyncio.Event | None = None
 
@@ -1908,6 +1909,27 @@ class RecordingPreparedMediaService:
         current_user_id: str | None = None,
     ) -> object:
         raise AssertionError("prepared automatic image path should be used")
+
+
+class PreparedImageRecordingMediaService(RecordingPreparedMediaService):
+    def prepare_automatic_if_due(
+        self,
+        *,
+        save_id: str,
+        source_message_id: str | None = None,
+    ) -> object | None:
+        self.events.append("automatic_media_prepare")
+        prepared = PreparedAutomaticImage(
+            save_id=save_id,
+            source_message_id=cast(str, source_message_id),
+            scene_context="A red lens hums in the tower.",
+            context_breakdown_json={},
+            provider="fake",
+            model_id="fake-image",
+            narrator_message_count=1,
+        )
+        self.prepared.append(prepared)
+        return prepared
 
 
 class RecordingStatePruningService:
@@ -7295,8 +7317,9 @@ def test_submit_timeskip_turn_runs_post_turn_jobs_with_system_source_message(
             player_message_id: str,
             narrator_message_id: str,
             **_kwargs: object,
-        ) -> None:
+        ) -> dict[str, object]:
             post_turn_calls.append((save_id, player_message_id, narrator_message_id))
+            return {}
 
     service = RecordingPostTurnChatService(
         repositories=repositories,
@@ -8865,6 +8888,54 @@ def test_submit_existing_player_turn_uses_scenario_specific_chat_model(
     assert result.player_message == player_message
     assert result.narrator_message.provider == "fullroleplay"
     assert result.narrator_message.model == "fullroleplay/narrator"
+
+
+def test_submit_existing_player_turn_finds_old_player_message_beyond_load_cap(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    old_player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I climb toward the beacon lens.",
+    )
+    for index in range(chat_service_module.RAW_CONTEXT_RECORD_LIMIT + 20):
+        repositories.append_message(
+            save_id=save.id,
+            role="narrator",
+            speaker_name="Narrator",
+            body=f"Later bridge detail {index}.",
+        )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = RecordingChatProvider("fake")
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    result = asyncio.run(
+        service.submit_existing_player_turn(
+            save_id=save.id,
+            player_message_id=old_player_message.id,
+            run_post_turn_jobs=False,
+        )
+    )
+
+    assert result.player_message == old_player_message
+    assert len(provider.chat_requests) == 1
 
 
 def test_submit_existing_player_turn_includes_one_shot_regeneration_feedback(
@@ -14313,6 +14384,235 @@ def test_run_post_turn_jobs_prepares_automatic_image_before_state_updates(
     _assert_event_before(events, "automatic_media_prepare", "state_finished")
 
 
+def test_run_post_turn_jobs_defers_automatic_image_generation_when_requested(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I climb toward the beacon lens.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon lens hums awake.",
+        provider="fake",
+        model="fake-chat",
+    )
+    events: list[str] = []
+    media_service = PreparedImageRecordingMediaService(
+        repositories=repositories,
+        events=events,
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+        media_service=media_service,
+    )
+
+    asyncio.run(
+        service.run_post_turn_jobs(
+            save_id=save.id,
+            player_message_id=player_message.id,
+            narrator_message_id=narrator_message.id,
+            defer_image_generation=True,
+        )
+    )
+
+    assert events == ["automatic_media_prepare"]
+    assert media_service.generated_prepared == []
+    coordinator = _post_turn_jobs(repositories, save.id)[-1]
+    assert _post_turn_child_status(coordinator, "image") == "queued"
+    image_result = _post_turn_child_result(coordinator, "image")
+    assert image_result["deferred_to_background"] is True
+    assert (
+        image_result["prepared_automatic_image"]["source_message_id"]
+        == narrator_message.id
+    )
+
+
+def test_generate_deferred_automatic_image_reconstructs_and_generates(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon lens hums awake.",
+        provider="fake",
+        model="fake-chat",
+    )
+    events: list[str] = []
+    media_service = RecordingPreparedMediaService(
+        repositories=repositories,
+        events=events,
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+        media_service=media_service,
+    )
+    prepared = PreparedAutomaticImage(
+        save_id=save.id,
+        source_message_id=narrator_message.id,
+        scene_context="A red lens hums in the tower.",
+        context_breakdown_json={},
+        provider="fake",
+        model_id="fake-image",
+        narrator_message_count=1,
+    )
+
+    status = asyncio.run(
+        service.generate_deferred_automatic_image(
+            prepared_automatic_image=prepared.to_json(),
+        )
+    )
+
+    assert status == "succeeded"
+    assert events == ["automatic_media"]
+    assert media_service.generated_prepared == [prepared]
+
+
+def test_run_post_turn_jobs_generates_automatic_image_inline_by_default(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I climb toward the beacon lens.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon lens hums awake.",
+        provider="fake",
+        model="fake-chat",
+    )
+    events: list[str] = []
+    media_service = RecordingPreparedMediaService(
+        repositories=repositories,
+        events=events,
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+        media_service=media_service,
+    )
+
+    asyncio.run(
+        service.run_post_turn_jobs(
+            save_id=save.id,
+            player_message_id=player_message.id,
+            narrator_message_id=narrator_message.id,
+        )
+    )
+
+    assert events == ["automatic_media_prepare", "automatic_media"]
+    assert media_service.generated_prepared == media_service.prepared
+    coordinator = _post_turn_jobs(repositories, save.id)[-1]
+    assert _post_turn_child_status(coordinator, "image") == "succeeded"
+
+
+def test_narrator_messages_reuses_snapshot_records_without_requery(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The gate looms in the ash."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        aliases=["Ilyra"],
+        met=True,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[character.id],
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="We approach the gatehouse.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Ilyra studies the gate from the rampart.",
+        provider="fake",
+        model="fake-chat",
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=narrator_message.id,
+        character_id=character.id,
+        visibility="not_visible",
+    )
+    counting = CountingNarrationPersistenceRepositories(repositories.connection)
+    messages = counting.list_messages(save.id)
+    scene_snapshot = counting.get_scene_snapshot(save.id)
+    characters = counting.list_characters(save.id)
+    message_visibility = counting.list_message_visibility(
+        save.id,
+        character_ids={character.id},
+    )
+    baseline_counts = dict(counting.read_counts)
+    player_message = next(
+        message for message in messages if message.role == "player"
+    )
+
+    transcript = chat_service_module._narrator_messages(
+        repositories=counting,
+        messages=messages,
+        context_result=ContextSearchResult(),
+        player_message=player_message,
+        scene_snapshot=scene_snapshot,
+        characters=characters,
+        message_visibility=message_visibility,
+    )
+
+    assert counting.read_counts == baseline_counts
+    assert [message.role for message in transcript] == ["player"]
+    assert transcript[-1].body == "We approach the gatehouse."
+
+
 def test_submit_player_turn_allows_missing_context_search_service_for_narrator_turns(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -18378,7 +18678,7 @@ def test_submit_player_turn_reuses_narration_snapshot_for_prompt_building(
     assert provider.structured_output_requests
     assert provider.chat_requests
     assert counting.read_counts["load_save_details"] <= 4
-    assert counting.read_counts["messages"] <= 3
+    assert counting.read_counts.get("messages", 0) <= 3
     for name in (
         "scene_snapshot",
         "locations",
