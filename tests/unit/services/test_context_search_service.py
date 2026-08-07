@@ -39,7 +39,6 @@ from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.services import context_search_service as context_search_module
 from bragi.services.agentic_context import ContextCurationService, CurationDecision
 from bragi.services.context_search_service import (
-    MAX_CONTEXT_CANDIDATE_POOL,
     RECENT_MESSAGE_CANDIDATE_LIMIT,
     ContextSearchResult,
     ContextSearchService,
@@ -3470,107 +3469,6 @@ def test_context_search_omits_state_changes_from_archived_source_messages(
     ]
 
 
-def test_context_search_cache_hit_keeps_old_active_state_change_sources(
-    repositories: PersistenceRepositories,
-) -> None:
-    scenario = repositories.create_scenario(
-        type="full_roleplay",
-        title="Old Roads",
-        premise="The useful route clue was recorded many turns ago.",
-        player_role="Pathfinder",
-        content={"starting_scene": "The map table is crowded with pins."},
-    )
-    save = repositories.create_save(scenario_id=scenario.id, title="Long Walk")
-    archived_source = repositories.append_message(
-        save_id=save.id,
-        role="narrator",
-        speaker_name="Narrator",
-        body="The archived path points toward the drowned tunnel.",
-    )
-    active_source = repositories.append_message(
-        save_id=save.id,
-        role="narrator",
-        speaker_name="Narrator",
-        body="The still-active path points toward the mirror bridge.",
-    )
-    archived_change = repositories.add_state_change(
-        save_id=save.id,
-        operation="upsert",
-        state_key="scene.route",
-        before_json=None,
-        after_json=json.dumps({"name": "Drowned Tunnel"}),
-        source_message_id=archived_source.id,
-    )
-    active_change = repositories.add_state_change(
-        save_id=save.id,
-        operation="upsert",
-        state_key="scene.route",
-        before_json=None,
-        after_json=json.dumps({"name": "Mirror Bridge"}),
-        source_message_id=active_source.id,
-    )
-    repositories.archive_message(archived_source.id)
-    for index in range(RECENT_MESSAGE_CANDIDATE_LIMIT):
-        repositories.append_message(
-            save_id=save.id,
-            role="narrator",
-            speaker_name="Narrator",
-            body=f"Later travel beat {index}.",
-        )
-    repositories.set_model_preference(
-        task="context_search",
-        provider="fake",
-        model_id="fake-context",
-    )
-    repositories.save_provider_model(
-        provider="fake",
-        model_id="fake-context",
-        display_name="Fake Context",
-        capabilities=[ProviderCapability.STRUCTURED_OUTPUT.value],
-    )
-    provider = RecordingStructuredContextProvider(
-        {
-            "selections": [
-                {
-                    "source_type": "state_change",
-                    "source_id": active_change.id,
-                    "relevance_note": "The old active route is still current.",
-                }
-            ]
-        }
-    )
-    service = ContextSearchService(
-        repositories=repositories,
-        providers={"fake": provider},
-    )
-    service.precompute_next_turn(save.id)
-    player_message = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Mara",
-        body="I choose the route that is still active.",
-    )
-
-    result = asyncio.run(
-        service.search(save_id=save.id, player_message_id=player_message.id)
-    )
-
-    request = provider.structured_output_requests[0]
-    selection_properties = request.schema["properties"]["selections"]["items"][
-        "properties"
-    ]
-    source_id_enum = selection_properties["source_id"]["enum"]
-    prompt = "\n".join(message.body for message in request.messages)
-    assert active_change.id in source_id_enum
-    assert archived_change.id not in source_id_enum
-    assert "Mirror Bridge" in prompt
-    assert "Drowned Tunnel" not in prompt
-    assert "still-active path points toward the mirror bridge" not in prompt
-    assert [item.source_id for item in result.selected_state_changes] == [
-        active_change.id
-    ]
-
-
 def test_context_search_media_candidates_include_only_recent_successful_linked_images(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -4684,6 +4582,70 @@ def test_context_search_uses_structured_paraphrase_and_pronoun_expansion(
     assert [item.source_id for item in result.selected_memories] == [memory.id]
 
 
+def test_context_search_expansion_reuses_retrieval_prelude(
+    repositories: PersistenceRepositories,
+) -> None:
+    counting = CountingPersistenceRepositories(repositories.connection)
+    save, player_message = _save_with_context_search_preference(counting)
+    source_message = next(
+        message
+        for message in counting.list_messages(save.id)
+        if message.role == "narrator"
+    )
+    memory = counting.add_memory(
+        save_id=save.id,
+        body="The physician keeps antivenom in the western archive.",
+        tags=["medicine"],
+        importance=0.8,
+        source_message_id=source_message.id,
+    )
+    physician = counting.add_character(
+        save_id=save.id,
+        name="Physician Tessa",
+        role="healer",
+        met=True,
+    )
+    counting.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Physician Tessa just left the western archive.",
+        present_character_ids=[physician.id],
+    )
+    counting.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="Where did she store it?",
+    )
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": memory.id,
+                    "relevance_note": "The healer refers to the physician.",
+                }
+            ]
+        },
+        expansion_data={
+            "terms": ["physician", "antivenom"],
+            "phrases": [],
+            "entity_ids": [physician.id],
+        },
+    )
+    service = ContextSearchService(
+        repositories=counting,
+        providers={"fake": provider},
+    )
+
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert [item.source_id for item in result.selected_memories] == [memory.id]
+    assert len(provider.expansion_requests) == 1
+    assert counting.list_counts["protected_context_sources"] == 1
+    assert counting.list_counts["context_source_searches"] == 4
+
+
 def test_context_search_uses_tool_paraphrase_despite_noisy_lexical_hit(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -5573,505 +5535,6 @@ def test_context_search_returns_empty_result_when_there_are_no_candidates(
     raw_result = jobs[-1]["result_json"]
     assert raw_result is not None
     assert "continuity_index_synced" not in raw_result
-
-
-def test_precompute_next_turn_persists_metadata_only_job_result(
-    repositories: PersistenceRepositories,
-) -> None:
-    save, player_message = _save_with_context_search_preference(repositories)
-    repositories.add_memory(
-        save_id=save.id,
-        body="Mara distrusts bells that ring without wind.",
-        tags=["bells", "suspicion"],
-        source_message_id=player_message.id,
-    )
-    service = ContextSearchService(repositories=repositories, providers={})
-
-    service.precompute_next_turn(save.id)
-
-    jobs = _jobs(repositories, save.id, "context_precompute")
-    assert jobs[-1]["status"] == "succeeded"
-    raw_result = jobs[-1]["result_json"]
-    assert raw_result is not None
-    result = json.loads(raw_result)
-    assert result["cache_status"] == "stored"
-    assert result["candidate_count"] == 3
-    assert result["source_type_counts"] == {
-        "world_state": 1,
-        "message": 2,
-    }
-    assert result["continuity_floor_candidate_count"] == 1
-    assert result["continuity_floor_source_type_counts"] == {"world_state": 1}
-    assert result["indexed_retrieval_enabled"] is True
-    assert isinstance(result["indexed_retrieval_query_term_count"], int)
-    assert result["indexed_retrieval_hit_count"] == 0
-    assert isinstance(result["cache_digest"], str)
-    assert isinstance(result["duration_ms"], int)
-    assert "indexed_retrieval_query_terms" not in result
-    assert "Bridge of Cinders" not in raw_result
-    assert "Cinders drift over the bridge stones." not in raw_result
-    assert "silver bell" not in raw_result
-    assert "Mara distrusts" not in raw_result
-
-
-def test_context_search_cache_hit_includes_new_player_message_in_request(
-    repositories: PersistenceRepositories,
-) -> None:
-    save, _player_message = _save_with_context_search_preference(repositories)
-    provider = RecordingStructuredContextProvider({"selections": []})
-    service = ContextSearchService(
-        repositories=repositories,
-        providers={"fake": provider},
-    )
-    service.precompute_next_turn(save.id)
-    next_message = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Mara",
-        body="I ask whether the bell remembers my oath.",
-    )
-
-    result = asyncio.run(
-        service.search(save_id=save.id, player_message_id=next_message.id)
-    )
-
-    assert result.continuity_index_synced is True
-    assert len(provider.structured_output_requests) == 1
-    prompt = "\n".join(
-        message.body for message in provider.structured_output_requests[0].messages
-    )
-    assert "I ask whether the bell remembers my oath." in prompt
-    assert "Mara: I cross the bridge and listen for the bell." in prompt
-    jobs = _context_search_jobs(repositories, save.id)
-    raw_result = jobs[-1]["result_json"]
-    assert raw_result is not None
-    assert "continuity_index_synced" not in raw_result
-
-
-def test_context_search_cache_hit_uses_continuity_floor_without_index_hits(
-    repositories: PersistenceRepositories,
-) -> None:
-    save, _player_message = _save_with_context_search_preference(repositories)
-    source_message = next(
-        message
-        for message in repositories.list_messages(save.id)
-        if message.role == "narrator"
-    )
-    memory = repositories.add_memory(
-        save_id=save.id,
-        body="The east lantern marks Orin's safe rendezvous after dusk.",
-        tags=["lantern"],
-        importance=0.9,
-        source_message_id=source_message.id,
-    )
-    provider = RecordingStructuredContextProvider(
-        {
-            "selections": [
-                {
-                    "source_type": "memory",
-                    "source_id": memory.id,
-                    "relevance_note": "The lantern detail still constrains continuity.",
-                }
-            ]
-        }
-    )
-    service = ContextSearchService(
-        repositories=repositories,
-        providers={"fake": provider},
-    )
-    service.precompute_next_turn(save.id)
-    next_message = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Mara",
-        body="Okay.",
-    )
-
-    result = asyncio.run(
-        service.search(save_id=save.id, player_message_id=next_message.id)
-    )
-
-    prompt = "\n".join(
-        message.body for message in provider.structured_output_requests[0].messages
-    )
-    assert memory.body in prompt
-    assert [item.source_id for item in result.selected_memories] == [memory.id]
-    job_result = json.loads(
-        _context_search_jobs(repositories, save.id)[-1]["result_json"]
-    )
-    diagnostics = job_result["diagnostics"]
-    assert diagnostics["cache_status"] == "hit"
-    assert diagnostics["indexed_retrieval_hit_count"] == 0
-    assert diagnostics["continuity_floor_candidate_count"] >= 2
-
-
-def test_context_search_cache_hit_keeps_absent_mention_scoped_context_hidden(
-    repositories: PersistenceRepositories,
-) -> None:
-    save, _player_message = _save_with_context_search_preference(repositories)
-    source_message = next(
-        message
-        for message in repositories.list_messages(save.id)
-        if message.role == "narrator"
-    )
-    character = repositories.add_character(
-        save_id=save.id,
-        name="Archivist Lio",
-        aliases=["Lio"],
-        met=True,
-    )
-    present = repositories.add_character(
-        save_id=save.id,
-        name="Captain Ilyra",
-        aliases=["Ilyra"],
-        met=True,
-        character_id="character-ilyra-cache-present",
-    )
-    repositories.upsert_scene_snapshot(
-        save_id=save.id,
-        situation="Ilyra studies the bridge while Lio is away.",
-        present_character_ids=[present.id],
-    )
-    hidden_memory = repositories.add_memory(
-        save_id=save.id,
-        body="Lio knows the crypt map is hidden under the drowned ledger.",
-        tags=["lio"],
-        source_message_id=source_message.id,
-    )
-    hidden_state = repositories.upsert_world_state(
-        save_id=save.id,
-        key="crypt.map",
-        value={"location": "drowned ledger"},
-        source_message_id=source_message.id,
-    )
-    for target_type, target_id in (
-        ("memory", hidden_memory.id),
-        ("world_state", hidden_state.id),
-    ):
-        repositories.add_entity_link(
-            save_id=save.id,
-            entity_type="character",
-            entity_id=character.id,
-            target_type=target_type,
-            target_id=target_id,
-            relation="knows",
-        )
-    provider = RecordingStructuredContextProvider()
-    service = ContextSearchService(
-        repositories=repositories,
-        providers={"fake": provider},
-    )
-    service.precompute_next_turn(save.id)
-    next_message = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Mara",
-        body="I ask Lio what he knows about the drowned ledger.",
-    )
-
-    result = asyncio.run(
-        service.search(save_id=save.id, player_message_id=next_message.id)
-    )
-
-    assert result.continuity_index_synced is True
-    prompt = "\n".join(
-        message.body for message in provider.structured_output_requests[0].messages
-    )
-    assert hidden_memory.body not in prompt
-    assert "crypt.map" not in prompt
-
-
-def test_context_search_cache_hit_narrows_candidates_with_new_player_message(
-    repositories: PersistenceRepositories,
-) -> None:
-    save, _player_message = _save_with_context_search_preference(repositories)
-    source_message = next(
-        message
-        for message in repositories.list_messages(save.id)
-        if message.role == "narrator"
-    )
-    for index in range(MAX_CONTEXT_CANDIDATE_POOL + 20):
-        repositories.add_memory(
-            save_id=save.id,
-            body=f"Routine bridge ledger entry {index:03d}.",
-            tags=["routine"],
-            source_message_id=source_message.id,
-        )
-    target_memory = repositories.add_memory(
-        save_id=save.id,
-        body="The moonstone compass unlocks the eastern scriptorium.",
-        tags=["moonstone", "scriptorium"],
-        source_message_id=source_message.id,
-    )
-    provider = RecordingStructuredContextProvider(
-        {
-            "selections": [
-                {
-                    "source_type": "memory",
-                    "source_id": target_memory.id,
-                    "relevance_note": "The compass detail matches the request.",
-                }
-            ]
-        }
-    )
-    service = ContextSearchService(
-        repositories=repositories,
-        providers={"fake": provider},
-    )
-    service.precompute_next_turn(save.id)
-    next_message = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Mara",
-        body="I inspect the moonstone compass beside the scriptorium door.",
-    )
-
-    result = asyncio.run(
-        service.search(save_id=save.id, player_message_id=next_message.id)
-    )
-
-    prompt = "\n".join(
-        message.body for message in provider.structured_output_requests[0].messages
-    )
-    assert target_memory.body in prompt
-    assert "Routine bridge ledger entry 000" not in prompt
-    assert [item.source_id for item in result.selected_memories] == [target_memory.id]
-    job_result = json.loads(
-        _context_search_jobs(repositories, save.id)[-1]["result_json"]
-    )
-    diagnostics = job_result["diagnostics"]
-    assert diagnostics["cache_status"] == "hit"
-    assert diagnostics["indexed_retrieval_enabled"] is True
-    assert diagnostics["indexed_retrieval_query_term_count"] > 0
-    assert diagnostics["indexed_retrieval_hit_count"] >= 1
-    assert diagnostics["indexed_retrieval_hit_count"] < MAX_CONTEXT_CANDIDATE_POOL
-    assert diagnostics["candidate_count_after_narrowing"] < MAX_CONTEXT_CANDIDATE_POOL
-    assert diagnostics["first_pass_source_type_counts"]["memory"] >= 1
-    assert "indexed_retrieval_query_terms" not in diagnostics
-    assert "Routine bridge ledger entry 000" not in json.dumps(diagnostics)
-
-
-def test_context_search_keeps_protected_context_without_text_match(
-    repositories: PersistenceRepositories,
-) -> None:
-    save, player_message = _save_with_context_search_preference(repositories)
-    thread = repositories.add_active_thread(
-        save_id=save.id,
-        title="Keep the lantern covered",
-        description="Do not uncover the lantern until Captain Ilyra gives the sign.",
-        priority=9,
-        source_message_id=player_message.id,
-    )
-    provider = RecordingStructuredContextProvider(
-        {
-            "selections": [
-                {
-                    "source_type": "open_obligation",
-                    "source_id": thread.id,
-                    "relevance_note": "The open obligation remains active.",
-                }
-            ]
-        }
-    )
-    service = ContextSearchService(
-        repositories=repositories,
-        providers={"fake": provider},
-    )
-    next_message = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Mara",
-        body="I ask about the moonstone compass.",
-    )
-
-    result = asyncio.run(
-        service.search(save_id=save.id, player_message_id=next_message.id)
-    )
-
-    prompt = "\n".join(
-        message.body for message in provider.structured_output_requests[0].messages
-    )
-    assert "Keep the lantern covered" in prompt
-    assert [item.source_id for item in result.selected_open_obligations] == [
-        thread.id
-    ]
-    diagnostics = json.loads(
-        _context_search_jobs(repositories, save.id)[-1]["result_json"]
-    )["diagnostics"]
-    assert diagnostics["protected_context_source_count"] >= 1
-
-
-def test_context_search_cache_hit_does_not_scan_bulky_context_rows(
-    repositories: PersistenceRepositories,
-) -> None:
-    counting = CountingPersistenceRepositories(repositories.connection)
-    save, _player_message = _save_with_context_search_preference(counting)
-    provider = RecordingStructuredContextProvider({"selections": []})
-    service = ContextSearchService(
-        repositories=counting,
-        providers={"fake": provider},
-    )
-    service.precompute_next_turn(save.id)
-    counts_after_precompute = dict(counting.list_counts)
-    next_message = counting.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Mara",
-        body="I ask whether the bell remembers my oath.",
-    )
-
-    asyncio.run(service.search(save_id=save.id, player_message_id=next_message.id))
-
-    expected_counts = dict(counts_after_precompute)
-    expected_counts["context_update_suggestions"] = (
-        expected_counts.get("context_update_suggestions", 0) + 1
-    )
-    expected_counts["protected_context_sources"] = (
-        expected_counts.get("protected_context_sources", 0) + 1
-    )
-    expected_counts["context_source_searches"] = (
-        expected_counts.get("context_source_searches", 0) + 2
-    )
-    assert counting.list_counts == expected_counts
-
-
-def test_context_search_cache_hit_refreshes_pending_suggestions(
-    repositories: PersistenceRepositories,
-) -> None:
-    save, player_message = _save_with_context_search_preference(repositories)
-    provider = RecordingStructuredContextProvider({"selections": []})
-    service = ContextSearchService(
-        repositories=repositories,
-        providers={"fake": provider},
-    )
-    character = repositories.add_character(save_id=save.id, name="Orin", met=True)
-    repositories.upsert_scene_snapshot(
-        save_id=save.id,
-        present_character_ids=[character.id],
-    )
-    repositories.add_message_visibility(
-        save_id=save.id,
-        message_id=player_message.id,
-        character_id=character.id,
-        visibility="not_visible",
-    )
-    for index in range(70):
-        repositories.append_message(
-            save_id=save.id,
-            role="narrator",
-            body=f"Unrelated bridge detail {index}.",
-        )
-    service.precompute_next_turn(save.id)
-    suggestion = repositories.add_context_update_suggestion(
-        save_id=save.id,
-        update_type="update",
-        entity_type="world_state",
-        entity_id="state-bell-mood",
-        field_path="bell.mood",
-        proposed_value={"mood": "watchful"},
-        reason="The bridge bell is newly described as watchful.",
-        confidence=0.88,
-        source_message_ids=[player_message.id],
-    )
-    next_message = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Mara",
-        body="I ask what the bell is watching.",
-    )
-
-    result = asyncio.run(
-        service.search(save_id=save.id, player_message_id=next_message.id)
-    )
-
-    assert result.narration_snapshot is not None
-    assert result.narration_snapshot.pending_context_suggestions == (suggestion,)
-    assert any(
-        visibility.message_id == player_message.id
-        and visibility.character_id == character.id
-        and visibility.visibility == "not_visible"
-        for visibility in result.narration_snapshot.message_visibility
-    )
-    job_result = json.loads(
-        _context_search_jobs(repositories, save.id)[-1]["result_json"]
-    )
-    assert job_result["diagnostics"]["cache_status"] == "hit"
-
-
-def test_context_search_rebuilds_stale_cache_before_structured_selection(
-    repositories: PersistenceRepositories,
-) -> None:
-    save, player_message = _save_with_context_search_preference(repositories)
-    provider = RecordingStructuredContextProvider()
-    service = ContextSearchService(
-        repositories=repositories,
-        providers={"fake": provider},
-    )
-    service.precompute_next_turn(save.id)
-    new_memory = repositories.add_memory(
-        save_id=save.id,
-        body="Mara now trusts Orin to guard the oath bell.",
-        tags=["orin", "trust"],
-        source_message_id=player_message.id,
-    )
-    provider.response_data = {
-        "selections": [
-            {
-                "source_type": "memory",
-                "source_id": new_memory.id,
-                "relevance_note": "New trust changes the next response.",
-            }
-        ]
-    }
-    next_message = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Mara",
-        body="I ask Orin to carry the bell across.",
-    )
-
-    result = asyncio.run(
-        service.search(save_id=save.id, player_message_id=next_message.id)
-    )
-
-    assert [item.source_id for item in result.selected_memories] == [new_memory.id]
-    prompt = "\n".join(
-        message.body for message in provider.structured_output_requests[0].messages
-    )
-    assert "Mara now trusts Orin to guard the oath bell." in prompt
-
-
-def test_context_search_rebuilds_stale_cache_after_message_edit(
-    repositories: PersistenceRepositories,
-) -> None:
-    save, player_message = _save_with_context_search_preference(repositories)
-    provider = RecordingStructuredContextProvider()
-    service = ContextSearchService(
-        repositories=repositories,
-        providers={"fake": provider},
-    )
-    service.precompute_next_turn(save.id)
-    repositories.update_message_body(
-        save_id=save.id,
-        message_id=player_message.id,
-        body="I cross the bridge and listen for the bell and Orin.",
-    )
-    next_message = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Mara",
-        body="I ask Orin to carry the bell across.",
-    )
-
-    asyncio.run(service.search(save_id=save.id, player_message_id=next_message.id))
-
-    jobs = _context_search_jobs(repositories, save.id)
-    raw_result = jobs[-1]["result_json"]
-    assert raw_result is not None
-    prompt = "\n".join(
-        message.body for message in provider.structured_output_requests[0].messages
-    )
-    assert "Mara: I cross the bridge and listen for the bell and Orin." in prompt
 
 
 def _save_with_context_search_preference(

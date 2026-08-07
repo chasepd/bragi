@@ -5715,6 +5715,122 @@ def test_repositories_apply_message_visibility_before_search_limit(
     assert [hit.record for hit in hits] == [accessible]
 
 
+def test_repositories_summaries_visible_to_characters_batches_visibility(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    public_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The public moonstone archive opens.",
+    )
+    hidden_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="A hidden moonstone rumor circulates.",
+    )
+    later_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The warden closes the archive for the night.",
+    )
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden_message.id,
+        character_id=character.id,
+        visibility="not_visible",
+    )
+    public_summary = repositories.add_summary(
+        save_id=save.id,
+        covers_message_start_id=public_message.id,
+        covers_message_end_id=public_message.id,
+        body="The public archive hours were kept.",
+        provider="fake",
+        model="fake-chat",
+        summary_id="summary-public-archive",
+    )
+    hidden_summary = repositories.add_summary(
+        save_id=save.id,
+        covers_message_start_id=hidden_message.id,
+        covers_message_end_id=later_message.id,
+        body="The hidden rumor was suppressed.",
+        provider="fake",
+        model="fake-chat",
+        summary_id="summary-hidden-rumor",
+    )
+    summaries = (
+        (public_summary.covers_message_start_id, public_summary.covers_message_end_id),
+        (hidden_summary.covers_message_start_id, hidden_summary.covers_message_end_id),
+    )
+
+    visible = repositories.summaries_visible_to_characters(
+        save_id=save.id,
+        summaries=summaries,
+        character_ids={character.id},
+    )
+
+    assert visible == {
+        (
+            public_summary.covers_message_start_id,
+            public_summary.covers_message_end_id,
+        )
+    }
+    for start_id, end_id in summaries:
+        assert repositories.summary_visible_to_characters(
+            save_id=save.id,
+            covers_message_start_id=start_id,
+            covers_message_end_id=end_id,
+            character_ids={character.id},
+        ) == ((start_id, end_id) in visible)
+
+
+def test_repositories_summaries_visible_to_characters_without_scoped_characters(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The beacon is lit.",
+    )
+    summary = repositories.add_summary(
+        save_id=save.id,
+        covers_message_start_id=message.id,
+        covers_message_end_id=message.id,
+        body="The beacon stays lit.",
+        provider="fake",
+        model="fake-chat",
+    )
+
+    visible = repositories.summaries_visible_to_characters(
+        save_id=save.id,
+        summaries=((summary.covers_message_start_id, summary.covers_message_end_id),),
+        character_ids=frozenset(),
+    )
+
+    assert visible == {
+        (summary.covers_message_start_id, summary.covers_message_end_id)
+    }
+
+
 def test_repositories_filter_singular_message_provenance_and_allow_visible_group(
     repositories: PersistenceRepositories,
 ) -> None:

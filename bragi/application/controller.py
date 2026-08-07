@@ -3598,6 +3598,7 @@ class BragiRuntime:
         progress_callback: PostTurnProgressCallback | None = None,
         prepared_action_choices: PreparedActionChoiceGeneration | None = None,
         current_user_id: str | None = None,
+        defer_image_generation: bool = False,
     ) -> RuntimeModel:
         try:
             chat_service = ChatService(
@@ -3620,6 +3621,8 @@ class BragiRuntime:
                 kwargs["progress_callback"] = progress_callback
             if "current_user_id" in parameters:
                 kwargs["current_user_id"] = current_user_id
+            if defer_image_generation and "defer_image_generation" in parameters:
+                kwargs["defer_image_generation"] = True
 
             async def run_prepared_action_choices() -> None:
                 if prepared_action_choices is None:
@@ -4128,22 +4131,6 @@ class BragiRuntime:
         )
         return self.build_model(status=status, active_save_id=save_id)
 
-    async def precompute_next_turn_context(self, save_id: str) -> None:
-        try:
-            precompute = getattr(
-                self.context_search_service,
-                "precompute_next_turn",
-                None,
-            )
-            if callable(precompute):
-                precompute(save_id)
-        except Exception as exc:
-            log_error_event(
-                "runtime.context_precompute_failed",
-                save_id=save_id,
-                **exception_log_fields(exc),
-            )
-
     async def run_context_cleanup(
         self,
         *,
@@ -4212,7 +4199,6 @@ class BragiRuntime:
 
         await self._run_manual_memory_consolidation(save_id, preference=preference)
         maintenance_status = await self._run_manual_character_maintenance(save_id)
-        await self.precompute_next_turn_context(save_id)
         status = (
             "Context cleanup finished: "
             f"{result.applied_actions} changes applied, "

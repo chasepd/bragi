@@ -11857,6 +11857,66 @@ class PersistenceRepositories:
         )
         return hidden is None
 
+    def summaries_visible_to_characters(
+        self,
+        *,
+        save_id: str,
+        summaries: tuple[tuple[str, str], ...],
+        character_ids: set[str] | frozenset[str] | tuple[str, ...],
+    ) -> set[tuple[str, str]]:
+        scoped_character_ids = tuple(sorted(set(character_ids)))
+        if not scoped_character_ids:
+            return set(summaries)
+        endpoint_ids = tuple(
+            dict.fromkeys(
+                message_id
+                for start_id, end_id in summaries
+                for message_id in (start_id, end_id)
+            )
+        )
+        if not endpoint_ids:
+            return set()
+        endpoints = self._fetch_all(
+            f"""
+            SELECT id, rowid AS message_rowid
+            FROM messages
+            WHERE save_id = ? AND id IN ({_placeholders(len(endpoint_ids))})
+            """,
+            (save_id, *endpoint_ids),
+        )
+        endpoint_rowids = {
+            str(row["id"]): int(row["message_rowid"]) for row in endpoints
+        }
+        hidden_rows = self._fetch_all(
+            f"""
+            SELECT message.rowid AS message_rowid
+            FROM message_visibility AS visibility
+            JOIN messages AS message
+              ON message.id = visibility.message_id
+             AND message.save_id = visibility.save_id
+            WHERE visibility.save_id = ?
+              AND visibility.character_id IN (
+                    {_placeholders(len(scoped_character_ids))}
+                  )
+              AND visibility.visibility = 'not_visible'
+            """,
+            (save_id, *scoped_character_ids),
+        )
+        hidden_rowids = {int(row["message_rowid"]) for row in hidden_rows}
+        visible: set[tuple[str, str]] = set()
+        for start_id, end_id in summaries:
+            start_rowid = endpoint_rowids.get(start_id)
+            end_rowid = endpoint_rowids.get(end_id)
+            if start_rowid is None or end_rowid is None:
+                continue
+            if any(
+                min(start_rowid, end_rowid) <= rowid <= max(start_rowid, end_rowid)
+                for rowid in hidden_rowids
+            ):
+                continue
+            visible.add((start_id, end_id))
+        return visible
+
     def save_provider_model(
         self,
         *,

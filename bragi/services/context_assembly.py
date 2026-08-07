@@ -158,40 +158,9 @@ class ContextAssemblyBreakdown:
         }
 
 
-@dataclass(frozen=True)
-class ContextAssemblyResult:
-    scenario_instructions: str
-    current_scene_context: tuple[str, ...]
-    breakdown: ContextAssemblyBreakdown
-
-
 class ContextAssemblyService:
     def __init__(self, repositories: PersistenceRepositories) -> None:
         self.repositories = repositories
-
-    def assemble_narrator_context(self, save_id: str) -> ContextAssemblyResult:
-        details = self.repositories.load_save_details(save_id)
-        if details is None:
-            raise ValueError(f"Unknown save id: {save_id}")
-        sources = (
-            *deterministic_context_sources(
-                repositories=self.repositories,
-                save_id=save_id,
-            ),
-            *pending_context_suggestion_sources(
-                repositories=self.repositories,
-                save_id=save_id,
-            ),
-        )
-        selected_sources, breakdown = apply_context_budget(
-            sources,
-            settings=context_budget_settings(self.repositories, save_id=save_id),
-        )
-        return ContextAssemblyResult(
-            scenario_instructions=compact_scenario_instructions(details.scenario),
-            current_scene_context=tuple(source.text for source in selected_sources),
-            breakdown=breakdown,
-        )
 
     def build_image_scene_context(
         self,

@@ -10359,40 +10359,6 @@ def test_run_context_cleanup_rejects_missing_catalog_row_for_selected_model(
     assert provider.structured_requests == []
 
 
-def test_run_context_cleanup_reports_success_and_precomputes_context(
-    repositories: PersistenceRepositories,
-    tmp_path: Path,
-    monkeypatch: MonkeyPatch,
-) -> None:
-    runtime = _import_runtime_without_gtk(monkeypatch)
-    save_id, _ = _persist_runtime_save(repositories)
-    _configure_context_cleanup_model(repositories)
-    provider = RuntimeStructuredCleanupProvider([{"notes": []}, {"actions": []}])
-    controller = _runtime_controller(
-        runtime,
-        repositories,
-        tmp_path,
-        provider=provider,
-    )
-    precomputed_save_ids: list[str] = []
-
-    async def precompute(save_id: str) -> None:
-        precomputed_save_ids.append(save_id)
-
-    controller.precompute_next_turn_context = precompute
-    controller.load_save(save_id)
-
-    model = asyncio.run(controller.run_context_cleanup())
-
-    assert _error_text(model) == ""
-    assert "Context cleanup finished" in _status_text(model)
-    assert precomputed_save_ids == [save_id]
-    assert [request.schema_name for request in provider.structured_requests] == [
-        "context_cleanup_scan",
-        "context_cleanup_actions",
-    ]
-
-
 def test_run_context_cleanup_uses_phase_specific_model_preferences(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -10650,7 +10616,6 @@ def test_run_context_cleanup_locks_apply_and_finalize_after_provider_calls(
         tmp_path,
         provider=provider,
     )
-    precomputed_save_ids: list[str] = []
 
     original_begin_immediate_transaction = (
         repositories.begin_immediate_transaction
@@ -10703,10 +10668,6 @@ def test_run_context_cleanup_locks_apply_and_finalize_after_provider_calls(
             error=error,
         )
 
-    async def precompute(save_id: str) -> None:
-        assert lock_depth == 0
-        precomputed_save_ids.append(save_id)
-
     monkeypatch.setattr(
         repositories,
         "begin_immediate_transaction",
@@ -10714,14 +10675,12 @@ def test_run_context_cleanup_locks_apply_and_finalize_after_provider_calls(
     )
     monkeypatch.setattr(repositories, "update_job", update_job)
     monkeypatch.setattr(controller, "_save_operation_lock", save_operation_lock)
-    controller.precompute_next_turn_context = precompute
     controller.load_save(save_id)
 
     model = asyncio.run(controller.run_context_cleanup())
 
     assert _error_text(model) == ""
     assert "Context cleanup finished" in _status_text(model)
-    assert precomputed_save_ids == [save_id]
     assert repositories.list_memories(save_id) == []
     assert [request.schema_name for request in provider.structured_requests] == [
         "context_cleanup_scan",

@@ -1321,6 +1321,11 @@ class ChatService:
                     messages=messages,
                     context_result=context_result,
                     player_message=focus_message,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    characters=list(narration_snapshot.characters),
+                    message_visibility=list(
+                        narration_snapshot.message_visibility
+                    ),
                 ),
                 scenario_instructions=budgeted_context.scenario_instructions,
                 user_narration_guidance=_user_narration_guidance(
@@ -1452,7 +1457,10 @@ class ChatService:
         )
         if preference is None:
             raise ValueError("No chat model preference configured")
-        details = self.repositories.load_save_details(save_id)
+        details = self.repositories.load_save_details(
+            save_id,
+            message_limit=RAW_CONTEXT_RECORD_LIMIT,
+        )
         messages = details.messages if details is not None else []
         player_message = next(
             (
@@ -1463,6 +1471,20 @@ class ChatService:
             ),
             None,
         )
+        if player_message is None and details is not None:
+            player_message = next(
+                (
+                    message
+                    for message in (
+                        self.repositories.get_message(
+                            save_id=save_id,
+                            message_id=player_message_id,
+                        ),
+                    )
+                    if message is not None and message.role == source_message_role
+                ),
+                None,
+            )
         if player_message is None:
             raise ValueError(f"Unknown active source message id: {player_message_id}")
         if log_turn_started:
@@ -1963,6 +1985,11 @@ class ChatService:
                     context_result=context_result,
                     player_message=player_message,
                     settings=prose_history_settings,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    characters=list(narration_snapshot.characters),
+                    message_visibility=list(
+                        narration_snapshot.message_visibility
+                    ),
                 ),
                 scenario_instructions=budgeted_context.scenario_instructions,
                 user_narration_guidance=_user_narration_guidance(
@@ -2021,6 +2048,11 @@ class ChatService:
                     context_result=context_result,
                     player_message=player_message,
                     settings=planner_history_settings,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    characters=list(narration_snapshot.characters),
+                    message_visibility=list(
+                        narration_snapshot.message_visibility
+                    ),
                 ),
                 scenario_instructions=(
                     planner_budgeted_context.scenario_instructions
@@ -3884,6 +3916,7 @@ class ChatService:
         world_update_context: PostTurnWorldUpdateContext | None = None,
         verified_coverage: VerifiedPostTurnCoverage | None = None,
         current_user_id: str | None = None,
+        defer_image_generation: bool = False,
     ) -> None:
         boundary = self._coerce_turn_revision(
             turn_revision,
@@ -4264,8 +4297,9 @@ class ChatService:
                 player_message_id=player_message_id,
                 narrator_message_id=narrator_message_id,
             ),
-            "image": lambda: self._generate_prepared_automatic_image_if_due(
-                prepared_image,
+            "image": lambda: self._generate_automatic_image_after_turn_step(
+                prepared_image=prepared_image,
+                defer_image_generation=defer_image_generation,
                 current_user_id=current_user_id,
             ),
         }
@@ -6308,6 +6342,74 @@ class ChatService:
             )
             return "failed"
 
+    async def _generate_automatic_image_after_turn_step(
+        self,
+        *,
+        prepared_image: object | None,
+        defer_image_generation: bool,
+        current_user_id: str | None,
+    ) -> str | _PostTurnStepResult:
+        if prepared_image is None:
+            return "skipped"
+        if not defer_image_generation:
+            return await self._generate_prepared_automatic_image_if_due(
+                prepared_image,
+                current_user_id=current_user_id,
+            )
+        self._spawn_deferred_automatic_image_generation(
+            prepared_image=prepared_image,
+            current_user_id=current_user_id,
+        )
+        return _PostTurnStepResult(
+            "queued",
+            {
+                "deferred_to_background": True,
+                "source_message_id": getattr(prepared_image, "source_message_id", None),
+                "media_type": getattr(prepared_image, "media_type", None),
+            },
+        )
+
+    def _spawn_deferred_automatic_image_generation(
+        self,
+        *,
+        prepared_image: object | None,
+        current_user_id: str | None,
+    ) -> asyncio.Task[str] | None:
+        if prepared_image is None:
+            return None
+
+        async def run_deferred_generation() -> str:
+            return await self._generate_prepared_automatic_image_if_due(
+                prepared_image,
+                current_user_id=current_user_id,
+            )
+
+        task = asyncio.create_task(run_deferred_generation())
+
+        def generation_done(done_task: asyncio.Task[str]) -> None:
+            try:
+                status = done_task.result()
+            except asyncio.CancelledError:
+                log_event(
+                    "chat.automatic_image_generation_cancelled",
+                    save_id=getattr(prepared_image, "save_id", None),
+                )
+            except Exception as exc:
+                log_error_event(
+                    "chat.automatic_image_failed",
+                    save_id=getattr(prepared_image, "save_id", None),
+                    **exception_log_fields(exc),
+                )
+            else:
+                log_event(
+                    "chat.automatic_image_generation_completed",
+                    save_id=getattr(prepared_image, "save_id", None),
+                    status=status,
+                )
+
+        task.add_done_callback(generation_done)
+        return task
+
     async def _prune_state_if_configured(self, *, save_id: str) -> str:
         preference = roleplay_model_preference(
             repositories=self.repositories,
@@ -7567,19 +7669,36 @@ def _narrator_messages(
     context_result: ContextSearchResult,
     player_message: MessageRecord,
     settings: ChatHistoryWindowSettings | None = None,
+    scene_snapshot: SceneSnapshotRecord | None = None,
+    characters: list[CharacterRecord] | None = None,
+    message_visibility: list[MessageVisibilityRecord] | None = None,
 ) -> tuple[ChatMessage, ...]:
+    snapshot = (
+        scene_snapshot
+        if scene_snapshot is not None
+        else repositories.get_scene_snapshot(player_message.save_id)
+    )
+    character_records = (
+        characters
+        if characters is not None
+        else repositories.list_characters(player_message.save_id)
+    )
     turn_scope = character_scope_for_turn(
-        scene_snapshot=repositories.get_scene_snapshot(player_message.save_id),
-        characters=repositories.list_characters(player_message.save_id),
+        scene_snapshot=snapshot,
+        characters=character_records,
         latest_player_message=player_message.body,
     )
-    message_visibility = (
-        repositories.list_message_visibility(
-            player_message.save_id,
-            character_ids=turn_scope.present_character_ids,
+    visibility_records = (
+        message_visibility
+        if message_visibility is not None
+        else (
+            repositories.list_message_visibility(
+                player_message.save_id,
+                character_ids=turn_scope.present_character_ids,
+            )
+            if turn_scope.present_character_ids
+            else []
         )
-        if turn_scope.present_character_ids
-        else []
     )
     prior_messages = [
         message
@@ -7588,7 +7707,7 @@ def _narrator_messages(
         if message_visible_to_present_characters(
             message_id=message.id,
             present_character_ids=turn_scope.present_character_ids,
-            message_visibility=message_visibility,
+            message_visibility=visibility_records,
         )
     ]
     baseline_ids = _recent_transcript_message_ids(
@@ -9817,14 +9936,22 @@ def _budgeted_narrator_context(
         if narration_snapshot is not None
         else tuple(repositories.list_summaries(save_id))
     )
+    present_character_ids = frozenset(
+        snapshot.present_character_ids if snapshot is not None else ()
+    )
+    visible_summary_keys = repositories.summaries_visible_to_characters(
+        save_id=save_id,
+        summaries=tuple(
+            (summary.covers_message_start_id, summary.covers_message_end_id)
+            for summary in summary_records
+        ),
+        character_ids=present_character_ids,
+    )
     visible_summary_records = tuple(
         summary
         for summary in summary_records
-        if _summary_visible_to_present_characters(
-            repositories=repositories,
-            summary=summary,
-            scene_snapshot=snapshot,
-        )
+        if (summary.covers_message_start_id, summary.covers_message_end_id)
+        in visible_summary_keys
     )
     deterministic_sources = deterministic_context_sources(
         repositories=repositories,
@@ -10638,23 +10765,6 @@ def _latest_summary_sources(
             reason="latest rolling summary",
             always_include=True,
         ),
-    )
-
-
-def _summary_visible_to_present_characters(
-    *,
-    repositories: PersistenceRepositories,
-    summary: SummaryRecord,
-    scene_snapshot: SceneSnapshotRecord | None,
-) -> bool:
-    present_character_ids = frozenset(
-        scene_snapshot.present_character_ids if scene_snapshot is not None else ()
-    )
-    return repositories.summary_visible_to_characters(
-        save_id=summary.save_id,
-        covers_message_start_id=summary.covers_message_start_id,
-        covers_message_end_id=summary.covers_message_end_id,
-        character_ids=present_character_ids,
     )
 
 

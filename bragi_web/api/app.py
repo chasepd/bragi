@@ -9130,6 +9130,11 @@ async def _run_post_turn_jobs_with_ordered_progress(
             "current_user_id",
         ):
             kwargs["current_user_id"] = current_user_id
+        if _call_accepts_keyword(
+            state.runtime.run_post_turn_jobs,
+            "defer_image_generation",
+        ):
+            kwargs["defer_image_generation"] = True
         return await state.runtime.run_post_turn_jobs(**kwargs)
     finally:
         progress_queue.put_nowait(done)
