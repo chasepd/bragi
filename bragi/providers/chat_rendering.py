@@ -239,10 +239,7 @@ def _data_context_block(request: ChatRequest) -> str:
         _pending_context_review_section(request.pending_context_suggestions),
         _director_pressure_section(request.director_pressure),
         _character_action_plan_section(request.character_action_plans),
-        _section(
-            "Narration brief",
-            (request.narration_brief,) if request.narration_brief.strip() else (),
-        ),
+        _narration_brief_section(request),
         _section(
             "Scenario context",
             (request.scenario_instructions,)
@@ -319,6 +316,17 @@ def _character_action_plan_section(values: tuple[str, ...]) -> str:
         "canonical facts."
     )
     return _section("Character action plans", (caveat, *values))
+
+
+def _narration_brief_section(request: ChatRequest) -> str:
+    if not request.narration_brief.strip():
+        return ""
+    caveat = (
+        "Authoritative plan for this narrator response. Any player-agency "
+        "constraints inside bind only the player character's uncommitted "
+        "choices; NPC and world reactions are never constrained."
+    )
+    return _section("Narration brief", (caveat, request.narration_brief))
 
 
 def _director_pressure_section(value: str) -> str:

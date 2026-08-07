@@ -51,13 +51,19 @@ def test_compact_scenario_instructions_keeps_setup_compact() -> None:
     assert "Player role: Signal warden" in instructions
     assert "Narrator control rule" in instructions
     assert (
-        "Do not advance time in ways that make the player character act"
+        "player agency means the player character's decisions, words, and "
+        "uncommitted actions belong to the player"
+    ) in instructions
+    assert "such reactions are never player-agency violations" in instructions
+    assert "pull out of the hug and walk away" in instructions
+    assert (
+        "must not invent or advance uncommitted player actions"
         in instructions
     )
     assert "texting, sleeping, traveling, arriving" in instructions
     assert (
-        "Treat stated intent, future-tense plans, NPC-provided directions, and "
-        "in-progress movement as not enough to complete the player's travel"
+        "Stated intent, future-tense plans, NPC-provided directions, and "
+        "in-progress movement are not enough to complete the player's travel"
     ) in instructions
     assert "arrival, entry, knock, touch, or other next action" in instructions
     assert "Tone/style: Tense frontier mystery." in instructions

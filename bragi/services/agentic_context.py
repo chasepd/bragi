@@ -277,6 +277,7 @@ class NarratorVerificationResult:
     post_turn_update_needed: bool = True
     npc_agency_issues: tuple[str, ...] = ()
     npc_passivity_issues: tuple[str, ...] = ()
+    player_choice_violations: tuple[str, ...] = ()
     npc_knowledge_leaks: tuple[NpcKnowledgeLeak, ...] = ()
     commit_decisions: tuple[NarratorCommitDecision, ...] = ()
     dating_route_stage_violations: tuple[DatingRouteStageViolation, ...] = ()
@@ -1602,7 +1603,11 @@ def format_narrator_message_spec(spec: NarratorMessageSpec) -> str:
     if spec.avoid:
         parts.append("Avoid: " + "; ".join(spec.avoid))
     if spec.agency_constraints:
-        parts.append("Player-agency constraints:")
+        parts.append(
+            "Player-agency constraints (bind only the player character's "
+            "uncommitted choices; NPC and world reactions are not "
+            "constrained):"
+        )
         for constraint in spec.agency_constraints:
             parts.append(_format_agency_constraint(constraint))
     if spec.uncertainties:
@@ -2746,6 +2751,11 @@ def _planner_schema(
     agency_constraint = {
         "type": "object",
         "additionalProperties": False,
+        "description": (
+            "Guards only the player character's uncommitted choices, words, "
+            "or actions. Never phrase a constraint as an NPC or world "
+            "behavior restriction; NPC reactions belong in npc_intents."
+        ),
         "properties": {
             "constraint": {"type": "string"},
             "reason": {"type": "string"},
@@ -2892,7 +2902,13 @@ def _planner_messages(request: ChatRequest) -> tuple[ChatMessage, ...]:
                 "not write final prose. Use the enforced schema. Include "
                 "ordered narrative beats, required facts or reveals, player "
                 "agency constraints, unresolved uncertainties, and any "
-                "state-affecting commit candidates as candidates only. Give "
+                "state-affecting commit candidates as candidates only. "
+                "Player agency constraints guard only the player character's "
+                "uncommitted choices, words, and actions; they never restrict "
+                "how NPCs or the world may react, so never phrase a constraint "
+                "as an NPC or world behavior restriction. NPC and world "
+                "reactions belong in npc_intents, not in agency constraints. "
+                "Give "
                 "each commit candidate a stable candidate_id, candidate_type, "
                 "valid evidence_source_ids, and evidence_quote copied exactly "
                 "from a cited source. For "
@@ -3081,6 +3097,24 @@ def _validated_narrator_message_spec(
         )
         for index, fact in enumerate(spec.required_facts)
     )
+    npc_names = tuple(
+        sorted(
+            {
+                character.name
+                for character in inventory.characters
+                if character.name and not character.is_player_character
+            }
+        )
+    )
+    player_names = tuple(
+        sorted(
+            {
+                character.name
+                for character in inventory.characters
+                if character.name and character.is_player_character
+            }
+        )
+    )
     agency_constraints = tuple(
         replace(
             constraint,
@@ -3093,6 +3127,13 @@ def _validated_narrator_message_spec(
             ),
         )
         for index, constraint in enumerate(spec.agency_constraints)
+        if not _reject_npc_restricting_agency_constraint(
+            constraint,
+            npc_names=npc_names,
+            player_names=player_names,
+            index=index,
+            rejections=rejections,
+        )
     )
     return replace(
         spec,
@@ -3105,6 +3146,58 @@ def _validated_narrator_message_spec(
         planner_rejections=tuple(rejections),
         evidence_source_text_by_id=dict(inventory.source_text_by_id),
     )
+
+
+_AGENCY_CONSTRAINT_PROHIBITION_RE = re.compile(
+    r"\b(?:must not|mustn'?t|cannot|can'?t|won'?t|will not|would not"
+    r"|wouldn'?t|shall not|shan'?t|may not|should not|shouldn'?t|does not"
+    r"|doesn'?t|do not|don'?t|never|is not allowed|isn'?t allowed"
+    r"|are not allowed|not allowed to|forbidden|prohibited|not permitted)\b",
+    re.IGNORECASE,
+)
+
+
+def _reject_npc_restricting_agency_constraint(
+    constraint: PlayerAgencyConstraint,
+    *,
+    npc_names: tuple[str, ...],
+    player_names: tuple[str, ...],
+    index: int,
+    rejections: list[PlannerRejection],
+) -> bool:
+    if not npc_names:
+        return False
+    if _AGENCY_CONSTRAINT_PROHIBITION_RE.search(constraint.constraint) is None:
+        return False
+    if not any(
+        re.search(
+            rf"\b{re.escape(name)}\b",
+            constraint.constraint,
+            re.IGNORECASE,
+        )
+        for name in npc_names
+    ):
+        return False
+    if any(
+        re.search(
+            rf"\b{re.escape(name)}\b",
+            constraint.constraint,
+            re.IGNORECASE,
+        )
+        for name in player_names
+    ):
+        return False
+    rejections.append(
+        PlannerRejection(
+            candidate_id=f"agency_constraint:{index}",
+            candidate_type="agency_constraint",
+            domain="player_agency",
+            reason="agency_constraint_restricts_npc_behavior",
+            field="constraint",
+            rejected_value=constraint.constraint,
+        )
+    )
+    return True
 
 
 def _validated_evidence_ids(
@@ -3496,6 +3589,11 @@ def _verifier_schema() -> dict[str, object]:
                 "items": {"type": "string"},
                 "maxItems": 8,
             },
+            "player_choice_violations": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 8,
+            },
             "npc_knowledge_leaks": {
                 "type": "array",
                 "items": leak,
@@ -3540,7 +3638,14 @@ def _verifier_messages(
                 "Verify whether the narrator response follows the message spec. "
                 "Use the enforced schema. Flag unsupported additions, missed "
                 "must-say beats, tone drift, player-agency violations, and "
-                "NPC knowledge leaks. Also flag unearned NPC compliance in "
+                "NPC knowledge leaks. A player-agency violation is narration "
+                "that decides or commits the player character's uncommitted "
+                "choices, words, or actions, for example 'you decide to walk "
+                "away.' NPC and world reactions that change the situation "
+                "around the player, such as refusing, interrupting, leaving, "
+                "or escalating, are never player-agency violations; do not "
+                "flag them as such. Report genuine violations in "
+                "player_choice_violations. Also flag unearned NPC compliance in "
                 "npc_agency_issues: helping, revealing, forgiving, joining, "
                 "surrendering, flirting, or changing allegiance without support "
                 "from motives, relationship, leverage, pressure, or recent "
@@ -3610,6 +3715,9 @@ def _verification_result_from_data(
 ) -> NarratorVerificationResult:
     npc_agency_issues = _string_tuple(data.get("npc_agency_issues"))
     npc_passivity_issues = _string_tuple(data.get("npc_passivity_issues"))
+    player_choice_violations = _string_tuple(
+        data.get("player_choice_violations")
+    )
     dating_route_stage_violations = _dating_route_stage_violations_from_data(
         data.get("dating_route_stage_violations")
     )
@@ -3617,6 +3725,7 @@ def _verification_result_from_data(
         passed=bool(data.get("passed"))
         and not npc_agency_issues
         and not npc_passivity_issues
+        and not player_choice_violations
         and not dating_route_stage_violations,
         issues=_string_tuple(data.get("issues")),
         retry_feedback=_string(data.get("retry_feedback")),
@@ -3624,6 +3733,7 @@ def _verification_result_from_data(
         post_turn_update_needed=data.get("post_turn_update_needed") is not False,
         npc_agency_issues=npc_agency_issues,
         npc_passivity_issues=npc_passivity_issues,
+        player_choice_violations=player_choice_violations,
         npc_knowledge_leaks=_npc_knowledge_leaks_from_data(
             data.get("npc_knowledge_leaks"),
         ),
