@@ -22,13 +22,17 @@ from bragi.providers.contracts import (
     StructuredOutputResponse,
 )
 from bragi.services.character_action_planning_service import (
+    CHARACTER_ACTION_PLANNING_BATCH_MAX_CHARACTERS,
     CHARACTER_ACTION_PLANNING_ENABLED_SETTING,
     CHARACTER_ACTION_PLANNING_MAX_CONCURRENCY_SETTING,
     CHARACTER_ACTION_PLANNING_TASK,
     CharacterActionPlanningService,
+    _character_presence_batch_messages,
     _character_presence_messages,
+    _planning_batch_evidence_sources,
     _planning_characters_for_turn,
     _planning_evidence_sources,
+    _presence_assessments_from_batch_data,
     character_action_planning_enabled,
     format_character_turn_assessment,
 )
@@ -89,25 +93,28 @@ def test_character_action_planning_updates_presence_and_returns_present_plans(
     assert characters["ren"] not in snapshot.present_character_ids
     assert [request.schema_name for request in provider.structured_output_requests] == [
         "character_presence_assessment",
-        "character_presence_assessment",
         "character_intent_plan",
     ]
-    assert "Decide only whether this character is present" in (
+    assert "Assess each listed character's scene presence" in (
         provider.structured_output_requests[0].messages[0].body
     )
     intent_prompt = provider.structured_output_requests[-1].messages[0].body
     assert "Favor visible initiative over waiting for the player" in intent_prompt
     assert "interrupt, demand, refuse, leave, escalate" in intent_prompt
-    assert "character_id" in provider.structured_output_requests[0].schema[
-        "properties"
-    ]
-    schema = provider.structured_output_requests[0].schema
+    presence_schema = provider.structured_output_requests[0].schema
+    assert presence_schema["type"] == "object"
+    item_schema = presence_schema["properties"]["assessments"]["items"]
+    assert "character_id" in item_schema["properties"]
     for field in (
         "enters_scene",
         "leaves_scene",
     ):
-        assert field in schema["properties"]
-        assert field in schema["required"]
+        assert field in item_schema["properties"]
+        assert field in item_schema["required"]
+    assert set(item_schema["properties"]["character_id"]["enum"]) == {
+        characters["mara"],
+        characters["ren"],
+    }
     intent_schema = provider.structured_output_requests[-1].schema
     for field in (
         "learned_memory_candidates",
@@ -116,6 +123,197 @@ def test_character_action_planning_updates_presence_and_returns_present_plans(
     ):
         assert field in intent_schema["properties"]
         assert field in intent_schema["required"]
+
+
+def test_character_action_planning_batch_presence_prompt_lists_all_characters(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id, characters = _create_save_with_characters(repositories)
+    provider = CharacterDecisionProvider(
+        {
+            "Mara": {
+                "present": True,
+                "action": "Mara stays by the lantern.",
+                "intent": "keep watch",
+                "reason": "Mara is in the scene.",
+                "confidence": 0.9,
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
+            },
+            "Ren": {
+                "present": False,
+                "action": "",
+                "intent": "",
+                "reason": "Ren is offscreen.",
+                "confidence": 0.8,
+                "evidence_source_ids": ["character:ren"],
+            },
+        }
+    )
+    _configure_planning(repositories)
+
+    asyncio.run(
+        CharacterActionPlanningService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).plan_for_turn(save_id=save_id, player_message_id=player_message_id)
+    )
+
+    presence_body = provider.structured_output_requests[0].messages[-1].body
+    assert "Character: Mara" in presence_body
+    assert "Character: Ren" in presence_body
+    assert f"character_id: {characters['mara']}" in presence_body
+    assert f"character_id: {characters['ren']}" in presence_body
+    assert "Evidence sources:" in presence_body
+    assert "scene_snapshot:snapshot-1" in presence_body
+    assert f"character:{characters['ren']}" in presence_body
+
+
+def test_character_action_planning_batch_omitted_character_is_failed(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id, characters = _create_save_with_characters(repositories)
+    provider = CharacterDecisionProvider(
+        {
+            "Mara": {
+                "present": True,
+                "action": "Mara keeps watch.",
+                "intent": "hold the room",
+                "reason": "Mara is in the scene.",
+                "confidence": 0.88,
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
+            }
+        }
+    )
+    _configure_planning(repositories)
+
+    result = asyncio.run(
+        CharacterActionPlanningService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).plan_for_turn(save_id=save_id, player_message_id=player_message_id)
+    )
+
+    assert result.failed_character_ids == (characters["ren"],)
+    assert [plan.character_id for plan in result.plans] == [characters["mara"]]
+    assert len(provider.structured_output_requests) == 2
+    assert [
+        request.schema_name for request in provider.structured_output_requests
+    ] == ["character_presence_assessment", "character_intent_plan"]
+
+
+def test_character_action_planning_batch_failure_falls_back_to_per_character_calls(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id, characters = _create_save_with_characters(repositories)
+    provider = BatchFailThenPerCharacterProvider(
+        {
+            "Mara": {
+                "present": True,
+                "action": "Mara keeps watch.",
+                "intent": "hold the room",
+                "reason": "Mara is in the scene.",
+                "confidence": 0.88,
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
+            },
+            "Ren": {
+                "present": False,
+                "action": "",
+                "intent": "",
+                "reason": "Ren is offscreen.",
+                "confidence": 0.8,
+                "evidence_source_ids": ["character:ren"],
+            },
+        },
+        fail_batch=True,
+    )
+    _configure_planning(repositories)
+
+    result = asyncio.run(
+        CharacterActionPlanningService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).plan_for_turn(save_id=save_id, player_message_id=player_message_id)
+    )
+
+    assert provider.batch_attempts == 1
+    presence_requests = [
+        request
+        for request in provider.structured_output_requests
+        if request.schema_name == "character_presence_assessment"
+        and not _is_batch_presence_request(request)
+    ]
+    assert len(presence_requests) == 2
+    assert [plan.character_id for plan in result.plans] == [characters["mara"]]
+
+
+def test_character_action_planning_falls_back_to_per_character_beyond_batch_cap(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A storm tower waits in the fog.",
+        player_role="Signal keeper",
+        content={"player_character_name": "Ily"},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Lantern Keep")
+    repositories.add_character(
+        save_id=save.id,
+        name="Ily",
+        met=True,
+        is_player_character=True,
+    )
+    names = tuple(
+        f"Crew {index}"
+        for index in range(CHARACTER_ACTION_PLANNING_BATCH_MAX_CHARACTERS + 1)
+    )
+    characters = [
+        repositories.add_character(save_id=save.id, name=name, met=True)
+        for name in names
+    ]
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="A large crew gathers in the gallery.",
+        present_character_ids=[character.id for character in characters],
+    )
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Ily",
+        body="I ask everyone what happens next.",
+    )
+    provider = CharacterDecisionProvider(
+        {
+            name: {
+                "present": False,
+                "action": "",
+                "intent": "",
+                "reason": "The crew waits quietly.",
+                "confidence": 0.5,
+                "evidence_source_ids": [],
+            }
+            for name in names
+        }
+    )
+    _configure_planning(repositories)
+
+    result = asyncio.run(
+        CharacterActionPlanningService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).plan_for_turn(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    presence_requests = [
+        request
+        for request in provider.structured_output_requests
+        if request.schema_name == "character_presence_assessment"
+    ]
+    assert len(presence_requests) == len(characters)
+    assert all(
+        not _is_batch_presence_request(request) for request in presence_requests
+    )
+    assert result.plans == ()
 
 
 def test_character_action_planning_skips_presence_update_without_grounded_quote(
@@ -505,7 +703,6 @@ def test_character_action_planning_includes_named_offscreen_possible_entrant(
     ]
     assert requested_names == [
         "Mara",
-        "Archivist Ren",
         "Mara",
         "Archivist Ren",
     ]
@@ -1209,7 +1406,7 @@ def test_character_action_planning_uses_configured_concurrency_cap(
                 "intent": "respond to the player",
                 "reason": "The player asked the crew.",
                 "confidence": 0.75,
-                "evidence_source_ids": [],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             }
             for name in names
         },
@@ -1232,7 +1429,7 @@ def test_character_action_planning_uses_configured_concurrency_cap(
         )
         await asyncio.wait_for(provider.expected_active.wait(), timeout=1)
         assert provider.max_active == 2
-        assert len(provider.structured_output_requests) == 2
+        assert len(provider.structured_output_requests) == 3
         provider.release.set()
         result = await task
         assert len(result.decisions) == len(names)
@@ -1446,6 +1643,115 @@ def test_storyteller_planning_includes_all_characters_and_excludes_direction_evi
     assert "not canonical evidence" in prompt
 
 
+def test_character_action_planning_batch_prompt_excludes_direction_and_player_text(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Ceremony",
+        premise="A rival waits in the wings.",
+        player_role="",
+        content={},
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Act One")
+    rival = repositories.add_character(save_id=save.id, name="The Rival")
+    witness = repositories.add_character(save_id=save.id, name="The Witness")
+    direction = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="Have the rival interrupt the ceremony.",
+    )
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The orchestra prepares for the final movement.",
+    )
+    evidence_sources = _planning_batch_evidence_sources(
+        repositories=repositories,
+        save_id=save.id,
+        characters=(rival, witness),
+        source_message=direction,
+        messages=(direction, narrator),
+    )
+    prompts = _character_presence_batch_messages(
+        repositories=repositories,
+        save_id=save.id,
+        characters=(rival, witness),
+        source_message=direction,
+        messages=(direction, narrator),
+        evidence_sources=evidence_sources,
+    )
+    prompt = "\n".join(message.body for message in prompts)
+    assert "Character: The Rival" in prompt
+    assert "Character: The Witness" in prompt
+    assert "Player character:" not in prompt
+    assert "Dating route pacing" not in prompt
+    assert f"message:{direction.id}" not in evidence_sources
+    assert f"message:{narrator.id}" in evidence_sources
+    assert "non-diegetic story direction" in prompt
+    assert "not canonical evidence" in prompt
+
+
+def test_presence_assessments_from_batch_data_skips_invalid_items(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id, characters = _create_save_with_characters(repositories)
+    source_message = repositories.get_message(
+        save_id=save_id,
+        message_id=player_message_id,
+    )
+    assert source_message is not None
+    character_records = {
+        character.id: character
+        for character in repositories.list_characters(save_id)
+    }
+    evidence_sources = _planning_batch_evidence_sources(
+        repositories=repositories,
+        save_id=save_id,
+        characters=(
+            character_records[characters["mara"]],
+            character_records[characters["ren"]],
+        ),
+        source_message=source_message,
+        messages=tuple(repositories.list_messages(save_id)),
+    )
+    mara_id = characters["mara"]
+    ren_id = characters["ren"]
+    all_characters = {
+        character.id: character
+        for character in repositories.list_characters(save_id)
+    }
+    mara_name = all_characters[mara_id].name
+    valid_item = {
+        "character_id": mara_id,
+        "present": True,
+        "enters_scene": False,
+        "leaves_scene": False,
+        "reason": "Mara is in the scene.",
+        "confidence": 0.9,
+        "evidence_source_ids": ["scene_snapshot:snapshot-1"],
+        "evidence_quote": "Mara steadies the storm lantern",
+    }
+
+    assessments = _presence_assessments_from_batch_data(
+        {
+            "assessments": [
+                valid_item,
+                {"character_id": ren_id, "present": "not-a-bool"},
+                {"character_id": "unknown-character-id", "present": True},
+                "not-a-dict",
+                valid_item,
+            ]
+        },
+        characters_by_id=all_characters,
+        evidence_sources=evidence_sources,
+    )
+
+    assert set(assessments) == {mara_id}
+    assert assessments[mara_id].character_name == mara_name
+
+
 def test_character_action_planning_can_be_disabled_per_save(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -1526,6 +1832,13 @@ class CharacterDecisionProvider:
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_output_requests.append(request)
+        if _is_batch_presence_request(request):
+            return _batch_presence_response(
+                self,
+                request,
+                decisions_by_name=self.decisions_by_name,
+                fail_names=self.fail_names,
+            )
         body = request.messages[-1].body
         name = _requested_character_name(body)
         if name in self.fail_names:
@@ -1539,6 +1852,28 @@ class CharacterDecisionProvider:
             model_id=request.model_id,
             token_usage={"total": 7},
         )
+
+
+class BatchFailThenPerCharacterProvider(CharacterDecisionProvider):
+    def __init__(
+        self,
+        decisions_by_name: dict[str, dict[str, object]],
+        *,
+        fail_batch: bool,
+    ) -> None:
+        super().__init__(decisions_by_name)
+        self.fail_batch = fail_batch
+        self.batch_attempts = 0
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        if _is_batch_presence_request(request):
+            self.batch_attempts += 1
+            if self.fail_batch:
+                raise ValueError("batch presence provider failed")
+        return await super().generate_structured_output(request)
 
 
 class SequenceCharacterDecisionProvider(CharacterDecisionProvider):
@@ -1558,6 +1893,16 @@ class SequenceCharacterDecisionProvider(CharacterDecisionProvider):
             raise AssertionError("no scripted character decision remaining")
         data = dict(self.decisions.pop(0))
         data = _with_allowed_evidence_ids_and_quote(data, request)
+        if _is_batch_presence_request(request):
+            body = request.messages[-1].body
+            pairs = _requested_batch_character_ids(body)
+            data["character_id"] = next(iter(pairs.values()))
+            return StructuredOutputResponse(
+                data={"assessments": [data]},
+                provider=request.provider,
+                model_id=request.model_id,
+                token_usage={"total": 7},
+            )
         data["character_id"] = request.schema["properties"]["character_id"]["enum"][0]
         return StructuredOutputResponse(
             data=data,
@@ -1582,6 +1927,13 @@ class EchoHiddenPromptDecisionProvider(CharacterDecisionProvider):
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_output_requests.append(request)
+        if _is_batch_presence_request(request):
+            return _batch_presence_response(
+                self,
+                request,
+                decisions_by_name=self.decisions_by_name,
+                fail_names=set(),
+            )
         body = request.messages[-1].body
         name = _requested_character_name(body)
         data = dict(self.decisions_by_name[name])
@@ -1619,6 +1971,13 @@ class BlockingCharacterDecisionProvider(CharacterDecisionProvider):
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_output_requests.append(request)
+        if _is_batch_presence_request(request):
+            return _batch_presence_response(
+                self,
+                request,
+                decisions_by_name=self.decisions_by_name,
+                fail_names=set(),
+            )
         body = request.messages[-1].body
         name = _requested_character_name(body)
         self.active += 1
@@ -1638,6 +1997,35 @@ class BlockingCharacterDecisionProvider(CharacterDecisionProvider):
             model_id=request.model_id,
             token_usage={"total": 7},
         )
+
+
+def _is_batch_presence_request(request: StructuredOutputRequest) -> bool:
+    return "assessments" in request.schema.get("properties", {})
+
+
+def _batch_presence_response(
+    provider: CharacterDecisionProvider,
+    request: StructuredOutputRequest,
+    *,
+    decisions_by_name: dict[str, dict[str, object]],
+    fail_names: set[str],
+) -> StructuredOutputResponse:
+    body = request.messages[-1].body
+    character_ids_by_name = _requested_batch_character_ids(body)
+    items: list[dict[str, object]] = []
+    for name, character_id in character_ids_by_name.items():
+        if name in fail_names or name not in decisions_by_name:
+            continue
+        data = dict(decisions_by_name[name])
+        data = _with_allowed_evidence_ids_and_quote(data, request)
+        data["character_id"] = character_id
+        items.append(data)
+    return StructuredOutputResponse(
+        data={"assessments": items},
+        provider=request.provider,
+        model_id=request.model_id,
+        token_usage={"total": 7},
+    )
 
 
 def _configure_planning(repositories: PersistenceRepositories) -> None:
@@ -1720,6 +2108,18 @@ def _requested_character_name(body: str) -> str:
         if line.startswith("Character: "):
             return line.removeprefix("Character: ").strip()
     raise AssertionError("request did not include a Character line")
+
+
+def _requested_batch_character_ids(body: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    current_name: str | None = None
+    for line in body.splitlines():
+        if line.startswith("Character: "):
+            current_name = line.removeprefix("Character: ").strip()
+        elif line.startswith("character_id: ") and current_name is not None:
+            pairs[current_name] = line.removeprefix("character_id: ").strip()
+            current_name = None
+    return pairs
 
 
 def _with_allowed_evidence_ids_and_quote(

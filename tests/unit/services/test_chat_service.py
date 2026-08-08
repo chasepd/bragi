@@ -550,6 +550,20 @@ class RecordingCharacterActionChatProvider(RecordingChatProvider):
             )
         self.events.append(request.schema_name)
         self.structured_output_requests.append(request)
+        if "assessments" in request.schema.get("properties", {}):
+            body = request.messages[-1].body
+            items: list[dict[str, object]] = []
+            for name, character_id in _requested_batch_character_ids(body).items():
+                data = dict(self.decisions_by_name[name])
+                data = _with_allowed_character_action_evidence_ids(data, request)
+                data["character_id"] = character_id
+                items.append(data)
+            return StructuredOutputResponse(
+                data={"assessments": items},
+                provider=request.provider,
+                model_id=request.model_id,
+                token_usage={"total": 13},
+            )
         name = _requested_character_name(request.messages[-1].body)
         data = dict(self.decisions_by_name[name])
         data = _with_allowed_character_action_evidence_ids(data, request)
@@ -17024,7 +17038,6 @@ def test_submit_player_turn_runs_character_action_planning_before_prompt(
     request = provider.chat_requests[0]
     assert provider.events == [
         "character_presence_assessment",
-        "character_presence_assessment",
         "character_intent_plan",
         "chat",
     ]
@@ -20859,6 +20872,18 @@ def _requested_character_name(body: str) -> str:
         if line.startswith("Character: "):
             return line.removeprefix("Character: ").strip()
     raise AssertionError("request did not include a Character line")
+
+
+def _requested_batch_character_ids(body: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    current_name: str | None = None
+    for line in body.splitlines():
+        if line.startswith("Character: "):
+            current_name = line.removeprefix("Character: ").strip()
+        elif line.startswith("character_id: ") and current_name is not None:
+            pairs[current_name] = line.removeprefix("character_id: ").strip()
+            current_name = None
+    return pairs
 
 
 def _database_text(repositories: PersistenceRepositories) -> str:

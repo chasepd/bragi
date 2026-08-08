@@ -67,6 +67,8 @@ DEFAULT_CHARACTER_ACTION_PLANNING_MAX_CONCURRENCY = 20
 MIN_CHARACTER_ACTION_PLANNING_MAX_CONCURRENCY = 1
 MAX_CHARACTER_ACTION_PLANNING_MAX_CONCURRENCY = 20
 CHARACTER_ACTION_PLANNING_RECENT_MESSAGE_LIMIT = 10
+CHARACTER_ACTION_PLANNING_BATCH_MAX_CHARACTERS = 6
+CHARACTER_ACTION_PLANNING_BATCH_RECENT_MESSAGE_LIMIT = 12
 
 
 @dataclass(frozen=True)
@@ -239,9 +241,35 @@ class CharacterActionPlanningService:
                     )
                     return None
 
-        raw_presence_decisions = await asyncio.gather(
-            *(assess_presence(character) for character in characters)
-        )
+        async def assess_presence_per_character() -> tuple[
+            CharacterTurnAssessment | None, ...
+        ]:
+            return tuple(
+                await asyncio.gather(
+                    *(assess_presence(character) for character in characters)
+                )
+            )
+
+        if len(characters) <= CHARACTER_ACTION_PLANNING_BATCH_MAX_CHARACTERS:
+            try:
+                raw_presence_decisions = await self._assess_presence_batch(
+                    save_id=save_id,
+                    preference=presence_preference,
+                    provider=cast(StructuredOutputProvider, presence_provider),
+                    characters=tuple(characters),
+                    source_message=source_message,
+                    messages=tuple(details.messages),
+                )
+            except Exception as exc:
+                log_error_event(
+                    "chat.character_presence_batch_failed",
+                    save_id=save_id,
+                    character_ids=[character.id for character in characters],
+                    **exception_log_fields(exc),
+                )
+                raw_presence_decisions = await assess_presence_per_character()
+        else:
+            raw_presence_decisions = await assess_presence_per_character()
         presence_decisions = tuple(
             decision for decision in raw_presence_decisions if decision is not None
         )
@@ -408,6 +436,59 @@ class CharacterActionPlanningService:
             character=character,
             evidence_sources=evidence_sources,
         )
+
+    async def _assess_presence_batch(
+        self,
+        *,
+        save_id: str,
+        preference: ModelPreferenceRecord,
+        provider: StructuredOutputProvider,
+        characters: tuple[CharacterRecord, ...],
+        source_message: MessageRecord,
+        messages: tuple[MessageRecord, ...],
+    ) -> tuple[CharacterTurnAssessment | None, ...]:
+        evidence_sources = _planning_batch_evidence_sources(
+            repositories=self.repositories,
+            save_id=save_id,
+            characters=characters,
+            source_message=source_message,
+            messages=messages,
+        )
+        request = StructuredOutputRequest(
+            provider=preference.provider,
+            model_id=preference.model_id,
+            schema_name="character_presence_assessment",
+            schema=_character_presence_batch_schema(
+                characters,
+                evidence_source_ids=tuple(evidence_sources),
+            ),
+            messages=_character_presence_batch_messages(
+                repositories=self.repositories,
+                save_id=save_id,
+                characters=characters,
+                source_message=source_message,
+                messages=messages,
+                evidence_sources=evidence_sources,
+            ),
+            temperature=0.2,
+            max_output_tokens=10_000,
+        )
+        response = await structured_output_with_fallback(
+            repositories=self.repositories,
+            providers=self.providers,
+            request=request,
+            task=CHARACTER_PRESENCE_ASSESSMENT_TASK,
+            save_id=save_id,
+            diagnostic_context={
+                "source_message_id": source_message.id,
+            },
+        )
+        assessments = _presence_assessments_from_batch_data(
+            response.data,
+            characters_by_id={character.id: character for character in characters},
+            evidence_sources=evidence_sources,
+        )
+        return tuple(assessments.get(character.id) for character in characters)
 
     async def _plan_character_intent(
         self,
@@ -693,12 +774,26 @@ def _character_presence_schema(
     *,
     evidence_source_ids: tuple[str, ...],
 ) -> dict[str, Any]:
+    return _character_presence_item_schema(
+        characters=(character,),
+        evidence_source_ids=evidence_source_ids,
+    )
+
+
+def _character_presence_item_schema(
+    characters: tuple[CharacterRecord, ...],
+    *,
+    evidence_source_ids: tuple[str, ...],
+) -> dict[str, Any]:
     string_array = _evidence_source_ids_schema(evidence_source_ids)
     return {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "character_id": {"type": "string", "enum": [character.id]},
+            "character_id": {
+                "type": "string",
+                "enum": sorted(character.id for character in characters),
+            },
             "present": {"type": "boolean"},
             "enters_scene": {"type": "boolean"},
             "leaves_scene": {"type": "boolean"},
@@ -717,6 +812,28 @@ def _character_presence_schema(
             "evidence_source_ids",
             "evidence_quote",
         ],
+    }
+
+
+def _character_presence_batch_schema(
+    characters: tuple[CharacterRecord, ...],
+    *,
+    evidence_source_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "assessments": {
+                "type": "array",
+                "items": _character_presence_item_schema(
+                    characters,
+                    evidence_source_ids=evidence_source_ids,
+                ),
+                "maxItems": len(characters),
+            }
+        },
+        "required": ["assessments"],
     }
 
 
@@ -885,6 +1002,89 @@ def _character_presence_messages(
                         if storyteller_mode
                         else _dating_route_text(repositories, save_id, character)
                     ),
+                    _evidence_sources_text(evidence_sources),
+                    "Recent chronicle:",
+                    *(
+                        _planning_message_line(
+                            message,
+                            storyteller_mode=storyteller_mode,
+                        )
+                        for message in recent_messages
+                    ),
+                    "",
+                    (
+                        "Latest non-diegetic story direction (guidance only; "
+                        "not canonical evidence):"
+                        if storyteller_mode
+                        else "Latest turn source message:"
+                    ),
+                    source_message.body,
+                )
+                if part != ""
+            ),
+        ),
+    )
+
+
+def _character_presence_batch_messages(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    characters: tuple[CharacterRecord, ...],
+    source_message: MessageRecord,
+    messages: tuple[MessageRecord, ...],
+    evidence_sources: Mapping[str, str],
+) -> tuple[ChatMessage, ...]:
+    details = repositories.load_save_details(save_id)
+    scenario = details.scenario if details is not None else None
+    storyteller_mode = (
+        details is not None
+        and details.save.interaction_mode is InteractionMode.STORYTELLER
+    )
+    snapshot = repositories.get_scene_snapshot(save_id)
+    recent_messages = _planning_batch_recent_messages(
+        repositories=repositories,
+        save_id=save_id,
+        characters=characters,
+        source_message=source_message,
+        messages=messages,
+    )
+    character_sections: list[str] = []
+    for character in characters:
+        section = _character_text(character)
+        if not storyteller_mode:
+            dating_route = _dating_route_text(repositories, save_id, character)
+            if dating_route:
+                section = f"{section}\n{dating_route}"
+        character_sections.append(section)
+    return (
+        ChatMessage(
+            role="system",
+            body=(
+                "Assess each listed character's scene presence for the next "
+                "Bragi narrator turn. Decide for each whether they are present, "
+                "entering, or leaving the current scene. Use the enforced "
+                "structured schema only, returning one assessment object per "
+                "listed character. Do not plan their next actions and never "
+                "plan or control the player character. Use only "
+                "evidence_source_ids listed in Evidence sources, and copy "
+                "evidence_quote exactly from one cited evidence source."
+            ),
+        ),
+        ChatMessage(
+            role="user",
+            body="\n".join(
+                part
+                for part in (
+                    _scenario_text(scenario),
+                    _scene_text(snapshot),
+                    (
+                        ""
+                        if storyteller_mode
+                        else _player_character_text(repositories, save_id=save_id)
+                    ),
+                    _active_threads_text(repositories.list_active_threads(save_id)),
+                    *character_sections,
                     _evidence_sources_text(evidence_sources),
                     "Recent chronicle:",
                     *(
@@ -1249,6 +1449,90 @@ def _planning_evidence_sources(
             continue
         add(f"message:{message.id}", message.body)
     return sources
+
+
+def _planning_batch_evidence_sources(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    characters: tuple[CharacterRecord, ...],
+    source_message: MessageRecord,
+    messages: tuple[MessageRecord, ...],
+) -> dict[str, str]:
+    combined: dict[str, str] = {}
+    recent_message_ids = {
+        message.id
+        for message in _planning_batch_recent_messages(
+            repositories=repositories,
+            save_id=save_id,
+            characters=characters,
+            source_message=source_message,
+            messages=messages,
+        )
+    }
+    recent_message_ids.add(source_message.id)
+    for character in characters:
+        for source_id, text in _planning_evidence_sources(
+            repositories=repositories,
+            save_id=save_id,
+            character=character,
+            source_message=source_message,
+            messages=messages,
+        ).items():
+            if source_id.startswith("message:") and (
+                source_id.removeprefix("message:") not in recent_message_ids
+            ):
+                continue
+            combined.setdefault(source_id, text)
+    return combined
+
+
+def _planning_batch_recent_messages(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    characters: tuple[CharacterRecord, ...],
+    source_message: MessageRecord,
+    messages: tuple[MessageRecord, ...],
+) -> tuple[MessageRecord, ...]:
+    seen: dict[str, MessageRecord] = {}
+    for character in characters:
+        for message in _visible_recent_messages_for_character(
+            repositories=repositories,
+            save_id=save_id,
+            character=character,
+            source_message=source_message,
+            messages=messages,
+        ):
+            seen.setdefault(message.id, message)
+    return tuple(seen.values())[-CHARACTER_ACTION_PLANNING_BATCH_RECENT_MESSAGE_LIMIT:]
+
+
+def _presence_assessments_from_batch_data(
+    data: Mapping[str, object],
+    *,
+    characters_by_id: Mapping[str, CharacterRecord],
+    evidence_sources: Mapping[str, str],
+) -> dict[str, CharacterTurnAssessment]:
+    raw_items = data.get("assessments")
+    items = raw_items if isinstance(raw_items, list) else ()
+    assessments: dict[str, CharacterTurnAssessment] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        character_id = _string(item.get("character_id"))
+        character = characters_by_id.get(character_id)
+        if character is None:
+            continue
+        try:
+            assessments[character_id] = _presence_assessment_from_data(
+                item,
+                character=character,
+                evidence_sources=evidence_sources,
+            )
+        except ValueError:
+            continue
+    return assessments
 
 
 def _evidence_sources_text(evidence_sources: Mapping[str, str]) -> str:
