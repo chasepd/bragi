@@ -472,7 +472,6 @@ CHAT_TURN_PROGRESS_JOB_ORDER = (
     "submission",
     "history",
     "input",
-    "time_state",
     "dating_route_profile",
     "character_planning",
     "context_selection",
@@ -1638,45 +1637,6 @@ class ChatService:
             )
 
         stage_started = perf_counter()
-        turn_progress.publish("time_state", "running", "Checking world time")
-        try:
-            world_time_result = await self._advance_world_time_if_configured(
-                save_id=save_id,
-                latest_message_id=player_message.id,
-            )
-        except Exception as exc:
-            log_error_event(
-                "chat.world_time_failed",
-                save_id=save_id,
-                player_message_id=player_message.id,
-                **exception_log_fields(exc),
-            )
-            world_time_result = {"status": "failed"}
-        world_time_status = _world_time_status(world_time_result)
-        turn_progress.publish(
-            "time_state",
-            world_time_status,
-            (
-                "World time checked"
-                if world_time_status != "skipped"
-                else "World time unchanged"
-            ),
-        )
-        _log_chat_stage(
-            "chat.stage.world_time_finished",
-            save_id=save_id,
-            started_at=stage_started,
-            player_message_id=player_message.id,
-            status=world_time_status,
-        )
-        if world_time_status in {"applied", "queued"}:
-            TurnSnapshotService(self.repositories).capture_current_head_if_dirty(
-                save_id,
-                reason="pre_turn_time_state",
-            )
-        throw_if_cancelled_after_job()
-
-        stage_started = perf_counter()
         turn_progress.publish(
             "dating_route_profile",
             "running",
@@ -2821,7 +2781,6 @@ class ChatService:
                     "context_search_selected_counts": (
                         _context_search_selected_counts(context_result)
                     ),
-                    "world_time": _world_time_result_mapping(world_time_result),
                     "prompt_context_trimmed": _context_breakdown_was_trimmed(
                         request.context_breakdown
                     ),
@@ -5419,22 +5378,6 @@ class ChatService:
             repositories=self.repositories,
             extractor=context_updater,
             world_data_enricher=context_updater,
-        )
-
-    async def _advance_world_time_if_configured(
-        self,
-        *,
-        save_id: str,
-        latest_message_id: str,
-    ) -> object:
-        service = self.world_time_service or self._world_time_service_for_save(
-            save_id,
-        )
-        if service is None:
-            return {"status": "skipped", "skipped_reason": "checker_unavailable"}
-        return await service.advance_time_if_supported(
-            save_id=save_id,
-            latest_message_id=latest_message_id,
         )
 
     async def _reconcile_world_time_after_turn_if_configured(
