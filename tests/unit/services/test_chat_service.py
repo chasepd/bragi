@@ -5545,6 +5545,99 @@ def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
     )
 
 
+def test_planned_learned_memory_candidate_skips_invalid_knowledge_metadata(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    candidate = StateCommitCandidate(
+        operation="create",
+        state_key="character.learned_memory",
+        value={
+            "body": "Mara learned the lens phrase.",
+            "knowledge_state": "observed",
+        },
+        reason="The planner offered a bad knowledge state.",
+        confidence=0.9,
+        evidence_source_ids=("message:source",),
+        evidence_quote="the lens phrase",
+        candidate_id="memory:mara:0",
+        candidate_type="character_learned_memory",
+        character_id=mara.id,
+    )
+
+    status, reason, changed = (
+        chat_service_module._apply_character_learned_memory_candidate(
+            repositories=repositories,
+            save_id=save.id,
+            player_message_id="message:player",
+            narrator_message_id="message:narrator",
+            candidate=candidate,
+            evidence_source_text_by_id={"message:source": "the lens phrase"},
+        )
+    )
+
+    assert status == "skipped"
+    assert reason == "unknown_knowledge_state"
+    assert changed is False
+    assert repositories.list_memories(save.id) == []
+
+
+def test_planned_commit_grounding_accepts_planning_scene_text(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    snapshot = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara waits by the beacon controls.",
+        present_character_ids=[mara.id],
+    )
+    assert snapshot is not None
+    candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={
+            "action": "leave",
+            "character_name": "Mara",
+            "evidence_quote": mara.id,
+        },
+        reason="Mara may leave.",
+        confidence=0.9,
+        evidence_source_ids=(f"scene_snapshot:{snapshot.id}",),
+        evidence_quote=mara.id,
+        candidate_id="scene_presence:mara:leave",
+        candidate_type="scene_presence",
+        character_id=mara.id,
+    )
+
+    grounded = chat_service_module._planned_commit_evidence_is_grounded(
+        repositories=repositories,
+        save_id=save.id,
+        player_message_id="message:player",
+        narrator_message_id="message:narrator",
+        candidate=candidate,
+        evidence_source_text_by_id={},
+    )
+
+    assert grounded is True
+
+
 def test_submit_player_turn_queues_verified_learned_memory_when_confirmation_enabled(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -32,7 +32,11 @@ from bragi.persistence.models import (
     SceneSnapshotRecord,
     SummaryRecord,
 )
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    CHARACTER_KNOWLEDGE_ACQUISITION_METHODS,
+    CHARACTER_KNOWLEDGE_STATES,
+    PersistenceRepositories,
+)
 from bragi.providers.chat_rendering import estimate_chat_request_tokens
 from bragi.providers.contracts import (
     NARRATOR_PROMPT_MODE_PLAN_FIRST,
@@ -84,6 +88,9 @@ from bragi.services.character_action_planning_service import (
     character_action_planning_enabled,
     character_turn_assessment_has_prompt_guidance,
     format_character_turn_assessment,
+)
+from bragi.services.character_action_planning_service import (
+    _scene_text as _planning_scene_text,
 )
 from bragi.services.character_registry_maintenance_service import (
     CharacterRegistryMaintenanceService,
@@ -8649,6 +8656,21 @@ def _apply_scene_snapshot_field_candidate(
     return "committed", "applied_scene_snapshot_field", changed
 
 
+def _planned_knowledge_metadata_skip_reason(
+    value: Mapping[str, object],
+) -> str:
+    knowledge_state = _string_mapping_value(value, "knowledge_state")
+    if knowledge_state and knowledge_state not in CHARACTER_KNOWLEDGE_STATES:
+        return "unknown_knowledge_state"
+    acquisition_method = _string_mapping_value(value, "acquisition_method")
+    if (
+        acquisition_method
+        and acquisition_method not in CHARACTER_KNOWLEDGE_ACQUISITION_METHODS
+    ):
+        return "unknown_acquisition_method"
+    return ""
+
+
 def _apply_character_learned_memory_candidate(
     *,
     repositories: PersistenceRepositories,
@@ -8705,6 +8727,9 @@ def _apply_character_learned_memory_candidate(
         or "unknown",
         "evidence_quote": evidence_quote,
     }
+    knowledge_skip_reason = _planned_knowledge_metadata_skip_reason(proposed_value)
+    if knowledge_skip_reason:
+        return "skipped", knowledge_skip_reason, False
     if manual_memory_confirmation_enabled(repositories, save_id=save_id):
         suggestion = repositories.add_context_update_suggestion(
             save_id=save_id,
@@ -8806,6 +8831,14 @@ def _apply_character_knowledge_edge_candidate(
     acquisition_method = (
         _string_mapping_value(candidate.value, "acquisition_method") or "unknown"
     )
+    knowledge_skip_reason = _planned_knowledge_metadata_skip_reason(
+        {
+            "knowledge_state": knowledge_state,
+            "acquisition_method": acquisition_method,
+        }
+    )
+    if knowledge_skip_reason:
+        return "skipped", knowledge_skip_reason, False
     if _knowledge_edge_requires_scene_grounding(
         knowledge_state=knowledge_state,
         acquisition_method=acquisition_method,
@@ -8862,6 +8895,12 @@ def _planned_commit_evidence_is_grounded(
         if message.id in message_ids
     }
     source_text_by_id = dict(evidence_source_text_by_id)
+    snapshot = repositories.get_scene_snapshot(save_id)
+    if snapshot is not None:
+        source_text_by_id.setdefault(
+            f"scene_snapshot:{snapshot.id}",
+            _planning_scene_text(snapshot),
+        )
     player_message = messages_by_id.get(player_message_id)
     if player_message is not None:
         source_text_by_id[f"message:{player_message_id}"] = player_message.body

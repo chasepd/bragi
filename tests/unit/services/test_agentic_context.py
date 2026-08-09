@@ -2573,6 +2573,54 @@ def test_narrator_planner_rejects_malformed_candidate_value_shapes(
                         ),
                     },
                     {
+                        "candidate_id": "memory:bad-knowledge-state",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "value": {
+                            "body": "Lio observed the lens.",
+                            "knowledge_state": "observed",
+                        },
+                        "character_id": lio.id,
+                        "reason": "Bad knowledge state.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "memory:bad-acquisition",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "value": {
+                            "body": "Lio learned the plan.",
+                            "acquisition_method": "guessed",
+                        },
+                        "character_id": lio.id,
+                        "reason": "Bad acquisition method.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "presence:stay-without-present",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "stay"},
+                        "character_id": lio.id,
+                        "reason": "Stay needs a present flag.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
                         "candidate_id": "presence:valid",
                         "candidate_type": "scene_presence",
                         "operation": "update",
@@ -2624,6 +2672,9 @@ def test_narrator_planner_rejects_malformed_candidate_value_shapes(
     } == {
         ("presence:bad-action", "unsupported_scene_presence_action"),
         ("memory:no-body", "missing_memory_body"),
+        ("memory:bad-knowledge-state", "unknown_knowledge_state"),
+        ("memory:bad-acquisition", "unknown_acquisition_method"),
+        ("presence:stay-without-present", "missing_scene_presence_present"),
     }
     assert [candidate.candidate_id for candidate in spec.state_commit_candidates] == [
         "presence:valid"

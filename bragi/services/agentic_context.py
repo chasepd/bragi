@@ -21,6 +21,8 @@ from bragi.persistence.models import (
     MessageRecord,
 )
 from bragi.persistence.repositories import (
+    CHARACTER_KNOWLEDGE_ACQUISITION_METHODS,
+    CHARACTER_KNOWLEDGE_STATES,
     PersistenceRepositories,
     canonical_claim_fingerprint,
 )
@@ -3353,6 +3355,13 @@ def _state_commit_candidate_value_shape_rejection(
                 field_name="value.action",
                 rejected_value=action,
             )
+        if action == "stay" and not isinstance(candidate.value.get("present"), bool):
+            return _planner_rejection(
+                candidate=candidate,
+                reason="missing_scene_presence_present",
+                field_name="value.present",
+                rejected_value="",
+            )
         return None
     if candidate.candidate_type == "character_learned_memory":
         body = _string(candidate.value.get("body"))
@@ -3363,17 +3372,51 @@ def _state_commit_candidate_value_shape_rejection(
                 field_name="value.body",
                 rejected_value="",
             )
+        knowledge_rejection = _candidate_knowledge_metadata_rejection(candidate)
+        if knowledge_rejection is not None:
+            return knowledge_rejection
         return None
     if candidate.candidate_type == "character_knowledge_edge":
+        knowledge_rejection = _candidate_knowledge_metadata_rejection(candidate)
+        if knowledge_rejection is not None:
+            return knowledge_rejection
         target_type = _string(candidate.value.get("target_type"))
         target_id = _string(candidate.value.get("target_id"))
-        if not target_type or not target_id:
+        missing_target = "target_id" if not target_id else (
+            "target_type" if not target_type else ""
+        )
+        if missing_target:
             return _planner_rejection(
                 candidate=candidate,
                 reason="missing_knowledge_edge_target",
-                field_name="value.target_type",
+                field_name=f"value.{missing_target}",
                 rejected_value="",
             )
+    return None
+
+
+def _candidate_knowledge_metadata_rejection(
+    candidate: StateCommitCandidate,
+) -> PlannerRejection | None:
+    knowledge_state = _string(candidate.value.get("knowledge_state"))
+    if knowledge_state and knowledge_state not in CHARACTER_KNOWLEDGE_STATES:
+        return _planner_rejection(
+            candidate=candidate,
+            reason="unknown_knowledge_state",
+            field_name="value.knowledge_state",
+            rejected_value=knowledge_state,
+        )
+    acquisition_method = _string(candidate.value.get("acquisition_method"))
+    if (
+        acquisition_method
+        and acquisition_method not in CHARACTER_KNOWLEDGE_ACQUISITION_METHODS
+    ):
+        return _planner_rejection(
+            candidate=candidate,
+            reason="unknown_acquisition_method",
+            field_name="value.acquisition_method",
+            rejected_value=acquisition_method,
+        )
     return None
 
 
