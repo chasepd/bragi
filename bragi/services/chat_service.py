@@ -8895,12 +8895,22 @@ def _planned_commit_evidence_is_grounded(
         if message.id in message_ids
     }
     source_text_by_id = dict(evidence_source_text_by_id)
+    planning_scene_text = ""
     snapshot = repositories.get_scene_snapshot(save_id)
     if snapshot is not None:
-        source_text_by_id.setdefault(
-            f"scene_snapshot:{snapshot.id}",
-            _planning_scene_text(snapshot),
+        planning_scene_text = _planning_scene_text(snapshot)
+
+    def matches(source_id: str) -> bool:
+        if source_id not in source_text_by_id:
+            return False
+        if quote_matches_source(quote, source_text_by_id[source_id]):
+            return True
+        return bool(
+            source_id.startswith("scene_snapshot:")
+            and planning_scene_text
+            and quote_matches_source(quote, planning_scene_text)
         )
+
     player_message = messages_by_id.get(player_message_id)
     if player_message is not None:
         source_text_by_id[f"message:{player_message_id}"] = player_message.body
@@ -8908,11 +8918,7 @@ def _planned_commit_evidence_is_grounded(
     if narrator_message is not None:
         source_text_by_id[f"message:{narrator_message_id}"] = narrator_message.body
         source_text_by_id["message:latest"] = narrator_message.body
-    return any(
-        source_id in source_text_by_id
-        and quote_matches_source(quote, source_text_by_id[source_id])
-        for source_id in candidate.evidence_source_ids
-    )
+    return any(matches(source_id) for source_id in candidate.evidence_source_ids)
 
 
 def _planned_commit_evidence_quote(candidate: StateCommitCandidate) -> str:

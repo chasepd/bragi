@@ -84,6 +84,39 @@ def test_character_action_planning_deterministic_presence_skips_model_calls(
     }
 
 
+def test_character_action_planning_deterministic_without_model_preference(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _player_message_id, characters = _create_save_with_characters(
+        repositories
+    )
+    player_message = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Ily",
+        body="I study the lantern mechanism.",
+    )
+    provider = CharacterDecisionProvider({})
+
+    result = asyncio.run(
+        CharacterActionPlanningService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).plan_for_turn(save_id=save_id, player_message_id=player_message.id)
+    )
+
+    assert result.skipped_reason == ""
+    assert provider.structured_output_requests == []
+    assert [assessment.character_name for assessment in result.assessments] == [
+        "Mara",
+        "Ren",
+    ]
+    assert all(assessment.present for assessment in result.assessments)
+    assert characters["mara"] in {
+        assessment.character_id for assessment in result.assessments
+    }
+
+
 def test_character_action_planning_deterministic_assessment_is_grounded(
     repositories: PersistenceRepositories,
 ) -> None:

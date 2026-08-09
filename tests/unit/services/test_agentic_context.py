@@ -2621,6 +2621,20 @@ def test_narrator_planner_rejects_malformed_candidate_value_shapes(
                         ),
                     },
                     {
+                        "candidate_id": f"scene_presence:{lio.id}:leave",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "enter"},
+                        "character_id": lio.id,
+                        "reason": "The id suffix contradicts the action.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
                         "candidate_id": "presence:valid",
                         "candidate_type": "scene_presence",
                         "operation": "update",
@@ -2675,6 +2689,7 @@ def test_narrator_planner_rejects_malformed_candidate_value_shapes(
         ("memory:bad-knowledge-state", "unknown_knowledge_state"),
         ("memory:bad-acquisition", "unknown_acquisition_method"),
         ("presence:stay-without-present", "missing_scene_presence_present"),
+        (f"scene_presence:{lio.id}:leave", "scene_presence_id_action_mismatch"),
     }
     assert [candidate.candidate_id for candidate in spec.state_commit_candidates] == [
         "presence:valid"

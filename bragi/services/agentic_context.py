@@ -3335,6 +3335,29 @@ _SCENE_PRESENCE_VALUE_ACTIONS = frozenset(
     {"enter", "present", "add", "leave", "absent", "remove", "stay"}
 )
 
+_SCENE_PRESENCE_ACTION_GROUPS = {
+    "enter": "enter",
+    "present": "enter",
+    "add": "enter",
+    "leave": "leave",
+    "absent": "leave",
+    "remove": "leave",
+    "stay": "stay",
+}
+
+
+def _scene_presence_action_group(action: str) -> str:
+    return _SCENE_PRESENCE_ACTION_GROUPS.get(action, "")
+
+
+def _scene_presence_candidate_id_action(candidate_id: str) -> str | None:
+    """Return the scene_presence candidate_id action suffix, if well-formed."""
+    prefix = "scene_presence:"
+    if not candidate_id.startswith(prefix):
+        return None
+    suffix = candidate_id[len(prefix) :]
+    return suffix.rsplit(":", 1)[-1] if ":" in suffix else suffix
+
 
 def _state_commit_candidate_value_shape_rejection(
     candidate: StateCommitCandidate,
@@ -3361,6 +3384,14 @@ def _state_commit_candidate_value_shape_rejection(
                 reason="missing_scene_presence_present",
                 field_name="value.present",
                 rejected_value="",
+            )
+        id_action = _scene_presence_candidate_id_action(candidate.candidate_id)
+        if id_action is not None and id_action != _scene_presence_action_group(action):
+            return _planner_rejection(
+                candidate=candidate,
+                reason="scene_presence_id_action_mismatch",
+                field_name="candidate_id",
+                rejected_value=candidate.candidate_id,
             )
         return None
     if candidate.candidate_type == "character_learned_memory":

@@ -5632,7 +5632,11 @@ def test_planned_commit_grounding_accepts_planning_scene_text(
         player_message_id="message:player",
         narrator_message_id="message:narrator",
         candidate=candidate,
-        evidence_source_text_by_id={},
+        evidence_source_text_by_id={
+            f"scene_snapshot:{snapshot.id}": (
+                "Scene snapshot: situation: Mara waits by the beacon controls."
+            )
+        },
     )
 
     assert grounded is True

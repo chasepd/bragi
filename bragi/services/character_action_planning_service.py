@@ -122,17 +122,6 @@ class CharacterActionPlanningService:
         source_message = _message_by_id(details.messages, player_message_id)
         if source_message is None or source_message.role not in {"player", "system"}:
             raise ValueError(f"Unknown active source message id: {player_message_id}")
-        presence_preference = _character_presence_model_preference(
-            repositories=self.repositories,
-            save_id=save_id,
-        )
-        if presence_preference is None:
-            return CharacterActionPlanningResult(skipped_reason="no_model_preference")
-        presence_provider, presence_skip_reason = self._structured_provider(
-            presence_preference
-        )
-        if presence_skip_reason is not None:
-            return CharacterActionPlanningResult(skipped_reason=presence_skip_reason)
         if not any(
             not character.is_player_character
             for character in self.repositories.list_characters(save_id)
@@ -147,6 +136,24 @@ class CharacterActionPlanningService:
             return CharacterActionPlanningResult(
                 skipped_reason="no_scoped_npc_characters",
             )
+        presence_preference: ModelPreferenceRecord | None = None
+        presence_provider: StructuredOutputProvider | None = None
+        if ambiguous:
+            presence_preference = _character_presence_model_preference(
+                repositories=self.repositories,
+                save_id=save_id,
+            )
+            if presence_preference is None:
+                return CharacterActionPlanningResult(
+                    skipped_reason="no_model_preference"
+                )
+            presence_provider, presence_skip_reason = self._structured_provider(
+                presence_preference
+            )
+            if presence_skip_reason is not None:
+                return CharacterActionPlanningResult(
+                    skipped_reason=presence_skip_reason
+                )
         semaphore = asyncio.Semaphore(
             character_action_planning_max_concurrency(
                 self.repositories,
@@ -161,7 +168,10 @@ class CharacterActionPlanningService:
                 try:
                     return await self._assess_character_presence(
                         save_id=save_id,
-                        preference=presence_preference,
+                        preference=cast(
+                            ModelPreferenceRecord,
+                            presence_preference,
+                        ),
                         provider=cast(StructuredOutputProvider, presence_provider),
                         character=character,
                         source_message=source_message,
@@ -192,7 +202,10 @@ class CharacterActionPlanningService:
                 try:
                     raw_presence_decisions = await self._assess_presence_batch(
                         save_id=save_id,
-                        preference=presence_preference,
+                        preference=cast(
+                            ModelPreferenceRecord,
+                            presence_preference,
+                        ),
                         provider=cast(StructuredOutputProvider, presence_provider),
                         characters=tuple(ambiguous),
                         source_message=source_message,
@@ -228,11 +241,11 @@ class CharacterActionPlanningService:
         else:
             ambiguous_decisions = ()
             failed_ids = []
+        scene_snapshot = self.repositories.get_scene_snapshot(save_id)
         deterministic_assessments = tuple(
             _deterministic_presence_assessment(
-                repositories=self.repositories,
-                save_id=save_id,
                 character=character,
+                snapshot=scene_snapshot,
             )
             for character in deterministic_present
         )
@@ -1031,15 +1044,13 @@ def _planning_batch_recent_messages(
 
 def _deterministic_presence_assessment(
     *,
-    repositories: PersistenceRepositories,
-    save_id: str,
     character: CharacterRecord,
+    snapshot: object | None,
 ) -> CharacterTurnAssessment:
-    snapshot = repositories.get_scene_snapshot(save_id)
     evidence_source_ids: tuple[str, ...] = ()
     evidence_quote = ""
     if snapshot is not None:
-        source_id = f"scene_snapshot:{snapshot.id}"
+        source_id = f"scene_snapshot:{getattr(snapshot, 'id', '')}"
         scene_text = _scene_text(snapshot)
         # The character id is quoted verbatim from the snapshot's present
         # character ids line, which this assessment merely restates; it keeps
