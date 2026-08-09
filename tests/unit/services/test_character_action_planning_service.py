@@ -77,7 +77,7 @@ def test_character_action_planning_deterministic_presence_skips_model_calls(
     assert all(assessment.present for assessment in result.assessments)
     assert result.deterministic_presence_count == 2
     assert result.presence_calls_made == 0
-    assert result.model_calls_avoided == 4
+    assert result.model_calls_avoided == 3
     assert result.applied_presence_update is False
     assert characters["mara"] in {
         assessment.character_id for assessment in result.assessments
@@ -177,7 +177,7 @@ def test_character_action_planning_mentions_ambiguous_present_character(
     assert mara.presence_evidence_source_ids
     assert result.deterministic_presence_count == 1
     assert result.presence_calls_made == 1
-    assert result.model_calls_avoided == 3
+    assert result.model_calls_avoided == 2
     snapshot = repositories.get_scene_snapshot(save_id)
     assert snapshot is not None
     assert set(snapshot.present_character_ids) == {
@@ -1264,6 +1264,63 @@ def test_storyteller_planning_includes_all_characters_and_excludes_direction_evi
     assert "narrator-controlled character" in prompt
     assert "non-diegetic story direction" in prompt
     assert "not canonical evidence" in prompt
+
+
+def test_storyteller_present_character_directed_to_leave_is_ambiguous(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Ceremony",
+        premise="A rival waits in the wings.",
+        player_role="",
+        content={},
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Act One")
+    rival = repositories.add_character(save_id=save.id, name="The Rival")
+    repositories.add_character(save_id=save.id, name="The Witness")
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The rival stands by the stage doors.",
+        present_character_ids=[rival.id],
+        snapshot_id="snapshot-1",
+    )
+    direction = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="Have the rival leave the ceremony.",
+    )
+    provider = CharacterDecisionProvider(
+        {
+            "The Rival": {
+                "present": True,
+                "enters_scene": False,
+                "leaves_scene": True,
+                "reason": "The direction sends the rival out.",
+                "confidence": 0.9,
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
+            },
+        }
+    )
+    _configure_planning(repositories)
+
+    result = asyncio.run(
+        CharacterActionPlanningService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).plan_for_turn(save_id=save.id, player_message_id=direction.id)
+    )
+
+    assert len(provider.structured_output_requests) == 1
+    assert result.deterministic_presence_count == 0
+    rival_assessment = next(
+        assessment
+        for assessment in result.assessments
+        if assessment.character_id == rival.id
+    )
+    assert rival_assessment.leaves_scene is True
+    assert rival_assessment.present is True
 
 
 def test_character_action_planning_batch_prompt_excludes_direction_and_player_text(

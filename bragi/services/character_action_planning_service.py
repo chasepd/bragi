@@ -266,9 +266,14 @@ class CharacterActionPlanningService:
                 or assessment.enters_scene
                 or assessment.leaves_scene
             )
+            and _assessment_has_grounded_presence(assessment)
+        )
+        previous_presence_calls = (
+            1 if len(decisions) <= CHARACTER_ACTION_PLANNING_BATCH_MAX_CHARACTERS
+            else len(decisions)
         )
         model_calls_avoided = (
-            len(decisions) + intent_wave_size - presence_calls_made
+            previous_presence_calls + intent_wave_size - presence_calls_made
         )
         return CharacterActionPlanningResult(
             decisions=decisions,
@@ -684,14 +689,21 @@ def _character_presence_batch_messages(
         ChatMessage(
             role="system",
             body=(
-                "Assess each listed character's scene presence for the next "
-                "Bragi narrator turn. Decide for each whether they are present, "
-                "entering, or leaving the current scene. Use the enforced "
-                "structured schema only, returning one assessment object per "
-                "listed character. Do not plan their next actions and never "
-                "plan or control the player character. Use only "
-                "evidence_source_ids listed in Evidence sources, and copy "
-                "evidence_quote exactly from one cited evidence source."
+                (
+                    "Assess each listed narrator-controlled character's scene "
+                    if storyteller_mode
+                    else "Assess each listed character's scene "
+                )
+                + (
+                    "presence for the next Bragi narrator turn. Decide for "
+                    "each whether they are present, entering, or leaving the "
+                    "current scene. Use the enforced "
+                    "structured schema only, returning one assessment object per "
+                    "listed character. Do not plan their next actions and never "
+                    "plan or control the player character. Use only "
+                    "evidence_source_ids listed in Evidence sources, and copy "
+                    "evidence_quote exactly from one cited evidence source."
+                )
             ),
         ),
         ChatMessage(
@@ -835,7 +847,10 @@ def _planning_characters_for_turn(
     are not mentioned in the source message, so their presence needs no model
     call. Ambiguous characters are either present but mentioned in the source
     message (possible exit) or off-scene and mentioned (possible entry), so a
-    model assessment is genuinely useful for them.
+    model assessment is genuinely useful for them. In storyteller mode every
+    off-scene character is ambiguous so direction can bring them in, while
+    present characters stay deterministic unless the direction mentions them
+    (possible directed exit).
     """
     snapshot = repositories.get_scene_snapshot(save_id)
     present_ids = set(snapshot.present_character_ids if snapshot else ())
@@ -852,12 +867,27 @@ def _planning_characters_for_turn(
         and save.interaction_mode is InteractionMode.STORYTELLER
         and not any(character.is_player_character for character in all_characters)
     ):
+        mentioned_ids = {
+            character.id
+            for character in characters
+            if character_name_is_mentioned(
+                name=character.name,
+                aliases=character.aliases,
+                text=source_text,
+            )
+        }
         return (
             tuple(
-                character for character in characters if character.id in present_ids
+                character
+                for character in characters
+                if character.id in present_ids
+                and character.id not in mentioned_ids
             ),
             tuple(
-                character for character in characters if character.id not in present_ids
+                character
+                for character in characters
+                if character.id not in present_ids
+                or character.id in mentioned_ids
             ),
         )
     mentioned_ids = {
@@ -1007,6 +1037,10 @@ def _deterministic_presence_assessment(
     if snapshot is not None:
         source_id = f"scene_snapshot:{snapshot.id}"
         scene_text = _scene_text(snapshot)
+        # The character id is quoted verbatim from the snapshot's present
+        # character ids line, which this assessment merely restates; it keeps
+        # the deterministic assessment grounded in the same evidence model
+        # assessments must cite. Membership comes from present_ids above.
         if character.id and quote_matches_source(character.id, scene_text):
             evidence_source_ids = (source_id,)
             evidence_quote = character.id
