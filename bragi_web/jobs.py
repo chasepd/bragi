@@ -20,6 +20,17 @@ JobChangeCallback = Callable[["JobRecord"], None]
 RepositoryScopeFactory = Callable[[], Any]
 ACTIVE_JOB_STATUSES = frozenset({"queued", "running"})
 TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
+RESPONSE_COMMITTED = "response_committed"
+CONTINUITY_READY = "continuity_ready"
+OPTIONAL_ENRICHMENTS_COMPLETE = "optional_enrichments_complete"
+TURN_COMPLETION_LEVELS = (
+    RESPONSE_COMMITTED,
+    CONTINUITY_READY,
+    OPTIONAL_ENRICHMENTS_COMPLETE,
+)
+_TURN_COMPLETION_LEVEL_ORDER = {
+    level: index for index, level in enumerate(TURN_COMPLETION_LEVELS)
+}
 PUBLIC_JOB_FAILURE_ERROR = "Background job failed. Check diagnostics for details."
 _PUBLIC_PROVIDER_FAILURE_PREFIX = "Provider request failed"
 
@@ -69,6 +80,7 @@ class JobRecord:
     creator_user_id: str | None = None
     exclusive_key: str | None = None
     operation_queue_key: str | None = None
+    completion_level: str | None = None
     status: str = "queued"
     created_at: float = field(default_factory=time)
     updated_at: float = field(default_factory=time)
@@ -86,6 +98,9 @@ class JobHandle:
 
     async def event(self, event: str, payload: Any = None) -> None:
         await self._registry.add_event(self.record.id, event, payload)
+
+    async def advance_completion_level(self, level: str) -> JobRecord:
+        return await self._registry.advance_completion_level(self.record.id, level)
 
 
 class JobRegistry:
@@ -281,6 +296,77 @@ class JobRegistry:
                 with self._condition:
                     self._remove_event_waiter_locked(waiter)
                 return last_index
+            except asyncio.CancelledError:
+                with self._condition:
+                    self._remove_event_waiter_locked(waiter)
+                raise
+
+    async def advance_completion_level(
+        self,
+        job_id: str,
+        level: str,
+    ) -> JobRecord:
+        if level not in _TURN_COMPLETION_LEVEL_ORDER:
+            raise ValueError(f"Unsupported completion level: {level}")
+        with self._condition:
+            record = self._jobs[job_id]
+            current = record.completion_level
+            if current is not None:
+                current_order = _TURN_COMPLETION_LEVEL_ORDER[current]
+                next_order = _TURN_COMPLETION_LEVEL_ORDER[level]
+                if next_order < current_order:
+                    raise ValueError(
+                        f"Completion level cannot move backward: {current} -> {level}"
+                    )
+                if next_order == current_order:
+                    return self._snapshot_locked(record)
+            record.completion_level = level
+            jsonable_payload = self._append_event_locked(
+                record,
+                "completion_level",
+                {"completion_level": level},
+                time(),
+            )
+            job_type = record.type
+            job_status = record.status
+            snapshot = self._snapshot_locked(record)
+            self._condition.notify_all()
+        self._notify_change(snapshot)
+        observe(
+            "web.job.event",
+            level="debug",
+            job_id=job_id,
+            job_type=job_type,
+            job_status=job_status,
+            event_name="completion_level",
+            **result_shape(jsonable_payload),
+        )
+        return snapshot
+
+    async def wait_for_completion_level(
+        self,
+        job_id: str,
+        level: str,
+    ) -> JobRecord | None:
+        if level not in _TURN_COMPLETION_LEVEL_ORDER:
+            raise ValueError(f"Unsupported completion level: {level}")
+        requested_order = _TURN_COMPLETION_LEVEL_ORDER[level]
+        while True:
+            with self._condition:
+                record = self._jobs.get(job_id)
+                if record is None:
+                    return None
+                current = record.completion_level
+                if (
+                    current is not None
+                    and _TURN_COMPLETION_LEVEL_ORDER[current] >= requested_order
+                ) or record.status in TERMINAL_JOB_STATUSES:
+                    return self._snapshot_locked(record)
+                loop = asyncio.get_running_loop()
+                waiter: asyncio.Future[None] = loop.create_future()
+                self._event_waiters.append((loop, waiter))
+            try:
+                await waiter
             except asyncio.CancelledError:
                 with self._condition:
                     self._remove_event_waiter_locked(waiter)
@@ -781,6 +867,7 @@ def job_summary(record: JobRecord) -> dict[str, Any]:
         "type": record.type,
         "save_id": record.save_id,
         "status": record.status,
+        "completion_level": record.completion_level,
         "result": to_jsonable(record.result),
         "error": _public_job_error_for_record(record),
         "created_at": record.created_at,

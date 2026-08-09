@@ -522,6 +522,7 @@ class TurnProgress:
 class PostTurnJobProgress:
     name: str
     status: str
+    category: str
 
 
 @dataclass(frozen=True)
@@ -4003,7 +4004,15 @@ class ChatService:
                             save_id=save_id,
                             coordinator_job_id=coordinator.id,
                             jobs=tuple(
-                                PostTurnJobProgress(job_name, statuses[job_name])
+                                PostTurnJobProgress(
+                                    job_name,
+                                    statuses[job_name],
+                                    (
+                                        "optional"
+                                        if job_name == "image"
+                                        else "continuity"
+                                    ),
+                                )
                                 for job_name in POST_TURN_JOB_ORDER
                             ),
                         )

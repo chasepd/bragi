@@ -63,7 +63,10 @@ from bragi_web.bragi_adapter import (
 )
 from bragi_web.jobs import (
     ACTIVE_JOB_STATUSES,
+    CONTINUITY_READY,
+    OPTIONAL_ENRICHMENTS_COMPLETE,
     PUBLIC_JOB_FAILURE_ERROR,
+    RESPONSE_COMMITTED,
     TERMINAL_JOB_STATUSES,
     JobHandle,
     JobRecord,
@@ -231,6 +234,7 @@ _CHAT_JOB_TYPES = frozenset(
 _POST_TURN_PROGRESS_JOB_ORDER = (
     "state",
     "context",
+    "time_reconciliation",
     "proactive_text",
     "director",
     "scenario",
@@ -3247,14 +3251,14 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "speaker_name": payload.speaker_name,
                 "active_save_id": submitted_save_id,
             }
-            needs_post_input_catchup = bool(
+            needs_continuity_catchup = bool(
                 _active_background_post_turn_jobs(
                     state,
                     save_id=submitted_save_id,
                 )
             )
 
-            async def post_input_catchup() -> None:
+            if needs_continuity_catchup:
                 await _wait_for_background_post_turn_catchup(
                     state,
                     handle,
@@ -3281,11 +3285,6 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "turn_progress_callback",
             ):
                 kwargs["turn_progress_callback"] = turn_progress_callback
-            if _call_accepts_keyword(
-                state.runtime.submit_player_message_for_initial_render,
-                "post_input_catchup",
-            ) and needs_post_input_catchup:
-                kwargs["post_input_catchup"] = post_input_catchup
             try:
                 turn = await state.runtime.submit_player_message_for_initial_render(
                     **kwargs
@@ -3299,6 +3298,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 failure_message="Chat turn did not produce a narrator response",
             )
             await _emit_initial_chat_turn_event(handle, turn)
+            await handle.advance_completion_level(RESPONSE_COMMITTED)
             if turn.has_post_turn_jobs:
                 queued = await _queue_post_turn_jobs_background(
                     state,
@@ -3318,7 +3318,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     current_user_id=current_user_id,
                 )
                 if queued is None:
-                    return await _run_post_turn_jobs_with_ordered_progress(
+                    return await _run_post_turn_jobs_inline_fallback(
                         state,
                         handle,
                         save_id=turn.save_id or "",
@@ -3464,14 +3464,14 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "instruction": instruction,
                 "active_save_id": submitted_save_id,
             }
-            needs_post_input_catchup = bool(
+            needs_continuity_catchup = bool(
                 _active_background_post_turn_jobs(
                     state,
                     save_id=submitted_save_id,
                 )
             )
 
-            async def post_input_catchup() -> None:
+            if needs_continuity_catchup:
                 await _wait_for_background_post_turn_catchup(
                     state,
                     handle,
@@ -3498,11 +3498,6 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "turn_progress_callback",
             ):
                 kwargs["turn_progress_callback"] = turn_progress_callback
-            if _call_accepts_keyword(
-                state.runtime.submit_timeskip_for_initial_render,
-                "post_input_catchup",
-            ) and needs_post_input_catchup:
-                kwargs["post_input_catchup"] = post_input_catchup
             try:
                 turn = await state.runtime.submit_timeskip_for_initial_render(
                     **kwargs
@@ -3516,6 +3511,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 failure_message="Timeskip did not produce a narrator response",
             )
             await _emit_initial_chat_turn_event(handle, turn)
+            await handle.advance_completion_level(RESPONSE_COMMITTED)
             if turn.has_post_turn_jobs:
                 queued = await _queue_post_turn_jobs_background(
                     state,
@@ -3535,7 +3531,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     current_user_id=current_user_id,
                 )
                 if queued is None:
-                    return await _run_post_turn_jobs_with_ordered_progress(
+                    return await _run_post_turn_jobs_inline_fallback(
                         state,
                         handle,
                         save_id=turn.save_id or "",
@@ -8963,8 +8959,8 @@ def _locked_job_worker(state: WebAppState, worker: JobWorker) -> JobWorker:
     return locked
 
 
-def _post_turn_operation_queue_key(save_id: str) -> str:
-    return f"post_turn:{save_id}"
+def _post_turn_operation_queue_key(save_id: str, narrator_message_id: str) -> str:
+    return f"post_turn:{save_id}:{narrator_message_id}"
 
 
 def _active_background_post_turn_jobs(
@@ -8972,11 +8968,10 @@ def _active_background_post_turn_jobs(
     *,
     save_id: str,
 ) -> list[JobRecord]:
-    queue_key = _post_turn_operation_queue_key(save_id)
     return [
         job
         for job in state.jobs.list_active(save_id=save_id)
-        if job.type == "post_turn_background" and job.operation_queue_key == queue_key
+        if job.type == "post_turn_background"
     ]
 
 
@@ -8987,9 +8982,14 @@ async def _wait_for_background_post_turn_catchup(
     save_id: str,
 ) -> None:
     active_jobs = _active_background_post_turn_jobs(state, save_id=save_id)
-    tasks = [job.task for job in active_jobs if job.task is not None]
-    if not tasks:
+    if not active_jobs:
         return
+    waiting_payload = {
+        "status": "waiting",
+        "completion_level": RESPONSE_COMMITTED,
+        "label": "Waiting for prior turn continuity",
+    }
+    await handle.event("progress", waiting_payload)
     await handle.event(
         "post_turn_catchup",
         {
@@ -8997,9 +8997,11 @@ async def _wait_for_background_post_turn_catchup(
             "job_ids": [job.id for job in active_jobs],
         },
     )
-    for task in tasks:
+    for job in active_jobs:
         try:
-            await asyncio.shield(task)
+            await asyncio.shield(
+                state.jobs.wait_for_completion_level(job.id, CONTINUITY_READY)
+            )
         except Exception as exc:
             await handle.event(
                 "post_turn_catchup",
@@ -9032,17 +9034,37 @@ async def _queue_post_turn_jobs_background(
     current_user_id: str | None = None,
 ) -> JobRecord | None:
     async def worker(post_turn_handle: JobHandle) -> Any:
-        return await _run_post_turn_jobs_with_ordered_progress(
+        await post_turn_handle.advance_completion_level(RESPONSE_COMMITTED)
+        optional_jobs: list[JobRecord] = []
+        action_choice_job = await _queue_prepared_action_choices_if_available(
+            state,
+            post_turn_handle,
+            save_id=save_id,
+            narrator_message_id=narrator_message_id,
+            prepared_action_choices=prepared_action_choices,
+            current_user_id=current_user_id,
+        )
+        if action_choice_job is not None:
+            optional_jobs.append(action_choice_job)
+        result = await _run_post_turn_jobs_with_ordered_progress(
             state,
             post_turn_handle,
             save_id=save_id,
             player_message_id=player_message_id,
             narrator_message_id=narrator_message_id,
             turn_revision=turn_revision,
-            prepared_action_choices=prepared_action_choices,
             prior_phase_jobs=None,
             current_user_id=current_user_id,
+            optional_jobs=optional_jobs,
         )
+        await post_turn_handle.advance_completion_level(CONTINUITY_READY)
+        for optional_job in optional_jobs:
+            if optional_job.task is not None:
+                await asyncio.shield(optional_job.task)
+        await post_turn_handle.advance_completion_level(
+            OPTIONAL_ENRICHMENTS_COMPLETE
+        )
+        return result
 
     try:
         record = await state.jobs.create(
@@ -9050,7 +9072,10 @@ async def _queue_post_turn_jobs_background(
             worker,
             save_id=save_id,
             creator_user_id=_owner_user_id_for_request(state),
-            operation_queue_key=_post_turn_operation_queue_key(save_id),
+            operation_queue_key=_post_turn_operation_queue_key(
+                save_id,
+                narrator_message_id,
+            ),
         )
     except (JobRegistryExclusiveKeyError, JobRegistryFullError) as exc:
         await handle.event(
@@ -9081,9 +9106,9 @@ async def _run_post_turn_jobs_with_ordered_progress(
     player_message_id: str,
     narrator_message_id: str,
     turn_revision: object | None = None,
-    prepared_action_choices: object | None = None,
     prior_phase_jobs: list[dict[str, str]] | None = None,
     current_user_id: str | None = None,
+    optional_jobs: list[JobRecord] | None = None,
 ) -> Any:
     done = object()
     progress_queue: asyncio.Queue[object] = asyncio.Queue()
@@ -9116,14 +9141,6 @@ async def _run_post_turn_jobs_with_ordered_progress(
             "turn_revision",
         ):
             kwargs["turn_revision"] = turn_revision
-        if (
-            prepared_action_choices is not None
-            and _call_accepts_keyword(
-                state.runtime.run_post_turn_jobs,
-                "prepared_action_choices",
-            )
-        ):
-            kwargs["prepared_action_choices"] = prepared_action_choices
         if _call_accepts_keyword(
             state.runtime.run_post_turn_jobs,
             "current_user_id",
@@ -9135,16 +9152,125 @@ async def _run_post_turn_jobs_with_ordered_progress(
         ):
             kwargs["defer_image_generation"] = True
         result = await state.runtime.run_post_turn_jobs(**kwargs)
-        await _queue_deferred_automatic_image_if_prepared(
+        image_job = await _queue_deferred_automatic_image_if_prepared(
             state,
             save_id=save_id,
             narrator_message_id=narrator_message_id,
             current_user_id=current_user_id,
         )
+        if image_job is not None and optional_jobs is not None:
+            optional_jobs.append(image_job)
         return result
     finally:
         progress_queue.put_nowait(done)
         await pump_task
+
+
+async def _run_post_turn_jobs_inline_fallback(
+    state: WebAppState,
+    handle: JobHandle,
+    *,
+    save_id: str,
+    player_message_id: str,
+    narrator_message_id: str,
+    turn_revision: object | None = None,
+    prepared_action_choices: object | None = None,
+    prior_phase_jobs: list[dict[str, str]] | None = None,
+    current_user_id: str | None = None,
+) -> Any:
+    optional_jobs: list[JobRecord] = []
+    action_choice_job = await _queue_prepared_action_choices_if_available(
+        state,
+        handle,
+        save_id=save_id,
+        narrator_message_id=narrator_message_id,
+        prepared_action_choices=prepared_action_choices,
+        current_user_id=current_user_id,
+    )
+    if action_choice_job is not None:
+        optional_jobs.append(action_choice_job)
+    result = await _run_post_turn_jobs_with_ordered_progress(
+        state,
+        handle,
+        save_id=save_id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator_message_id,
+        turn_revision=turn_revision,
+        prior_phase_jobs=prior_phase_jobs,
+        current_user_id=current_user_id,
+        optional_jobs=optional_jobs,
+    )
+    await handle.advance_completion_level(CONTINUITY_READY)
+
+    async def finish_optional_jobs() -> None:
+        for optional_job in optional_jobs:
+            if optional_job.task is not None:
+                await asyncio.shield(optional_job.task)
+        await handle.advance_completion_level(OPTIONAL_ENRICHMENTS_COMPLETE)
+
+    if optional_jobs:
+        finalizer = asyncio.create_task(finish_optional_jobs())
+        finalizer.add_done_callback(
+            lambda task: None if task.cancelled() else task.exception()
+        )
+    else:
+        await handle.advance_completion_level(OPTIONAL_ENRICHMENTS_COMPLETE)
+    return result
+
+
+async def _queue_prepared_action_choices_if_available(
+    state: WebAppState,
+    handle: JobHandle,
+    *,
+    save_id: str,
+    narrator_message_id: str,
+    prepared_action_choices: object | None,
+    current_user_id: str | None = None,
+) -> JobRecord | None:
+    if prepared_action_choices is None:
+        return None
+    run_prepared = getattr(state.runtime, "run_prepared_action_choices", None)
+    if not callable(run_prepared):
+        return None
+
+    async def worker(action_choice_handle: JobHandle) -> Any:
+        del action_choice_handle
+        kwargs: dict[str, object] = {
+            "prepared_action_choices": prepared_action_choices,
+        }
+        if _call_accepts_keyword(run_prepared, "current_user_id"):
+            kwargs["current_user_id"] = current_user_id
+        return await run_prepared(**kwargs)
+
+    try:
+        record = await state.jobs.create(
+            "automatic_action_choice_generation",
+            worker,
+            save_id=save_id,
+            creator_user_id=current_user_id,
+            operation_queue_key=(
+                f"automatic_action_choices:{save_id}:{narrator_message_id}"
+            ),
+        )
+    except Exception as exc:
+        observe(
+            "web.optional_enrichment_queue_failed",
+            level="error",
+            save_id=save_id,
+            narrator_message_id=narrator_message_id,
+            enrichment="action_choices",
+            **error_fields(exc),
+        )
+        await handle.event(
+            "optional_enrichment",
+            {"name": "action_choices", "status": "queue_failed"},
+        )
+        return None
+    await handle.event(
+        "optional_enrichment",
+        {"name": "action_choices", "status": "queued", "job_id": record.id},
+    )
+    return record
 
 
 async def _queue_deferred_automatic_image_if_prepared(
@@ -9153,27 +9279,27 @@ async def _queue_deferred_automatic_image_if_prepared(
     save_id: str,
     narrator_message_id: str,
     current_user_id: str | None = None,
-) -> None:
+) -> JobRecord | None:
     consume = getattr(
         state.runtime,
         "consume_deferred_automatic_image",
         None,
     )
     if not callable(consume):
-        return
+        return None
     prepared_automatic_image = consume(
         save_id=save_id,
         narrator_message_id=narrator_message_id,
     )
     if prepared_automatic_image is None:
-        return
+        return None
     run_deferred = getattr(
         state.runtime,
         "run_deferred_automatic_image",
         None,
     )
     if not callable(run_deferred):
-        return
+        return None
 
     async def worker(post_turn_handle: JobHandle) -> Any:
         kwargs: dict[str, object] = {
@@ -9185,21 +9311,23 @@ async def _queue_deferred_automatic_image_if_prepared(
         return await run_deferred(**kwargs)
 
     try:
-        await state.jobs.create(
+        return await state.jobs.create(
             "automatic_image_generation",
             worker,
             save_id=save_id,
             creator_user_id=current_user_id,
             operation_queue_key=f"automatic_image:{save_id}",
         )
-    except Exception:
-        kwargs: dict[str, object] = {
-            "save_id": save_id,
-            "prepared_automatic_image": prepared_automatic_image,
-        }
-        if _call_accepts_keyword(run_deferred, "current_user_id"):
-            kwargs["current_user_id"] = current_user_id
-        await run_deferred(**kwargs)
+    except Exception as exc:
+        observe(
+            "web.optional_enrichment_queue_failed",
+            level="error",
+            save_id=save_id,
+            narrator_message_id=narrator_message_id,
+            enrichment="image",
+            **error_fields(exc),
+        )
+        return None
 
 
 def _initial_chat_turn_progress(status_text: str) -> dict[str, object]:
@@ -9265,7 +9393,11 @@ def _progress_jobs(progress: object) -> list[dict[str, str]]:
         name = job.get("name")
         status = job.get("status")
         if isinstance(name, str) and isinstance(status, str):
-            parsed.append({"name": name, "status": status})
+            parsed_job = {"name": name, "status": status}
+            category = job.get("category")
+            if isinstance(category, str):
+                parsed_job["category"] = category
+            parsed.append(parsed_job)
     return parsed
 
 
@@ -9293,7 +9425,11 @@ def _initial_post_turn_progress(
         "status_text": "Updating world state",
         "jobs": (prior_phase_jobs or [])
         + [
-            {"name": name, "status": "pending"}
+            {
+                "name": name,
+                "status": "pending",
+                "category": "optional" if name == "image" else "continuity",
+            }
             for name in _POST_TURN_PROGRESS_JOB_ORDER
         ],
     }

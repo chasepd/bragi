@@ -8,7 +8,7 @@ import json
 import sqlite3
 import threading
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -7653,11 +7653,14 @@ def test_timeskip_post_turn_jobs_preserve_request_actor(
     tmp_path: Path,
     max_active_jobs: int | None,
 ) -> None:
+    prepared_choices = object()
+
     class RuntimeWithTimeskipPostTurn(_RuntimeDouble):
         def __init__(self) -> None:
             super().__init__()
             self.submission_user_ids: list[str | None] = []
             self.post_turn_user_ids: list[str | None] = []
+            self.choice_user_ids: list[str | None] = []
             self.post_turn_finished = threading.Event()
 
         async def submit_timeskip_for_initial_render(
@@ -7675,7 +7678,18 @@ def test_timeskip_post_turn_jobs_preserve_request_actor(
                 save_id=cast(str, active_save_id),
                 player_message_id="timeskip-1",
                 narrator_message_id="narrator-1",
+                prepared_action_choices=prepared_choices,
             )
+
+        async def run_prepared_action_choices(
+            self,
+            *,
+            prepared_action_choices: object,
+            current_user_id: str | None = None,
+        ) -> str:
+            assert prepared_action_choices is prepared_choices
+            self.choice_user_ids.append(current_user_id)
+            return "succeeded"
 
         async def run_post_turn_jobs(
             self,
@@ -7730,6 +7744,11 @@ def test_timeskip_post_turn_jobs_preserve_request_actor(
     assert job["status"] == "succeeded"
     assert runtime.submission_user_ids == [user.id]
     assert runtime.post_turn_user_ids == [user.id]
+    if max_active_jobs is None:
+        assert runtime.choice_user_ids == [user.id]
+    else:
+        assert runtime.choice_user_ids == []
+        assert job["completion_level"] == "optional_enrichments_complete"
 
 
 def test_look_around_post_records_save_id_and_returns_answer_job(
@@ -8736,6 +8755,10 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
             super().__init__()
             self.deferred_calls: list[dict[str, object]] = []
             self._payloads: dict[tuple[str, str], dict[str, object]] = {}
+            self.submit_count = 0
+            self.image_started = threading.Event()
+            self.release_image = threading.Event()
+            self.second_turn_started = threading.Event()
 
         async def submit_player_message_for_initial_render(
             self,
@@ -8744,6 +8767,16 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
             speaker_name: str | None,
             active_save_id: object,
         ) -> SimpleNamespace:
+            self.submit_count += 1
+            if self.submit_count > 1:
+                self.second_turn_started.set()
+                return SimpleNamespace(
+                    model=_chat_model("The lens keeps humming."),
+                    has_post_turn_jobs=False,
+                    save_id="save-1",
+                    player_message_id="player-2",
+                    narrator_message_id="narrator-2",
+                )
             return SimpleNamespace(
                 model=_chat_model("The bell answers."),
                 has_post_turn_jobs=True,
@@ -8780,6 +8813,8 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
             current_user_id: str | None = None,
         ) -> str:
             self.deferred_calls.append(prepared_automatic_image)
+            self.image_started.set()
+            await asyncio.to_thread(self.release_image.wait)
             return "succeeded"
 
     runtime = DeferredImageRuntime()
@@ -8790,12 +8825,46 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
             json={"body": "Light the beacon", "save_id": "save-1"},
         )
         assert created.status_code == 200
+        _wait_for_terminal_job(client, created.json()["id"], save_id="save-1")
+        assert runtime.image_started.wait(timeout=2)
         for _ in range(100):
-            if runtime.deferred_calls:
+            post_turn_jobs = [
+                job
+                for job in client.get("/api/jobs?status=active").json()["jobs"]
+                if job["type"] == "post_turn_background"
+            ]
+            if (
+                post_turn_jobs
+                and post_turn_jobs[0]["completion_level"] == "continuity_ready"
+            ):
                 break
             time.sleep(0.01)
+        else:
+            raise AssertionError("post-turn continuity did not become ready")
+
+        second = client.post(
+            "/api/chat",
+            json={"body": "Inspect the lens", "save_id": "save-1"},
+        )
+        assert second.status_code == 200
+        assert runtime.second_turn_started.wait(timeout=2)
+        second_finished = _wait_for_terminal_job(
+            client,
+            second.json()["id"],
+            save_id="save-1",
+        )
+        assert second_finished["status"] == "succeeded"
+        runtime.release_image.set()
+        post_turn_finished = _wait_for_terminal_job(
+            client,
+            post_turn_jobs[0]["id"],
+            save_id="save-1",
+        )
 
     assert runtime.deferred_calls == [prepared_payload]
+    assert post_turn_finished["completion_level"] == (
+        "optional_enrichments_complete"
+    )
 
 
 def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
@@ -8978,18 +9047,39 @@ def test_post_turn_jobs_expose_initial_phase_progress_before_runtime_callback(
     assert job["latest_progress"] == {
         "status_text": "Updating world state",
         "jobs": [
-            {"name": "state", "status": "pending"},
-            {"name": "context", "status": "pending"},
-            {"name": "proactive_text", "status": "pending"},
-            {"name": "director", "status": "pending"},
-            {"name": "scenario", "status": "pending"},
-            {"name": "image", "status": "pending"},
+            {"name": "state", "status": "pending", "category": "continuity"},
+            {
+                "name": "context",
+                "status": "pending",
+                "category": "continuity",
+            },
+            {
+                "name": "time_reconciliation",
+                "status": "pending",
+                "category": "continuity",
+            },
+            {
+                "name": "proactive_text",
+                "status": "pending",
+                "category": "continuity",
+            },
+            {
+                "name": "director",
+                "status": "pending",
+                "category": "continuity",
+            },
+            {
+                "name": "scenario",
+                "status": "pending",
+                "category": "continuity",
+            },
+            {"name": "image", "status": "pending", "category": "optional"},
         ],
     }
     assert finished["status"] == "succeeded"
 
 
-def test_chat_turn_waits_for_background_post_turn_after_input_progress(
+def test_chat_turn_waits_for_background_continuity_before_persisting_input(
     tmp_path: Path,
 ) -> None:
     class PostTurnCatchupRuntime(_RuntimeDouble):
@@ -8998,8 +9088,7 @@ def test_chat_turn_waits_for_background_post_turn_after_input_progress(
             self.submit_count = 0
             self.post_turn_started = threading.Event()
             self.release_post_turn = threading.Event()
-            self.second_input_saved = threading.Event()
-            self.second_catchup_done = threading.Event()
+            self.second_submit_started = threading.Event()
 
         async def submit_player_message_for_initial_render(
             self,
@@ -9008,7 +9097,6 @@ def test_chat_turn_waits_for_background_post_turn_after_input_progress(
             speaker_name: str | None,
             active_save_id: object,
             turn_progress_callback: Callable[[object], None] | None = None,
-            post_input_catchup: Callable[[], Awaitable[Any]] | None = None,
         ) -> SimpleNamespace:
             del speaker_name
             self.submit_count += 1
@@ -9024,16 +9112,13 @@ def test_chat_turn_waits_for_background_post_turn_after_input_progress(
             assert active_save_id == "save-1"
             assert body == "I check the lens while the world settles."
             assert turn_progress_callback is not None
-            assert post_input_catchup is not None
+            self.second_submit_started.set()
             turn_progress_callback(
                 _expected_chat_turn_progress(
                     "Player input saved",
                     succeeded=("submission", "history", "input"),
                 )
             )
-            self.second_input_saved.set()
-            await post_input_catchup()
-            self.second_catchup_done.set()
             return SimpleNamespace(
                 model=_chat_model("The lens keeps humming."),
                 has_post_turn_jobs=False,
@@ -9079,16 +9164,14 @@ def test_chat_turn_waits_for_background_post_turn_after_input_progress(
         )
         assert second.status_code == 200
         second_job_id = second.json()["id"]
-        assert runtime.second_input_saved.wait(timeout=2)
-        assert not runtime.second_catchup_done.is_set()
         for _ in range(50):
             second_running = client.get(_job_url(second_job_id, "save-1")).json()
-            if second_running.get("latest_progress", {}).get("status_text") == (
-                "Player input saved"
-            ):
+            if second_running.get("latest_progress", {}).get("status") == "waiting":
                 break
             time.sleep(0.01)
+        assert not runtime.second_submit_started.is_set()
         runtime.release_post_turn.set()
+        assert runtime.second_submit_started.wait(timeout=2)
         second_finished = _wait_for_terminal_job(
             client,
             second_job_id,
@@ -9097,12 +9180,124 @@ def test_chat_turn_waits_for_background_post_turn_after_input_progress(
 
     assert first_job["status"] == "succeeded"
     assert second_running["status"] == "running"
-    assert second_running["latest_progress"] == _expected_chat_turn_progress(
-        "Player input saved",
-        succeeded=("submission", "history", "input"),
-    )
-    assert runtime.second_catchup_done.is_set()
+    assert second_running["latest_progress"] == {
+        "status": "waiting",
+        "completion_level": "response_committed",
+        "label": "Waiting for prior turn continuity",
+    }
     assert second_finished["status"] == "succeeded"
+
+
+def test_slow_action_choices_do_not_delay_next_narrator_turn(tmp_path: Path) -> None:
+    prepared_choices = object()
+
+    class OptionalActionRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.submit_count = 0
+            self.action_choices_started = threading.Event()
+            self.release_action_choices = threading.Event()
+            self.second_turn_started = threading.Event()
+
+        async def submit_player_message_for_initial_render(
+            self,
+            *,
+            body: str,
+            speaker_name: str | None,
+            active_save_id: object,
+        ) -> SimpleNamespace:
+            del body, speaker_name, active_save_id
+            self.submit_count += 1
+            if self.submit_count == 1:
+                return SimpleNamespace(
+                    model=_chat_model("The bell answers."),
+                    has_post_turn_jobs=True,
+                    save_id="save-1",
+                    player_message_id="player-1",
+                    narrator_message_id="narrator-1",
+                    prepared_action_choices=prepared_choices,
+                )
+            self.second_turn_started.set()
+            return SimpleNamespace(
+                model=_chat_model("The lens keeps humming."),
+                has_post_turn_jobs=False,
+                save_id="save-1",
+                player_message_id="player-2",
+                narrator_message_id="narrator-2",
+            )
+
+        async def run_post_turn_jobs(
+            self,
+            *,
+            save_id: str,
+            player_message_id: str,
+            narrator_message_id: str,
+            progress_callback: object | None = None,
+        ) -> dict[str, object]:
+            del save_id, player_message_id, narrator_message_id, progress_callback
+            return _chat_model("Continuity ready.")
+
+        async def run_prepared_action_choices(
+            self,
+            *,
+            prepared_action_choices: object,
+            current_user_id: str | None = None,
+        ) -> str:
+            del current_user_id
+            assert prepared_action_choices is prepared_choices
+            self.action_choices_started.set()
+            await asyncio.to_thread(self.release_action_choices.wait)
+            return "succeeded"
+
+    runtime = OptionalActionRuntime()
+    state = _state_double(tmp_path, runtime)
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        first = client.post(
+            "/api/chat",
+            json={"body": "Light the beacon", "save_id": "save-1"},
+        )
+        assert first.status_code == 200
+        _wait_for_terminal_job(client, first.json()["id"], save_id="save-1")
+        assert runtime.action_choices_started.wait(timeout=2)
+
+        for _ in range(50):
+            post_turn_jobs = [
+                job
+                for job in client.get("/api/jobs?status=active").json()["jobs"]
+                if job["type"] == "post_turn_background"
+            ]
+            if (
+                post_turn_jobs
+                and post_turn_jobs[0]["completion_level"] == "continuity_ready"
+            ):
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("post-turn continuity did not become ready")
+
+        second = client.post(
+            "/api/chat",
+            json={"body": "I inspect the lens", "save_id": "save-1"},
+        )
+        assert second.status_code == 200
+        assert runtime.second_turn_started.wait(timeout=2)
+        second_finished = _wait_for_terminal_job(
+            client,
+            second.json()["id"],
+            save_id="save-1",
+        )
+        assert second_finished["status"] == "succeeded"
+
+        runtime.release_action_choices.set()
+        post_turn_finished = _wait_for_terminal_job(
+            client,
+            post_turn_jobs[0]["id"],
+            save_id="save-1",
+        )
+
+    assert post_turn_finished["completion_level"] == (
+        "optional_enrichments_complete"
+    )
 
 
 def test_chat_turn_leaves_state_pruning_for_scheduler(tmp_path: Path) -> None:
