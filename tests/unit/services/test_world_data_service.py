@@ -1273,6 +1273,46 @@ def test_world_data_service_applies_memory_suggestion_with_observation_provenanc
     assert memory.claim_fingerprint
 
 
+def test_world_data_service_applies_memory_suggestion_with_epistemic_identity(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    world_data = _import_world_data_service_without_gtk(monkeypatch)
+    save_id, ids = _persist_normalized_world_data_fixture(repositories)
+    actor = repositories.add_character(save_id=save_id, name="Courier")
+    suggestion = repositories.add_context_update_suggestion(
+        save_id=save_id,
+        update_type="create",
+        entity_type="memory",
+        field_path="*",
+        proposed_value={
+            "body": "The north gate is unguarded.",
+            "tags": ["hearsay"],
+            "importance": 0.9,
+            "source_message_ids": [ids["message"]],
+            "source_observation_ids": [],
+            "epistemic_status": "reported_speech",
+            "epistemic_actor_id": actor.id,
+            "epistemic_actor_name": actor.name,
+        },
+        source_message_ids=[ids["message"]],
+    )
+
+    world_data.WorldDataService(
+        repositories=repositories,
+        active_save_id=save_id,
+    ).apply_suggestions((suggestion.id,))
+
+    memory = next(
+        item
+        for item in repositories.list_memories(save_id)
+        if item.body == "The north gate is unguarded."
+    )
+    assert memory.epistemic_status == "reported_speech"
+    assert memory.epistemic_actor_id == actor.id
+    assert memory.epistemic_actor_name == "Courier"
+
+
 def test_world_data_service_applies_scene_time_suggestion_with_canonical_provenance(
     repositories: PersistenceRepositories,
     monkeypatch: MonkeyPatch,

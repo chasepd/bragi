@@ -151,7 +151,6 @@ from bragi.services.knowledge_boundary import (
     ScopedTargets,
     allowed_character_scoped_targets,
     character_scope_for_turn,
-    message_visible_to_present_characters,
 )
 from bragi.services.maintenance_scheduler import (
     CONTEXT_UPDATE_RETRY_DRAIN_LIMIT,
@@ -7636,42 +7635,12 @@ def _narrator_messages(
     characters: list[CharacterRecord] | None = None,
     message_visibility: list[MessageVisibilityRecord] | None = None,
 ) -> tuple[ChatMessage, ...]:
-    snapshot = (
-        scene_snapshot
-        if scene_snapshot is not None
-        else repositories.get_scene_snapshot(player_message.save_id)
-    )
-    character_records = (
-        characters
-        if characters is not None
-        else repositories.list_characters(player_message.save_id)
-    )
-    turn_scope = character_scope_for_turn(
-        scene_snapshot=snapshot,
-        characters=character_records,
-        latest_player_message=player_message.body,
-    )
-    visibility_records = (
-        message_visibility
-        if message_visibility is not None
-        else (
-            repositories.list_message_visibility(
-                player_message.save_id,
-                character_ids=turn_scope.present_character_ids,
-            )
-            if turn_scope.present_character_ids
-            else []
-        )
-    )
+    del context_result, scene_snapshot, characters, message_visibility
+    # The narrator is omniscient. Character-specific visibility is enforced by
+    # actor projections and knowledge-edge labels, not by deleting facts from
+    # the narrator's shared context when one present character lacks them.
     prior_messages = [
-        message
-        for message in messages
-        if message.id != player_message.id
-        if message_visible_to_present_characters(
-            message_id=message.id,
-            present_character_ids=turn_scope.present_character_ids,
-            message_visibility=visibility_records,
-        )
+        message for message in messages if message.id != player_message.id
     ]
     baseline_ids = _recent_transcript_message_ids(
         prior_messages,
@@ -9937,72 +9906,37 @@ def _budgeted_narrator_context(
         if narration_snapshot is not None
         else tuple(repositories.list_message_visibility(save_id))
     )
-    hidden_message_ids = _hidden_message_ids_for_present_characters(
-        scene_snapshot=snapshot,
-        message_visibility=message_visibility_records,
-    )
+    hidden_message_ids: frozenset[str] = frozenset()
     memory_records = (
         tuple(narration_snapshot.memories)
         if narration_snapshot is not None
         else tuple(repositories.list_memories(save_id))
     )
-    visible_memory_records = tuple(
-        memory
-        for memory in memory_records
-        if not hidden_message_ids.intersection(memory.source_message_ids)
-    )
+    visible_memory_records = memory_records
     world_state_records = (
         tuple(narration_snapshot.world_state)
         if narration_snapshot is not None
         else tuple(repositories.list_world_state(save_id))
     )
-    visible_world_state_records = tuple(
-        state
-        for state in world_state_records
-        if state.source_message_id not in hidden_message_ids
-    )
+    visible_world_state_records = world_state_records
     entity_link_records = (
         tuple(narration_snapshot.entity_links)
         if narration_snapshot is not None
         else tuple(repositories.list_entity_links(save_id))
     )
-    visible_entity_link_records = tuple(
-        link
-        for link in entity_link_records
-        if link.source_message_id not in hidden_message_ids
-    )
+    visible_entity_link_records = entity_link_records
     knowledge_edge_records = (
         tuple(narration_snapshot.character_knowledge_edges)
         if narration_snapshot is not None
         else tuple(repositories.list_character_knowledge_edges(save_id))
     )
-    visible_knowledge_edge_records = tuple(
-        edge
-        for edge in knowledge_edge_records
-        if not hidden_message_ids.intersection(edge.source_message_ids)
-    )
+    visible_knowledge_edge_records = knowledge_edge_records
     summary_records = (
         tuple(narration_snapshot.summaries)
         if narration_snapshot is not None
         else tuple(repositories.list_summaries(save_id))
     )
-    present_character_ids = frozenset(
-        snapshot.present_character_ids if snapshot is not None else ()
-    )
-    visible_summary_keys = repositories.summaries_visible_to_characters(
-        save_id=save_id,
-        summaries=tuple(
-            (summary.covers_message_start_id, summary.covers_message_end_id)
-            for summary in summary_records
-        ),
-        character_ids=present_character_ids,
-    )
-    visible_summary_records = tuple(
-        summary
-        for summary in summary_records
-        if (summary.covers_message_start_id, summary.covers_message_end_id)
-        in visible_summary_keys
-    )
+    visible_summary_records = summary_records
     deterministic_sources = deterministic_context_sources(
         repositories=repositories,
         save_id=save_id,

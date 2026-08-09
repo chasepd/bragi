@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
+from bragi.epistemics import format_epistemic_fact
 from bragi.persistence.models import (
     ActiveThreadRecord,
     CharacterKnowledgeEdgeRecord,
@@ -41,6 +42,7 @@ from bragi.services.dating_route_policy import (
 from bragi.services.knowledge_boundary import (
     character_scope_for_turn,
     knowledge_edge_has_character_text_source,
+    message_visible_to_character,
     message_visible_to_present_characters,
 )
 from bragi.services.mention_matching import character_name_is_mentioned
@@ -1642,9 +1644,15 @@ def _dedupe_context_sources(
     sources: tuple[ContextSource, ...],
 ) -> tuple[ContextSource, ...]:
     deduped: list[ContextSource] = []
-    seen: dict[tuple[str, str], int] = {}
+    seen: dict[tuple[str, str, str], int] = {}
     for source in sources:
-        key = (source.source_type, source.source_id)
+        actor_scope = ""
+        if (
+            source.tier == "active_linked_facts"
+            and source.text.startswith("Character-scoped knowledge (")
+        ):
+            actor_scope = source.text.partition(" linked ")[0]
+        key = (source.source_type, source.source_id, actor_scope)
         if key in seen:
             existing_index = seen[key]
             if source.always_include and not deduped[existing_index].always_include:
@@ -1949,7 +1957,6 @@ def _active_linked_fact_sources(
         )
         if _knowledge_edge_source_visible_to_active_characters(
             edge,
-            active_character_ids=active_character_ids,
             message_visibility=visibility_records,
         )
     )
@@ -2019,6 +2026,37 @@ def _active_linked_fact_sources(
             message_positions=message_positions,
         )
     }
+    knowledge_memory_by_id = {
+        memory.id: memory
+        for memory in memory_records
+        if _record_is_at_or_before(
+            memory,
+            source_message_id=source_message_id,
+            message_positions=message_positions,
+        )
+    }
+    knowledge_state_by_id = {
+        state.id: state
+        for state in world_state_records
+        if not (
+            active_thread_records_exist and is_open_threads_aggregate_key(state.key)
+        )
+        if _record_is_at_or_before(
+            state,
+            source_message_id=source_message_id,
+            message_positions=message_positions,
+        )
+    }
+    knowledge_summary_by_id = {
+        summary.id: summary
+        for summary in summary_records
+        if validate_summary_output(summary.body).accepted
+        if _summary_is_at_or_before(
+            summary,
+            source_message_id=source_message_id,
+            message_positions=message_positions,
+        )
+    }
     scenario_candidates = scenario_section_candidates(scenario)
     scenario_sections = {
         source_id: (section_id, text)
@@ -2033,23 +2071,27 @@ def _active_linked_fact_sources(
         for character in character_records
     }
     sources: list[ContextSource] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     knowledge_edge_targets: set[tuple[str, str, str]] = set()
     for edge in knowledge_edges:
         target_type = _normalized_link_type(edge.target_type)
         knowledge_edge_targets.add((edge.character_id, target_type, edge.target_id))
         source = _knowledge_edge_source(
             edge=edge,
-            memory_by_id=memory_by_id,
-            state_by_id=state_by_id,
-            summary_by_id=summary_by_id,
+            memory_by_id=knowledge_memory_by_id,
+            state_by_id=knowledge_state_by_id,
+            summary_by_id=knowledge_summary_by_id,
             scenario_sections=scenario_sections,
             scenario_sections_by_key=scenario_sections_by_key,
             character_names=character_names,
         )
         if source is None:
             continue
-        key = (source.source_type, source.source_id)
+        key = (
+            source.source_type,
+            source.source_id,
+            f"knowledge:{edge.character_id}:{edge.knowledge_state}",
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -2081,7 +2123,7 @@ def _active_linked_fact_sources(
         )
         if source is None:
             continue
-        key = (source.source_type, source.source_id)
+        key = (source.source_type, source.source_id, "entity_link")
         if key in seen:
             continue
         seen.add(key)
@@ -2128,7 +2170,7 @@ def _linked_fact_source(
             tier="active_linked_facts",
             source_type="memory",
             source_id=memory.id,
-            text=f"{prefix}memory: {memory.body}",
+            text=f"{prefix}memory: {_epistemic_memory_text(memory)}",
             reason=_link_reason(link),
         )
     if target_type == "world_state":
@@ -2177,6 +2219,15 @@ def _linked_fact_source(
     return None
 
 
+def _epistemic_memory_text(memory: MemoryRecord) -> str:
+    return format_epistemic_fact(
+        memory.body,
+        status=memory.epistemic_status,
+        actor_id=memory.epistemic_actor_id,
+        actor_name=memory.epistemic_actor_name,
+    )
+
+
 def _knowledge_edge_source(
     *,
     edge: CharacterKnowledgeEdgeRecord,
@@ -2200,7 +2251,7 @@ def _knowledge_edge_source(
             tier="active_linked_facts",
             source_type="memory",
             source_id=memory.id,
-            text=f"{prefix}memory: {memory.body}",
+            text=f"{prefix}memory: {_epistemic_memory_text(memory)}",
             reason=reason,
         )
     if target_type == "world_state":
@@ -2300,16 +2351,18 @@ def _normalized_link_type(value: str) -> str:
 def _knowledge_edge_source_visible_to_active_characters(
     edge: CharacterKnowledgeEdgeRecord,
     *,
-    active_character_ids: set[str],
     message_visibility: tuple[MessageVisibilityRecord, ...],
 ) -> bool:
-    return _source_message_ids_visible_to_active_characters(
-        (
+    return all(
+        message_visible_to_character(
+            message_id=source_id,
+            character_id=edge.character_id,
+            message_visibility=list(message_visibility),
+        )
+        for source_id in (
             *edge.source_message_ids,
             *([edge.source_message_id] if edge.source_message_id else []),
-        ),
-        active_character_ids=active_character_ids,
-        message_visibility=message_visibility,
+        )
     )
 
 

@@ -3477,6 +3477,88 @@ def test_update_memory_atomically_merges_canonical_collision(
     assert repositories.list_memories(save_id) == [merged]
 
 
+def test_epistemic_memory_update_preserves_status_actor_and_distinct_fingerprint(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    actor = repositories.add_character(save_id=save_id, name="Courier")
+    legacy = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate is unguarded.",
+        tags=["fact"],
+    )
+    hearsay = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate is unguarded.",
+        tags=["hearsay"],
+        epistemic_status="reported_speech",
+        epistemic_actor_id=actor.id,
+        epistemic_actor_name=actor.name,
+    )
+
+    updated = repositories.update_memory(
+        memory_id=hearsay.id,
+        body="The north gate may be unguarded.",
+        tags=["hearsay", "gate"],
+        importance=0.8,
+    )
+    duplicate = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate may be unguarded.",
+        tags=["report"],
+        importance=0.9,
+        epistemic_status="reported_speech",
+        epistemic_actor_id=actor.id,
+        epistemic_actor_name=actor.name,
+    )
+
+    assert legacy.id != hearsay.id
+    assert updated.epistemic_status == "reported_speech"
+    assert updated.epistemic_actor_id == actor.id
+    assert duplicate.id == hearsay.id
+    assert duplicate.epistemic_status == "reported_speech"
+    assert set(duplicate.tags) == {"hearsay", "gate", "report"}
+
+
+def test_add_memory_repairs_mismatched_epistemic_identity(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    actor = repositories.add_character(save_id=save_id, name="Courier")
+    memory = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate is open.",
+        tags=["legacy"],
+        epistemic_status="reported_speech",
+        epistemic_actor_id=actor.id,
+        epistemic_actor_name=actor.name,
+    )
+    repositories.connection.execute(
+        """
+        UPDATE memories
+        SET epistemic_status = 'legacy_unclassified',
+            epistemic_actor_id = NULL,
+            epistemic_actor_name = ''
+        WHERE id = ?
+        """,
+        (memory.id,),
+    )
+    repositories.commit()
+
+    repaired = repositories.add_memory(
+        save_id=save_id,
+        body=memory.body,
+        tags=["hearsay"],
+        epistemic_status="reported_speech",
+        epistemic_actor_id=actor.id,
+        epistemic_actor_name=actor.name,
+    )
+
+    assert repaired.id == memory.id
+    assert repaired.epistemic_status == "reported_speech"
+    assert repaired.epistemic_actor_id == actor.id
+
+
 def test_repositories_consolidate_duplicates_without_losing_active_references(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3723,6 +3805,36 @@ def test_restore_memories_merges_active_fingerprint_collision(
     assert trigger.trigger_key == f"memory:{archived.id}"
     assert trigger.source_id == archived.id
     assert trigger.reason == "Replacement preference"
+
+
+def test_restore_memory_preserves_epistemic_fingerprint_identity(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    actor = repositories.add_character(save_id=save_id, name="Courier")
+    objective = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate is open.",
+        tags=["fact"],
+        epistemic_status="objective_outcome",
+    )
+    report = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate is open.",
+        tags=["hearsay"],
+        epistemic_status="reported_speech",
+        epistemic_actor_id=actor.id,
+        epistemic_actor_name=actor.name,
+    )
+    repositories.archive_memory(report.id)
+
+    repositories.restore_memories(frozenset({report.id}))
+
+    restored = repositories.get_memory(save_id, report.id)
+    assert restored is not None
+    assert restored.id != objective.id
+    assert restored.epistemic_status == "reported_speech"
+    assert restored.epistemic_actor_id == actor.id
 
 
 def test_repositories_check_unprotected_character_existence(

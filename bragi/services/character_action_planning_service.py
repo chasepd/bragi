@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Any, cast
 
 from bragi.app_logging import exception_log_fields, log_error_event
+from bragi.epistemics import format_epistemic_fact
 from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import (
     ActiveThreadRecord,
@@ -38,7 +39,11 @@ from bragi.services.dating_route_policy import (
     intimacy_profile_guidance,
 )
 from bragi.services.evidence import quote_matches_source
-from bragi.services.knowledge_boundary import message_visible_to_present_characters
+from bragi.services.knowledge_boundary import (
+    knowledge_edge_allows_prompt_use,
+    message_visible_to_character,
+    normalized_knowledge_target_type,
+)
 from bragi.services.mention_matching import character_name_is_mentioned
 from bragi.services.model_capabilities import (
     MODEL_LACKS_CAPABILITY_REASON,
@@ -1018,7 +1023,12 @@ def _character_presence_messages(
                         if storyteller_mode
                         else "Latest turn source message:"
                     ),
-                    source_message.body,
+                    _source_message_text_for_character(
+                        repositories=repositories,
+                        save_id=save_id,
+                        character=character,
+                        source_message=source_message,
+                    ),
                 )
                 if part != ""
             ),
@@ -1101,7 +1111,19 @@ def _character_presence_batch_messages(
                         if storyteller_mode
                         else "Latest turn source message:"
                     ),
-                    source_message.body,
+                    (
+                        source_message.body
+                        if all(
+                            _source_message_visible_to_character(
+                                repositories=repositories,
+                                save_id=save_id,
+                                character=character,
+                                source_message=source_message,
+                            )
+                            for character in characters
+                        )
+                        else "[Latest source is not shared by every character.]"
+                    ),
                 )
                 if part != ""
             ),
@@ -1206,7 +1228,12 @@ def _character_intent_messages(
                         if storyteller_mode
                         else "Latest turn source message:"
                     ),
-                    source_message.body,
+                    _source_message_text_for_character(
+                        repositories=repositories,
+                        save_id=save_id,
+                        character=character,
+                        source_message=source_message,
+                    ),
                 )
                 if part != ""
             ),
@@ -1414,6 +1441,59 @@ def _planning_evidence_sources(
     if snapshot is not None:
         add(f"scene_snapshot:{snapshot.id}", _scene_text(snapshot))
     add(f"character:{character.id}", _character_text(character))
+    visibility = repositories.list_message_visibility(
+        save_id,
+        character_ids=frozenset({character.id}),
+    )
+    memories_by_id = {
+        memory.id: memory for memory in repositories.list_memories(save_id)
+    }
+    state_by_id = {
+        state.id: state for state in repositories.list_world_state(save_id)
+    }
+    summaries_by_id = {
+        summary.id: summary for summary in repositories.list_summaries(save_id)
+    }
+    for edge in repositories.list_character_knowledge_edges(
+        save_id,
+        character_ids=frozenset({character.id}),
+    ):
+        source_ids = tuple(
+            dict.fromkeys(
+                (
+                    *edge.source_message_ids,
+                    *((edge.source_message_id,) if edge.source_message_id else ()),
+                )
+            )
+        )
+        if not knowledge_edge_allows_prompt_use(edge) or any(
+            not message_visible_to_character(
+                message_id=source_id,
+                character_id=character.id,
+                message_visibility=visibility,
+            )
+            for source_id in source_ids
+        ):
+            continue
+        target_type = normalized_knowledge_target_type(edge.target_type)
+        if target_type == "memory" and (memory := memories_by_id.get(edge.target_id)):
+            add(
+                f"memory:{memory.id}",
+                format_epistemic_fact(
+                    memory.body,
+                    status=memory.epistemic_status,
+                    actor_id=memory.epistemic_actor_id,
+                    actor_name=memory.epistemic_actor_name,
+                ),
+            )
+        elif target_type == "world_state" and (
+            state := state_by_id.get(edge.target_id)
+        ):
+            add(f"world_state:{state.id}", f"{state.key}: {state.value}")
+        elif target_type == "summary" and (
+            summary := summaries_by_id.get(edge.target_id)
+        ):
+            add(f"summary:{summary.id}", summary.body)
     for thread in repositories.list_active_threads(save_id):
         if (
             active_thread_is_prompt_visible(thread)
@@ -1444,7 +1524,17 @@ def _planning_evidence_sources(
         save is not None
         and save.interaction_mode is InteractionMode.STORYTELLER
     )
-    for message in (*recent_messages, source_message):
+    source_messages = (
+        (source_message,)
+        if _source_message_visible_to_character(
+            repositories=repositories,
+            save_id=save_id,
+            character=character,
+            source_message=source_message,
+        )
+        else ()
+    )
+    for message in (*recent_messages, *source_messages):
         if storyteller_mode and message.role != "narrator":
             continue
         add(f"message:{message.id}", message.body)
@@ -1460,6 +1550,16 @@ def _planning_batch_evidence_sources(
     messages: tuple[MessageRecord, ...],
 ) -> dict[str, str]:
     combined: dict[str, str] = {}
+    evidence_by_character = [
+        _planning_evidence_sources(
+            repositories=repositories,
+            save_id=save_id,
+            character=character,
+            source_message=source_message,
+            messages=messages,
+        )
+        for character in characters
+    ]
     recent_message_ids = {
         message.id
         for message in _planning_batch_recent_messages(
@@ -1470,17 +1570,29 @@ def _planning_batch_evidence_sources(
             messages=messages,
         )
     }
-    recent_message_ids.add(source_message.id)
-    for character in characters:
-        for source_id, text in _planning_evidence_sources(
+    if all(
+        _source_message_visible_to_character(
             repositories=repositories,
             save_id=save_id,
             character=character,
             source_message=source_message,
-            messages=messages,
-        ).items():
+        )
+        for character in characters
+    ):
+        recent_message_ids.add(source_message.id)
+    shared_private_source_ids = (
+        set.intersection(*(set(evidence) for evidence in evidence_by_character))
+        if evidence_by_character
+        else set()
+    )
+    for evidence in evidence_by_character:
+        for source_id, text in evidence.items():
             if source_id.startswith("message:") and (
                 source_id.removeprefix("message:") not in recent_message_ids
+            ):
+                continue
+            if source_id.startswith(("memory:", "world_state:", "summary:")) and (
+                source_id not in shared_private_source_ids
             ):
                 continue
             combined.setdefault(source_id, text)
@@ -1495,17 +1607,24 @@ def _planning_batch_recent_messages(
     source_message: MessageRecord,
     messages: tuple[MessageRecord, ...],
 ) -> tuple[MessageRecord, ...]:
-    seen: dict[str, MessageRecord] = {}
+    visible_id_sets: list[set[str]] = []
     for character in characters:
-        for message in _visible_recent_messages_for_character(
-            repositories=repositories,
-            save_id=save_id,
-            character=character,
-            source_message=source_message,
-            messages=messages,
-        ):
-            seen.setdefault(message.id, message)
-    return tuple(seen.values())[-CHARACTER_ACTION_PLANNING_BATCH_RECENT_MESSAGE_LIMIT:]
+        visible_id_sets.append(
+            {
+                message.id
+                for message in _visible_recent_messages_for_character(
+                    repositories=repositories,
+                    save_id=save_id,
+                    character=character,
+                    source_message=source_message,
+                    messages=messages,
+                )
+            }
+        )
+    shared_ids = set.intersection(*visible_id_sets) if visible_id_sets else set()
+    return tuple(
+        message for message in messages if message.id in shared_ids
+    )[-CHARACTER_ACTION_PLANNING_BATCH_RECENT_MESSAGE_LIMIT:]
 
 
 def _presence_assessments_from_batch_data(
@@ -1920,26 +2039,55 @@ def _visible_recent_messages_for_character(
     source_message: MessageRecord,
     messages: tuple[MessageRecord, ...],
 ) -> tuple[MessageRecord, ...]:
-    target_ids = {character.id}
-    player = _player_character(repositories, save_id=save_id)
-    if player is not None:
-        target_ids.add(player.id)
-    present_character_ids = frozenset(target_ids)
     visibility = repositories.list_message_visibility(
         save_id,
-        character_ids=present_character_ids,
+        character_ids=frozenset({character.id}),
     )
     visible_messages = [
         message
         for message in messages
         if message.id != source_message.id
-        if message_visible_to_present_characters(
+        if message_visible_to_character(
             message_id=message.id,
-            present_character_ids=present_character_ids,
+            character_id=character.id,
             message_visibility=visibility,
         )
     ]
     return tuple(visible_messages[-CHARACTER_ACTION_PLANNING_RECENT_MESSAGE_LIMIT:])
+
+
+def _source_message_visible_to_character(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    character: CharacterRecord,
+    source_message: MessageRecord,
+) -> bool:
+    return message_visible_to_character(
+        message_id=source_message.id,
+        character_id=character.id,
+        message_visibility=repositories.list_message_visibility(
+            save_id,
+            character_ids=frozenset({character.id}),
+        ),
+    )
+
+
+def _source_message_text_for_character(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    character: CharacterRecord,
+    source_message: MessageRecord,
+) -> str:
+    if _source_message_visible_to_character(
+        repositories=repositories,
+        save_id=save_id,
+        character=character,
+        source_message=source_message,
+    ):
+        return source_message.body
+    return "[Latest source is not visible to this character.]"
 
 
 def _player_character(

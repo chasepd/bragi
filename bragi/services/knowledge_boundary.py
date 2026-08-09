@@ -125,9 +125,9 @@ def allowed_character_scoped_targets(
         if (link.entity_id, *target) in graph_targets:
             continue
         if link.source_message_id is not None and not (
-            message_visible_to_present_characters(
+            message_visible_to_character(
                 message_id=link.source_message_id,
-                present_character_ids=present_ids,
+                character_id=link.entity_id,
                 message_visibility=message_visibility or [],
             )
         ):
@@ -181,9 +181,9 @@ def _knowledge_edge_is_prompt_blocked(
         )
     )
     if any(
-        not message_visible_to_present_characters(
+        not message_visible_to_character(
             message_id=source_id,
-            present_character_ids=present_ids,
+            character_id=edge.character_id,
             message_visibility=message_visibility,
         )
         for source_id in source_message_ids
@@ -217,6 +217,20 @@ def message_visible_to_present_characters(
     return not any(
         record.message_id == message_id
         and record.character_id in present_character_ids
+        and record.visibility == "not_visible"
+        for record in message_visibility
+    )
+
+
+def message_visible_to_character(
+    *,
+    message_id: str,
+    character_id: str,
+    message_visibility: list[MessageVisibilityRecord],
+) -> bool:
+    return not any(
+        record.message_id == message_id
+        and record.character_id == character_id
         and record.visibility == "not_visible"
         for record in message_visibility
     )

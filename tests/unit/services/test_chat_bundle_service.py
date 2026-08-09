@@ -2699,6 +2699,80 @@ def test_import_save_preserves_memory_and_scene_scratch_provenance(
     assert imported_scratch.expires_after_turn_number == 13
 
 
+def test_export_import_preserves_epistemic_fields_and_remaps_actor(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    courier = repositories.add_character(save_id=save.id, name="Courier")
+    second_courier = repositories.add_character(save_id=save.id, name="Courier")
+    repositories.add_memory(
+        save_id=save.id,
+        body="The courier reports that the north gate is unguarded.",
+        tags=["hearsay"],
+        source_message_id=PLAYER_MESSAGE_ID,
+        epistemic_status="reported_speech",
+        epistemic_actor_id=courier.id,
+        epistemic_actor_name=courier.name,
+    )
+    repositories.add_memory(
+        save_id=save.id,
+        body="The courier reports that the north gate is unguarded.",
+        tags=["hearsay"],
+        source_message_id=PLAYER_MESSAGE_ID,
+        epistemic_status="reported_speech",
+        epistemic_actor_id=second_courier.id,
+        epistemic_actor_name=second_courier.name,
+    )
+    repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="character_fact",
+        claim="The courier intends to leave before dawn.",
+        evidence_quote="I climb toward the beacon lens.",
+        source_message_ids=[PLAYER_MESSAGE_ID],
+        epistemic_status="intention",
+        epistemic_actor_id=courier.id,
+        epistemic_actor_name=courier.name,
+    )
+    bundle_path = tmp_path / "exports" / "epistemic-round-trip.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+    imported_save_id = _imported_save_id(imported)
+    imported_couriers = [
+        character
+        for character in repositories.list_characters(imported_save_id)
+        if character.name == "Courier"
+    ]
+    imported_memories = [
+        memory
+        for memory in repositories.list_memories(imported_save_id)
+        if "north gate" in memory.body
+    ]
+    imported_observation = next(
+        observation
+        for observation in repositories.list_context_observations(imported_save_id)
+        if "before dawn" in observation.claim
+    )
+
+    assert len(imported_couriers) == 2
+    assert len(imported_memories) == 2
+    assert {memory.epistemic_actor_id for memory in imported_memories} == {
+        character.id for character in imported_couriers
+    }
+    assert all(
+        memory.epistemic_status == "reported_speech"
+        and memory.epistemic_actor_name == "Courier"
+        for memory in imported_memories
+    )
+    assert imported_observation.epistemic_status == "intention"
+    assert imported_observation.epistemic_actor_id in {
+        character.id for character in imported_couriers
+    }
+
+
 def test_import_save_accepts_legacy_memories_without_observation_provenance(
     repositories: PersistenceRepositories,
     tmp_path: Path,

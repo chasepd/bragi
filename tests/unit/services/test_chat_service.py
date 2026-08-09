@@ -14622,7 +14622,8 @@ def test_narrator_messages_reuses_snapshot_records_without_requery(
     )
 
     assert counting.read_counts == baseline_counts
-    assert [message.role for message in transcript] == ["player"]
+    assert [message.role for message in transcript] == ["narrator", "player"]
+    assert transcript[0].body == "Ilyra studies the gate from the rampart."
     assert transcript[-1].body == "We approach the gatehouse."
 
 
@@ -16892,7 +16893,10 @@ def test_submit_player_turn_includes_active_linked_facts_in_narrator_recap(
     )
 
     request = provider.chat_requests[0]
-    assert f"Linked memory: {linked_fact}" in "\n".join(request.current_scene_recap)
+    assert (
+        "Linked memory: [epistemic status: legacy_unclassified] " + linked_fact
+        in "\n".join(request.current_scene_recap)
+    )
     assert request.retrieved_memories == ()
     linked_fact_breakdown = next(
         source
@@ -19721,7 +19725,7 @@ def test_submit_player_turn_includes_latest_summary_when_search_selects_none(
     )
 
 
-def test_submit_player_turn_excludes_summary_covering_hidden_message(
+def test_submit_player_turn_keeps_hidden_character_fact_in_omniscient_context(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -19839,8 +19843,7 @@ def test_submit_player_turn_excludes_summary_covering_hidden_message(
     )
 
     request = provider.chat_requests[0]
-    assert request.summary is None
-    assert summary.body not in request.scenario_instructions
+    assert summary.body in (request.summary or "")
     assert hidden_memory.body not in request.scenario_instructions
     assert hidden_state.key not in request.scenario_instructions
     assert request.pending_context_suggestions == ()

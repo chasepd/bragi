@@ -417,6 +417,7 @@ class RuntimeToolReconciliationProvider(RuntimeFakeProvider):
                             "category": "scene",
                             "source_message_id": source_message_id,
                             "evidence_quote": "The corridor holds steady",
+                            "epistemic_status": "objective_outcome",
                             "confidence": 0.9,
                             "persistence_scope": "durable",
                         }
@@ -7108,9 +7109,9 @@ def test_edit_message_without_resubmit_player_reconciles_world_data(
     assert len(revisions) == 1
     assert revisions[0].reconciliation_status == "succeeded"
     assert revisions[0].reconciled_at is not None
-    assert {
-        state.key: state.value for state in repositories.list_world_state(save_id)
-    } == {"scene.corridor": {"status": "stable"}}
+    # The edited player action is still a claim/attempt until narration confirms
+    # its outcome, so reconciliation must not promote it into objective state.
+    assert repositories.list_world_state(save_id) == []
     edited_message = next(
         message
         for message in _chronicle_messages(model)

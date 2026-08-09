@@ -12,6 +12,11 @@ from dataclasses import dataclass, field, replace
 from typing import Protocol, TypeVar
 from uuid import uuid4
 
+from bragi.epistemics import (
+    EPISTEMIC_STATUSES,
+    EpistemicStatus,
+    normalize_epistemic_status,
+)
 from bragi.observation_types import OBSERVATION_TYPES, normalize_observation_type
 from bragi.persistence.models import (
     CharacterRecord,
@@ -22,6 +27,7 @@ from bragi.persistence.models import (
 )
 from bragi.persistence.repositories import (
     PersistenceRepositories,
+    _epistemic_claim_fingerprint,
     canonical_claim_fingerprint,
 )
 from bragi.providers.chat_rendering import rendered_chat_request_text
@@ -98,6 +104,9 @@ class ExtractedObservation:
     scope: str
     confidence: float
     tags: tuple[str, ...] = ()
+    epistemic_status: str = EpistemicStatus.LEGACY_UNCLASSIFIED
+    epistemic_actor_id: str | None = None
+    epistemic_actor_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -430,14 +439,32 @@ class ObservationService:
                 safety_transition=message.safety_transition,
             )
         )
+        message_roles_by_id = {message.id: message.role for message in messages}
+        normalized_extracted = tuple(
+            replace(observation, epistemic_status=EpistemicStatus.CLAIM)
+            if observation.epistemic_status == EpistemicStatus.OBJECTIVE_OUTCOME
+            and not any(
+                message_roles_by_id.get(source_id) == "narrator"
+                and quote_matches_source(
+                    observation.evidence_quote,
+                    messages_by_id.get(source_id, ""),
+                )
+                for source_id in observation.source_message_ids
+            )
+            else observation
+            for observation in extracted[:64]
+        )
         eligible = tuple(
             {
                 (
                     observation.observation_type,
                     canonical_claim_fingerprint(observation.claim),
                     tuple(observation.source_message_ids),
+                    normalize_epistemic_status(observation.epistemic_status),
+                    observation.epistemic_actor_id or "",
+                    observation.epistemic_actor_name.strip().casefold(),
                 ): observation
-                for observation in extracted[:64]
+                for observation in normalized_extracted
                 if observation.claim.strip()
                 and _observation_evidence_is_grounded(
                     observation,
@@ -468,6 +495,9 @@ class ObservationService:
                         confidence=observation.confidence,
                         tags=observation.tags,
                         metadata={"observer": "structured_output"},
+                        epistemic_status=observation.epistemic_status,
+                        epistemic_actor_id=observation.epistemic_actor_id,
+                        epistemic_actor_name=observation.epistemic_actor_name,
                     )
                     for observation in eligible
                 )
@@ -1057,7 +1087,12 @@ class ContextCurationService:
                     lease_token=lease_token,
                 )
                 return (0, 0, 1, 0, 0)
-            fingerprint = canonical_claim_fingerprint(body)
+            fingerprint = _epistemic_claim_fingerprint(
+                body,
+                epistemic_status=observation.epistemic_status,
+                epistemic_actor_id=observation.epistemic_actor_id,
+                epistemic_actor_name=observation.epistemic_actor_name,
+            )
             existing_memory = _memory_with_fingerprint(
                 self.repositories,
                 save_id=save_id,
@@ -1150,6 +1185,9 @@ class ContextCurationService:
                 source_message_ids=source_message_ids,
                 source_observation_ids=(observation.id,),
                 claim_fingerprint=fingerprint,
+                epistemic_status=observation.epistemic_status,
+                epistemic_actor_id=observation.epistemic_actor_id,
+                epistemic_actor_name=observation.epistemic_actor_name,
             )
             self._mark_observation(
                 observation,
@@ -1214,6 +1252,9 @@ class ContextCurationService:
                     "scope": observation.scope,
                     "source_message_ids": observation.source_message_ids,
                     "evidence_quote": observation.evidence_quote,
+                    "epistemic_status": observation.epistemic_status,
+                    "epistemic_actor_id": observation.epistemic_actor_id,
+                    "epistemic_actor_name": observation.epistemic_actor_name,
                     "curation_action": decision.action,
                     "importance": decision.confidence,
                 },
@@ -1305,6 +1346,9 @@ class ContextCurationService:
                 importance=decision.confidence,
                 source_message_ids=tuple(observation.source_message_ids),
                 source_observation_id=observation.id,
+                epistemic_status=observation.epistemic_status,
+                epistemic_actor_id=observation.epistemic_actor_id,
+                epistemic_actor_name=observation.epistemic_actor_name,
             ) | {
                 "grounding_review": _decision_metadata(decision),
             }
@@ -1439,6 +1483,9 @@ class ContextCurationService:
             importance=confidence,
             source_message_ids=tuple(observation.source_message_ids),
             source_observation_id=observation.id,
+            epistemic_status=observation.epistemic_status,
+            epistemic_actor_id=observation.epistemic_actor_id,
+            epistemic_actor_name=observation.epistemic_actor_name,
         )
         suggestion = self.repositories.add_context_update_suggestion(
             save_id=save_id,
@@ -1860,6 +1907,18 @@ def _observation_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object
                             "uniqueItems": True,
                             "items": {"type": "string", "maxLength": 64},
                         },
+                        "epistemic_status": {
+                            "type": "string",
+                            "enum": list(EPISTEMIC_STATUSES),
+                        },
+                        "epistemic_actor_id": {
+                            "type": "string",
+                            "maxLength": 200,
+                        },
+                        "epistemic_actor_name": {
+                            "type": "string",
+                            "maxLength": 200,
+                        },
                     },
                     "required": [
                         "observation_type",
@@ -1869,6 +1928,9 @@ def _observation_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object
                         "scope",
                         "confidence",
                         "tags",
+                        "epistemic_status",
+                        "epistemic_actor_id",
+                        "epistemic_actor_name",
                     ],
                 },
             }
@@ -1890,6 +1952,9 @@ def _observation_messages(
                 " Use confidence 0.4 for tentative evidence, 0.7 for a strongly "
                 "grounded interpretation, and 0.9 only for an explicit, "
                 "unambiguous fact."
+                " Classify claims, beliefs, reported speech, intentions, and "
+                "attempted actions explicitly. Use objective_outcome only when "
+                "the narrator confirms the outcome."
                 " A marked narrator safety transition is only an off-screen "
                 "event and elapsed time; do not infer intimate details from it."
             ),
@@ -1936,6 +2001,12 @@ def _observations_from_data(
                 scope=_string(raw.get("scope")) or "turn",
                 confidence=_observation_confidence(raw.get("confidence")),
                 tags=_string_tuple(raw.get("tags")),
+                epistemic_status=(
+                    _string(raw.get("epistemic_status"))
+                    or EpistemicStatus.LEGACY_UNCLASSIFIED
+                ),
+                epistemic_actor_id=_string(raw.get("epistemic_actor_id")) or None,
+                epistemic_actor_name=_string(raw.get("epistemic_actor_name"))[:200],
             )
         )
     return tuple(observations)
@@ -4245,6 +4316,9 @@ def _curated_memory_proposed_value(
     importance: float,
     source_message_ids: tuple[str, ...],
     source_observation_id: str,
+    epistemic_status: str,
+    epistemic_actor_id: str | None,
+    epistemic_actor_name: str,
 ) -> dict[str, object]:
     source_message_id = source_message_ids[0] if source_message_ids else None
     return {
@@ -4255,7 +4329,15 @@ def _curated_memory_proposed_value(
         "source_message_ids": list(source_message_ids),
         "source_observation_id": source_observation_id,
         "source_observation_ids": [source_observation_id],
-        "claim_fingerprint": canonical_claim_fingerprint(body),
+        "claim_fingerprint": _epistemic_claim_fingerprint(
+            body,
+            epistemic_status=epistemic_status,
+            epistemic_actor_id=epistemic_actor_id,
+            epistemic_actor_name=epistemic_actor_name,
+        ),
+        "epistemic_status": epistemic_status,
+        "epistemic_actor_id": epistemic_actor_id,
+        "epistemic_actor_name": epistemic_actor_name,
     }
 
 

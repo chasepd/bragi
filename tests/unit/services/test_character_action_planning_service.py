@@ -33,6 +33,8 @@ from bragi.services.character_action_planning_service import (
     _planning_characters_for_turn,
     _planning_evidence_sources,
     _presence_assessments_from_batch_data,
+    _source_message_text_for_character,
+    _visible_recent_messages_for_character,
     character_action_planning_enabled,
     format_character_turn_assessment,
 )
@@ -802,7 +804,7 @@ def test_character_action_planning_skips_player_character(
     assert [plan.character_id for plan in result.plans] == [characters["mara"]]
 
 
-def test_character_action_planning_filters_recent_messages_hidden_from_character(
+def test_character_action_planning_projects_mixed_knowledge_per_character(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -827,16 +829,15 @@ def test_character_action_planning_filters_recent_messages_hidden_from_character
         speaker_name="Narrator",
         body="The gate password is hidden from the lens crew.",
     )
-    for character_id in (mara.id, ren.id):
-        repositories.add_message_visibility(
-            save_id=save.id,
-            message_id=hidden.id,
-            character_id=character_id,
-            visibility="not_visible",
-            confidence=1.0,
-            source="scene_presence",
-            evidence="The character was not present.",
-        )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=hidden.id,
+        character_id=ren.id,
+        visibility="not_visible",
+        confidence=1.0,
+        source="scene_presence",
+        evidence="Ren was not present.",
+    )
     repositories.upsert_scene_snapshot(
         save_id=save.id,
         situation="Mara and Ren are by the lens.",
@@ -847,6 +848,32 @@ def test_character_action_planning_filters_recent_messages_hidden_from_character
         role="player",
         speaker_name="Ily",
         body="I ask what everyone does next.",
+    )
+    persisted_secret = repositories.add_memory(
+        save_id=save.id,
+        body="The archive password is ember dawn.",
+        tags=["secret"],
+        epistemic_status="belief",
+        epistemic_actor_id=mara.id,
+        epistemic_actor_name=mara.name,
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=mara.id,
+        target_type="memory",
+        target_id=persisted_secret.id,
+        knowledge_state="knows",
+        acquisition_method="told",
+        confidence=1.0,
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=source_message.id,
+        character_id=ren.id,
+        visibility="not_visible",
+        confidence=1.0,
+        source="private_address",
+        evidence="The player addressed Mara privately.",
     )
     provider = EchoHiddenPromptDecisionProvider(
         {
@@ -876,14 +903,61 @@ def test_character_action_planning_filters_recent_messages_hidden_from_character
         ).plan_for_turn(save_id=save.id, player_message_id=source_message.id)
     )
 
-    request_text = "\n\n".join(
-        message.body
-        for request in provider.structured_output_requests
-        for message in request.messages
+    messages = tuple(repositories.list_messages(save.id))
+    mara_projection = _visible_recent_messages_for_character(
+        repositories=repositories,
+        save_id=save.id,
+        character=mara,
+        source_message=source_message,
+        messages=messages,
     )
-    plan_text = "\n".join(plan.action for plan in result.plans)
-    assert hidden.body not in request_text
-    assert "gate password" not in plan_text
+    ren_projection = _visible_recent_messages_for_character(
+        repositories=repositories,
+        save_id=save.id,
+        character=ren,
+        source_message=source_message,
+        messages=messages,
+    )
+    assert hidden in mara_projection
+    assert hidden not in ren_projection
+    assert _source_message_text_for_character(
+        repositories=repositories,
+        save_id=save.id,
+        character=mara,
+        source_message=source_message,
+    ) == source_message.body
+    assert _source_message_text_for_character(
+        repositories=repositories,
+        save_id=save.id,
+        character=ren,
+        source_message=source_message,
+    ) == "[Latest source is not visible to this character.]"
+    mara_evidence = _planning_evidence_sources(
+        repositories=repositories,
+        save_id=save.id,
+        character=mara,
+        source_message=source_message,
+        messages=messages,
+    )
+    ren_evidence = _planning_evidence_sources(
+        repositories=repositories,
+        save_id=save.id,
+        character=ren,
+        source_message=source_message,
+        messages=messages,
+    )
+    assert "archive password is ember dawn" in mara_evidence[
+        f"memory:{persisted_secret.id}"
+    ]
+    assert f"memory:{persisted_secret.id}" not in ren_evidence
+    batch_prompts = [
+        "\n".join(message.body for message in request.messages)
+        for request in provider.structured_output_requests
+        if request.schema_name == "character_presence_assessment"
+        and "Assess each listed character" in request.messages[0].body
+    ]
+    assert all(persisted_secret.body not in prompt for prompt in batch_prompts)
+    assert result.failed_character_ids == ()
 
 
 def test_character_action_planning_includes_active_threads(
