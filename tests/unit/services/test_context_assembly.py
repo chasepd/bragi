@@ -999,6 +999,7 @@ def test_character_knows_linked_facts_are_attributed_as_character_scoped(
     )
     assert (
         "Character-scoped knowledge (Captain Ilyra knows) linked memory: "
+        "[epistemic status: legacy_unclassified] "
         "The lens-key phrase is ember dawn."
     ) in linked_text
     assert (
@@ -1027,6 +1028,14 @@ def test_character_knowledge_edges_are_attributed_as_character_scoped(
         met=True,
         character_id="character-knowledge-nira",
     )
+    also_present = repositories.add_character(
+        save_id=save.id,
+        name="Bram",
+        role="Archive guard",
+        location_id=current_location.id,
+        met=True,
+        character_id="character-knowledge-bram",
+    )
     absent = repositories.add_character(
         save_id=save.id,
         name="Tarin",
@@ -1038,7 +1047,7 @@ def test_character_knowledge_edges_are_attributed_as_character_scoped(
         save_id=save.id,
         current_location_id=current_location.id,
         situation="Nira has just arrived.",
-        present_character_ids=[present.id],
+        present_character_ids=[present.id, also_present.id],
         snapshot_id="snapshot-character-knowledge",
     )
     first_message = repositories.append_message(
@@ -1089,6 +1098,14 @@ def test_character_knowledge_edges_are_attributed_as_character_scoped(
         )
     repositories.add_character_knowledge_edge(
         save_id=save.id,
+        character_id=also_present.id,
+        target_type="memory",
+        target_id=visible_memory.id,
+        knowledge_state="may_know",
+        acquisition_method="witnessed",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
         character_id=absent.id,
         target_type="memory",
         target_id=hidden_memory.id,
@@ -1103,6 +1120,12 @@ def test_character_knowledge_edges_are_attributed_as_character_scoped(
     )
     assert (
         "Character-scoped knowledge (Nira knows) linked memory: "
+        "[epistemic status: legacy_unclassified] "
+        "Nira knows Avery invited her into the chart room."
+    ) in linked_text
+    assert (
+        "Character-scoped knowledge (Bram may know) linked memory: "
+        "[epistemic status: legacy_unclassified] "
         "Nira knows Avery invited her into the chart room."
     ) in linked_text
     assert (
@@ -1175,6 +1198,75 @@ def test_character_knowledge_edges_hidden_from_present_scene_are_not_linked_fact
         source.text for source in sources if source.tier == "active_linked_facts"
     )
     assert "Tarin knows the moonstone opens the cobalt ledger" not in linked_text
+
+
+def test_character_knowledge_edge_target_is_not_intersection_filtered(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, current_location = _create_context_save(
+        repositories,
+        scenario_id="scenario-mixed-present-knowledge",
+        save_id="save-mixed-present-knowledge",
+    )
+    owner = repositories.add_character(
+        save_id=save.id,
+        name="Nira",
+        role="Archive guide",
+        location_id=current_location.id,
+        met=True,
+        character_id="character-mixed-nira",
+    )
+    other = repositories.add_character(
+        save_id=save.id,
+        name="Bram",
+        role="Guard",
+        location_id=current_location.id,
+        met=True,
+        character_id="character-mixed-bram",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=current_location.id,
+        situation="Nira and Bram compare notes.",
+        present_character_ids=[owner.id, other.id],
+        snapshot_id="snapshot-mixed-present-knowledge",
+    )
+    secret_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Nira alone learned that the moonstone opens the cobalt ledger.",
+        message_id="message-mixed-present-secret",
+    )
+    secret = repositories.add_memory(
+        save_id=save.id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["secret"],
+        source_message_id=secret_message.id,
+        memory_id="memory-mixed-present-secret",
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=secret_message.id,
+        character_id=other.id,
+        visibility="not_visible",
+        source="scene_presence",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=owner.id,
+        target_type="memory",
+        target_id=secret.id,
+        knowledge_state="knows",
+        acquisition_method="witnessed",
+    )
+
+    sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
+
+    linked_text = "\n".join(
+        source.text for source in sources if source.tier == "active_linked_facts"
+    )
+    assert "Character-scoped knowledge (Nira knows)" in linked_text
+    assert "The moonstone opens the cobalt ledger." in linked_text
 
 
 def test_source_less_character_link_does_not_hydrate_hidden_source_memory(

@@ -34,7 +34,7 @@ from bragi.persistence.models import (
 )
 from bragi.persistence.repositories import (
     PersistenceRepositories,
-    canonical_claim_fingerprint,
+    _epistemic_claim_fingerprint,
 )
 from bragi.services.character_locks import merge_character_locked_fields
 from bragi.services.character_profile_completion import (
@@ -3228,7 +3228,17 @@ def _apply_suggestion_value(
             else None
         )
         tags = _string_list_value(value.get("tags", []), "Memory tags")
-        fingerprint = canonical_claim_fingerprint(body)
+        epistemic_status = str(value.get("epistemic_status", "legacy_unclassified"))
+        epistemic_actor_id = value.get("epistemic_actor_id")
+        if not isinstance(epistemic_actor_id, str):
+            epistemic_actor_id = None
+        epistemic_actor_name = str(value.get("epistemic_actor_name", ""))
+        fingerprint = _epistemic_claim_fingerprint(
+            body,
+            epistemic_status=epistemic_status,
+            epistemic_actor_id=epistemic_actor_id,
+            epistemic_actor_name=epistemic_actor_name,
+        )
         repositories.begin_immediate_transaction()
         try:
             existing = next(
@@ -3252,6 +3262,9 @@ def _apply_suggestion_value(
                     ),
                     source_message_ids=memory_source_message_ids,
                     source_observation_ids=memory_source_observation_ids,
+                    epistemic_status=epistemic_status,
+                    epistemic_actor_id=epistemic_actor_id,
+                    epistemic_actor_name=epistemic_actor_name,
                 )
             else:
                 repositories.update_memory(

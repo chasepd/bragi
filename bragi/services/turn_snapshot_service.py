@@ -22,6 +22,7 @@ from bragi.json_safety import JsonSafetyError, validate_json_structure
 from bragi.persistence.models import MediaAssetRecord, MessageRecord, SaveRecord
 from bragi.persistence.repositories import (
     PersistenceRepositories,
+    _epistemic_claim_fingerprint,
     canonical_claim_fingerprint,
     validate_context_source_index_budget,
 )
@@ -246,6 +247,8 @@ _TABLE_REFERENCE_COLUMNS: dict[str, dict[str, str]] = {
     },
     "locations": {"parent_location_id": "locations"},
     "characters": {"location_id": "locations"},
+    "memories": {"epistemic_actor_id": "characters"},
+    "context_observations": {"epistemic_actor_id": "characters"},
     "scene_snapshots": {"current_location_id": "locations"},
     "scene_facts": {"scene_snapshot_id": "scene_snapshots"},
     "scene_fact_sources": {"scene_fact_id": "scene_facts"},
@@ -1707,6 +1710,14 @@ class _SnapshotRemapper:
                 )
             else:
                 remapped[column] = value
+        if table_name == "memories" and "epistemic_status" in remapped:
+            actor_id = remapped.get("epistemic_actor_id")
+            remapped["claim_fingerprint"] = _epistemic_claim_fingerprint(
+                str(remapped.get("body", "") or ""),
+                epistemic_status=str(remapped.get("epistemic_status", "")),
+                epistemic_actor_id=(actor_id if isinstance(actor_id, str) else None),
+                epistemic_actor_name=str(remapped.get("epistemic_actor_name", "")),
+            )
         return remapped
 
     def _mapped_message_id(self, value: object) -> object:
@@ -4411,7 +4422,16 @@ def _normalize_legacy_snapshot_memories(
     memory_id_map: dict[str, str] = {}
     normalized_memories: list[dict[str, object]] = []
     for row in rows.get("memories", []):
-        fingerprint = canonical_claim_fingerprint(row.get("body", ""))
+        if "epistemic_status" in row:
+            actor_id = row.get("epistemic_actor_id")
+            fingerprint = _epistemic_claim_fingerprint(
+                str(row.get("body", "") or ""),
+                epistemic_status=str(row.get("epistemic_status", "")),
+                epistemic_actor_id=(actor_id if isinstance(actor_id, str) else None),
+                epistemic_actor_name=str(row.get("epistemic_actor_name", "")),
+            )
+        else:
+            fingerprint = canonical_claim_fingerprint(row.get("body", ""))
         if row.get("archived_at") is not None or not fingerprint:
             normalized_memories.append(row)
             continue

@@ -12,6 +12,7 @@ from time import perf_counter
 from typing import cast
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
+from bragi.epistemics import format_epistemic_fact
 from bragi.persistence.models import (
     CharacterKnowledgeEdgeRecord,
     CharacterRecord,
@@ -1000,7 +1001,7 @@ def _indexed_context_source_retrieval_prelude(
         limit=PROTECTED_CONTEXT_SOURCE_LIMIT,
         allowed_owner_names=allowed_owner_names,
         reference_character_ids=reference_character_ids,
-        visibility_character_ids=set(turn_scope.present_character_ids),
+        visibility_character_ids=None,
         current_scene_snapshot_id=current_scene_snapshot_id,
         current_scene_generation=current_scene_generation,
         current_turn_number=current_turn_number,
@@ -1044,7 +1045,6 @@ def _indexed_context_source_search_pass(
         )
     )[:MAX_CONTEXT_EXACT_PHRASES]
     exact_identifiers = _bounded_structured_identifiers(query_text)
-    scoped_present_ids = set(prelude.turn_scope.present_character_ids)
     exact_hits = repositories.search_context_sources(
         save_id,
         query_terms=query_terms,
@@ -1052,7 +1052,7 @@ def _indexed_context_source_search_pass(
         limit=min(24, INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT),
         allowed_owner_names=prelude.allowed_owner_names,
         reference_character_ids=prelude.reference_character_ids,
-        visibility_character_ids=scoped_present_ids,
+        visibility_character_ids=None,
         current_scene_snapshot_id=prelude.current_scene_snapshot_id,
         current_scene_generation=prelude.current_scene_generation,
         current_turn_number=prelude.current_turn_number,
@@ -1068,7 +1068,7 @@ def _indexed_context_source_search_pass(
         limit=INDEXED_CONTEXT_SOURCE_RETRIEVAL_LIMIT,
         allowed_owner_names=prelude.allowed_owner_names,
         reference_character_ids=prelude.reference_character_ids,
-        visibility_character_ids=scoped_present_ids,
+        visibility_character_ids=None,
         current_scene_snapshot_id=prelude.current_scene_snapshot_id,
         current_scene_generation=prelude.current_scene_generation,
         current_turn_number=prelude.current_turn_number,
@@ -3315,6 +3315,7 @@ def _indexed_context_candidates(
     present_character_ids: frozenset[str],
     message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
+    del present_character_ids, message_visibility
     candidates: list[_ContextCandidate] = []
     for record in records:
         if record.metadata.get("suppression_only") is True:
@@ -3324,12 +3325,6 @@ def _indexed_context_candidates(
             accepted_observation_ids=accepted_observation_ids,
         )
         if source_type is None:
-            continue
-        if not _metadata_provenance_visible_to_present_characters(
-            record.metadata,
-            present_character_ids=present_character_ids,
-            message_visibility=message_visibility,
-        ):
             continue
         if _audience_candidate_blocked(record, reference_character_ids):
             continue
@@ -3681,6 +3676,15 @@ def _indexed_context_candidate_text(
     body = record.body.strip()
     if source_type != "observation":
         return body
+    status = str(record.metadata.get("epistemic_status") or "legacy_unclassified")
+    actor_id_value = record.metadata.get("epistemic_actor_id")
+    actor_name_value = record.metadata.get("epistemic_actor_name")
+    body = format_epistemic_fact(
+        body,
+        status=status,
+        actor_id=(actor_id_value if isinstance(actor_id_value, str) else None),
+        actor_name=(actor_name_value if isinstance(actor_name_value, str) else ""),
+    )
     title = record.title.strip()
     if title and body:
         if title.casefold() in body.casefold():
@@ -4011,17 +4015,10 @@ def _state_candidates(
     present_character_ids: frozenset[str],
     message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
+    del present_character_ids, message_visibility
     candidates: list[_ContextCandidate] = []
     for record in records:
         if exclude_open_thread_aggregates and is_open_threads_aggregate_key(record.key):
-            continue
-        if record.source_message_id and not (
-            _source_messages_visible_to_present_characters(
-                (record.source_message_id,),
-                present_character_ids=present_character_ids,
-                message_visibility=message_visibility,
-            )
-        ):
             continue
         text = _scoped_candidate_text(
             source_type="world_state",
@@ -4049,17 +4046,13 @@ def _state_change_candidates(
     present_character_ids: frozenset[str],
     message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
+    del present_character_ids, message_visibility
     current_values = {record.key: record.value for record in world_state}
     blocked_state_keys = _blocked_world_state_keys(world_state, scoped_targets)
     candidates = [
         record
         for record in records
         if _has_active_source_message(record, active_message_ids)
-        and _state_change_source_visible_to_present_characters(
-            record,
-            present_character_ids=present_character_ids,
-            message_visibility=message_visibility,
-        )
         and record.state_key not in blocked_state_keys
         and not _is_manual_archive_change(record)
         and not _duplicates_current_state(record, current_values)
@@ -4164,28 +4157,18 @@ def _memory_candidates(
     message_visibility: list[MessageVisibilityRecord],
     observations_by_id: dict[str, ContextObservationRecord],
 ) -> tuple[_ContextCandidate, ...]:
+    del present_character_ids, message_visibility, observations_by_id
     candidates: list[_ContextCandidate] = []
     for record in records:
-        source_message_ids = tuple(
-            dict.fromkeys(
-                (
-                    *record.source_message_ids,
-                    *((record.source_message_id,) if record.source_message_id else ()),
-                )
-            )
-        )
-        if not _memory_provenance_visible_to_present_characters(
-            record,
-            source_message_ids=source_message_ids,
-            observations_by_id=observations_by_id,
-            present_character_ids=present_character_ids,
-            message_visibility=message_visibility,
-        ):
-            continue
         text = _scoped_candidate_text(
             source_type="memory",
             source_id=record.id,
-            text=record.body,
+            text=format_epistemic_fact(
+                record.body,
+                status=record.epistemic_status,
+                actor_id=record.epistemic_actor_id,
+                actor_name=record.epistemic_actor_name,
+            ),
             scoped_targets=scoped_targets,
         )
         if text is None:
@@ -4264,20 +4247,22 @@ def _observation_candidates(
     present_character_ids: frozenset[str],
     message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
+    del present_character_ids, message_visibility
     candidates: list[_ContextCandidate] = []
     for record in records:
         if record.status != "accepted":
             continue
         if record.id in excluded_observation_ids:
             continue
-        if not _source_messages_visible_to_present_characters(
-            tuple(record.source_message_ids),
-            present_character_ids=present_character_ids,
-            message_visibility=message_visibility,
-        ):
-            continue
+        qualified_claim = format_epistemic_fact(
+            record.claim,
+            status=record.epistemic_status,
+            actor_id=record.epistemic_actor_id,
+            actor_name=record.epistemic_actor_name,
+        )
         text = (
-            f"{record.claim} Evidence: {record.evidence_quote or 'not quoted'}; "
+            f"{qualified_claim} "
+            f"Evidence: {record.evidence_quote or 'not quoted'}; "
             f"sources: {', '.join(record.source_message_ids) or 'none'}; "
             f"scope: {record.scope}; status: {record.status}."
         )
@@ -4400,13 +4385,10 @@ def _message_candidates(
     present_character_ids: frozenset[str],
     message_visibility: list[MessageVisibilityRecord],
 ) -> tuple[_ContextCandidate, ...]:
-    visible_records = _latest_visible_messages(
-        records,
-        limit=RECENT_MESSAGE_CANDIDATE_LIMIT,
-        present_character_ids=present_character_ids,
-        message_visibility=message_visibility,
-        excluded_message_id=player_message_id,
-    )
+    del present_character_ids, message_visibility
+    visible_records = [
+        record for record in records if record.id != player_message_id
+    ][-RECENT_MESSAGE_CANDIDATE_LIMIT:]
     return tuple(
         _ContextCandidate(
             source_type="message",
@@ -4570,15 +4552,10 @@ def _context_search_visible_messages(
     scene_snapshot: SceneSnapshotRecord | None,
     required_messages: tuple[MessageRecord, ...] = (),
 ) -> list[MessageRecord]:
-    visible_messages = repositories.list_recent_messages_visible_to_characters(
-        save_id,
-        character_ids=(
-            set(scene_snapshot.present_character_ids)
-            if scene_snapshot is not None
-            else set()
-        ),
-        limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
-    )
+    del scene_snapshot
+    visible_messages = repositories.list_messages(save_id)[
+        -CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT:
+    ]
     visible_ids = {message.id for message in visible_messages}
     visible_messages.extend(
         message for message in required_messages if message.id not in visible_ids

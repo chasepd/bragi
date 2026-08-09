@@ -9,6 +9,7 @@ from time import perf_counter
 from typing import Protocol, cast
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
+from bragi.epistemics import EPISTEMIC_STATUSES, EpistemicStatus
 from bragi.persistence.models import (
     MemoryRecord,
     MessageRecord,
@@ -107,6 +108,7 @@ class ExtractedStateChange:
     source_message_id: str
     evidence_quote: str = ""
     persistence_scope: str = ""
+    epistemic_status: str = EpistemicStatus.OBJECTIVE_OUTCOME
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,9 @@ class ExtractedMemory:
     importance: float
     source_message_id: str
     evidence_quote: str = ""
+    epistemic_status: str = EpistemicStatus.OBJECTIVE_OUTCOME
+    epistemic_actor_id: str | None = None
+    epistemic_actor_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -177,6 +182,10 @@ STATE_EXTRACTION_SCHEMA: dict[str, object] = {
                         "type": "string",
                         "enum": ["durable", "scene", "ephemeral"],
                     },
+                    "epistemic_status": {
+                        "type": "string",
+                        "enum": list(EPISTEMIC_STATUSES),
+                    },
                 },
                 "required": [
                     "operation",
@@ -186,6 +195,7 @@ STATE_EXTRACTION_SCHEMA: dict[str, object] = {
                     "confidence",
                     "source_message_id",
                     "evidence_quote",
+                    "epistemic_status",
                 ],
             },
         },
@@ -200,6 +210,12 @@ STATE_EXTRACTION_SCHEMA: dict[str, object] = {
                     "importance": {"type": "number", "minimum": 0, "maximum": 1},
                     "source_message_id": {"type": "string"},
                     "evidence_quote": {"type": "string"},
+                    "epistemic_status": {
+                        "type": "string",
+                        "enum": list(EPISTEMIC_STATUSES),
+                    },
+                    "epistemic_actor_id": {"type": "string"},
+                    "epistemic_actor_name": {"type": "string"},
                 },
                 "required": [
                     "body",
@@ -207,6 +223,7 @@ STATE_EXTRACTION_SCHEMA: dict[str, object] = {
                     "importance",
                     "source_message_id",
                     "evidence_quote",
+                    "epistemic_status",
                 ],
             },
         },
@@ -946,8 +963,20 @@ class StateService:
             self.repositories,
             save_id=save_id,
         )
+        source_messages_by_id = {
+            message.id: message
+            for message in self.repositories.list_messages(save_id)
+        }
 
         for change in extraction.state_changes:
+            source = source_messages_by_id.get(change.source_message_id)
+            if (
+                change.epistemic_status != EpistemicStatus.OBJECTIVE_OUTCOME
+                or source is None
+                or source.role != "narrator"
+            ):
+                suppressed_state_change_count += 1
+                continue
             if change.source_message_id in safety_transition_source_message_ids:
                 suppressed_state_change_count += 1
                 continue
@@ -1069,6 +1098,18 @@ class StateService:
                     tags=list(memory.tags),
                     importance=memory.importance,
                     source_message_id=memory.source_message_id,
+                    epistemic_status=(
+                        EpistemicStatus.CLAIM
+                        if memory.epistemic_status
+                        == EpistemicStatus.OBJECTIVE_OUTCOME
+                        and source_messages_by_id.get(memory.source_message_id)
+                        is not None
+                        and source_messages_by_id[memory.source_message_id].role
+                        != "narrator"
+                        else memory.epistemic_status
+                    ),
+                    epistemic_actor_id=memory.epistemic_actor_id,
+                    epistemic_actor_name=memory.epistemic_actor_name,
                 )
             )
 
@@ -1511,7 +1552,11 @@ def _state_extraction_instruction(
         "time; never extract intimate detail or inferred physical facts from it."
         " Mark persistence_scope as durable for stable facts, scene for current "
         "scene status or current emotional state, and ephemeral for beat notes "
-        "that should not become durable world state."
+        "that should not become durable world state. Classify every item with "
+        "an epistemic_status. Only narrator-confirmed outcomes may be "
+        "objective_outcome. Player statements, lies, reported speech, beliefs, "
+        "intentions, and attempted actions retain their corresponding "
+        "non-objective status; they must never become world-state patches."
     )
     if scenario_type == "fantasy_roleplay":
         return (
@@ -1704,6 +1749,10 @@ def _state_extraction_tool_schemas(
     base_grounding = {
         "source_message_id": source_schema,
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "epistemic_status": {
+            "type": "string",
+            "enum": list(EPISTEMIC_STATUSES),
+        },
     }
     schemas = {
         "patch_world_state": _tool_schema(
@@ -1712,6 +1761,7 @@ def _state_extraction_tool_schemas(
                 "key",
                 "source_message_id",
                 "evidence_quote",
+                "epistemic_status",
             ],
             properties={
                 **base_grounding,
@@ -1734,13 +1784,20 @@ def _state_extraction_tool_schemas(
             },
         ),
         "record_memory_fact": _tool_schema(
-            required=["body", "source_message_id", "evidence_quote"],
+            required=[
+                "body",
+                "source_message_id",
+                "evidence_quote",
+                "epistemic_status",
+            ],
             properties={
                 **base_grounding,
                 "body": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "importance": {"type": "number", "minimum": 0, "maximum": 1},
                 "evidence_quote": {"type": "string"},
+                "epistemic_actor_id": {"type": "string"},
+                "epistemic_actor_name": {"type": "string"},
             },
         ),
         "flag_state_conflict": _tool_schema(
@@ -2138,6 +2195,9 @@ def _state_change_from_tool_arguments(
         source_message_id=str(arguments.get("source_message_id", "")).strip(),
         evidence_quote=str(arguments.get("evidence_quote", "")).strip(),
         persistence_scope=str(arguments.get("persistence_scope", "")).strip(),
+        epistemic_status=str(
+            arguments.get("epistemic_status", EpistemicStatus.LEGACY_UNCLASSIFIED)
+        ),
     )
 
 
@@ -2158,6 +2218,15 @@ def _memory_from_tool_arguments(arguments: dict[str, object]) -> ExtractedMemory
         importance=_confidence(arguments.get("importance")),
         source_message_id=str(arguments.get("source_message_id", "")).strip(),
         evidence_quote=str(arguments.get("evidence_quote", "")).strip(),
+        epistemic_status=str(
+            arguments.get("epistemic_status", EpistemicStatus.OBJECTIVE_OUTCOME)
+        ),
+        epistemic_actor_id=(
+            str(arguments["epistemic_actor_id"]).strip()
+            if arguments.get("epistemic_actor_id")
+            else None
+        ),
+        epistemic_actor_name=str(arguments.get("epistemic_actor_name", "")).strip(),
     )
 
 
@@ -2202,6 +2271,9 @@ def _state_change_from_data(value: object) -> ExtractedStateChange:
         source_message_id=str(value.get("source_message_id", "")),
         evidence_quote=str(value.get("evidence_quote", "")),
         persistence_scope=str(value.get("persistence_scope", "")),
+        epistemic_status=str(
+            value.get("epistemic_status", EpistemicStatus.OBJECTIVE_OUTCOME)
+        ),
     )
 
 
@@ -2219,6 +2291,15 @@ def _memory_from_data(value: object) -> ExtractedMemory:
         importance=float(value.get("importance", 1.0)),
         source_message_id=str(value.get("source_message_id", "")),
         evidence_quote=str(value.get("evidence_quote", "")),
+        epistemic_status=str(
+            value.get("epistemic_status", EpistemicStatus.OBJECTIVE_OUTCOME)
+        ),
+        epistemic_actor_id=(
+            str(value["epistemic_actor_id"]).strip()
+            if value.get("epistemic_actor_id")
+            else None
+        ),
+        epistemic_actor_name=str(value.get("epistemic_actor_name", "")).strip(),
     )
 
 

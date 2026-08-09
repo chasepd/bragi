@@ -722,6 +722,9 @@ class MemoryRecord:
     source_message_ids: list[str] = field(default_factory=list)
     claim_fingerprint: str = ""
     source_observation_ids: list[str] = field(default_factory=list)
+    epistemic_status: str = "legacy_unclassified"
+    epistemic_actor_id: str | None = None
+    epistemic_actor_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -740,6 +743,9 @@ class ContextObservationRecord:
     created_at: str | None = None
     updated_at: str | None = None
     archived_at: str | None = None
+    epistemic_status: str = "legacy_unclassified"
+    epistemic_actor_id: str | None = None
+    epistemic_actor_name: str = ""
 
 
 @dataclass(frozen=True)
