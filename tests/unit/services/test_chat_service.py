@@ -96,6 +96,7 @@ from bragi.services.chat_service import (
     CancellationToken,
     ChatService,
     _selected_context_sources,
+    _verified_post_turn_coverage_for_turn,
 )
 from bragi.services.content_rating import (
     CONTENT_FILTER_RATING_SETTING,
@@ -6693,6 +6694,11 @@ def test_submit_player_turn_applies_planned_character_world_state_effects(
         "mood": "tense"
     }
     assert state_by_key["keep.supplies"] == {"arrows": 3}
+    narrator_message_id = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "narrator_message_id"
+    ]
+    for state in repositories.list_world_state(save.id):
+        assert state.source_message_id == narrator_message_id
     planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
         "planned_commits"
     ]
@@ -6709,6 +6715,22 @@ def test_submit_player_turn_applies_planned_character_world_state_effects(
         "resource",
     }
     assert f"character.{mara.id}.physical_state" in coverage["state_keys"]
+    reloaded_coverage = _verified_post_turn_coverage_for_turn(
+        repositories=repositories,
+        save_id=save.id,
+        player_message_id=_chat_completion_jobs(repositories, save.id)[-1]["result"][
+            "player_message_id"
+        ],
+        narrator_message_id=narrator_message_id,
+    )
+    assert f"character.{mara.id}.physical_state" in reloaded_coverage.state_keys
+    assert f"character.{mara.id}.relationships" in reloaded_coverage.state_keys
+    assert f"character.{mara.id}.current_emotional_state" in (
+        reloaded_coverage.state_keys
+    )
+    assert reloaded_coverage.applied_domains == frozenset(
+        coverage["applied_domains"]
+    )
 
 
 def test_submit_player_turn_applies_planned_world_state_change(

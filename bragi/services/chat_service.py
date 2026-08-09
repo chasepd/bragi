@@ -273,6 +273,9 @@ from bragi.services.text_script_policy import (
 from bragi.services.turn_outcome import (
     TurnOutcome,
     TurnOutcomeEffect,
+    character_emotional_state_key,
+    character_physical_state_key,
+    character_relationships_state_key,
     turn_outcome_coverage,
     turn_outcome_from_mapping,
 )
@@ -8148,12 +8151,24 @@ def _persist_turn_outcome(
             narrator_spec.attempt_feasibility if narrator_spec is not None else ()
         ),
         attempt_evidence_source_ids=(
-            narrator_spec.attempt_evidence_source_ids
-            if narrator_spec is not None
-            else ()
+            verification_result.attempt_evidence_source_ids
+            if verification_result is not None
+            and verification_result.attempt_evidence_source_ids
+            else (
+                narrator_spec.attempt_evidence_source_ids
+                if narrator_spec is not None
+                else ()
+            )
         ),
         attempt_evidence_quote=(
-            narrator_spec.attempt_evidence_quote if narrator_spec is not None else ""
+            verification_result.attempt_evidence_quote
+            if verification_result is not None
+            and verification_result.attempt_evidence_quote
+            else (
+                narrator_spec.attempt_evidence_quote
+                if narrator_spec is not None
+                else ""
+            )
         ),
         attempt_resolution=(
             verification_result.attempt_resolution
@@ -8382,6 +8397,8 @@ def _effective_post_turn_inference_mode(
     if configured_mode != POST_TURN_INFERENCE_MODE_PLAN_OWNED:
         return configured_mode, "configured"
     if verified_coverage.confirmation_queued_count:
+        # Pending manual confirmations must be resolved before a turn can be
+        # considered fully owned; legacy inference fills their domains.
         return (
             POST_TURN_INFERENCE_MODE_HYBRID,
             "plan_owned_confirmation_queued_fallback",
@@ -9237,15 +9254,15 @@ _PLANNED_CHARACTER_STATE_FIELDS = frozenset(
 
 
 def _character_physical_state_key(character_id: str) -> str:
-    return f"character.{character_id}.physical_state"
+    return character_physical_state_key(character_id)
 
 
 def _character_emotional_state_key(character_id: str) -> str:
-    return f"character.{character_id}.current_emotional_state"
+    return character_emotional_state_key(character_id)
 
 
 def _character_relationships_state_key(character_id: str) -> str:
-    return f"character.{character_id}.relationships"
+    return character_relationships_state_key(character_id)
 
 
 def _apply_physical_change_candidate(
@@ -9289,6 +9306,7 @@ def _apply_physical_change_candidate(
         repositories=repositories,
         save_id=save_id,
         candidate=candidate,
+        narrator_message_id=narrator_message_id,
         key=key,
         value=value,
         entity_type="world_state",
@@ -9335,6 +9353,7 @@ def _apply_emotional_change_candidate(
         repositories=repositories,
         save_id=save_id,
         candidate=candidate,
+        narrator_message_id=narrator_message_id,
         key=key,
         value=value,
         entity_type="world_state",
@@ -9382,6 +9401,7 @@ def _apply_relationship_change_candidate(
         repositories=repositories,
         save_id=save_id,
         candidate=candidate,
+        narrator_message_id=narrator_message_id,
         key=key,
         value=value,
         entity_type="world_state",
@@ -9419,6 +9439,7 @@ def _apply_resource_change_candidate(
         repositories=repositories,
         save_id=save_id,
         candidate=candidate,
+        narrator_message_id=narrator_message_id,
         key=key,
         value=raw_value,
         entity_type="world_state",
@@ -9456,6 +9477,7 @@ def _apply_world_state_change_candidate(
         repositories=repositories,
         save_id=save_id,
         candidate=candidate,
+        narrator_message_id=narrator_message_id,
         key=key,
         value=raw_value,
         entity_type="world_state",
@@ -9470,6 +9492,7 @@ def _apply_character_world_state_effect(
     repositories: PersistenceRepositories,
     save_id: str,
     candidate: StateCommitCandidate,
+    narrator_message_id: str,
     key: str,
     value: dict[str, object],
     entity_type: str,
@@ -9477,6 +9500,9 @@ def _apply_character_world_state_effect(
     reason: str,
     reason_key: str,
 ) -> tuple[str, str, bool]:
+    source_message_id = (
+        _state_source_message_id(candidate) or narrator_message_id
+    )
     before = _find_world_state_record(repositories.list_world_state(save_id), key)
     if before is not None and before.value == value:
         return "committed", reason_key, False
@@ -9486,11 +9512,11 @@ def _apply_character_world_state_effect(
         value=value,
         category="scene",
         confidence=candidate.confidence or 1.0,
-        source_message_id=_state_source_message_id(candidate),
+        source_message_id=source_message_id,
     )
     repositories.add_state_change(
         save_id=save_id,
-        source_message_id=_state_source_message_id(candidate),
+        source_message_id=source_message_id,
         operation="upsert",
         state_key=key,
         before_json=_json_dumps_compact(before.value) if before is not None else None,
@@ -9612,15 +9638,27 @@ def _apply_active_thread_change_candidate(
     locked_fields = set(thread.locked_fields)
     if any(field in locked_fields for field in ("title", "status", "description")):
         return "skipped", "locked_active_thread_field", False
+    resolved_description = description or thread.description
+    resolved_visibility = visibility or thread.visibility
+    resolved_related = related_entities or thread.related_entities
+    if (
+        thread.title == title
+        and thread.description == resolved_description
+        and thread.status == status
+        and thread.priority == priority
+        and thread.visibility == resolved_visibility
+        and thread.related_entities == resolved_related
+    ):
+        return "committed", "active_thread_unchanged", False
     updated = repositories.update_active_thread(
         replace(
             thread,
             title=title,
-            description=description or thread.description,
+            description=resolved_description,
             status=status,
             priority=priority,
-            visibility=visibility or thread.visibility,
-            related_entities=related_entities or thread.related_entities,
+            visibility=resolved_visibility,
+            related_entities=resolved_related,
             source_message_id=source_message_id,
             last_updated_message_id=source_message_id,
         )

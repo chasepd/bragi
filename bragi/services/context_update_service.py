@@ -481,7 +481,6 @@ def _filter_character_physical_for_verified_coverage(
         appearance="",
         visual_notes="",
         current_clothing="",
-        known_state="",
         status="",
     )
 

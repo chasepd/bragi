@@ -1541,14 +1541,18 @@ class ChatBundleService:
                 transitioned_original_message_ids,
             ):
                 continue
-            message_id = _mapped_optional_required(
-                message_id_map=message_id_map,
-                original_id=_optional_text(row, "message_id"),
-                field_name="turn_outcomes.message_id",
-                repair_tracker=repair_tracker,
-            )
-            if message_id is None:
-                continue
+            original_message_id = _optional_text(row, "message_id")
+            if original_message_id:
+                message_id = _mapped_optional_required(
+                    message_id_map=message_id_map,
+                    original_id=original_message_id,
+                    field_name="turn_outcomes.message_id",
+                    repair_tracker=repair_tracker,
+                )
+                if message_id is None:
+                    continue
+            else:
+                message_id = None
             payload = _optional_json_object(row, "payload_json") or {}
             if _bundle_payload_references_messages(
                 payload,

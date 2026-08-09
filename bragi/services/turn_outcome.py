@@ -239,6 +239,18 @@ def turn_outcome_coverage(outcome: TurnOutcome) -> VerifiedPostTurnCoverage:
     )
 
 
+def character_physical_state_key(character_id: str) -> str:
+    return f"character.{character_id}.physical_state"
+
+
+def character_emotional_state_key(character_id: str) -> str:
+    return f"character.{character_id}.current_emotional_state"
+
+
+def character_relationships_state_key(character_id: str) -> str:
+    return f"character.{character_id}.relationships"
+
+
 def _accumulate_effect_coverage(
     effect: TurnOutcomeEffect,
     *,
@@ -275,6 +287,20 @@ def _accumulate_effect_coverage(
     elif effect.candidate_type == "world_time_change":
         for field in ("in_world_time", "time_of_day", "day_of_week"):
             scene_fields.add(field)
+    elif effect.candidate_type in {
+        "physical_change",
+        "emotional_change",
+        "relationship_change",
+    }:
+        character_id = effect.character_id or _text(effect.value.get("character_id"))
+        if not character_id:
+            return
+        if effect.candidate_type == "physical_change":
+            state_keys.add(character_physical_state_key(character_id))
+        elif effect.candidate_type == "emotional_change":
+            state_keys.add(character_emotional_state_key(character_id))
+        else:
+            state_keys.add(character_relationships_state_key(character_id))
 
 
 def remap_turn_outcome_payload(
@@ -359,6 +385,9 @@ def _string_tuple(value: object) -> tuple[str, ...]:
 __all__ = [
     "TurnOutcome",
     "TurnOutcomeEffect",
+    "character_emotional_state_key",
+    "character_physical_state_key",
+    "character_relationships_state_key",
     "remap_turn_outcome_payload",
     "remap_source_ref",
     "turn_outcome_coverage",
