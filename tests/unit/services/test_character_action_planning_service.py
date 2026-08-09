@@ -319,7 +319,8 @@ def test_character_action_planning_batch_failure_falls_back_to_per_character_cal
         and not _is_batch_presence_request(request)
     ]
     assert len(presence_requests) == 2
-    assert result.presence_calls_made == 2
+    assert result.presence_calls_made == 3
+    assert result.model_calls_avoided == 1
     assert len(result.assessments) == 2
 
 
@@ -1321,6 +1322,47 @@ def test_storyteller_present_character_directed_to_leave_is_ambiguous(
     )
     assert rival_assessment.leaves_scene is True
     assert rival_assessment.present is True
+
+
+def test_storyteller_with_player_scopes_mentions_like_roleplay(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Ceremony",
+        premise="A rival waits in the wings.",
+        player_role="Director",
+        content={"player_character_name": "Ily"},
+        interaction_mode=InteractionMode.STORYTELLER,
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Act One")
+    repositories.add_character(
+        save_id=save.id,
+        name="Ily",
+        met=True,
+        is_player_character=True,
+    )
+    witness = repositories.add_character(save_id=save.id, name="The Witness")
+    rival = repositories.add_character(save_id=save.id, name="The Rival")
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The witness waits by the stage doors.",
+        present_character_ids=[witness.id],
+    )
+    direction = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="Have the rival enter from the wings.",
+    )
+
+    deterministic_present, ambiguous = _planning_characters_for_turn(
+        repositories=repositories,
+        save_id=save.id,
+        source_message=direction,
+    )
+
+    assert {character.id for character in deterministic_present} == {witness.id}
+    assert {character.id for character in ambiguous} == {rival.id}
 
 
 def test_character_action_planning_batch_prompt_excludes_direction_and_player_text(

@@ -207,7 +207,7 @@ class CharacterActionPlanningService:
                         **exception_log_fields(exc),
                     )
                     raw_presence_decisions = await assess_presence_per_character()
-                    presence_calls_made = len(ambiguous)
+                    presence_calls_made = 1 + len(ambiguous)
             else:
                 raw_presence_decisions = await assess_presence_per_character()
                 presence_calls_made = len(ambiguous)
@@ -268,12 +268,15 @@ class CharacterActionPlanningService:
             )
             and _assessment_has_grounded_presence(assessment)
         )
+        scoped_count = len(deterministic_present) + len(ambiguous)
         previous_presence_calls = (
-            1 if len(decisions) <= CHARACTER_ACTION_PLANNING_BATCH_MAX_CHARACTERS
-            else len(decisions)
+            1
+            if scoped_count <= CHARACTER_ACTION_PLANNING_BATCH_MAX_CHARACTERS
+            else scoped_count
         )
         model_calls_avoided = (
-            previous_presence_calls + intent_wave_size - presence_calls_made
+            max(0, previous_presence_calls - presence_calls_made)
+            + intent_wave_size
         )
         return CharacterActionPlanningResult(
             decisions=decisions,
@@ -847,10 +850,11 @@ def _planning_characters_for_turn(
     are not mentioned in the source message, so their presence needs no model
     call. Ambiguous characters are either present but mentioned in the source
     message (possible exit) or off-scene and mentioned (possible entry), so a
-    model assessment is genuinely useful for them. In storyteller mode every
-    off-scene character is ambiguous so direction can bring them in, while
-    present characters stay deterministic unless the direction mentions them
-    (possible directed exit).
+    model assessment is genuinely useful for them. In storyteller saves with
+    no player character, every off-scene character is ambiguous so direction
+    can bring them in, while present characters stay deterministic unless the
+    direction mentions them (possible directed exit); storyteller saves with a
+    player character use the same mention-based scope as roleplay saves.
     """
     snapshot = repositories.get_scene_snapshot(save_id)
     present_ids = set(snapshot.present_character_ids if snapshot else ())

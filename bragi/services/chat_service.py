@@ -10678,6 +10678,7 @@ def _absent_character_ids(
         and decision.presence_evidence_quote.strip()
         and not decision.present
         and not decision.enters_scene
+        and not decision.leaves_scene
     )
 
 
