@@ -107,6 +107,7 @@ def test_character_action_planning_deterministic_without_model_preference(
 
     assert result.skipped_reason == ""
     assert provider.structured_output_requests == []
+    assert result.model_calls_avoided == 0
     assert [assessment.character_name for assessment in result.assessments] == [
         "Mara",
         "Ren",

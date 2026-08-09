@@ -8888,12 +8888,6 @@ def _planned_commit_evidence_is_grounded(
     quote = _planned_commit_evidence_quote(candidate)
     if not candidate.evidence_source_ids or not quote:
         return False
-    message_ids = {player_message_id, narrator_message_id}
-    messages_by_id = {
-        message.id: message
-        for message in repositories.list_messages(save_id)
-        if message.id in message_ids
-    }
     source_text_by_id = dict(evidence_source_text_by_id)
     planning_scene_text = ""
     snapshot = repositories.get_scene_snapshot(save_id)
@@ -8911,10 +8905,16 @@ def _planned_commit_evidence_is_grounded(
             and quote_matches_source(quote, planning_scene_text)
         )
 
-    player_message = messages_by_id.get(player_message_id)
+    player_message = repositories.get_message(
+        save_id=save_id,
+        message_id=player_message_id,
+    )
     if player_message is not None:
         source_text_by_id[f"message:{player_message_id}"] = player_message.body
-    narrator_message = messages_by_id.get(narrator_message_id)
+    narrator_message = repositories.get_message(
+        save_id=save_id,
+        message_id=narrator_message_id,
+    )
     if narrator_message is not None:
         source_text_by_id[f"message:{narrator_message_id}"] = narrator_message.body
         source_text_by_id["message:latest"] = narrator_message.body

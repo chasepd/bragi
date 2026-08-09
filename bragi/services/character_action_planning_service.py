@@ -136,20 +136,21 @@ class CharacterActionPlanningService:
             return CharacterActionPlanningResult(
                 skipped_reason="no_scoped_npc_characters",
             )
-        presence_preference: ModelPreferenceRecord | None = None
+        presence_preference = _character_presence_model_preference(
+            repositories=self.repositories,
+            save_id=save_id,
+        )
         presence_provider: StructuredOutputProvider | None = None
-        if ambiguous:
-            presence_preference = _character_presence_model_preference(
-                repositories=self.repositories,
-                save_id=save_id,
+        presence_skip_reason: str | None = None
+        if presence_preference is not None:
+            presence_provider, presence_skip_reason = self._structured_provider(
+                presence_preference
             )
+        if ambiguous:
             if presence_preference is None:
                 return CharacterActionPlanningResult(
                     skipped_reason="no_model_preference"
                 )
-            presence_provider, presence_skip_reason = self._structured_provider(
-                presence_preference
-            )
             if presence_skip_reason is not None:
                 return CharacterActionPlanningResult(
                     skipped_reason=presence_skip_reason
@@ -287,10 +288,16 @@ class CharacterActionPlanningService:
             if scoped_count <= CHARACTER_ACTION_PLANNING_BATCH_MAX_CHARACTERS
             else scoped_count
         )
-        model_calls_avoided = (
-            max(0, previous_presence_calls - presence_calls_made)
-            + intent_wave_size
+        presence_configured = (
+            presence_preference is not None and presence_provider is not None
         )
+        if presence_configured:
+            model_calls_avoided = (
+                max(0, previous_presence_calls - presence_calls_made)
+                + intent_wave_size
+            )
+        else:
+            model_calls_avoided = 0
         return CharacterActionPlanningResult(
             decisions=decisions,
             failed_character_ids=tuple(failed_ids),
@@ -1051,12 +1058,14 @@ def _deterministic_presence_assessment(
     evidence_quote = ""
     if snapshot is not None:
         source_id = f"scene_snapshot:{getattr(snapshot, 'id', '')}"
-        scene_text = _scene_text(snapshot)
+        present_character_ids = set(
+            getattr(snapshot, "present_character_ids", []) or []
+        )
         # The character id is quoted verbatim from the snapshot's present
         # character ids line, which this assessment merely restates; it keeps
         # the deterministic assessment grounded in the same evidence model
         # assessments must cite. Membership comes from present_ids above.
-        if character.id and quote_matches_source(character.id, scene_text):
+        if character.id in present_character_ids:
             evidence_source_ids = (source_id,)
             evidence_quote = character.id
     return CharacterTurnAssessment(

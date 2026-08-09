@@ -3411,8 +3411,10 @@ def _state_commit_candidate_value_shape_rejection(
         knowledge_rejection = _candidate_knowledge_metadata_rejection(candidate)
         if knowledge_rejection is not None:
             return knowledge_rejection
-        target_type = _string(candidate.value.get("target_type"))
-        target_id = _string(candidate.value.get("target_id"))
+        target_type = candidate.target_type or _string(
+            candidate.value.get("target_type")
+        )
+        target_id = candidate.target_id or _string(candidate.value.get("target_id"))
         missing_target = "target_id" if not target_id else (
             "target_type" if not target_type else ""
         )
