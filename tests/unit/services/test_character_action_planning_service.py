@@ -47,7 +47,80 @@ def repositories(tmp_path: Path) -> Iterator[PersistenceRepositories]:
         yield PersistenceRepositories(connection)
 
 
-def test_character_action_planning_updates_presence_and_returns_present_plans(
+def test_character_action_planning_deterministic_presence_skips_model_calls(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _player_message_id, characters = _create_save_with_characters(
+        repositories
+    )
+    player_message = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Ily",
+        body="I study the lantern mechanism.",
+    )
+    provider = CharacterDecisionProvider({})
+    _configure_planning(repositories)
+
+    result = asyncio.run(
+        CharacterActionPlanningService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).plan_for_turn(save_id=save_id, player_message_id=player_message.id)
+    )
+
+    assert provider.structured_output_requests == []
+    assert [assessment.character_name for assessment in result.assessments] == [
+        "Mara",
+        "Ren",
+    ]
+    assert all(assessment.present for assessment in result.assessments)
+    assert result.deterministic_presence_count == 2
+    assert result.presence_calls_made == 0
+    assert result.model_calls_avoided == 4
+    assert result.applied_presence_update is False
+    assert characters["mara"] in {
+        assessment.character_id for assessment in result.assessments
+    }
+
+
+def test_character_action_planning_deterministic_assessment_is_grounded(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _player_message_id, characters = _create_save_with_characters(
+        repositories
+    )
+    player_message = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Ily",
+        body="I study the lantern mechanism.",
+    )
+    provider = CharacterDecisionProvider({})
+    _configure_planning(repositories)
+
+    result = asyncio.run(
+        CharacterActionPlanningService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).plan_for_turn(save_id=save_id, player_message_id=player_message.id)
+    )
+
+    ren = next(
+        assessment
+        for assessment in result.assessments
+        if assessment.character_id == characters["ren"]
+    )
+    assert ren.present is True
+    assert ren.enters_scene is False
+    assert ren.leaves_scene is False
+    assert ren.confidence == 1.0
+    assert ren.presence_evidence_source_ids == ("scene_snapshot:snapshot-1",)
+    assert ren.presence_evidence_quote == characters["ren"]
+    assert "present: yes" in format_character_turn_assessment(ren)
+
+
+def test_character_action_planning_mentions_ambiguous_present_character(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, player_message_id, characters = _create_save_with_characters(repositories)
@@ -55,19 +128,11 @@ def test_character_action_planning_updates_presence_and_returns_present_plans(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara lowers the storm lantern and asks what changed.",
-                "intent": "keep the lens crew calm",
-                "reason": "She is already beside the lantern in the scene.",
+                "enters_scene": False,
+                "leaves_scene": False,
+                "reason": "Mara is already beside the lantern in the scene.",
                 "confidence": 0.92,
                 "evidence_source_ids": ["scene_snapshot:snapshot-1"],
-            },
-            "Ren": {
-                "present": False,
-                "action": "",
-                "intent": "",
-                "reason": "Ren is still cataloging the archives offscreen.",
-                "confidence": 0.8,
-                "evidence_source_ids": ["character:ren"],
             },
         }
     )
@@ -80,27 +145,12 @@ def test_character_action_planning_updates_presence_and_returns_present_plans(
         ).plan_for_turn(save_id=save_id, player_message_id=player_message_id)
     )
 
-    assert [(plan.character_name, plan.action) for plan in result.plans] == [
-        ("Mara", "Mara lowers the storm lantern and asks what changed.")
-    ]
-    assert result.applied_presence_update is True
-    snapshot = repositories.get_scene_snapshot(save_id)
-    assert snapshot is not None
-    assert set(snapshot.present_character_ids) == {
-        characters["player"],
-        characters["mara"],
-    }
-    assert characters["ren"] not in snapshot.present_character_ids
     assert [request.schema_name for request in provider.structured_output_requests] == [
-        "character_presence_assessment",
-        "character_intent_plan",
+        "character_presence_assessment"
     ]
     assert "Assess each listed character's scene presence" in (
         provider.structured_output_requests[0].messages[0].body
     )
-    intent_prompt = provider.structured_output_requests[-1].messages[0].body
-    assert "Favor visible initiative over waiting for the player" in intent_prompt
-    assert "interrupt, demand, refuse, leave, escalate" in intent_prompt
     presence_schema = provider.structured_output_requests[0].schema
     assert presence_schema["type"] == "object"
     item_schema = presence_schema["properties"]["assessments"]["items"]
@@ -113,39 +163,58 @@ def test_character_action_planning_updates_presence_and_returns_present_plans(
         assert field in item_schema["required"]
     assert set(item_schema["properties"]["character_id"]["enum"]) == {
         characters["mara"],
+    }
+    assert [assessment.character_name for assessment in result.assessments] == [
+        "Ren",
+        "Mara",
+    ]
+    mara = next(
+        assessment
+        for assessment in result.assessments
+        if assessment.character_id == characters["mara"]
+    )
+    assert mara.present is True
+    assert mara.presence_evidence_source_ids
+    assert result.deterministic_presence_count == 1
+    assert result.presence_calls_made == 1
+    assert result.model_calls_avoided == 3
+    snapshot = repositories.get_scene_snapshot(save_id)
+    assert snapshot is not None
+    assert set(snapshot.present_character_ids) == {
+        characters["player"],
+        characters["mara"],
         characters["ren"],
     }
-    intent_schema = provider.structured_output_requests[-1].schema
-    for field in (
-        "learned_memory_candidates",
-        "knowledge_edge_candidates",
-        "needs_review_notes",
-    ):
-        assert field in intent_schema["properties"]
-        assert field in intent_schema["required"]
 
 
 def test_character_action_planning_batch_presence_prompt_lists_all_characters(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, player_message_id, characters = _create_save_with_characters(repositories)
+    player_message = repositories.get_message(
+        save_id=save_id,
+        message_id=player_message_id,
+    )
+    assert player_message is not None
+    player_message = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Ily",
+        body="I ask Mara and Ren what they see in the lens.",
+    )
     provider = CharacterDecisionProvider(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara stays by the lantern.",
-                "intent": "keep watch",
                 "reason": "Mara is in the scene.",
                 "confidence": 0.9,
                 "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
             "Ren": {
-                "present": False,
-                "action": "",
-                "intent": "",
-                "reason": "Ren is offscreen.",
-                "confidence": 0.8,
-                "evidence_source_ids": ["character:ren"],
+                "present": True,
+                "reason": "Ren is in the scene.",
+                "confidence": 0.9,
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
         }
     )
@@ -155,7 +224,7 @@ def test_character_action_planning_batch_presence_prompt_lists_all_characters(
         CharacterActionPlanningService(
             repositories=repositories,
             providers={"fake": provider},
-        ).plan_for_turn(save_id=save_id, player_message_id=player_message_id)
+        ).plan_for_turn(save_id=save_id, player_message_id=player_message.id)
     )
 
     presence_body = provider.structured_output_requests[0].messages[-1].body
@@ -165,19 +234,22 @@ def test_character_action_planning_batch_presence_prompt_lists_all_characters(
     assert f"character_id: {characters['ren']}" in presence_body
     assert "Evidence sources:" in presence_body
     assert "scene_snapshot:snapshot-1" in presence_body
-    assert f"character:{characters['ren']}" in presence_body
 
 
 def test_character_action_planning_batch_omitted_character_is_failed(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, player_message_id, characters = _create_save_with_characters(repositories)
+    player_message = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Ily",
+        body="I ask Mara and Ren what they see in the lens.",
+    )
     provider = CharacterDecisionProvider(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara keeps watch.",
-                "intent": "hold the room",
                 "reason": "Mara is in the scene.",
                 "confidence": 0.88,
                 "evidence_source_ids": ["scene_snapshot:snapshot-1"],
@@ -190,38 +262,42 @@ def test_character_action_planning_batch_omitted_character_is_failed(
         CharacterActionPlanningService(
             repositories=repositories,
             providers={"fake": provider},
-        ).plan_for_turn(save_id=save_id, player_message_id=player_message_id)
+        ).plan_for_turn(save_id=save_id, player_message_id=player_message.id)
     )
 
     assert result.failed_character_ids == (characters["ren"],)
-    assert [plan.character_id for plan in result.plans] == [characters["mara"]]
-    assert len(provider.structured_output_requests) == 2
+    assert [assessment.character_name for assessment in result.assessments] == [
+        "Mara",
+    ]
+    assert len(provider.structured_output_requests) == 1
     assert [
         request.schema_name for request in provider.structured_output_requests
-    ] == ["character_presence_assessment", "character_intent_plan"]
+    ] == ["character_presence_assessment"]
 
 
 def test_character_action_planning_batch_failure_falls_back_to_per_character_calls(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, player_message_id, characters = _create_save_with_characters(repositories)
+    player_message = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Ily",
+        body="I ask Mara and Ren what they see in the lens.",
+    )
     provider = BatchFailThenPerCharacterProvider(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara keeps watch.",
-                "intent": "hold the room",
                 "reason": "Mara is in the scene.",
                 "confidence": 0.88,
                 "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
             "Ren": {
                 "present": False,
-                "action": "",
-                "intent": "",
                 "reason": "Ren is offscreen.",
                 "confidence": 0.8,
-                "evidence_source_ids": ["character:ren"],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
         },
         fail_batch=True,
@@ -232,7 +308,7 @@ def test_character_action_planning_batch_failure_falls_back_to_per_character_cal
         CharacterActionPlanningService(
             repositories=repositories,
             providers={"fake": provider},
-        ).plan_for_turn(save_id=save_id, player_message_id=player_message_id)
+        ).plan_for_turn(save_id=save_id, player_message_id=player_message.id)
     )
 
     assert provider.batch_attempts == 1
@@ -243,7 +319,8 @@ def test_character_action_planning_batch_failure_falls_back_to_per_character_cal
         and not _is_batch_presence_request(request)
     ]
     assert len(presence_requests) == 2
-    assert [plan.character_id for plan in result.plans] == [characters["mara"]]
+    assert result.presence_calls_made == 2
+    assert len(result.assessments) == 2
 
 
 def test_character_action_planning_falls_back_to_per_character_beyond_batch_cap(
@@ -280,17 +357,15 @@ def test_character_action_planning_falls_back_to_per_character_beyond_batch_cap(
         save_id=save.id,
         role="player",
         speaker_name="Ily",
-        body="I ask everyone what happens next.",
+        body="I ask " + ", ".join(names) + " what happens next.",
     )
     provider = CharacterDecisionProvider(
         {
             name: {
-                "present": False,
-                "action": "",
-                "intent": "",
+                "present": True,
                 "reason": "The crew waits quietly.",
                 "confidence": 0.5,
-                "evidence_source_ids": [],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             }
             for name in names
         }
@@ -313,7 +388,7 @@ def test_character_action_planning_falls_back_to_per_character_beyond_batch_cap(
     assert all(
         not _is_batch_presence_request(request) for request in presence_requests
     )
-    assert result.plans == ()
+    assert len(result.assessments) == len(characters)
 
 
 def test_character_action_planning_skips_presence_update_without_grounded_quote(
@@ -324,21 +399,12 @@ def test_character_action_planning_skips_presence_update_without_grounded_quote(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara keeps watch beside the lantern.",
-                "intent": "guard the lens",
-                "reason": "Mara is in the scene.",
-                "confidence": 0.91,
-                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
-            },
-            "Ren": {
-                "present": False,
-                "action": "Ren slips out of the beacon room.",
-                "intent": "",
-                "reason": "Ren is claimed absent without grounded evidence.",
+                "enters_scene": False,
+                "leaves_scene": True,
+                "reason": "Mara is claimed leaving without grounded evidence.",
                 "confidence": 0.8,
                 "evidence_source_ids": ["scene_snapshot:snapshot-1"],
                 "evidence_quote": "ruby library",
-                "leaves_scene": True,
             },
         }
     )
@@ -352,16 +418,13 @@ def test_character_action_planning_skips_presence_update_without_grounded_quote(
     )
 
     assert result.applied_presence_update is False
-    assert [(plan.character_name, plan.action) for plan in result.plans] == [
-        ("Mara", "Mara keeps watch beside the lantern.")
-    ]
-    ren_decision = next(
+    mara_decision = next(
         decision
         for decision in result.decisions
-        if decision.character_id == characters["ren"]
+        if decision.character_id == characters["mara"]
     )
-    assert ren_decision.evidence_source_ids == ()
-    assert ren_decision.evidence_quote == ""
+    assert mara_decision.evidence_source_ids == ()
+    assert mara_decision.evidence_quote == ""
     snapshot = repositories.get_scene_snapshot(save_id)
     assert snapshot is not None
     assert set(snapshot.present_character_ids) == {
@@ -371,80 +434,7 @@ def test_character_action_planning_skips_presence_update_without_grounded_quote(
     }
 
 
-def test_character_action_planning_drops_intent_guidance_with_ungrounded_quote(
-    repositories: PersistenceRepositories,
-) -> None:
-    scenario = repositories.create_scenario(
-        type="full_roleplay",
-        title="Lantern Keep",
-        premise="A storm tower waits in the fog.",
-        player_role="Signal keeper",
-        content={"player_character_name": "Ily"},
-    )
-    save = repositories.create_save(scenario_id=scenario.id, title="Lantern Keep")
-    repositories.add_character(
-        save_id=save.id,
-        name="Ily",
-        met=True,
-        is_player_character=True,
-    )
-    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
-    repositories.upsert_scene_snapshot(
-        save_id=save.id,
-        situation="Mara steadies the storm lantern.",
-        present_character_ids=[mara.id],
-        snapshot_id="snapshot-1",
-    )
-    player_message = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Ily",
-        body="I ask Mara whether the corridor is clear.",
-    )
-    provider = SequenceCharacterDecisionProvider(
-        (
-            {
-                "present": True,
-                "enters_scene": False,
-                "leaves_scene": False,
-                "reason": "Mara is already present in the scene.",
-                "confidence": 0.86,
-                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
-            },
-            {
-                "present": True,
-                "action": "Mara checks the corridor.",
-                "intent": "inspect the tower corridor",
-                "reason": "The player asked Mara to check the corridor.",
-                "confidence": 0.9,
-                "evidence_source_ids": [f"message:{player_message.id}"],
-                "evidence_quote": "ruby library",
-                "learned_memory_candidates": [],
-                "knowledge_edge_candidates": [],
-                "needs_review_notes": [],
-            },
-        )
-    )
-    _configure_planning(repositories)
-
-    result = asyncio.run(
-        CharacterActionPlanningService(
-            repositories=repositories,
-            providers={"fake": provider},
-        ).plan_for_turn(save_id=save.id, player_message_id=player_message.id)
-    )
-
-    assert result.plans == ()
-    assert len(result.assessments) == 1
-    assessment = result.assessments[0]
-    assert assessment.character_id == mara.id
-    assert assessment.present is True
-    assert assessment.evidence_source_ids
-    assert assessment.action == ""
-    assert assessment.intent == ""
-
-
-def test_character_action_planning_does_not_borrow_intent_evidence_for_presence(
+def test_character_action_planning_drops_entering_without_grounded_quote(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -474,9 +464,9 @@ def test_character_action_planning_does_not_borrow_intent_evidence_for_presence(
         speaker_name="Ily",
         body="I call Mara from the archive stairs.",
     )
-    provider = SequenceCharacterDecisionProvider(
-        (
-            {
+    provider = CharacterDecisionProvider(
+        {
+            "Mara": {
                 "present": False,
                 "enters_scene": True,
                 "leaves_scene": False,
@@ -485,19 +475,7 @@ def test_character_action_planning_does_not_borrow_intent_evidence_for_presence(
                 "evidence_source_ids": ["scene_snapshot:snapshot-1"],
                 "evidence_quote": "ruby library",
             },
-            {
-                "present": True,
-                "action": "Mara answers from the stairwell.",
-                "intent": "respond to Ily's call",
-                "reason": "The player called Mara.",
-                "confidence": 0.9,
-                "evidence_source_ids": [f"message:{player_message.id}"],
-                "evidence_quote": "call Mara",
-                "learned_memory_candidates": [],
-                "knowledge_edge_candidates": [],
-                "needs_review_notes": [],
-            },
-        )
+        }
     )
     _configure_planning(repositories)
 
@@ -511,7 +489,6 @@ def test_character_action_planning_does_not_borrow_intent_evidence_for_presence(
     assert [request.schema_name for request in provider.structured_output_requests] == [
         "character_presence_assessment"
     ]
-    assert result.plans == ()
     assert result.applied_presence_update is False
     snapshot = repositories.get_scene_snapshot(save.id)
     assert snapshot is not None
@@ -548,8 +525,6 @@ def test_character_action_planning_does_not_create_snapshot_for_ungrounded_absen
                 "present": False,
                 "enters_scene": False,
                 "leaves_scene": False,
-                "action": "",
-                "intent": "",
                 "reason": "Mara is claimed absent without support.",
                 "confidence": 0.8,
                 "evidence_source_ids": [f"message:{player_message.id}"],
@@ -599,20 +574,9 @@ def test_character_action_planning_skips_unmentioned_offscreen_characters(
         save_id=save.id,
         role="player",
         speaker_name="Ily",
-        body="I ask Mara what she sees in the lens.",
+        body="I study the lantern mechanism.",
     )
-    provider = CharacterDecisionProvider(
-        {
-            "Mara": {
-                "present": True,
-                "action": "Mara studies the lens.",
-                "intent": "answer Ily",
-                "reason": "Mara is in the current scene.",
-                "confidence": 0.9,
-                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
-            },
-        }
-    )
+    provider = CharacterDecisionProvider({})
     _configure_planning(repositories)
 
     result = asyncio.run(
@@ -622,11 +586,7 @@ def test_character_action_planning_skips_unmentioned_offscreen_characters(
         ).plan_for_turn(save_id=save.id, player_message_id=player_message.id)
     )
 
-    requested_names = [
-        _requested_character_name(request.messages[-1].body)
-        for request in provider.structured_output_requests
-    ]
-    assert requested_names == ["Mara", "Mara"]
+    assert provider.structured_output_requests == []
     assert [assessment.character_name for assessment in result.assessments] == [
         "Mara"
     ]
@@ -669,19 +629,10 @@ def test_character_action_planning_includes_named_offscreen_possible_entrant(
     )
     provider = CharacterDecisionProvider(
         {
-            "Mara": {
-                "present": True,
-                "action": "Mara keeps watch.",
-                "intent": "hold the room",
-                "reason": "Mara is already present.",
-                "confidence": 0.88,
-                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
-            },
             "Archivist Ren": {
                 "present": False,
                 "enters_scene": True,
-                "action": "Ren steps in from the archive stairs.",
-                "intent": "answer Ily's call",
+                "leaves_scene": False,
                 "reason": "Ily explicitly called for Ren.",
                 "confidence": 0.86,
                 "evidence_source_ids": [f"message:{player_message.id}"],
@@ -700,43 +651,44 @@ def test_character_action_planning_includes_named_offscreen_possible_entrant(
     requested_names = [
         _requested_character_name(request.messages[-1].body)
         for request in provider.structured_output_requests
+        if not _is_batch_presence_request(request)
     ]
-    assert requested_names == [
-        "Mara",
-        "Mara",
-        "Archivist Ren",
-    ]
-    assert [plan.character_name for plan in result.plans] == [
+    assert requested_names == []
+    assert [assessment.character_name for assessment in result.assessments] == [
         "Mara",
         "Archivist Ren",
     ]
     snapshot = repositories.get_scene_snapshot(save.id)
     assert snapshot is not None
     assert ren.id in snapshot.present_character_ids
+    assert result.deterministic_presence_count == 1
+    assert result.presence_calls_made == 1
 
 
 def test_character_action_planning_can_return_tentative_presence_without_mutating_scene(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, player_message_id, characters = _create_save_with_characters(repositories)
+    player_message = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Ily",
+        body="I ask Mara and Ren what they see in the lens.",
+    )
     provider = CharacterDecisionProvider(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara keeps watch beside the lantern.",
-                "intent": "guard the lens",
                 "reason": "Mara is in the scene.",
                 "confidence": 0.91,
                 "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
             "Ren": {
                 "present": False,
-                "action": "Ren leaves the gallery for the archive stairs.",
-                "intent": "check the old maps",
+                "leaves_scene": True,
                 "reason": "Ren decides to leave during the planned beat.",
                 "confidence": 0.86,
-                "evidence_source_ids": ["message:latest"],
-                "leaves_scene": True,
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
         }
     )
@@ -748,7 +700,7 @@ def test_character_action_planning_can_return_tentative_presence_without_mutatin
             providers={"fake": provider},
         ).plan_for_turn(
             save_id=save_id,
-            player_message_id=player_message_id,
+            player_message_id=player_message.id,
             apply_presence_updates=False,
         )
     )
@@ -775,8 +727,6 @@ def test_character_action_planning_skips_player_character(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara watches the player for a cue.",
-                "intent": "wait for confirmation",
                 "reason": "The player addressed her directly.",
                 "confidence": 0.75,
                 "evidence_source_ids": ["scene_snapshot:snapshot-1"],
@@ -799,7 +749,9 @@ def test_character_action_planning_skips_player_character(
     )
     assert "Player character: Ily" in request_text
     assert "Character: Ily" not in request_text
-    assert [plan.character_id for plan in result.plans] == [characters["mara"]]
+    assert characters["player"] not in {
+        assessment.character_id for assessment in result.assessments
+    }
 
 
 def test_character_action_planning_filters_recent_messages_hidden_from_character(
@@ -846,23 +798,21 @@ def test_character_action_planning_filters_recent_messages_hidden_from_character
         save_id=save.id,
         role="player",
         speaker_name="Ily",
-        body="I ask what everyone does next.",
+        body="I ask Mara and Ren what everyone does next.",
     )
     provider = EchoHiddenPromptDecisionProvider(
         {
             "Mara": {
                 "present": True,
-                "intent": "stay alert",
                 "reason": "Mara is in the scene.",
                 "confidence": 0.8,
-                "evidence_source_ids": [],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
             "Ren": {
                 "present": True,
-                "intent": "watch the archive satchel",
                 "reason": "Ren is in the scene.",
                 "confidence": 0.8,
-                "evidence_source_ids": [],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
         },
         hidden_text="gate password",
@@ -881,9 +831,8 @@ def test_character_action_planning_filters_recent_messages_hidden_from_character
         for request in provider.structured_output_requests
         for message in request.messages
     )
-    plan_text = "\n".join(plan.action for plan in result.plans)
     assert hidden.body not in request_text
-    assert "gate password" not in plan_text
+    assert len(result.assessments) == 2
 
 
 def test_character_action_planning_includes_active_threads(
@@ -891,6 +840,12 @@ def test_character_action_planning_includes_active_threads(
 ) -> None:
     save_id, player_message_id, _characters = _create_save_with_characters(
         repositories
+    )
+    player_message = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Ily",
+        body="I ask Mara and Ren what they see in the lens.",
     )
     repositories.add_active_thread(
         save_id=save_id,
@@ -900,7 +855,7 @@ def test_character_action_planning_includes_active_threads(
         priority=3,
         visibility="scene",
         related_entities=["director_pressure"],
-        source_message_id=player_message_id,
+        source_message_id=player_message.id,
     )
     repositories.add_active_thread(
         save_id=save_id,
@@ -910,25 +865,21 @@ def test_character_action_planning_includes_active_threads(
         priority=4,
         visibility="private",
         related_entities=["character:ren"],
-        source_message_id=player_message_id,
+        source_message_id=player_message.id,
     )
     provider = CharacterDecisionProvider(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara shutters the lantern.",
-                "intent": "avoid the guard search",
-                "reason": "The active guard search raises the risk.",
+                "reason": "Mara is in the scene.",
                 "confidence": 0.9,
-                "evidence_source_ids": [],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
             "Ren": {
                 "present": True,
-                "action": "Ren hides the archive satchel.",
-                "intent": "protect contraband notes",
-                "reason": "The active guard search threatens the archive.",
+                "reason": "Ren is in the scene.",
                 "confidence": 0.84,
-                "evidence_source_ids": [],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
         }
     )
@@ -938,7 +889,7 @@ def test_character_action_planning_includes_active_threads(
         CharacterActionPlanningService(
             repositories=repositories,
             providers={"fake": provider},
-        ).plan_for_turn(save_id=save_id, player_message_id=player_message_id)
+        ).plan_for_turn(save_id=save_id, player_message_id=player_message.id)
     )
 
     request_text = "\n\n".join(
@@ -956,7 +907,9 @@ def test_character_action_planning_includes_active_threads(
 def test_character_turn_assessments_apply_entering_and_leaving(
     repositories: PersistenceRepositories,
 ) -> None:
-    save_id, player_message_id, characters = _create_save_with_characters(repositories)
+    save_id, _player_message_id, characters = _create_save_with_characters(
+        repositories
+    )
     repositories.upsert_scene_snapshot(
         save_id=save_id,
         situation="Mara guards the lantern while Ren approaches from the stairs.",
@@ -975,21 +928,17 @@ def test_character_turn_assessments_apply_entering_and_leaving(
                 "present": True,
                 "enters_scene": False,
                 "leaves_scene": True,
-                "action": "Mara hands off the storm lantern and exits.",
-                "intent": "leave Ren to inspect the lens",
                 "reason": "The player asked Ren to take over.",
                 "confidence": 0.83,
-                "evidence_source_ids": ["message:player"],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
             "Ren": {
                 "present": False,
                 "enters_scene": True,
                 "leaves_scene": False,
-                "action": "Ren steps into the gallery and studies the lens.",
-                "intent": "inspect the beacon mechanism",
                 "reason": "The player called Ren into the room.",
                 "confidence": 0.86,
-                "evidence_source_ids": ["message:player"],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
         }
     )
@@ -1002,190 +951,16 @@ def test_character_turn_assessments_apply_entering_and_leaving(
         ).plan_for_turn(save_id=save_id, player_message_id=player_message_id)
     )
 
-    assert [(plan.character_name, plan.action) for plan in result.plans] == [
-        ("Mara", "Mara hands off the storm lantern and exits."),
-        ("Ren", "Ren steps into the gallery and studies the lens."),
-    ]
     snapshot = repositories.get_scene_snapshot(save_id)
     assert snapshot is not None
     assert characters["mara"] not in snapshot.present_character_ids
     assert characters["ren"] in snapshot.present_character_ids
     assert result.assessments[0].leaves_scene is True
     assert result.assessments[1].enters_scene is True
+    assert result.applied_presence_update is True
 
 
-def test_character_turn_assessment_keeps_shadow_memory_and_edge_candidates(
-    repositories: PersistenceRepositories,
-) -> None:
-    scenario = repositories.create_scenario(
-        type="full_roleplay",
-        title="Lantern Keep",
-        premise="A storm tower waits in the fog.",
-        player_role="Signal keeper",
-        content={
-            "player_character_name": "Ily",
-            "beacon_protocol": "The red lens responds to an ember-dawn phrase.",
-        },
-    )
-    save = repositories.create_save(scenario_id=scenario.id, title="Lantern Keep")
-    repositories.add_character(
-        save_id=save.id,
-        name="Ily",
-        met=True,
-        is_player_character=True,
-    )
-    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
-    repositories.upsert_scene_snapshot(
-        save_id=save.id,
-        situation="Mara waits by the beacon controls.",
-        present_character_ids=[mara.id],
-        snapshot_id="snapshot-shadow-candidates",
-    )
-    source = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Ily",
-        body="I tell Mara the lens-key phrase is ember dawn.",
-    )
-    memory = repositories.add_memory(
-        save_id=save.id,
-        body="The lens-key phrase is ember dawn.",
-        tags=["beacon"],
-        memory_id="memory-lens-key",
-    )
-    state = repositories.upsert_world_state(
-        save_id=save.id,
-        key="beacon.lens",
-        value={"status": "red"},
-        state_id="state-beacon-lens",
-    )
-    summary = repositories.add_summary(
-        save_id=save.id,
-        covers_message_start_id=source.id,
-        covers_message_end_id=source.id,
-        body="Ily told Mara the lens-key phrase.",
-        provider="fake",
-        model="summary",
-        summary_id="summary-lens-key",
-    )
-    provider = CharacterDecisionProvider(
-        {
-            "Mara": {
-                "present": True,
-                "action": "Mara repeats the ember-dawn phrase under her breath.",
-                "intent": "remember the lens key",
-                "reason": "The latest message directly tells her the phrase.",
-                "confidence": 0.91,
-                "evidence_source_ids": [f"message:{source.id}"],
-                "learned_memory_candidates": [
-                    {
-                        "body": "Mara learned that the lens-key phrase is ember dawn.",
-                        "tags": ["mara", "beacon"],
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "Ily directly told Mara.",
-                        "confidence": 0.9,
-                        "evidence_source_ids": [f"message:{source.id}"],
-                        "evidence_quote": "the lens-key phrase is ember dawn",
-                    }
-                ],
-                "knowledge_edge_candidates": [
-                    {
-                        "target_type": "memory",
-                        "target_id": memory.id,
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "The source message teaches the memory fact.",
-                        "confidence": 0.88,
-                        "evidence_source_ids": [f"message:{source.id}"],
-                        "evidence_quote": "the lens-key phrase is ember dawn",
-                    },
-                    {
-                        "target_type": "world_state",
-                        "target_id": state.id,
-                        "knowledge_state": "may_know",
-                        "acquisition_method": "inferred_from_visible_consequence",
-                        "reason": "The red lens is visible in the scene.",
-                        "confidence": 0.72,
-                        "evidence_source_ids": [
-                            "scene_snapshot:snapshot-shadow-candidates"
-                        ],
-                        "evidence_quote": "Mara waits by the beacon controls.",
-                    },
-                    {
-                        "target_type": "summary",
-                        "target_id": summary.id,
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "The summary covers the same direct disclosure.",
-                        "confidence": 0.81,
-                        "evidence_source_ids": [f"message:{source.id}"],
-                        "evidence_quote": "lens-key phrase is ember dawn",
-                    },
-                    {
-                        "target_type": "scenario_section",
-                        "target_id": f"scenario:{scenario.id}:section:beacon_protocol",
-                        "knowledge_state": "may_know",
-                        "acquisition_method": "told",
-                        "reason": "The told phrase touches this scenario section.",
-                        "confidence": 0.7,
-                        "evidence_source_ids": [f"message:{source.id}"],
-                        "evidence_quote": "ember dawn",
-                    },
-                    {
-                        "target_type": "memory",
-                        "target_id": "memory-other-save",
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "This should be ignored.",
-                        "confidence": 1.0,
-                        "evidence_source_ids": [f"message:{source.id}"],
-                        "evidence_quote": "bad target",
-                    },
-                ],
-                "needs_review_notes": [
-                    "Confirm whether Mara should retain this as durable memory."
-                ],
-            }
-        }
-    )
-    _configure_planning(repositories)
-
-    result = asyncio.run(
-        CharacterActionPlanningService(
-            repositories=repositories,
-            providers={"fake": provider},
-        ).plan_for_turn(save_id=save.id, player_message_id=source.id)
-    )
-
-    assessment = result.assessments[0]
-    assert assessment.learned_memory_candidates[0].body == (
-        "Mara learned that the lens-key phrase is ember dawn."
-    )
-    assert assessment.learned_memory_candidates[0].evidence_source_ids == (
-        f"message:{source.id}",
-    )
-    target_ids = [
-        candidate.target_id for candidate in assessment.knowledge_edge_candidates
-    ]
-    assert target_ids == [
-        memory.id,
-        state.id,
-        summary.id,
-        f"scenario:{scenario.id}:section:beacon_protocol",
-    ]
-    assert assessment.needs_review_notes == (
-        "Confirm whether Mara should retain this as durable memory.",
-    )
-    assert len(repositories.list_memories(save.id)) == 1
-    assert repositories.list_character_knowledge_edges(save.id) == []
-    formatted = format_character_turn_assessment(assessment)
-    assert "learned memory candidate (do not persist automatically)" in formatted
-    assert "knowledge edge candidate (do not persist automatically)" in formatted
-    assert f"evidence: message:{source.id}" in formatted
-
-
-def test_character_action_planning_exposes_allowed_evidence_source_ids(
+def test_character_action_planning_batch_exposes_allowed_evidence_source_ids(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, player_message_id, _characters = _create_save_with_characters(
@@ -1195,19 +970,9 @@ def test_character_action_planning_exposes_allowed_evidence_source_ids(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara studies the lens.",
-                "intent": "answer Ily",
-                "reason": "Mara is in the current scene.",
+                "reason": "Mara is in the scene.",
                 "confidence": 0.9,
                 "evidence_source_ids": [f"message:{player_message_id}"],
-            },
-            "Ren": {
-                "present": False,
-                "action": "",
-                "intent": "",
-                "reason": "Ren is offscreen.",
-                "confidence": 0.8,
-                "evidence_source_ids": [],
             },
         }
     )
@@ -1220,149 +985,12 @@ def test_character_action_planning_exposes_allowed_evidence_source_ids(
         ).plan_for_turn(save_id=save_id, player_message_id=player_message_id)
     )
 
-    intent_request = provider.structured_output_requests[-1]
-    evidence_schema = intent_request.schema["properties"]["evidence_source_ids"]
+    presence_request = provider.structured_output_requests[0]
+    evidence_schema = presence_request.schema["properties"]["assessments"]["items"][
+        "properties"
+    ]["evidence_source_ids"]
     assert f"message:{player_message_id}" in evidence_schema["items"]["enum"]
-    assert f"message:{player_message_id}" in intent_request.messages[-1].body
-
-
-def test_character_action_planning_drops_ungrounded_candidate_evidence(
-    repositories: PersistenceRepositories,
-) -> None:
-    scenario = repositories.create_scenario(
-        type="full_roleplay",
-        title="Lantern Keep",
-        premise="A storm tower waits in the fog.",
-        player_role="Signal keeper",
-        content={"player_character_name": "Ily"},
-    )
-    save = repositories.create_save(scenario_id=scenario.id, title="Lantern Keep")
-    repositories.add_character(
-        save_id=save.id,
-        name="Ily",
-        met=True,
-        is_player_character=True,
-    )
-    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
-    repositories.upsert_scene_snapshot(
-        save_id=save.id,
-        situation="Mara waits by the beacon controls.",
-        present_character_ids=[mara.id],
-        snapshot_id="snapshot-1",
-    )
-    source = repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Ily",
-        body="I tell Mara the lens-key phrase is ember dawn.",
-    )
-    memory = repositories.add_memory(
-        save_id=save.id,
-        body="The beacon answers to ember dawn.",
-        tags=["beacon"],
-        memory_id="memory-beacon-key",
-    )
-    provider = CharacterDecisionProvider(
-        {
-            "Mara": {
-                "present": True,
-                "action": "Mara repeats the ember-dawn phrase under her breath.",
-                "intent": "remember the lens key",
-                "reason": "The latest message directly tells her the phrase.",
-                "confidence": 0.91,
-                "evidence_source_ids": [f"message:{source.id}"],
-                "learned_memory_candidates": [
-                    {
-                        "body": "Mara learned that the lens-key phrase is ember dawn.",
-                        "tags": ["mara", "beacon"],
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "Ily directly told Mara.",
-                        "confidence": 0.9,
-                        "evidence_source_ids": [f"message:{source.id}"],
-                        "evidence_quote": "lens-key phrase is ember dawn",
-                    },
-                    {
-                        "body": "Mara learned a phrase from a missing message.",
-                        "tags": ["mara"],
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "This source id is invalid.",
-                        "confidence": 0.9,
-                        "evidence_source_ids": ["message:missing"],
-                        "evidence_quote": "lens-key phrase is ember dawn",
-                    },
-                    {
-                        "body": "Mara learned an unsupported library clue.",
-                        "tags": ["mara"],
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "This quote is invalid.",
-                        "confidence": 0.9,
-                        "evidence_source_ids": [f"message:{source.id}"],
-                        "evidence_quote": "ruby library",
-                    },
-                    {
-                        "body": "Mara learned without citing her own source.",
-                        "tags": ["mara"],
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "Nested candidates must cite their own source.",
-                        "confidence": 0.9,
-                        "evidence_quote": "lens-key phrase is ember dawn",
-                    },
-                ],
-                "knowledge_edge_candidates": [
-                    {
-                        "target_type": "memory",
-                        "target_id": memory.id,
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "The source message teaches the memory fact.",
-                        "confidence": 0.88,
-                        "evidence_source_ids": [f"message:{source.id}"],
-                        "evidence_quote": "ember dawn",
-                    },
-                    {
-                        "target_type": "memory",
-                        "target_id": memory.id,
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "The quote is not grounded.",
-                        "confidence": 0.88,
-                        "evidence_source_ids": [f"message:{source.id}"],
-                        "evidence_quote": "ruby library",
-                    },
-                    {
-                        "target_type": "memory",
-                        "target_id": memory.id,
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "Nested edge candidates must cite their own source.",
-                        "confidence": 0.88,
-                        "evidence_quote": "ember dawn",
-                    },
-                ],
-                "needs_review_notes": [],
-            }
-        }
-    )
-    _configure_planning(repositories)
-
-    result = asyncio.run(
-        CharacterActionPlanningService(
-            repositories=repositories,
-            providers={"fake": provider},
-        ).plan_for_turn(save_id=save.id, player_message_id=source.id)
-    )
-
-    assessment = result.assessments[0]
-    assert [
-        candidate.body for candidate in assessment.learned_memory_candidates
-    ] == ["Mara learned that the lens-key phrase is ember dawn."]
-    assert [
-        candidate.evidence_quote for candidate in assessment.knowledge_edge_candidates
-    ] == ["ember dawn"]
+    assert f"message:{player_message_id}" in presence_request.messages[-1].body
 
 
 def test_character_action_planning_uses_configured_concurrency_cap(
@@ -1382,7 +1010,7 @@ def test_character_action_planning_uses_configured_concurrency_cap(
         met=True,
         is_player_character=True,
     )
-    names = ("Mara", "Ren", "Talla", "Ivo", "Senn")
+    names = ("Mara", "Ren", "Talla", "Ivo", "Senn", "Theo", "Vega")
     characters = [
         repositories.add_character(save_id=save.id, name=name, met=True)
         for name in names
@@ -1396,14 +1024,12 @@ def test_character_action_planning_uses_configured_concurrency_cap(
         save_id=save.id,
         role="player",
         speaker_name="Ily",
-        body="I ask everyone what they do next.",
+        body="I ask " + ", ".join(names) + " what they do next.",
     )
     provider = BlockingCharacterDecisionProvider(
         {
             name: {
                 "present": True,
-                "action": f"{name} acts.",
-                "intent": "respond to the player",
                 "reason": "The player asked the crew.",
                 "confidence": 0.75,
                 "evidence_source_ids": ["scene_snapshot:snapshot-1"],
@@ -1429,9 +1055,9 @@ def test_character_action_planning_uses_configured_concurrency_cap(
         )
         await asyncio.wait_for(provider.expected_active.wait(), timeout=1)
         assert provider.max_active == 2
-        assert len(provider.structured_output_requests) == 3
         provider.release.set()
         result = await task
+        assert len(provider.structured_output_requests) == len(names)
         assert len(result.decisions) == len(names)
 
     asyncio.run(run_planning())
@@ -1471,7 +1097,7 @@ def test_character_action_planning_includes_dating_route_escalation_policy(
         save_id=save.id,
         role="player",
         speaker_name="Ren",
-        body="I tell Mika I would like to see her again.",
+        body="I tell Mika Arai I would like to see her again.",
     )
     repositories.upsert_dating_route_state(
         save_id=save.id,
@@ -1487,11 +1113,9 @@ def test_character_action_planning_includes_dating_route_escalation_policy(
         {
             "Mika Arai": {
                 "present": True,
-                "action": "Mika smiles and suggests exchanging numbers.",
-                "intent": "show interest without overcommitting",
                 "reason": "The route is still early.",
                 "confidence": 0.83,
-                "evidence_source_ids": [],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             }
         }
     )
@@ -1522,14 +1146,12 @@ def test_character_action_planning_failure_preserves_existing_presence(
         {
             "Mara": {
                 "present": False,
-                "action": "",
-                "intent": "",
                 "reason": "Mara stepped out before this beat.",
                 "confidence": 0.7,
-                "evidence_source_ids": [],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             }
         },
-        fail_names={"Ren"},
+        fail_names={"Mara"},
     )
     _configure_planning(repositories)
 
@@ -1542,9 +1164,11 @@ def test_character_action_planning_failure_preserves_existing_presence(
 
     snapshot = repositories.get_scene_snapshot(save_id)
     assert snapshot is not None
-    assert characters["ren"] in snapshot.present_character_ids
-    assert result.plans == ()
-    assert result.failed_character_ids == (characters["ren"],)
+    assert characters["mara"] in snapshot.present_character_ids
+    assert result.failed_character_ids == (characters["mara"],)
+    assert [assessment.character_name for assessment in result.assessments] == [
+        "Ren"
+    ]
 
 
 def test_character_action_planning_skips_missing_catalog_row(
@@ -1555,11 +1179,9 @@ def test_character_action_planning_skips_missing_catalog_row(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara takes a breath.",
-                "intent": "steady the crew",
                 "reason": "Mara is present in the scene.",
                 "confidence": 0.7,
-                "evidence_source_ids": [],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             }
         }
     )
@@ -1614,12 +1236,13 @@ def test_storyteller_planning_includes_all_characters_and_excludes_direction_evi
         body="The orchestra prepares for the final movement.",
     )
 
-    planned = _planning_characters_for_turn(
+    deterministic_present, ambiguous = _planning_characters_for_turn(
         repositories=repositories,
         save_id=save.id,
         source_message=direction,
     )
-    assert {character.id for character in planned} == {rival.id, witness.id}
+    assert deterministic_present == ()
+    assert {character.id for character in ambiguous} == {rival.id, witness.id}
     evidence = _planning_evidence_sources(
         repositories=repositories,
         save_id=save.id,
@@ -1760,11 +1383,9 @@ def test_character_action_planning_can_be_disabled_per_save(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara takes a breath.",
-                "intent": "",
                 "reason": "",
                 "confidence": 0.7,
-                "evidence_source_ids": [],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             }
         }
     )
@@ -1876,42 +1497,6 @@ class BatchFailThenPerCharacterProvider(CharacterDecisionProvider):
         return await super().generate_structured_output(request)
 
 
-class SequenceCharacterDecisionProvider(CharacterDecisionProvider):
-    def __init__(
-        self,
-        decisions: tuple[dict[str, object], ...],
-    ) -> None:
-        super().__init__({})
-        self.decisions = list(decisions)
-
-    async def generate_structured_output(
-        self,
-        request: StructuredOutputRequest,
-    ) -> StructuredOutputResponse:
-        self.structured_output_requests.append(request)
-        if not self.decisions:
-            raise AssertionError("no scripted character decision remaining")
-        data = dict(self.decisions.pop(0))
-        data = _with_allowed_evidence_ids_and_quote(data, request)
-        if _is_batch_presence_request(request):
-            body = request.messages[-1].body
-            pairs = _requested_batch_character_ids(body)
-            data["character_id"] = next(iter(pairs.values()))
-            return StructuredOutputResponse(
-                data={"assessments": [data]},
-                provider=request.provider,
-                model_id=request.model_id,
-                token_usage={"total": 7},
-            )
-        data["character_id"] = request.schema["properties"]["character_id"]["enum"][0]
-        return StructuredOutputResponse(
-            data=data,
-            provider=request.provider,
-            model_id=request.model_id,
-            token_usage={"total": 7},
-        )
-
-
 class EchoHiddenPromptDecisionProvider(CharacterDecisionProvider):
     def __init__(
         self,
@@ -1939,7 +1524,7 @@ class EchoHiddenPromptDecisionProvider(CharacterDecisionProvider):
         data = dict(self.decisions_by_name[name])
         data = _with_allowed_evidence_ids_and_quote(data, request)
         data["character_id"] = request.schema["properties"]["character_id"]["enum"][0]
-        data["action"] = (
+        data["reason"] = (
             f"{name} repeats the {self.hidden_text}."
             if self.hidden_text in body
             else f"{name} continues without hidden knowledge."
@@ -2168,10 +1753,7 @@ def _with_allowed_evidence_ids_and_quote(
                     rewritten[key] = normalized_ids
                 else:
                     rewritten[key] = rewrite(raw_value)
-            if (
-                normalized_ids
-                and "evidence_quote" not in rewritten
-            ):
+            if normalized_ids and "evidence_quote" not in rewritten:
                 quote = next(
                     (
                         source_texts[source_id]

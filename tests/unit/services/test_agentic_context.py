@@ -2499,6 +2499,25 @@ def test_narrator_planner_returns_message_spec_from_structured_output() -> None:
     assert "candidate only" in brief
 
 
+def test_planner_prompt_instructs_batched_intents_and_knowledge_candidates() -> None:
+    request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(ChatMessage(role="player", body="What do I see?"),),
+    )
+
+    messages = agentic_context_module._planner_messages(request)
+
+    system_body = messages[0].body
+    assert "npc_intents is the single batched intent artifact" in system_body
+    assert "present or entering non-player character" in system_body
+    assert "scene_presence state commit candidate" in system_body
+    assert "value.action" in system_body
+    assert "character_learned_memory or character_knowledge_edge" in system_body
+    assert "uncommitted until verified" in system_body
+    assert "never invent target ids" in system_body
+
+
 def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
     repositories: PersistenceRepositories,
 ) -> None:

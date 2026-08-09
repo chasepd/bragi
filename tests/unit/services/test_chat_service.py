@@ -5475,8 +5475,6 @@ def test_character_assessment_scene_presence_candidate_uses_presence_evidence(
                     character_name="Mara",
                     present=True,
                     enters_scene=True,
-                    action="Mara checks the corridor.",
-                    intent="inspect the corridor",
                     reason="Mara enters only if presence evidence is grounded.",
                     confidence=0.84,
                     evidence_source_ids=("message:intent",),
@@ -17057,7 +17055,7 @@ def test_submit_player_turn_runs_character_action_planning_before_prompt(
                 "intent": "",
                 "reason": "Lio is not in the gallery.",
                 "confidence": 0.8,
-                "evidence_source_ids": ["character:lio"],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
         },
     )
@@ -17093,14 +17091,16 @@ def test_submit_player_turn_runs_character_action_planning_before_prompt(
     request = provider.chat_requests[0]
     assert provider.events == [
         "character_presence_assessment",
-        "character_intent_plan",
         "chat",
     ]
     assert request.character_action_plans == (
         "[character_action:"
-        f"{mara.id}] Mara | intent: protect the lens crew | next action: "
-        "Mara lowers the lantern and listens for the reply. | reason: Mara is "
-        "in the current scene by the controls. | confidence: 90% | evidence: "
+        f"{lio.id}] Archivist Lio | present: no | reason: Lio is not in the "
+        "gallery. | confidence: 80% | evidence: "
+        f"scene_snapshot:{original_snapshot.id}",
+        "[character_action:"
+        f"{mara.id}] Mara | present: yes | reason: Mara is in the current "
+        "scene by the controls. | confidence: 90% | evidence: "
         f"scene_snapshot:{original_snapshot.id}",
     )
     current_snapshot = repositories.get_scene_snapshot(save.id)
@@ -17355,7 +17355,7 @@ def test_storyteller_character_planning_never_applies_direction_presence(
     assert planner.apply_presence_updates == [False]
 
 
-def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
+def test_submit_player_turn_feeds_presence_assessments_to_planner(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -17383,12 +17383,6 @@ def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
         situation="Mara waits beside the beacon controls.",
         present_character_ids=[mara.id],
     )
-    memory = repositories.add_memory(
-        save_id=save.id,
-        body="The beacon lens answers to ember dawn.",
-        tags=["beacon"],
-        memory_id="memory-beacon-key",
-    )
     repositories.set_app_setting(CHARACTER_ACTION_PLANNING_ENABLED_SETTING, True)
     repositories.set_model_preference(
         task="chat",
@@ -17411,38 +17405,11 @@ def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara pockets the phrase and watches the lens.",
-                "intent": "remember the beacon phrase",
-                "reason": "The player directly tells Mara the phrase.",
+                "enters_scene": False,
+                "leaves_scene": False,
+                "reason": "The player directly addresses Mara.",
                 "confidence": 0.89,
                 "evidence_source_ids": ["message:latest"],
-                "learned_memory_candidates": [
-                    {
-                        "body": "Mara learned that ember dawn wakes the beacon lens.",
-                        "tags": ["mara", "beacon"],
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "The player told Mara directly.",
-                        "confidence": 0.87,
-                        "evidence_source_ids": ["message:latest"],
-                        "evidence_quote": "ember dawn wakes the beacon lens",
-                    }
-                ],
-                "knowledge_edge_candidates": [
-                    {
-                        "target_type": "memory",
-                        "target_id": memory.id,
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "The source message teaches this memory.",
-                        "confidence": 0.84,
-                        "evidence_source_ids": ["message:latest"],
-                        "evidence_quote": "ember dawn",
-                    }
-                ],
-                "needs_review_notes": [
-                    "Review before making Mara's learned phrase durable."
-                ],
             }
         },
     )
@@ -17474,20 +17441,9 @@ def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
 
     assert len(planner.calls) == 1
     assessment_text = "\n".join(planner.calls[0][1].character_action_plans)
-    assert "Mara pockets the phrase and watches the lens." in assessment_text
-    assert "learned memory candidate (do not persist automatically)" in (
-        assessment_text
-    )
-    assert "Mara learned that ember dawn wakes the beacon lens." in assessment_text
-    assert "knowledge edge candidate (do not persist automatically)" in (
-        assessment_text
-    )
-    assert "target: memory:memory-beacon-key" in assessment_text
-    assert "Review before making Mara's learned phrase durable." in assessment_text
-    assert [record.id for record in repositories.list_memories(save.id)] == [
-        memory.id
-    ]
-    assert repositories.list_character_knowledge_edges(save.id) == []
+    assert "present: yes" in assessment_text
+    assert "reason: The player directly addresses Mara." in assessment_text
+    assert "The player directly addresses Mara." in assessment_text
 
 
 def test_submit_player_turn_does_not_run_director_pressure_before_prompt(
@@ -17667,6 +17623,9 @@ def test_submit_player_turn_skips_character_action_planning_when_disabled(
         "prompt_guidance_count": 0,
         "skipped_reason": "disabled",
         "applied_presence_update": False,
+        "model_calls_avoided": 0,
+        "presence_calls_made": 0,
+        "deterministic_presence_count": 0,
     }
 
 
@@ -17738,15 +17697,13 @@ def test_submit_timeskip_turn_runs_character_action_planning(
 
     assert provider.events == [
         "character_presence_assessment",
-        "character_intent_plan",
         "chat",
     ]
     request = provider.chat_requests[0]
     assert len(request.character_action_plans) == 1
     assert request.character_action_plans[0].startswith(
         "[character_action:"
-        f"{mara.id}] Mara | intent: protect the signal | next action: "
-        "Mara shields the lantern as dawn breaks. | reason: The timeskip "
+        f"{mara.id}] Mara | present: yes | reason: The timeskip "
         "keeps Mara at the beacon. | confidence: 85% | evidence: message:"
     )
     snapshot = repositories.get_scene_snapshot(save.id)

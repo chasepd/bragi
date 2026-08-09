@@ -1,11 +1,11 @@
-"""Per-character pre-narrator action planning."""
+"""Deterministic pre-narrator character presence planning."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, cast
 
 from bragi.app_logging import exception_log_fields, log_error_event
@@ -17,11 +17,7 @@ from bragi.persistence.models import (
     MessageRecord,
     ModelPreferenceRecord,
 )
-from bragi.persistence.repositories import (
-    CHARACTER_KNOWLEDGE_ACQUISITION_METHODS,
-    CHARACTER_KNOWLEDGE_STATES,
-    PersistenceRepositories,
-)
+from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     ChatMessage,
     ProviderClient,
@@ -32,7 +28,6 @@ from bragi.services.active_thread_lifecycle import (
     active_thread_is_prompt_visible,
     normalize_active_thread_status,
 )
-from bragi.services.context_assembly import scenario_section_candidates
 from bragi.services.dating_route_policy import (
     escalation_policy_for_stage,
     intimacy_profile_guidance,
@@ -48,7 +43,6 @@ from bragi.services.model_capabilities import (
     check_model_capabilities,
 )
 from bragi.services.model_preferences import (
-    CHARACTER_INTENT_PLANNING_PURPOSE,
     CHARACTER_PRESENCE_ASSESSMENT_PURPOSE,
     roleplay_model_preference_with_fallbacks,
 )
@@ -57,7 +51,6 @@ from bragi.world_time_model import format_world_time_from_snapshot
 
 CHARACTER_ACTION_PLANNING_TASK = "character_action_planning"
 CHARACTER_PRESENCE_ASSESSMENT_TASK = CHARACTER_PRESENCE_ASSESSMENT_PURPOSE
-CHARACTER_INTENT_PLANNING_TASK = CHARACTER_INTENT_PLANNING_PURPOSE
 CHARACTER_ACTION_PLANNING_ENABLED_SETTING = "character_action_planning_enabled"
 CHARACTER_ACTION_PLANNING_ENABLED_DEFAULT = True
 CHARACTER_ACTION_PLANNING_MAX_CONCURRENCY_SETTING = (
@@ -72,47 +65,10 @@ CHARACTER_ACTION_PLANNING_BATCH_RECENT_MESSAGE_LIMIT = 12
 
 
 @dataclass(frozen=True)
-class CharacterActionPlan:
-    character_id: str
-    character_name: str
-    action: str
-    intent: str = ""
-    reason: str = ""
-    confidence: float = 0.0
-    evidence_source_ids: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class CharacterLearnedMemoryCandidate:
-    body: str
-    tags: tuple[str, ...] = ()
-    knowledge_state: str = "knows"
-    acquisition_method: str = "unknown"
-    reason: str = ""
-    confidence: float = 0.0
-    evidence_source_ids: tuple[str, ...] = ()
-    evidence_quote: str = ""
-
-
-@dataclass(frozen=True)
-class CharacterKnowledgeEdgeCandidate:
-    target_type: str
-    target_id: str
-    knowledge_state: str = "knows"
-    acquisition_method: str = "unknown"
-    reason: str = ""
-    confidence: float = 0.0
-    evidence_source_ids: tuple[str, ...] = ()
-    evidence_quote: str = ""
-
-
-@dataclass(frozen=True)
 class CharacterTurnAssessment:
     character_id: str
     character_name: str
     present: bool
-    action: str = ""
-    intent: str = ""
     reason: str = ""
     confidence: float = 0.0
     evidence_source_ids: tuple[str, ...] = ()
@@ -121,21 +77,17 @@ class CharacterTurnAssessment:
     presence_evidence_quote: str = ""
     enters_scene: bool = False
     leaves_scene: bool = False
-    learned_memory_candidates: tuple[CharacterLearnedMemoryCandidate, ...] = ()
-    knowledge_edge_candidates: tuple[CharacterKnowledgeEdgeCandidate, ...] = ()
-    needs_review_notes: tuple[str, ...] = ()
-
-
-CharacterPresenceDecision = CharacterTurnAssessment
 
 
 @dataclass(frozen=True)
 class CharacterActionPlanningResult:
-    plans: tuple[CharacterActionPlan, ...] = ()
     decisions: tuple[CharacterTurnAssessment, ...] = ()
     failed_character_ids: tuple[str, ...] = ()
     skipped_reason: str = ""
     applied_presence_update: bool = False
+    model_calls_avoided: int = 0
+    presence_calls_made: int = 0
+    deterministic_presence_count: int = 0
 
     @property
     def assessments(self) -> tuple[CharacterTurnAssessment, ...]:
@@ -176,41 +128,25 @@ class CharacterActionPlanningService:
         )
         if presence_preference is None:
             return CharacterActionPlanningResult(skipped_reason="no_model_preference")
-        intent_preference = _character_intent_model_preference(
-            repositories=self.repositories,
-            save_id=save_id,
-        )
-        if intent_preference is None:
-            return CharacterActionPlanningResult(skipped_reason="no_model_preference")
         presence_provider, presence_skip_reason = self._structured_provider(
             presence_preference
         )
         if presence_skip_reason is not None:
             return CharacterActionPlanningResult(skipped_reason=presence_skip_reason)
-        intent_provider, intent_skip_reason = self._structured_provider(
-            intent_preference
-        )
-        if intent_skip_reason is not None:
-            return CharacterActionPlanningResult(skipped_reason=intent_skip_reason)
         if not any(
             not character.is_player_character
             for character in self.repositories.list_characters(save_id)
         ):
             return CharacterActionPlanningResult(skipped_reason="no_npc_characters")
-        characters = _planning_characters_for_turn(
+        deterministic_present, ambiguous = _planning_characters_for_turn(
             repositories=self.repositories,
             save_id=save_id,
             source_message=source_message,
         )
-        if not characters:
+        if not deterministic_present and not ambiguous:
             return CharacterActionPlanningResult(
                 skipped_reason="no_scoped_npc_characters",
             )
-        valid_knowledge_targets = _valid_knowledge_edge_targets(
-            repositories=self.repositories,
-            save_id=save_id,
-            scenario=details.scenario,
-        )
         semaphore = asyncio.Semaphore(
             character_action_planning_max_concurrency(
                 self.repositories,
@@ -246,100 +182,71 @@ class CharacterActionPlanningService:
         ]:
             return tuple(
                 await asyncio.gather(
-                    *(assess_presence(character) for character in characters)
+                    *(assess_presence(character) for character in ambiguous)
                 )
             )
 
-        if len(characters) <= CHARACTER_ACTION_PLANNING_BATCH_MAX_CHARACTERS:
-            try:
-                raw_presence_decisions = await self._assess_presence_batch(
-                    save_id=save_id,
-                    preference=presence_preference,
-                    provider=cast(StructuredOutputProvider, presence_provider),
-                    characters=tuple(characters),
-                    source_message=source_message,
-                    messages=tuple(details.messages),
-                )
-            except Exception as exc:
-                log_error_event(
-                    "chat.character_presence_batch_failed",
-                    save_id=save_id,
-                    character_ids=[character.id for character in characters],
-                    **exception_log_fields(exc),
-                )
-                raw_presence_decisions = await assess_presence_per_character()
-        else:
-            raw_presence_decisions = await assess_presence_per_character()
-        presence_decisions = tuple(
-            decision for decision in raw_presence_decisions if decision is not None
-        )
-        failed_ids = [
-            character.id
-            for character, decision in zip(
-                characters,
-                raw_presence_decisions,
-                strict=True,
-            )
-            if decision is None
-        ]
-        characters_by_id = {character.id: character for character in characters}
-        intent_candidates = tuple(
-            decision
-            for decision in presence_decisions
-            if _assessment_has_grounded_presence(decision)
-            and (
-                decision.present
-                or decision.enters_scene
-                or decision.leaves_scene
-            )
-        )
-
-        async def plan_intent(
-            assessment: CharacterTurnAssessment,
-        ) -> CharacterTurnAssessment | None:
-            character = characters_by_id[assessment.character_id]
-            async with semaphore:
+        presence_calls_made = 0
+        if ambiguous:
+            if len(ambiguous) <= CHARACTER_ACTION_PLANNING_BATCH_MAX_CHARACTERS:
                 try:
-                    return await self._plan_character_intent(
+                    raw_presence_decisions = await self._assess_presence_batch(
                         save_id=save_id,
-                        preference=intent_preference,
-                        provider=cast(StructuredOutputProvider, intent_provider),
-                        character=character,
-                        presence_assessment=assessment,
+                        preference=presence_preference,
+                        provider=cast(StructuredOutputProvider, presence_provider),
+                        characters=tuple(ambiguous),
                         source_message=source_message,
                         messages=tuple(details.messages),
-                        valid_knowledge_targets=valid_knowledge_targets,
                     )
+                    presence_calls_made = 1
                 except Exception as exc:
                     log_error_event(
-                        "chat.character_intent_planning_failed",
+                        "chat.character_presence_batch_failed",
                         save_id=save_id,
-                        character_id=character.id,
-                        character_name=character.name,
+                        character_ids=[character.id for character in ambiguous],
                         **exception_log_fields(exc),
                     )
-                    return None
-
-        raw_intent_decisions = await asyncio.gather(
-            *(plan_intent(assessment) for assessment in intent_candidates)
-        )
-        intent_by_character_id = {
-            decision.character_id: decision
-            for decision in raw_intent_decisions
-            if decision is not None
-        }
-        failed_ids.extend(
-            assessment.character_id
-            for assessment, decision in zip(
-                intent_candidates,
-                raw_intent_decisions,
-                strict=True,
+                    raw_presence_decisions = await assess_presence_per_character()
+                    presence_calls_made = len(ambiguous)
+            else:
+                raw_presence_decisions = await assess_presence_per_character()
+                presence_calls_made = len(ambiguous)
+            ambiguous_decisions = tuple(
+                decision
+                for decision in raw_presence_decisions
+                if decision is not None
             )
-            if decision is None
+            failed_ids = [
+                character.id
+                for character, decision in zip(
+                    ambiguous,
+                    raw_presence_decisions,
+                    strict=True,
+                )
+                if decision is None
+            ]
+        else:
+            ambiguous_decisions = ()
+            failed_ids = []
+        deterministic_assessments = tuple(
+            _deterministic_presence_assessment(
+                repositories=self.repositories,
+                save_id=save_id,
+                character=character,
+            )
+            for character in deterministic_present
         )
+        assessments_by_character_id = {
+            assessment.character_id: assessment
+            for assessment in (
+                *deterministic_assessments,
+                *ambiguous_decisions,
+            )
+        }
         decisions = tuple(
-            intent_by_character_id.get(decision.character_id, decision)
-            for decision in presence_decisions
+            assessments_by_character_id[character.id]
+            for character in (*deterministic_present, *ambiguous)
+            if character.id in assessments_by_character_id
         )
         applied = (
             _apply_presence_decisions(
@@ -351,16 +258,25 @@ class CharacterActionPlanningService:
             if apply_presence_updates
             else False
         )
-        plans = tuple(
-            _plan_from_assessment(assessment)
+        intent_wave_size = sum(
+            1
             for assessment in decisions
-            if _assessment_has_action_plan(assessment)
+            if (
+                assessment.present
+                or assessment.enters_scene
+                or assessment.leaves_scene
+            )
+        )
+        model_calls_avoided = (
+            len(decisions) + intent_wave_size - presence_calls_made
         )
         return CharacterActionPlanningResult(
-            plans=plans,
             decisions=decisions,
             failed_character_ids=tuple(failed_ids),
             applied_presence_update=applied,
+            model_calls_avoided=model_calls_avoided,
+            presence_calls_made=presence_calls_made,
+            deterministic_presence_count=len(deterministic_assessments),
         )
 
     def _structured_provider(
@@ -490,65 +406,6 @@ class CharacterActionPlanningService:
         )
         return tuple(assessments.get(character.id) for character in characters)
 
-    async def _plan_character_intent(
-        self,
-        *,
-        save_id: str,
-        preference: ModelPreferenceRecord,
-        provider: StructuredOutputProvider,
-        character: CharacterRecord,
-        presence_assessment: CharacterTurnAssessment,
-        source_message: MessageRecord,
-        messages: tuple[MessageRecord, ...],
-        valid_knowledge_targets: Mapping[str, frozenset[str]],
-    ) -> CharacterTurnAssessment:
-        evidence_sources = _planning_evidence_sources(
-            repositories=self.repositories,
-            save_id=save_id,
-            character=character,
-            source_message=source_message,
-            messages=messages,
-        )
-        request = StructuredOutputRequest(
-            provider=preference.provider,
-            model_id=preference.model_id,
-            schema_name="character_intent_plan",
-            schema=_character_intent_schema(
-                character,
-                evidence_source_ids=tuple(evidence_sources),
-            ),
-            messages=_character_intent_messages(
-                repositories=self.repositories,
-                save_id=save_id,
-                character=character,
-                presence_assessment=presence_assessment,
-                source_message=source_message,
-                messages=messages,
-                valid_knowledge_targets=valid_knowledge_targets,
-                evidence_sources=evidence_sources,
-            ),
-            temperature=0.2,
-            max_output_tokens=10_000,
-        )
-        response = await structured_output_with_fallback(
-            repositories=self.repositories,
-            providers=self.providers,
-            request=request,
-            task=CHARACTER_INTENT_PLANNING_TASK,
-            save_id=save_id,
-            diagnostic_context={
-                "character_id": character.id,
-                "source_message_id": source_message.id,
-            },
-        )
-        return _intent_assessment_from_data(
-            response.data,
-            presence_assessment=presence_assessment,
-            character=character,
-            valid_knowledge_targets=valid_knowledge_targets,
-            evidence_sources=evidence_sources,
-        )
-
 
 def character_action_planning_enabled(
     repositories: PersistenceRepositories,
@@ -587,83 +444,27 @@ def sanitize_character_action_planning_max_concurrency(value: object) -> int:
     )
 
 
-def format_character_action_plan(plan: CharacterActionPlan) -> str:
-    parts = [
-        f"[character_action:{plan.character_id}] {plan.character_name}",
-        f"intent: {plan.intent}" if plan.intent else "",
-        f"next action: {plan.action}",
-        f"reason: {plan.reason}" if plan.reason else "",
-        f"confidence: {round(plan.confidence * 100)}%",
-        (
-            "evidence: " + ", ".join(plan.evidence_source_ids)
-            if plan.evidence_source_ids
-            else ""
-        ),
-    ]
-    return " | ".join(part for part in parts if part)
-
-
 def character_turn_assessment_has_prompt_guidance(
     assessment: CharacterTurnAssessment,
 ) -> bool:
-    return bool(
-        _assessment_has_action_plan(assessment)
-        or assessment.learned_memory_candidates
-        or assessment.knowledge_edge_candidates
-        or assessment.needs_review_notes
-    )
+    return _assessment_has_grounded_presence(assessment)
 
 
 def format_character_turn_assessment(assessment: CharacterTurnAssessment) -> str:
-    if not _assessment_has_richer_guidance(assessment):
-        return format_character_action_plan(_plan_from_assessment(assessment))
-    has_action_plan = _assessment_has_action_plan(assessment)
     parts = [
         f"[character_action:{assessment.character_id}] {assessment.character_name}",
-        f"present: {'yes' if assessment.present else 'no'}"
-        if has_action_plan
-        else "",
-        "enters scene: yes"
-        if has_action_plan and assessment.enters_scene
-        else "",
-        "leaves scene after beat: yes"
-        if has_action_plan and assessment.leaves_scene
-        else "",
-        f"intent: {assessment.intent}" if has_action_plan and assessment.intent else "",
-        f"next action: {assessment.action}"
-        if has_action_plan and assessment.action
-        else "",
-        f"reason: {assessment.reason}" if has_action_plan and assessment.reason else "",
-        f"confidence: {round(assessment.confidence * 100)}%"
-        if has_action_plan
-        else "",
+        f"present: {'yes' if assessment.present else 'no'}",
+        "enters scene: yes" if assessment.enters_scene else "",
+        "leaves scene: yes" if assessment.leaves_scene else "",
+        f"reason: {assessment.reason}" if assessment.reason else "",
+        f"confidence: {round(assessment.confidence * 100)}%",
         (
             "evidence: " + ", ".join(assessment.evidence_source_ids)
-            if has_action_plan and assessment.evidence_source_ids
+            if assessment.evidence_source_ids
             else ""
         ),
     ]
-    parts.extend(
-        _format_learned_memory_candidate(candidate)
-        for candidate in assessment.learned_memory_candidates
-    )
-    parts.extend(
-        _format_knowledge_edge_candidate(candidate)
-        for candidate in assessment.knowledge_edge_candidates
-    )
-    if assessment.needs_review_notes:
-        parts.append("needs review: " + "; ".join(assessment.needs_review_notes))
     return " | ".join(part for part in parts if part)
-
-
-def _assessment_has_action_plan(assessment: CharacterTurnAssessment) -> bool:
-    return bool(
-        assessment.action
-        and _assessment_has_grounded_presence(assessment)
-        and assessment.evidence_source_ids
-        and assessment.evidence_quote.strip()
-        and (assessment.present or assessment.enters_scene or assessment.leaves_scene)
-    )
 
 
 def _assessment_has_grounded_presence(assessment: CharacterTurnAssessment) -> bool:
@@ -671,65 +472,6 @@ def _assessment_has_grounded_presence(assessment: CharacterTurnAssessment) -> bo
         assessment.presence_evidence_source_ids
         and assessment.presence_evidence_quote.strip()
     )
-
-
-def _assessment_has_richer_guidance(assessment: CharacterTurnAssessment) -> bool:
-    return bool(
-        not _assessment_has_action_plan(assessment)
-        or assessment.enters_scene
-        or assessment.leaves_scene
-        or assessment.learned_memory_candidates
-        or assessment.knowledge_edge_candidates
-        or assessment.needs_review_notes
-    )
-
-
-def _format_learned_memory_candidate(
-    candidate: CharacterLearnedMemoryCandidate,
-) -> str:
-    parts = [
-        "learned memory candidate (do not persist automatically): " + candidate.body,
-        "tags: " + ", ".join(candidate.tags) if candidate.tags else "",
-        f"knowledge: {candidate.knowledge_state}",
-        (
-            f"acquired: {candidate.acquisition_method}"
-            if candidate.acquisition_method != "unknown"
-            else ""
-        ),
-        f"reason: {candidate.reason}" if candidate.reason else "",
-        f"confidence: {round(candidate.confidence * 100)}%",
-        (
-            "evidence: " + ", ".join(candidate.evidence_source_ids)
-            if candidate.evidence_source_ids
-            else ""
-        ),
-        f"quote: {candidate.evidence_quote}" if candidate.evidence_quote else "",
-    ]
-    return "; ".join(part for part in parts if part)
-
-
-def _format_knowledge_edge_candidate(
-    candidate: CharacterKnowledgeEdgeCandidate,
-) -> str:
-    parts = [
-        "knowledge edge candidate (do not persist automatically): "
-        f"target: {candidate.target_type}:{candidate.target_id}",
-        f"knowledge: {candidate.knowledge_state}",
-        (
-            f"acquired: {candidate.acquisition_method}"
-            if candidate.acquisition_method != "unknown"
-            else ""
-        ),
-        f"reason: {candidate.reason}" if candidate.reason else "",
-        f"confidence: {round(candidate.confidence * 100)}%",
-        (
-            "evidence: " + ", ".join(candidate.evidence_source_ids)
-            if candidate.evidence_source_ids
-            else ""
-        ),
-        f"quote: {candidate.evidence_quote}" if candidate.evidence_quote else "",
-    ]
-    return "; ".join(part for part in parts if part)
 
 
 def _character_presence_model_preference(
@@ -742,21 +484,6 @@ def _character_presence_model_preference(
         save_id=save_id,
         purposes=(
             CHARACTER_PRESENCE_ASSESSMENT_TASK,
-            CHARACTER_ACTION_PLANNING_TASK,
-        ),
-    )
-
-
-def _character_intent_model_preference(
-    *,
-    repositories: PersistenceRepositories,
-    save_id: str,
-) -> ModelPreferenceRecord | None:
-    return roleplay_model_preference_with_fallbacks(
-        repositories=repositories,
-        save_id=save_id,
-        purposes=(
-            CHARACTER_INTENT_PLANNING_TASK,
             CHARACTER_ACTION_PLANNING_TASK,
         ),
     )
@@ -834,110 +561,6 @@ def _character_presence_batch_schema(
             }
         },
         "required": ["assessments"],
-    }
-
-
-def _character_intent_schema(
-    character: CharacterRecord,
-    *,
-    evidence_source_ids: tuple[str, ...],
-) -> dict[str, Any]:
-    string_array = _evidence_source_ids_schema(evidence_source_ids)
-    tags_array = {"type": "array", "items": {"type": "string"}, "maxItems": 8}
-    knowledge_state = {
-        "type": "string",
-        "enum": sorted(CHARACTER_KNOWLEDGE_STATES),
-    }
-    acquisition_method = {
-        "type": "string",
-        "enum": sorted(CHARACTER_KNOWLEDGE_ACQUISITION_METHODS),
-    }
-    learned_memory_candidate = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "body": {"type": "string"},
-            "tags": tags_array,
-            "knowledge_state": knowledge_state,
-            "acquisition_method": acquisition_method,
-            "reason": {"type": "string"},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "evidence_source_ids": string_array,
-            "evidence_quote": {"type": "string"},
-        },
-        "required": [
-            "body",
-            "tags",
-            "knowledge_state",
-            "acquisition_method",
-            "reason",
-            "confidence",
-            "evidence_source_ids",
-            "evidence_quote",
-        ],
-    }
-    knowledge_edge_candidate = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "target_type": {
-                "type": "string",
-                "enum": ["memory", "world_state", "summary", "scenario_section"],
-            },
-            "target_id": {"type": "string"},
-            "knowledge_state": knowledge_state,
-            "acquisition_method": acquisition_method,
-            "reason": {"type": "string"},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "evidence_source_ids": string_array,
-            "evidence_quote": {"type": "string"},
-        },
-        "required": [
-            "target_type",
-            "target_id",
-            "knowledge_state",
-            "acquisition_method",
-            "reason",
-            "confidence",
-            "evidence_source_ids",
-            "evidence_quote",
-        ],
-    }
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "character_id": {"type": "string", "enum": [character.id]},
-            "action": {"type": "string"},
-            "intent": {"type": "string"},
-            "reason": {"type": "string"},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "evidence_source_ids": string_array,
-            "evidence_quote": {"type": "string"},
-            "learned_memory_candidates": {
-                "type": "array",
-                "items": learned_memory_candidate,
-                "maxItems": 6,
-            },
-            "knowledge_edge_candidates": {
-                "type": "array",
-                "items": knowledge_edge_candidate,
-                "maxItems": 8,
-            },
-            "needs_review_notes": string_array,
-        },
-        "required": [
-            "character_id",
-            "action",
-            "intent",
-            "reason",
-            "confidence",
-            "evidence_source_ids",
-            "evidence_quote",
-            "learned_memory_candidates",
-            "knowledge_edge_candidates",
-            "needs_review_notes",
-        ],
     }
 
 
@@ -1109,111 +732,6 @@ def _character_presence_batch_messages(
     )
 
 
-def _character_intent_messages(
-    *,
-    repositories: PersistenceRepositories,
-    save_id: str,
-    character: CharacterRecord,
-    presence_assessment: CharacterTurnAssessment,
-    source_message: MessageRecord,
-    messages: tuple[MessageRecord, ...],
-    valid_knowledge_targets: Mapping[str, frozenset[str]],
-    evidence_sources: Mapping[str, str],
-) -> tuple[ChatMessage, ...]:
-    details = repositories.load_save_details(save_id)
-    scenario = details.scenario if details is not None else None
-    storyteller_mode = (
-        details is not None
-        and details.save.interaction_mode is InteractionMode.STORYTELLER
-    )
-    snapshot = repositories.get_scene_snapshot(save_id)
-    recent_messages = _visible_recent_messages_for_character(
-        repositories=repositories,
-        save_id=save_id,
-        character=character,
-        source_message=source_message,
-        messages=messages,
-    )
-    return (
-        ChatMessage(
-            role="system",
-            body=(
-                (
-                    "Plan one narrator-controlled character's next visible intent and "
-                    if storyteller_mode
-                    else "Plan one non-player character's next visible intent and "
-                )
-                + (
-                "action for the next Bragi narrator turn. Use the enforced "
-                "structured schema only. The character was already assessed "
-                "as present, entering, or leaving, so choose only the action "
-                "this character would plausibly take. Favor visible initiative "
-                "over waiting for the player: choose an action that changes the "
-                "situation, applies pressure, sets a boundary, or can "
-                "interrupt, demand, refuse, leave, escalate, advance a clock, "
-                "or otherwise advance the NPC's agenda when plausible. Preserve "
-                "the full spectrum of NPC stances: a trusting character may "
-                "cooperate, while a hostile, self-interested, unfair, or "
-                "unreasonable character should act from that profile when "
-                "evidence supports it. Restraint "
-                "is valid only when supported by evidence, boundaries, or route "
-                "pacing. Learned memories and knowledge edges are candidates only; "
-                "never treat them as "
-                "committed canon. Keep source or evidence ids on every "
-                "proposed memory or knowledge candidate. Never plan or "
-                "control the player character. Use only evidence_source_ids "
-                "listed in Evidence sources, copy top-level evidence_quote "
-                "exactly from one cited source, and copy evidence_quote exactly "
-                "from one cited evidence source for every learned memory or "
-                "knowledge edge candidate."
-                )
-            ),
-        ),
-        ChatMessage(
-            role="user",
-            body="\n".join(
-                part
-                for part in (
-                    _scenario_text(scenario),
-                    _scene_text(snapshot),
-                    (
-                        ""
-                        if storyteller_mode
-                        else _player_character_text(repositories, save_id=save_id)
-                    ),
-                    _active_threads_text(repositories.list_active_threads(save_id)),
-                    _character_text(character),
-                    _presence_assessment_text(presence_assessment),
-                    (
-                        ""
-                        if storyteller_mode
-                        else _dating_route_text(repositories, save_id, character)
-                    ),
-                    _linkable_knowledge_targets_text(valid_knowledge_targets),
-                    _evidence_sources_text(evidence_sources),
-                    "Recent chronicle:",
-                    *(
-                        _planning_message_line(
-                            message,
-                            storyteller_mode=storyteller_mode,
-                        )
-                        for message in recent_messages
-                    ),
-                    "",
-                    (
-                        "Latest non-diegetic story direction (guidance only; "
-                        "not canonical evidence):"
-                        if storyteller_mode
-                        else "Latest turn source message:"
-                    ),
-                    source_message.body,
-                )
-                if part != ""
-            ),
-        ),
-    )
-
-
 def _active_threads_text(threads: list[ActiveThreadRecord]) -> str:
     visible = [
         thread
@@ -1305,38 +823,20 @@ def _known_world_day_count(
     return max(0, current_day - first_day)
 
 
-def _valid_knowledge_edge_targets(
-    *,
-    repositories: PersistenceRepositories,
-    save_id: str,
-    scenario: object | None,
-) -> dict[str, frozenset[str]]:
-    scenario_targets: set[str] = set()
-    for source_id, section_id, _text in scenario_section_candidates(
-        cast(Any, scenario)
-    ):
-        scenario_targets.add(source_id)
-        scenario_targets.add(section_id)
-    return {
-        "memory": frozenset(
-            memory.id for memory in repositories.list_memories(save_id)
-        ),
-        "world_state": frozenset(
-            state.id for state in repositories.list_world_state(save_id)
-        ),
-        "summary": frozenset(
-            summary.id for summary in repositories.list_summaries(save_id)
-        ),
-        "scenario_section": frozenset(scenario_targets),
-    }
-
-
 def _planning_characters_for_turn(
     *,
     repositories: PersistenceRepositories,
     save_id: str,
     source_message: MessageRecord,
-) -> tuple[CharacterRecord, ...]:
+) -> tuple[tuple[CharacterRecord, ...], tuple[CharacterRecord, ...]]:
+    """Return (deterministically-present, ambiguous) non-player characters.
+
+    Deterministically-present characters are already in the scene snapshot and
+    are not mentioned in the source message, so their presence needs no model
+    call. Ambiguous characters are either present but mentioned in the source
+    message (possible exit) or off-scene and mentioned (possible entry), so a
+    model assessment is genuinely useful for them.
+    """
     snapshot = repositories.get_scene_snapshot(save_id)
     present_ids = set(snapshot.present_character_ids if snapshot else ())
     source_text = source_message.body
@@ -1352,47 +852,34 @@ def _planning_characters_for_turn(
         and save.interaction_mode is InteractionMode.STORYTELLER
         and not any(character.is_player_character for character in all_characters)
     ):
-        return characters
-    present = tuple(
-        character for character in characters if character.id in present_ids
-    )
-    referenced = tuple(
-        character
+        return (
+            tuple(
+                character for character in characters if character.id in present_ids
+            ),
+            tuple(
+                character for character in characters if character.id not in present_ids
+            ),
+        )
+    mentioned_ids = {
+        character.id
         for character in characters
-        if character.id not in present_ids
-        and character_name_is_mentioned(
+        if character_name_is_mentioned(
             name=character.name,
             aliases=character.aliases,
             text=source_text,
         )
+    }
+    deterministic_present = tuple(
+        character
+        for character in characters
+        if character.id in present_ids and character.id not in mentioned_ids
     )
-    return present + referenced
-
-
-def _linkable_knowledge_targets_text(
-    valid_targets: Mapping[str, frozenset[str]],
-) -> str:
-    lines: list[str] = []
-    for target_type in ("memory", "world_state", "summary", "scenario_section"):
-        target_ids = sorted(valid_targets.get(target_type, frozenset()))
-        if not target_ids:
-            continue
-        shown = target_ids[:25]
-        suffix = (
-            f"; {len(target_ids) - len(shown)} more"
-            if len(target_ids) > 25
-            else ""
-        )
-        lines.append(f"- {target_type}: {', '.join(shown)}{suffix}")
-    if not lines:
-        return ""
-    return "\n".join(
-        (
-            "Existing linkable knowledge target IDs for candidate edges only. "
-            "Use exact target_type and target_id values; do not invent target IDs.",
-            *lines,
-        )
+    ambiguous = tuple(
+        character
+        for character in characters
+        if character.id in mentioned_ids
     )
+    return deterministic_present, ambiguous
 
 
 def _planning_evidence_sources(
@@ -1508,6 +995,34 @@ def _planning_batch_recent_messages(
     return tuple(seen.values())[-CHARACTER_ACTION_PLANNING_BATCH_RECENT_MESSAGE_LIMIT:]
 
 
+def _deterministic_presence_assessment(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    character: CharacterRecord,
+) -> CharacterTurnAssessment:
+    snapshot = repositories.get_scene_snapshot(save_id)
+    evidence_source_ids: tuple[str, ...] = ()
+    evidence_quote = ""
+    if snapshot is not None:
+        source_id = f"scene_snapshot:{snapshot.id}"
+        scene_text = _scene_text(snapshot)
+        if character.id and quote_matches_source(character.id, scene_text):
+            evidence_source_ids = (source_id,)
+            evidence_quote = character.id
+    return CharacterTurnAssessment(
+        character_id=character.id,
+        character_name=character.name,
+        present=True,
+        reason="Already present in the current scene snapshot.",
+        confidence=1.0,
+        evidence_source_ids=evidence_source_ids,
+        evidence_quote=evidence_quote,
+        presence_evidence_source_ids=evidence_source_ids,
+        presence_evidence_quote=evidence_quote,
+    )
+
+
 def _presence_assessments_from_batch_data(
     data: Mapping[str, object],
     *,
@@ -1549,23 +1064,6 @@ def _evidence_sources_text(evidence_sources: Mapping[str, str]) -> str:
     )
 
 
-def _presence_assessment_text(assessment: CharacterTurnAssessment) -> str:
-    parts = [
-        f"present: {'yes' if assessment.present else 'no'}",
-        f"enters scene: {'yes' if assessment.enters_scene else 'no'}",
-        f"leaves scene: {'yes' if assessment.leaves_scene else 'no'}",
-        f"reason: {assessment.reason}" if assessment.reason else "",
-        f"confidence: {round(assessment.confidence * 100)}%",
-        (
-            "evidence: " + ", ".join(assessment.evidence_source_ids)
-            if assessment.evidence_source_ids
-            else ""
-        ),
-        f"quote: {assessment.evidence_quote}" if assessment.evidence_quote else "",
-    ]
-    return "Presence assessment: " + " | ".join(part for part in parts if part)
-
-
 def _presence_assessment_from_data(
     data: Mapping[str, object],
     *,
@@ -1598,69 +1096,6 @@ def _presence_assessment_from_data(
         presence_evidence_quote=evidence_quote,
         enters_scene=enters_scene,
         leaves_scene=leaves_scene,
-    )
-
-
-def _intent_assessment_from_data(
-    data: Mapping[str, object],
-    *,
-    presence_assessment: CharacterTurnAssessment,
-    character: CharacterRecord,
-    valid_knowledge_targets: Mapping[str, frozenset[str]],
-    evidence_sources: Mapping[str, str],
-) -> CharacterTurnAssessment:
-    character_id = _string(data.get("character_id"))
-    if character_id != character.id:
-        raise ValueError("Character intent plan returned the wrong character_id")
-    action = _string(data.get("action"))
-    if not action:
-        raise ValueError("Active character intent plan must include an action")
-    evidence_source_ids, evidence_quote = _grounded_assessment_evidence(
-        data,
-        evidence_sources=evidence_sources,
-    )
-    has_grounded_intent = bool(evidence_source_ids)
-    learned_memory_candidates = _learned_memory_candidates_from_data(
-        data.get("learned_memory_candidates"),
-        evidence_sources=evidence_sources,
-    )
-    knowledge_edge_candidates = _knowledge_edge_candidates_from_data(
-        data.get("knowledge_edge_candidates"),
-        valid_targets=valid_knowledge_targets,
-        evidence_sources=evidence_sources,
-    )
-    if has_grounded_intent:
-        reason = _string(data.get("reason")) or presence_assessment.reason
-        confidence = (
-            _float(data.get("confidence"))
-            if isinstance(data.get("confidence"), (int, float))
-            else presence_assessment.confidence
-        )
-        intent = _string(data.get("intent"))
-        needs_review_notes = _string_tuple(data.get("needs_review_notes"))
-    else:
-        action = ""
-        intent = ""
-        reason = presence_assessment.reason
-        confidence = presence_assessment.confidence
-        evidence_source_ids = presence_assessment.evidence_source_ids
-        evidence_quote = presence_assessment.evidence_quote
-        needs_review_notes = (
-            _string_tuple(data.get("needs_review_notes"))
-            if learned_memory_candidates or knowledge_edge_candidates
-            else ()
-        )
-    return replace(
-        presence_assessment,
-        action=action,
-        intent=intent,
-        reason=reason,
-        confidence=confidence,
-        evidence_source_ids=evidence_source_ids,
-        evidence_quote=evidence_quote,
-        learned_memory_candidates=learned_memory_candidates,
-        knowledge_edge_candidates=knowledge_edge_candidates,
-        needs_review_notes=needs_review_notes,
     )
 
 
@@ -1712,18 +1147,6 @@ def _apply_presence_decisions(
     return True
 
 
-def _plan_from_assessment(assessment: CharacterTurnAssessment) -> CharacterActionPlan:
-    return CharacterActionPlan(
-        character_id=assessment.character_id,
-        character_name=assessment.character_name,
-        action=assessment.action,
-        intent=assessment.intent,
-        reason=assessment.reason,
-        confidence=assessment.confidence,
-        evidence_source_ids=assessment.evidence_source_ids,
-    )
-
-
 def _allowed_evidence_source_ids(
     value: object,
     *,
@@ -1755,106 +1178,6 @@ def _grounded_assessment_evidence(
     ):
         return (), ""
     return evidence_source_ids, quote
-
-
-def _grounded_candidate_evidence_source_ids(
-    item: Mapping[str, object],
-    *,
-    evidence_sources: Mapping[str, str],
-) -> tuple[str, ...]:
-    evidence_source_ids = _allowed_evidence_source_ids(
-        item.get("evidence_source_ids"),
-        evidence_sources=evidence_sources,
-    )
-    quote = _string(item.get("evidence_quote"))
-    if not evidence_source_ids or not quote:
-        return ()
-    if not any(
-        quote_matches_source(quote, evidence_sources[source_id])
-        for source_id in evidence_source_ids
-    ):
-        return ()
-    return evidence_source_ids
-
-
-def _learned_memory_candidates_from_data(
-    value: object,
-    *,
-    evidence_sources: Mapping[str, str],
-) -> tuple[CharacterLearnedMemoryCandidate, ...]:
-    if not isinstance(value, list):
-        return ()
-    candidates: list[CharacterLearnedMemoryCandidate] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        body = _string(item.get("body"))
-        if not body:
-            continue
-        evidence_source_ids = _grounded_candidate_evidence_source_ids(
-            item,
-            evidence_sources=evidence_sources,
-        )
-        if not evidence_source_ids:
-            continue
-        candidates.append(
-            CharacterLearnedMemoryCandidate(
-                body=body,
-                tags=_string_tuple(item.get("tags")),
-                knowledge_state=_knowledge_state(item.get("knowledge_state")),
-                acquisition_method=_acquisition_method(
-                    item.get("acquisition_method")
-                ),
-                reason=_string(item.get("reason")),
-                confidence=_float(item.get("confidence")),
-                evidence_source_ids=evidence_source_ids,
-                evidence_quote=_string(item.get("evidence_quote")),
-            )
-        )
-    return tuple(candidates)
-
-
-def _knowledge_edge_candidates_from_data(
-    value: object,
-    *,
-    valid_targets: Mapping[str, frozenset[str]],
-    evidence_sources: Mapping[str, str],
-) -> tuple[CharacterKnowledgeEdgeCandidate, ...]:
-    if not isinstance(value, list):
-        return ()
-    candidates: list[CharacterKnowledgeEdgeCandidate] = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        target_type = _normalized_knowledge_target_type(item.get("target_type"))
-        target_id = _string(item.get("target_id"))
-        if (
-            not target_type
-            or not target_id
-            or target_id not in valid_targets.get(target_type, frozenset())
-        ):
-            continue
-        evidence_source_ids = _grounded_candidate_evidence_source_ids(
-            item,
-            evidence_sources=evidence_sources,
-        )
-        if not evidence_source_ids:
-            continue
-        candidates.append(
-            CharacterKnowledgeEdgeCandidate(
-                target_type=target_type,
-                target_id=target_id,
-                knowledge_state=_knowledge_state(item.get("knowledge_state")),
-                acquisition_method=_acquisition_method(
-                    item.get("acquisition_method")
-                ),
-                reason=_string(item.get("reason")),
-                confidence=_float(item.get("confidence")),
-                evidence_source_ids=evidence_source_ids,
-                evidence_quote=_string(item.get("evidence_quote")),
-            )
-        )
-    return tuple(candidates)
 
 
 def _message_by_id(
@@ -2030,29 +1353,6 @@ def _string_tuple(value: object) -> tuple[str, ...]:
 
 def _bool(value: object) -> bool:
     return bool(value) if isinstance(value, bool) else False
-
-
-def _knowledge_state(value: object) -> str:
-    text = _string(value)
-    return text if text in CHARACTER_KNOWLEDGE_STATES else "knows"
-
-
-def _acquisition_method(value: object) -> str:
-    text = _string(value)
-    return text if text in CHARACTER_KNOWLEDGE_ACQUISITION_METHODS else "unknown"
-
-
-def _normalized_knowledge_target_type(value: object) -> str:
-    text = _string(value)
-    if text in {"memory", "memories"}:
-        return "memory"
-    if text in {"world_state", "state"}:
-        return "world_state"
-    if text in {"summary", "summaries"}:
-        return "summary"
-    if text in {"scenario", "scenario_section"}:
-        return "scenario_section"
-    return ""
 
 
 def _float(value: object) -> float:

@@ -1730,11 +1730,13 @@ class ChatService:
                 save_id=save_id,
                 started_at=stage_started,
                 player_message_id=player_message.id,
-                plan_count=len(result.plans),
                 decision_count=len(result.decisions),
                 failed_count=len(result.failed_character_ids),
                 skipped_reason=result.skipped_reason,
                 applied_presence_update=result.applied_presence_update,
+                model_calls_avoided=result.model_calls_avoided,
+                presence_calls_made=result.presence_calls_made,
+                deterministic_presence_count=result.deterministic_presence_count,
             )
             throw_if_cancelled_after_job()
             return result
@@ -7809,71 +7811,6 @@ def _character_assessment_commit_candidates(
                         character_id=assessment.character_id,
                     )
                 )
-        for index, candidate in enumerate(
-            assessment.learned_memory_candidates,
-            start=1,
-        ):
-            if (
-                not candidate.evidence_source_ids
-                or not candidate.evidence_quote.strip()
-            ):
-                continue
-            candidates.append(
-                StateCommitCandidate(
-                    operation="create",
-                    state_key="character.learned_memory",
-                    value={
-                        "body": candidate.body,
-                        "tags": list(candidate.tags),
-                        "knowledge_state": candidate.knowledge_state,
-                        "acquisition_method": candidate.acquisition_method,
-                        "evidence_quote": candidate.evidence_quote,
-                    },
-                    reason=candidate.reason,
-                    confidence=candidate.confidence,
-                    evidence_source_ids=candidate.evidence_source_ids,
-                    evidence_quote=candidate.evidence_quote,
-                    candidate_id=(
-                        "character_learned_memory:"
-                        f"{assessment.character_id}:{index}"
-                    ),
-                    candidate_type="character_learned_memory",
-                    character_id=assessment.character_id,
-                )
-            )
-        for edge_candidate in assessment.knowledge_edge_candidates:
-            if (
-                not edge_candidate.evidence_source_ids
-                or not edge_candidate.evidence_quote.strip()
-            ):
-                continue
-            candidates.append(
-                StateCommitCandidate(
-                    operation="upsert",
-                    state_key="character.knowledge_edge",
-                    value={
-                        "target_type": edge_candidate.target_type,
-                        "target_id": edge_candidate.target_id,
-                        "knowledge_state": edge_candidate.knowledge_state,
-                        "acquisition_method": edge_candidate.acquisition_method,
-                        "evidence_quote": edge_candidate.evidence_quote,
-                    },
-                    reason=edge_candidate.reason,
-                    confidence=edge_candidate.confidence,
-                    evidence_source_ids=edge_candidate.evidence_source_ids,
-                    evidence_quote=edge_candidate.evidence_quote,
-                    candidate_id=(
-                        "character_knowledge_edge:"
-                        f"{assessment.character_id}:"
-                        f"{edge_candidate.target_type}:{edge_candidate.target_id}"
-                    ),
-                    candidate_type="character_knowledge_edge",
-                    character_id=assessment.character_id,
-                    target_type=edge_candidate.target_type,
-                    target_id=edge_candidate.target_id,
-                    safe_without_narration_allowed=True,
-                )
-            )
     return tuple(candidates)
 
 
@@ -9879,6 +9816,9 @@ def _character_action_planning_context_breakdown(
             ),
             "skipped_reason": result.skipped_reason,
             "applied_presence_update": result.applied_presence_update,
+            "model_calls_avoided": result.model_calls_avoided,
+            "presence_calls_made": result.presence_calls_made,
+            "deterministic_presence_count": result.deterministic_presence_count,
         }
     }
 
@@ -10738,7 +10678,6 @@ def _absent_character_ids(
         and decision.presence_evidence_quote.strip()
         and not decision.present
         and not decision.enters_scene
-        and not decision.action
     )
 
 
