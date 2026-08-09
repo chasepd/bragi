@@ -61,12 +61,16 @@ def validate_scene_fact_shape(
         raise ValueError("Scene fact value is required")
     if subject_type == "character" and not subject_id:
         raise ValueError("Character scene fact subjects require subject_id")
+    if subject_type in {"object", "environment"} and subject_id is not None:
+        raise ValueError("Scene-local object and environment subjects cannot use IDs")
     if subject_type != "character" and not subject_label.strip():
         raise ValueError("Object and environment subjects require subject_label")
     if target_type == "character" and not target_id:
         raise ValueError("Character scene fact targets require target_id")
     if target_type == "location" and not target_id:
         raise ValueError("Location scene fact targets require target_id")
+    if target_type in {"", "object", "environment"} and target_id is not None:
+        raise ValueError("Scene-local object and environment targets cannot use IDs")
     if target_type in {"object", "environment"} and not target_label.strip():
         raise ValueError("Object and environment targets require target_label")
 
@@ -127,5 +131,9 @@ def _scene_fact_reference_key(
 ) -> str:
     if not reference_type:
         return ""
-    value = reference_id or normalize_scene_fact_label(label)
+    value = (
+        reference_id
+        if reference_type in {"character", "location"}
+        else normalize_scene_fact_label(label)
+    )
     return f"{reference_type}:{value}"
