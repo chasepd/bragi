@@ -2074,3 +2074,64 @@ def _save_context_revision(connection: sqlite3.Connection) -> int:
             ("save-1",),
         ).fetchone()[0]
     )
+
+
+def test_migration_75_to_76_adds_turn_outcomes_schema(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE turn_outcomes")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 76")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = _column_names(connection, "turn_outcomes")
+        assert {"id", "save_id", "message_id", "payload_json", "created_at"} <= columns
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_76_keeps_existing_turn_outcome_rows(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO scenarios(id, type, title, content_json)
+            VALUES ('s', 'full_roleplay', 'Legacy', '{}')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO saves(id, scenario_id, title)
+            VALUES ('save-1', 's', 'Keep')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO messages(save_id, role, speaker_name, body)
+            VALUES ('save-1', 'narrator', 'Narrator', 'body')
+            """
+        )
+        message_id = connection.execute(
+            "SELECT id FROM messages WHERE save_id = 'save-1'"
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO turn_outcomes(id, save_id, message_id, payload_json)
+            VALUES ('o-1', 'save-1', ?, '{"save_id": "save-1", "message_id": "m"}')
+            """,
+            (message_id,),
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 76")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            "SELECT id, payload_json FROM turn_outcomes WHERE id = 'o-1'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "o-1"

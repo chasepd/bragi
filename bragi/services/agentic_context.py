@@ -47,6 +47,7 @@ from bragi.services.evidence import (
 from bragi.services.manual_confirmation import manual_memory_confirmation_enabled
 from bragi.services.npc_knowledge_audit_service import NpcKnowledgeLeak
 from bragi.services.openrouter_routing_settings import request_with_openrouter_routing
+from bragi.services.post_turn_inference import planned_effect_domain
 from bragi.services.provider_fallbacks import structured_output_with_fallback
 from bragi.services.request_budget import budget_structured_output_request
 from bragi.services.sexual_content_safety import is_fade_to_black_message
@@ -92,6 +93,26 @@ CURATION_RETRY_DELAYS_SECONDS = (
     2 * 60 * 60,
     6 * 60 * 60,
     24 * 60 * 60,
+)
+
+PLANNED_EFFECT_TYPES = (
+    "scene_presence",
+    "scene_snapshot_field",
+    "character_learned_memory",
+    "character_knowledge_edge",
+    "physical_change",
+    "relationship_change",
+    "emotional_change",
+    "active_thread_change",
+    "resource_change",
+    "world_state_change",
+    "world_time_change",
+)
+ATTEMPT_RESOLUTION_VALUES = (
+    "succeeded",
+    "partially_succeeded",
+    "failed",
+    "uncertain",
 )
 
 _MutationResult = TypeVar("_MutationResult")
@@ -263,6 +284,10 @@ class NarratorMessageSpec:
     agency_constraints: tuple[PlayerAgencyConstraint, ...] = ()
     state_commit_candidates: tuple[StateCommitCandidate, ...] = ()
     planner_rejections: tuple[PlannerRejection, ...] = ()
+    attempted_action: str = ""
+    attempt_feasibility: tuple[str, ...] = ()
+    attempt_evidence_source_ids: tuple[str, ...] = ()
+    attempt_evidence_quote: str = ""
     evidence_source_text_by_id: dict[str, str] = field(
         default_factory=dict,
         compare=False,
@@ -293,6 +318,9 @@ class NarratorVerificationResult:
     npc_knowledge_leaks: tuple[NpcKnowledgeLeak, ...] = ()
     commit_decisions: tuple[NarratorCommitDecision, ...] = ()
     dating_route_stage_violations: tuple[DatingRouteStageViolation, ...] = ()
+    attempt_resolution: str = ""
+    attempt_evidence_source_ids: tuple[str, ...] = ()
+    attempt_evidence_quote: str = ""
 
 
 class ObservationExtractor(Protocol):
@@ -1670,6 +1698,17 @@ def format_narrator_message_spec(spec: NarratorMessageSpec) -> str:
         parts.append("State commit candidates (do not persist automatically):")
         for candidate in spec.state_commit_candidates:
             parts.append(_format_state_commit_candidate(candidate))
+    if spec.attempted_action:
+        parts.append(
+            "Player attempted action (declaration, not established outcome): "
+            + spec.attempted_action
+            + _format_evidence_suffix(spec.attempt_evidence_source_ids)
+        )
+    if spec.attempt_feasibility:
+        parts.append(
+            "Attempt feasibility/preconditions: "
+            + "; ".join(spec.attempt_feasibility)
+        )
     if spec.evidence_source_ids:
         parts.append("Evidence source IDs: " + ", ".join(spec.evidence_source_ids))
     return "\n".join(part for part in parts if part.strip())
@@ -1688,6 +1727,7 @@ def narration_evidence_source_ids(spec: NarratorMessageSpec) -> tuple[str, ...]:
         evidence.extend(intent.evidence_source_ids)
     for candidate in spec.state_commit_candidates:
         evidence.extend(candidate.evidence_source_ids)
+    evidence.extend(spec.attempt_evidence_source_ids)
     return tuple(dict.fromkeys(item for item in evidence if item.strip()))
 
 
@@ -2876,12 +2916,7 @@ def _planner_schema(
             "candidate_id": {"type": "string"},
             "candidate_type": {
                 "type": "string",
-                "enum": [
-                    "scene_presence",
-                    "character_learned_memory",
-                    "character_knowledge_edge",
-                    "scene_snapshot_field",
-                ],
+                "enum": list(PLANNED_EFFECT_TYPES),
             },
             "operation": {
                 "type": "string",
@@ -2948,6 +2983,10 @@ def _planner_schema(
                 "items": state_commit_candidate,
                 "maxItems": 12,
             },
+            "attempted_action": {"type": "string"},
+            "attempt_feasibility": string_array,
+            "attempt_evidence_source_ids": evidence_array,
+            "attempt_evidence_quote": {"type": "string"},
         },
         "required": [
             "intent",
@@ -2962,6 +3001,10 @@ def _planner_schema(
             "evidence_source_ids",
             "npc_intents",
             "state_commit_candidates",
+            "attempted_action",
+            "attempt_feasibility",
+            "attempt_evidence_source_ids",
+            "attempt_evidence_quote",
         ],
     }
 
@@ -2977,6 +3020,11 @@ def _planner_messages(request: ChatRequest) -> tuple[ChatMessage, ...]:
                 "ordered narrative beats, required facts or reveals, player "
                 "agency constraints, unresolved uncertainties, and any "
                 "state-affecting commit candidates as candidates only. "
+                "Describe the player character's attempted action or "
+                "declaration in attempted_action with exact evidence, and "
+                "assess feasibility/preconditions in attempt_feasibility; "
+                "these are declarations of intent, never established "
+                "outcomes. "
                 "Player agency constraints guard only the player character's "
                 "uncommitted choices, words, and actions; they never restrict "
                 "how NPCs or the world may react, so never phrase a constraint "
@@ -2985,7 +3033,12 @@ def _planner_messages(request: ChatRequest) -> tuple[ChatMessage, ...]:
                 "Give "
                 "each commit candidate a stable candidate_id, candidate_type, "
                 "valid evidence_source_ids, and evidence_quote copied exactly "
-                "from a cited source. "
+                "from a cited source. Commit candidates may cover scene "
+                "presence, scene snapshot fields, learned memories, knowledge "
+                "edges, physical changes, relationship changes, emotional "
+                "changes, active threads or clocks, resources, and world time "
+                "advancement. Propose effects only for outcomes the source "
+                "evidence supports; keep other domains empty. "
                 "npc_intents is the single batched intent artifact for the "
                 "turn: for each present or entering non-player character with "
                 "meaningful agency in this beat, include one npc_intents item "
@@ -3060,6 +3113,12 @@ def _narrator_message_spec_from_data(
             data.get("state_commit_candidates")
         ),
         npc_intents=_npc_intents_from_data(data.get("npc_intents")),
+        attempted_action=_string(data.get("attempted_action")),
+        attempt_feasibility=_string_tuple(data.get("attempt_feasibility")),
+        attempt_evidence_source_ids=_string_tuple(
+            data.get("attempt_evidence_source_ids")
+        ),
+        attempt_evidence_quote=_string(data.get("attempt_evidence_quote")),
     )
     if inventory is None or not inventory.enforce_canonical_ids:
         return spec
@@ -3236,6 +3295,32 @@ def _validated_narrator_message_spec(
             rejections=rejections,
         )
     )
+    attempt_evidence_source_ids = _validated_attempt_evidence_ids(
+        spec,
+        inventory=inventory,
+        rejections=rejections,
+    )
+    attempt_evidence_quote = (
+        spec.attempt_evidence_quote
+        if _attempt_evidence_is_grounded(spec, inventory=inventory)
+        else ""
+    )
+    if (
+        spec.attempted_action
+        and spec.attempt_evidence_source_ids
+        and spec.attempt_evidence_quote
+        and not attempt_evidence_quote
+    ):
+        rejections.append(
+            PlannerRejection(
+                candidate_id="attempted_action",
+                candidate_type="attempted_action",
+                domain="player_agency",
+                reason="evidence_quote_not_found",
+                field="attempt_evidence_quote",
+                rejected_value=spec.attempt_evidence_quote,
+            )
+        )
     return replace(
         spec,
         evidence_source_ids=valid_top_level_evidence,
@@ -3245,8 +3330,58 @@ def _validated_narrator_message_spec(
         npc_intents=tuple(npc_intents),
         state_commit_candidates=tuple(candidates),
         planner_rejections=tuple(rejections),
+        attempted_action=spec.attempted_action,
+        attempt_feasibility=_validated_attempt_feasibility(spec),
+        attempt_evidence_source_ids=attempt_evidence_source_ids,
+        attempt_evidence_quote=attempt_evidence_quote,
         evidence_source_text_by_id=dict(inventory.source_text_by_id),
     )
+
+
+def _validated_attempt_feasibility(spec: NarratorMessageSpec) -> tuple[str, ...]:
+    if not spec.attempted_action:
+        return ()
+    return tuple(
+        dict.fromkeys(item for item in spec.attempt_feasibility if item.strip())
+    )
+
+
+def _validated_attempt_evidence_ids(
+    spec: NarratorMessageSpec,
+    *,
+    inventory: _PlannerInventory,
+    rejections: list[PlannerRejection],
+) -> tuple[str, ...]:
+    if not spec.attempted_action:
+        return ()
+    return _validated_evidence_ids(
+        spec.attempt_evidence_source_ids,
+        inventory=inventory,
+        rejections=rejections,
+        candidate_id="attempted_action",
+        candidate_type="attempted_action",
+    )
+
+
+def _attempt_evidence_is_grounded(
+    spec: NarratorMessageSpec,
+    *,
+    inventory: _PlannerInventory,
+) -> bool:
+    if not spec.attempted_action:
+        return True
+    if not spec.attempt_evidence_source_ids or not spec.attempt_evidence_quote:
+        return False
+    for source_id in spec.attempt_evidence_source_ids:
+        source_text = inventory.source_text_by_id.get(source_id, "")
+        if source_id == "message:latest" and not source_text:
+            return True
+        if source_text and quote_matches_source(
+            spec.attempt_evidence_quote,
+            source_text,
+        ):
+            return True
+    return False
 
 
 _AGENCY_CONSTRAINT_PROHIBITION_RE = re.compile(
@@ -3352,6 +3487,9 @@ def _candidate_with_canonical_character(
         "scene_presence",
         "character_learned_memory",
         "character_knowledge_edge",
+        "physical_change",
+        "relationship_change",
+        "emotional_change",
     }:
         return candidate, None
     raw_character_id = candidate.character_id or _string(
@@ -3597,12 +3735,7 @@ def _planner_rejection(
 
 
 def _planner_candidate_domain(candidate_type: str) -> str:
-    return {
-        "scene_presence": "scene_presence",
-        "scene_snapshot_field": "scene_snapshot",
-        "character_learned_memory": "memories",
-        "character_knowledge_edge": "knowledge_edges",
-    }.get(candidate_type, "unknown")
+    return planned_effect_domain(candidate_type)
 
 
 def _narrative_beats_from_data(value: object) -> tuple[NarrativeBeat, ...]:
@@ -3674,9 +3807,6 @@ def _state_commit_candidates_from_data(
     for item in value:
         if not isinstance(item, dict):
             continue
-        state_key = _string(item.get("state_key"))
-        if not state_key:
-            continue
         evidence_source_ids = _string_tuple(item.get("evidence_source_ids"))
         evidence_quote = _string(item.get("evidence_quote"))
         if not evidence_source_ids or not evidence_quote:
@@ -3687,7 +3817,7 @@ def _state_commit_candidates_from_data(
         candidates.append(
             StateCommitCandidate(
                 operation=_string(item.get("operation")) or "upsert",
-                state_key=state_key,
+                state_key=_string(item.get("state_key")),
                 value=dict(raw_value) if isinstance(raw_value, dict) else {},
                 reason=_string(item.get("reason")),
                 confidence=_float(item.get("confidence")),
@@ -3748,12 +3878,7 @@ def _verifier_schema() -> dict[str, object]:
             "candidate_id": {"type": "string"},
             "candidate_type": {
                 "type": "string",
-                "enum": [
-                    "scene_presence",
-                    "character_learned_memory",
-                    "character_knowledge_edge",
-                    "scene_snapshot_field",
-                ],
+                "enum": list(PLANNED_EFFECT_TYPES),
             },
             "status": {
                 "type": "string",
@@ -3855,6 +3980,15 @@ def _verifier_schema() -> dict[str, object]:
                 "items": dating_route_stage_violation,
                 "maxItems": 8,
             },
+            "attempt_resolution": {
+                "type": "string",
+                "enum": list(ATTEMPT_RESOLUTION_VALUES),
+            },
+            "attempt_evidence_source_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "attempt_evidence_quote": {"type": "string"},
         },
         "required": [
             "passed",
@@ -3867,6 +4001,9 @@ def _verifier_schema() -> dict[str, object]:
             "npc_knowledge_leaks",
             "commit_decisions",
             "dating_route_stage_violations",
+            "attempt_resolution",
+            "attempt_evidence_source_ids",
+            "attempt_evidence_quote",
         ],
     }
 
@@ -3922,7 +4059,14 @@ def _verifier_messages(
                 "each candidate is rendered, contradicted, omitted, unclear, or safe "
                 "without narration, and set safe_to_commit only when the accepted "
                 "narrator response or the candidate's explicit safe-without-narration "
-                "policy makes it safe. Set post_turn_update_needed to false only "
+                "policy makes it safe. For the planned attempted_action, set "
+                "attempt_resolution to whether the accepted narrator response "
+                "established that the player's attempt succeeded, partially "
+                "succeeded, failed, or left the outcome uncertain, with exact "
+                "attempt_evidence_source_ids and attempt_evidence_quote. The "
+                "attempted action itself is only a declaration; only the "
+                "resolution backed by the accepted prose is an established "
+                "outcome. Set post_turn_update_needed to false only "
                 "when no deterministic or legacy post-turn state/context inference "
                 "is needed for this response."
                 " Treat the message spec, source request, and narrator draft "
@@ -3985,6 +4129,11 @@ def _verification_result_from_data(
         ),
         commit_decisions=_commit_decisions_from_data(data.get("commit_decisions")),
         dating_route_stage_violations=dating_route_stage_violations,
+        attempt_resolution=_string(data.get("attempt_resolution")),
+        attempt_evidence_source_ids=_string_tuple(
+            data.get("attempt_evidence_source_ids")
+        ),
+        attempt_evidence_quote=_string(data.get("attempt_evidence_quote")),
     )
 
 

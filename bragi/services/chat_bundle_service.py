@@ -72,6 +72,7 @@ from bragi.services.scenario_service import (
     scenario_record_is_retired,
     strip_deprecated_scenario_character_sections,
 )
+from bragi.services.turn_outcome import remap_turn_outcome_payload
 from bragi.services.turn_snapshot_service import (
     TurnSnapshotService,
     portable_context_observation_curation_state_row,
@@ -825,6 +826,15 @@ class ChatBundleService:
                 """,
                 (save_id,),
             ),
+            "turn_outcomes": self._rows(
+                """
+                SELECT id, save_id, message_id, payload_json, created_at
+                FROM turn_outcomes
+                WHERE save_id = ?
+                ORDER BY created_at, rowid
+                """,
+                (save_id,),
+            ),
             "save_app_settings": _save_app_setting_rows(
                 self.repositories,
                 save_id=save_id,
@@ -1025,6 +1035,12 @@ class ChatBundleService:
             active_source_refs,
             "context_update_audit",
         )
+        data["turn_outcomes"] = [
+            row
+            for row in _list_of_objects(data["turn_outcomes"], "turn_outcomes")
+            if row.get("message_id") is None
+            or row.get("message_id") in active_message_ids
+        ]
         exported_target_ids = _exported_knowledge_target_ids(data)
         data["character_knowledge_edges"] = _filter_character_knowledge_edge_rows(
             data["character_knowledge_edges"],
@@ -1516,6 +1532,40 @@ class ChatBundleService:
             state_change_id_map[original_id] = change.id
         imported_id_maps["state_change"] = state_change_id_map
         imported_id_maps["state_changes"] = state_change_id_map
+
+        turn_outcome_id_map: dict[str, str] = {}
+        for row in _list_of_objects(data.get("turn_outcomes"), "turn_outcomes"):
+            original_id = _text(row, "id")
+            if _bundle_row_references_messages(
+                row,
+                transitioned_original_message_ids,
+            ):
+                continue
+            message_id = _mapped_optional_required(
+                message_id_map=message_id_map,
+                original_id=_optional_text(row, "message_id"),
+                field_name="turn_outcomes.message_id",
+                repair_tracker=repair_tracker,
+            )
+            if message_id is None:
+                continue
+            payload = _optional_json_object(row, "payload_json") or {}
+            if _bundle_payload_references_messages(
+                payload,
+                transitioned_original_message_ids,
+            ):
+                continue
+            outcome_record = self.repositories.add_turn_outcome(
+                save_id=save.id,
+                message_id=message_id,
+                payload=remap_turn_outcome_payload(
+                    payload,
+                    message_id_map=message_id_map,
+                ),
+            )
+            turn_outcome_id_map[original_id] = outcome_record.id
+        imported_id_maps["turn_outcome"] = turn_outcome_id_map
+        imported_id_maps["turn_outcomes"] = turn_outcome_id_map
 
         observation_id_map: dict[str, str] = {}
         for row in _list_of_objects(
@@ -6059,6 +6109,37 @@ def _bundle_row_references_messages(
     return bool(message_ids.intersection(source_ids))
 
 
+def _bundle_payload_references_messages(
+    payload: dict[str, object],
+    message_ids: set[str],
+) -> bool:
+    if not message_ids:
+        return False
+
+    def references_refs(refs: object) -> bool:
+        if not isinstance(refs, list):
+            return False
+        return any(
+            isinstance(item, str)
+            and item.startswith("message:")
+            and item.removeprefix("message:") in message_ids
+            for item in refs
+        )
+
+    if references_refs(payload.get("source_message_ids")):
+        return True
+    if references_refs(payload.get("attempt_evidence_source_ids")):
+        return True
+    raw_effects = payload.get("effects")
+    if isinstance(raw_effects, list):
+        for item in raw_effects:
+            if isinstance(item, dict) and references_refs(
+                item.get("evidence_source_ids")
+            ):
+                return True
+    return False
+
+
 def _bundle_summary_covers_transition(
     row: dict[str, object],
     *,
@@ -6113,6 +6194,7 @@ def _remove_imported_safety_transition_records(
         "save_loss_conditions",
         "save_loss_outcomes",
         "state_changes",
+        "turn_outcomes",
         "world_state",
     )
     for table_name in table_names:
@@ -6144,6 +6226,7 @@ def _remove_imported_safety_transition_records(
             "proposed_value_json",
             "before_json",
             "after_json",
+            "payload_json",
         ):
             if column in columns:
                 for message_id in transition_message_ids:

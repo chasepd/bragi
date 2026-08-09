@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
 from time import perf_counter
@@ -20,6 +20,7 @@ from bragi.app_logging import (
 )
 from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import (
+    ActiveThreadRecord,
     CharacterKnowledgeEdgeRecord,
     CharacterRecord,
     ContextUpdateSuggestionRecord,
@@ -31,6 +32,7 @@ from bragi.persistence.models import (
     SaveScenarioUpdateRecord,
     SceneSnapshotRecord,
     SummaryRecord,
+    WorldStateRecord,
 )
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.chat_rendering import estimate_chat_request_tokens
@@ -208,11 +210,20 @@ from bragi.services.phrase_denylist import (
     summarize_phrase_policy_violations,
 )
 from bragi.services.post_turn_inference import (
+    POST_TURN_DOMAIN_EMOTIONAL,
+    POST_TURN_DOMAIN_KNOWLEDGE,
+    POST_TURN_DOMAIN_PHYSICAL,
+    POST_TURN_DOMAIN_RELATIONSHIP,
+    POST_TURN_DOMAIN_SCENE,
+    POST_TURN_DOMAIN_STATE,
+    POST_TURN_DOMAIN_THREAD_CLOCK,
+    POST_TURN_DOMAIN_TIME,
     POST_TURN_INFERENCE_MODE_HYBRID,
     POST_TURN_INFERENCE_MODE_LEGACY,
     POST_TURN_INFERENCE_MODE_PLAN_OWNED,
     VerifiedPostTurnCoverage,
     memory_fingerprint,
+    planned_effect_domain,
     post_turn_inference_mode,
     verified_post_turn_coverage_from_mapping,
 )
@@ -258,6 +269,12 @@ from bragi.services.text_script_policy import (
     script_guard_mode,
     summarize_script_policy_violations,
     text_script_violations,
+)
+from bragi.services.turn_outcome import (
+    TurnOutcome,
+    TurnOutcomeEffect,
+    turn_outcome_coverage,
+    turn_outcome_from_mapping,
 )
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 from bragi.services.user_narration_guidance import (
@@ -4275,6 +4292,7 @@ class ChatService:
                     save_id=save_id,
                     player_message_id=player_message_id,
                     narrator_message_id=narrator_message_id,
+                    verified_coverage=verified_coverage,
                 )
             ),
             "proactive_text": lambda: (
@@ -5424,7 +5442,23 @@ class ChatService:
         save_id: str,
         player_message_id: str,
         narrator_message_id: str,
+        verified_coverage: VerifiedPostTurnCoverage | None = None,
     ) -> _PostTurnStepResult:
+        if _coverage_covers_domain(
+            verified_coverage,
+            POST_TURN_DOMAIN_TIME,
+        ):
+            return _PostTurnStepResult(
+                status="skipped",
+                result={
+                    "skipped_reason": "post_turn_time_domain_covered",
+                    "verified_plan_coverage": (
+                        verified_coverage.to_json()
+                        if verified_coverage is not None
+                        else None
+                    ),
+                },
+            )
         service = self.world_time_service or self._world_time_service_for_save(
             save_id,
         )
@@ -6551,6 +6585,20 @@ class ChatService:
                     "verified_plan_coverage": verified_coverage.to_json(),
                 },
             )
+        if _coverage_covers_domain(
+            verified_coverage,
+            POST_TURN_DOMAIN_STATE,
+        ) and _coverage_covers_domain(
+            verified_coverage,
+            POST_TURN_DOMAIN_KNOWLEDGE,
+        ):
+            return _PostTurnStepResult(
+                status="skipped",
+                result={
+                    "skipped_reason": "post_turn_state_and_knowledge_covered",
+                    "verified_plan_coverage": verified_coverage.to_json(),
+                },
+            )
         preference = roleplay_model_preference(
             repositories=self.repositories,
             save_id=save_id,
@@ -6834,6 +6882,29 @@ class ChatService:
                 status="skipped",
                 result={
                     "skipped_reason": "post_turn_inference_mode_plan_owned",
+                    "verified_plan_coverage": verified_coverage.to_json(),
+                },
+            )
+        if _coverage_covers_domain(
+            verified_coverage,
+            POST_TURN_DOMAIN_SCENE,
+        ) and _coverage_covers_domain(
+            verified_coverage,
+            POST_TURN_DOMAIN_PHYSICAL,
+        ) and _coverage_covers_domain(
+            verified_coverage,
+            POST_TURN_DOMAIN_RELATIONSHIP,
+        ) and _coverage_covers_domain(
+            verified_coverage,
+            POST_TURN_DOMAIN_EMOTIONAL,
+        ) and _coverage_covers_domain(
+            verified_coverage,
+            POST_TURN_DOMAIN_THREAD_CLOCK,
+        ):
+            return _PostTurnStepResult(
+                status="skipped",
+                result={
+                    "skipped_reason": "post_turn_context_domains_covered",
                     "verified_plan_coverage": verified_coverage.to_json(),
                 },
             )
@@ -7875,6 +7946,16 @@ def _apply_verified_planned_commits(
             verification_result=verification_result,
         )
         diagnostics["coverage"] = coverage.to_json()
+        _persist_turn_outcome(
+            repositories=repositories,
+            save_id=save_id,
+            message_id=narrator_message_id,
+            source_message_ids=coverage.source_message_ids,
+            narrator_spec=narrator_spec,
+            verification_result=verification_result,
+            coverage=coverage,
+            diagnostics=diagnostics,
+        )
         return diagnostics, coverage
     decisions_by_id = (
         {
@@ -7978,23 +8059,139 @@ def _apply_verified_planned_commits(
         verification_result=verification_result,
     )
     diagnostics["coverage"] = coverage.to_json()
+    _persist_turn_outcome(
+        repositories=repositories,
+        save_id=save_id,
+        message_id=narrator_message_id,
+        source_message_ids=coverage.source_message_ids,
+        narrator_spec=narrator_spec,
+        verification_result=verification_result,
+        coverage=coverage,
+        diagnostics=diagnostics,
+    )
     return diagnostics, coverage
+
+
+def _persist_turn_outcome(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    message_id: str,
+    source_message_ids: tuple[str, ...],
+    narrator_spec: NarratorMessageSpec | None,
+    verification_result: NarratorVerificationResult | None,
+    coverage: VerifiedPostTurnCoverage,
+    diagnostics: Mapping[str, object],
+) -> None:
+    candidates_by_id = {
+        candidate.candidate_id: candidate
+        for candidate in (
+            narrator_spec.state_commit_candidates if narrator_spec is not None else ()
+        )
+        if candidate.candidate_id
+    }
+    effects: list[TurnOutcomeEffect] = []
+    raw_decisions = diagnostics.get("decisions")
+    if isinstance(raw_decisions, list):
+        for item in raw_decisions:
+            if not isinstance(item, Mapping):
+                continue
+            candidate_id = _string_mapping_value(item, "candidate_id")
+            candidate = candidates_by_id.get(candidate_id)
+            effects.append(
+                TurnOutcomeEffect(
+                    candidate_id=candidate_id,
+                    candidate_type=_string_mapping_value(item, "candidate_type"),
+                    domain=_planned_commit_domain(
+                        _string_mapping_value(item, "candidate_type")
+                    ),
+                    operation=candidate.operation if candidate is not None else "",
+                    state_key=candidate.state_key if candidate is not None else "",
+                    field_path=(
+                        candidate.field_path if candidate is not None else ""
+                    ),
+                    character_id=(
+                        candidate.character_id if candidate is not None else ""
+                    ),
+                    target_type=(
+                        candidate.target_type if candidate is not None else ""
+                    ),
+                    target_id=candidate.target_id if candidate is not None else "",
+                    value=dict(candidate.value) if candidate is not None else {},
+                    confidence=candidate.confidence if candidate is not None else 0.0,
+                    evidence_source_ids=(
+                        candidate.evidence_source_ids
+                        if candidate is not None
+                        else ()
+                    ),
+                    evidence_quote=(
+                        candidate.evidence_quote if candidate is not None else ""
+                    ),
+                    verifier_status=_string_mapping_value(item, "status"),
+                    safe_to_commit=bool(item.get("safe_to_commit")),
+                    application_status=_string_mapping_value(
+                        item,
+                        "application_status",
+                    ),
+                    reason=_string_mapping_value(item, "reason"),
+                    changed=bool(item.get("changed")),
+                )
+            )
+    outcome = TurnOutcome(
+        save_id=save_id,
+        message_id=message_id,
+        source_message_ids=source_message_ids,
+        attempted_action=(
+            narrator_spec.attempted_action if narrator_spec is not None else ""
+        ),
+        attempt_feasibility=(
+            narrator_spec.attempt_feasibility if narrator_spec is not None else ()
+        ),
+        attempt_evidence_source_ids=(
+            narrator_spec.attempt_evidence_source_ids
+            if narrator_spec is not None
+            else ()
+        ),
+        attempt_evidence_quote=(
+            narrator_spec.attempt_evidence_quote if narrator_spec is not None else ""
+        ),
+        attempt_resolution=(
+            verification_result.attempt_resolution
+            if verification_result is not None
+            else ""
+        ),
+        effects=tuple(effects),
+        applied_domains=coverage.applied_domains,
+        queued_domains=coverage.queued_domains,
+        verification_passed=(
+            verification_result.passed if verification_result is not None else False
+        ),
+        verifier_available=verification_result is not None,
+        post_turn_update_needed=(
+            verification_result.post_turn_update_needed
+            if verification_result is not None
+            else True
+        ),
+        committed_count=coverage.committed_count,
+        confirmation_queued_count=coverage.confirmation_queued_count,
+    )
+    repositories.add_turn_outcome(
+        save_id=save_id,
+        message_id=message_id,
+        payload=outcome.to_json(),
+    )
 
 
 def _planned_commit_diagnostics(
     candidates: tuple[StateCommitCandidate, ...],
     planner_rejections: tuple[PlannerRejection, ...] = (),
 ) -> dict[str, object]:
+    from bragi.services.agentic_context import PLANNED_EFFECT_TYPES
+
     commit_rejections = tuple(
         rejection
         for rejection in planner_rejections
-        if rejection.candidate_type
-        in {
-            "scene_presence",
-            "scene_snapshot_field",
-            "character_learned_memory",
-            "character_knowledge_edge",
-        }
+        if rejection.candidate_type in PLANNED_EFFECT_TYPES
     )
     by_type: dict[str, dict[str, int]] = {}
     by_domain: dict[str, dict[str, int]] = {}
@@ -8066,6 +8263,18 @@ def _verified_post_turn_coverage_for_turn(
         player_message_id=player_message_id,
         narrator_message_id=narrator_message_id,
     )
+    outcome_record = repositories.get_turn_outcome_for_message(
+        save_id=save_id,
+        message_id=narrator_message_id,
+    )
+    if outcome_record is not None:
+        outcome = turn_outcome_from_mapping(outcome_record.payload)
+        if outcome is not None:
+            coverage = turn_outcome_coverage(outcome)
+            return _coverage_with_source_message_ids(
+                coverage,
+                source_message_ids=source_message_ids,
+            )
     job = repositories.find_chat_completion_job_for_narrator_message(
         narrator_message_id
     )
@@ -8079,6 +8288,28 @@ def _verified_post_turn_coverage_for_turn(
             source_message_ids=source_message_ids
         )
     coverage = verified_post_turn_coverage_from_mapping(planned_commits.get("coverage"))
+    if coverage.source_message_ids:
+        return coverage
+    return VerifiedPostTurnCoverage(
+        source_message_ids=source_message_ids,
+        state_keys=coverage.state_keys,
+        scene_snapshot_fields=coverage.scene_snapshot_fields,
+        scene_presence_character_ids=coverage.scene_presence_character_ids,
+        memory_fingerprints=coverage.memory_fingerprints,
+        knowledge_edge_targets=coverage.knowledge_edge_targets,
+        applied_domains=coverage.applied_domains,
+        queued_domains=coverage.queued_domains,
+        committed_count=coverage.committed_count,
+        confirmation_queued_count=coverage.confirmation_queued_count,
+        metadata=coverage.metadata,
+    )
+
+
+def _coverage_with_source_message_ids(
+    coverage: VerifiedPostTurnCoverage,
+    *,
+    source_message_ids: tuple[str, ...],
+) -> VerifiedPostTurnCoverage:
     if coverage.source_message_ids:
         return coverage
     return VerifiedPostTurnCoverage(
@@ -8150,13 +8381,13 @@ def _effective_post_turn_inference_mode(
 ) -> tuple[str, str]:
     if configured_mode != POST_TURN_INFERENCE_MODE_PLAN_OWNED:
         return configured_mode, "configured"
-    if _plan_owned_coverage_is_strong(verified_coverage):
-        return POST_TURN_INFERENCE_MODE_PLAN_OWNED, "plan_owned_coverage_strong"
     if verified_coverage.confirmation_queued_count:
         return (
             POST_TURN_INFERENCE_MODE_HYBRID,
             "plan_owned_confirmation_queued_fallback",
         )
+    if _plan_owned_coverage_is_strong(verified_coverage):
+        return POST_TURN_INFERENCE_MODE_PLAN_OWNED, "plan_owned_coverage_strong"
     if (
         verified_coverage.committed_count
         and verified_coverage.metadata.get("planned_commit_post_turn_update_needed")
@@ -8173,13 +8404,19 @@ def _plan_owned_coverage_is_strong(coverage: VerifiedPostTurnCoverage) -> bool:
     metadata = coverage.metadata
     if metadata.get("planned_commit_verifier_available") is not True:
         return False
-    proposed_count = _int_mapping_value(metadata, "planned_commit_proposed_count")
-    if proposed_count <= 0:
-        return (
-            metadata.get("planned_commit_verification_passed") is True
-            and metadata.get("planned_commit_post_turn_update_needed") is False
-        )
-    return False
+    return (
+        metadata.get("planned_commit_verification_passed") is True
+        and metadata.get("planned_commit_post_turn_update_needed") is False
+    )
+
+
+def _coverage_covers_domain(
+    coverage: VerifiedPostTurnCoverage | None,
+    domain: str,
+) -> bool:
+    if coverage is None:
+        return False
+    return domain in coverage.applied_domains or domain in coverage.queued_domains
 
 
 def _int_diagnostic(value: Mapping[str, object], key: str) -> int:
@@ -8255,6 +8492,38 @@ def _coverage_with_candidate(
             )
             if character_id and target_type and target_id:
                 knowledge_edges.add((character_id, target_type, target_id))
+        elif candidate.candidate_type == "physical_change":
+            character_id = candidate.character_id or _string_mapping_value(
+                candidate.value,
+                "character_id",
+            )
+            if character_id:
+                state_keys.add(
+                    candidate.state_key
+                    or _character_physical_state_key(character_id)
+                )
+        elif candidate.candidate_type == "emotional_change":
+            character_id = candidate.character_id or _string_mapping_value(
+                candidate.value,
+                "character_id",
+            )
+            if character_id:
+                state_keys.add(
+                    candidate.state_key
+                    or _character_emotional_state_key(character_id)
+                )
+        elif candidate.candidate_type == "relationship_change":
+            character_id = candidate.character_id or _string_mapping_value(
+                candidate.value,
+                "character_id",
+            )
+            if character_id:
+                state_keys.add(
+                    candidate.state_key
+                    or _character_relationships_state_key(character_id)
+                )
+        elif candidate.candidate_type == "world_time_change":
+            scene_fields.update({"in_world_time", "time_of_day", "day_of_week"})
     elif confirmation_queued:
         queued_domains.add(domain)
     return VerifiedPostTurnCoverage(
@@ -8360,12 +8629,7 @@ def _record_planned_commit_decision(
 
 
 def _planned_commit_domain(candidate_type: str) -> str:
-    return {
-        "scene_presence": "scene_presence",
-        "scene_snapshot_field": "scene_snapshot",
-        "character_learned_memory": "memories",
-        "character_knowledge_edge": "knowledge_edges",
-    }.get(candidate_type, "unknown")
+    return planned_effect_domain(candidate_type)
 
 
 def _planned_commit_decision_allows_commit(
@@ -8438,6 +8702,69 @@ def _apply_planned_commit_candidate(
         )
     if candidate.candidate_type == "character_knowledge_edge":
         return _apply_character_knowledge_edge_candidate(
+            repositories=repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+            candidate=candidate,
+            evidence_source_text_by_id=evidence_source_text_by_id,
+        )
+    if candidate.candidate_type == "physical_change":
+        return _apply_physical_change_candidate(
+            repositories=repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+            candidate=candidate,
+            evidence_source_text_by_id=evidence_source_text_by_id,
+        )
+    if candidate.candidate_type == "emotional_change":
+        return _apply_emotional_change_candidate(
+            repositories=repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+            candidate=candidate,
+            evidence_source_text_by_id=evidence_source_text_by_id,
+        )
+    if candidate.candidate_type == "relationship_change":
+        return _apply_relationship_change_candidate(
+            repositories=repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+            candidate=candidate,
+            evidence_source_text_by_id=evidence_source_text_by_id,
+        )
+    if candidate.candidate_type == "resource_change":
+        return _apply_resource_change_candidate(
+            repositories=repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+            candidate=candidate,
+            evidence_source_text_by_id=evidence_source_text_by_id,
+        )
+    if candidate.candidate_type == "world_state_change":
+        return _apply_world_state_change_candidate(
+            repositories=repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+            candidate=candidate,
+            evidence_source_text_by_id=evidence_source_text_by_id,
+        )
+    if candidate.candidate_type == "active_thread_change":
+        return _apply_active_thread_change_candidate(
+            repositories=repositories,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+            candidate=candidate,
+            evidence_source_text_by_id=evidence_source_text_by_id,
+        )
+    if candidate.candidate_type == "world_time_change":
+        return _apply_world_time_change_candidate(
             repositories=repositories,
             save_id=save_id,
             player_message_id=player_message_id,
@@ -8896,6 +9223,554 @@ def _apply_character_knowledge_edge_candidate(
         evidence_quote=evidence_quote,
     )
     return "committed", "applied_character_knowledge_edge", not before
+
+
+_PLANNED_CHARACTER_STATE_FIELDS = frozenset(
+    {
+        "appearance",
+        "current_clothing",
+        "visual_notes",
+        "injuries",
+        "status",
+    }
+)
+
+
+def _character_physical_state_key(character_id: str) -> str:
+    return f"character.{character_id}.physical_state"
+
+
+def _character_emotional_state_key(character_id: str) -> str:
+    return f"character.{character_id}.current_emotional_state"
+
+
+def _character_relationships_state_key(character_id: str) -> str:
+    return f"character.{character_id}.relationships"
+
+
+def _apply_physical_change_candidate(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    player_message_id: str,
+    narrator_message_id: str,
+    candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
+) -> tuple[str, str, bool]:
+    character_id = candidate.character_id or _string_mapping_value(
+        candidate.value,
+        "character_id",
+    )
+    if not _character_belongs_to_save(
+        repositories,
+        save_id=save_id,
+        character_id=character_id,
+    ):
+        return "skipped", "unknown_character", False
+    if not _planned_commit_evidence_is_grounded(
+        repositories=repositories,
+        save_id=save_id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator_message_id,
+        candidate=candidate,
+        evidence_source_text_by_id=evidence_source_text_by_id,
+    ):
+        return "skipped", "ungrounded_evidence_metadata", False
+    value: dict[str, object] = {
+        str(field): str(raw).strip()
+        for field in _PLANNED_CHARACTER_STATE_FIELDS
+        for raw in [candidate.value.get(field)]
+        if isinstance(raw, str) and raw.strip()
+    }
+    if not value:
+        return "skipped", "missing_physical_change_value", False
+    key = candidate.state_key or _character_physical_state_key(character_id)
+    return _apply_character_world_state_effect(
+        repositories=repositories,
+        save_id=save_id,
+        candidate=candidate,
+        key=key,
+        value=value,
+        entity_type="world_state",
+        field_path=key,
+        reason=candidate.reason or "Applied planned physical change.",
+        reason_key="applied_physical_change",
+    )
+
+
+def _apply_emotional_change_candidate(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    player_message_id: str,
+    narrator_message_id: str,
+    candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
+) -> tuple[str, str, bool]:
+    character_id = candidate.character_id or _string_mapping_value(
+        candidate.value,
+        "character_id",
+    )
+    if not _character_belongs_to_save(
+        repositories,
+        save_id=save_id,
+        character_id=character_id,
+    ):
+        return "skipped", "unknown_character", False
+    if not _planned_commit_evidence_is_grounded(
+        repositories=repositories,
+        save_id=save_id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator_message_id,
+        candidate=candidate,
+        evidence_source_text_by_id=evidence_source_text_by_id,
+    ):
+        return "skipped", "ungrounded_evidence_metadata", False
+    raw_mood = candidate.value.get("mood")
+    if not isinstance(raw_mood, str) or not raw_mood.strip():
+        return "skipped", "missing_emotional_state", False
+    value: dict[str, object] = {"mood": raw_mood.strip()}
+    key = candidate.state_key or _character_emotional_state_key(character_id)
+    return _apply_character_world_state_effect(
+        repositories=repositories,
+        save_id=save_id,
+        candidate=candidate,
+        key=key,
+        value=value,
+        entity_type="world_state",
+        field_path=key,
+        reason=candidate.reason or "Applied planned emotional change.",
+        reason_key="applied_emotional_change",
+    )
+
+
+def _apply_relationship_change_candidate(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    player_message_id: str,
+    narrator_message_id: str,
+    candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
+) -> tuple[str, str, bool]:
+    character_id = candidate.character_id or _string_mapping_value(
+        candidate.value,
+        "character_id",
+    )
+    if not _character_belongs_to_save(
+        repositories,
+        save_id=save_id,
+        character_id=character_id,
+    ):
+        return "skipped", "unknown_character", False
+    if not _planned_commit_evidence_is_grounded(
+        repositories=repositories,
+        save_id=save_id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator_message_id,
+        candidate=candidate,
+        evidence_source_text_by_id=evidence_source_text_by_id,
+    ):
+        return "skipped", "ungrounded_evidence_metadata", False
+    target_name = _string_mapping_value(candidate.value, "target_name")
+    posture = _string_mapping_value(candidate.value, "posture")
+    if not target_name or not posture:
+        return "skipped", "missing_relationship_target_or_posture", False
+    value: dict[str, object] = {target_name: posture}
+    key = candidate.state_key or _character_relationships_state_key(character_id)
+    return _apply_character_world_state_effect(
+        repositories=repositories,
+        save_id=save_id,
+        candidate=candidate,
+        key=key,
+        value=value,
+        entity_type="world_state",
+        field_path=key,
+        reason=candidate.reason or "Applied planned relationship change.",
+        reason_key="applied_relationship_change",
+    )
+
+
+def _apply_resource_change_candidate(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    player_message_id: str,
+    narrator_message_id: str,
+    candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
+) -> tuple[str, str, bool]:
+    if not _planned_commit_evidence_is_grounded(
+        repositories=repositories,
+        save_id=save_id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator_message_id,
+        candidate=candidate,
+        evidence_source_text_by_id=evidence_source_text_by_id,
+    ):
+        return "skipped", "ungrounded_evidence_metadata", False
+    key = candidate.state_key or _string_mapping_value(candidate.value, "state_key")
+    if not key:
+        return "skipped", "missing_resource_state_key", False
+    raw_value = candidate.value.get("value")
+    if not isinstance(raw_value, dict) or not raw_value:
+        return "skipped", "missing_resource_value", False
+    return _apply_character_world_state_effect(
+        repositories=repositories,
+        save_id=save_id,
+        candidate=candidate,
+        key=key,
+        value=raw_value,
+        entity_type="world_state",
+        field_path=key,
+        reason=candidate.reason or "Applied planned resource change.",
+        reason_key="applied_resource_change",
+    )
+
+
+def _apply_world_state_change_candidate(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    player_message_id: str,
+    narrator_message_id: str,
+    candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
+) -> tuple[str, str, bool]:
+    if not _planned_commit_evidence_is_grounded(
+        repositories=repositories,
+        save_id=save_id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator_message_id,
+        candidate=candidate,
+        evidence_source_text_by_id=evidence_source_text_by_id,
+    ):
+        return "skipped", "ungrounded_evidence_metadata", False
+    key = candidate.state_key or _string_mapping_value(candidate.value, "key")
+    if not key:
+        return "skipped", "missing_world_state_key", False
+    raw_value = candidate.value.get("value")
+    if not isinstance(raw_value, dict) or not raw_value:
+        return "skipped", "missing_world_state_value", False
+    return _apply_character_world_state_effect(
+        repositories=repositories,
+        save_id=save_id,
+        candidate=candidate,
+        key=key,
+        value=raw_value,
+        entity_type="world_state",
+        field_path=key,
+        reason=candidate.reason or "Applied planned world state change.",
+        reason_key="applied_world_state_change",
+    )
+
+
+def _apply_character_world_state_effect(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    candidate: StateCommitCandidate,
+    key: str,
+    value: dict[str, object],
+    entity_type: str,
+    field_path: str,
+    reason: str,
+    reason_key: str,
+) -> tuple[str, str, bool]:
+    before = _find_world_state_record(repositories.list_world_state(save_id), key)
+    if before is not None and before.value == value:
+        return "committed", reason_key, False
+    state = repositories.upsert_world_state(
+        save_id=save_id,
+        key=key,
+        value=value,
+        category="scene",
+        confidence=candidate.confidence or 1.0,
+        source_message_id=_state_source_message_id(candidate),
+    )
+    repositories.add_state_change(
+        save_id=save_id,
+        source_message_id=_state_source_message_id(candidate),
+        operation="upsert",
+        state_key=key,
+        before_json=_json_dumps_compact(before.value) if before is not None else None,
+        after_json=_json_dumps_compact(value),
+    )
+    repositories.add_context_update_audit(
+        save_id=save_id,
+        operation="updated" if before is not None else "created",
+        entity_type=entity_type,
+        entity_id=state.id,
+        field_path=field_path,
+        before=before.value if before is not None else None,
+        after=value,
+        reason=reason,
+        confidence=candidate.confidence or 1.0,
+        source_message_ids=[
+            source_id
+            for source_id in _state_source_message_ids(candidate)
+            if source_id
+        ],
+    )
+    return "committed", reason_key, True
+
+
+def _state_source_message_id(candidate: StateCommitCandidate) -> str | None:
+    message_id = _string_mapping_value(candidate.value, "source_message_id")
+    return message_id or None
+
+
+def _state_source_message_ids(candidate: StateCommitCandidate) -> list[str]:
+    raw = candidate.value.get("source_message_ids")
+    if isinstance(raw, list):
+        return [str(item) for item in raw if str(item).strip()]
+    message_id = _state_source_message_id(candidate)
+    return [message_id] if message_id else []
+
+
+def _json_dumps_compact(value: dict[str, object]) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _find_world_state_record(
+    records: Iterable[WorldStateRecord],
+    key: str,
+) -> WorldStateRecord | None:
+    for record in records:
+        if record.key == key:
+            return record
+    return None
+
+
+def _apply_active_thread_change_candidate(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    player_message_id: str,
+    narrator_message_id: str,
+    candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
+) -> tuple[str, str, bool]:
+    if not _planned_commit_evidence_is_grounded(
+        repositories=repositories,
+        save_id=save_id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator_message_id,
+        candidate=candidate,
+        evidence_source_text_by_id=evidence_source_text_by_id,
+    ):
+        return "skipped", "ungrounded_evidence_metadata", False
+    title = _string_mapping_value(candidate.value, "title")
+    if not title:
+        return "skipped", "missing_thread_title", False
+    status = (
+        _string_mapping_value(candidate.value, "status").lower()
+        or "active"
+    )
+    if status not in {"active", "resolved", "archived", "paused"}:
+        return "skipped", "unsupported_thread_status", False
+    description = _string_mapping_value(candidate.value, "description")
+    raw_priority = candidate.value.get("priority")
+    priority = int(raw_priority) if isinstance(raw_priority, int) else 0
+    visibility = _string_mapping_value(candidate.value, "visibility") or "public"
+    related_entities = _string_list_mapping_value(
+        candidate.value,
+        "related_entities",
+    )
+    thread = _matching_active_thread(repositories, save_id, title)
+    source_message_id = _state_source_message_id(candidate) or narrator_message_id
+    if thread is None:
+        created = repositories.add_active_thread(
+            save_id=save_id,
+            title=title,
+            description=description,
+            status=status,
+            priority=priority,
+            visibility=visibility,
+            related_entities=related_entities,
+            source_message_id=source_message_id,
+        )
+        repositories.add_context_update_audit(
+            save_id=save_id,
+            operation="created",
+            entity_type="active_thread",
+            entity_id=created.id,
+            field_path="*",
+            before=None,
+            after={
+                "title": title,
+                "description": description,
+                "status": status,
+                "priority": priority,
+                "visibility": visibility,
+            },
+            reason=candidate.reason or "Applied planned active thread change.",
+            confidence=candidate.confidence or 1.0,
+            source_message_ids=[player_message_id, narrator_message_id],
+        )
+        return "committed", "created_active_thread", True
+    locked_fields = set(thread.locked_fields)
+    if any(field in locked_fields for field in ("title", "status", "description")):
+        return "skipped", "locked_active_thread_field", False
+    updated = repositories.update_active_thread(
+        replace(
+            thread,
+            title=title,
+            description=description or thread.description,
+            status=status,
+            priority=priority,
+            visibility=visibility or thread.visibility,
+            related_entities=related_entities or thread.related_entities,
+            source_message_id=source_message_id,
+            last_updated_message_id=source_message_id,
+        )
+    )
+    repositories.add_context_update_audit(
+        save_id=save_id,
+        operation="updated",
+        entity_type="active_thread",
+        entity_id=updated.id,
+        field_path="*",
+        before={
+            "title": thread.title,
+            "description": thread.description,
+            "status": thread.status,
+            "priority": thread.priority,
+            "visibility": thread.visibility,
+        },
+        after={
+            "title": updated.title,
+            "description": updated.description,
+            "status": updated.status,
+            "priority": updated.priority,
+            "visibility": updated.visibility,
+        },
+        reason=candidate.reason or "Applied planned active thread change.",
+        confidence=candidate.confidence or 1.0,
+        source_message_ids=[player_message_id, narrator_message_id],
+    )
+    return "committed", "updated_active_thread", True
+
+
+def _matching_active_thread(
+    repositories: PersistenceRepositories,
+    save_id: str,
+    title: str,
+) -> ActiveThreadRecord | None:
+    normalized = title.strip().casefold()
+    for thread in repositories.list_active_threads(save_id):
+        if thread.title.strip().casefold() == normalized:
+            return thread
+    return None
+
+
+def _apply_world_time_change_candidate(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    player_message_id: str,
+    narrator_message_id: str,
+    candidate: StateCommitCandidate,
+    evidence_source_text_by_id: Mapping[str, str],
+) -> tuple[str, str, bool]:
+    snapshot = repositories.get_scene_snapshot(save_id)
+    if snapshot is None:
+        return "skipped", "missing_scene_snapshot", False
+    if not _planned_commit_evidence_is_grounded(
+        repositories=repositories,
+        save_id=save_id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator_message_id,
+        candidate=candidate,
+        evidence_source_text_by_id=evidence_source_text_by_id,
+    ):
+        return "skipped", "ungrounded_evidence_metadata", False
+    in_world_time = _string_mapping_value(candidate.value, "in_world_time")
+    time_of_day = _string_mapping_value(candidate.value, "time_of_day")
+    day_of_week = _string_mapping_value(candidate.value, "day_of_week")
+    if not (in_world_time or time_of_day or day_of_week):
+        return "skipped", "missing_world_time_value", False
+    current_in_world_time = in_world_time or snapshot.in_world_time
+    current_time_of_day = time_of_day or snapshot.time_of_day
+    current_day_of_week = day_of_week or snapshot.day_of_week
+    current_world_day_index = snapshot.world_day_index or 0
+    raw_days_elapsed = candidate.value.get("days_elapsed")
+    if isinstance(raw_days_elapsed, int) and raw_days_elapsed > 0:
+        current_world_day_index += raw_days_elapsed
+    canonical_world_time = canonical_world_time_from_legacy(
+        in_world_time=current_in_world_time,
+        time_of_day=current_time_of_day,
+        day_of_week=current_day_of_week,
+        world_day_index=current_world_day_index,
+        source_message_id=narrator_message_id,
+        confidence=candidate.confidence,
+    )
+    display_world_time = canonical_world_time_from_values(
+        day_index=canonical_world_time.day_index,
+        day_label=canonical_world_time.day_label,
+        phase=canonical_world_time.phase,
+        clock_minutes=(
+            canonical_world_time.clock_minutes
+            if canonical_world_time.clock_minutes is not None
+            else snapshot.world_time_clock_minutes
+        ),
+        period_label=(
+            canonical_world_time.period_label
+            or snapshot.world_time_period_label
+        ),
+        source_message_id=narrator_message_id,
+        confidence=canonical_world_time.confidence,
+        legacy_in_world_time=current_in_world_time,
+        legacy_time_of_day=current_time_of_day,
+        legacy_day_of_week=current_day_of_week,
+        legacy_world_day_index=snapshot.world_day_index,
+    )
+    legacy_fields = legacy_world_time_fields(display_world_time)
+    from bragi.services.time_loop_time_policy import TimeLoopTimePolicy
+
+    loop_policy = TimeLoopTimePolicy(repositories, save_id=save_id)
+    loop_policy.ensure_baseline(snapshot)
+    saved_snapshot = repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        current_location_id=snapshot.current_location_id,
+        situation=snapshot.situation,
+        objective=snapshot.objective,
+        in_world_time=cast(str, legacy_fields["in_world_time"]),
+        time_of_day=cast(str, legacy_fields["time_of_day"]),
+        day_of_week=cast(str, legacy_fields["day_of_week"]),
+        world_day_index=current_world_day_index,
+        weather=snapshot.weather,
+        mood=snapshot.mood,
+        nearby_objects=snapshot.nearby_objects,
+        hazards=snapshot.hazards,
+        present_character_ids=snapshot.present_character_ids,
+        source_message_id=narrator_message_id,
+        locked_fields=snapshot.locked_fields,
+        snapshot_id=snapshot.id,
+        first_seen_message_id=snapshot.first_seen_message_id,
+        last_updated_message_id=narrator_message_id,
+        world_time_day_index=display_world_time.day_index,
+        world_time_day_label=display_world_time.day_label,
+        world_time_phase=display_world_time.phase,
+        world_time_clock_minutes=(
+            display_world_time.clock_minutes
+            if display_world_time.clock_minutes is not None
+            else snapshot.world_time_clock_minutes
+        ),
+        world_time_period_label=(
+            display_world_time.period_label
+            or snapshot.world_time_period_label
+        ),
+        world_time_source_message_id=narrator_message_id,
+        world_time_confidence=display_world_time.confidence,
+    )
+    loop_policy.ensure_baseline(saved_snapshot)
+    loop_policy.sync_current(
+        saved_snapshot,
+        transition="planned_world_time_change",
+        source_message_id=narrator_message_id,
+    )
+    return "committed", "applied_world_time_change", True
 
 
 def _planned_commit_evidence_is_grounded(

@@ -29,6 +29,54 @@ POST_TURN_INFERENCE_MODE_OPTIONS = (
     POST_TURN_INFERENCE_MODE_PLAN_OWNED,
 )
 
+POST_TURN_DOMAIN_STATE = "state"
+POST_TURN_DOMAIN_SCENE = "scene"
+POST_TURN_DOMAIN_PHYSICAL = "physical"
+POST_TURN_DOMAIN_RELATIONSHIP = "relationship"
+POST_TURN_DOMAIN_EMOTIONAL = "emotional"
+POST_TURN_DOMAIN_KNOWLEDGE = "knowledge"
+POST_TURN_DOMAIN_THREAD_CLOCK = "thread_clock"
+POST_TURN_DOMAIN_RESOURCE = "resource"
+POST_TURN_DOMAIN_TIME = "time"
+ALL_POST_TURN_DOMAINS = frozenset(
+    {
+        POST_TURN_DOMAIN_STATE,
+        POST_TURN_DOMAIN_SCENE,
+        POST_TURN_DOMAIN_PHYSICAL,
+        POST_TURN_DOMAIN_RELATIONSHIP,
+        POST_TURN_DOMAIN_EMOTIONAL,
+        POST_TURN_DOMAIN_KNOWLEDGE,
+        POST_TURN_DOMAIN_THREAD_CLOCK,
+        POST_TURN_DOMAIN_RESOURCE,
+        POST_TURN_DOMAIN_TIME,
+    }
+)
+
+PLANNED_EFFECT_TYPE_TO_DOMAIN: dict[str, str] = {
+    "scene_presence": POST_TURN_DOMAIN_SCENE,
+    "scene_snapshot_field": POST_TURN_DOMAIN_SCENE,
+    "character_learned_memory": POST_TURN_DOMAIN_KNOWLEDGE,
+    "character_knowledge_edge": POST_TURN_DOMAIN_KNOWLEDGE,
+    "physical_change": POST_TURN_DOMAIN_PHYSICAL,
+    "relationship_change": POST_TURN_DOMAIN_RELATIONSHIP,
+    "emotional_change": POST_TURN_DOMAIN_EMOTIONAL,
+    "active_thread_change": POST_TURN_DOMAIN_THREAD_CLOCK,
+    "resource_change": POST_TURN_DOMAIN_RESOURCE,
+    "world_state_change": POST_TURN_DOMAIN_STATE,
+    "world_time_change": POST_TURN_DOMAIN_TIME,
+}
+
+
+def planned_effect_domain(candidate_type: str) -> str:
+    return PLANNED_EFFECT_TYPE_TO_DOMAIN.get(candidate_type, "unknown")
+
+
+def planned_effect_type(domain: str) -> str | None:
+    for candidate_type, candidate_domain in PLANNED_EFFECT_TYPE_TO_DOMAIN.items():
+        if candidate_domain == domain:
+            return candidate_type
+    return None
+
 
 @dataclass(frozen=True)
 class VerifiedPostTurnCoverage:

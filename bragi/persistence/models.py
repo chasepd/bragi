@@ -712,6 +712,15 @@ class StateChangeRecord:
 
 
 @dataclass(frozen=True)
+class TurnOutcomeRecord:
+    id: str
+    save_id: str
+    message_id: str | None
+    payload: dict[str, object]
+    created_at: str | None = None
+
+
+@dataclass(frozen=True)
 class MemoryRecord:
     id: str
     save_id: str

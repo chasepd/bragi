@@ -9492,3 +9492,66 @@ def _load_content(content_json: str) -> dict[str, object]:
     loaded = json.loads(content_json)
     assert isinstance(loaded, dict)
     return cast(dict[str, object], loaded)
+
+
+def test_turn_outcomes_round_trip_and_list_by_save(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Evening comes.",
+    )
+    other_save = repositories.create_save(scenario_id=scenario.id, title="Other")
+
+    added = repositories.add_turn_outcome(
+        save_id=save.id,
+        message_id=message.id,
+        payload={
+            "save_id": save.id,
+            "message_id": message.id,
+            "attempt_resolution": "succeeded",
+            "effects": [],
+        },
+    )
+    assert added.payload["attempt_resolution"] == "succeeded"
+
+    fetched = repositories.get_turn_outcome_for_message(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    assert fetched is not None
+    assert fetched.payload["message_id"] == message.id
+    assert fetched.save_id == save.id
+
+    assert [row.id for row in repositories.list_turn_outcomes(save.id)] == [added.id]
+    assert repositories.list_turn_outcomes(other_save.id) == []
+
+
+def test_turn_outcome_lookup_returns_none_for_unknown_message(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    assert (
+        repositories.get_turn_outcome_for_message(
+            save_id=save.id,
+            message_id="missing",
+        )
+        is None
+    )
