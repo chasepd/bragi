@@ -127,7 +127,7 @@ def test_turn_outcome_coverage_derives_domains_and_details() -> None:
     )
     assert coverage.queued_domains == frozenset({POST_TURN_DOMAIN_KNOWLEDGE})
     assert coverage.scene_snapshot_fields == frozenset({"mood"})
-    assert len(coverage.memory_fingerprints) == 1
+    assert len(coverage.memory_fingerprints) == 2
     assert coverage.committed_count == 2
     assert coverage.confirmation_queued_count == 1
     assert coverage.source_message_ids == ("player-1", "narrator-1")

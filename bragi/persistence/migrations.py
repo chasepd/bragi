@@ -2297,17 +2297,6 @@ def _ensure_scene_fact_schema(connection: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_scene_fact_sources_fact
         ON scene_fact_sources(scene_fact_id, created_at, id);
-
-        CREATE TABLE IF NOT EXISTS turn_outcomes (
-            id TEXT PRIMARY KEY,
-            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
-            message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
-            payload_json TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_turn_outcomes_save_message
-        ON turn_outcomes(save_id, message_id);
         """,
     )
 

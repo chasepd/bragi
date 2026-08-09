@@ -489,7 +489,9 @@ def _coverage_covers_domain(
     coverage: VerifiedPostTurnCoverage,
     domain: str,
 ) -> bool:
-    return domain in coverage.applied_domains or domain in coverage.queued_domains
+    # Only applied domains count as established; confirmation-queued effects
+    # are pending manual approval and legacy inference fills their domains.
+    return domain in coverage.applied_domains
 
 
 def _filter_focused_maintenance_for_verified_coverage(

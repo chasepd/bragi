@@ -62,6 +62,7 @@ from bragi.services.action_choice_service import (
     PreparedActionChoiceGeneration,
 )
 from bragi.services.agentic_context import (
+    PLANNED_EFFECT_TYPES,
     RESPONSE_VERIFICATION_MODE_RETRY,
     ContextCurationService,
     NarratorCommitDecision,
@@ -8201,8 +8202,6 @@ def _planned_commit_diagnostics(
     candidates: tuple[StateCommitCandidate, ...],
     planner_rejections: tuple[PlannerRejection, ...] = (),
 ) -> dict[str, object]:
-    from bragi.services.agentic_context import PLANNED_EFFECT_TYPES
-
     commit_rejections = tuple(
         rejection
         for rejection in planner_rejections
@@ -8433,7 +8432,9 @@ def _coverage_covers_domain(
 ) -> bool:
     if coverage is None:
         return False
-    return domain in coverage.applied_domains or domain in coverage.queued_domains
+    # Only applied domains count as established; confirmation-queued effects
+    # are pending manual approval and legacy inference fills their domains.
+    return domain in coverage.applied_domains
 
 
 def _int_diagnostic(value: Mapping[str, object], key: str) -> int:
@@ -8543,6 +8544,10 @@ def _coverage_with_candidate(
             scene_fields.update({"in_world_time", "time_of_day", "day_of_week"})
     elif confirmation_queued:
         queued_domains.add(domain)
+        if candidate.candidate_type == "character_learned_memory":
+            body = _string_mapping_value(candidate.value, "body")
+            if body:
+                memory_fingerprints.add(memory_fingerprint(body))
     return VerifiedPostTurnCoverage(
         source_message_ids=coverage.source_message_ids,
         state_keys=frozenset(state_keys),
@@ -9313,6 +9318,7 @@ def _apply_physical_change_candidate(
         field_path=key,
         reason=candidate.reason or "Applied planned physical change.",
         reason_key="applied_physical_change",
+        merge_existing=True,
     )
 
 
@@ -9360,6 +9366,7 @@ def _apply_emotional_change_candidate(
         field_path=key,
         reason=candidate.reason or "Applied planned emotional change.",
         reason_key="applied_emotional_change",
+        merge_existing=True,
     )
 
 
@@ -9408,6 +9415,7 @@ def _apply_relationship_change_candidate(
         field_path=key,
         reason=candidate.reason or "Applied planned relationship change.",
         reason_key="applied_relationship_change",
+        merge_existing=True,
     )
 
 
@@ -9499,32 +9507,37 @@ def _apply_character_world_state_effect(
     field_path: str,
     reason: str,
     reason_key: str,
+    merge_existing: bool = False,
 ) -> tuple[str, str, bool]:
-    source_message_id = (
-        _state_source_message_id(candidate) or narrator_message_id
-    )
     category = _planned_world_state_category(candidate.candidate_type)
     before = _find_world_state_record(repositories.list_world_state(save_id), key)
-    if before is not None and before.value == value:
+    applied_value = value
+    if (
+        merge_existing
+        and before is not None
+        and isinstance(before.value, dict)
+    ):
+        applied_value = {**before.value, **value}
+    if before is not None and before.value == applied_value:
         return "committed", reason_key, False
     state = repositories.upsert_world_state(
         save_id=save_id,
         key=key,
-        value=value,
+        value=applied_value,
         category=category,
         confidence=candidate.confidence or 1.0,
-        source_message_id=source_message_id,
+        source_message_id=narrator_message_id,
     )
     repositories.add_state_change(
         save_id=save_id,
-        source_message_id=source_message_id,
+        source_message_id=narrator_message_id,
         operation="upsert",
         state_key=key,
         before_json=_json_dumps_compact(before.value) if before is not None else None,
-        after_json=_json_dumps_compact(value),
+        after_json=_json_dumps_compact(applied_value),
     )
     audit_source_message_ids = (
-        _state_source_message_ids(candidate) or [source_message_id]
+        _state_source_message_ids(candidate) or [narrator_message_id]
     )
     repositories.add_context_update_audit(
         save_id=save_id,
@@ -9533,7 +9546,7 @@ def _apply_character_world_state_effect(
         entity_id=state.id,
         field_path=field_path,
         before=before.value if before is not None else None,
-        after=value,
+        after=applied_value,
         reason=reason,
         confidence=candidate.confidence or 1.0,
         source_message_ids=audit_source_message_ids,
@@ -9551,18 +9564,7 @@ def _planned_world_state_category(candidate_type: str) -> str:
     return "world_state"
 
 
-def _state_source_message_id(candidate: StateCommitCandidate) -> str | None:
-    message_id = _string_mapping_value(candidate.value, "source_message_id")
-    return message_id or None
-
-
 def _state_source_message_ids(candidate: StateCommitCandidate) -> list[str]:
-    raw = candidate.value.get("source_message_ids")
-    if isinstance(raw, list):
-        return [str(item) for item in raw if str(item).strip()]
-    message_id = _state_source_message_id(candidate)
-    if message_id:
-        return [message_id]
     return [
         source_id.removeprefix("message:")
         for source_id in candidate.evidence_source_ids
@@ -9620,7 +9622,7 @@ def _apply_active_thread_change_candidate(
         "related_entities",
     )
     thread = _matching_active_thread(repositories, save_id, title)
-    source_message_id = _state_source_message_id(candidate) or narrator_message_id
+    source_message_id = narrator_message_id
     if thread is None:
         created = repositories.add_active_thread(
             save_id=save_id,
@@ -9876,7 +9878,10 @@ def _apply_world_time_change_candidate(
         },
         reason=candidate.reason or "Applied planned world time change.",
         confidence=candidate.confidence or 1.0,
-        source_message_ids=[player_message_id, narrator_message_id],
+        source_message_ids=(
+            _state_source_message_ids(candidate)
+            or [player_message_id, narrator_message_id]
+        ),
     )
     return "committed", "applied_world_time_change", True
 

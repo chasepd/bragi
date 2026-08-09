@@ -5874,7 +5874,7 @@ def test_submit_player_turn_queues_verified_learned_memory_when_confirmation_ena
     ]
     assert planned["confirmation_queued_count"] == 1
     assert planned["committed_count"] == 0
-    assert planned["coverage"]["memory_count"] == 0
+    assert planned["coverage"]["memory_count"] == 1
     assert planned["coverage"]["applied_domains"] == []
     assert planned["coverage"]["queued_domains"] == ["knowledge"]
 
@@ -22771,3 +22771,240 @@ def test_look_around_derives_markdown_blocks_from_answer(
     assert code_texts == ["silver key"]
     [observation] = repositories.list_context_observations(save.id)
     assert observation.claim == answer_body
+
+def test_hybrid_queued_knowledge_still_runs_state_job_without_duplicate_memory(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting("manual_confirmation_memories_enabled", True)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=POST_TURN_INFERENCE_MODE_SETTING,
+        value="plan_owned",
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=DIRECTOR_PRESSURE_ENABLED_SETTING,
+        value=False,
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=CHARACTER_ACTION_PLANNING_ENABLED_SETTING,
+        value=False,
+    )
+    for task, model_id in (
+        ("chat", "fake-chat"),
+        ("state_memory", "fake-state-memory"),
+        ("context_update", "fake-context-update"),
+        ("scenario_evolution", "fake-scenario-evolution"),
+    ):
+        repositories.save_provider_model(
+            provider="fake",
+            model_id=model_id,
+            display_name=model_id,
+            capabilities=["chat"] if task == "chat" else ["structured_output"],
+            context_window=32768,
+        )
+        repositories.set_model_preference(
+            task=task,
+            provider="fake",
+            model_id=model_id,
+        )
+    memory_body = "Mara learned that ember dawn wakes the beacon."
+    memory_candidate = _learned_memory_candidate(
+        mara.id,
+        body=memory_body,
+        candidate_id="character_learned_memory:mara:beacon",
+    )
+    state_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="keep.beacon",
+        value={
+            "value": {"status": "lit"},
+            "evidence_quote": "ember dawn wakes the beacon",
+        },
+        reason="The beacon is lit.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="ember dawn wakes the beacon",
+        candidate_id="world_state_change:keep.beacon",
+        candidate_type="world_state_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="The beacon is lit and Mara learns the phrase.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(state_candidate, memory_candidate),
+    )
+    events: list[str] = []
+    provider = ScriptedPostTurnStructuredProvider(
+        "fake",
+        response_bodies=(
+            "ember dawn wakes the beacon and Mara repeats the phrase.",
+        ),
+        events=events,
+        state_data={
+            "state_changes": [],
+            "memories": [
+                {
+                    "body": memory_body,
+                    "tags": ["mara", "beacon"],
+                    "importance": 0.86,
+                    "evidence_quote": "ember dawn wakes the beacon",
+                }
+            ],
+        },
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={"fake": provider},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                NarratorVerificationResult(
+                    passed=True,
+                    issues=(),
+                    retry_feedback="",
+                    confidence=0.92,
+                    post_turn_update_needed=True,
+                    commit_decisions=(
+                        _commit_decision(state_candidate),
+                        _commit_decision(memory_candidate),
+                    ),
+                )
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I check the beacon.",
+            speaker_name="Ily",
+        )
+    )
+
+    assert "state_memory_extraction" in events
+    assert repositories.list_memories(save.id) == []
+    pending = [
+        suggestion
+        for suggestion in repositories.list_context_update_suggestions(save.id)
+        if suggestion.status == "pending"
+    ]
+    assert len(pending) == 1
+    coordinator = _post_turn_jobs(repositories, save.id)[-1]
+    assert coordinator["payload"]["effective_post_turn_inference_mode"] == "hybrid"
+    state_result = _post_turn_child_result(coordinator, "state")
+    assert state_result["suppressed_memory_count"] == 1
+    assert _post_turn_child_status(coordinator, "state") == "narrowed"
+
+
+def test_submit_player_turn_merges_multiple_planned_relationship_changes(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    ily_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="",
+        value={
+            "target_name": "Ily",
+            "posture": "wary",
+            "character_id": mara.id,
+            "evidence_quote": "wary of Ily",
+        },
+        reason="Mara is wary of Ily.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="wary of Ily",
+        candidate_id="relationship_change:mara:ily",
+        candidate_type="relationship_change",
+        character_id=mara.id,
+    )
+    bo_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="",
+        value={
+            "target_name": "Bo",
+            "posture": "trusting",
+            "character_id": mara.id,
+            "evidence_quote": "trusting Bo",
+        },
+        reason="Mara trusts Bo.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="trusting Bo",
+        candidate_id="relationship_change:mara:bo",
+        candidate_type="relationship_change",
+        character_id=mara.id,
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Mara's ties shift.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(ily_candidate, bo_candidate),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("Mara grows wary of Ily while trusting Bo.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(
+                    _commit_decision(ily_candidate),
+                    _commit_decision(bo_candidate),
+                )
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I ask who Mara trusts.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    state_by_key = {
+        state.key: state.value for state in repositories.list_world_state(save.id)
+    }
+    assert state_by_key[f"character.{mara.id}.relationships"] == {
+        "Ily": "wary",
+        "Bo": "trusting",
+    }

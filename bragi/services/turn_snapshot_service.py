@@ -1890,6 +1890,12 @@ class _SnapshotRemapper:
             return raw
         remapped = dict(raw)
         remapped["save_id"] = self.target_save_id
+        payload_message_id = raw.get("message_id")
+        if isinstance(payload_message_id, str) and payload_message_id:
+            remapped["message_id"] = self._mapped_table_id(
+                "messages",
+                payload_message_id,
+            )
 
         def remap_refs(refs: object) -> object:
             if not isinstance(refs, list):

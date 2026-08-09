@@ -260,6 +260,12 @@ def _accumulate_effect_coverage(
     memory_fingerprints: set[str],
     knowledge_edge_targets: set[tuple[str, str, str]],
 ) -> None:
+    if effect.application_status == "confirmation_queued":
+        if effect.candidate_type == "character_learned_memory":
+            body = _text(effect.value.get("body"))
+            if body:
+                memory_fingerprints.add(memory_fingerprint(body))
+        return
     if effect.application_status != "committed":
         return
     if effect.state_key:
@@ -315,6 +321,12 @@ def remap_turn_outcome_payload(
     remapped = dict(payload)
     if save_id is not None:
         remapped["save_id"] = save_id
+    payload_message_id = payload.get("message_id")
+    if isinstance(payload_message_id, str) and payload_message_id:
+        remapped["message_id"] = remap_source_ref(
+            payload_message_id,
+            message_id_map=message_id_map,
+        )
 
     def remap_refs(refs: object) -> object:
         if not isinstance(refs, list):
