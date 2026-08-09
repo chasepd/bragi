@@ -1390,6 +1390,24 @@ describe("frontend helpers", () => {
     expect(events).toHaveBeenCalledWith("chat_turn_delta", delta);
   });
 
+  it("delivers job completion level events", async () => {
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const events = vi.fn();
+    const stop = watchJob("job-1", vi.fn(), events, "save-1");
+
+    sources[0].dispatchRaw(
+      "completion_level",
+      JSON.stringify({ completion_level: "continuity_ready" })
+    );
+
+    expect(events).toHaveBeenCalledWith(
+      "completion_level",
+      { completion_level: "continuity_ready" }
+    );
+    stop();
+  });
+
   it("scopes job event streams and fallback polling to a save", async () => {
     const { watchJob } = await import("./api");
     const sources = installEventSourceDouble();
@@ -6368,6 +6386,67 @@ describe("frontend helpers", () => {
     expect(screen.getByText("Context update")).toBeInTheDocument();
     expect(screen.getByText("Character cleanup")).toBeInTheDocument();
     expect(screen.getByText("Generating image")).toBeInTheDocument();
+  });
+
+  it("distinguishes continuity work from optional post-turn enrichments", async () => {
+    const { PendingJobsTray } = await import("./main");
+
+    render(
+      <PendingJobsTray
+        mode="expanded"
+        jobs={[
+          {
+            job: {
+              id: "job-continuity",
+              type: "post_turn_background",
+              status: "running",
+              completion_level: "response_committed",
+              result: null,
+              error: null
+            },
+            progress: "World state running"
+          },
+          {
+            job: {
+              id: "job-optional",
+              type: "post_turn_background",
+              status: "running",
+              completion_level: "continuity_ready",
+              result: null,
+              error: null
+            },
+            progress: "Action choices running"
+          }
+        ]}
+        onCancel={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("Response ready")).toBeInTheDocument();
+    expect(screen.getByText("Continuity ready")).toBeInTheDocument();
+  });
+
+  it("shows post-turn completion in the default compact tray", async () => {
+    const { PendingJobsTray } = await import("./main");
+
+    render(
+      <PendingJobsTray
+        jobs={[{
+          job: {
+            id: "job-optional-complete",
+            type: "post_turn_background",
+            status: "running",
+            completion_level: "optional_enrichments_complete",
+            result: null,
+            error: null
+          },
+          progress: "Scenario evolution complete"
+        }]}
+        onCancel={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("Optional complete")).toBeInTheDocument();
   });
 
   it("renders expanded pending jobs with pre-narrator phase detail", async () => {

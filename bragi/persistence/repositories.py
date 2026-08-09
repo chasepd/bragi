@@ -9697,12 +9697,20 @@ class PersistenceRepositories:
         provider: str = "",
         model: str = "",
         content_ratings: list[str] | tuple[str, ...] | None = None,
+        expected_head_message_id: str | None = None,
     ) -> list[MessageActionChoiceRecord]:
         normalized_choices = tuple(
             choice.strip() for choice in choices if choice.strip()
         )
-        self.begin_transaction()
+        self.begin_immediate_transaction()
         try:
+            if (
+                expected_head_message_id is not None
+                and self.latest_active_message_id(save_id)
+                != expected_head_message_id
+            ):
+                self.rollback_transaction()
+                return []
             self.connection.execute(
                 """
                 DELETE FROM message_action_choices

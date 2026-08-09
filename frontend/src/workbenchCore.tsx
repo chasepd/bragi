@@ -3289,6 +3289,19 @@ function Workbench({
             };
           });
         }
+        if (name === "completion_level" && isCompletionLevelEvent(data)) {
+          setTrackedJobs((current) => {
+            const tracked = current[created.id];
+            if (!tracked) return current;
+            return {
+              ...current,
+              [created.id]: {
+                ...tracked,
+                job: { ...tracked.job, completion_level: data.completion_level }
+              }
+            };
+          });
+        }
       },
       created.save_id ?? null
     );
@@ -5453,8 +5466,8 @@ function PendingJobsCompactSummary({
   onCancel: (job: TrackedJob) => void;
   onToggleDetails?: () => void;
 }) {
-  const groups = compactJobGroups(jobs);
-  const summary = groups.map((group) => group.count > 1 ? `${group.label} x${group.count}` : group.label).join("; ");
+  const summary = (jobs.length === 1 && postTurnCompletionLabel(jobs[0].job))
+    || compactJobGroups(jobs).map((group) => group.count > 1 ? `${group.label} x${group.count}` : group.label).join("; ");
   return (
     <div className="pending-job-row compact-summary">
       <Loader2 className="spin" size={15} />
@@ -5501,7 +5514,8 @@ function PendingJobRow({
   expandedFull?: boolean;
 }) {
   const label = jobTypeLabel(tracked.job.type);
-  const progress = tracked.progress || labelize(tracked.job.status);
+  const progress = postTurnCompletionLabel(tracked.job)
+    ?? (tracked.progress || labelize(tracked.job.status));
   const visiblePhases = expanded ? visiblePostTurnPhases(tracked.phases, expandedFull) : [];
   const longRunningHint = useLongRunningJobHint(tracked);
   return (
@@ -9339,6 +9353,23 @@ function jobTypeLabel(type: string) {
     scenario_character_starters: "Generating character starters"
   };
   return labels[type] ?? labelize(type);
+}
+
+const POST_TURN_COMPLETION_LABELS = {
+  response_committed: "Response ready",
+  continuity_ready: "Continuity ready",
+  optional_enrichments_complete: "Optional complete"
+} as const;
+
+function postTurnCompletionLabel(job: Job): string | null {
+  if (job.type !== "post_turn_background" || !job.completion_level) return null;
+  return POST_TURN_COMPLETION_LABELS[job.completion_level];
+}
+
+function isCompletionLevelEvent(data: unknown): data is { completion_level: NonNullable<Job["completion_level"]> } {
+  if (!data || typeof data !== "object") return false;
+  const level = (data as { completion_level?: unknown }).completion_level;
+  return typeof level === "string" && level in POST_TURN_COMPLETION_LABELS;
 }
 
 function isChatJobType(type: string) {

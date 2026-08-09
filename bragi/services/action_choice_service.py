@@ -233,6 +233,7 @@ class ActionChoiceService:
             provider=response.provider,
             model=response.model_id,
             content_ratings=content_ratings,
+            expected_head_message_id=prepared.narrator_message_id,
         )
 
 

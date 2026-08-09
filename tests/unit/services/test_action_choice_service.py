@@ -528,6 +528,52 @@ def test_action_choice_service_rechecks_prepared_model_capability(
     assert repositories.list_message_action_choices(save_id) == []
 
 
+def test_action_choice_service_discards_prepared_choices_after_head_advances(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, narrator_id = _create_cyoa_save(repositories)
+    _save_model(
+        repositories,
+        model_id="fake-chat",
+        capabilities=["structured_output"],
+    )
+    provider = FakeProviderClient(
+        structured_output={
+            "choices": [
+                {"body": "Open the brass atlas."},
+                {"body": "Question the librarian."},
+                {"body": "Hide the index under your coat."},
+                {"body": "Step through the blue shelf-door."},
+            ]
+        }
+    )
+    repositories.set_model_preference(
+        task=CHARACTER_ACTION_PLANNING_TASK,
+        provider="fake",
+        model_id="fake-chat",
+    )
+    service = ActionChoiceService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+    prepared = service.prepare_for_message(
+        save_id=save_id,
+        narrator_message_id=narrator_id,
+    )
+    assert prepared is not None
+    repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Ily",
+        body="I choose my own path.",
+    )
+
+    records = asyncio.run(service.generate_prepared(prepared))
+
+    assert records == []
+    assert repositories.list_message_action_choices(save_id) == []
+
+
 def test_action_choice_service_skips_saves_without_action_choices_enabled(
     repositories: PersistenceRepositories,
 ) -> None:

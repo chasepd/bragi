@@ -3599,7 +3599,6 @@ class BragiRuntime:
         narrator_message_id: str,
         turn_revision: TurnRevisionBoundary | dict[str, object] | None = None,
         progress_callback: PostTurnProgressCallback | None = None,
-        prepared_action_choices: PreparedActionChoiceGeneration | None = None,
         current_user_id: str | None = None,
         defer_image_generation: bool = False,
     ) -> RuntimeModel:
@@ -3627,27 +3626,6 @@ class BragiRuntime:
             if defer_image_generation and "defer_image_generation" in parameters:
                 kwargs["defer_image_generation"] = True
 
-            async def run_prepared_action_choices() -> None:
-                if prepared_action_choices is None:
-                    return
-                try:
-                    await ActionChoiceService(
-                        repositories=self.repositories,
-                        providers=self.providers,
-                    ).generate_prepared(
-                        replace(
-                            prepared_action_choices,
-                            current_user_id=current_user_id,
-                        )
-                    )
-                except Exception as exc:
-                    log_error_event(
-                        "runtime.action_choice_generation_failed",
-                        save_id=save_id,
-                        narrator_message_id=narrator_message_id,
-                        **exception_log_fields(exc),
-                    )
-
             async def run_post_turn() -> dict[str, object]:
                 if "world_update_context" in parameters:
 
@@ -3665,16 +3643,7 @@ class BragiRuntime:
                         await cast(Any, chat_service.run_post_turn_jobs)(**kwargs),
                     )
 
-            action_choice_task = (
-                asyncio.create_task(run_prepared_action_choices())
-                if prepared_action_choices is not None
-                else None
-            )
-            try:
-                coordinator_result = await run_post_turn()
-            finally:
-                if action_choice_task is not None:
-                    await action_choice_task
+            coordinator_result = await run_post_turn()
             prepared = _prepared_image_from_coordinator_result(coordinator_result)
             if prepared is not None:
                 if len(self._deferred_automatic_image_payloads) > 64:
@@ -3699,6 +3668,41 @@ class BragiRuntime:
             ),
             active_save_id=save_id,
         )
+
+    async def run_prepared_action_choices(
+        self,
+        *,
+        prepared_action_choices: PreparedActionChoiceGeneration,
+        current_user_id: str | None = None,
+    ) -> str:
+        try:
+            records = await ActionChoiceService(
+                repositories=self.repositories,
+                providers=self.providers,
+            ).generate_prepared(
+                replace(
+                    prepared_action_choices,
+                    current_user_id=current_user_id,
+                )
+            )
+        except Exception as exc:
+            log_error_event(
+                "runtime.action_choice_generation_failed",
+                save_id=prepared_action_choices.save_id,
+                narrator_message_id=prepared_action_choices.narrator_message_id,
+                **exception_log_fields(exc),
+            )
+            return "failed"
+        if records:
+            return "succeeded"
+        if (
+            self.repositories.latest_active_message_id(
+                prepared_action_choices.save_id
+            )
+            != prepared_action_choices.narrator_message_id
+        ):
+            return "obsolete"
+        return "skipped"
 
     def consume_deferred_automatic_image(
         self,

@@ -899,6 +899,7 @@ export type Job = {
   type: string;
   save_id?: string | null;
   status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  completion_level?: "response_committed" | "continuity_ready" | "optional_enrichments_complete" | null;
   result: unknown;
   error: string | null;
   created_at?: number;
@@ -1320,38 +1321,16 @@ export function watchJob(
     }
     closeWatcher();
   });
-  events.addEventListener("progress", (event) => {
-    const parsed = parseSseJson<unknown>(event as MessageEvent, { stream: "job", eventName: "progress", jobId, saveId });
-    if (!parsed.ok) {
-      startFallback();
-      return;
-    }
-    onEvent?.("progress", parsed.value);
-  });
-  events.addEventListener("runtime", (event) => {
-    const parsed = parseSseJson<unknown>(event as MessageEvent, { stream: "job", eventName: "runtime", jobId, saveId });
-    if (!parsed.ok) {
-      startFallback();
-      return;
-    }
-    onEvent?.("runtime", parsed.value);
-  });
-  events.addEventListener("chat_turn_delta", (event) => {
-    const parsed = parseSseJson<unknown>(event as MessageEvent, { stream: "job", eventName: "chat_turn_delta", jobId, saveId });
-    if (!parsed.ok) {
-      startFallback();
-      return;
-    }
-    onEvent?.("chat_turn_delta", parsed.value);
-  });
-  events.addEventListener("narrator_draft", (event) => {
-    const parsed = parseSseJson<unknown>(event as MessageEvent, { stream: "job", eventName: "narrator_draft", jobId, saveId });
-    if (!parsed.ok) {
-      startFallback();
-      return;
-    }
-    onEvent?.("narrator_draft", parsed.value);
-  });
+  for (const eventName of ["progress", "completion_level", "runtime", "chat_turn_delta", "narrator_draft"]) {
+    events.addEventListener(eventName, (event) => {
+      const parsed = parseSseJson<unknown>(event as MessageEvent, { stream: "job", eventName, jobId, saveId });
+      if (!parsed.ok) {
+        startFallback();
+        return;
+      }
+      onEvent?.(eventName, parsed.value);
+    });
+  }
   events.addEventListener("error", (event) => {
     const data = (event as MessageEvent).data;
     if (typeof data === "string" && data.length > 0) {
