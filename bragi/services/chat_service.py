@@ -9657,7 +9657,9 @@ def _apply_active_thread_change_candidate(
         )
         return "committed", "created_active_thread", True
     locked_fields = set(thread.locked_fields)
-    if any(field in locked_fields for field in ("title", "status", "description")):
+    if locked_fields.intersection(
+        ("title", "description", "status", "priority", "visibility", "related_entities")
+    ):
         return "skipped", "locked_active_thread_field", False
     resolved_description = description or thread.description
     resolved_visibility = visibility or thread.visibility

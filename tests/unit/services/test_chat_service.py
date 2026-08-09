@@ -23008,3 +23008,89 @@ def test_submit_player_turn_merges_multiple_planned_relationship_changes(
         "Ily": "wary",
         "Bo": "trusting",
     }
+
+
+def test_submit_player_turn_skips_planned_active_thread_change_for_locked_field(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.add_active_thread(
+        save_id=save.id,
+        title="Riders in the ash",
+        description="Riders close in.",
+        status="active",
+        priority=1,
+        locked_fields=["priority"],
+    )
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    candidate = StateCommitCandidate(
+        operation="update",
+        state_key="",
+        value={
+            "title": "Riders in the ash",
+            "status": "active",
+            "priority": 5,
+            "evidence_quote": "riders close in",
+        },
+        reason="The riders grow urgent.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="riders close in",
+        candidate_id="active_thread_change:riders:priority",
+        candidate_type="active_thread_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="The rider clock advances.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(candidate,),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("Horns sound as riders close in on the ash road.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(_commit_decision(candidate))
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I listen for movement.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    threads = repositories.list_active_threads(save.id)
+    assert [thread.title for thread in threads] == ["Riders in the ash"]
+    assert threads[0].priority == 1
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["committed_count"] == 0
+    assert {
+        decision["reason"] for decision in planned["decisions"]
+    } == {"locked_active_thread_field"}

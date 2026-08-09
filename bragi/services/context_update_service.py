@@ -454,10 +454,18 @@ def _filter_extraction_for_verified_coverage(
     )
     characters = extraction.characters
     if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_PHYSICAL):
-        characters = tuple(
-            _filter_character_physical_for_verified_coverage(character)
-            for character in characters
+        covered_physical_names = _coverage_character_names(
+            coverage,
+            "physical_state",
+            characters=request.characters,
         )
+        if covered_physical_names:
+            characters = tuple(
+                _filter_character_physical_for_verified_coverage(character)
+                if character.name.strip().casefold() in covered_physical_names
+                else character
+                for character in characters
+            )
     active_threads = extraction.active_threads
     if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_THREAD_CLOCK):
         active_threads = ()
@@ -470,6 +478,35 @@ def _filter_extraction_for_verified_coverage(
         characters=characters,
         active_threads=active_threads,
         entity_links=entity_links,
+    )
+
+
+def _coverage_character_ids(
+    coverage: VerifiedPostTurnCoverage,
+    key_suffix: str,
+) -> frozenset[str]:
+    prefix = "character."
+    suffix = f".{key_suffix}"
+    return frozenset(
+        key[len(prefix) : -len(suffix)]
+        for key in coverage.state_keys
+        if key.startswith(prefix) and key.endswith(suffix)
+    )
+
+
+def _coverage_character_names(
+    coverage: VerifiedPostTurnCoverage,
+    key_suffix: str,
+    *,
+    characters: tuple[CharacterRecord, ...],
+) -> frozenset[str]:
+    covered_ids = _coverage_character_ids(coverage, key_suffix)
+    if not covered_ids:
+        return frozenset()
+    return frozenset(
+        character.name.strip().casefold()
+        for character in characters
+        if character.id in covered_ids and character.name.strip()
     )
 
 
@@ -515,15 +552,30 @@ def _filter_focused_maintenance_for_verified_coverage(
         if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_THREAD_CLOCK)
         else maintenance.active_thread_updates
     )
+    covered_relationship_ids = _coverage_character_ids(
+        coverage,
+        "relationships",
+    )
     character_relationships = (
         ()
         if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_RELATIONSHIP)
-        else maintenance.character_relationships
+        and not covered_relationship_ids
+        else tuple(
+            relationship
+            for relationship in maintenance.character_relationships
+            if relationship.character_id not in covered_relationship_ids
+        )
     )
+    covered_emotion_ids = _coverage_character_ids(coverage, "current_emotional_state")
     character_emotions = (
         ()
         if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_EMOTIONAL)
-        else maintenance.character_emotions
+        and not covered_emotion_ids
+        else tuple(
+            emotion
+            for emotion in maintenance.character_emotions
+            if emotion.character_id not in covered_emotion_ids
+        )
     )
     return replace(
         maintenance,

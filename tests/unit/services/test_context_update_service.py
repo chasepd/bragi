@@ -8712,7 +8712,7 @@ def test_filter_extraction_for_verified_coverage_suppresses_covered_domains(
 ) -> None:
     module = _context_update_module()
     save, player_message, narrator_message = _save_with_completed_turn(repositories)
-    repositories.add_character(
+    character = repositories.add_character(
         save_id=save.id,
         name="Captain Ilyra",
         source_message_id=player_message.id,
@@ -8793,6 +8793,9 @@ def test_filter_extraction_for_verified_coverage_suppresses_covered_domains(
                     POST_TURN_DOMAIN_THREAD_CLOCK,
                     POST_TURN_DOMAIN_KNOWLEDGE,
                 }
+            ),
+            state_keys=frozenset(
+                {f"character.{character.id}.physical_state"}
             ),
             committed_count=3,
         ),
@@ -8988,3 +8991,78 @@ def test_filter_focused_maintenance_keeps_uncovered_domains(
     )
 
     assert len(filtered.character_emotions) == 1
+
+
+def test_filter_extraction_preserves_uncovered_characters_in_covered_domain(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    mara = repositories.add_character(
+        save_id=save.id,
+        name="Mara",
+        source_message_id=player_message.id,
+    )
+    repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        source_message_id=player_message.id,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The old scene.",
+        present_character_ids=[mara.id],
+    )
+    extraction = module.ContextUpdateExtraction(
+        characters=(
+            module.ExtractedCharacter(
+                name="Mara",
+                source_message_id=narrator_message.id,
+                appearance="bruised",
+                current_clothing="torn cloak",
+                evidence_quote="bruised",
+                reason="The narrator described her.",
+            ),
+            module.ExtractedCharacter(
+                name="Captain Ilyra",
+                source_message_id=narrator_message.id,
+                appearance="weathered leather coat",
+                status="unharmed",
+                evidence_quote="weathered leather",
+                reason="The narrator described her.",
+            ),
+        ),
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(player_message, narrator_message),
+        scene_snapshot=repositories.get_scene_snapshot(save.id),
+        locations=tuple(repositories.list_locations(save.id)),
+        characters=tuple(repositories.list_characters(save.id)),
+        active_threads=tuple(repositories.list_active_threads(save.id)),
+        entity_links=tuple(repositories.list_entity_links(save.id)),
+        memories=tuple(repositories.list_memories(save.id)),
+        world_state=tuple(repositories.list_world_state(save.id)),
+        summaries=tuple(repositories.list_summaries(save.id)),
+        prior_context=(),
+    )
+    from bragi.services.post_turn_inference import (
+        POST_TURN_DOMAIN_PHYSICAL,
+        VerifiedPostTurnCoverage,
+    )
+
+    filtered = module._filter_extraction_for_verified_coverage(
+        extraction,
+        coverage=VerifiedPostTurnCoverage(
+            applied_domains=frozenset({POST_TURN_DOMAIN_PHYSICAL}),
+            state_keys=frozenset({f"character.{mara.id}.physical_state"}),
+            committed_count=1,
+        ),
+        request=request,
+    )
+
+    by_name = {character.name: character for character in filtered.characters}
+    assert by_name["Mara"].appearance == ""
+    assert by_name["Mara"].current_clothing == ""
+    assert by_name["Captain Ilyra"].appearance == "weathered leather coat"
+    assert by_name["Captain Ilyra"].status == "unharmed"
