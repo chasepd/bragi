@@ -32,6 +32,7 @@ from bragi.safety import (
     FADE_TO_BLACK_TRANSITION_KIND,
     normalize_message_safety,
 )
+from bragi.scene_facts import scene_fact_conflict_key
 from bragi.services.character_text_world_update_service import (
     character_text_source_ref,
     parse_character_text_source_ref,
@@ -112,6 +113,8 @@ _SNAPSHOT_TABLES: tuple[_SnapshotTable, ...] = (
     _SnapshotTable("locations", active_only=True),
     _SnapshotTable("characters", active_only=True),
     _SnapshotTable("scene_snapshots"),
+    _SnapshotTable("scene_facts", active_only=True, order_by="created_at, rowid"),
+    _SnapshotTable("scene_fact_sources", order_by="created_at, rowid"),
     _SnapshotTable("active_threads", active_only=True),
     _SnapshotTable("entity_links"),
     _SnapshotTable("context_update_suggestions"),
@@ -164,6 +167,8 @@ _RESTORE_DELETE_ORDER = (
     "context_update_audit",
     "context_update_suggestions",
     "context_sources",
+    "scene_fact_sources",
+    "scene_facts",
     "scene_snapshots",
     "active_threads",
     "characters",
@@ -190,6 +195,8 @@ _RESTORE_INSERT_ORDER = (
     "character_text_activity_events",
     "narrator_phone_activity_cursors",
     "scene_snapshots",
+    "scene_facts",
+    "scene_fact_sources",
     "active_threads",
     "media_assets",
     "character_text_message_revisions",
@@ -240,6 +247,8 @@ _TABLE_REFERENCE_COLUMNS: dict[str, dict[str, str]] = {
     "locations": {"parent_location_id": "locations"},
     "characters": {"location_id": "locations"},
     "scene_snapshots": {"current_location_id": "locations"},
+    "scene_facts": {"scene_snapshot_id": "scene_snapshots"},
+    "scene_fact_sources": {"scene_fact_id": "scene_facts"},
     "context_sources": {"scene_snapshot_id": "scene_snapshots"},
     "media_assets": {"source_media_asset_id": "media_assets"},
     "save_loss_condition_changes": {"condition_id": "save_loss_conditions"},
@@ -348,6 +357,7 @@ _ENTITY_TABLES = {
     "thread": "active_threads",
     "active_thread": "active_threads",
     "scene_snapshot": "scene_snapshots",
+    "scene_fact": "scene_facts",
     "loss_condition": "save_loss_conditions",
     "media_asset": "media_assets",
     "save": "saves",
@@ -1622,6 +1632,28 @@ class _SnapshotRemapper:
                     cast(str | None, row.get(type_column)),
                     value,
                 )
+            elif table_name == "scene_facts" and column in {
+                "subject_id",
+                "target_id",
+            }:
+                type_column = (
+                    "subject_type" if column == "subject_id" else "target_type"
+                )
+                remapped[column] = self._mapped_entity_id(
+                    cast(str | None, row.get(type_column)),
+                    value,
+                )
+            elif table_name == "scene_facts" and column == "conflict_key":
+                remapped[column] = scene_fact_conflict_key(
+                    fact_type=str(remapped.get("fact_type", "")),
+                    subject_type=str(remapped.get("subject_type", "")),
+                    subject_id=cast(str | None, remapped.get("subject_id")),
+                    subject_label=str(remapped.get("subject_label", "")),
+                    target_type=str(remapped.get("target_type", "")),
+                    target_id=cast(str | None, remapped.get("target_id")),
+                    target_label=str(remapped.get("target_label", "")),
+                    aspect=str(remapped.get("aspect", "")),
+                )
             elif table_name == "context_sources" and column == "source_id":
                 remapped[column] = self._mapped_context_source_id(
                     cast(str | None, row.get("source_type")),
@@ -2593,6 +2625,7 @@ _SNAPSHOT_MESSAGE_SCOPED_TABLES = frozenset(
         "summaries",
         "save_loss_outcomes",
         "context_sources",
+        "scene_fact_sources",
         "narrator_phone_activity_cursors",
         "character_contact_states",
         "character_text_proactive_triggers",
@@ -2605,6 +2638,7 @@ _SNAPSHOT_KEEP_ENTITY_TABLES = frozenset(
         "locations",
         "active_threads",
         "scene_snapshots",
+        "scene_facts",
         "world_state",
         "media_assets",
         "memories",
@@ -2687,6 +2721,8 @@ def _snapshot_row_typed_entity_references_unresolved(
     typed_columns: tuple[tuple[str, str], ...] = ()
     if table_name == "entity_links":
         typed_columns = (("entity_id", "entity_type"), ("target_id", "target_type"))
+    elif table_name == "scene_facts":
+        typed_columns = (("subject_id", "subject_type"), ("target_id", "target_type"))
     elif table_name in {"context_update_suggestions", "context_update_audit"}:
         typed_columns = (("entity_id", "entity_type"),)
     elif table_name == "character_knowledge_edges":

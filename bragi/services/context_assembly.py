@@ -21,11 +21,13 @@ from bragi.persistence.models import (
     MessageVisibilityRecord,
     SaveDetailsRecord,
     ScenarioRecord,
+    SceneFactRecord,
     SceneSnapshotRecord,
     SummaryRecord,
     WorldStateRecord,
 )
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.scene_facts import MAX_SCENE_FACT_CONTEXT
 from bragi.services.action_choice_flags import scenario_action_choices_enabled
 from bragi.services.active_thread_lifecycle import (
     active_thread_is_prompt_visible,
@@ -1289,6 +1291,14 @@ def deterministic_context_sources(
         sources.extend(
             _scene_snapshot_sources(snapshot, location_map, character_map, mode)
         )
+        if mode == "narrator":
+            sources.extend(
+                _scene_fact_sources(
+                    repositories.list_scene_facts(save_id),
+                    locations=location_map,
+                    characters=character_map,
+                )
+            )
         sources.extend(
             _dating_route_context_sources(
                 repositories=repositories,
@@ -2430,6 +2440,91 @@ def _scene_snapshot_sources(
             )
         )
     return tuple(sources)
+
+
+_SCENE_FACT_CONTEXT_PRIORITY = {
+    "pending_reaction": 0,
+    "ongoing_action": 1,
+    "physical_constraint": 2,
+    "line_of_sight": 3,
+    "actor_position": 4,
+    "actor_pose": 5,
+    "object_possession": 6,
+    "object_location": 6,
+    "environment_state": 7,
+}
+
+
+def _scene_fact_sources(
+    facts: list[SceneFactRecord],
+    *,
+    locations: dict[str, LocationRecord],
+    characters: dict[str, CharacterRecord],
+) -> tuple[ContextSource, ...]:
+    ordered = sorted(
+        facts,
+        key=lambda fact: (
+            _SCENE_FACT_CONTEXT_PRIORITY.get(fact.fact_type, 99),
+            _scene_fact_reference_text(
+                fact.subject_type,
+                fact.subject_id,
+                fact.subject_label,
+                locations=locations,
+                characters=characters,
+            ).casefold(),
+            fact.conflict_key,
+            fact.id,
+        ),
+    )[:MAX_SCENE_FACT_CONTEXT]
+    if not ordered:
+        return ()
+    lines = ["Volatile current-scene facts (not durable lore):"]
+    for fact in ordered:
+        subject = _scene_fact_reference_text(
+            fact.subject_type,
+            fact.subject_id,
+            fact.subject_label,
+            locations=locations,
+            characters=characters,
+        )
+        target = _scene_fact_reference_text(
+            fact.target_type,
+            fact.target_id,
+            fact.target_label,
+            locations=locations,
+            characters=characters,
+        )
+        aspect = f" [{fact.aspect}]" if fact.aspect else ""
+        target_text = f" -> {target}" if target else ""
+        lines.append(
+            f"- {fact.fact_type.replace('_', ' ')}: "
+            f"{subject}{target_text}{aspect}: {fact.value}"
+        )
+    return (
+        ContextSource(
+            tier="current_scene",
+            source_type="scene_fact",
+            source_id=",".join(fact.id for fact in ordered),
+            text="\n".join(lines),
+            reason="typed volatile scene facts",
+            always_include=True,
+        ),
+    )
+
+
+def _scene_fact_reference_text(
+    reference_type: str,
+    reference_id: str | None,
+    label: str,
+    *,
+    locations: dict[str, LocationRecord],
+    characters: dict[str, CharacterRecord],
+) -> str:
+    if reference_type == "character" and reference_id in characters:
+        return characters[reference_id].name
+    if reference_type == "location" and reference_id in locations:
+        return locations[reference_id].name
+    return label
 
 
 def _dating_route_context_sources(

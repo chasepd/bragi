@@ -655,6 +655,172 @@ def test_repositories_round_trip_scene_snapshot_world_time(
     assert snapshot.locked_fields == ["time_of_day"]
 
 
+def test_repositories_scene_facts_replace_shared_object_placement_slot(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Room",
+        premise="Two travelers search a locked room.",
+        player_role="Traveler",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="The Search")
+    player = repositories.add_character(
+        save_id=save.id,
+        name="Rowan",
+        is_player_character=True,
+    )
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Rowan drops the brass key beside the north door.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[player.id],
+        source_message_id=narrator.id,
+    )
+
+    held, replaced, refreshed = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="object_possession",
+        subject_type="object",
+        subject_id=None,
+        subject_label="Brass Key",
+        target_type="character",
+        target_id=player.id,
+        value="held in Rowan's right hand",
+        source_message_id=narrator.id,
+        evidence_quote="Rowan drops the brass key",
+    )
+    dropped, replaced, refreshed = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="brass   key",
+        target_type="environment",
+        target_label="north door",
+        value="on the floor beside the north door",
+        source_message_id=narrator.id,
+        evidence_quote="brass key beside the north door",
+    )
+
+    assert replaced is not None
+    assert replaced.id == held.id
+    assert refreshed is False
+    assert repositories.get_scene_fact(held.id).archive_reason == "superseded"  # type: ignore[union-attr]
+    assert repositories.list_scene_facts(save.id) == [dropped]
+
+
+def test_repositories_scene_fact_refreshes_turn_ttl_and_provenance(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Gatehouse",
+        premise="A guard braces the gate.",
+        player_role="Scout",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="At the Gate")
+    guard = repositories.add_character(save_id=save.id, name="Mara")
+    first = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara keeps hauling the gate chain.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[guard.id],
+        source_message_id=first.id,
+    )
+    fact, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="ongoing_action",
+        subject_type="character",
+        subject_id=guard.id,
+        subject_label="Mara",
+        value="hauling the gate chain",
+        source_message_id=first.id,
+        evidence_quote="Mara keeps hauling the gate chain",
+    )
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I brace the mechanism.",
+    )
+    second = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara is still hauling the gate chain.",
+    )
+
+    assert repositories.list_scene_facts(save.id) == []
+    refreshed, replaced, was_refreshed = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="ongoing_action",
+        subject_type="character",
+        subject_id=guard.id,
+        subject_label="Mara",
+        value="hauling the gate chain",
+        source_message_id=second.id,
+        evidence_quote="still hauling the gate chain",
+    )
+
+    assert player.role == "player"
+    assert refreshed.id != fact.id
+    assert replaced is None
+    assert was_refreshed is False
+    assert refreshed.expires_after_turn_number == 3
+    assert [item.source_message_id for item in refreshed.provenance] == [second.id]
+
+
+def test_repositories_scene_transition_archives_current_facts(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Vault",
+        premise="A sealed vault opens into a tunnel.",
+        player_role="Delver",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Below")
+    actor = repositories.add_character(save_id=save.id, name="Ilya")
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Ilya crouches behind the stone plinth.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[actor.id],
+        source_message_id=message.id,
+    )
+    fact, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="actor_pose",
+        subject_type="character",
+        subject_id=actor.id,
+        subject_label="Ilya",
+        value="crouched behind the stone plinth",
+        source_message_id=message.id,
+        evidence_quote="Ilya crouches behind the stone plinth",
+    )
+
+    repositories.advance_scene_generation(
+        save_id=save.id,
+        source_message_id=message.id,
+    )
+
+    assert repositories.list_scene_facts(save.id) == []
+    archived = repositories.get_scene_fact(fact.id)
+    assert archived is not None
+    assert archived.archive_reason == "scene_transition"
+
+
 def test_repositories_preserve_canonical_world_time_on_unrelated_snapshot_update(
     repositories: PersistenceRepositories,
 ) -> None:

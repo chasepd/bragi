@@ -3075,6 +3075,56 @@ def test_restore_snapshot_replaces_scene_scratch_before_its_scene(
     assert fork_scratch.source_id == fork_observation.id
 
 
+def test_restore_snapshot_restores_scene_facts_and_provenance(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The brass key rests on the table.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="A brass key rests within reach.",
+        source_message_id=message.id,
+    )
+    original, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="brass key",
+        value="on the table",
+        source_message_id=message.id,
+        evidence_quote="rests on the table",
+    )
+    service = TurnSnapshotService(repositories)
+    snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="brass key",
+        value="under the table",
+        source_message_id=message.id,
+        evidence_quote="brass key",
+    )
+
+    service.restore_save_to_snapshot(save_id=save.id, snapshot_id=snapshot.id)
+
+    [restored] = repositories.list_scene_facts(save.id)
+    assert restored.id == original.id
+    assert restored.fact_type == "object_location"
+    assert restored.value == "on the table"
+    assert restored.provenance[0].source_message_id == message.id
+
+
 def test_snapshot_backed_fork_remaps_character_text_reply_links(
     repositories: PersistenceRepositories,
     tmp_path: Path,
