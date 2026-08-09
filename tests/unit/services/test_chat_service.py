@@ -16671,6 +16671,15 @@ def test_submit_player_turn_injects_selected_old_messages_as_retrieved_chronicle
         speaker_name="Mara",
         body="I check the cold storeroom.",
     )
+    for index in range(18):
+        repositories.append_message(
+            save_id=save.id,
+            role="narrator" if index % 2 else "player",
+            speaker_name="Narrator" if index % 2 else "Mara",
+            body=f"Later chronicle bridge event {index}.",
+            provider="openrouter" if index % 2 else None,
+            model="anthropic/claude-3.5-sonnet" if index % 2 else None,
+        )
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
@@ -17940,7 +17949,149 @@ def test_current_scene_recap_preserves_long_narrator_message_edges() -> None:
     assert "..." in recap_line
 
 
-def test_submit_player_turn_keeps_recent_transcript_out_of_current_scene_recap(
+@pytest.mark.parametrize(
+    ("prior_entries", "current_body", "expected_fragments"),
+    (
+        (
+            (("narrator", "Ilyra", "Who sent you to the tower?"),),
+            "Wait—the west door just opened.",
+            ("Who sent you to the tower?", "west door just opened"),
+        ),
+        (
+            (
+                ("player", "Mara", "I sprint across the failing bridge."),
+                (
+                    "narrator",
+                    "Narrator",
+                    "Mara reaches the midpoint before the bridge drops again.",
+                ),
+            ),
+            "I grab the remaining cable.",
+            ("sprint across", "reaches the midpoint", "remaining cable"),
+        ),
+        (
+            (
+                ("player", "Mara", "I hand Ilyra the brass key."),
+                (
+                    "narrator",
+                    "Narrator",
+                    "Ilyra holds out her palm but has not taken the key.",
+                ),
+            ),
+            "I wait for her answer.",
+            ("hand Ilyra", "has not taken the key", "wait for her answer"),
+        ),
+        (
+            (
+                ("player", "Mara", "I lunge at the ash guard."),
+                (
+                    "narrator",
+                    "Narrator",
+                    "The guard catches Mara's wrist; neither has yielded.",
+                ),
+            ),
+            "I twist toward the open stairwell.",
+            ("lunge", "catches Mara's wrist", "neither has yielded"),
+        ),
+        (
+            (
+                (
+                    "narrator",
+                    "Narrator",
+                    "The lens keeps humming; no one changes position.",
+                ),
+            ),
+            "I stay still and listen.",
+            ("no one changes position", "stay still and listen"),
+        ),
+    ),
+)
+def test_current_scene_recap_preserves_immediate_causal_bridge(
+    prior_entries: tuple[tuple[str, str, str], ...],
+    current_body: str,
+    expected_fragments: tuple[str, ...],
+) -> None:
+    messages = [
+        MessageRecord(
+            id=f"prior-{index}",
+            save_id="save-1",
+            role=role,
+            speaker_name=speaker,
+            body=body,
+            provider="fake" if role == "narrator" else None,
+            model="fake-chat" if role == "narrator" else None,
+            token_estimate=None,
+        )
+        for index, (role, speaker, body) in enumerate(prior_entries)
+    ]
+    player_message = MessageRecord(
+        id="current-player",
+        save_id="save-1",
+        role="player",
+        speaker_name="Mara",
+        body=current_body,
+        provider=None,
+        model=None,
+        token_estimate=None,
+    )
+
+    recap = "\n".join(
+        chat_service_module._current_scene_recap(
+            messages=[*messages, player_message],
+            player_message=player_message,
+        )
+    )
+
+    assert "player input; outcome unconfirmed" in recap
+    assert "narrator chronicle; accepted evidence" in recap or not any(
+        role == "narrator" for role, _speaker, _body in prior_entries
+    )
+    for fragment in expected_fragments:
+        assert fragment in recap
+
+
+def test_current_scene_recap_excludes_hidden_messages_and_bounds_window() -> None:
+    prior_messages = [
+        MessageRecord(
+            id=f"message-{index}",
+            save_id="save-1",
+            role="narrator" if index % 2 == 0 else "player",
+            speaker_name="Narrator" if index % 2 == 0 else "Mara",
+            body=f"Chronicle event {index}",
+            provider="fake" if index % 2 == 0 else None,
+            model="fake-chat" if index % 2 == 0 else None,
+            token_estimate=None,
+        )
+        for index in range(25)
+    ]
+    player_message = MessageRecord(
+        id="current-player",
+        save_id="save-1",
+        role="player",
+        speaker_name="Mara",
+        body="I answer the latest event.",
+        provider=None,
+        model=None,
+        token_estimate=None,
+    )
+
+    sources = chat_service_module._current_scene_recap_sources(
+        messages=[*prior_messages, player_message],
+        player_message=player_message,
+        hidden_message_ids=frozenset({"message-24"}),
+    )
+
+    message_sources = [source for source in sources if source.source_type == "message"]
+    assert (
+        len(message_sources)
+        == chat_service_module.CURRENT_SCENE_RECAP_MESSAGE_WINDOW
+    )
+    assert message_sources[0].source_id == "message-5"
+    assert message_sources[-1].source_id == player_message.id
+    assert "message-24" not in {source.source_id for source in message_sources}
+
+
+def test_submit_player_turn_bridges_bounded_history_through_current_scene_recap(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -17955,7 +18106,19 @@ def test_submit_player_turn_keeps_recent_transcript_out_of_current_scene_recap(
         save_id=save.id,
         role="narrator",
         speaker_name="Narrator",
-        body="The exact brass lens transcript should only appear as chat history.",
+        body="Ilyra asks who loosened the brass lens while keeping hold of it.",
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=RECENT_PLAYER_MESSAGE_WINDOW_SETTING,
+        value=0,
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=RECENT_NARRATOR_MESSAGE_WINDOW_SETTING,
+        value=0,
     )
     repositories.set_model_preference(
         task="chat",
@@ -17969,20 +18132,50 @@ def test_submit_player_turn_keeps_recent_transcript_out_of_current_scene_recap(
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
 
-    asyncio.run(
+    submitted = asyncio.run(
         service.submit_player_turn(
             save_id=save.id,
-            body="I inspect the lens housing.",
+            body="I reach for the lens housing.",
             speaker_name="Mara",
+            run_post_turn_jobs=False,
         )
     )
 
     request = provider.chat_requests[0]
-    assert prior_message.body in [message.body for message in request.messages]
+    assert prior_message.body not in [message.body for message in request.messages]
     recap_text = "\n".join(request.current_scene_recap)
-    assert "Recent chronicle:" not in recap_text
-    assert prior_message.body not in recap_text
+    assert prior_message.body in recap_text
+    assert "Mara (player input; outcome unconfirmed)" in recap_text
+    assert "I reach for the lens housing." in recap_text
     assert "Deterministic current-scene context" in recap_text
+    recap_sources = [
+        source
+        for source in request.context_breakdown["sources"]
+        if source["tier"] == "current_scene_recap"
+    ]
+    assert [
+        source["source_id"]
+        for source in recap_sources
+        if source["source_type"] == "message"
+    ] == [
+        prior_message.id,
+        submitted.player_message.id,
+    ]
+    diagnostics = chat_service_module._chat_prompt_context_diagnostics(
+        request,
+        context_search_failed=False,
+        context_search_degraded=False,
+        context_search_recovery=None,
+    )
+    assert diagnostics["current_scene_recap_chars"] == sum(
+        len(line) for line in request.current_scene_recap
+    )
+    assert diagnostics["current_scene_recap_source_ids"] == [
+        "current_scene_recap:authority",
+        f"message:{prior_message.id}",
+        f"message:{submitted.player_message.id}",
+        "rules:current_scene_authority",
+    ]
 
 
 def test_submit_player_turn_budgets_retrieved_context_and_reports_breakdown(
@@ -18715,7 +18908,7 @@ def test_submit_player_turn_reuses_narration_snapshot_for_prompt_building(
     assert counting.read_counts.get("message_visibility", 0) <= 4
 
 
-def test_submit_player_turn_final_prompt_budget_trims_baseline_before_retrieval(
+def test_submit_player_turn_final_prompt_budget_trims_recap_and_baseline(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -18794,6 +18987,7 @@ def test_submit_player_turn_final_prompt_budget_trims_baseline_before_retrieval(
     trimmed_sections = [
         item["section"] for item in budget["trimmed_sections"] if isinstance(item, dict)
     ]
+    assert "current_scene_recap" in trimmed_sections
     assert "messages" in trimmed_sections
     assert "retrieved_state" not in trimmed_sections
     job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
@@ -18807,6 +19001,12 @@ def test_submit_player_turn_final_prompt_budget_trims_baseline_before_retrieval(
     )
     assert prompt_diagnostics["retrieved_counts"]["state"] == 1
     assert prompt_diagnostics["final_prompt_budget"]["trimmed"] is True
+    assert prompt_diagnostics["current_scene_recap_source_count"] == len(
+        request.current_scene_recap
+    )
+    assert f"message:{submitted.player_message.id}" in prompt_diagnostics[
+        "current_scene_recap_source_ids"
+    ]
 
 
 def test_final_prompt_budget_trims_pending_suggestions_before_messages() -> None:
@@ -18835,6 +19035,43 @@ def test_final_prompt_budget_trims_pending_suggestions_before_messages() -> None
     ]
     assert trimmed_sections[0] == "pending_context_suggestions"
     assert "messages" not in trimmed_sections
+
+
+def test_final_prompt_recap_trim_candidates_use_message_provenance() -> None:
+    deceptive_state = (
+        "Scene snapshot: a placard reads "
+        "(player input; outcome unconfirmed): but remains accepted state."
+    )
+    request = ChatRequest(
+        provider="fake",
+        model_id="fake-chat",
+        messages=(ChatMessage(role="player", body="I wait."),),
+        current_scene_recap=(
+            chat_service_module.CURRENT_SCENE_RECAP_AUTHORITY,
+            'Narrator (narrator chronicle; accepted evidence): "Earlier beat."',
+            'Mara (player input; outcome unconfirmed): "I wait."',
+            deceptive_state,
+        ),
+        context_breakdown={
+            "current_scene_recap_source_ids": [
+                "current_scene_recap:authority",
+                "message:earlier-narrator",
+                "message:current-player",
+                "scene_snapshot:current-scene",
+            ]
+        },
+    )
+
+    candidates = [
+        candidate
+        for candidate in chat_service_module._final_prompt_trim_candidates(request)
+        if candidate.section == "current_scene_recap"
+    ]
+
+    assert [
+        (candidate.index, candidate.source_type, candidate.source_id)
+        for candidate in candidates
+    ] == [(1, "message", "earlier-narrator")]
 
 
 def test_final_prompt_budget_can_trim_phone_context() -> None:
@@ -19052,10 +19289,10 @@ def test_submit_player_turn_keeps_recent_baseline_and_retrieves_selected_prior_m
             provider=None if index % 2 == 0 else "openrouter",
             model=None if index % 2 == 0 else "anthropic/claude-3.5-sonnet",
         )
-        for index in range(16)
+        for index in range(25)
     ]
     selected_older_message = prior_messages[0]
-    selected_newer_message = prior_messages[14]
+    selected_newer_message = prior_messages[23]
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
@@ -19095,16 +19332,16 @@ def test_submit_player_turn_keeps_recent_baseline_and_retrieves_selected_prior_m
 
     request = provider.chat_requests[0]
     assert [message.body for message in request.messages] == [
-        prior_messages[6].body,
-        prior_messages[7].body,
-        prior_messages[8].body,
-        prior_messages[9].body,
-        prior_messages[10].body,
-        prior_messages[11].body,
-        prior_messages[12].body,
-        prior_messages[13].body,
-        selected_newer_message.body,
         prior_messages[15].body,
+        prior_messages[16].body,
+        prior_messages[17].body,
+        prior_messages[18].body,
+        prior_messages[19].body,
+        prior_messages[20].body,
+        prior_messages[21].body,
+        prior_messages[22].body,
+        selected_newer_message.body,
+        prior_messages[24].body,
         "I raise the storm lantern again.",
     ]
     assert {
@@ -19112,11 +19349,11 @@ def test_submit_player_turn_keeps_recent_baseline_and_retrieves_selected_prior_m
         for message in request.messages
         if message.role == "player"
     } == {
-        prior_messages[6].body,
-        prior_messages[8].body,
-        prior_messages[10].body,
-        prior_messages[12].body,
-        selected_newer_message.body,
+        prior_messages[16].body,
+        prior_messages[18].body,
+        prior_messages[20].body,
+        prior_messages[22].body,
+        prior_messages[24].body,
         "I raise the storm lantern again.",
     }
     assert {
@@ -19124,11 +19361,11 @@ def test_submit_player_turn_keeps_recent_baseline_and_retrieves_selected_prior_m
         for message in request.messages
         if message.role == "narrator"
     } == {
-        prior_messages[7].body,
-        prior_messages[9].body,
-        prior_messages[11].body,
-        prior_messages[13].body,
         prior_messages[15].body,
+        prior_messages[17].body,
+        prior_messages[19].body,
+        prior_messages[21].body,
+        selected_newer_message.body,
     }
     assert selected_older_message.body not in [
         message.body for message in request.messages
@@ -19137,11 +19374,11 @@ def test_submit_player_turn_keeps_recent_baseline_and_retrieves_selected_prior_m
         selected_newer_message.body
     ) == 1
     assert request.retrieved_recent_messages == (
-        "[message:"
-        f"{selected_newer_message.id}] {selected_newer_message.body}",
-        "[message:"
-        f"{selected_older_message.id}] {selected_older_message.body}",
+        f"[message:{selected_older_message.id}] {selected_older_message.body}",
     )
+    assert request.context_breakdown["suppressed_duplicate_retrieval_keys"] == [
+        f"message:{selected_newer_message.id}"
+    ]
     assert all(
         message.body not in {chat_message.body for chat_message in request.messages}
         for message in (prior_messages[1], prior_messages[2], prior_messages[3])
