@@ -1771,6 +1771,78 @@ def test_structured_context_update_drops_items_with_ungrounded_evidence(
     assert [location.name for location in extraction.locations] == ["Beacon Gallery"]
 
 
+def test_structured_context_update_drops_invalid_scene_local_id_without_batch_loss(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    provider = SequenceStructuredProvider(
+        [
+            {
+                "scene": {},
+                "locations": [
+                    {
+                        "name": "Beacon Gallery",
+                        "source_message_id": narrator_message.id,
+                        "evidence_quote": "beacon gallery",
+                    }
+                ],
+                "characters": [],
+                "active_threads": [],
+                "entity_links": [],
+                "phone_number_exchanges": [],
+                "scene_fact_upserts": [
+                    {
+                        "fact_type": "object_location",
+                        "subject_type": "object",
+                        "subject_id": "provider-generated-object-id",
+                        "subject_label": "beacon lens",
+                        "target_type": "",
+                        "target_id": "",
+                        "target_label": "",
+                        "aspect": "",
+                        "value": "inside the beacon gallery",
+                        "source_message_id": narrator_message.id,
+                        "evidence_quote": "beacon gallery",
+                        "reason": "Track its position.",
+                        "confidence": 0.9,
+                    }
+                ],
+                "scene_fact_retirements": [],
+            }
+        ]
+    )
+    updater = module.StructuredProviderContextUpdater(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-structured",
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(player_message, narrator_message),
+        scene_snapshot=None,
+        locations=(),
+        characters=(),
+        active_threads=(),
+        entity_links=(),
+    )
+    extraction = asyncio.run(updater.extract(request))
+    service = module.ContextUpdateService(
+        repositories=repositories,
+        extractor=RecordingContextUpdateExtractor(module.ContextUpdateExtraction()),
+    )
+
+    result = service.apply_extraction(
+        save_id=save.id,
+        extraction=extraction,
+        allowed_source_message_ids=(player_message.id, narrator_message.id),
+        completed_messages=(player_message, narrator_message),
+    )
+
+    assert [location.name for location in result.locations] == ["Beacon Gallery"]
+    assert repositories.list_scene_facts(save.id) == []
+
+
 def test_apply_extraction_drops_items_with_ungrounded_completed_message_evidence(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -6710,10 +6710,32 @@ def _drop_invalid_extracted_entities(
             for exchange in extraction.phone_number_exchanges
             if exchange.character_id.strip()
         ),
-        scene_fact_upserts=extraction.scene_fact_upserts,
+        scene_fact_upserts=tuple(
+            fact
+            for fact in extraction.scene_fact_upserts
+            if _scene_fact_shape_is_valid(fact)
+        ),
         scene_fact_retirements=extraction.scene_fact_retirements,
         tool_diagnostics=extraction.tool_diagnostics,
     )
+
+
+def _scene_fact_shape_is_valid(fact: ExtractedSceneFactUpsert) -> bool:
+    try:
+        validate_scene_fact_shape(
+            fact_type=fact.fact_type,
+            subject_type=fact.subject_type,
+            subject_id=fact.subject_id,
+            subject_label=fact.subject_label,
+            target_type=fact.target_type,
+            target_id=fact.target_id,
+            target_label=fact.target_label,
+            aspect=fact.aspect,
+            value=fact.value,
+        )
+    except ValueError:
+        return False
+    return True
 
 
 def _selector_from_extractor(
