@@ -104,7 +104,8 @@ class SummarizationContextNarratorProvider:
         )
         assert request.retrieved_state == ()
         assert request.context_breakdown["suppressed_duplicate_retrieval_keys"] == [
-            "world_state:state-ash-bridge"
+            "world_state:state-ash-bridge",
+            "message:message-echo",
         ]
         assert request.retrieved_memories == (
             "[memory:memory-bell] Mara distrusts bells that ring without wind.",
