@@ -1294,7 +1294,11 @@ def deterministic_context_sources(
         if mode == "narrator":
             sources.extend(
                 _scene_fact_sources(
-                    repositories.list_scene_facts(save_id),
+                    repositories.list_scene_facts(
+                        save_id,
+                        scene_snapshot_id=snapshot.id,
+                        scene_generation=snapshot.scene_generation,
+                    ),
                     locations=location_map,
                     characters=character_map,
                 )

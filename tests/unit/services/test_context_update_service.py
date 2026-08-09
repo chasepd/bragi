@@ -8485,6 +8485,72 @@ def test_apply_extraction_moves_actor_and_retires_interrupted_action(
     }
 
 
+def test_apply_extraction_keeps_corroborating_scene_fact_provenance(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="North Hall",
+        premise="A runner crosses a guarded hall.",
+        player_role="Runner",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Crossing")
+    actor = repositories.add_character(save_id=save.id, name="Mara")
+    first = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I stop beside the window.",
+    )
+    second = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara now stands beside the window.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[actor.id],
+        source_message_id=second.id,
+    )
+    upserts = tuple(
+        module.ExtractedSceneFactUpsert(
+            fact_type="actor_position",
+            subject_type="character",
+            subject_id=actor.id,
+            subject_label="Mara",
+            value="beside the window",
+            source_message_id=message.id,
+            evidence_quote=evidence,
+        )
+        for message, evidence in (
+            (first, "stop beside the window"),
+            (second, "stands beside the window"),
+        )
+    )
+    service = module.ContextUpdateService(
+        repositories=repositories,
+        extractor=RecordingContextUpdateExtractor(module.ContextUpdateExtraction()),
+    )
+
+    result = service.apply_extraction(
+        save_id=save.id,
+        extraction=module.ContextUpdateExtraction(scene_fact_upserts=upserts),
+        allowed_source_message_ids=(first.id, second.id),
+        completed_messages=(first, second),
+    )
+
+    [fact] = repositories.list_scene_facts(save.id)
+    assert [source.source_message_id for source in fact.provenance] == [
+        first.id,
+        second.id,
+    ]
+    assert [entry.operation for entry in result.audit_entries] == [
+        "created",
+        "refreshed",
+    ]
+
+
 def _save_with_completed_turn(
     repositories: PersistenceRepositories,
 ) -> tuple[SaveRecord, MessageRecord, MessageRecord]:

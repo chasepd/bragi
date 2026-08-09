@@ -5663,15 +5663,20 @@ class PersistenceRepositories:
         *,
         include_archived: bool = False,
         current_only: bool = True,
+        scene_snapshot_id: str | None = None,
+        scene_generation: int | None = None,
     ) -> list[SceneFactRecord]:
-        scene = self.get_scene_snapshot(save_id)
-        if current_only and scene is None:
-            return []
+        if current_only and (scene_snapshot_id is None or scene_generation is None):
+            scene = self.get_scene_snapshot(save_id)
+            if scene is None:
+                return []
+            scene_snapshot_id = scene.id
+            scene_generation = scene.scene_generation
         filters = ["facts.save_id = ?"]
         params: list[object] = [save_id]
         if not include_archived:
             filters.append("facts.archived_at IS NULL")
-        if current_only and scene is not None:
+        if current_only:
             current_turn = self.count_active_messages_by_role(
                 save_id,
                 roles=("narrator",),
@@ -5684,7 +5689,7 @@ class PersistenceRepositories:
                     "facts.expires_after_turn_number > ?)",
                 )
             )
-            params.extend((scene.id, scene.scene_generation, current_turn))
+            params.extend((scene_snapshot_id, scene_generation, current_turn))
         rows = self._fetch_all(
             f"""
             SELECT facts.id, facts.save_id, facts.scene_snapshot_id,
@@ -6006,6 +6011,11 @@ class PersistenceRepositories:
                 (save_id, *ordered_ids),
             )
         )
+        before_by_id = {
+            fact_id: fact
+            for fact_id in sorted(affected)
+            if (fact := self.get_scene_fact(fact_id)) is not None
+        }
         self.connection.execute(
             f"""
             DELETE FROM scene_fact_sources
@@ -6013,7 +6023,7 @@ class PersistenceRepositories:
             """,
             (save_id, *ordered_ids),
         )
-        for fact_id in affected:
+        for fact_id in sorted(affected):
             remaining = self._fetch_one(
                 "SELECT 1 FROM scene_fact_sources WHERE scene_fact_id = ? LIMIT 1",
                 (fact_id,),
@@ -6033,6 +6043,40 @@ class PersistenceRepositories:
                     (fact_id,),
                 )
         self.commit()
+        for fact_id, before in before_by_id.items():
+            removed_sources = tuple(
+                source
+                for source in before.provenance
+                if source.source_message_id in message_ids
+            )
+            after = self.get_scene_fact(fact_id)
+            archived = after is None or after.archive_reason == "source_removed"
+            after_payload = (
+                None
+                if after is None or archived
+                else _scene_fact_audit_payload(after)
+            )
+            self.add_context_update_audit(
+                save_id=save_id,
+                operation="source_removed" if archived else "provenance_removed",
+                entity_type="scene_fact",
+                entity_id=fact_id,
+                field_path=before.conflict_key,
+                before=_scene_fact_audit_payload(before),
+                after=after_payload,
+                reason=(
+                    "The final supporting message was removed."
+                    if archived
+                    else "Supporting message provenance was removed."
+                ),
+                confidence=max(
+                    (source.confidence for source in removed_sources),
+                    default=1.0,
+                ),
+                source_message_ids=[
+                    source.source_message_id for source in removed_sources
+                ],
+            )
         return affected
 
     def _scene_fact_from_row(self, row: sqlite3.Row) -> SceneFactRecord:

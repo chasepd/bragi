@@ -633,10 +633,11 @@ def _load_context_update_read_snapshot(
 ) -> _ContextUpdateReadSnapshot:
     source_ids = set(source_message_ids)
     all_messages = tuple(repositories.list_messages(save_id))
+    scene_snapshot = repositories.get_scene_snapshot(save_id)
     return _ContextUpdateReadSnapshot(
         all_messages=all_messages,
         messages=tuple(message for message in all_messages if message.id in source_ids),
-        scene_snapshot=repositories.get_scene_snapshot(save_id),
+        scene_snapshot=scene_snapshot,
         locations=tuple(repositories.list_locations(save_id)),
         characters=tuple(repositories.list_characters(save_id)),
         active_threads=tuple(
@@ -645,7 +646,15 @@ def _load_context_update_read_snapshot(
             if active_thread_is_prompt_visible(thread)
         ),
         entity_links=tuple(repositories.list_entity_links(save_id)),
-        scene_facts=tuple(repositories.list_scene_facts(save_id)),
+        scene_facts=tuple(
+            repositories.list_scene_facts(
+                save_id,
+                scene_snapshot_id=(scene_snapshot.id if scene_snapshot else None),
+                scene_generation=(
+                    scene_snapshot.scene_generation if scene_snapshot else None
+                ),
+            )
+        ),
         memories=tuple(repositories.list_memories(save_id)),
         world_state=tuple(repositories.list_world_state(save_id)),
         summaries=tuple(repositories.list_summaries(save_id)),
@@ -4608,7 +4617,7 @@ class _ContextUpdateApplier:
                 source_message_ids=[retirement.source_message_id],
             )
 
-        unique: dict[str, ExtractedSceneFactUpsert] = {}
+        grouped: dict[str, list[ExtractedSceneFactUpsert]] = {}
         conflicts: set[str] = set()
         for upsert in upserts:
             conflict_key = scene_fact_conflict_key(
@@ -4621,13 +4630,18 @@ class _ContextUpdateApplier:
                 target_label=upsert.target_label,
                 aspect=upsert.aspect,
             )
-            existing = unique.get(conflict_key)
-            if existing is not None and existing != upsert:
+            existing = grouped.get(conflict_key, [])
+            if existing and any(
+                _extracted_scene_fact_audit_value(item)
+                != _extracted_scene_fact_audit_value(upsert)
+                for item in existing
+            ):
                 conflicts.add(conflict_key)
                 continue
-            unique[conflict_key] = upsert
+            existing.append(upsert)
+            grouped[conflict_key] = existing
         for conflict_key in sorted(conflicts):
-            rejected = unique.pop(conflict_key)
+            rejected = grouped.pop(conflict_key)[0]
             self.audit_entries.append(
                 self.repositories.add_context_update_audit(
                     save_id=self.save_id,
@@ -4642,45 +4656,46 @@ class _ContextUpdateApplier:
                     source_message_ids=[rejected.source_message_id],
                 )
             )
-        for conflict_key, upsert in unique.items():
-            saved, replaced, refreshed = self.repositories.upsert_scene_fact(
-                save_id=self.save_id,
-                fact_type=upsert.fact_type,
-                subject_type=upsert.subject_type,
-                subject_id=upsert.subject_id,
-                subject_label=upsert.subject_label,
-                target_type=upsert.target_type,
-                target_id=upsert.target_id,
-                target_label=upsert.target_label,
-                aspect=upsert.aspect,
-                value=upsert.value,
-                source_message_id=upsert.source_message_id,
-                evidence_quote=upsert.evidence_quote,
-                reason=upsert.reason,
-                confidence=upsert.confidence,
-            )
-            operation = (
-                "refreshed"
-                if refreshed
-                else "superseded"
-                if replaced
-                else "created"
-            )
-            self._record_applied(
-                operation=operation,
-                entity_type="scene_fact",
-                entity_id=saved.id,
-                field_path=conflict_key,
-                before=(
-                    _scene_fact_audit_value(replaced)
-                    if replaced is not None
-                    else _scene_fact_audit_value(saved) if refreshed else None
-                ),
-                after=_scene_fact_audit_value(saved),
-                reason=upsert.reason,
-                confidence=upsert.confidence,
-                source_message_ids=[upsert.source_message_id],
-            )
+        for conflict_key, fact_upserts in grouped.items():
+            for upsert in fact_upserts:
+                saved, replaced, refreshed = self.repositories.upsert_scene_fact(
+                    save_id=self.save_id,
+                    fact_type=upsert.fact_type,
+                    subject_type=upsert.subject_type,
+                    subject_id=upsert.subject_id,
+                    subject_label=upsert.subject_label,
+                    target_type=upsert.target_type,
+                    target_id=upsert.target_id,
+                    target_label=upsert.target_label,
+                    aspect=upsert.aspect,
+                    value=upsert.value,
+                    source_message_id=upsert.source_message_id,
+                    evidence_quote=upsert.evidence_quote,
+                    reason=upsert.reason,
+                    confidence=upsert.confidence,
+                )
+                operation = (
+                    "refreshed"
+                    if refreshed
+                    else "superseded"
+                    if replaced
+                    else "created"
+                )
+                self._record_applied(
+                    operation=operation,
+                    entity_type="scene_fact",
+                    entity_id=saved.id,
+                    field_path=conflict_key,
+                    before=(
+                        _scene_fact_audit_value(replaced)
+                        if replaced is not None
+                        else _scene_fact_audit_value(saved) if refreshed else None
+                    ),
+                    after=_scene_fact_audit_value(saved),
+                    reason=upsert.reason,
+                    confidence=upsert.confidence,
+                    source_message_ids=[upsert.source_message_id],
+                )
 
     def apply_world_data_enrichment(self, enrichment: WorldDataEnrichment) -> None:
         for location in enrichment.locations:

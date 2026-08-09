@@ -7236,6 +7236,8 @@ def test_edit_narrator_message_reconciliation_prefers_tool_calls(
             "upsert_active_thread",
             "link_entities",
             "record_phone_number_exchange",
+            "upsert_scene_fact",
+            "retire_scene_fact",
         ),
     ]
     request_text = "\n\n".join(

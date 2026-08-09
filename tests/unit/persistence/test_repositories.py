@@ -777,6 +777,71 @@ def test_repositories_scene_fact_refreshes_turn_ttl_and_provenance(
     assert [item.source_message_id for item in refreshed.provenance] == [second.id]
 
 
+def test_scene_fact_source_removal_is_audited_and_archives_last_source(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, first_message_id = _persist_repository_save(repositories)
+    repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        source_message_id=first_message_id,
+    )
+    fact, _, _ = repositories.upsert_scene_fact(
+        save_id=save_id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="brass key",
+        value="on the table",
+        source_message_id=first_message_id,
+        evidence_quote="Ash scratches the glass",
+    )
+    second = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        body="The brass key remains on the table.",
+    )
+    refreshed, _, was_refreshed = repositories.upsert_scene_fact(
+        save_id=save_id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="brass key",
+        value="on the table",
+        source_message_id=second.id,
+        evidence_quote="remains on the table",
+    )
+    assert refreshed.id == fact.id
+    assert was_refreshed is True
+
+    repositories.remove_scene_fact_provenance_for_messages(
+        save_id=save_id,
+        message_ids={first_message_id},
+    )
+    still_active = repositories.get_scene_fact(fact.id)
+    assert still_active is not None
+    assert still_active.archived_at is None
+    assert [source.source_message_id for source in still_active.provenance] == [
+        second.id
+    ]
+
+    repositories.remove_scene_fact_provenance_for_messages(
+        save_id=save_id,
+        message_ids={second.id},
+    )
+    archived = repositories.get_scene_fact(fact.id)
+    assert archived is not None
+    assert archived.archive_reason == "source_removed"
+    audits = [
+        audit
+        for audit in repositories.list_context_update_audit(save_id)
+        if audit.entity_id == fact.id
+    ]
+    assert [audit.operation for audit in audits] == [
+        "provenance_removed",
+        "source_removed",
+    ]
+
+
 def test_repositories_scene_transition_archives_current_facts(
     repositories: PersistenceRepositories,
 ) -> None:
