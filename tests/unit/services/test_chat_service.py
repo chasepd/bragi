@@ -5493,6 +5493,58 @@ def test_character_assessment_scene_presence_candidate_uses_presence_evidence(
     assert candidates[0].value["evidence_quote"] == "presence quote"
 
 
+def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
+    assessment_candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={
+            "action": "leave",
+            "character_name": "Mara",
+            "evidence_quote": "presence quote",
+        },
+        reason="Mara may leave.",
+        confidence=0.9,
+        evidence_source_ids=("message:presence",),
+        evidence_quote="presence quote",
+        candidate_id="scene_presence:mara:leave",
+        candidate_type="scene_presence",
+        character_id="mara",
+    )
+    model_duplicate = replace(
+        assessment_candidate,
+        value={"action": "leave"},
+        reason="Model-authored duplicate candidate.",
+    )
+    model_unique = replace(
+        assessment_candidate,
+        candidate_id="scene_presence:mara:enter",
+        value={"action": "enter"},
+        reason="Model-authored additional candidate.",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Mara leaves if rendered.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(model_duplicate, model_unique),
+    )
+
+    merged = chat_service_module._narrator_spec_with_commit_candidates(
+        spec,
+        (assessment_candidate,),
+    )
+
+    assert merged is not None
+    assert merged.state_commit_candidates == (
+        model_unique,
+        assessment_candidate,
+    )
+
+
 def test_submit_player_turn_queues_verified_learned_memory_when_confirmation_enabled(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -7743,18 +7743,20 @@ def _narrator_spec_with_commit_candidates(
 ) -> NarratorMessageSpec | None:
     if spec is None or not candidates:
         return spec
-    existing_ids = {
+    assessment_candidate_ids = {
         candidate.candidate_id
-        for candidate in spec.state_commit_candidates
+        for candidate in candidates
         if candidate.candidate_id
     }
-    merged = list(spec.state_commit_candidates)
-    for candidate in candidates:
-        if candidate.candidate_id and candidate.candidate_id in existing_ids:
-            continue
-        merged.append(candidate)
-        if candidate.candidate_id:
-            existing_ids.add(candidate.candidate_id)
+    merged = [
+        candidate
+        for candidate in spec.state_commit_candidates
+        if not (
+            candidate.candidate_id
+            and candidate.candidate_id in assessment_candidate_ids
+        )
+    ]
+    merged.extend(candidates)
     return replace(spec, state_commit_candidates=tuple(merged))
 
 

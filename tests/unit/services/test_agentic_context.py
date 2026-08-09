@@ -2518,6 +2518,118 @@ def test_planner_prompt_instructs_batched_intents_and_knowledge_candidates() -> 
     assert "never invent target ids" in system_body
 
 
+def test_narrator_planner_rejects_malformed_candidate_value_shapes(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player_message = repositories.list_messages(save.id)[0]
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="Keep it grounded while I climb toward the beacon lens.",
+    )
+    lio = repositories.add_character(save_id=save.id, name="Lio", met=True)
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_plan": {
+                "intent": "Answer the player move.",
+                "thesis": "The scene settles.",
+                "narrative_beats": [],
+                "required_facts": [],
+                "must_say": [],
+                "avoid": [],
+                "agency_constraints": [],
+                "tone": "grounded",
+                "uncertainties": [],
+                "evidence_source_ids": [f"message:{player_message.id}"],
+                "npc_intents": [],
+                "state_commit_candidates": [
+                    {
+                        "candidate_id": "presence:bad-action",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "teleport"},
+                        "character_id": lio.id,
+                        "reason": "Bad action.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "memory:no-body",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "value": {},
+                        "character_id": lio.id,
+                        "reason": "No body.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "presence:valid",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "enter"},
+                        "character_id": lio.id,
+                        "reason": "Lio enters.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                ],
+            }
+        }
+    )
+    planner = StructuredProviderNarratorPlanner(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="planner",
+        repositories=repositories,
+    )
+    request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(ChatMessage(role="player", body=player_message.body),),
+        context_breakdown={
+            "sources": [
+                {
+                    "source_type": "message",
+                    "source_id": player_message.id,
+                    "included": True,
+                },
+                {
+                    "source_type": "character",
+                    "source_id": lio.id,
+                    "included": True,
+                },
+            ]
+        },
+    )
+
+    spec = asyncio.run(planner.plan(save_id=save.id, request=request))
+
+    assert {
+        (rejection.candidate_id, rejection.reason)
+        for rejection in spec.planner_rejections
+    } == {
+        ("presence:bad-action", "unsupported_scene_presence_action"),
+        ("memory:no-body", "missing_memory_body"),
+    }
+    assert [candidate.candidate_id for candidate in spec.state_commit_candidates] == [
+        "presence:valid"
+    ]
+
+
 def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
     repositories: PersistenceRepositories,
 ) -> None:

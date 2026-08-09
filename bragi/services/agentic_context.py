@@ -3000,6 +3000,12 @@ def _validated_narrator_message_spec(
     rejections: list[PlannerRejection] = []
     candidates: list[StateCommitCandidate] = []
     for candidate in spec.state_commit_candidates:
+        value_shape_rejection = _state_commit_candidate_value_shape_rejection(
+            candidate
+        )
+        if value_shape_rejection is not None:
+            rejections.append(value_shape_rejection)
+            continue
         invalid_source_id = next(
             (
                 source_id
@@ -3320,6 +3326,54 @@ def _candidate_target_rejection(
             field_name="target_id",
             rejected_value=target_id,
         )
+    return None
+
+
+_SCENE_PRESENCE_VALUE_ACTIONS = frozenset(
+    {"enter", "present", "add", "leave", "absent", "remove", "stay"}
+)
+
+
+def _state_commit_candidate_value_shape_rejection(
+    candidate: StateCommitCandidate,
+) -> PlannerRejection | None:
+    """Reject candidates whose free-form value cannot drive a state write.
+
+    The planner schema leaves state_commit_candidate.value free-form, but the
+    apply paths read structured fields out of it. Validate those fields
+    deterministically here so malformed candidates are visible planner
+    rejections instead of silent apply-time skips.
+    """
+    if candidate.candidate_type == "scene_presence":
+        action = _string(candidate.value.get("action")).lower()
+        if action not in _SCENE_PRESENCE_VALUE_ACTIONS:
+            return _planner_rejection(
+                candidate=candidate,
+                reason="unsupported_scene_presence_action",
+                field_name="value.action",
+                rejected_value=action,
+            )
+        return None
+    if candidate.candidate_type == "character_learned_memory":
+        body = _string(candidate.value.get("body"))
+        if not body:
+            return _planner_rejection(
+                candidate=candidate,
+                reason="missing_memory_body",
+                field_name="value.body",
+                rejected_value="",
+            )
+        return None
+    if candidate.candidate_type == "character_knowledge_edge":
+        target_type = _string(candidate.value.get("target_type"))
+        target_id = _string(candidate.value.get("target_id"))
+        if not target_type or not target_id:
+            return _planner_rejection(
+                candidate=candidate,
+                reason="missing_knowledge_edge_target",
+                field_name="value.target_type",
+                rejected_value="",
+            )
     return None
 
 
