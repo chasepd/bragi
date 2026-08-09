@@ -500,13 +500,30 @@ def _coverage_character_names(
     *,
     characters: tuple[CharacterRecord, ...],
 ) -> frozenset[str]:
-    covered_ids = _coverage_character_ids(coverage, key_suffix)
-    if not covered_ids:
+    covered_slugs = _coverage_character_ids(coverage, key_suffix)
+    if not covered_slugs:
         return frozenset()
     return frozenset(
         character.name.strip().casefold()
         for character in characters
-        if character.id in covered_ids and character.name.strip()
+        if _continuity_key_slug(character.name) in covered_slugs
+        and character.name.strip()
+    )
+
+
+def _coverage_character_records(
+    coverage: VerifiedPostTurnCoverage,
+    key_suffix: str,
+    *,
+    characters: tuple[CharacterRecord, ...],
+) -> frozenset[str]:
+    covered_slugs = _coverage_character_ids(coverage, key_suffix)
+    if not covered_slugs:
+        return frozenset()
+    return frozenset(
+        character.id
+        for character in characters
+        if _continuity_key_slug(character.name) in covered_slugs
     )
 
 
@@ -552,31 +569,38 @@ def _filter_focused_maintenance_for_verified_coverage(
         if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_THREAD_CLOCK)
         else maintenance.active_thread_updates
     )
-    covered_relationship_ids = _coverage_character_ids(
+    covered_relationship_ids = _coverage_character_records(
         coverage,
         "relationships",
+        characters=characters,
     )
-    character_relationships = (
-        ()
-        if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_RELATIONSHIP)
-        and not covered_relationship_ids
-        else tuple(
+    if (
+        _coverage_covers_domain(coverage, POST_TURN_DOMAIN_RELATIONSHIP)
+        and covered_relationship_ids
+    ):
+        character_relationships = tuple(
             relationship
             for relationship in maintenance.character_relationships
             if relationship.character_id not in covered_relationship_ids
         )
+    else:
+        character_relationships = maintenance.character_relationships
+    covered_emotion_ids = _coverage_character_records(
+        coverage,
+        "current_emotional_state",
+        characters=characters,
     )
-    covered_emotion_ids = _coverage_character_ids(coverage, "current_emotional_state")
-    character_emotions = (
-        ()
-        if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_EMOTIONAL)
-        and not covered_emotion_ids
-        else tuple(
+    if (
+        _coverage_covers_domain(coverage, POST_TURN_DOMAIN_EMOTIONAL)
+        and covered_emotion_ids
+    ):
+        character_emotions = tuple(
             emotion
             for emotion in maintenance.character_emotions
             if emotion.character_id not in covered_emotion_ids
         )
-    )
+    else:
+        character_emotions = maintenance.character_emotions
     return replace(
         maintenance,
         scene_updates=scene_updates,

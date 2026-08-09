@@ -6384,7 +6384,7 @@ def test_plan_owned_accepted_turn_does_not_trigger_duplicate_inference(
     assert "context_observation_extraction" not in events
     assert "world_time_reconciliation" not in events
     assert [state.key for state in repositories.list_world_state(save.id)] == [
-        f"character.{mara.id}.current_emotional_state"
+        "character.mara.current_emotional_state"
     ]
     snapshot = repositories.get_scene_snapshot(save.id)
     assert snapshot is not None
@@ -6686,11 +6686,11 @@ def test_submit_player_turn_applies_planned_character_world_state_effects(
     state_by_key = {
         state.key: state.value for state in repositories.list_world_state(save.id)
     }
-    assert state_by_key[f"character.{mara.id}.physical_state"] == {
+    assert state_by_key["character.mara.physical_state"] == {
         "appearance": "bruised"
     }
-    assert state_by_key[f"character.{mara.id}.relationships"] == {"Ily": "wary"}
-    assert state_by_key[f"character.{mara.id}.current_emotional_state"] == {
+    assert state_by_key["character.mara.relationships"] == {"Ily": "wary"}
+    assert state_by_key["character.mara.current_emotional_state"] == {
         "mood": "tense"
     }
     assert state_by_key["keep.supplies"] == {"arrows": 3}
@@ -6714,7 +6714,7 @@ def test_submit_player_turn_applies_planned_character_world_state_effects(
         "emotional",
         "resource",
     }
-    assert f"character.{mara.id}.physical_state" in coverage["state_keys"]
+    assert "character.mara.physical_state" in coverage["state_keys"]
     reloaded_coverage = _verified_post_turn_coverage_for_turn(
         repositories=repositories,
         save_id=save.id,
@@ -6723,11 +6723,9 @@ def test_submit_player_turn_applies_planned_character_world_state_effects(
         ],
         narrator_message_id=narrator_message_id,
     )
-    assert f"character.{mara.id}.physical_state" in reloaded_coverage.state_keys
-    assert f"character.{mara.id}.relationships" in reloaded_coverage.state_keys
-    assert f"character.{mara.id}.current_emotional_state" in (
-        reloaded_coverage.state_keys
-    )
+    assert "character.mara.physical_state" in reloaded_coverage.state_keys
+    assert "character.mara.relationships" in reloaded_coverage.state_keys
+    assert "character.mara.current_emotional_state" in reloaded_coverage.state_keys
     assert reloaded_coverage.applied_domains == frozenset(
         coverage["applied_domains"]
     )
@@ -23004,7 +23002,7 @@ def test_submit_player_turn_merges_multiple_planned_relationship_changes(
     state_by_key = {
         state.key: state.value for state in repositories.list_world_state(save.id)
     }
-    assert state_by_key[f"character.{mara.id}.relationships"] == {
+    assert state_by_key["character.mara.relationships"] == {
         "Ily": "wary",
         "Bo": "trusting",
     }

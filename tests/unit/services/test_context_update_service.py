@@ -8712,7 +8712,7 @@ def test_filter_extraction_for_verified_coverage_suppresses_covered_domains(
 ) -> None:
     module = _context_update_module()
     save, player_message, narrator_message = _save_with_completed_turn(repositories)
-    character = repositories.add_character(
+    repositories.add_character(
         save_id=save.id,
         name="Captain Ilyra",
         source_message_id=player_message.id,
@@ -8795,7 +8795,7 @@ def test_filter_extraction_for_verified_coverage_suppresses_covered_domains(
                 }
             ),
             state_keys=frozenset(
-                {f"character.{character.id}.physical_state"}
+                {"character.captain_ilyra.physical_state"}
             ),
             committed_count=3,
         ),
@@ -8937,6 +8937,12 @@ def test_filter_focused_maintenance_for_verified_coverage_drops_covered_domains(
                     POST_TURN_DOMAIN_EMOTIONAL,
                 }
             ),
+            state_keys=frozenset(
+                {
+                    "character.captain_ilyra.relationships",
+                    "character.captain_ilyra.current_emotional_state",
+                }
+            ),
             committed_count=3,
         ),
         current_snapshot=repositories.get_scene_snapshot(save.id),
@@ -9055,7 +9061,7 @@ def test_filter_extraction_preserves_uncovered_characters_in_covered_domain(
         extraction,
         coverage=VerifiedPostTurnCoverage(
             applied_domains=frozenset({POST_TURN_DOMAIN_PHYSICAL}),
-            state_keys=frozenset({f"character.{mara.id}.physical_state"}),
+            state_keys=frozenset({"character.mara.physical_state"}),
             committed_count=1,
         ),
         request=request,

@@ -132,6 +132,7 @@ from bragi.services.context_update_service import (
     StructuredProviderContextUpdater,
     ToolCallingFocusedSceneMaintainer,
     ToolCallingProviderContextUpdater,
+    _continuity_key_slug,
 )
 from bragi.services.continuity_index_service import ContinuityIndexService
 from bragi.services.dating_route_profile_service import (
@@ -7934,6 +7935,14 @@ def _apply_verified_planned_commits(
     planner_rejections = tuple(
         narrator_spec.planner_rejections if narrator_spec else ()
     )
+    candidates = tuple(
+        _resolved_character_state_candidate(
+            repositories,
+            save_id=save_id,
+            candidate=candidate,
+        )
+        for candidate in candidates
+    )
     diagnostics = _planned_commit_diagnostics(candidates, planner_rejections)
     coverage = _empty_verified_coverage(
         source_message_ids=_canonical_turn_source_message_ids(
@@ -7955,6 +7964,7 @@ def _apply_verified_planned_commits(
             save_id=save_id,
             message_id=narrator_message_id,
             source_message_ids=coverage.source_message_ids,
+            candidates=candidates,
             narrator_spec=narrator_spec,
             verification_result=verification_result,
             coverage=coverage,
@@ -8068,6 +8078,7 @@ def _apply_verified_planned_commits(
         save_id=save_id,
         message_id=narrator_message_id,
         source_message_ids=coverage.source_message_ids,
+        candidates=candidates,
         narrator_spec=narrator_spec,
         verification_result=verification_result,
         coverage=coverage,
@@ -8082,6 +8093,7 @@ def _persist_turn_outcome(
     save_id: str,
     message_id: str,
     source_message_ids: tuple[str, ...],
+    candidates: tuple[StateCommitCandidate, ...],
     narrator_spec: NarratorMessageSpec | None,
     verification_result: NarratorVerificationResult | None,
     coverage: VerifiedPostTurnCoverage,
@@ -8089,9 +8101,7 @@ def _persist_turn_outcome(
 ) -> None:
     candidates_by_id = {
         candidate.candidate_id: candidate
-        for candidate in (
-            narrator_spec.state_commit_candidates if narrator_spec is not None else ()
-        )
+        for candidate in candidates
         if candidate.candidate_id
     }
     effects: list[TurnOutcomeEffect] = []
@@ -9270,6 +9280,43 @@ def _character_relationships_state_key(character_id: str) -> str:
     return character_relationships_state_key(character_id)
 
 
+_PLANNED_CHARACTER_STATE_KEY_SUFFIXES = {
+    "physical_change": "physical_state",
+    "emotional_change": "current_emotional_state",
+    "relationship_change": "relationships",
+}
+
+
+def _resolved_character_state_candidate(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    candidate: StateCommitCandidate,
+) -> StateCommitCandidate:
+    """Resolve character-domain effects to the name-slug state keys that
+    narration context assembly reads, matching the legacy extraction
+    convention (character.<slug>.<field>)."""
+    suffix = _PLANNED_CHARACTER_STATE_KEY_SUFFIXES.get(candidate.candidate_type)
+    if suffix is None or candidate.state_key:
+        return candidate
+    character_id = candidate.character_id or _string_mapping_value(
+        candidate.value,
+        "character_id",
+    )
+    if not character_id:
+        return candidate
+    character = repositories.get_character(character_id)
+    if character is None or character.save_id != save_id:
+        return candidate
+    slug = _continuity_key_slug(character.name)
+    if not slug:
+        return candidate
+    return replace(
+        candidate,
+        state_key=f"character.{slug}.{suffix}",
+    )
+
+
 def _apply_physical_change_candidate(
     *,
     repositories: PersistenceRepositories,
@@ -9607,16 +9654,10 @@ def _apply_active_thread_change_candidate(
     title = _string_mapping_value(candidate.value, "title")
     if not title:
         return "skipped", "missing_thread_title", False
-    status = (
-        _string_mapping_value(candidate.value, "status").lower()
-        or "active"
-    )
-    if status not in {"active", "resolved", "archived", "paused"}:
-        return "skipped", "unsupported_thread_status", False
-    description = _string_mapping_value(candidate.value, "description")
+    raw_status = _string_mapping_value(candidate.value, "status").lower()
     raw_priority = candidate.value.get("priority")
-    priority = int(raw_priority) if isinstance(raw_priority, int) else 0
-    visibility = _string_mapping_value(candidate.value, "visibility") or "public"
+    raw_visibility = _string_mapping_value(candidate.value, "visibility")
+    description = _string_mapping_value(candidate.value, "description")
     related_entities = _string_list_mapping_value(
         candidate.value,
         "related_entities",
@@ -9624,6 +9665,11 @@ def _apply_active_thread_change_candidate(
     thread = _matching_active_thread(repositories, save_id, title)
     source_message_id = narrator_message_id
     if thread is None:
+        status = raw_status or "active"
+        if status not in {"active", "resolved", "archived", "paused"}:
+            return "skipped", "unsupported_thread_status", False
+        priority = int(raw_priority) if isinstance(raw_priority, int) else 0
+        visibility = raw_visibility or "public"
         created = repositories.add_active_thread(
             save_id=save_id,
             title=title,
@@ -9661,15 +9707,19 @@ def _apply_active_thread_change_candidate(
         ("title", "description", "status", "priority", "visibility", "related_entities")
     ):
         return "skipped", "locked_active_thread_field", False
+    status = raw_status or thread.status
+    if status not in {"active", "resolved", "archived", "paused"}:
+        return "skipped", "unsupported_thread_status", False
+    priority = int(raw_priority) if isinstance(raw_priority, int) else thread.priority
+    visibility = raw_visibility or thread.visibility
     resolved_description = description or thread.description
-    resolved_visibility = visibility or thread.visibility
     resolved_related = related_entities or thread.related_entities
     if (
         thread.title == title
         and thread.description == resolved_description
         and thread.status == status
         and thread.priority == priority
-        and thread.visibility == resolved_visibility
+        and thread.visibility == visibility
         and thread.related_entities == resolved_related
     ):
         return "committed", "active_thread_unchanged", False
@@ -9680,7 +9730,7 @@ def _apply_active_thread_change_candidate(
             description=resolved_description,
             status=status,
             priority=priority,
-            visibility=resolved_visibility,
+            visibility=visibility,
             related_entities=resolved_related,
             source_message_id=source_message_id,
             last_updated_message_id=source_message_id,
