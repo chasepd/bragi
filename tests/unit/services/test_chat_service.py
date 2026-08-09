@@ -20400,6 +20400,62 @@ def test_scenario_evolution_not_due_records_configured_interval_skip_job(
     assert len(provider.structured_output_requests) == 1
 
 
+def test_scenario_evolution_interval_anchors_player_only_tone_update(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"tone_genre": "Tense frontier fantasy."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    source_player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I turn the grim watch into an irreverent adventure.",
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The first watch ends in laughter.",
+    )
+    repositories.record_save_scenario_evolution(
+        save_id=save.id,
+        title=scenario.title,
+        premise=scenario.premise,
+        player_role=scenario.player_role,
+        content={"tone_genre": "Irreverent frontier fantasy."},
+        reason="tone_genre: The player redirected the tone.",
+        provider="fake",
+        model="fake-scenario-evolution",
+        source_message_id=source_player.id,
+        source_message_ids=(source_player.id,),
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I crack another joke during the watch.",
+    )
+    next_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The guards struggle not to laugh.",
+    )
+
+    due = chat_service_module._scenario_evolution_due(
+        repositories=repositories,
+        save_id=save.id,
+        narrator_message_id=next_narrator.id,
+        turn_interval=2,
+    )
+
+    assert due.due is False
+    assert due.narrator_turns_since_update == 1
+    assert due.skip_reason == "not_due"
+
+
 def test_retired_character_interaction_state_extraction_has_no_special_guidance(
     repositories: PersistenceRepositories,
 ) -> None:

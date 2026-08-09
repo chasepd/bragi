@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -186,7 +187,10 @@ def _create_full_roleplay_save(
         content={
             "current_scene": "The warden stands at the lower gate.",
             "lore": "The red lens is hidden in the tower.",
-            "tone": "Tense but hopeful",
+            "tone_genre": "Tense but hopeful.",
+            "_source": {
+                "generation_prompt": "Keep every scene relentlessly grim.",
+            },
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
@@ -576,6 +580,71 @@ def test_structured_evolver_builds_schema_messages_and_parses_content_updates(
     asyncio.run(run())
 
 
+def test_structured_evolver_accepts_tone_only_from_current_player(
+    repositories: PersistenceRepositories,
+) -> None:
+    async def run() -> None:
+        save_id, _scenario_id, _message_id = _create_full_roleplay_save(repositories)
+        player = repositories.append_message(
+            save_id=save_id,
+            role="player",
+            body="I turn the ordeal into a running joke and keep everyone laughing.",
+        )
+        narrator = repositories.append_message(
+            save_id=save_id,
+            role="narrator",
+            body="The gallery answers with unexpectedly playful banter.",
+        )
+        messages = (player, narrator)
+        provider = FakeStructuredProvider(
+            {
+                "change_type": "phase_shift",
+                "updates": [
+                    {
+                        "section_id": "tone_genre",
+                        "text": (
+                            "A playful fantasy adventure driven by dry banter, "
+                            "while retaining the setting's underlying danger."
+                        ),
+                        "reason": "The player is consistently steering toward comedy.",
+                        "source_message_id": player.id,
+                    }
+                ],
+            }
+        )
+
+        evolution = await StructuredProviderScenarioEvolver(
+            provider=provider,
+            provider_name="fake",
+            model_id="fake-structured",
+        ).evolve(
+            ScenarioEvolutionRequest(
+                save_id=save_id,
+                messages=messages,
+                tone_evidence_messages=(player,),
+            ),
+            repositories=repositories,
+        )
+
+        request = provider.requests[0]
+        properties = cast(dict[str, Any], request.schema["properties"])
+        updates = cast(dict[str, Any], properties["updates"])
+        items = cast(dict[str, Any], updates["items"])
+        branches = cast(list[dict[str, Any]], items["anyOf"])
+        tone_properties = cast(dict[str, Any], branches[1]["properties"])
+        assert tone_properties["section_id"]["enum"] == ["tone_genre"]
+        assert tone_properties["source_message_id"]["enum"] == [player.id]
+        prompt = "\n".join(message.body for message in request.messages)
+        assert "Recent player-authored tone evidence" in prompt
+        assert player.body in prompt
+        assert "never tone evidence" in prompt
+        assert "Keep every scene relentlessly grim" not in prompt
+        assert evolution.updates[0].section_id == "tone_genre"
+        assert evolution.updates[0].source_message_id == player.id
+
+    asyncio.run(run())
+
+
 def test_tool_calling_evolver_parses_section_updates(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -624,6 +693,85 @@ def test_tool_calling_evolver_parses_section_updates(
             "update_scenario_section",
             "skip_scenario_evolution",
         ]
+
+    asyncio.run(run())
+
+
+def test_tool_calling_evolver_retries_narrator_attributed_tone_update(
+    repositories: PersistenceRepositories,
+) -> None:
+    async def run() -> None:
+        save_id, _scenario_id, _message_id = _create_full_roleplay_save(repositories)
+        player = repositories.append_message(
+            save_id=save_id,
+            role="player",
+            body="I keep puncturing the solemn ritual with irreverent jokes.",
+        )
+        narrator = repositories.append_message(
+            save_id=save_id,
+            role="narrator",
+            body="The solemn chamber dissolves into laughter.",
+        )
+        provider = FakeToolProvider(
+            [
+                (
+                    ProviderToolCall(
+                        id="call-bad-tone",
+                        name="update_scenario_tone",
+                        arguments_json=json.dumps(
+                            {
+                                "text": "Playful and irreverent.",
+                                "reason": "The narrator became funny.",
+                                "source_message_id": narrator.id,
+                            }
+                        ),
+                    ),
+                ),
+                (
+                    ProviderToolCall(
+                        id="call-tone",
+                        name="update_scenario_tone",
+                        arguments_json=json.dumps(
+                            {
+                                "text": "Playful and irreverent.",
+                                "reason": "The player keeps redirecting toward comedy.",
+                                "source_message_id": player.id,
+                            }
+                        ),
+                    ),
+                ),
+            ]
+        )
+
+        evolution = await ToolCallingProviderScenarioEvolver(
+            provider=provider,
+            provider_name="fake",
+            model_id="fake-tools",
+        ).evolve(
+            ScenarioEvolutionRequest(
+                save_id=save_id,
+                messages=(player, narrator),
+                tone_evidence_messages=(player,),
+            ),
+            repositories=repositories,
+        )
+
+        assert evolution.updates == (
+            ScenarioSectionUpdate(
+                section_id="tone_genre",
+                text="Playful and irreverent.",
+                reason="The player keeps redirecting toward comedy.",
+                source_message_id=player.id,
+            ),
+        )
+        assert [tool.name for tool in provider.tool_requests[0].tools] == [
+            "update_scenario_section",
+            "update_scenario_tone",
+            "skip_scenario_evolution",
+        ]
+        assert "source_message_id must be one of" in (
+            provider.tool_requests[1].messages[-1].body
+        )
 
     asyncio.run(run())
 
@@ -1478,6 +1626,135 @@ def test_apply_evolution_persists_save_specific_update_without_mutating_base(
     assert json.loads(base_scenario.content_json)["current_scene"] == (
         "The warden stands at the lower gate."
     )
+
+
+def test_apply_evolution_persists_player_attributed_tone_only(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, scenario_id, narrator_message_id = _create_full_roleplay_save(
+        repositories
+    )
+    player = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        body="I keep this dangerous journey light with quick, irreverent banter.",
+    )
+    service = ScenarioEvolutionService(
+        repositories=repositories,
+        evolver=StructuredProviderScenarioEvolver(
+            provider=FakeStructuredProvider({}),
+            provider_name="fake",
+            model_id="fake-structured",
+        ),
+        provider_name="fake",
+        model_id="fake-structured",
+    )
+    evolution = ScenarioEvolution(
+        updates=(
+            ScenarioSectionUpdate(
+                section_id="tone_genre",
+                text="Playful fantasy danger shaped by quick, irreverent banter.",
+                reason="The player has durably redirected the register.",
+                source_message_id=player.id,
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="current player message"):
+        service.apply_evolution(
+            save_id=save_id,
+            evolution=ScenarioEvolution(
+                updates=(
+                    replace(
+                        evolution.updates[0],
+                        source_message_id=narrator_message_id,
+                    ),
+                )
+            ),
+            allowed_source_message_ids=(player.id, narrator_message_id),
+            allowed_tone_source_message_ids=(player.id,),
+        )
+
+    update = service.apply_evolution(
+        save_id=save_id,
+        evolution=evolution,
+        allowed_source_message_ids=(player.id, narrator_message_id),
+        allowed_tone_source_message_ids=(player.id,),
+    )
+
+    assert update is not None
+    assert update.source_message_id == player.id
+    assert json.loads(update.content_json)["tone_genre"] == (
+        "Playful fantasy danger shaped by quick, irreverent banter."
+    )
+    base = repositories.get_scenario(scenario_id)
+    assert base is not None
+    assert json.loads(base.content_json)["tone_genre"] == "Tense but hopeful."
+    effective = repositories.load_save_details(save_id)
+    assert effective is not None
+    assert json.loads(effective.scenario.content_json)["tone_genre"] == (
+        "Playful fantasy danger shaped by quick, irreverent banter."
+    )
+
+
+def test_evolve_after_turn_uses_recent_player_tone_evidence_at_source_boundary(
+    repositories: PersistenceRepositories,
+) -> None:
+    class CapturingEvolver:
+        request: ScenarioEvolutionRequest | None = None
+
+        async def evolve(
+            self,
+            request: ScenarioEvolutionRequest,
+            *,
+            repositories: PersistenceRepositories,
+        ) -> ScenarioEvolution:
+            self.request = request
+            return ScenarioEvolution(skip_reason="no_phase_shift")
+
+    async def run() -> None:
+        save_id, _scenario_id, _opening_id = _create_full_roleplay_save(repositories)
+        players = []
+        narrators = []
+        for index in range(10):
+            players.append(
+                repositories.append_message(
+                    save_id=save_id,
+                    role="player",
+                    body=f"Player direction {index}.",
+                )
+            )
+            narrators.append(
+                repositories.append_message(
+                    save_id=save_id,
+                    role="narrator",
+                    body=f"Narrator response {index}.",
+                )
+            )
+        evolver = CapturingEvolver()
+        service = ScenarioEvolutionService(
+            repositories=repositories,
+            evolver=cast(Any, evolver),
+            provider_name="fake",
+            model_id="fake-structured",
+        )
+
+        await service.evolve_after_turn(
+            save_id=save_id,
+            source_message_ids=(players[8].id, narrators[8].id),
+        )
+
+        assert evolver.request is not None
+        assert [message.body for message in evolver.request.tone_evidence_messages] == [
+            f"Player direction {index}." for index in range(1, 9)
+        ]
+        assert players[9] not in evolver.request.tone_evidence_messages
+        assert all(
+            message.role == "player"
+            for message in evolver.request.tone_evidence_messages
+        )
+
+    asyncio.run(run())
 
 
 def test_apply_evolution_rejects_invalid_sections_and_repairs_unknown_sources(
