@@ -1565,6 +1565,7 @@ class ChatBundleService:
                 payload=remap_turn_outcome_payload(
                     payload,
                     message_id_map=message_id_map,
+                    save_id=save.id,
                 ),
             )
             turn_outcome_id_map[original_id] = outcome_record.id
@@ -6125,8 +6126,11 @@ def _bundle_payload_references_messages(
             return False
         return any(
             isinstance(item, str)
-            and item.startswith("message:")
-            and item.removeprefix("message:") in message_ids
+            and (
+                item.startswith("message:")
+                and item.removeprefix("message:") in message_ids
+                or item in message_ids
+            )
             for item in refs
         )
 

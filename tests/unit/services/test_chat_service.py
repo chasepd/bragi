@@ -6964,6 +6964,163 @@ def test_submit_player_turn_applies_planned_world_time_change(
     }
 
 
+def test_submit_player_turn_skips_planned_world_time_change_for_locked_field(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara watches the beacon lens.",
+        in_world_time="morning",
+        time_of_day="morning",
+        locked_fields=["time_of_day"],
+    )
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene_snapshot.in_world_time",
+        value={"time_of_day": "evening", "evidence_quote": "evening comes"},
+        reason="Evening comes to the keep.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="evening comes",
+        candidate_id="world_time_change:evening",
+        candidate_type="world_time_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Evening comes.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(candidate,),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("evening comes to the ash-darkened keep.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(_commit_decision(candidate))
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I wait through the day.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert snapshot is not None
+    assert snapshot.time_of_day == "morning"
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["committed_count"] == 0
+    assert {
+        decision["reason"] for decision in planned["decisions"]
+    } == {"locked_world_time_field"}
+
+
+def test_submit_player_turn_planned_world_time_change_is_noop_when_unchanged(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara watches the beacon lens.",
+        in_world_time="evening",
+        time_of_day="evening",
+    )
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene_snapshot.in_world_time",
+        value={"time_of_day": "evening", "evidence_quote": "evening holds"},
+        reason="Evening holds.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="evening holds",
+        candidate_id="world_time_change:evening",
+        candidate_type="world_time_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Evening holds.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(candidate,),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("evening holds over the ash-darkened keep.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(_commit_decision(candidate))
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I watch the evening.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert snapshot is not None
+    assert snapshot.time_of_day == "evening"
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["committed_count"] == 1
+    assert planned["decisions"][0]["changed"] is False
+
+
 def test_plan_owned_post_turn_mode_falls_back_when_commits_still_need_updates(
     repositories: PersistenceRepositories,
 ) -> None:

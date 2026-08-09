@@ -9503,6 +9503,7 @@ def _apply_character_world_state_effect(
     source_message_id = (
         _state_source_message_id(candidate) or narrator_message_id
     )
+    category = _planned_world_state_category(candidate.candidate_type)
     before = _find_world_state_record(repositories.list_world_state(save_id), key)
     if before is not None and before.value == value:
         return "committed", reason_key, False
@@ -9510,7 +9511,7 @@ def _apply_character_world_state_effect(
         save_id=save_id,
         key=key,
         value=value,
-        category="scene",
+        category=category,
         confidence=candidate.confidence or 1.0,
         source_message_id=source_message_id,
     )
@@ -9522,6 +9523,9 @@ def _apply_character_world_state_effect(
         before_json=_json_dumps_compact(before.value) if before is not None else None,
         after_json=_json_dumps_compact(value),
     )
+    audit_source_message_ids = (
+        _state_source_message_ids(candidate) or [source_message_id]
+    )
     repositories.add_context_update_audit(
         save_id=save_id,
         operation="updated" if before is not None else "created",
@@ -9532,13 +9536,19 @@ def _apply_character_world_state_effect(
         after=value,
         reason=reason,
         confidence=candidate.confidence or 1.0,
-        source_message_ids=[
-            source_id
-            for source_id in _state_source_message_ids(candidate)
-            if source_id
-        ],
+        source_message_ids=audit_source_message_ids,
     )
     return "committed", reason_key, True
+
+
+def _planned_world_state_category(candidate_type: str) -> str:
+    if candidate_type in {
+        "physical_change",
+        "emotional_change",
+        "relationship_change",
+    }:
+        return "scene"
+    return "world_state"
 
 
 def _state_source_message_id(candidate: StateCommitCandidate) -> str | None:
@@ -9551,7 +9561,13 @@ def _state_source_message_ids(candidate: StateCommitCandidate) -> list[str]:
     if isinstance(raw, list):
         return [str(item) for item in raw if str(item).strip()]
     message_id = _state_source_message_id(candidate)
-    return [message_id] if message_id else []
+    if message_id:
+        return [message_id]
+    return [
+        source_id.removeprefix("message:")
+        for source_id in candidate.evidence_source_ids
+        if source_id.startswith("message:") and source_id != "message:latest"
+    ]
 
 
 def _json_dumps_compact(value: dict[str, object]) -> str:
@@ -9632,7 +9648,10 @@ def _apply_active_thread_change_candidate(
             },
             reason=candidate.reason or "Applied planned active thread change.",
             confidence=candidate.confidence or 1.0,
-            source_message_ids=[player_message_id, narrator_message_id],
+            source_message_ids=(
+                _state_source_message_ids(candidate)
+                or [player_message_id, narrator_message_id]
+            ),
         )
         return "committed", "created_active_thread", True
     locked_fields = set(thread.locked_fields)
@@ -9685,7 +9704,10 @@ def _apply_active_thread_change_candidate(
         },
         reason=candidate.reason or "Applied planned active thread change.",
         confidence=candidate.confidence or 1.0,
-        source_message_ids=[player_message_id, narrator_message_id],
+        source_message_ids=(
+            _state_source_message_ids(candidate)
+            or [player_message_id, narrator_message_id]
+        ),
     )
     return "committed", "updated_active_thread", True
 
@@ -9764,6 +9786,32 @@ def _apply_world_time_change_candidate(
         legacy_world_day_index=snapshot.world_day_index,
     )
     legacy_fields = legacy_world_time_fields(display_world_time)
+    proposed_time_of_day = cast(str, legacy_fields["time_of_day"])
+    proposed_day_of_week = cast(str, legacy_fields["day_of_week"])
+
+    def time_field_changed(field: str, new_value: object) -> bool:
+        current = cast(object, getattr(snapshot, field))
+        if field == "world_day_index":
+            return bool((new_value or 0) != (current or 0))
+        return bool(new_value != current)
+
+    changed_fields = [
+        field
+        for field, new_value in (
+            ("in_world_time", cast(str, legacy_fields["in_world_time"])),
+            ("time_of_day", proposed_time_of_day),
+            ("day_of_week", proposed_day_of_week),
+            ("world_day_index", current_world_day_index),
+        )
+        if time_field_changed(field, new_value)
+    ]
+    if not changed_fields:
+        return "committed", "applied_world_time_change", False
+    if any(
+        scene_snapshot_field_is_locked(snapshot.locked_fields, field)
+        for field in changed_fields
+    ):
+        return "skipped", "locked_world_time_field", False
     from bragi.services.time_loop_time_policy import TimeLoopTimePolicy
 
     loop_policy = TimeLoopTimePolicy(repositories, save_id=save_id)
@@ -9774,8 +9822,8 @@ def _apply_world_time_change_candidate(
         situation=snapshot.situation,
         objective=snapshot.objective,
         in_world_time=cast(str, legacy_fields["in_world_time"]),
-        time_of_day=cast(str, legacy_fields["time_of_day"]),
-        day_of_week=cast(str, legacy_fields["day_of_week"]),
+        time_of_day=proposed_time_of_day,
+        day_of_week=proposed_day_of_week,
         world_day_index=current_world_day_index,
         weather=snapshot.weather,
         mood=snapshot.mood,
@@ -9807,6 +9855,28 @@ def _apply_world_time_change_candidate(
         saved_snapshot,
         transition="planned_world_time_change",
         source_message_id=narrator_message_id,
+    )
+    repositories.add_context_update_audit(
+        save_id=save_id,
+        operation="updated",
+        entity_type="scene_snapshot",
+        entity_id=snapshot.id,
+        field_path="world_time",
+        before={
+            "in_world_time": snapshot.in_world_time,
+            "time_of_day": snapshot.time_of_day,
+            "day_of_week": snapshot.day_of_week,
+            "world_day_index": snapshot.world_day_index,
+        },
+        after={
+            "in_world_time": cast(str, legacy_fields["in_world_time"]),
+            "time_of_day": proposed_time_of_day,
+            "day_of_week": proposed_day_of_week,
+            "world_day_index": current_world_day_index,
+        },
+        reason=candidate.reason or "Applied planned world time change.",
+        confidence=candidate.confidence or 1.0,
+        source_message_ids=[player_message_id, narrator_message_id],
     )
     return "committed", "applied_world_time_change", True
 

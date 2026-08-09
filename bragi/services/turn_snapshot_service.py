@@ -1889,6 +1889,7 @@ class _SnapshotRemapper:
         if not isinstance(raw, dict):
             return raw
         remapped = dict(raw)
+        remapped["save_id"] = self.target_save_id
 
         def remap_refs(refs: object) -> object:
             if not isinstance(refs, list):
@@ -1925,13 +1926,16 @@ class _SnapshotRemapper:
         return remapped
 
     def _remapped_turn_outcome_source_ref(self, source_id: str) -> str:
-        if not source_id.startswith("message:"):
-            return source_id
-        message_id = source_id.removeprefix("message:")
-        mapped = self._mapped_table_id("messages", message_id)
-        if not isinstance(mapped, str) or mapped == message_id:
-            return source_id
-        return f"message:{mapped}"
+        if source_id.startswith("message:"):
+            message_id = source_id.removeprefix("message:")
+            mapped = self._mapped_table_id("messages", message_id)
+            if not isinstance(mapped, str) or mapped == message_id:
+                return source_id
+            return f"message:{mapped}"
+        mapped = self._mapped_table_id("messages", source_id)
+        if isinstance(mapped, str) and mapped != source_id:
+            return mapped
+        return source_id
 
     def _remap_json_id_list(self, value: object, table_name: str) -> object:
         if not isinstance(value, str):

@@ -71,13 +71,6 @@ def planned_effect_domain(candidate_type: str) -> str:
     return PLANNED_EFFECT_TYPE_TO_DOMAIN.get(candidate_type, "unknown")
 
 
-def planned_effect_type(domain: str) -> str | None:
-    for candidate_type, candidate_domain in PLANNED_EFFECT_TYPE_TO_DOMAIN.items():
-        if candidate_domain == domain:
-            return candidate_type
-    return None
-
-
 @dataclass(frozen=True)
 class VerifiedPostTurnCoverage:
     source_message_ids: tuple[str, ...] = ()

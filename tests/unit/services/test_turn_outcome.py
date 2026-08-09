@@ -167,8 +167,10 @@ def test_remap_turn_outcome_payload_remaps_message_refs() -> None:
     remapped = remap_turn_outcome_payload(
         outcome.to_json(),
         message_id_map={"player-1": "player-2", "narrator-1": "narrator-2"},
+        save_id="save-2",
     )
-    assert remapped["source_message_ids"] == ["player-1", "narrator-1"]
+    assert remapped["save_id"] == "save-2"
+    assert remapped["source_message_ids"] == ["player-2", "narrator-2"]
     assert remapped["attempt_evidence_source_ids"] == ["message:player-2"]
     raw_effects = remapped["effects"]
     assert isinstance(raw_effects, list)
@@ -188,3 +190,4 @@ def test_remap_turn_outcome_payload_ignores_unknown_message_refs() -> None:
     effect = raw_effects[0]
     assert isinstance(effect, dict)
     assert effect["evidence_source_ids"] == ["message:player-1"]
+    assert remapped["source_message_ids"] == ["player-1", "narrator-1"]

@@ -18,7 +18,6 @@ from bragi.services.post_turn_inference import (
     POST_TURN_INFERENCE_MODES,
     VerifiedPostTurnCoverage,
     planned_effect_domain,
-    planned_effect_type,
     sanitize_post_turn_inference_mode,
     verified_post_turn_coverage_from_mapping,
 )
@@ -50,11 +49,6 @@ def test_planned_effect_domain_mapping() -> None:
     assert planned_effect_domain("world_state_change") == POST_TURN_DOMAIN_STATE
     assert planned_effect_domain("world_time_change") == POST_TURN_DOMAIN_TIME
     assert planned_effect_domain("unknown_type") == "unknown"
-
-
-def test_planned_effect_type_round_trips_domains() -> None:
-    assert planned_effect_type(POST_TURN_DOMAIN_TIME) == "world_time_change"
-    assert planned_effect_type(POST_TURN_DOMAIN_STATE) == "world_state_change"
 
 
 def test_sanitize_post_turn_inference_mode() -> None:

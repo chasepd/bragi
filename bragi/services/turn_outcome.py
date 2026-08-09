@@ -292,6 +292,8 @@ def _accumulate_effect_coverage(
         "emotional_change",
         "relationship_change",
     }:
+        if effect.state_key:
+            return
         character_id = effect.character_id or _text(effect.value.get("character_id"))
         if not character_id:
             return
@@ -307,9 +309,12 @@ def remap_turn_outcome_payload(
     payload: dict[str, object],
     *,
     message_id_map: Mapping[str, str],
+    save_id: str | None = None,
 ) -> dict[str, object]:
     """Remap message references inside a TurnOutcome payload after import."""
     remapped = dict(payload)
+    if save_id is not None:
+        remapped["save_id"] = save_id
 
     def remap_refs(refs: object) -> object:
         if not isinstance(refs, list):
@@ -347,13 +352,16 @@ def remap_turn_outcome_payload(
 
 
 def remap_source_ref(source_id: str, *, message_id_map: Mapping[str, str]) -> str:
-    if not source_id.startswith("message:"):
-        return source_id
-    message_id = source_id.removeprefix("message:")
-    mapped = message_id_map.get(message_id)
+    if source_id.startswith("message:"):
+        message_id = source_id.removeprefix("message:")
+        mapped = message_id_map.get(message_id)
+        if mapped is None:
+            return source_id
+        return f"message:{mapped}"
+    mapped = message_id_map.get(source_id)
     if mapped is None:
         return source_id
-    return f"message:{mapped}"
+    return mapped
 
 
 def _text(value: object) -> str:

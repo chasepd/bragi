@@ -7363,7 +7363,12 @@ def test_chat_bundle_round_trips_turn_outcomes_with_remapped_message_refs(
         message_id=imported_narrator_id,
     )
     assert outcome is not None
+    assert outcome.payload["save_id"] == imported_save.id
     assert outcome.payload["attempt_resolution"] == "succeeded"
+    assert outcome.payload["source_message_ids"] == [
+        imported_player_id,
+        imported_narrator_id,
+    ]
     assert outcome.payload["attempt_evidence_source_ids"] == [
         f"message:{imported_player_id}"
     ]
