@@ -202,6 +202,8 @@ _SCENARIO_EVOLUTION_SEMANTIC_SKIP_REASONS = frozenset(
     ("no_phase_shift", "turn_level_change")
 )
 SCENARIO_EVOLUTION_SECTION_MAX_CHARS = 1200
+SCENARIO_TONE_EVIDENCE_MESSAGE_LIMIT = 8
+SCENARIO_TONE_SECTION_ID = "tone_genre"
 MAX_SCENARIO_EVOLUTION_TOOL_FEEDBACK_TURNS = MODEL_OUTPUT_MAX_ATTEMPTS - 1
 
 
@@ -224,6 +226,7 @@ class ScenarioEvolution:
 class ScenarioEvolutionRequest:
     save_id: str
     messages: tuple[MessageRecord, ...]
+    tone_evidence_messages: tuple[MessageRecord, ...] = ()
 
 
 class ScenarioEvolver(Protocol):
@@ -262,7 +265,12 @@ class StructuredProviderScenarioEvolver:
             scenario_type=details.scenario.type,
             content=details.scenario.content_json,
         )
-        if not allowed_sections:
+        tone_source_message_ids = _tone_source_message_ids(request)
+        request_sections = _request_evolvable_sections(
+            allowed_sections,
+            tone_source_message_ids=tone_source_message_ids,
+        )
+        if not request_sections:
             return ScenarioEvolution()
         structured_request = request_with_openrouter_routing(
             repositories,
@@ -271,14 +279,16 @@ class StructuredProviderScenarioEvolver:
                 model_id=self.model_id,
                 schema_name="scenario_evolution",
                 schema=_scenario_evolution_schema(
-                    allowed_sections=allowed_sections,
+                    allowed_sections=request_sections,
                     messages=request.messages,
+                    tone_source_message_ids=tone_source_message_ids,
                 ),
                 messages=_scenario_evolution_messages(
                     scenario_type=details.scenario.type,
                     scenario_context=_scenario_context_text(details.scenario),
                     messages=request.messages,
-                    allowed_sections=allowed_sections,
+                    allowed_sections=request_sections,
+                    tone_evidence_messages=request.tone_evidence_messages,
                 ),
                 temperature=0.0,
             ),
@@ -303,7 +313,8 @@ class StructuredProviderScenarioEvolver:
             )
         return _scenario_evolution_from_structured_data(
             response.data,
-            allowed_sections=allowed_sections,
+            allowed_sections=request_sections,
+            allowed_tone_source_message_ids=tone_source_message_ids,
         )
 
 
@@ -334,7 +345,12 @@ class ToolCallingProviderScenarioEvolver:
             scenario_type=details.scenario.type,
             content=details.scenario.content_json,
         )
-        if not allowed_sections:
+        tone_source_message_ids = _tone_source_message_ids(request)
+        request_sections = _request_evolvable_sections(
+            allowed_sections,
+            tone_source_message_ids=tone_source_message_ids,
+        )
+        if not request_sections:
             return ScenarioEvolution()
         tool_request = request_with_openrouter_routing(
             repositories,
@@ -345,11 +361,13 @@ class ToolCallingProviderScenarioEvolver:
                     scenario_type=details.scenario.type,
                     scenario_context=_scenario_context_text(details.scenario),
                     messages=request.messages,
-                    allowed_sections=allowed_sections,
+                    allowed_sections=request_sections,
+                    tone_evidence_messages=request.tone_evidence_messages,
                 ),
                 tools=_scenario_evolution_tool_definitions(
-                    allowed_sections=allowed_sections,
+                    allowed_sections=request_sections,
                     messages=request.messages,
+                    tone_source_message_ids=tone_source_message_ids,
                 ),
                 temperature=0.0,
             ),
@@ -362,10 +380,11 @@ class ToolCallingProviderScenarioEvolver:
                     repositories=repositories,
                     provider=self.provider,
                     request=tool_request,
-                    allowed_sections=allowed_sections,
+                    allowed_sections=request_sections,
                     source_message_ids=tuple(
                         message.id for message in request.messages
                     ),
+                    tone_source_message_ids=tone_source_message_ids,
                 )
             return await _scenario_evolution_with_tool_fallback(
                 repositories=repositories,
@@ -373,10 +392,11 @@ class ToolCallingProviderScenarioEvolver:
                 provider=self.provider,
                 request=tool_request,
                 save_id=request.save_id,
-                allowed_sections=allowed_sections,
+                allowed_sections=request_sections,
                 source_message_ids=tuple(
                     message.id for message in request.messages
                 ),
+                tone_source_message_ids=tone_source_message_ids,
             )
         except ProviderError as exc:
             # The tool fallback chain enriches the failing error; the enriched
@@ -463,10 +483,14 @@ class ScenarioEvolutionService:
             save_id=save_id,
             source_message_count=len(source_message_ids),
         )
+        all_messages = self.repositories.list_messages(save_id)
+        source_message_id_set = set(source_message_ids)
         messages = tuple(
-            message
-            for message in self.repositories.list_messages(save_id)
-            if message.id in set(source_message_ids)
+            message for message in all_messages if message.id in source_message_id_set
+        )
+        tone_evidence_messages = _recent_player_tone_evidence(
+            all_messages,
+            source_message_ids=source_message_ids,
         )
         started_at = perf_counter()
         if any(
@@ -488,13 +512,20 @@ class ScenarioEvolutionService:
             return None
         try:
             evolution = await self.evolver.evolve(
-                ScenarioEvolutionRequest(save_id=save_id, messages=messages),
+                ScenarioEvolutionRequest(
+                    save_id=save_id,
+                    messages=messages,
+                    tone_evidence_messages=tone_evidence_messages,
+                ),
                 repositories=self.repositories,
             )
             update = self.apply_evolution(
                 save_id=save_id,
                 evolution=evolution,
                 allowed_source_message_ids=tuple(message.id for message in messages),
+                allowed_tone_source_message_ids=tuple(
+                    message.id for message in messages if message.role == "player"
+                ),
             )
         except Exception as exc:
             self.jobs.fail(
@@ -538,6 +569,7 @@ class ScenarioEvolutionService:
         save_id: str,
         evolution: ScenarioEvolution,
         allowed_source_message_ids: tuple[str, ...] | None = None,
+        allowed_tone_source_message_ids: tuple[str, ...] | None = None,
     ) -> SaveScenarioUpdateRecord | None:
         details = self.repositories.load_save_details(save_id)
         if details is None:
@@ -554,6 +586,7 @@ class ScenarioEvolutionService:
             evolution,
             allowed_sections=allowed_sections,
             allowed_source_message_ids=allowed_source_message_ids,
+            allowed_tone_source_message_ids=allowed_tone_source_message_ids,
         )
         if not evolution.updates:
             return None
@@ -640,15 +673,118 @@ def record_scenario_evolution_skip(
     return updated
 
 
+def _tone_source_message_ids(
+    request: ScenarioEvolutionRequest,
+) -> tuple[str, ...]:
+    evidence_ids = {message.id for message in request.tone_evidence_messages}
+    return tuple(
+        message.id
+        for message in request.messages
+        if message.role == "player" and message.id in evidence_ids
+    )
+
+
+def _request_evolvable_sections(
+    allowed_sections: tuple[str, ...],
+    *,
+    tone_source_message_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    if tone_source_message_ids:
+        return allowed_sections
+    return tuple(
+        section_id
+        for section_id in allowed_sections
+        if section_id != SCENARIO_TONE_SECTION_ID
+    )
+
+
+def _recent_player_tone_evidence(
+    messages: list[MessageRecord],
+    *,
+    source_message_ids: tuple[str, ...],
+) -> tuple[MessageRecord, ...]:
+    source_ids = set(source_message_ids)
+    source_positions = [
+        index for index, message in enumerate(messages) if message.id in source_ids
+    ]
+    current_player_ids = {
+        message.id
+        for message in messages
+        if message.id in source_ids and message.role == "player"
+    }
+    if not source_positions or not current_player_ids:
+        return ()
+    eligible = (
+        message
+        for message in messages[: max(source_positions) + 1]
+        if message.role == "player"
+        and not is_fade_to_black_message(
+            role=message.role,
+            body=message.body,
+            safety_transition=message.safety_transition,
+        )
+    )
+    return tuple(eligible)[-SCENARIO_TONE_EVIDENCE_MESSAGE_LIMIT:]
+
+
 def _scenario_evolution_schema(
     *,
     allowed_sections: tuple[str, ...],
     messages: tuple[MessageRecord, ...],
+    tone_source_message_ids: tuple[str, ...] = (),
 ) -> dict[str, object]:
     message_ids = [message.id for message in messages]
     source_schema: dict[str, object] = {"type": "string"}
     if message_ids:
         source_schema["enum"] = message_ids
+    ordinary_sections = tuple(
+        section_id
+        for section_id in allowed_sections
+        if section_id != SCENARIO_TONE_SECTION_ID
+    )
+    ordinary_update_schema: dict[str, object] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "section_id": {
+                "type": "string",
+                "enum": list(ordinary_sections),
+            },
+            "text": {"type": "string"},
+            "reason": {"type": "string"},
+            "source_message_id": source_schema,
+        },
+        "required": ["section_id", "text", "reason", "source_message_id"],
+    }
+    update_item_schema: dict[str, object] = ordinary_update_schema
+    if SCENARIO_TONE_SECTION_ID in allowed_sections and tone_source_message_ids:
+        update_item_schema = {
+            "anyOf": [
+                ordinary_update_schema,
+                {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "section_id": {
+                            "type": "string",
+                            "enum": [SCENARIO_TONE_SECTION_ID],
+                        },
+                        "text": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "source_message_id": {
+                            "type": "string",
+                            "enum": list(tone_source_message_ids),
+                        },
+                    },
+                    "required": [
+                        "section_id",
+                        "text",
+                        "reason",
+                        "source_message_id",
+                    ],
+                },
+            ]
+        }
     return normalize_strict_json_schema({
         "type": "object",
         "additionalProperties": False,
@@ -665,32 +801,15 @@ def _scenario_evolution_schema(
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
-                    section_id: {"type": "string"} for section_id in allowed_sections
+                    section_id: {"type": "string"}
+                    for section_id in ordinary_sections
                 },
             },
             "reason": {"type": "string"},
             "source_message_id": source_schema,
             "updates": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "section_id": {
-                            "type": "string",
-                            "enum": list(allowed_sections),
-                        },
-                        "text": {"type": "string"},
-                        "reason": {"type": "string"},
-                        "source_message_id": source_schema,
-                    },
-                    "required": [
-                        "section_id",
-                        "text",
-                        "reason",
-                        "source_message_id",
-                    ],
-                },
+                "items": update_item_schema,
             },
         },
         "required": ["change_type", "updates"],
@@ -703,6 +822,7 @@ def _scenario_evolution_messages(
     scenario_context: str,
     messages: tuple[MessageRecord, ...],
     allowed_sections: tuple[str, ...],
+    tone_evidence_messages: tuple[MessageRecord, ...] = (),
 ) -> tuple[ChatMessage, ...]:
     return (
         ChatMessage(
@@ -716,6 +836,7 @@ def _scenario_evolution_messages(
                     scenario_context,
                     "Evolvable sections: " + ", ".join(allowed_sections),
                     _messages_text(messages),
+                    _tone_evidence_text(tone_evidence_messages),
                 )
             ),
         ),
@@ -728,6 +849,7 @@ def _scenario_evolution_tool_messages(
     scenario_context: str,
     messages: tuple[MessageRecord, ...],
     allowed_sections: tuple[str, ...],
+    tone_evidence_messages: tuple[MessageRecord, ...] = (),
 ) -> tuple[ToolCallMessage, ...]:
     return tuple(
         ToolCallMessage(
@@ -735,10 +857,11 @@ def _scenario_evolution_tool_messages(
             body=message.body.replace(
                 "Use the enforced schema.",
                 (
-                    "Use update_scenario_section for durable phase-shift "
-                    "section updates, or skip_scenario_evolution when no "
-                    "phase-shift update is appropriate. Do not write prose "
-                    "outside tool calls."
+                    "Use update_scenario_section for ordinary durable "
+                    "phase-shift updates, update_scenario_tone for a durable "
+                    "player-directed tone shift when that tool is available, "
+                    "or skip_scenario_evolution when no update is appropriate. "
+                    "Do not write prose outside tool calls."
                 ),
             ),
             speaker_name=message.speaker_name,
@@ -748,6 +871,7 @@ def _scenario_evolution_tool_messages(
             scenario_context=scenario_context,
             messages=messages,
             allowed_sections=allowed_sections,
+            tone_evidence_messages=tone_evidence_messages,
         )
     )
 
@@ -756,12 +880,18 @@ def _scenario_evolution_tool_definitions(
     *,
     allowed_sections: tuple[str, ...],
     messages: tuple[MessageRecord, ...],
+    tone_source_message_ids: tuple[str, ...] = (),
 ) -> tuple[ToolDefinition, ...]:
     message_ids = [message.id for message in messages]
     source_schema: dict[str, object] = {"type": "string"}
     if message_ids:
         source_schema["enum"] = message_ids
-    return (
+    ordinary_sections = tuple(
+        section_id
+        for section_id in allowed_sections
+        if section_id != SCENARIO_TONE_SECTION_ID
+    )
+    tools = [
         ToolDefinition(
             name="update_scenario_section",
             description="Replace one evolvable scenario section after a phase shift.",
@@ -771,7 +901,7 @@ def _scenario_evolution_tool_definitions(
                 "properties": {
                     "section_id": {
                         "type": "string",
-                        "enum": list(allowed_sections),
+                        "enum": list(ordinary_sections),
                     },
                     "text": {"type": "string"},
                     "reason": {"type": "string"},
@@ -779,7 +909,31 @@ def _scenario_evolution_tool_definitions(
                 },
                 "required": ["section_id", "text", "reason", "source_message_id"],
             },
-        ),
+        )
+    ]
+    if SCENARIO_TONE_SECTION_ID in allowed_sections and tone_source_message_ids:
+        tools.append(
+            ToolDefinition(
+                name="update_scenario_tone",
+                description=(
+                    "Replace tone/style after a durable player-directed shift."
+                ),
+                parameters={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "text": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "source_message_id": {
+                            "type": "string",
+                            "enum": list(tone_source_message_ids),
+                        },
+                    },
+                    "required": ["text", "reason", "source_message_id"],
+                },
+            )
+        )
+    tools.append(
         ToolDefinition(
             name="skip_scenario_evolution",
             description="Record that this turn does not require scenario evolution.",
@@ -798,8 +952,9 @@ def _scenario_evolution_tool_definitions(
                 },
                 "required": ["change_type", "skip_reason"],
             },
-        ),
+        )
     )
+    return tuple(tools)
 
 
 async def _scenario_evolution_with_tool_fallback(
@@ -811,6 +966,7 @@ async def _scenario_evolution_with_tool_fallback(
     save_id: str,
     allowed_sections: tuple[str, ...],
     source_message_ids: tuple[str, ...],
+    tone_source_message_ids: tuple[str, ...],
 ) -> ScenarioEvolution:
     try:
         return await _scenario_evolution_with_tool_feedback(
@@ -819,6 +975,7 @@ async def _scenario_evolution_with_tool_fallback(
             request=request,
             allowed_sections=allowed_sections,
             source_message_ids=source_message_ids,
+            tone_source_message_ids=tone_source_message_ids,
         )
     except ProviderError as exc:
         fallback_request = tool_call_fallback_request(
@@ -845,6 +1002,7 @@ async def _scenario_evolution_with_tool_fallback(
                 request=fallback_request,
                 allowed_sections=allowed_sections,
                 source_message_ids=source_message_ids,
+                tone_source_message_ids=tone_source_message_ids,
             )
         except ProviderError as fallback_exc:
             enriched = provider_error_with_fallback_attempted(
@@ -867,6 +1025,7 @@ async def _scenario_evolution_with_tool_feedback(
     request: ToolCallRequest,
     allowed_sections: tuple[str, ...],
     source_message_ids: tuple[str, ...],
+    tone_source_message_ids: tuple[str, ...],
 ) -> ScenarioEvolution:
     messages = list(request.messages)
     tool_schemas = {tool.name: tool.parameters for tool in request.tools}
@@ -902,6 +1061,7 @@ async def _scenario_evolution_with_tool_feedback(
                 tool_schemas=tool_schemas,
                 allowed_sections=allowed_sections,
                 source_message_ids=source_message_ids,
+                tone_source_message_ids=tone_source_message_ids,
             )
             if accepted:
                 if isinstance(item, ScenarioSectionUpdate):
@@ -952,6 +1112,7 @@ async def _scenario_evolution_with_tool_feedback(
                 evolution,
                 allowed_sections=allowed_sections,
                 allowed_source_message_ids=source_message_ids,
+                allowed_tone_source_message_ids=tone_source_message_ids,
             )
             return evolution
 
@@ -978,6 +1139,7 @@ def _validate_scenario_evolution_tool_call(
     tool_schemas: dict[str, dict[str, object]],
     allowed_sections: tuple[str, ...],
     source_message_ids: tuple[str, ...],
+    tone_source_message_ids: tuple[str, ...],
 ) -> tuple[bool, dict[str, str], ScenarioSectionUpdate | str | None]:
     schema = tool_schemas.get(call.name)
     if schema is None:
@@ -999,7 +1161,16 @@ def _validate_scenario_evolution_tool_call(
                 f"Unknown scenario evolution skip_reason: {skip_reason}"
             )
         return True, accepted_tool_result(), skip_reason
-    update = _section_update_from_data(arguments)
+    update = (
+        ScenarioSectionUpdate(
+            section_id=SCENARIO_TONE_SECTION_ID,
+            text=str(arguments.get("text", "")).strip(),
+            reason=str(arguments.get("reason", "")).strip(),
+            source_message_id=str(arguments.get("source_message_id", "")),
+        )
+        if call.name == "update_scenario_tone"
+        else _section_update_from_data(arguments)
+    )
     if update.section_id not in set(allowed_sections):
         return _invalid_scenario_evolution_tool_call(
             f"Scenario section cannot evolve: {update.section_id}"
@@ -1007,6 +1178,13 @@ def _validate_scenario_evolution_tool_call(
     if update.source_message_id not in set(source_message_ids):
         return _invalid_scenario_evolution_tool_call(
             f"Unknown scenario update source_message_id: {update.source_message_id}"
+        )
+    if (
+        update.section_id == SCENARIO_TONE_SECTION_ID
+        and update.source_message_id not in set(tone_source_message_ids)
+    ):
+        return _invalid_scenario_evolution_tool_call(
+            "Scenario tone source_message_id must identify the current player message"
         )
     if len(update.text) > SCENARIO_EVOLUTION_SECTION_MAX_CHARS:
         return _invalid_scenario_evolution_tool_call(
@@ -1041,9 +1219,17 @@ def _scenario_evolution_instruction(scenario_type: str) -> str:
         "no_phase_shift when nothing durable changed. Return section updates "
         "only when change_type is phase_shift and only for sections whose "
         "operational context is clearly superseded by the messages. Do not "
-        "rewrite title, player role, core premise, tone/style, or opening "
-        "message. Preserve the scenario identity and update only durable "
-        "context needed by future narrator prompts."
+        "rewrite title, player role, core premise, or opening message. Preserve "
+        "the scenario identity and update only durable context needed by future "
+        "narrator prompts. Tone/style is a special case: change tone_genre only "
+        "when the current player-authored message explicitly or unmistakably "
+        "redirects the style, or continues a clear durable pattern in the recent "
+        "player-authored tone evidence. A lone joke, transient emotion, NPC "
+        "dialogue, and narrator prose are never enough; narrator messages are "
+        "never tone evidence. When tone evolves, replace contradictory mandates "
+        "while preserving compatible genre, premise, content boundaries, and "
+        "style traits. Return a complete concise tone_genre replacement and cite "
+        "the current player message as its source."
     )
     if scenario_type == "dating_sim":
         return (
@@ -1140,7 +1326,7 @@ def _scenario_context_text(scenario: ScenarioRecord) -> str:
         f"- player role: {player_role}",
     ]
     for key, value in _scenario_content(content_json).items():
-        if key in _SCENARIO_CORE_CONTENT_KEYS:
+        if key.startswith("_") or key in _SCENARIO_CORE_CONTENT_KEYS:
             continue
         if value:
             lines.append(
@@ -1155,6 +1341,26 @@ def _messages_text(messages: tuple[MessageRecord, ...]) -> str:
         return "Completed turn messages: none"
     return "Completed turn messages:\n" + "\n".join(
         f"- {message.id} [{message.role}] {message.body}" for message in messages
+    )
+
+
+def _tone_evidence_text(messages: tuple[MessageRecord, ...]) -> str:
+    if not messages:
+        return (
+            "Recent player-authored tone evidence: none. Tone/style cannot evolve "
+            "without a current player-authored source message."
+        )
+    return "\n".join(
+        (
+            "Recent player-authored tone evidence (the only tone evidence; "
+            "completed-turn narrator text is context for other sections and is "
+            "never tone evidence):",
+            *(
+                f"- {message.id} [player] "
+                f"{_compact_text(message.body, SCENARIO_EVOLUTION_SECTION_MAX_CHARS)}"
+                for message in messages
+            ),
+        )
     )
 
 
@@ -1200,13 +1406,14 @@ def _evolvable_sections(
         allowed = POLITICAL_INTRIGUE_EVOLVABLE_SECTIONS
     else:
         allowed = FULL_ROLEPLAY_EVOLVABLE_SECTIONS
-    return tuple(sorted(allowed))
+    return tuple(sorted((*allowed, SCENARIO_TONE_SECTION_ID)))
 
 
 def _scenario_evolution_from_structured_data(
     data: dict[str, object],
     *,
     allowed_sections: tuple[str, ...],
+    allowed_tone_source_message_ids: tuple[str, ...] = (),
 ) -> ScenarioEvolution:
     change_type = _change_type_from_data(data)
     if change_type in _SCENARIO_EVOLUTION_SEMANTIC_SKIP_REASONS:
@@ -1222,6 +1429,7 @@ def _scenario_evolution_from_structured_data(
             evolution,
             allowed_sections=allowed_sections,
             allowed_source_message_ids=None,
+            allowed_tone_source_message_ids=allowed_tone_source_message_ids,
         )
         return evolution
 
@@ -1240,6 +1448,7 @@ def _scenario_evolution_from_structured_data(
         evolution,
         allowed_sections=allowed_sections,
         allowed_source_message_ids=None,
+        allowed_tone_source_message_ids=allowed_tone_source_message_ids,
     )
     return evolution
 
@@ -1276,7 +1485,9 @@ def _content_updates_from_data(
     if not isinstance(raw_content, dict):
         return []
     unknown_sections = set(str(section_id) for section_id in raw_content) - set(
-        allowed_sections
+        section_id
+        for section_id in allowed_sections
+        if section_id != SCENARIO_TONE_SECTION_ID
     )
     if unknown_sections:
         raise ValueError(
@@ -1317,6 +1528,7 @@ def _validate_evolution(
     *,
     allowed_sections: tuple[str, ...],
     allowed_source_message_ids: tuple[str, ...] | None,
+    allowed_tone_source_message_ids: tuple[str, ...] | None = None,
 ) -> None:
     if (
         evolution.skip_reason is not None
@@ -1327,6 +1539,7 @@ def _validate_evolution(
         )
     allowed_section_set = set(allowed_sections)
     allowed_message_set = set(allowed_source_message_ids or ())
+    allowed_tone_message_set = set(allowed_tone_source_message_ids or ())
     seen_sections: set[str] = set()
     for update in evolution.updates:
         if update.section_id not in allowed_section_set:
@@ -1346,6 +1559,14 @@ def _validate_evolution(
             raise ValueError(
                 f"Unknown scenario update source_message_id: {update.source_message_id}"
             )
+        if update.section_id == SCENARIO_TONE_SECTION_ID and (
+            allowed_tone_source_message_ids is None
+            or update.source_message_id not in allowed_tone_message_set
+        ):
+            raise ValueError(
+                "Scenario tone source_message_id must identify the current "
+                "player message"
+            )
 
 
 def _repair_evolution_source_message_ids(
@@ -1361,7 +1582,10 @@ def _repair_evolution_source_message_ids(
     )
     updates: list[ScenarioSectionUpdate] = []
     for update in evolution.updates:
-        if update.source_message_id in allowed:
+        if (
+            update.section_id == SCENARIO_TONE_SECTION_ID
+            or update.source_message_id in allowed
+        ):
             updates.append(update)
         elif fallback_source_id:
             updates.append(

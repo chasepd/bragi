@@ -10978,11 +10978,12 @@ def _scenario_evolution_due(
             due=True,
             turn_interval=turn_interval,
         )
-    narrator_message_ids = [
-        message.id
-        for message in repositories.list_messages(save_id)
-        if message.role == "narrator"
-    ]
+    messages = repositories.list_messages(save_id)
+    message_positions = {
+        message.id: position for position, message in enumerate(messages)
+    }
+    narrator_messages = [message for message in messages if message.role == "narrator"]
+    narrator_message_ids = [message.id for message in narrator_messages]
     try:
         current_index = narrator_message_ids.index(narrator_message_id)
     except ValueError:
@@ -10991,11 +10992,24 @@ def _scenario_evolution_due(
             turn_interval=turn_interval,
         )
     update_source_ids = _scenario_update_source_message_ids(active_update)
-    anchor_indexes = [
-        narrator_message_ids.index(source_id)
-        for source_id in update_source_ids
-        if source_id in narrator_message_ids
-    ]
+    anchor_indexes: list[int] = []
+    for source_id in update_source_ids:
+        if source_id in narrator_message_ids:
+            anchor_indexes.append(narrator_message_ids.index(source_id))
+            continue
+        source_position = message_positions.get(source_id)
+        if source_position is None:
+            continue
+        following_narrator_index = next(
+            (
+                index
+                for index, message in enumerate(narrator_messages)
+                if message_positions[message.id] > source_position
+            ),
+            None,
+        )
+        if following_narrator_index is not None:
+            anchor_indexes.append(following_narrator_index)
     if not anchor_indexes:
         return _ScenarioEvolutionDueResult(
             due=True,
