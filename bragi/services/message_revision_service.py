@@ -803,6 +803,10 @@ class MessageRevisionService:
                 message_ids=deleted_message_ids,
             )
         )
+        self.repositories.remove_scene_fact_provenance_for_messages(
+            save_id=save_id,
+            message_ids=deleted_message_ids,
+        )
         archived_context_sources = tuple(
             source
             for source in context_sources

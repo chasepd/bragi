@@ -1517,6 +1517,8 @@ def test_tool_calling_context_update_applies_valid_tool_calls(
         "upsert_active_thread",
         "link_entities",
         "record_phone_number_exchange",
+        "upsert_scene_fact",
+        "retire_scene_fact",
     ]
 
 
@@ -1767,6 +1769,78 @@ def test_structured_context_update_drops_items_with_ungrounded_evidence(
 
     assert extraction.scene is None
     assert [location.name for location in extraction.locations] == ["Beacon Gallery"]
+
+
+def test_structured_context_update_drops_invalid_scene_local_id_without_batch_loss(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    provider = SequenceStructuredProvider(
+        [
+            {
+                "scene": {},
+                "locations": [
+                    {
+                        "name": "Beacon Gallery",
+                        "source_message_id": narrator_message.id,
+                        "evidence_quote": "beacon gallery",
+                    }
+                ],
+                "characters": [],
+                "active_threads": [],
+                "entity_links": [],
+                "phone_number_exchanges": [],
+                "scene_fact_upserts": [
+                    {
+                        "fact_type": "object_location",
+                        "subject_type": "object",
+                        "subject_id": "provider-generated-object-id",
+                        "subject_label": "beacon lens",
+                        "target_type": "",
+                        "target_id": "",
+                        "target_label": "",
+                        "aspect": "",
+                        "value": "inside the beacon gallery",
+                        "source_message_id": narrator_message.id,
+                        "evidence_quote": "beacon gallery",
+                        "reason": "Track its position.",
+                        "confidence": 0.9,
+                    }
+                ],
+                "scene_fact_retirements": [],
+            }
+        ]
+    )
+    updater = module.StructuredProviderContextUpdater(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-structured",
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(player_message, narrator_message),
+        scene_snapshot=None,
+        locations=(),
+        characters=(),
+        active_threads=(),
+        entity_links=(),
+    )
+    extraction = asyncio.run(updater.extract(request))
+    service = module.ContextUpdateService(
+        repositories=repositories,
+        extractor=RecordingContextUpdateExtractor(module.ContextUpdateExtraction()),
+    )
+
+    result = service.apply_extraction(
+        save_id=save.id,
+        extraction=extraction,
+        allowed_source_message_ids=(player_message.id, narrator_message.id),
+        completed_messages=(player_message, narrator_message),
+    )
+
+    assert [location.name for location in result.locations] == ["Beacon Gallery"]
+    assert repositories.list_scene_facts(save.id) == []
 
 
 def test_apply_extraction_drops_items_with_ungrounded_completed_message_evidence(
@@ -8390,6 +8464,163 @@ def _tool_call_user_body(request: ToolCallRequest) -> str:
         for message in request.messages
         if message.role == "user"
     )
+
+
+def test_apply_extraction_moves_actor_and_retires_interrupted_action(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="North Hall",
+        premise="A runner crosses a guarded hall.",
+        player_role="Runner",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Crossing")
+    actor = repositories.add_character(save_id=save.id, name="Mara")
+    source = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara reaches the window and stops running.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[actor.id],
+        source_message_id=source.id,
+    )
+    old_position, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="actor_position",
+        subject_type="character",
+        subject_id=actor.id,
+        subject_label="Mara",
+        value="beside the north door",
+        source_message_id=source.id,
+        evidence_quote="Mara reaches the window",
+    )
+    action, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="ongoing_action",
+        subject_type="character",
+        subject_id=actor.id,
+        subject_label="Mara",
+        value="running across the hall",
+        source_message_id=source.id,
+        evidence_quote="stops running",
+    )
+    service = module.ContextUpdateService(
+        repositories=repositories,
+        extractor=RecordingContextUpdateExtractor(module.ContextUpdateExtraction()),
+    )
+    extraction = module.ContextUpdateExtraction(
+        scene_fact_upserts=(
+            module.ExtractedSceneFactUpsert(
+                fact_type="actor_position",
+                subject_type="character",
+                subject_id=actor.id,
+                subject_label="Mara",
+                value="beside the window",
+                source_message_id=source.id,
+                evidence_quote="Mara reaches the window",
+            ),
+        ),
+        scene_fact_retirements=(
+            module.ExtractedSceneFactRetirement(
+                fact_id=action.id,
+                source_message_id=source.id,
+                evidence_quote="stops running",
+            ),
+        ),
+    )
+
+    result = service.apply_extraction(
+        save_id=save.id,
+        extraction=extraction,
+        allowed_source_message_ids=(source.id,),
+        completed_messages=(source,),
+    )
+
+    current = repositories.list_scene_facts(save.id)
+    assert len(current) == 1
+    assert current[0].fact_type == "actor_position"
+    assert current[0].value == "beside the window"
+    archived_position = repositories.get_scene_fact(old_position.id)
+    archived_action = repositories.get_scene_fact(action.id)
+    assert archived_position is not None
+    assert archived_action is not None
+    assert archived_position.archive_reason == "superseded"
+    assert archived_action.archive_reason == "explicit_retirement"
+    assert {entry.operation for entry in result.audit_entries} == {
+        "retired",
+        "superseded",
+    }
+
+
+def test_apply_extraction_keeps_corroborating_scene_fact_provenance(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="North Hall",
+        premise="A runner crosses a guarded hall.",
+        player_role="Runner",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Crossing")
+    actor = repositories.add_character(save_id=save.id, name="Mara")
+    first = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I stop beside the window.",
+    )
+    second = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara now stands beside the window.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[actor.id],
+        source_message_id=second.id,
+    )
+    upserts = tuple(
+        module.ExtractedSceneFactUpsert(
+            fact_type="actor_position",
+            subject_type="character",
+            subject_id=actor.id,
+            subject_label="Mara",
+            value="beside the window",
+            source_message_id=message.id,
+            evidence_quote=evidence,
+        )
+        for message, evidence in (
+            (first, "stop beside the window"),
+            (second, "stands beside the window"),
+        )
+    )
+    service = module.ContextUpdateService(
+        repositories=repositories,
+        extractor=RecordingContextUpdateExtractor(module.ContextUpdateExtraction()),
+    )
+
+    result = service.apply_extraction(
+        save_id=save.id,
+        extraction=module.ContextUpdateExtraction(scene_fact_upserts=upserts),
+        allowed_source_message_ids=(first.id, second.id),
+        completed_messages=(first, second),
+    )
+
+    [fact] = repositories.list_scene_facts(save.id)
+    assert [source.source_message_id for source in fact.provenance] == [
+        first.id,
+        second.id,
+    ]
+    assert [entry.operation for entry in result.audit_entries] == [
+        "created",
+        "refreshed",
+    ]
 
 
 def _save_with_completed_turn(

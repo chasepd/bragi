@@ -6455,6 +6455,52 @@ def _seed_bundle_save(
     return save
 
 
+def test_export_import_round_trips_active_scene_facts(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara stands beside the red beacon lens.",
+        source_message_id=NARRATOR_MESSAGE_ID,
+    )
+    fact, _, _ = repositories.upsert_scene_fact(
+        fact_id="scene-fact-beacon-lens",
+        save_id=save.id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="beacon lens",
+        value="mounted above the tower stair",
+        source_message_id=NARRATOR_MESSAGE_ID,
+        evidence_quote="The lens flashes red",
+    )
+    bundle_path = tmp_path / "scene-facts.bragi-chat"
+
+    chat_bundle_module.ChatBundleService(
+        repositories=repositories,
+        media_dir=media_dir,
+    ).export_save(save.id, bundle_path)
+    imported = chat_bundle_module.ChatBundleService(
+        repositories=repositories,
+        media_dir=media_dir,
+    ).import_save(bundle_path)
+
+    [imported_fact] = repositories.list_scene_facts(imported.save_id)
+    imported_messages = repositories.list_messages(imported.save_id)
+    imported_narrator = next(
+        message for message in imported_messages if message.role == "narrator"
+    )
+    assert imported_fact.id != fact.id
+    assert imported_fact.subject_label == "beacon lens"
+    assert imported_fact.value == "mounted above the tower stair"
+    assert imported_fact.scene_snapshot_id != fact.scene_snapshot_id
+    assert imported_fact.provenance[0].source_message_id == imported_narrator.id
+
+
 def _replace_seed_scenario_update_content(
     repositories: PersistenceRepositories,
     content: dict[str, object],

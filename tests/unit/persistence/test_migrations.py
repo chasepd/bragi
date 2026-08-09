@@ -981,6 +981,28 @@ def test_migration_73_to_74_adds_roleplay_interaction_mode_defaults(
         assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
 
 
+def test_migration_74_to_75_adds_scene_fact_tables(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE scene_fact_sources")
+        connection.execute("DROP TABLE scene_facts")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 75")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {"scene_facts", "scene_fact_sources"} <= tables
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
 def test_current_schema_repair_bounds_memory_observation_backfill(
     tmp_path: Path,
 ) -> None:

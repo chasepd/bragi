@@ -2063,6 +2063,55 @@ def test_deterministic_context_sources_include_political_intrigue_state(
     assert "memory.unrelated" not in source_text
 
 
+def test_current_scene_facts_are_narrator_only_volatile_context(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, location = _create_context_save(
+        repositories,
+        scenario_id="scenario-scene-facts",
+        save_id="save-scene-facts",
+    )
+    character = repositories.add_character(save_id=save.id, name="Mara")
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara crouches behind the brass console.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=location.id,
+        present_character_ids=[character.id],
+        source_message_id=message.id,
+    )
+    fact, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="actor_pose",
+        subject_type="character",
+        subject_id=character.id,
+        subject_label="Mara",
+        value="crouched behind the brass console",
+        source_message_id=message.id,
+        evidence_quote="Mara crouches behind the brass console",
+    )
+
+    narrator_sources = deterministic_context_sources(
+        repositories=repositories,
+        save_id=save.id,
+        mode="narrator",
+    )
+    image_sources = deterministic_context_sources(
+        repositories=repositories,
+        save_id=save.id,
+        mode="image",
+    )
+
+    source = next(item for item in narrator_sources if item.source_type == "scene_fact")
+    assert source.source_id == fact.id
+    assert "Volatile current-scene facts (not durable lore)" in source.text
+    assert "actor pose: Mara: crouched behind the brass console" in source.text
+    assert all(item.source_type != "scene_fact" for item in image_sources)
+
+
 def _create_context_save(
     repositories: PersistenceRepositories,
     *,

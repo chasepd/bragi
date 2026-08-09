@@ -22,7 +22,7 @@ from bragi.text_search import (
     unicode_word_terms,
 )
 
-CURRENT_SCHEMA_VERSION = 74
+CURRENT_SCHEMA_VERSION = 75
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
@@ -256,6 +256,52 @@ CREATE TABLE IF NOT EXISTS scene_snapshots (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(save_id, current_location_id) REFERENCES locations(save_id, id)
 );
+
+CREATE TABLE IF NOT EXISTS scene_facts (
+    id TEXT PRIMARY KEY,
+    save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+    scene_snapshot_id TEXT NOT NULL REFERENCES scene_snapshots(id) ON DELETE CASCADE,
+    scene_generation INTEGER NOT NULL,
+    fact_type TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT,
+    subject_label TEXT NOT NULL DEFAULT '',
+    target_type TEXT NOT NULL DEFAULT '',
+    target_id TEXT,
+    target_label TEXT NOT NULL DEFAULT '',
+    aspect TEXT NOT NULL DEFAULT '',
+    value TEXT NOT NULL,
+    conflict_key TEXT NOT NULL,
+    lifetime TEXT NOT NULL,
+    created_turn_number INTEGER NOT NULL,
+    expires_after_turn_number INTEGER,
+    archived_at TEXT,
+    archive_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scene_facts_active_conflict
+ON scene_facts(save_id, scene_snapshot_id, scene_generation, conflict_key)
+WHERE archived_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_scene_facts_current
+ON scene_facts(save_id, scene_snapshot_id, scene_generation, archived_at);
+
+CREATE TABLE IF NOT EXISTS scene_fact_sources (
+    id TEXT PRIMARY KEY,
+    save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+    scene_fact_id TEXT NOT NULL REFERENCES scene_facts(id) ON DELETE CASCADE,
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    evidence_quote TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(scene_fact_id, source_message_id, evidence_quote)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scene_fact_sources_fact
+ON scene_fact_sources(scene_fact_id, created_at, id);
 
 CREATE TABLE IF NOT EXISTS locations (
     id TEXT PRIMARY KEY,
@@ -668,23 +714,30 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 73:
+            if current == 74:
+                _migrate_schema_74_to_75(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 73:
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 72:
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 71:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 70:
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 69:
                 _migrate_schema_69_to_70(connection)
@@ -692,6 +745,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 68:
                 _migrate_schema_68_to_69(connection)
@@ -700,6 +754,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 67:
                 _migrate_schema_67_to_68(connection)
@@ -709,6 +764,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 66:
                 _migrate_schema_66_to_67(connection)
@@ -719,6 +775,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 65:
                 _migrate_schema_65_to_66(connection)
@@ -730,6 +787,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 64:
                 _migrate_schema_64_to_65(connection)
@@ -742,6 +800,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 63:
                 _migrate_schema_63_to_64(connection)
@@ -755,6 +814,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 62:
                 _migrate_schema_62_to_63(connection)
@@ -769,6 +829,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 61:
                 _migrate_schema_61_to_62(connection)
@@ -784,6 +845,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
                 current = CURRENT_SCHEMA_VERSION
             else:
                 raise RuntimeError(
@@ -817,6 +879,8 @@ def migrate_database(database_path: Path | str) -> None:
             or not _schema_migration_applied(connection, 74)
         ):
             _migrate_schema_73_to_74(connection)
+        if not _schema_migration_applied(connection, 75):
+            _migrate_schema_74_to_75(connection)
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
         _ensure_context_observation_curation_schema(connection)
@@ -824,6 +888,7 @@ def migrate_database(database_path: Path | str) -> None:
         _ensure_character_text_schema(connection)
         _ensure_character_text_activity_schema(connection)
         _ensure_scene_world_time_schema(connection)
+        _ensure_scene_fact_schema(connection)
         _ensure_hot_narration_query_indexes(connection)
         _ensure_continuity_index_revision_schema(connection)
         _ensure_context_source_search_terms_schema(connection)
@@ -859,6 +924,7 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         _ensure_character_agency_schema(connection)
         _ensure_character_age_schema(connection)
         _ensure_scene_world_time_schema(connection)
+        _ensure_scene_fact_schema(connection)
         _ensure_dating_route_state_schema(connection)
         _ensure_character_text_schema(connection)
         _ensure_character_text_activity_schema(connection)
@@ -2127,6 +2193,66 @@ def _migrate_schema_72_to_73(connection: sqlite3.Connection) -> None:
 def _migrate_schema_73_to_74(connection: sqlite3.Connection) -> None:
     _ensure_interaction_mode_schema(connection)
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (74)")
+
+
+def _migrate_schema_74_to_75(connection: sqlite3.Connection) -> None:
+    _ensure_scene_fact_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (75)")
+
+
+def _ensure_scene_fact_schema(connection: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS scene_facts (
+            id TEXT PRIMARY KEY,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            scene_snapshot_id TEXT NOT NULL
+                REFERENCES scene_snapshots(id) ON DELETE CASCADE,
+            scene_generation INTEGER NOT NULL,
+            fact_type TEXT NOT NULL,
+            subject_type TEXT NOT NULL,
+            subject_id TEXT,
+            subject_label TEXT NOT NULL DEFAULT '',
+            target_type TEXT NOT NULL DEFAULT '',
+            target_id TEXT,
+            target_label TEXT NOT NULL DEFAULT '',
+            aspect TEXT NOT NULL DEFAULT '',
+            value TEXT NOT NULL,
+            conflict_key TEXT NOT NULL,
+            lifetime TEXT NOT NULL,
+            created_turn_number INTEGER NOT NULL,
+            expires_after_turn_number INTEGER,
+            archived_at TEXT,
+            archive_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_scene_facts_active_conflict
+        ON scene_facts(save_id, scene_snapshot_id, scene_generation, conflict_key)
+        WHERE archived_at IS NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_scene_facts_current
+        ON scene_facts(save_id, scene_snapshot_id, scene_generation, archived_at);
+
+        CREATE TABLE IF NOT EXISTS scene_fact_sources (
+            id TEXT PRIMARY KEY,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            scene_fact_id TEXT NOT NULL
+                REFERENCES scene_facts(id) ON DELETE CASCADE,
+            source_message_id TEXT NOT NULL REFERENCES messages(id),
+            evidence_quote TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 1.0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(scene_fact_id, source_message_id, evidence_quote)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_scene_fact_sources_fact
+        ON scene_fact_sources(scene_fact_id, created_at, id);
+        """,
+    )
 
 
 def _interaction_mode_schema_is_current(connection: sqlite3.Connection) -> bool:

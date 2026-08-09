@@ -69,6 +69,8 @@ from bragi.persistence.models import (
     SaveRecord,
     SaveScenarioUpdateRecord,
     ScenarioRecord,
+    SceneFactProvenanceRecord,
+    SceneFactRecord,
     SceneSnapshotRecord,
     ScheduledTaskRecord,
     ScopedSettingRecord,
@@ -84,6 +86,12 @@ from bragi.retry_policy import (
     configured_retry_count,
 )
 from bragi.safety import normalize_message_safety
+from bragi.scene_facts import (
+    MAX_ACTIVE_SCENE_FACTS,
+    scene_fact_conflict_key,
+    scene_fact_lifetime,
+    validate_scene_fact_shape,
+)
 from bragi.text_search import (
     MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS,
     cjk_lexical_anchors,
@@ -2464,6 +2472,7 @@ class PersistenceRepositories:
                     roles=("narrator",),
                 )["narrator"],
             )
+            self.archive_stale_scene_facts(save_id=save_id)
         self.commit()
         row = self._fetch_one(
             """
@@ -5645,7 +5654,503 @@ class PersistenceRepositories:
         saved = self.get_scene_snapshot(save_id)
         if saved is None:
             raise ValueError(f"Unknown scene snapshot for save id: {save_id}")
+        self.archive_stale_scene_facts(save_id=save_id)
         return saved
+
+    def list_scene_facts(
+        self,
+        save_id: str,
+        *,
+        include_archived: bool = False,
+        current_only: bool = True,
+        scene_snapshot_id: str | None = None,
+        scene_generation: int | None = None,
+    ) -> list[SceneFactRecord]:
+        if current_only and (scene_snapshot_id is None or scene_generation is None):
+            scene = self.get_scene_snapshot(save_id)
+            if scene is None:
+                return []
+            scene_snapshot_id = scene.id
+            scene_generation = scene.scene_generation
+        filters = ["facts.save_id = ?"]
+        params: list[object] = [save_id]
+        if not include_archived:
+            filters.append("facts.archived_at IS NULL")
+        if current_only:
+            current_turn = self.count_active_messages_by_role(
+                save_id,
+                roles=("narrator",),
+            )["narrator"]
+            filters.extend(
+                (
+                    "facts.scene_snapshot_id = ?",
+                    "facts.scene_generation = ?",
+                    "(facts.lifetime != 'turn' OR "
+                    "facts.expires_after_turn_number > ?)",
+                )
+            )
+            params.extend((scene_snapshot_id, scene_generation, current_turn))
+        rows = self._fetch_all(
+            f"""
+            SELECT facts.id, facts.save_id, facts.scene_snapshot_id,
+                   facts.scene_generation, facts.fact_type, facts.subject_type,
+                   facts.subject_id, facts.subject_label, facts.target_type,
+                   facts.target_id, facts.target_label, facts.aspect, facts.value,
+                   facts.conflict_key, facts.lifetime,
+                   facts.created_turn_number, facts.expires_after_turn_number,
+                   facts.archived_at, facts.archive_reason,
+                   facts.created_at, facts.updated_at
+            FROM scene_facts AS facts
+            WHERE {' AND '.join(filters)}
+            ORDER BY facts.created_at, facts.rowid
+            """,
+            tuple(params),
+        )
+        return [self._scene_fact_from_row(row) for row in rows]
+
+    def get_scene_fact(self, fact_id: str) -> SceneFactRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, scene_snapshot_id, scene_generation, fact_type,
+                   subject_type, subject_id, subject_label, target_type,
+                   target_id, target_label, aspect, value, conflict_key,
+                   lifetime, created_turn_number, expires_after_turn_number,
+                   archived_at, archive_reason, created_at, updated_at
+            FROM scene_facts
+            WHERE id = ?
+            """,
+            (fact_id,),
+        )
+        return self._scene_fact_from_row(row) if row is not None else None
+
+    def upsert_scene_fact(
+        self,
+        *,
+        save_id: str,
+        fact_type: str,
+        subject_type: str,
+        subject_id: str | None,
+        subject_label: str,
+        value: str,
+        source_message_id: str,
+        evidence_quote: str,
+        target_type: str = "",
+        target_id: str | None = None,
+        target_label: str = "",
+        aspect: str = "",
+        reason: str = "",
+        confidence: float = 1.0,
+        fact_id: str | None = None,
+    ) -> tuple[SceneFactRecord, SceneFactRecord | None, bool]:
+        scene = self.get_scene_snapshot(save_id)
+        if scene is None:
+            raise ValueError(f"Unknown scene snapshot for save id: {save_id}")
+        validate_scene_fact_shape(
+            fact_type=fact_type,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            subject_label=subject_label,
+            target_type=target_type,
+            target_id=target_id,
+            target_label=target_label,
+            aspect=aspect,
+            value=value,
+        )
+        self._validate_scene_fact_reference(
+            save_id=save_id,
+            reference_type=subject_type,
+            reference_id=subject_id,
+            field_name="subject_id",
+        )
+        self._validate_scene_fact_reference(
+            save_id=save_id,
+            reference_type=target_type,
+            reference_id=target_id,
+            field_name="target_id",
+        )
+        message = self.get_message(save_id=save_id, message_id=source_message_id)
+        if message is None:
+            raise ValueError(f"Unknown scene fact source message: {source_message_id}")
+        if not evidence_quote.strip():
+            raise ValueError("Scene fact evidence_quote is required")
+
+        self.archive_stale_scene_facts(save_id=save_id)
+        conflict_key = scene_fact_conflict_key(
+            fact_type=fact_type,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            subject_label=subject_label,
+            target_type=target_type,
+            target_id=target_id,
+            target_label=target_label,
+            aspect=aspect,
+        )
+        existing_row = self._fetch_one(
+            """
+            SELECT id
+            FROM scene_facts
+            WHERE save_id = ? AND scene_snapshot_id = ?
+              AND scene_generation = ? AND conflict_key = ?
+              AND archived_at IS NULL
+            """,
+            (save_id, scene.id, scene.scene_generation, conflict_key),
+        )
+        existing = (
+            self.get_scene_fact(str(existing_row["id"]))
+            if existing_row is not None
+            else None
+        )
+        lifetime = scene_fact_lifetime(fact_type)
+        turn_number = self.count_active_messages_by_role(
+            save_id,
+            roles=("narrator",),
+        )["narrator"]
+        expires_after = turn_number + 1 if lifetime == "turn" else None
+        values = (
+            fact_type,
+            subject_type,
+            subject_id,
+            subject_label.strip(),
+            target_type,
+            target_id,
+            target_label.strip(),
+            aspect.strip(),
+            value.strip(),
+        )
+        refreshed = existing is not None and values == (
+            existing.fact_type,
+            existing.subject_type,
+            existing.subject_id,
+            existing.subject_label,
+            existing.target_type,
+            existing.target_id,
+            existing.target_label,
+            existing.aspect,
+            existing.value,
+        )
+        replaced = None if refreshed else existing
+        if refreshed and existing is not None:
+            self.connection.execute(
+                """
+                UPDATE scene_facts
+                SET expires_after_turn_number = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (expires_after, existing.id),
+            )
+            saved_id = existing.id
+        else:
+            if existing is not None:
+                self.connection.execute(
+                    """
+                    UPDATE scene_facts
+                    SET archived_at = CURRENT_TIMESTAMP,
+                        archive_reason = 'superseded',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (existing.id,),
+                )
+            active_count = len(self.list_scene_facts(save_id))
+            if active_count >= MAX_ACTIVE_SCENE_FACTS:
+                raise ValueError("Current scene fact limit reached")
+            saved_id = fact_id or _new_id()
+            self.connection.execute(
+                """
+                INSERT INTO scene_facts(
+                    id, save_id, scene_snapshot_id, scene_generation, fact_type,
+                    subject_type, subject_id, subject_label, target_type,
+                    target_id, target_label, aspect, value, conflict_key,
+                    lifetime, created_turn_number, expires_after_turn_number
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    saved_id,
+                    save_id,
+                    scene.id,
+                    scene.scene_generation,
+                    *values,
+                    conflict_key,
+                    lifetime,
+                    turn_number,
+                    expires_after,
+                ),
+            )
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO scene_fact_sources(
+                id, save_id, scene_fact_id, source_message_id, evidence_quote,
+                reason, confidence
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _new_id(),
+                save_id,
+                saved_id,
+                source_message_id,
+                evidence_quote.strip(),
+                reason.strip(),
+                max(0.0, min(1.0, confidence)),
+            ),
+        )
+        self.commit()
+        saved = self.get_scene_fact(saved_id)
+        if saved is None:
+            raise ValueError(f"Unknown scene fact id: {saved_id}")
+        return saved, replaced, refreshed
+
+    def retire_scene_fact(
+        self,
+        *,
+        save_id: str,
+        fact_id: str,
+        reason: str = "retired",
+    ) -> SceneFactRecord | None:
+        existing = self.get_scene_fact(fact_id)
+        if existing is None or existing.save_id != save_id or existing.archived_at:
+            return None
+        self.connection.execute(
+            """
+            UPDATE scene_facts
+            SET archived_at = CURRENT_TIMESTAMP, archive_reason = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (reason, fact_id),
+        )
+        self.commit()
+        return existing
+
+    def archive_stale_scene_facts(self, *, save_id: str) -> tuple[str, ...]:
+        scene = self.get_scene_snapshot(save_id)
+        if scene is None:
+            return ()
+        current_turn = self.count_active_messages_by_role(
+            save_id,
+            roles=("narrator",),
+        )["narrator"]
+        rows = self._fetch_all(
+            """
+            SELECT id,
+                   CASE
+                       WHEN scene_snapshot_id != ? OR scene_generation != ?
+                           THEN 'scene_transition'
+                       ELSE 'ttl_expired'
+                   END AS archive_reason
+            FROM scene_facts
+            WHERE save_id = ? AND archived_at IS NULL
+              AND (
+                    scene_snapshot_id != ? OR scene_generation != ?
+                    OR (lifetime = 'turn' AND expires_after_turn_number <= ?)
+              )
+            ORDER BY created_at, rowid
+            """,
+            (
+                scene.id,
+                scene.scene_generation,
+                save_id,
+                scene.id,
+                scene.scene_generation,
+                current_turn,
+            ),
+        )
+        for row in rows:
+            fact = self.get_scene_fact(str(row["id"]))
+            self.connection.execute(
+                """
+                UPDATE scene_facts
+                SET archived_at = CURRENT_TIMESTAMP, archive_reason = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (row["archive_reason"], row["id"]),
+            )
+            if fact is not None:
+                self.add_context_update_audit(
+                    save_id=save_id,
+                    operation=f"{row['archive_reason']}_expired",
+                    entity_type="scene_fact",
+                    entity_id=fact.id,
+                    field_path=fact.conflict_key,
+                    before=_scene_fact_audit_payload(fact),
+                    after=None,
+                    reason=str(row["archive_reason"]),
+                    confidence=max(
+                        (source.confidence for source in fact.provenance),
+                        default=1.0,
+                    ),
+                    source_message_ids=[
+                        source.source_message_id for source in fact.provenance
+                    ],
+                )
+        if rows:
+            self.commit()
+        return tuple(str(row["id"]) for row in rows)
+
+    def remove_scene_fact_provenance_for_messages(
+        self,
+        *,
+        save_id: str,
+        message_ids: set[str] | frozenset[str],
+    ) -> frozenset[str]:
+        if not message_ids:
+            return frozenset()
+        ordered_ids = tuple(sorted(message_ids))
+        placeholders = _placeholders(len(ordered_ids))
+        affected = frozenset(
+            str(row["scene_fact_id"])
+            for row in self._fetch_all(
+                f"""
+                SELECT DISTINCT scene_fact_id
+                FROM scene_fact_sources
+                WHERE save_id = ?
+                  AND source_message_id IN ({placeholders})
+                """,
+                (save_id, *ordered_ids),
+            )
+        )
+        before_by_id = {
+            fact_id: fact
+            for fact_id in sorted(affected)
+            if (fact := self.get_scene_fact(fact_id)) is not None
+        }
+        self.connection.execute(
+            f"""
+            DELETE FROM scene_fact_sources
+            WHERE save_id = ? AND source_message_id IN ({placeholders})
+            """,
+            (save_id, *ordered_ids),
+        )
+        for fact_id in sorted(affected):
+            remaining = self._fetch_one(
+                "SELECT 1 FROM scene_fact_sources WHERE scene_fact_id = ? LIMIT 1",
+                (fact_id,),
+            )
+            if remaining is None:
+                self.connection.execute(
+                    """
+                    UPDATE scene_facts
+                    SET archived_at = COALESCE(archived_at, CURRENT_TIMESTAMP),
+                        archive_reason = CASE
+                            WHEN archived_at IS NULL THEN 'source_removed'
+                            ELSE archive_reason
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (fact_id,),
+                )
+        self.commit()
+        for fact_id, before in before_by_id.items():
+            removed_sources = tuple(
+                source
+                for source in before.provenance
+                if source.source_message_id in message_ids
+            )
+            after = self.get_scene_fact(fact_id)
+            archived = after is None or after.archive_reason == "source_removed"
+            after_payload = (
+                None
+                if after is None or archived
+                else _scene_fact_audit_payload(after)
+            )
+            self.add_context_update_audit(
+                save_id=save_id,
+                operation="source_removed" if archived else "provenance_removed",
+                entity_type="scene_fact",
+                entity_id=fact_id,
+                field_path=before.conflict_key,
+                before=_scene_fact_audit_payload(before),
+                after=after_payload,
+                reason=(
+                    "The final supporting message was removed."
+                    if archived
+                    else "Supporting message provenance was removed."
+                ),
+                confidence=max(
+                    (source.confidence for source in removed_sources),
+                    default=1.0,
+                ),
+                source_message_ids=[
+                    source.source_message_id for source in removed_sources
+                ],
+            )
+        return affected
+
+    def _scene_fact_from_row(self, row: sqlite3.Row) -> SceneFactRecord:
+        source_rows = self._fetch_all(
+            """
+            SELECT id, save_id, scene_fact_id, source_message_id,
+                   evidence_quote, reason, confidence, created_at
+            FROM scene_fact_sources
+            WHERE scene_fact_id = ?
+            ORDER BY created_at, rowid
+            """,
+            (row["id"],),
+        )
+        return SceneFactRecord(
+            id=str(row["id"]),
+            save_id=str(row["save_id"]),
+            scene_snapshot_id=str(row["scene_snapshot_id"]),
+            scene_generation=int(row["scene_generation"]),
+            fact_type=str(row["fact_type"]),
+            subject_type=str(row["subject_type"]),
+            subject_id=cast(str | None, row["subject_id"]),
+            subject_label=str(row["subject_label"]),
+            target_type=str(row["target_type"]),
+            target_id=cast(str | None, row["target_id"]),
+            target_label=str(row["target_label"]),
+            aspect=str(row["aspect"]),
+            value=str(row["value"]),
+            conflict_key=str(row["conflict_key"]),
+            lifetime=str(row["lifetime"]),
+            created_turn_number=int(row["created_turn_number"]),
+            expires_after_turn_number=_optional_int(
+                row["expires_after_turn_number"]
+            ),
+            archived_at=cast(str | None, row["archived_at"]),
+            archive_reason=str(row["archive_reason"]),
+            created_at=cast(str | None, row["created_at"]),
+            updated_at=cast(str | None, row["updated_at"]),
+            provenance=tuple(
+                SceneFactProvenanceRecord(
+                    id=str(source["id"]),
+                    save_id=str(source["save_id"]),
+                    scene_fact_id=str(source["scene_fact_id"]),
+                    source_message_id=str(source["source_message_id"]),
+                    evidence_quote=str(source["evidence_quote"]),
+                    reason=str(source["reason"]),
+                    confidence=float(source["confidence"]),
+                    created_at=cast(str | None, source["created_at"]),
+                )
+                for source in source_rows
+            ),
+        )
+
+    def _validate_scene_fact_reference(
+        self,
+        *,
+        save_id: str,
+        reference_type: str,
+        reference_id: str | None,
+        field_name: str,
+    ) -> None:
+        if reference_type == "character":
+            if reference_id is None:
+                raise ValueError(f"{field_name} is required for a character")
+            self._validate_character_reference(
+                save_id=save_id,
+                character_id=reference_id,
+                field_name=field_name,
+            )
+        elif reference_type == "location":
+            self._validate_location_reference(
+                save_id=save_id,
+                location_id=reference_id,
+                field_name=field_name,
+            )
 
     def upsert_scene_snapshot(
         self,
@@ -15156,6 +15661,23 @@ def _scene_snapshot_from_row(row: sqlite3.Row) -> SceneSnapshotRecord:
         last_updated_message_id=last_updated_message_id,
         scene_generation=int(row["scene_generation"]),
     )
+
+
+def _scene_fact_audit_payload(fact: SceneFactRecord) -> dict[str, object]:
+    return {
+        "fact_type": fact.fact_type,
+        "subject_type": fact.subject_type,
+        "subject_id": fact.subject_id,
+        "subject_label": fact.subject_label,
+        "target_type": fact.target_type,
+        "target_id": fact.target_id,
+        "target_label": fact.target_label,
+        "aspect": fact.aspect,
+        "value": fact.value,
+        "lifetime": fact.lifetime,
+        "scene_generation": fact.scene_generation,
+        "expires_after_turn_number": fact.expires_after_turn_number,
+    }
 
 
 def _location_params(record: LocationRecord) -> tuple[object, ...]:

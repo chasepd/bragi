@@ -322,6 +322,44 @@ class SceneSnapshotRecord:
 
 
 @dataclass(frozen=True)
+class SceneFactProvenanceRecord:
+    id: str
+    save_id: str
+    scene_fact_id: str
+    source_message_id: str
+    evidence_quote: str
+    reason: str
+    confidence: float
+    created_at: str | None = None
+
+
+@dataclass(frozen=True)
+class SceneFactRecord:
+    id: str
+    save_id: str
+    scene_snapshot_id: str
+    scene_generation: int
+    fact_type: str
+    subject_type: str
+    subject_id: str | None
+    subject_label: str
+    target_type: str
+    target_id: str | None
+    target_label: str
+    aspect: str
+    value: str
+    conflict_key: str
+    lifetime: str
+    created_turn_number: int
+    expires_after_turn_number: int | None
+    archived_at: str | None = None
+    archive_reason: str = ""
+    created_at: str | None = None
+    updated_at: str | None = None
+    provenance: tuple[SceneFactProvenanceRecord, ...] = ()
+
+
+@dataclass(frozen=True)
 class DatingRouteStateRecord:
     id: str
     save_id: str

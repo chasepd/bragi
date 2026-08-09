@@ -30,6 +30,7 @@ from bragi.persistence.repositories import (
     validate_context_source_index_budget,
 )
 from bragi.private_files import write_private_bytes
+from bragi.scene_facts import scene_fact_conflict_key
 from bragi.services.action_choice_flags import normalize_legacy_action_choice_scenario
 from bragi.services.character_text_world_update_service import (
     character_text_source_ref,
@@ -563,6 +564,32 @@ class ChatBundleService:
                 FROM scene_snapshots
                 WHERE save_id = ?
                 ORDER BY rowid
+                """,
+                (save_id,),
+            ),
+            "scene_facts": self._rows(
+                """
+                SELECT id, save_id, scene_snapshot_id, scene_generation,
+                       fact_type, subject_type, subject_id, subject_label,
+                       target_type, target_id, target_label, aspect, value,
+                       conflict_key, lifetime, created_turn_number,
+                       expires_after_turn_number, archived_at, archive_reason,
+                       created_at, updated_at
+                FROM scene_facts
+                WHERE save_id = ? AND archived_at IS NULL
+                ORDER BY created_at, rowid
+                """,
+                (save_id,),
+            ),
+            "scene_fact_sources": self._rows(
+                """
+                SELECT sources.id, sources.save_id, sources.scene_fact_id,
+                       sources.source_message_id, sources.evidence_quote,
+                       sources.reason, sources.confidence, sources.created_at
+                FROM scene_fact_sources AS sources
+                JOIN scene_facts AS facts ON facts.id = sources.scene_fact_id
+                WHERE sources.save_id = ? AND facts.archived_at IS NULL
+                ORDER BY sources.created_at, sources.rowid
                 """,
                 (save_id,),
             ),
@@ -1953,6 +1980,17 @@ class ChatBundleService:
             _text(row, "id"): uuid4().hex
             for row in _list_of_objects(data.get("scene_snapshots"), "scene_snapshots")
         }
+        scene_fact_id_map = {
+            _text(row, "id"): uuid4().hex
+            for row in _list_of_objects(data.get("scene_facts"), "scene_facts")
+        }
+        scene_fact_source_id_map = {
+            _text(row, "id"): uuid4().hex
+            for row in _list_of_objects(
+                data.get("scene_fact_sources"),
+                "scene_fact_sources",
+            )
+        }
         dating_route_state_id_map = {
             _text(row, "id"): uuid4().hex
             for row in _list_of_objects(
@@ -2027,6 +2065,10 @@ class ChatBundleService:
         imported_id_maps["context_update_audit"] = context_update_audit_id_map
         imported_id_maps["scene_snapshot"] = scene_snapshot_id_map
         imported_id_maps["scene_snapshots"] = scene_snapshot_id_map
+        imported_id_maps["scene_fact"] = scene_fact_id_map
+        imported_id_maps["scene_facts"] = scene_fact_id_map
+        imported_id_maps["scene_fact_source"] = scene_fact_source_id_map
+        imported_id_maps["scene_fact_sources"] = scene_fact_source_id_map
         imported_id_maps["dating_route_state"] = dating_route_state_id_map
         imported_id_maps["dating_route_states"] = dating_route_state_id_map
         imported_id_maps["character_text_thread"] = character_text_thread_id_map
@@ -2073,6 +2115,7 @@ class ChatBundleService:
             "character_text_thread": character_text_thread_id_map,
             "character_text_message": character_text_message_id_map,
             "scene_snapshot": scene_snapshot_id_map,
+            "scene_fact": scene_fact_id_map,
             "dating_route_state": dating_route_state_id_map,
         }
         _remap_imported_media_reference_metadata(
@@ -2172,6 +2215,74 @@ class ChatBundleService:
             scene_snapshots.append(copied)
         _insert_rows(connection, "scene_snapshots", scene_snapshots)
         _backfill_imported_scene_world_time(connection, save_id)
+
+        scene_facts: list[dict[str, object]] = []
+        for row in _list_of_objects(data.get("scene_facts"), "scene_facts"):
+            original_id = _text(row, "id")
+            copied = _copy_row_for_save(
+                row,
+                save_id,
+                new_id=scene_fact_id_map[original_id],
+            )
+            copied["scene_snapshot_id"] = _mapped_optional_value(
+                scene_snapshot_id_map,
+                _optional_text(row, "scene_snapshot_id"),
+                field_name="scene_facts.scene_snapshot_id",
+                repair_tracker=repair_tracker,
+            )
+            for prefix in ("subject", "target"):
+                reference_type = _optional_text(row, f"{prefix}_type") or ""
+                original_reference_id = _optional_text(row, f"{prefix}_id")
+                reference_map = (
+                    character_id_map
+                    if reference_type == "character"
+                    else location_id_map
+                    if reference_type == "location"
+                    else {}
+                )
+                copied[f"{prefix}_id"] = _mapped_optional_value(
+                    reference_map,
+                    original_reference_id,
+                    field_name=f"scene_facts.{prefix}_id",
+                    repair_tracker=repair_tracker,
+                )
+            copied["conflict_key"] = scene_fact_conflict_key(
+                fact_type=_text(copied, "fact_type"),
+                subject_type=_text(copied, "subject_type"),
+                subject_id=_optional_text(copied, "subject_id"),
+                subject_label=_text(copied, "subject_label"),
+                target_type=_optional_text(copied, "target_type") or "",
+                target_id=_optional_text(copied, "target_id"),
+                target_label=_optional_text(copied, "target_label") or "",
+                aspect=_optional_text(copied, "aspect") or "",
+            )
+            scene_facts.append(copied)
+        _insert_rows(connection, "scene_facts", scene_facts)
+
+        scene_fact_sources: list[dict[str, object]] = []
+        for row in _list_of_objects(
+            data.get("scene_fact_sources"),
+            "scene_fact_sources",
+        ):
+            original_fact_id = _text(row, "scene_fact_id")
+            mapped_fact_id = scene_fact_id_map.get(original_fact_id)
+            mapped_message_id = _mapped_optional_required(
+                message_id_map=message_id_map,
+                original_id=_optional_text(row, "source_message_id"),
+                field_name="scene_fact_sources.source_message_id",
+                repair_tracker=repair_tracker,
+            )
+            if mapped_fact_id is None or mapped_message_id is None:
+                continue
+            copied = _copy_row_for_save(
+                row,
+                save_id,
+                new_id=scene_fact_source_id_map[_text(row, "id")],
+            )
+            copied["scene_fact_id"] = mapped_fact_id
+            copied["source_message_id"] = mapped_message_id
+            scene_fact_sources.append(copied)
+        _insert_rows(connection, "scene_fact_sources", scene_fact_sources)
 
         context_sources: list[dict[str, object]] = []
         for row in _list_of_objects(data.get("context_sources"), "context_sources"):
