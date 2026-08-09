@@ -10068,9 +10068,9 @@ def _budgeted_narrator_context(
                 include_setup=include_full_scenario_setup,
             ),
             reason=(
-                "compact scenario header"
+                "durable scenario contract with setup"
                 if include_full_scenario_setup
-                else "lean scenario header after opening left recent chronicle"
+                else "durable scenario contract"
             ),
             always_include=True,
         ),

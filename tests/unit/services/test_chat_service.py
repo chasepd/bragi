@@ -4252,10 +4252,7 @@ def test_submit_player_turn_keeps_dating_route_anchor_after_setup_ages_out(
     scenario = repositories.create_scenario(
         type="dating_sim",
         title="Last Summer",
-        premise=(
-            "A long initial dating-sim setup with romance options and dorm "
-            "politics that should age out of the normal scenario header."
-        ),
+        premise="A transfer student navigates romance options and dorm politics.",
         player_role="Transfer student",
         content={
             "player_character_name": "Lio Takahashi",
@@ -4366,7 +4363,10 @@ def test_submit_player_turn_keeps_dating_route_anchor_after_setup_ages_out(
         assert "trust: guarded" in route_context
         assert "comfort with intimacy: none yet" in route_context
         assert "premature now: exclusivity or commitment language" in route_context
-    assert "Premise/setup:" not in request.scenario_instructions
+    assert (
+        "Premise: A transfer student navigates romance options and dorm politics."
+        in request.scenario_instructions
+    )
     assert "Opening romance-option setup that has aged out." not in [
         message.body for message in request.messages
     ]
@@ -16005,29 +16005,30 @@ def test_submit_player_turn_continues_when_optional_context_search_fails(
     assert persisted_messages[1] == result.narrator_message
 
 
-def test_submit_player_turn_omits_initial_setup_after_opening_leaves_recent_window(
+def test_submit_player_turn_keeps_contract_after_opening_leaves_prompt_windows(
     repositories: PersistenceRepositories,
 ) -> None:
     long_premise = (
-        "A long initial setup about lantern ferries, archive districts, and "
-        "the discovery of a disputed star map."
+        "An archive courier must recover a disputed star map before rival "
+        "factions turn the city against itself."
     )
     long_tone = (
-        "Warm archival mystery with a lengthy initial tone brief full of "
-        "ferry bells, catalog disputes, and understated romance."
+        "Warm archival mystery told in close third person with understated romance."
     )
     long_player_role = (
-        "The player is Avery Quill, a fictional archive courier with an "
-        "initial biography that should not ride along forever after setup."
+        "Avery Quill, an archive courier trusted by neither faction."
     )
     scenario = repositories.create_scenario(
-        type="full_roleplay",
+        type="fantasy_roleplay",
         title="Lantern Archive Arrival",
         premise=long_premise,
         player_role=long_player_role,
         content={
             "player_character_name": "Avery Quill",
             "tone_genre": long_tone,
+            "magic_system": "Reading a star map consumes one treasured memory.",
+            "realms_and_places": "The opening ferry crosses seven archive districts.",
+            "starting_scene": "Avery steps off the lantern ferry at dawn.",
             "current_scene": (
                 "Avery is reviewing a map with Nira in the archive atrium."
             ),
@@ -16043,29 +16044,55 @@ def test_submit_player_turn_omits_initial_setup_after_opening_leaves_recent_wind
         speaker_name="Narrator",
         body="Opening setup chronicle that has now aged out.",
     )
-    repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Avery",
-        body="I ask Nira what the map's missing mark means.",
-    )
-    recent_narrator = repositories.append_message(
-        save_id=save.id,
-        role="narrator",
-        speaker_name="Narrator",
-        body="Nira sets the brass compass on the archive table.",
-    )
+    for index in range(3):
+        repositories.append_message(
+            save_id=save.id,
+            role="player",
+            speaker_name="Avery",
+            body=f"I ask Nira about map mark {index}.",
+        )
+        repositories.append_message(
+            save_id=save.id,
+            role="narrator",
+            speaker_name="Narrator",
+            body=f"Nira moves brass compass {index} across the archive table.",
+        )
+    repositories.set_app_setting(RECENT_PLAYER_MESSAGE_WINDOW_SETTING, 1)
     repositories.set_app_setting(RECENT_NARRATOR_MESSAGE_WINDOW_SETTING, 1)
+    repositories.set_app_setting(
+        NARRATOR_PLANNER_RECENT_PLAYER_MESSAGE_WINDOW_SETTING,
+        2,
+    )
+    repositories.set_app_setting(
+        NARRATOR_PLANNER_RECENT_NARRATOR_MESSAGE_WINDOW_SETTING,
+        2,
+    )
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting(PLAN_FIRST_NARRATOR_SETTING, True)
+    repositories.set_app_setting("context_budget_mode", "fixed_chars")
+    repositories.set_app_setting("context_budget_fixed_total_chars", 1)
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
         model_id="anthropic/claude-3.5-sonnet",
     )
     provider = RecordingChatProvider("openrouter")
+    planner = ScriptedNarratorPlanner(
+        NarratorMessageSpec(
+            intent="Answer Avery without losing the scenario contract.",
+            thesis="The disputed map remains central.",
+            must_say=(),
+            avoid=(),
+            tone="warm archival mystery",
+            uncertainties=(),
+            evidence_source_ids=(),
+        )
+    )
     service = ChatService(
         repositories=repositories,
         providers={"openrouter": provider},
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
+        narrator_planner=planner,
     )
 
     asyncio.run(
@@ -16073,25 +16100,44 @@ def test_submit_player_turn_omits_initial_setup_after_opening_leaves_recent_wind
             save_id=save.id,
             body="I answer Nira honestly.",
             speaker_name="Avery",
+            run_post_turn_jobs=False,
         )
     )
 
+    planner_request = planner.calls[0][1]
     request = provider.chat_requests[0]
-    assert "Title: Lantern Archive Arrival" in request.scenario_instructions
-    assert "Player character name: Avery Quill" in request.scenario_instructions
-    assert (
-        "Current scene: Avery is reviewing a map with Nira in the archive atrium."
-        in request.scenario_instructions
-    )
-    assert "Premise/setup:" not in request.scenario_instructions
-    assert "Tone/style:" not in request.scenario_instructions
-    assert "Player role:" not in request.scenario_instructions
-    assert long_premise not in request.scenario_instructions
-    assert long_tone not in request.scenario_instructions
-    assert long_player_role not in request.scenario_instructions
-    assert [
-        message.body for message in request.messages if message.role == "narrator"
-    ] == [recent_narrator.body]
+    for seen_request in (planner_request, request):
+        assert "Title: Lantern Archive Arrival" in seen_request.scenario_instructions
+        assert (
+            "Player character name: Avery Quill"
+            in seen_request.scenario_instructions
+        )
+        assert f"Premise: {long_premise}" in seen_request.scenario_instructions
+        assert f"Tone/style: {long_tone}" in seen_request.scenario_instructions
+        assert f"Player role: {long_player_role}" in seen_request.scenario_instructions
+        assert (
+            "Magic constraints: Reading a star map consumes one treasured memory."
+            in seen_request.scenario_instructions
+        )
+        assert "The opening ferry crosses seven archive districts." not in (
+            seen_request.scenario_instructions
+        )
+        assert "Avery steps off the lantern ferry at dawn." not in (
+            seen_request.scenario_instructions
+        )
+        scenario_source = next(
+            source
+            for source in seen_request.context_breakdown["sources"]
+            if source["tier"] == "scenario_header"
+        )
+        assert scenario_source["included"] is True
+        assert scenario_source["reason"] == "durable scenario contract"
+    assert len(
+        [message for message in planner_request.messages if message.role == "narrator"]
+    ) == 2
+    assert len(
+        [message for message in request.messages if message.role == "narrator"]
+    ) == 1
 
 
 def test_submit_player_turn_continues_when_context_search_is_rate_limited(

@@ -507,8 +507,8 @@ def compact_scenario_instructions(
         include_setup=include_setup,
     )
     cyoa_identity_parts = _choose_your_own_adventure_identity_lines(scenario)
-    full_setup_parts = (
-        f"Premise/setup: {scenario.premise}",
+    scenario_contract_parts = (
+        f"Premise: {scenario.premise}",
         _player_character_name_line(scenario),
         *fantasy_identity_parts,
         *science_fiction_identity_parts,
@@ -528,24 +528,6 @@ def compact_scenario_instructions(
         _scenario_content_line(scenario, "current_scene", "Current scene"),
         f"Player role: {scenario.player_role}",
     )
-    lean_identity_parts = (
-        _player_character_name_line(scenario),
-        _scenario_content_line(scenario, "current_scene", "Current scene"),
-        *fantasy_identity_parts,
-        *science_fiction_identity_parts,
-        *first_contact_identity_parts,
-        *survival_expedition_identity_parts,
-        *time_loop_identity_parts,
-        *mystery_identity_parts,
-        *heist_identity_parts,
-        *intrigue_identity_parts,
-        *settlement_identity_parts,
-        *hunt_identity_parts,
-        *journey_identity_parts,
-        *trade_identity_parts,
-        *dating_sim_identity_parts,
-        *cyoa_identity_parts,
-    )
     header = (
         (
             "Scenario header. Treat this as identity and setup only; current "
@@ -554,10 +536,10 @@ def compact_scenario_instructions(
         )
         if include_setup
         else (
-            "Scenario header. Treat this as durable identity only; initial "
-            "setup is omitted because the opening is no longer in the recent "
-            "chronicle window. Current scene context, selected retrieval, and "
-            "chronicle messages are authoritative when they diverge."
+            "Scenario header. Treat this as the durable creative contract; "
+            "initial setup details are omitted because the opening is no longer "
+            "in the recent chronicle window. Current scene context, selected "
+            "retrieval, and chronicle messages are authoritative when they diverge."
         )
     )
     return "\n".join(
@@ -604,7 +586,7 @@ def compact_scenario_instructions(
                 else ""
             ),
             f"Title: {scenario.title}",
-            *(full_setup_parts if include_setup else lean_identity_parts),
+            *scenario_contract_parts,
         )
         if part
     )

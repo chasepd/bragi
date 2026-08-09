@@ -47,7 +47,7 @@ def test_compact_scenario_instructions_keeps_setup_compact() -> None:
     instructions = compact_scenario_instructions(scenario)
 
     assert "Title: Ashfall Keep" in instructions
-    assert "Premise/setup: A border keep is cut off by ash storms." in instructions
+    assert "Premise: A border keep is cut off by ash storms." in instructions
     assert "Player role: Signal warden" in instructions
     assert "Narrator control rule" in instructions
     assert (
@@ -229,26 +229,18 @@ def test_compact_scenario_instructions_includes_political_intrigue_setup() -> No
     )
 
 
-def test_compact_scenario_instructions_can_omit_aged_setup_fields() -> None:
+def test_compact_scenario_instructions_keeps_contract_when_setup_ages_out() -> None:
     scenario = ScenarioRecord(
         id="scenario-aged",
         type="full_roleplay",
         title="Lantern Archive Arrival",
-        premise=(
-            "A sprawling initial setup about lantern ferries, archive districts, "
-            "and a disputed star map."
-        ),
-        player_role=(
-            "The player is Avery Quill, a fictional archive courier whose initial "
-            "biography should not ride along after setup is no longer recent."
-        ),
+        premise="A courier must recover a disputed star map before the archive war.",
+        player_role="Avery Quill, an archive courier trusted by neither faction.",
         content_json=json.dumps(
             {
                 "player_character_name": "Avery Quill",
-                "tone_genre": (
-                    "Warm archival mystery with a long initial style brief "
-                    "that belongs near setup, not every late narrator prompt."
-                ),
+                "tone_genre": "Warm archival mystery with understated romance.",
+                "starting_scene": "Avery steps off the lantern ferry at dawn.",
                 "current_scene": (
                     "Avery is reviewing a map with Nira in the archive atrium."
                 ),
@@ -265,12 +257,41 @@ def test_compact_scenario_instructions_can_omit_aged_setup_fields() -> None:
         in instructions
     )
     assert "Narrator control rule" in instructions
-    assert "Premise/setup:" not in instructions
-    assert "Tone/style:" not in instructions
-    assert "Player role:" not in instructions
-    assert "disputed star map" not in instructions
-    assert "long initial style brief" not in instructions
-    assert "long initial biography" not in instructions
+    assert (
+        "Premise: A courier must recover a disputed star map before the archive war."
+        in instructions
+    )
+    assert "Tone/style: Warm archival mystery with understated romance." in instructions
+    assert (
+        "Player role: Avery Quill, an archive courier trusted by neither faction."
+        in instructions
+    )
+    assert "Avery steps off the lantern ferry at dawn." not in instructions
+
+
+def test_compact_scenario_instructions_keeps_specialized_durable_contract() -> None:
+    scenario = _scenario(
+        scenario_type="fantasy_roleplay",
+        content={
+            "magic_system": "Every spell consumes a treasured memory.",
+            "realms_and_places": "The opening road crosses seven named kingdoms.",
+            "factions_and_orders": "The opening court hosts five rival orders.",
+            "tone_genre": "Mythic tragedy told through close third-person prose.",
+            "current_scene": "Mara waits beneath the broken moon gate.",
+        },
+    )
+
+    instructions = compact_scenario_instructions(scenario, include_setup=False)
+
+    assert "Premise: A border keep is cut off by ash storms." in instructions
+    assert "Player role: Signal warden" in instructions
+    assert (
+        "Tone/style: Mythic tragedy told through close third-person prose."
+        in instructions
+    )
+    assert "Magic constraints: Every spell consumes a treasured memory." in instructions
+    assert "The opening road crosses seven named kingdoms." not in instructions
+    assert "The opening court hosts five rival orders." not in instructions
 
 
 def test_scenario_section_candidates_exclude_core_content_fields() -> None:
