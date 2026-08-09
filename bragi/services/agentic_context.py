@@ -21,8 +21,6 @@ from bragi.persistence.models import (
     MessageRecord,
 )
 from bragi.persistence.repositories import (
-    CHARACTER_KNOWLEDGE_ACQUISITION_METHODS,
-    CHARACTER_KNOWLEDGE_STATES,
     PersistenceRepositories,
     canonical_claim_fingerprint,
 )
@@ -36,7 +34,10 @@ from bragi.providers.contracts import (
     StructuredOutputResponse,
 )
 from bragi.retry_policy import configured_max_attempts
-from bragi.services.evidence import quote_matches_source
+from bragi.services.evidence import (
+    invalid_knowledge_metadata_field,
+    quote_matches_source,
+)
 from bragi.services.manual_confirmation import manual_memory_confirmation_enabled
 from bragi.services.npc_knowledge_audit_service import NpcKnowledgeLeak
 from bragi.services.openrouter_routing_settings import request_with_openrouter_routing
@@ -3431,24 +3432,23 @@ def _state_commit_candidate_value_shape_rejection(
 def _candidate_knowledge_metadata_rejection(
     candidate: StateCommitCandidate,
 ) -> PlannerRejection | None:
-    knowledge_state = _string(candidate.value.get("knowledge_state"))
-    if knowledge_state and knowledge_state not in CHARACTER_KNOWLEDGE_STATES:
+    invalid_field = invalid_knowledge_metadata_field(
+        knowledge_state=_string(candidate.value.get("knowledge_state")),
+        acquisition_method=_string(candidate.value.get("acquisition_method")),
+    )
+    if invalid_field == "knowledge_state":
         return _planner_rejection(
             candidate=candidate,
             reason="unknown_knowledge_state",
             field_name="value.knowledge_state",
-            rejected_value=knowledge_state,
+            rejected_value=_string(candidate.value.get("knowledge_state")),
         )
-    acquisition_method = _string(candidate.value.get("acquisition_method"))
-    if (
-        acquisition_method
-        and acquisition_method not in CHARACTER_KNOWLEDGE_ACQUISITION_METHODS
-    ):
+    if invalid_field == "acquisition_method":
         return _planner_rejection(
             candidate=candidate,
             reason="unknown_acquisition_method",
             field_name="value.acquisition_method",
-            rejected_value=acquisition_method,
+            rejected_value=_string(candidate.value.get("acquisition_method")),
         )
     return None
 

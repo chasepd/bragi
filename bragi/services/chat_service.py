@@ -32,11 +32,7 @@ from bragi.persistence.models import (
     SceneSnapshotRecord,
     SummaryRecord,
 )
-from bragi.persistence.repositories import (
-    CHARACTER_KNOWLEDGE_ACQUISITION_METHODS,
-    CHARACTER_KNOWLEDGE_STATES,
-    PersistenceRepositories,
-)
+from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.chat_rendering import estimate_chat_request_tokens
 from bragi.providers.contracts import (
     NARRATOR_PROMPT_MODE_PLAN_FIRST,
@@ -147,7 +143,10 @@ from bragi.services.director_pressure_service import (
     DirectorPressureService,
     director_pressure_enabled,
 )
-from bragi.services.evidence import quote_matches_source
+from bragi.services.evidence import (
+    invalid_knowledge_metadata_field,
+    quote_matches_source,
+)
 from bragi.services.generation_settings import (
     DEFAULT_CHAT_MAX_OUTPUT_TOKENS,
     chat_generation_settings,
@@ -8659,14 +8658,13 @@ def _apply_scene_snapshot_field_candidate(
 def _planned_knowledge_metadata_skip_reason(
     value: Mapping[str, object],
 ) -> str:
-    knowledge_state = _string_mapping_value(value, "knowledge_state")
-    if knowledge_state and knowledge_state not in CHARACTER_KNOWLEDGE_STATES:
+    invalid_field = invalid_knowledge_metadata_field(
+        knowledge_state=_string_mapping_value(value, "knowledge_state"),
+        acquisition_method=_string_mapping_value(value, "acquisition_method"),
+    )
+    if invalid_field == "knowledge_state":
         return "unknown_knowledge_state"
-    acquisition_method = _string_mapping_value(value, "acquisition_method")
-    if (
-        acquisition_method
-        and acquisition_method not in CHARACTER_KNOWLEDGE_ACQUISITION_METHODS
-    ):
+    if invalid_field == "acquisition_method":
         return "unknown_acquisition_method"
     return ""
 
@@ -8895,9 +8893,10 @@ def _planned_commit_evidence_is_grounded(
         planning_scene_text = _planning_scene_text(snapshot)
 
     def matches(source_id: str) -> bool:
-        if source_id not in source_text_by_id:
-            return False
-        if quote_matches_source(quote, source_text_by_id[source_id]):
+        if (
+            source_id in source_text_by_id
+            and quote_matches_source(quote, source_text_by_id[source_id])
+        ):
             return True
         return bool(
             source_id.startswith("scene_snapshot:")

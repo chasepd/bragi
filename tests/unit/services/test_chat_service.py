@@ -5641,6 +5641,19 @@ def test_planned_commit_grounding_accepts_planning_scene_text(
 
     assert grounded is True
 
+    grounded_without_inventory_key = (
+        chat_service_module._planned_commit_evidence_is_grounded(
+            repositories=repositories,
+            save_id=save.id,
+            player_message_id="message:player",
+            narrator_message_id="message:narrator",
+            candidate=candidate,
+            evidence_source_text_by_id={},
+        )
+    )
+
+    assert grounded_without_inventory_key is True
+
 
 def test_submit_player_turn_queues_verified_learned_memory_when_confirmation_enabled(
     repositories: PersistenceRepositories,
