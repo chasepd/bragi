@@ -27,6 +27,7 @@ from bragi.services.model_preferences import roleplay_model_preference
 from bragi.services.openrouter_routing_settings import request_with_openrouter_routing
 from bragi.services.provider_fallbacks import structured_output_with_fallback
 from bragi.services.sexual_content_safety import is_fade_to_black_message
+from bragi.services.turn_outcome import TurnOutcome, turn_outcome_from_mapping
 from bragi.world_time_model import format_world_time_from_snapshot
 
 DIRECTOR_PRESSURE_TASK = "director_pressure"
@@ -90,6 +91,16 @@ class DirectorPressureResult:
     state: DirectorPressureState = DirectorPressureState()
     skipped_reason: str = ""
     commit_state: bool = True
+    provider_called: bool = False
+    pacing_signal: str = ""
+
+
+@dataclass(frozen=True)
+class _DirectorPressureGate:
+    eligible: bool
+    reason: str
+    pacing_signal: str
+    state: DirectorPressureState
 
 
 class DirectorPressureService:
@@ -139,31 +150,45 @@ class DirectorPressureService:
         ):
             return _skipped("safety_transition")
 
+        previous_state = load_director_pressure_state(self.repositories, save_id)
+        outcome = _turn_outcome_for_message(
+            self.repositories,
+            save_id=save_id,
+            narrator_message_id=narrator_message_id,
+        )
+        gate = _director_pressure_gate(previous_state, outcome)
+        if not gate.eligible:
+            return DirectorPressureResult(
+                state=gate.state,
+                skipped_reason=gate.reason,
+                pacing_signal=gate.pacing_signal,
+                commit_state=gate.pacing_signal != "unverified",
+            )
+
         preference = roleplay_model_preference(
             repositories=self.repositories,
             save_id=save_id,
             purpose=DIRECTOR_PRESSURE_TASK,
         )
         if preference is None:
-            return _skipped("no_model_preference")
+            return _gated_skip("no_model_preference", gate=gate)
         provider = self.providers.get(preference.provider)
         if not isinstance(cast(object, provider), StructuredOutputProvider):
-            return _skipped("provider_unavailable")
+            return _gated_skip("provider_unavailable", gate=gate)
         if known_model_is_unavailable(
             self.repositories,
             provider=preference.provider,
             model_id=preference.model_id,
         ):
-            return _skipped("model_unavailable")
+            return _gated_skip("model_unavailable", gate=gate)
         if not model_supports_any_capability(
             self.repositories,
             provider=preference.provider,
             model_id=preference.model_id,
             required=STRUCTURED_OUTPUT_CAPABILITIES,
         ):
-            return _skipped("model_lacks_structured_output")
+            return _gated_skip("model_lacks_structured_output", gate=gate)
 
-        previous_state = load_director_pressure_state(self.repositories, save_id)
         request = request_with_openrouter_routing(
             self.repositories,
             StructuredOutputRequest(
@@ -177,7 +202,7 @@ class DirectorPressureService:
                     messages=tuple(details.messages),
                     player_message=player_message,
                     narrator_message=narrator_message,
-                    previous_state=previous_state,
+                    previous_state=gate.state,
                 ),
                 temperature=0.2,
                 max_output_tokens=10_000,
@@ -192,7 +217,11 @@ class DirectorPressureService:
             task=DIRECTOR_PRESSURE_TASK,
             save_id=save_id,
         )
-        return _result_from_data(response.data, previous_state=previous_state)
+        return _result_from_data(
+            response.data,
+            previous_state=gate.state,
+            pacing_signal=gate.pacing_signal,
+        )
 
     def commit_after_narration(
         self,
@@ -232,6 +261,108 @@ def load_director_pressure_state(
         None,
     )
     return _state_from_world_state(record)
+
+
+def _turn_outcome_for_message(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    narrator_message_id: str,
+) -> TurnOutcome | None:
+    record = repositories.get_turn_outcome_for_message(
+        save_id=save_id,
+        message_id=narrator_message_id,
+    )
+    if record is None:
+        return None
+    return turn_outcome_from_mapping(record.payload)
+
+
+def _director_pressure_gate(
+    previous_state: DirectorPressureState,
+    outcome: TurnOutcome | None,
+) -> _DirectorPressureGate:
+    if outcome is None or not outcome.verification_passed:
+        return _DirectorPressureGate(
+            eligible=False,
+            reason="unverified_turn_outcome",
+            pacing_signal="unverified",
+            state=previous_state,
+        )
+
+    cooldown = max(previous_state.cooldown_turns - 1, 0)
+    pacing_signal = _turn_pacing_signal(outcome)
+    if pacing_signal == "resolving":
+        state = replace(
+            previous_state,
+            tension_trend="resolving",
+            stall_turns=0,
+            cooldown_turns=cooldown,
+        )
+        return _DirectorPressureGate(False, "player_resolving", pacing_signal, state)
+    if pacing_signal == "rising":
+        state = replace(
+            previous_state,
+            tension_trend="rising",
+            stall_turns=0,
+            cooldown_turns=cooldown,
+        )
+        return _DirectorPressureGate(False, "tension_rising", pacing_signal, state)
+    if pacing_signal == "temporal_progress":
+        state = replace(
+            previous_state,
+            tension_trend="rising",
+            stall_turns=0,
+            cooldown_turns=cooldown,
+        )
+        return _DirectorPressureGate(False, "temporal_progress", pacing_signal, state)
+
+    state = replace(
+        previous_state,
+        tension_trend="stalled",
+        stall_turns=min(previous_state.stall_turns + 1, 99),
+        cooldown_turns=cooldown,
+    )
+    if cooldown > 0:
+        return _DirectorPressureGate(False, "cooldown", "stalled", state)
+    if state.stall_turns < DIRECTOR_PRESSURE_STALL_THRESHOLD:
+        return _DirectorPressureGate(False, "stall_threshold", "stalled", state)
+    return _DirectorPressureGate(True, "", "stalled", state)
+
+
+def _turn_pacing_signal(outcome: TurnOutcome) -> str:
+    accepted_effects = tuple(
+        effect
+        for effect in outcome.effects
+        if effect.application_status in {"committed", "confirmation_queued"}
+        and (effect.changed or effect.application_status == "confirmation_queued")
+    )
+    for effect in accepted_effects:
+        if effect.candidate_type != "active_thread_change":
+            continue
+        status = _string(effect.value.get("status")).casefold()
+        if effect.operation == "delete" or status in {"resolved", "archived"}:
+            return "resolving"
+    for effect in accepted_effects:
+        if effect.candidate_type != "active_thread_change":
+            continue
+        status = _string(effect.value.get("status")).casefold()
+        if status != "paused":
+            return "rising"
+    if any(
+        effect.candidate_type == "world_time_change"
+        for effect in accepted_effects
+    ):
+        return "temporal_progress"
+    return "stalled"
+
+
+def _gated_skip(reason: str, *, gate: _DirectorPressureGate) -> DirectorPressureResult:
+    return DirectorPressureResult(
+        state=gate.state,
+        skipped_reason=reason,
+        pacing_signal=gate.pacing_signal,
+    )
 
 
 def commit_director_pressure_result(
@@ -308,9 +439,7 @@ def _director_pressure_schema() -> dict[str, object]:
         "additionalProperties": False,
         "properties": {
             "tension_level": {"type": "integer", "minimum": 0, "maximum": 5},
-            "tension_trend": {"type": "string", "enum": sorted(_TRENDS)},
             "dramatic_questions": string_array,
-            "player_is_resolving_existing_pressure": {"type": "boolean"},
             "assessment": {"type": "string"},
             "action": {"type": "string", "enum": ["abstain", "apply_pressure"]},
             "pressure_kind": {"type": "string", "enum": ["", *sorted(_KINDS)]},
@@ -323,9 +452,7 @@ def _director_pressure_schema() -> dict[str, object]:
         },
         "required": [
             "tension_level",
-            "tension_trend",
             "dramatic_questions",
-            "player_is_resolving_existing_pressure",
             "assessment",
             "action",
             "pressure_kind",
@@ -359,11 +486,12 @@ def _director_pressure_messages(
             body=(
                 "You are Bragi's Director/Pressure agent. You represent no "
                 "character. Assess the completed player/narrator turn and "
-                "propose external pressure only when tension has stalled. Use "
+                "propose external pressure or abstain. Deterministic pacing "
+                "policy has already established that tension is stalled and "
+                "the cooldown has expired. Use "
                 "the enforced schema. Do not write narrator prose. Do not decide "
                 "how any character responds; characters will react in-character "
-                "in later turns. Abstain when tension is already rising or the "
-                "player is resolving an existing pressure thread."
+                "in later turns."
             ),
         ),
         ChatMessage(
@@ -393,37 +521,24 @@ def _result_from_data(
     data: dict[str, object],
     *,
     previous_state: DirectorPressureState,
+    pacing_signal: str,
 ) -> DirectorPressureResult:
-    trend = _trend(data.get("tension_trend"))
-    player_resolving = bool(data.get("player_is_resolving_existing_pressure"))
-    cooldown = max(previous_state.cooldown_turns - 1, 0)
-    if trend == "stalled" and not player_resolving:
-        stall_turns = previous_state.stall_turns + 1
-    else:
-        stall_turns = 0
-
     action = _string(data.get("action"))
     directive = _string(data.get("pressure_directive"))
     requested_pressure = action == "apply_pressure" and bool(directive)
-    skipped_reason = ""
-    applied = False
-    if not requested_pressure:
-        skipped_reason = "model_abstained"
-    elif player_resolving:
-        skipped_reason = "player_resolving"
-    elif cooldown > 0:
-        skipped_reason = "cooldown"
-    elif stall_turns < DIRECTOR_PRESSURE_STALL_THRESHOLD:
-        skipped_reason = "stall_threshold"
-    else:
-        applied = True
-        stall_turns = 0
-        cooldown = DIRECTOR_PRESSURE_COOLDOWN_TURNS
+    applied = requested_pressure
+    skipped_reason = "" if applied else "model_abstained"
+    stall_turns = 0 if applied else previous_state.stall_turns
+    cooldown = (
+        DIRECTOR_PRESSURE_COOLDOWN_TURNS
+        if applied
+        else previous_state.cooldown_turns
+    )
 
     state = DirectorPressureState(
         dramatic_questions=_string_tuple(data.get("dramatic_questions"))[:6],
         tension_level=_int(data.get("tension_level"), minimum=0, maximum=5),
-        tension_trend=trend,
+        tension_trend="rising" if applied else previous_state.tension_trend,
         stall_turns=stall_turns,
         cooldown_turns=cooldown,
         active_clocks=_clocks_from_data(data.get("active_clocks")),
@@ -446,6 +561,8 @@ def _result_from_data(
         evidence_source_ids=_string_tuple(data.get("evidence_source_ids")),
         state=state,
         skipped_reason=skipped_reason,
+        provider_called=True,
+        pacing_signal=pacing_signal,
     )
 
 

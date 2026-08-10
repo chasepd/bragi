@@ -1151,6 +1151,37 @@ def test_world_time_service_reconciles_player_authorized_narrator_time_jump(
     assert f"[{narrator_message_id}] narrator" in provider.requests[0].messages[1].body
 
 
+def test_world_time_service_skips_completed_turn_without_advance_signal(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id, narrator_message_id = _save_with_completed_turn(
+        repositories,
+        player_body="I inspect the beacon lens.",
+        narrator_body="Mara brushes ash from the brass housing.",
+    )
+    provider = RecordingStructuredTimeProvider({"changed": False})
+    service = WorldTimeService(
+        repositories=repositories,
+        checker=StructuredProviderWorldTimeChecker(
+            provider=provider,
+            provider_name="fake",
+            model_id="fake-time",
+        ),
+    )
+
+    result = asyncio.run(
+        service.reconcile_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+        )
+    )
+
+    assert result.status == "skipped"
+    assert result.skipped_reason == "no_time_advance_signal"
+    assert provider.requests == []
+
+
 def test_world_time_service_queues_ambiguous_narrator_only_time_jump(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -1430,9 +1461,10 @@ def test_world_time_service_reconciliation_rejects_timer_readout_evidence(
     snapshot = repositories.get_scene_snapshot(save_id)
     assert snapshot is not None
     assert result.status == "skipped"
-    assert result.skipped_reason == "timer_readout_not_clock"
+    assert result.skipped_reason == "no_time_advance_signal"
     assert snapshot.time_of_day == "morning"
     assert snapshot.in_world_time == "Monday morning"
+    assert provider.requests == []
 
 
 def test_world_time_service_time_loop_phase_advance_keeps_repeated_day_index(
