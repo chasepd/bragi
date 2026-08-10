@@ -2281,7 +2281,7 @@ def test_migration_77_to_78_backfills_summary_pressure_state(tmp_path: Path) -> 
         assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
 
 
-def test_migration_78_to_79_backfills_incremental_snapshot_tracking(
+def test_migration_80_to_81_backfills_incremental_snapshot_tracking(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "incremental-snapshots.db"
@@ -2311,7 +2311,7 @@ def test_migration_78_to_79_backfills_incremental_snapshot_tracking(
             "save_snapshot_state",
         ):
             connection.execute(f"DROP TABLE {table_name}")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 79")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 81")
         connection.commit()
 
     migrate_database(database_path)
