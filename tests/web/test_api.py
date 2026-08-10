@@ -8805,8 +8805,12 @@ def test_generic_chat_job_cancel_records_cancelled_status(tmp_path: Path) -> Non
                 break
             time.sleep(0.01)
 
+        repeated = client.post(_job_cancel_url(job_id, "save-1"))
+
     assert job["status"] == "cancelled"
     assert job["error"] == "Cancelled"
+    assert repeated.status_code == 200
+    assert repeated.json() == {"cancelled": False}
 
 
 def test_chat_turn_completes_after_initial_render_and_queues_post_turn_job(
@@ -10676,6 +10680,37 @@ def test_terminal_chat_like_job_cancel_does_not_request_runtime_cancellation(
     assert cancelled.status_code == 200
     assert cancelled.json() == {"cancelled": False}
     assert runtime.cancel_calls == []
+
+
+def test_active_chat_like_job_cancel_reports_when_cancellation_cannot_be_requested(
+    tmp_path: Path,
+) -> None:
+    class RejectingCancelRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_calls: list[str | None] = []
+
+        def cancel_active_submit(self, *, save_id: str | None = None) -> bool:
+            self.cancel_calls.append(save_id)
+            return False
+
+    runtime = RejectingCancelRuntime()
+    state = _state_double(tmp_path, runtime)
+    state.jobs._jobs = {  # noqa: SLF001 - controlled registry fixture
+        "chat-turn-running": JobRecord(
+            id="chat-turn-running",
+            type="chat_turn",
+            save_id="save-1",
+            status="running",
+        )
+    }
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        cancelled = client.post(_job_cancel_url("chat-turn-running", "save-1"))
+
+    assert cancelled.status_code == 409
+    assert cancelled.json()["detail"] == "Job cancellation could not be requested"
+    assert runtime.cancel_calls == ["save-1"]
 
 
 def test_chat_regenerate_passes_feedback_to_runtime(tmp_path: Path) -> None:
