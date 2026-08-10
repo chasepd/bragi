@@ -571,6 +571,105 @@ class ContextSearchService:
             )
             candidates = candidate_set.candidates
             candidate_diagnostics = candidate_set.diagnostics
+            preselection_revision = (
+                self.repositories.context_candidate_revision_token(
+                    save_id,
+                    ignored_message_id=player_message_id,
+                )
+            )
+            if (
+                cache_entry is not None
+                and preselection_revision != cache_entry.fingerprint
+            ):
+                cache_status = "stale"
+                _sync_continuity_index_for_search(self.repositories, save_id)
+                details = self.repositories.load_save_details(
+                    save_id,
+                    message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+                )
+                if details is None:
+                    raise ValueError(f"Unknown save id: {save_id}")
+                scenario = details.scenario
+                messages = (
+                    details.messages
+                    if focus_message is None
+                    else [*details.messages, focus_message]
+                )
+                narration_snapshot = load_narration_context_snapshot(
+                    self.repositories,
+                    save_id=save_id,
+                    details=details,
+                    include_context_sources=False,
+                    raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
+                )
+                if narration_snapshot is None:
+                    raise ValueError(f"Unknown save id: {save_id}")
+                messages = _context_search_visible_messages(
+                    self.repositories,
+                    save_id=save_id,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    required_messages=tuple(
+                        message
+                        for message in messages
+                        if message.id == player_message_id
+                    ),
+                )
+                retrieved_sources = await _retrieve_indexed_context_sources(
+                    self.repositories,
+                    provider=provider,
+                    provider_name=preference.provider,
+                    model_id=preference.model_id,
+                    save_id=save_id,
+                    latest_player_message=player_message,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    characters=list(narration_snapshot.characters),
+                    character_knowledge_edges=list(
+                        narration_snapshot.character_knowledge_edges
+                    ),
+                    entity_links=list(narration_snapshot.entity_links),
+                    recent_messages=messages,
+                    message_visibility=list(narration_snapshot.message_visibility),
+                    additional_query_terms=additional_query_terms,
+                    allow_expansion=allow_expansion,
+                )
+                candidate_observations = _observations_with_indexed_sources(
+                    self.repositories,
+                    save_id=save_id,
+                    observations=narration_snapshot.observations,
+                    context_sources=retrieved_sources.records,
+                )
+                candidate_set = _context_candidate_set(
+                    scenario=scenario,
+                    scene_snapshot=narration_snapshot.scene_snapshot,
+                    characters=list(narration_snapshot.characters),
+                    character_knowledge_edges=list(
+                        narration_snapshot.character_knowledge_edges
+                    ),
+                    message_visibility=list(narration_snapshot.message_visibility),
+                    entity_links=list(narration_snapshot.entity_links),
+                    world_state=list(narration_snapshot.world_state),
+                    world_state_for_scope=(
+                        list(narration_snapshot.world_state_for_scope)
+                    ),
+                    state_changes=list(narration_snapshot.state_changes),
+                    media_assets=list(narration_snapshot.media_assets),
+                    memories=list(narration_snapshot.memories),
+                    summaries=list(narration_snapshot.summaries),
+                    observations=list(candidate_observations),
+                    context_sources=list(retrieved_sources.records),
+                    recent_messages=messages,
+                    player_message_id=player_message_id,
+                    include_missing_raw_candidates=False,
+                    retrieval_diagnostics=retrieved_sources.diagnostics,
+                )
+                candidates = candidate_set.candidates
+                candidate_diagnostics = candidate_set.diagnostics
+                preselection_revision = (
+                    self.repositories.context_candidate_revision_token(
+                        save_id,
+                        ignored_message_id=player_message_id,
+                    )
+                )
             log_event(
                 "context_search.candidates_built",
                 save_id=save_id,
@@ -578,12 +677,6 @@ class ContextSearchService:
                 candidate_count=len(candidates),
                 cache_status=cache_status,
                 **_candidate_count_fields(candidates),
-            )
-            preselection_revision = (
-                self.repositories.context_candidate_revision_token(
-                    save_id,
-                    ignored_message_id=player_message_id,
-                )
             )
             requirement_error = _model_requirement_error(
                 repositories=self.repositories,
@@ -849,13 +942,12 @@ def _rehydrate_selected_context(
     preselection_revision: str,
 ) -> tuple[ContextSearchResult, NarrationContextSnapshot | None]:
     selected_items = _selected_context_items(result)
-    if not selected_items:
-        return result, fallback_snapshot
-
     current_revision = repositories.context_candidate_revision_token(
         save_id,
         ignored_message_id=player_message_id,
     )
+    if not selected_items and current_revision == preselection_revision:
+        return result, fallback_snapshot
     if (
         current_revision == preselection_revision
         and fallback_snapshot is not None
