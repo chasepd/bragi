@@ -63,6 +63,7 @@ from bragi.services.agentic_context import (
     RESPONSE_VERIFICATION_MODE_SETTING,
     CurationResult,
     DatingRouteStageViolation,
+    EvidenceRefinementRequest,
     NarrativeBeat,
     NarratorCommitDecision,
     NarratorMessageSpec,
@@ -1379,6 +1380,28 @@ class ScriptedContextSearch:
         return self.result
 
 
+class RefiningScriptedContextSearch(ScriptedContextSearch):
+    def __init__(
+        self,
+        result: ContextSearchResult,
+        refined_result: ContextSearchResult,
+    ) -> None:
+        super().__init__(result)
+        self.refined_result = refined_result
+        self.refinement_calls: list[EvidenceRefinementRequest] = []
+
+    async def refine_for_plan(
+        self,
+        *,
+        save_id: str,
+        player_message_id: str,
+        request: EvidenceRefinementRequest,
+        prior_result: ContextSearchResult,
+    ) -> ContextSearchResult:
+        self.refinement_calls.append(request)
+        return self.refined_result
+
+
 class ScriptedWorldTimeRunner:
     def __init__(
         self,
@@ -1477,6 +1500,21 @@ class ScriptedNarratorPlanner:
     ) -> NarratorMessageSpec:
         self.calls.append((save_id, request))
         return self.spec
+
+
+class SequenceNarratorPlanner(ScriptedNarratorPlanner):
+    def __init__(self, specs: tuple[NarratorMessageSpec, ...]) -> None:
+        super().__init__(specs[-1])
+        self.specs = list(specs)
+
+    async def plan(
+        self,
+        *,
+        save_id: str,
+        request: ChatRequest,
+    ) -> NarratorMessageSpec:
+        self.calls.append((save_id, request))
+        return self.specs.pop(0)
 
 
 class FailingNarratorPlanner:
@@ -3342,6 +3380,80 @@ def test_submit_player_turn_uses_rich_request_when_plan_first_plan_is_empty(
     job = _chat_completion_jobs(repositories, save.id)[-1]
     assert job["result"]["narrator_mode"] == "rich_context"
     assert job["result"]["narrator_mode_reason"] == "invalid_turn_plan"
+
+
+def test_submit_player_turn_replans_once_after_authoritative_context_refinement(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(PLAN_FIRST_NARRATOR_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    first_spec = NarratorMessageSpec(
+        intent="Resolve the player's indirect reference.",
+        thesis="Find the missing remedy evidence.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=("Which remedy the player means.",),
+        evidence_source_ids=(),
+        evidence_refinement=EvidenceRefinementRequest(
+            terms=("physician", "antivenom"),
+            reason="The pronouns are ambiguous.",
+        ),
+    )
+    final_spec = replace(
+        first_spec,
+        thesis="The physician stored the antivenom in the western archive.",
+        uncertainties=(),
+        evidence_refinement=None,
+    )
+    context_search = RefiningScriptedContextSearch(
+        ContextSearchResult(),
+        ContextSearchResult(
+            selected_memories=(
+                SelectedContextItem(
+                    source_type="memory",
+                    source_id="memory-antivenom",
+                    text="The physician stored antivenom in the western archive.",
+                    relevance_note="The refinement resolved the reference.",
+                ),
+            ),
+            retrieval_round_used=True,
+        ),
+    )
+    planner = SequenceNarratorPlanner((first_spec, final_spec))
+    provider = RecordingChatProvider("fake")
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={"fake": provider},
+            context_search_service=context_search,
+            narrator_planner=planner,
+        ).submit_player_turn(
+            save_id=save.id,
+            body="Where did she store it?",
+            speaker_name="Mara",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    assert len(context_search.refinement_calls) == 1
+    assert len(planner.calls) == 2
+    assert planner.calls[1][1].retrieved_memories
+    assert provider.chat_requests[0].retrieved_memories
+    assert "western archive" in provider.chat_requests[0].narration_brief
 
 
 def test_submit_player_turn_uses_response_planning_model_preference(
@@ -13056,6 +13168,7 @@ def test_run_post_turn_jobs_leaves_character_maintenance_for_scheduler(
         "proactive_text",
         "director",
         "scenario",
+        "context_precompute",
         "image",
     ]
 
@@ -13104,6 +13217,47 @@ def test_run_post_turn_jobs_does_not_review_outcomes(
     assert len(jobs) == 1
     child_names = [child["name"] for child in jobs[0]["result"]["jobs"]]
     assert "outcome" not in child_names
+
+
+def test_run_post_turn_jobs_precomputes_next_turn_context(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message_id, narrator_message_id = _append_completed_turns(
+        repositories,
+        save_id=save.id,
+        count=1,
+    )
+
+    class PrecomputingContextSearch(ScriptedContextSearch):
+        def __init__(self) -> None:
+            super().__init__(ContextSearchResult())
+            self.precomputed_save_ids: list[str] = []
+
+        def precompute_next_turn(self, save_id: str) -> None:
+            self.precomputed_save_ids.append(save_id)
+
+    context_search = PrecomputingContextSearch()
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={},
+            context_search_service=context_search,
+        ).run_post_turn_jobs(
+            save_id=save.id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+        )
+    )
+
+    assert context_search.precomputed_save_ids == [save.id]
 
 
 def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
@@ -13188,12 +13342,14 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         "proactive_text": "blocked_dependency",
         "director": "blocked_dependency",
         "scenario": "skipped",
+        "context_precompute": "blocked_dependency",
         "image": "failed",
     }
     assert progress_updates[-1].status_text == (
         "Post-turn: summary skipped, state succeeded, context failed, "
         "time_reconciliation blocked_dependency, proactive_text blocked_dependency, "
-        "director blocked_dependency, scenario skipped, image failed"
+        "director blocked_dependency, scenario skipped, "
+        "context_precompute blocked_dependency, image failed"
     )
     assert all(
         [job.name for job in progress.jobs]
@@ -13205,6 +13361,7 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
             "proactive_text",
             "director",
             "scenario",
+            "context_precompute",
             "image",
         ]
         for progress in progress_updates
@@ -13223,7 +13380,9 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
 
     jobs = _post_turn_jobs(repositories, save.id)
     assert len(jobs) == 1
-    assert jobs[0]["status"] == "succeeded"
+    assert jobs[0]["status"] == "failed"
+    assert jobs[0]["result"]["continuity_degraded"] is True
+    assert jobs[0]["result"]["retry_pending"] is True
     expected_dependencies = {
         "summary": [],
         "state": [],
@@ -13232,6 +13391,14 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         "proactive_text": ["time_reconciliation"],
         "director": ["time_reconciliation"],
         "scenario": [],
+        "context_precompute": [
+            "summary",
+            "context",
+            "time_reconciliation",
+            "proactive_text",
+            "director",
+            "scenario",
+        ],
         "image": [],
     }
     assert jobs[0]["payload"]["dependencies"] == expected_dependencies
@@ -13247,6 +13414,7 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         ("proactive_text", "blocked_dependency"),
         ("director", "blocked_dependency"),
         ("scenario", "skipped"),
+        ("context_precompute", "blocked_dependency"),
         ("image", "failed"),
     ]
     assert result_jobs[3]["result"]["blocked_by"] == "context"
@@ -13264,11 +13432,33 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         "proactive_text": ("blocked_dependency", "chat"),
         "director": ("blocked_dependency", "director_pressure"),
         "scenario": ("skipped", "scenario_evolution"),
+        "context_precompute": ("blocked_dependency", "context_precompute"),
         "image": ("failed", "image_generation"),
     }
     assert all(step.duration_ms is not None for step in steps)
     assert step_by_name["context"].error == "context updater unavailable"
     assert step_by_name["image"].error == "image provider unavailable"
+
+    async def repaired_context_step(**_kwargs: object) -> str:
+        return "succeeded"
+
+    monkeypatch.setattr(
+        service,
+        "_update_context_if_configured",
+        repaired_context_step,
+    )
+    assert asyncio.run(
+        service.run_post_turn_outbox_recovery(save_id=save.id)
+    ) == 1
+    recovered = repositories.list_post_turn_outbox_steps(save_id=save.id)
+    assert {row.step: row.status for row in recovered} == {
+        "state": "succeeded",
+        "context": "succeeded",
+        "time_reconciliation": "skipped",
+        "proactive_text": "skipped",
+        "director": "skipped",
+    }
+    assert next(row for row in recovered if row.step == "state").attempt_count == 1
 
 
 def test_run_post_turn_jobs_records_world_time_reconciliation_metadata(
@@ -13770,6 +13960,7 @@ def test_run_post_turn_jobs_leaves_world_context_retention_for_scheduler(
         "proactive_text",
         "director",
         "scenario",
+        "context_precompute",
         "image",
     ]
 

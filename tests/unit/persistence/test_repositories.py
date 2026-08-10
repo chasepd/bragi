@@ -8613,6 +8613,69 @@ def test_repository_records_job_steps_with_safe_metadata_and_redacted_errors(
     assert repositories.list_job_steps(job.id) == [step]
 
 
+def test_repository_claims_and_recovers_post_turn_outbox_steps(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower above the ash.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I light the beacon.",
+    )
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The lens answers with red fire.",
+    )
+
+    created = repositories.ensure_post_turn_outbox_steps(
+        save_id=save.id,
+        player_message_id=player.id,
+        narrator_message_id=narrator.id,
+        turn_revision="revision-1",
+        steps=("state", "context"),
+        payload={"turn_revision": {"expected_head_message_id": narrator.id}},
+    )
+    duplicate = repositories.ensure_post_turn_outbox_steps(
+        save_id=save.id,
+        player_message_id=player.id,
+        narrator_message_id=narrator.id,
+        turn_revision="revision-1",
+        steps=("state", "context"),
+        payload={},
+    )
+
+    assert [step.step for step in created] == ["state", "context"]
+    assert [step.id for step in duplicate] == [step.id for step in created]
+    claimed = repositories.claim_post_turn_outbox_step(created[0].id)
+    assert claimed is not None
+    assert claimed.status == "running"
+    assert claimed.attempt_count == 1
+    assert repositories.claim_post_turn_outbox_step(created[0].id) is None
+
+    recovered = repositories.requeue_running_post_turn_outbox_steps()
+    assert [step.id for step in recovered] == [created[0].id]
+    assert recovered[0].status == "pending"
+    reclaimed = repositories.claim_post_turn_outbox_step(created[0].id)
+    assert reclaimed is not None
+    completed = repositories.complete_post_turn_outbox_step(
+        created[0].id,
+        status="succeeded",
+        result={"applied": True},
+    )
+    assert completed.status == "succeeded"
+    assert completed.result == {"applied": True}
+
+
 def test_repository_runtime_performance_aggregates_success_durations_only(
     repositories: PersistenceRepositories,
 ) -> None:

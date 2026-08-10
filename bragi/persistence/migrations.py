@@ -693,6 +693,28 @@ ON job_steps(name, status, completed_at);
 CREATE INDEX IF NOT EXISTS idx_job_steps_provider_model_task_status_completed
 ON job_steps(provider, model, task, status, completed_at);
 
+CREATE TABLE IF NOT EXISTS post_turn_outbox (
+    id TEXT PRIMARY KEY,
+    save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+    player_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    narrator_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    turn_revision TEXT NOT NULL,
+    step TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TEXT,
+    completed_at TEXT,
+    UNIQUE(save_id, player_message_id, narrator_message_id, turn_revision, step)
+);
+
+CREATE INDEX IF NOT EXISTS idx_post_turn_outbox_save_status_updated
+ON post_turn_outbox(save_id, status, updated_at);
+
 CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
     value_json TEXT NOT NULL,
@@ -2330,6 +2352,48 @@ def _ensure_scene_fact_schema(connection: sqlite3.Connection) -> None:
 def _migrate_schema_76_to_77(connection: sqlite3.Connection) -> None:
     _ensure_turn_outcome_schema(connection)
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (77)")
+    _migrate_schema_77_to_78(connection)
+    _migrate_schema_78_to_79(connection)
+
+
+def _migrate_schema_78_to_79(connection: sqlite3.Connection) -> None:
+    _ensure_post_turn_outbox_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (79)")
+
+
+def _ensure_post_turn_outbox_schema(connection: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS post_turn_outbox (
+            id TEXT PRIMARY KEY,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            player_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            narrator_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            turn_revision TEXT NOT NULL,
+            step TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            result_json TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            started_at TEXT,
+            completed_at TEXT,
+            UNIQUE(
+                save_id,
+                player_message_id,
+                narrator_message_id,
+                turn_revision,
+                step
+            )
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_post_turn_outbox_save_status_updated
+        ON post_turn_outbox(save_id, status, updated_at);
+        """,
+    )
 
 
 def _migrate_schema_77_to_78(connection: sqlite3.Connection) -> None:

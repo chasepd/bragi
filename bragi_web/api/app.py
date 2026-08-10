@@ -3250,19 +3250,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "speaker_name": payload.speaker_name,
                 "active_save_id": submitted_save_id,
             }
-            needs_continuity_catchup = bool(
-                _active_background_post_turn_jobs(
-                    state,
-                    save_id=submitted_save_id,
-                )
+            await _wait_for_background_post_turn_catchup(
+                state,
+                handle,
+                save_id=submitted_save_id,
             )
-
-            if needs_continuity_catchup:
-                await _wait_for_background_post_turn_catchup(
-                    state,
-                    handle,
-                    save_id=submitted_save_id,
-                )
 
             if _call_accepts_keyword(
                 state.runtime.submit_player_message_for_initial_render,
@@ -3456,19 +3448,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "instruction": instruction,
                 "active_save_id": submitted_save_id,
             }
-            needs_continuity_catchup = bool(
-                _active_background_post_turn_jobs(
-                    state,
-                    save_id=submitted_save_id,
-                )
+            await _wait_for_background_post_turn_catchup(
+                state,
+                handle,
+                save_id=submitted_save_id,
             )
-
-            if needs_continuity_catchup:
-                await _wait_for_background_post_turn_catchup(
-                    state,
-                    handle,
-                    save_id=submitted_save_id,
-                )
 
             if _call_accepts_keyword(
                 state.runtime.submit_timeskip_for_initial_render,
@@ -9012,7 +8996,20 @@ async def _wait_for_background_post_turn_catchup(
     save_id: str,
 ) -> None:
     active_jobs = _active_background_post_turn_jobs(state, save_id=save_id)
-    if not active_jobs:
+    list_outbox_steps = getattr(
+        state.repositories,
+        "list_post_turn_outbox_steps",
+        None,
+    )
+    incomplete_outbox = (
+        list_outbox_steps(
+            save_id=save_id,
+            statuses=("pending", "running", "failed"),
+        )
+        if callable(list_outbox_steps)
+        else ()
+    )
+    if not active_jobs and not incomplete_outbox:
         return
     waiting_payload = {
         "status": "waiting",
@@ -9027,21 +9024,49 @@ async def _wait_for_background_post_turn_catchup(
             "job_ids": [job.id for job in active_jobs],
         },
     )
-    for job in active_jobs:
-        try:
-            await asyncio.shield(
-                state.jobs.wait_for_completion_level(job.id, CONTINUITY_READY)
+    try:
+        async with asyncio.timeout(10):
+            for job in active_jobs:
+                try:
+                    await asyncio.shield(
+                        state.jobs.wait_for_completion_level(
+                            job.id,
+                            CONTINUITY_READY,
+                        )
+                    )
+                except Exception:
+                    # A failed prior web job still leaves durable outbox work
+                    # eligible for repair within the same preflight budget.
+                    continue
+            recover = getattr(
+                state.runtime,
+                "run_post_turn_outbox_recovery",
+                None,
             )
-        except Exception as exc:
-            await handle.event(
-                "post_turn_catchup",
-                {
-                    "status": "failed",
-                    "job_ids": [job.id for job in active_jobs],
-                    "error": str(exc) or exc.__class__.__name__,
-                },
+            result = (
+                await recover(active_save_id=save_id)
+                if callable(recover)
+                else None
             )
-            return
+    except Exception as exc:
+        await handle.event(
+            "post_turn_catchup",
+            {
+                "status": "degraded",
+                "job_ids": [job.id for job in active_jobs],
+                "error": str(exc) or exc.__class__.__name__,
+            },
+        )
+        return
+    if result is not None and result.continuity_degraded:
+        await handle.event(
+            "post_turn_catchup",
+            {
+                "status": "degraded",
+                "job_ids": [job.id for job in active_jobs],
+            },
+        )
+        return
     await handle.event(
         "post_turn_catchup",
         {
@@ -9085,6 +9110,9 @@ async def _queue_post_turn_jobs_background(
             current_user_id=current_user_id,
             optional_jobs=optional_jobs,
         )
+        if bool(getattr(result, "continuity_degraded", False)):
+            await post_turn_handle.event("runtime", to_jsonable(result))
+            raise RuntimeError("Post-turn continuity is degraded; retry pending")
         await post_turn_handle.advance_completion_level(CONTINUITY_READY)
         for optional_job in optional_jobs:
             if optional_job.task is not None:
@@ -9226,6 +9254,9 @@ async def _run_post_turn_jobs_inline_fallback(
         current_user_id=current_user_id,
         optional_jobs=optional_jobs,
     )
+    if bool(getattr(result, "continuity_degraded", False)):
+        await handle.event("runtime", to_jsonable(result))
+        raise RuntimeError("Post-turn continuity is degraded; retry pending")
     await handle.advance_completion_level(CONTINUITY_READY)
 
     async def finish_optional_jobs() -> None:

@@ -3257,6 +3257,31 @@ def test_narrator_planner_defaults_missing_new_plan_fields() -> None:
     assert "unreasonable" in prompt_text
 
 
+def test_narrator_planner_returns_typed_evidence_refinement_request() -> None:
+    data: dict[str, object] = {
+        "intent": "Resolve the indirect reference.",
+        "thesis": "Find the healer's stored remedy.",
+        "must_say": [],
+        "avoid": [],
+        "tone": "grounded",
+        "uncertainties": ["Which remedy the player means."],
+        "evidence_source_ids": [],
+        "evidence_refinement": {
+            "terms": ["physician", "antivenom"],
+            "phrases": ["western archive"],
+            "entity_ids": [],
+            "source_ids": [],
+            "reason": "The pronouns are ambiguous.",
+        },
+    }
+
+    spec = agentic_context_module._narrator_message_spec_from_data(data)
+
+    assert spec.evidence_refinement is not None
+    assert spec.evidence_refinement.terms == ("physician", "antivenom")
+    assert spec.evidence_refinement.phrases == ("western archive",)
+
+
 def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
     provider = RecordingStructuredProvider(
         {

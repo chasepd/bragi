@@ -469,6 +469,7 @@ def create_state() -> WebAppState:
         secret_store._use_keyring = False  # noqa: SLF001
     providers = _provider_clients(secret_store, repositories=repositories)
     with repositories.scope():
+        repositories.requeue_running_post_turn_outbox_steps()
         JobLifecycleService(
             repositories=cast(Any, repositories),
         ).recover_stale_jobs(
