@@ -47,6 +47,7 @@ from bragi.services.knowledge_boundary import (
 )
 from bragi.services.mention_matching import character_name_is_mentioned
 from bragi.services.open_threads import is_open_threads_aggregate_key
+from bragi.services.scenario_canon import scenario_canon_claims
 from bragi.services.summary_safety import validate_summary_output
 from bragi.world_time_model import format_world_time_from_snapshot
 
@@ -1130,6 +1131,57 @@ def scenario_section_candidates(
                 f"scenario:{scenario.id}:section:{section_id}",
                 section_id,
                 text,
+            )
+        )
+    return tuple(candidates)
+
+
+def scenario_claim_candidates(
+    scenario: ScenarioRecord | None,
+) -> tuple[tuple[str, str, str, dict[str, object]], ...]:
+    """Return compiled atomic claims with deterministic prompt boundaries."""
+
+    if scenario is None:
+        return ()
+    try:
+        loaded = json.loads(scenario.content_json)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(loaded, dict):
+        return ()
+    candidates: list[tuple[str, str, str, dict[str, object]]] = []
+    for claim in scenario_canon_claims(loaded):
+        if not claim.claim_key or not claim.claim:
+            continue
+        text = (
+            f"[{claim.authority} | {claim.temporal_status} | "
+            f"{claim.reveal_policy}] {claim.claim}"
+        )
+        if claim.reveal_policy == "narrator_only":
+            text += " [Narrator-only: do not reveal without accepted reveal evidence.]"
+        elif claim.reveal_policy == "restricted":
+            text += " [Restricted knowledge: preserve the stated audience boundary.]"
+        if claim.temporal_status == "current_at_scenario_start":
+            text += " [Scenario-start state; newer accepted state supersedes it.]"
+        candidates.append(
+            (
+                f"scenario:{scenario.id}:claim:{claim.claim_key}",
+                claim.source_section,
+                text,
+                {
+                    "scenario_id": scenario.id,
+                    "claim_key": claim.claim_key,
+                    "source_section": claim.source_section,
+                    "source_sha256": claim.source_sha256,
+                    "evidence_quote": claim.evidence_quote,
+                    "entity_anchors": list(claim.entity_anchors),
+                    "fact_type": claim.fact_type,
+                    "authority": claim.authority,
+                    "temporal_status": claim.temporal_status,
+                    "reveal_policy": claim.reveal_policy,
+                    "known_by": list(claim.known_by),
+                    "importance": claim.importance,
+                },
             )
         )
     return tuple(candidates)

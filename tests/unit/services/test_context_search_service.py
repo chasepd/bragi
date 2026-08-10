@@ -347,18 +347,18 @@ class ScenarioSectionSelectingProvider(RecordingStructuredContextProvider):
         selection_properties = request.schema["properties"]["selections"]["items"][
             "properties"
         ]
-        assert "scenario_section" in selection_properties["source_type"]["enum"]
+        assert "scenario_claim" in selection_properties["source_type"]["enum"]
         prompt = "\n".join(message.body for message in request.messages)
         source_id = _candidate_source_id(
             prompt,
-            source_type="scenario_section",
+            source_type="scenario_claim",
             expected_text=self.selected_text,
         )
         return StructuredOutputResponse(
             data={
                 "selections": [
                     {
-                        "source_type": "scenario_section",
+                        "source_type": "scenario_claim",
                         "source_id": source_id,
                         "relevance_note": "The tower details shape the next beat.",
                     },
@@ -1242,6 +1242,7 @@ def test_context_search_uses_one_structured_selection_request_and_provider_order
         "scenario_section",
         "state_change",
         "media_asset",
+        "scenario_claim",
     }
     assert "source_id" in selection_properties
     prompt = "\n".join(message.body for message in request.messages)
@@ -3029,6 +3030,42 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
         content={
             "locations": selected_section,
             "factions": unselected_section,
+            "_canon_claims": {
+                "version": 1,
+                "source_digest": "fixture",
+                "provider": "fake",
+                "model": "canon",
+                "claims": [
+                    {
+                        "claim_key": "east-lens",
+                        "source_section": "locations",
+                        "source_sha256": "fixture",
+                        "claim": selected_section,
+                        "evidence_quote": selected_section,
+                        "entity_anchors": [],
+                        "fact_type": "state",
+                        "authority": "canonical",
+                        "temporal_status": "current_at_scenario_start",
+                        "reveal_policy": "open",
+                        "known_by": [],
+                        "importance": 0.45,
+                    },
+                    {
+                        "claim_key": "pantry-guild",
+                        "source_section": "factions",
+                        "source_sha256": "fixture",
+                        "claim": unselected_section,
+                        "evidence_quote": unselected_section,
+                        "entity_anchors": [],
+                        "fact_type": "relationship",
+                        "authority": "canonical",
+                        "temporal_status": "durable",
+                        "reveal_policy": "open",
+                        "known_by": [],
+                        "importance": 0.65,
+                    },
+                ],
+            },
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
@@ -3068,15 +3105,14 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
     prompt = "\n".join(
         message.body for message in provider.structured_output_requests[0].messages
     )
-    assert "[scenario_section:" in prompt
+    assert "[scenario_claim:" in prompt
     assert selected_section in prompt
     assert unselected_section not in prompt
     assert [item.source_type for item in result.selected_scenario_sections] == [
-        "scenario_section",
+        "scenario_claim",
     ]
-    assert [item.text for item in result.selected_scenario_sections] == [
-        selected_section,
-    ]
+    assert selected_section in result.selected_scenario_sections[0].text
+    assert "Scenario-start state" in result.selected_scenario_sections[0].text
     assert result.selected_scenario_sections[0].relevance_note == (
         "The tower details shape the next beat."
     )
@@ -4001,14 +4037,14 @@ def test_context_search_offers_continuity_floor_when_index_has_no_hits(
     assert "scene.location" in prompt
     assert state.id in prompt
     assert memory.body in prompt
-    assert "The lower pass is blocked by glass ice." in prompt
+    assert "The lower pass is blocked by glass ice." not in prompt
     assert [item.source_id for item in result.selected_memories] == [memory.id]
     jobs = _context_search_jobs(repositories, save.id)
     job_result = json.loads(jobs[-1]["result_json"])
     diagnostics = job_result["diagnostics"]
     assert diagnostics["indexed_retrieval_hit_count"] == 0
     assert diagnostics["protected_context_source_count"] >= 1
-    assert diagnostics["continuity_floor_candidate_count"] >= 3
+    assert diagnostics["continuity_floor_candidate_count"] >= 2
 
 
 def test_context_search_rehydrates_selected_items_beyond_selector_excerpt(

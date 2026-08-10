@@ -118,7 +118,6 @@ from bragi.services.context_assembly import (
     compact_scenario_instructions,
     context_budget_settings,
     deterministic_context_sources,
-    pending_context_suggestion_sources,
     pre_turn_scene_hint_sources,
     scenario_section_candidates,
 )
@@ -10326,6 +10325,7 @@ def _apply_final_prompt_budget(
     *,
     model_context_window: int | None,
 ) -> ChatRequest:
+    request = replace(request, pending_context_suggestions=())
     reserved_output_tokens = _final_prompt_reserved_output_tokens(request)
     estimated_tokens_before = estimate_chat_request_tokens(request)
     diagnostics: dict[str, object] = {
@@ -11134,25 +11134,6 @@ def _budgeted_narrator_context(
         for item in context_result.selected_summaries
         if item.source_id in visible_summary_ids
     )
-    pending_suggestion_records = (
-        tuple(narration_snapshot.pending_context_suggestions)
-        if narration_snapshot is not None
-        else tuple(
-            repositories.list_context_update_suggestions(
-                save_id,
-                status="pending",
-            )
-        )
-    )
-    visible_pending_suggestions = tuple(
-        suggestion
-        for suggestion in pending_suggestion_records
-        if _context_update_suggestion_visible_to_present_characters(
-            suggestion=suggestion,
-            scene_snapshot=snapshot,
-            message_visibility=message_visibility_records,
-        )
-    )
     sources = (
         *base_sources,
         *_selected_character_voice_sources(
@@ -11166,11 +11147,6 @@ def _budgeted_narrator_context(
             tier="open_obligations",
             suppressed_keys=deterministic_source_keys,
             relevance_query=player_message.body,
-        ),
-        *pending_context_suggestion_sources(
-            repositories=repositories,
-            save_id=save_id,
-            suggestions=visible_pending_suggestions,
         ),
         *_selected_context_sources(
             context_result.selected_state,
@@ -11292,11 +11268,7 @@ def _budgeted_narrator_context(
             for source in selected_sources
             if source.tier == "open_obligations"
         ),
-        pending_context_suggestions=tuple(
-            source.text
-            for source in selected_sources
-            if source.tier == "pending_context_suggestions"
-        ),
+        pending_context_suggestions=(),
         retrieved_scenario_sections=tuple(
             source.text
             for source in selected_sources

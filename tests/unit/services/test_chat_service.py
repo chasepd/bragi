@@ -8388,7 +8388,7 @@ def test_submit_player_turn_falls_back_to_legacy_npc_audit_when_verifier_unavail
     )
 
 
-def test_submit_player_turn_includes_pending_context_suggestions_without_applying(
+def test_submit_player_turn_omits_pending_context_suggestions_without_applying(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -8439,23 +8439,13 @@ def test_submit_player_turn_includes_pending_context_suggestions_without_applyin
     )
 
     request = provider.chat_requests[0]
-    assert request.pending_context_suggestions == (
-        "Pending review (not canon yet): update world_state/state-storm-mood "
-        'storm.mood -> {"mood": "wary"}; confidence=91%',
-    )
-    assert source_message.id not in "\n".join(request.pending_context_suggestions)
-    assert "The narrator described the storm as wary" not in "\n".join(
-        request.pending_context_suggestions
-    )
+    assert request.pending_context_suggestions == ()
     assert repositories.list_world_state(save.id) == []
     assert repositories.list_context_update_suggestions(save.id, status="pending") == [
         suggestion
     ]
-    assert any(
-        source["tier"] == "pending_context_suggestions"
-        and source["source_type"] == "context_update_suggestion"
-        and source["source_id"] == suggestion.id
-        and source["included"] is True
+    assert all(
+        source["tier"] != "pending_context_suggestions"
         for source in request.context_breakdown["sources"]
     )
 
@@ -20233,7 +20223,7 @@ def test_submit_player_turn_final_prompt_budget_trims_recap_and_baseline(
     ]
 
 
-def test_final_prompt_budget_trims_pending_suggestions_before_messages() -> None:
+def test_final_prompt_budget_discards_pending_suggestions_before_messages() -> None:
     request = chat_service_module._apply_final_prompt_budget(
         ChatRequest(
             provider="fake",
@@ -20257,7 +20247,7 @@ def test_final_prompt_budget_trims_pending_suggestions_before_messages() -> None
         "Brief prior beat.",
         "I wait for the signal.",
     ]
-    assert trimmed_sections[0] == "pending_context_suggestions"
+    assert "pending_context_suggestions" not in trimmed_sections
     assert "messages" not in trimmed_sections
 
 

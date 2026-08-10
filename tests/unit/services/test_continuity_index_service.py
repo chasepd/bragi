@@ -30,7 +30,33 @@ def test_continuity_index_syncs_atomic_facts_with_evidence_metadata(
         title="Ashfall Keep",
         premise="A border keep is cut off by ash storms.",
         player_role="Signal warden",
-        content={"lore": "The red lens was forged under the old tower."},
+        content={
+            "lore": "The red lens was forged under the old tower.",
+            "_canon_claims": {
+                "version": 1,
+                "source_digest": "fixture",
+                "provider": "fake",
+                "model": "canon",
+                "claims": [
+                    {
+                        "claim_key": "lens-forged",
+                        "source_section": "lore",
+                        "source_sha256": "fixture",
+                        "claim": "The red lens was forged under the old tower.",
+                        "evidence_quote": (
+                            "The red lens was forged under the old tower."
+                        ),
+                        "entity_anchors": [],
+                        "fact_type": "historical",
+                        "authority": "canonical",
+                        "temporal_status": "historical",
+                        "reveal_policy": "open",
+                        "known_by": [],
+                        "importance": 0.65,
+                    }
+                ],
+            },
+        },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
     source_message = repositories.append_message(
@@ -112,12 +138,12 @@ def test_continuity_index_syncs_atomic_facts_with_evidence_metadata(
     ]
     assert isinstance(source_message_ids, list)
     assert source_message.id in source_message_ids
-    scenario_section_ids = [
+    scenario_claim_ids = [
         source_id
         for source_type, source_id in by_source
-        if source_type == "scenario_section"
+        if source_type == "scenario_claim"
     ]
-    assert scenario_section_ids == [f"scenario:{scenario.id}:section:lore"]
+    assert scenario_claim_ids == [f"scenario:{scenario.id}:claim:lens-forged"]
 
     repositories.archive_memory(memory.id)
     ContinuityIndexService(repositories).sync_save(save.id)

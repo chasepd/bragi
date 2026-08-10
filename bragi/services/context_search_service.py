@@ -90,6 +90,7 @@ from bragi.services.request_budget import (
     budget_structured_output_request,
     budget_tool_call_request,
 )
+from bragi.services.scenario_canon import ensure_scenario_canon_for_save
 from bragi.services.tool_call_helpers import (
     CONTEXT_SEARCH_TOOL_RETRY_INSTRUCTION,
     accepted_tool_result,
@@ -130,6 +131,7 @@ INDEXED_CONTEXT_SOURCE_TYPES = frozenset(
     {
         "character_text_thread",
         "open_obligation",
+        "scenario_claim",
         "scenario_section",
         "state",
         "world_state",
@@ -360,6 +362,19 @@ class ContextSearchService:
             )
             if details is None:
                 raise ValueError(f"Unknown save id: {save_id}")
+            scenario_compiled = await ensure_scenario_canon_for_save(
+                repositories=self.repositories,
+                providers=self.providers,
+                save_id=save_id,
+                details=details,
+            )
+            if scenario_compiled:
+                details = self.repositories.load_save_details(
+                    save_id,
+                    message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+                )
+                if details is None:
+                    raise ValueError(f"Unknown save id: {save_id}")
             messages = (
                 details.messages
                 if focus_message is None
@@ -1593,7 +1608,11 @@ def _context_candidate_set(
         present_character_ids=turn_scope.present_character_ids,
         message_visibility=message_visibility or [],
     )
-    scenario_candidates = _scenario_section_candidates(scenario)
+    scenario_candidates = tuple(
+        candidate
+        for candidate in indexed_candidates
+        if candidate.source_type == "scenario_claim"
+    )
     raw_state_candidates = _state_candidates(
         world_state,
         scoped_targets=scoped_targets,
@@ -2608,6 +2627,7 @@ def _context_selection_schema(
                             "type": "string",
                             "enum": [
                                 "open_obligation",
+                                "scenario_claim",
                                 "scenario_section",
                                 "world_state",
                                 "state_change",
@@ -2927,7 +2947,7 @@ def _context_result_from_items(
     for item in items:
         if item.source_type == "open_obligation":
             selected_open_obligations.append(item)
-        elif item.source_type == "scenario_section":
+        elif item.source_type in {"scenario_claim", "scenario_section"}:
             selected_scenario_sections.append(item)
         elif item.source_type == "world_state":
             selected_state.append(item)
@@ -3038,6 +3058,7 @@ def _fallback_candidates(
         "state_change",
         "media_asset",
         "message",
+        "scenario_claim",
         "scenario_section",
     ):
         candidate = _fallback_candidate_for_type(candidates, source_type)
@@ -3077,7 +3098,7 @@ def _candidate_count_fields(
         "recent_message_candidate_count": 0,
     }
     for candidate in candidates:
-        if candidate.source_type == "scenario_section":
+        if candidate.source_type in {"scenario_claim", "scenario_section"}:
             counts["scenario_section_candidate_count"] += 1
         elif candidate.source_type == "open_obligation":
             counts["open_obligation_candidate_count"] += 1
@@ -3659,6 +3680,7 @@ def _indexed_candidate_source_type(
     if normalized_source_type in {
         "character_text_thread",
         "open_obligation",
+        "scenario_claim",
         "scenario_section",
         "world_state",
         "memory",
@@ -3889,6 +3911,7 @@ def _candidate_rank(
         "state_change": 5.5,
         "media_asset": 4.5,
         "message": 4.0,
+        "scenario_claim": 3.0,
         "scenario_section": 3.0,
         "summary": 1.5,
     }.get(candidate.source_type, 0.0)

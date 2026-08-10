@@ -236,7 +236,6 @@ def _effective_prompt_purpose(request: ChatRequest) -> ChatPromptPurpose:
 
 def _data_context_block(request: ChatRequest) -> str:
     sections = [
-        _pending_context_review_section(request.pending_context_suggestions),
         _director_pressure_section(request.director_pressure),
         _character_action_plan_section(request.character_action_plans),
         _narration_brief_section(request),
