@@ -2113,6 +2113,7 @@ class ChatService:
             assessed_character_ids=frozenset(
                 assessment.character_id
                 for assessment in character_action_planning_result.assessments
+                if character_turn_assessment_has_prompt_guidance(assessment)
             ),
         )
         if (
@@ -7780,8 +7781,30 @@ def _narrator_spec_with_commit_candidates(
             in authoritative_scene_presence_character_ids
         )
     ]
+    superseded = [
+        candidate
+        for candidate in spec.state_commit_candidates
+        if candidate not in merged
+    ]
+    rejections = list(spec.planner_rejections)
+    rejections.extend(
+        PlannerRejection(
+            candidate_id=candidate.candidate_id,
+            candidate_type="scene_presence",
+            domain="scene_presence",
+            reason="superseded_by_assessment",
+            field="candidate_id",
+            rejected_value=candidate.candidate_id,
+        )
+        for candidate in superseded
+        if candidate.candidate_type == "scene_presence"
+    )
     merged.extend(candidates)
-    return replace(spec, state_commit_candidates=tuple(merged))
+    return replace(
+        spec,
+        state_commit_candidates=tuple(merged),
+        planner_rejections=tuple(rejections),
+    )
 
 
 def _character_assessment_commit_candidates(

@@ -5566,6 +5566,66 @@ def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
         model_other_character,
         assessment_candidate,
     )
+    assert {
+        (rejection.candidate_id, rejection.reason)
+        for rejection in merged.planner_rejections
+    } == {
+        ("scene_presence:mara:leave", "superseded_by_assessment"),
+        ("scene_presence:mara:enter", "superseded_by_assessment"),
+        ("scene_presence:ren:leave", "superseded_by_assessment"),
+    }
+
+
+def test_narrator_spec_keeps_model_candidate_for_ungrounded_assessment(
+    repositories: PersistenceRepositories,
+) -> None:
+    assessment_candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={
+            "action": "leave",
+            "character_name": "Mara",
+            "evidence_quote": "presence quote",
+        },
+        reason="Mara may leave.",
+        confidence=0.9,
+        evidence_source_ids=("message:presence",),
+        evidence_quote="presence quote",
+        candidate_id="scene_presence:mara:leave",
+        candidate_type="scene_presence",
+        character_id="mara",
+    )
+    model_candidate = replace(
+        assessment_candidate,
+        character_id="ren",
+        candidate_id="scene_presence:ren:leave",
+        value={"action": "leave"},
+        reason="Model candidate for an ungrounded assessment character.",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Ren leaves if rendered.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(model_candidate,),
+    )
+
+    merged = chat_service_module._narrator_spec_with_commit_candidates(
+        spec,
+        (assessment_candidate,),
+        assessed_character_ids=frozenset({"mara"}),
+    )
+
+    assert merged is not None
+    assert merged.state_commit_candidates == (
+        model_candidate,
+        assessment_candidate,
+    )
+    assert merged.planner_rejections == ()
 
 
 def test_planned_learned_memory_candidate_skips_invalid_knowledge_metadata(
