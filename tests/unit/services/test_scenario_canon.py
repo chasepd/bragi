@@ -144,6 +144,10 @@ def test_compiler_normalizes_punctuated_evidence_into_atomic_claim() -> None:
     [
         ("The beacon is not cold.", "The beacon is cold."),
         ("Mira follows Rowan.", "Rowan follows Mira."),
+        ("It is false that Rowan is guilty.", "Rowan is guilty."),
+        ("Mira believes Rowan left.", "Rowan left."),
+        ("Rowan guarded the gate last winter.", "Rowan guards the gate."),
+        ("The beacon glows. The keeper is blind.", "The beacon glows."),
     ],
 )
 def test_compiler_rejects_meaning_changing_evidence_normalization(
