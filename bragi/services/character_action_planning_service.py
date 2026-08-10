@@ -1064,7 +1064,7 @@ def _deterministic_presence_assessment(
         # The character id is quoted verbatim from the snapshot's present
         # character ids line, which this assessment merely restates; it keeps
         # the deterministic assessment grounded in the same evidence model
-        # assessments must cite. Membership comes from present_ids above.
+        # assessments must cite. Membership comes from the snapshot argument.
         if character.id in present_character_ids:
             evidence_source_ids = (source_id,)
             evidence_quote = character.id

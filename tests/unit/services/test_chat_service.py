@@ -5516,11 +5516,18 @@ def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
         value={"action": "leave"},
         reason="Model-authored duplicate candidate.",
     )
-    model_unique = replace(
+    model_conflicting = replace(
         assessment_candidate,
         candidate_id="scene_presence:mara:enter",
         value={"action": "enter"},
-        reason="Model-authored additional candidate.",
+        reason="Model-authored conflicting candidate.",
+    )
+    model_other_character = replace(
+        assessment_candidate,
+        character_id="lio",
+        candidate_id="scene_presence:lio:enter",
+        value={"action": "enter"},
+        reason="Model-authored candidate for a different character.",
     )
     spec = NarratorMessageSpec(
         intent="Answer the player move.",
@@ -5530,7 +5537,11 @@ def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
         tone="grounded",
         uncertainties=(),
         evidence_source_ids=(),
-        state_commit_candidates=(model_duplicate, model_unique),
+        state_commit_candidates=(
+            model_duplicate,
+            model_conflicting,
+            model_other_character,
+        ),
     )
 
     merged = chat_service_module._narrator_spec_with_commit_candidates(
@@ -5540,7 +5551,7 @@ def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
 
     assert merged is not None
     assert merged.state_commit_candidates == (
-        model_unique,
+        model_other_character,
         assessment_candidate,
     )
 
@@ -5626,20 +5637,40 @@ def test_planned_commit_grounding_accepts_planning_scene_text(
         character_id=mara.id,
     )
 
-    grounded = chat_service_module._planned_commit_evidence_is_grounded(
+    situation_quote_candidate = replace(
+        candidate,
+        evidence_source_ids=(f"scene_snapshot:{snapshot.id}",),
+        evidence_quote="Mara waits by the beacon controls.",
+    )
+    grounded_via_inventory = chat_service_module._planned_commit_evidence_is_grounded(
         repositories=repositories,
         save_id=save.id,
         player_message_id="message:player",
         narrator_message_id="message:narrator",
-        candidate=candidate,
+        candidate=situation_quote_candidate,
         evidence_source_text_by_id={
             f"scene_snapshot:{snapshot.id}": (
                 "Scene snapshot: situation: Mara waits by the beacon controls."
             )
         },
     )
+    assert grounded_via_inventory is True
 
-    assert grounded is True
+    grounded_via_ids_line_fallback = (
+        chat_service_module._planned_commit_evidence_is_grounded(
+            repositories=repositories,
+            save_id=save.id,
+            player_message_id="message:player",
+            narrator_message_id="message:narrator",
+            candidate=candidate,
+            evidence_source_text_by_id={
+                f"scene_snapshot:{snapshot.id}": (
+                    "Scene snapshot: situation: Mara waits by the beacon controls."
+                )
+            },
+        )
+    )
+    assert grounded_via_ids_line_fallback is True
 
     grounded_without_inventory_key = (
         chat_service_module._planned_commit_evidence_is_grounded(
@@ -5651,7 +5682,6 @@ def test_planned_commit_grounding_accepts_planning_scene_text(
             evidence_source_text_by_id={},
         )
     )
-
     assert grounded_without_inventory_key is True
 
 

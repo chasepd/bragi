@@ -7754,12 +7754,24 @@ def _narrator_spec_with_commit_candidates(
         for candidate in candidates
         if candidate.candidate_id
     }
+    assessment_scene_presence_character_ids = {
+        candidate.character_id
+        for candidate in candidates
+        if candidate.candidate_type == "scene_presence"
+        and candidate.character_id
+    }
     merged = [
         candidate
         for candidate in spec.state_commit_candidates
         if not (
             candidate.candidate_id
             and candidate.candidate_id in assessment_candidate_ids
+        )
+        and not (
+            candidate.candidate_type == "scene_presence"
+            and candidate.character_id
+            and candidate.character_id
+            in assessment_scene_presence_character_ids
         )
     ]
     merged.extend(candidates)
@@ -7790,6 +7802,10 @@ def _character_assessment_commit_candidates(
                 not current_present and assessment.present
             ):
                 action = "enter"
+            if (action == "leave" and not current_present) or (
+                action == "enter" and current_present
+            ):
+                action = ""
             presence_evidence_source_ids = assessment.presence_evidence_source_ids
             presence_evidence_quote = assessment.presence_evidence_quote
             if (
