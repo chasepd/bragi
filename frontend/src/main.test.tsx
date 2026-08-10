@@ -1424,6 +1424,49 @@ describe("frontend helpers", () => {
     stop();
   });
 
+  it("reconstructs active job progress during SSE fallback polling", async () => {
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const progress = {
+      kind: "post_turn_catchup",
+      status: "waiting",
+      status_text: "Waiting for prior turn continuity",
+      continuity_degraded: false,
+      retry_pending: false,
+      job_ids: ["prior-job"],
+      jobs: [{ name: "post_turn_catchup", status: "waiting", category: "continuity" }]
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve(
+      path === "/api/log/client"
+        ? { ok: true, json: async () => ({ ok: true }) }
+        : {
+            ok: true,
+            json: async () => ({
+              id: "job-1",
+              type: "chat_turn",
+              save_id: "save-1",
+              status: "running",
+              completion_level: "response_committed",
+              latest_progress: progress,
+              result: null,
+              error: null
+            })
+          }
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    const events = vi.fn();
+
+    const stop = watchJob("job-1", vi.fn(), events, "save-1");
+    sources[0].dispatchNativeError();
+
+    await waitFor(() => expect(events).toHaveBeenCalledWith("progress", progress));
+    expect(events).toHaveBeenCalledWith(
+      "completion_level",
+      { completion_level: "response_committed" }
+    );
+    stop();
+  });
+
   it("scopes job event streams and fallback polling to a save", async () => {
     const { watchJob } = await import("./api");
     const sources = installEventSourceDouble();
@@ -6344,6 +6387,23 @@ describe("frontend helpers", () => {
     );
   });
 
+  it.each([
+    ["waiting", "Waiting for prior turn continuity"],
+    ["succeeded", "Prior turn continuity is ready"],
+    ["failed", "Prior turn continuity catch-up failed; repair will retry"],
+    ["retry_pending", "Prior turn continuity is still catching up; retry pending"],
+    ["cancelled", "Prior turn continuity catch-up cancelled"]
+  ])("formats %s post-turn catch-up progress", async (status, statusText) => {
+    const { progressLabel } = await import("./main");
+
+    expect(progressLabel({
+      kind: "post_turn_catchup",
+      status,
+      status_text: statusText,
+      jobs: [{ name: "post_turn_catchup", status, category: "continuity" }]
+    })).toBe(statusText);
+  });
+
   it("renders compact pending jobs as grouped summaries", async () => {
     const { PendingJobsTray } = await import("./main");
     const onCancel = vi.fn();
@@ -6633,6 +6693,45 @@ describe("frontend helpers", () => {
         { name: "context", status: "running" },
         { name: "characters", status: "pending" }
       ]
+    });
+  });
+
+  it("hydrates and then replaces post-turn catch-up progress", async () => {
+    const { trackedActiveJob } = await import("./main");
+    const catchupProgress = {
+      kind: "post_turn_catchup" as const,
+      status: "waiting" as const,
+      status_text: "Waiting for prior turn continuity",
+      continuity_degraded: false,
+      retry_pending: false,
+      job_ids: ["prior-job"],
+      jobs: [{ name: "post_turn_catchup", status: "waiting", category: "continuity" }]
+    };
+    const waitingJob = {
+      id: "job-1",
+      type: "chat_turn",
+      status: "running",
+      result: null,
+      error: null,
+      latest_progress: catchupProgress
+    } satisfies Job;
+    const waiting = trackedActiveJob(waitingJob);
+
+    expect(waiting).toEqual({
+      job: waitingJob,
+      progress: "Waiting for prior turn continuity",
+      phases: [{ name: "post_turn_catchup", status: "waiting" }]
+    });
+
+    const narratingJob = {
+      ...waitingJob,
+      updated_at: 2,
+      latest_progress: { label: "Selecting context" }
+    } satisfies Job;
+    expect(trackedActiveJob(narratingJob, waiting)).toEqual({
+      job: narratingJob,
+      progress: "Selecting context",
+      phases: undefined
     });
   });
 
@@ -11889,6 +11988,83 @@ describe("frontend helpers", () => {
     expect(within(tray).getByText("World state")).toBeInTheDocument();
     expect(within(tray).getByText("Context update")).toBeInTheDocument();
     expect(within(tray).getByText("Character cleanup")).toBeInTheDocument();
+  });
+
+  it("does not let stale active-job hydration restore catch-up after live narration progress", async () => {
+    const sources = installEventSourceDouble();
+    const catchupProgress = {
+      kind: "post_turn_catchup" as const,
+      status: "waiting" as const,
+      status_text: "Waiting for prior turn continuity",
+      continuity_degraded: false,
+      retry_pending: false,
+      job_ids: ["prior-job"],
+      jobs: [{ name: "post_turn_catchup", status: "waiting", category: "continuity" }]
+    };
+    const activeJobs: Job[] = [{
+      id: "job-1",
+      type: "chat_turn",
+      save_id: "save-1",
+      status: "running",
+      result: null,
+      error: null,
+      latest_progress: catchupProgress
+    } satisfies Job];
+    const baseFetch = workbenchFetch(activeJobs, runtimeModel());
+    const staleActiveResponse = deferred<{
+      ok: boolean;
+      json: () => Promise<{ jobs: Job[] }>;
+    }>();
+    let activeJobRequests = 0;
+    const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path.startsWith("/api/jobs?status=active")) {
+        activeJobRequests += 1;
+        if (activeJobRequests === 2) return staleActiveResponse.promise;
+      }
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByText("Waiting for prior turn continuity")).toBeInTheDocument();
+    const jobSource = sources.find((source) => source.url.startsWith("/api/jobs/job-1/events"));
+    const saveSource = sources.find((source) => source.url === "/api/saves/save-1/events");
+    expect(jobSource).toBeDefined();
+    expect(saveSource).toBeDefined();
+
+    act(() => {
+      saveSource?.dispatch("job_changed", {
+        event_id: 1,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: { job: activeJobs[0] }
+      });
+    });
+    await waitFor(() => expect(activeJobRequests).toBe(2));
+
+    act(() => {
+      jobSource?.dispatch("progress", { label: "Selecting context" });
+    });
+    expect(await screen.findByText("Selecting context")).toBeInTheDocument();
+
+    await act(async () => {
+      staleActiveResponse.resolve({
+        ok: true,
+        json: async () => ({ jobs: [{ ...activeJobs[0], updated_at: 2 }] })
+      });
+      await staleActiveResponse.promise;
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Selecting context")).toBeInTheDocument();
+      expect(screen.queryByText("Waiting for prior turn continuity")).not.toBeInTheDocument();
+    });
   });
 
   it("does not render narrator output before the final job result", async () => {

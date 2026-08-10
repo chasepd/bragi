@@ -160,6 +160,189 @@ def test_async_api_routes_do_not_use_blocking_state_lock() -> None:
     assert offenders == []
 
 
+@pytest.mark.parametrize(
+    ("status", "status_text", "continuity_degraded", "retry_pending"),
+    [
+        ("waiting", "Waiting for prior turn continuity", False, False),
+        ("succeeded", "Prior turn continuity is ready", False, False),
+        (
+            "failed",
+            "Prior turn continuity catch-up failed; repair will retry",
+            True,
+            True,
+        ),
+        (
+            "retry_pending",
+            "Prior turn continuity is still catching up; retry pending",
+            True,
+            True,
+        ),
+        ("cancelled", "Prior turn continuity catch-up cancelled", False, False),
+    ],
+)
+def test_post_turn_catchup_progress_contract(
+    status: str,
+    status_text: str,
+    continuity_degraded: bool,
+    retry_pending: bool,
+) -> None:
+    assert api_app._post_turn_catchup_progress(  # pyright: ignore[reportPrivateUsage]
+        status,
+        job_ids=["prior-job"],
+    ) == {
+        "kind": "post_turn_catchup",
+        "status": status,
+        "status_text": status_text,
+        "continuity_degraded": continuity_degraded,
+        "retry_pending": retry_pending,
+        "job_ids": ["prior-job"],
+        "jobs": [
+            {
+                "name": "post_turn_catchup",
+                "status": status,
+                "category": "continuity",
+            }
+        ],
+    }
+
+
+def test_post_turn_catchup_emits_retry_pending_from_recovery() -> None:
+    class CatchupHandle:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        async def event(self, event: str, payload: object = None) -> None:
+            self.events.append((event, payload))
+
+    class CatchupRuntime:
+        async def run_post_turn_outbox_recovery(
+            self,
+            *,
+            active_save_id: str,
+        ) -> SimpleNamespace:
+            assert active_save_id == "save-1"
+            return SimpleNamespace(continuity_degraded=True)
+
+    handle = CatchupHandle()
+    state = SimpleNamespace(
+        jobs=SimpleNamespace(list_active=lambda **_kwargs: []),
+        repositories=SimpleNamespace(
+            list_post_turn_outbox_steps=lambda **_kwargs: [object()]
+        ),
+        runtime=CatchupRuntime(),
+    )
+
+    asyncio.run(
+        api_app._wait_for_background_post_turn_catchup(
+            cast(WebAppState, state),
+            cast(Any, handle),
+            save_id="save-1",
+        )
+    )
+
+    assert [
+        cast(dict[str, object], payload)["status"]
+        for event, payload in handle.events
+        if event == "progress"
+    ] == ["waiting", "retry_pending"]
+
+
+def test_post_turn_catchup_emits_safe_failure_progress() -> None:
+    class CatchupHandle:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        async def event(self, event: str, payload: object = None) -> None:
+            self.events.append((event, payload))
+
+    class CatchupRuntime:
+        async def run_post_turn_outbox_recovery(
+            self,
+            *,
+            active_save_id: str,
+        ) -> NoReturn:
+            assert active_save_id == "save-1"
+            raise RuntimeError("provider leaked api_key=live-secret")
+
+    handle = CatchupHandle()
+    state = SimpleNamespace(
+        jobs=SimpleNamespace(list_active=lambda **_kwargs: []),
+        repositories=SimpleNamespace(
+            list_post_turn_outbox_steps=lambda **_kwargs: [object()]
+        ),
+        runtime=CatchupRuntime(),
+    )
+
+    asyncio.run(
+        api_app._wait_for_background_post_turn_catchup(
+            cast(WebAppState, state),
+            cast(Any, handle),
+            save_id="save-1",
+        )
+    )
+
+    payloads = [payload for event, payload in handle.events if event == "progress"]
+    assert [cast(dict[str, object], payload)["status"] for payload in payloads] == [
+        "waiting",
+        "failed",
+    ]
+    assert "live-secret" not in json.dumps(payloads)
+    assert "api_key" not in json.dumps(payloads)
+
+
+def test_post_turn_catchup_emits_cancelled_before_propagating_cancellation() -> None:
+    async def run_test() -> list[tuple[str, object]]:
+        class CatchupHandle:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, object]] = []
+
+            async def event(self, event: str, payload: object = None) -> None:
+                self.events.append((event, payload))
+
+        class CatchupRuntime:
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+
+            async def run_post_turn_outbox_recovery(
+                self,
+                *,
+                active_save_id: str,
+            ) -> None:
+                assert active_save_id == "save-1"
+                self.started.set()
+                await asyncio.Event().wait()
+
+        runtime = CatchupRuntime()
+        handle = CatchupHandle()
+        state = SimpleNamespace(
+            jobs=SimpleNamespace(list_active=lambda **_kwargs: []),
+            repositories=SimpleNamespace(
+                list_post_turn_outbox_steps=lambda **_kwargs: [object()]
+            ),
+            runtime=runtime,
+        )
+        task = asyncio.create_task(
+            api_app._wait_for_background_post_turn_catchup(
+                cast(WebAppState, state),
+                cast(Any, handle),
+                save_id="save-1",
+            )
+        )
+        await runtime.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return handle.events
+
+    events = asyncio.run(run_test())
+
+    assert [
+        cast(dict[str, object], payload)["status"]
+        for event, payload in events
+        if event == "progress"
+    ] == ["waiting", "cancelled"]
+
+
 def test_async_api_routes_wait_for_runtime_lock_contention(tmp_path: Path) -> None:
     class ActionChoiceRuntime(_RuntimeDouble):
         async def regenerate_action_choices(
@@ -9184,15 +9367,36 @@ def test_chat_turn_waits_for_background_continuity_before_persisting_input(
             second_job_id,
             save_id="save-1",
         )
+        second_record = state.jobs.get(second_job_id)
 
     assert first_job["status"] == "succeeded"
     assert second_running["status"] == "running"
+    catchup_job_ids = second_running["latest_progress"]["job_ids"]
+    assert len(catchup_job_ids) == 1
     assert second_running["latest_progress"] == {
+        "kind": "post_turn_catchup",
         "status": "waiting",
-        "completion_level": "response_committed",
-        "label": "Waiting for prior turn continuity",
+        "status_text": "Waiting for prior turn continuity",
+        "continuity_degraded": False,
+        "retry_pending": False,
+        "job_ids": catchup_job_ids,
+        "jobs": [
+            {
+                "name": "post_turn_catchup",
+                "status": "waiting",
+                "category": "continuity",
+            }
+        ],
     }
     assert second_finished["status"] == "succeeded"
+    assert second_finished["latest_progress"]["status_text"] == "Player input saved"
+    assert second_record is not None
+    assert [
+        event["payload"]["status"]
+        for event in second_record.events
+        if event["event"] == "progress"
+        and event["payload"].get("kind") == "post_turn_catchup"
+    ] == ["waiting", "succeeded"]
 
 
 def test_slow_action_choices_do_not_delay_next_narrator_turn(tmp_path: Path) -> None:
