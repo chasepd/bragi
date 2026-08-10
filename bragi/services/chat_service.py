@@ -11589,6 +11589,13 @@ def _director_pressure_result_mapping(
     payload: dict[str, object] = {
         "applied": result.applied,
         "commit_state": result.commit_state,
+        "provider_called": result.provider_called,
+        "pacing_signal": result.pacing_signal,
+        "pacing_state": {
+            "tension_trend": result.state.tension_trend,
+            "stall_turns": result.state.stall_turns,
+            "cooldown_turns": result.state.cooldown_turns,
+        },
     }
     for key in (
         "pressure_kind",

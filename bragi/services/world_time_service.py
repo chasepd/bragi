@@ -40,6 +40,15 @@ WORLD_TIME_SCHEMA_NAME = "world_time_advance"
 WORLD_TIME_RECONCILIATION_SCHEMA_NAME = "world_time_reconciliation"
 WORLD_TIME_CONFIDENCE_THRESHOLD = 0.65
 NARRATOR_ONLY_WORLD_TIME_CONFIDENCE_THRESHOLD = 0.9
+_COMPLETED_TURN_AMBIGUOUS_TIME_RE = re.compile(
+    r"(?:^|[.!?]\s+)"
+    r"(?:"
+    r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"(?:\s+(?:morning|afternoon|evening|night))?"
+    r"|morning|afternoon|evening|night|dawn|dusk"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 class _WorldTimeSnapshotKwargs(TypedDict, total=False):
@@ -310,6 +319,11 @@ class WorldTimeService:
         snapshot = self.repositories.get_scene_snapshot(save_id)
         if snapshot is None:
             return WorldTimeResult("skipped", skipped_reason="missing_scene_snapshot")
+        if not completed_turn_may_advance_time(
+            player_message.body,
+            narrator_message.body,
+        ):
+            return WorldTimeResult("skipped", skipped_reason="no_time_advance_signal")
         if self.checker is None:
             return WorldTimeResult("skipped", skipped_reason="checker_unavailable")
         assess_completed_turn = getattr(self.checker, "assess_completed_turn", None)
@@ -695,6 +709,19 @@ class WorldTimeService:
 
 def latest_message_may_advance_time(text: str) -> bool:
     return has_world_time_advance_signal(text)
+
+
+def completed_turn_may_advance_time(
+    player_text: str,
+    narrator_text: str,
+) -> bool:
+    return any(
+        has_world_time_advance_signal(text)
+        for text in (player_text, narrator_text)
+    ) or (
+        _COMPLETED_TURN_AMBIGUOUS_TIME_RE.search(narrator_text)
+        is not None
+    )
 
 
 def _fade_transition_has_elapsed_time_evidence(evidence_quote: str) -> bool:
