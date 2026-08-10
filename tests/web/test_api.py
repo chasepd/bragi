@@ -6896,6 +6896,65 @@ def test_job_sse_summarizes_failed_job_error_events(tmp_path: Path) -> None:
     asyncio.run(run_test())
 
 
+def test_job_event_stream_resumes_after_last_event_id(tmp_path: Path) -> None:
+    async def run_test() -> None:
+        state = _state_double(tmp_path)
+        succeeded = JobRecord(
+            id="job-resume",
+            type="chat_turn",
+            status="succeeded",
+            events=[
+                {"event": "progress", "payload": {"step": 1}},
+                {"event": "progress", "payload": {"step": 2}},
+            ],
+        )
+        state.jobs._jobs = {  # noqa: SLF001 - controlled fixture
+            succeeded.id: succeeded
+        }
+
+        chunks = [
+            chunk
+            async for chunk in api_app._event_stream(  # noqa: SLF001
+                cast(WebAppState, state),
+                succeeded.id,
+                last_event_id=1,
+            )
+        ]
+
+        assert any("id: 2" in chunk and '"step": 2' in chunk for chunk in chunks)
+        assert '"step": 1' not in repr(chunks)
+        assert any("event: done" in chunk for chunk in chunks)
+
+    asyncio.run(run_test())
+
+
+def test_job_event_stream_emits_heartbeat_while_idle(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def run_test() -> None:
+        state = _state_double(tmp_path)
+        running = JobRecord(id="job-idle", type="chat_turn", status="running")
+        state.jobs._jobs = {running.id: running}  # noqa: SLF001 - controlled fixture
+
+        async def wait_for_event(_job_id: str, last_index: int) -> int:
+            return last_index
+
+        monkeypatch.setattr(state.jobs, "wait_for_event", wait_for_event)
+        stream = cast(
+            AsyncGenerator[str, None],
+            api_app._event_stream(cast(WebAppState, state), running.id),  # noqa: SLF001
+        )
+        try:
+            chunk = await anext(stream)
+        finally:
+            await stream.aclose()
+
+        assert chunk == "event: heartbeat\ndata: {}\n\n"
+
+    asyncio.run(run_test())
+
+
 def test_job_runtime_payloads_use_fresh_visible_save_list(tmp_path: Path) -> None:
     async def collect_events(state: WebAppState, job_id: str) -> list[str]:
         return [
@@ -7127,6 +7186,38 @@ def test_save_event_stream_resumes_after_last_event_id(tmp_path: Path) -> None:
     asyncio.run(run_test())
 
 
+def test_save_event_stream_emits_heartbeat_while_idle(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def run_test() -> None:
+        state = _state_double(tmp_path)
+
+        async def wait_for_event(
+            _save_id: str,
+            last_event_id: int,
+            **_kwargs: object,
+        ) -> int:
+            return last_event_id
+
+        monkeypatch.setattr(state.save_events, "wait_for_event", wait_for_event)
+        stream = cast(
+            AsyncGenerator[str, None],
+            api_app._save_event_stream(  # noqa: SLF001
+                cast(WebAppState, state),
+                "save-1",
+            ),
+        )
+        try:
+            chunk = await anext(stream)
+        finally:
+            await stream.aclose()
+
+        assert chunk == "event: heartbeat\ndata: {}\n\n"
+
+    asyncio.run(run_test())
+
+
 def test_save_event_stream_replays_retained_events_after_overflow(
     tmp_path: Path,
 ) -> None:
@@ -7227,6 +7318,58 @@ def test_save_events_route_reads_last_event_id_header(
 
     assert response.status_code == 200
     assert seen == [(state, "save-1", 1)]
+
+
+def test_event_stream_routes_disable_buffering_and_job_route_resumes(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = _state_double(tmp_path)
+    succeeded = JobRecord(
+        id="job-1",
+        type="chat_turn",
+        status="succeeded",
+        events=[
+            {"event": "progress", "payload": {"step": step}}
+            for step in range(3)
+        ],
+    )
+    state.jobs._jobs = {succeeded.id: succeeded}  # noqa: SLF001 - controlled fixture
+    seen: list[int] = []
+
+    async def stream_double(
+        _stream_state: WebAppState,
+        _job_id: str,
+        last_event_id: int = 0,
+        **_kwargs: object,
+    ) -> AsyncGenerator[str, None]:
+        seen.append(last_event_id)
+        yield "event: done\ndata: {}\n\n"
+
+    monkeypatch.setattr(api_app, "_event_stream", stream_double)
+
+    async def save_stream_double(
+        _stream_state: WebAppState,
+        _save_id: str,
+        _last_event_id: int = 0,
+        **_kwargs: object,
+    ) -> AsyncGenerator[str, None]:
+        yield "event: heartbeat\ndata: {}\n\n"
+
+    monkeypatch.setattr(api_app, "_save_event_stream", save_stream_double)
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        job_response = client.get(
+            "/api/jobs/job-1/events",
+            headers={"Last-Event-ID": "3"},
+        )
+        save_response = client.get("/api/saves/save-1/events")
+
+    assert seen == [3]
+    for response in (job_response, save_response):
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-cache"
+        assert response.headers["x-accel-buffering"] == "no"
 
 
 def test_save_event_last_event_id_header_parser_falls_back_safely() -> None:
@@ -9936,7 +10079,10 @@ def test_provider_retry_progress_events_are_sent_before_sse_done(
         ]
 
     chunks = asyncio.run(collect_events())
-    event_names = [chunk.split("\n", 1)[0] for chunk in chunks]
+    event_names = [
+        next(line for line in chunk.splitlines() if line.startswith("event: "))
+        for chunk in chunks
+    ]
     retry_index = next(
         index
         for index, chunk in enumerate(chunks)

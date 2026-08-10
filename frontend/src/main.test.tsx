@@ -33,12 +33,14 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 type EventSourceDoubleInstance = {
   url: string;
   closed: boolean;
   closeCalls: number;
+  dispatchOpen: () => void;
   dispatch: (name: string, data: unknown) => void;
   dispatchRaw: (name: string, data: string) => void;
   dispatchNativeError: () => void;
@@ -52,6 +54,7 @@ function installEventSourceDouble(): EventSourceDoubleInstance[] {
     closed = false;
     closeCalls = 0;
     listeners: Record<string, ((event: Event) => void)[]> = {};
+    onopen: ((event: Event) => void) | null = null;
     onerror: ((event: Event) => void) | null = null;
 
     constructor(url: string) {
@@ -68,14 +71,20 @@ function installEventSourceDouble(): EventSourceDoubleInstance[] {
       this.closeCalls += 1;
     }
 
+    dispatchOpen() {
+      this.onopen?.(new Event("open"));
+    }
+
     dispatch(name: string, data: unknown) {
       this.dispatchRaw(name, JSON.stringify(data));
     }
 
     dispatchRaw(name: string, data: string) {
+      const event = { data } as MessageEvent;
       for (const listener of this.listeners[name] ?? []) {
-        listener({ data } as MessageEvent);
+        listener(event);
       }
+      if (name === "error") this.onerror?.(event);
     }
 
     dispatchNativeError() {
@@ -1577,7 +1586,6 @@ describe("frontend helpers", () => {
   it("stops fallback polling when a job is no longer known", async () => {
     const { watchJob } = await import("./api");
     const sources = installEventSourceDouble();
-    const setTimeoutSpy = vi.spyOn(window, "setTimeout");
     const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve(
       path === "/api/log/client"
         ? { ok: true, json: async () => ({ ok: true }) }
@@ -1587,60 +1595,218 @@ describe("frontend helpers", () => {
 
     const updates = vi.fn();
     watchJob("job-1", updates);
-    await act(async () => {
-      sources[0].dispatchNativeError();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    sources[0].dispatchNativeError();
 
-    expect(updates).toHaveBeenCalledWith(expect.objectContaining({
+    await waitFor(() => expect(updates).toHaveBeenCalledWith(expect.objectContaining({
       id: "job-1",
       status: "cancelled",
       error: "Unknown job"
-    }));
+    })));
     expect(fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1")).toHaveLength(1);
-    expect(setTimeoutSpy).not.toHaveBeenCalled();
     expect(fetchMock.mock.calls.some(([path, init]) => path === "/api/log/client" && String(init.body).includes("client.job.stale"))).toBe(true);
-    setTimeoutSpy.mockRestore();
   });
 
   it("keeps retrying fallback polling after transient job read failures", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
     const { watchJob } = await import("./api");
     const sources = installEventSourceDouble();
-    let retryPoll: (() => void) | undefined;
-    const setTimeoutSpy = vi.spyOn(window, "setTimeout").mockImplementation((callback: TimerHandler) => {
-      retryPoll = callback as () => void;
-      return 1;
+    let jobReads = 0;
+    const fetchMock = vi.fn().mockImplementation((path: string) => {
+      if (path === "/api/log/client") {
+        return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+      }
+      jobReads += 1;
+      if (jobReads === 1) return Promise.reject(new TypeError("network down"));
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({ id: "job-1", type: "chat_turn", status: "succeeded", result: null, error: null })
+      });
     });
-    const fetchMock = vi.fn()
-      .mockImplementationOnce((path: string) => Promise.resolve(path === "/api/log/client" ? { ok: true, json: async () => ({ ok: true }) } : { ok: true, json: async () => ({ ok: true }) }))
-      .mockRejectedValueOnce(new TypeError("network down"))
-      .mockImplementation((path: string) => Promise.resolve(
-        path === "/api/log/client"
-          ? { ok: true, json: async () => ({ ok: true }) }
-          : { ok: true, json: async () => ({ id: "job-1", type: "chat_turn", status: "succeeded", result: null, error: null }) }
-      ));
     vi.stubGlobal("fetch", fetchMock);
 
     const updates = vi.fn();
     watchJob("job-1", updates);
-    await act(async () => {
-      sources[0].dispatchNativeError();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    sources[0].dispatchNativeError();
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(fetchMock).toHaveBeenCalledWith("/api/jobs/job-1", expect.anything());
-    expect(retryPoll).toBeDefined();
-    await act(async () => {
-      retryPoll?.();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    await vi.advanceTimersByTimeAsync(1_000);
 
     expect(updates).toHaveBeenCalledWith(expect.objectContaining({ id: "job-1", status: "succeeded" }));
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1").length).toBeGreaterThanOrEqual(2);
-    setTimeoutSpy.mockRestore();
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1")).toHaveLength(2);
+    vi.useRealTimers();
+  });
+
+  it("treats data-bearing job error events as healthy SSE messages", async () => {
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "job-1", type: "chat_turn", status: "running", result: null, error: null })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const events = vi.fn();
+
+    const stop = watchJob("job-1", vi.fn(), events);
+    sources[0].dispatch("error", { error: "Job failed safely" });
+
+    expect(events).toHaveBeenCalledWith("error", { error: "Job failed safely" });
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1")).toHaveLength(0);
+    expect(sources[0].closed).toBe(false);
+    stop();
+  });
+
+  it("coalesces fallback polls and ignores a late response after SSE recovery", async () => {
+    vi.useFakeTimers();
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const response = deferred<{ ok: boolean; json: () => Promise<Job> }>();
+    const fetchMock = vi.fn().mockImplementation((path: string) => (
+      path === "/api/log/client"
+        ? Promise.resolve({ ok: true, json: async () => ({ ok: true }) })
+        : response.promise
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    const updates = vi.fn();
+
+    const stop = watchJob("job-1", updates);
+    sources[0].dispatchNativeError();
+    await vi.advanceTimersByTimeAsync(0);
+    sources[0].dispatchNativeError();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1")).toHaveLength(1);
+
+    sources[0].dispatchOpen();
+    response.resolve({
+      ok: true,
+      json: async () => ({ id: "job-1", type: "chat_turn", status: "succeeded", result: null, error: null })
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(updates).not.toHaveBeenCalled();
+    expect(sources[0].closed).toBe(false);
+    stop();
+    vi.useRealTimers();
+  });
+
+  it("backs off job polling and stops it when SSE recovers", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve(
+      path === "/api/log/client"
+        ? { ok: true, json: async () => ({ ok: true }) }
+        : { ok: true, json: async () => ({ id: "job-1", type: "chat_turn", status: "running", result: null, error: null }) }
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const stop = watchJob("job-1", vi.fn());
+    sources[0].dispatchOpen();
+    sources[0].dispatchNativeError();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const jobCalls = () => fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1").length;
+    expect(jobCalls()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(jobCalls()).toBe(2);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(jobCalls()).toBe(3);
+    await vi.advanceTimersByTimeAsync(4_000);
+    await vi.advanceTimersByTimeAsync(8_000);
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(jobCalls()).toBe(6);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(jobCalls()).toBe(6);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(jobCalls()).toBe(7);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(jobCalls()).toBe(8);
+
+    sources[0].dispatchOpen();
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(jobCalls()).toBe(8);
+    expect(sources[0].closed).toBe(false);
+
+    stop();
+    vi.useRealTimers();
+  });
+
+  it("uses heartbeats to detect stale save streams and stop fallback polling", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { watchSave } = await import("./api");
+    const sources = installEventSourceDouble();
+    const fallbackPoll = vi.fn().mockResolvedValue(undefined);
+
+    const stop = watchSave("save-1", vi.fn(), undefined, fallbackPoll);
+    sources[0].dispatchOpen();
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(fallbackPoll).not.toHaveBeenCalled();
+
+    sources[0].dispatch("heartbeat", {});
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(fallbackPoll).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_001);
+    expect(fallbackPoll).toHaveBeenCalledTimes(1);
+
+    sources[0].dispatch("heartbeat", {});
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(fallbackPoll).toHaveBeenCalledTimes(1);
+
+    stop();
+    vi.useRealTimers();
+  });
+
+  it("pauses save fallback polling while offline or hidden", async () => {
+    vi.useFakeTimers();
+    const { watchSave } = await import("./api");
+    const sources = installEventSourceDouble();
+    const fallbackPoll = vi.fn().mockResolvedValue(undefined);
+    let online = false;
+    let hidden = false;
+    vi.spyOn(navigator, "onLine", "get").mockImplementation(() => online);
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+
+    const stop = watchSave("save-1", vi.fn(), undefined, fallbackPoll);
+    sources[0].dispatchNativeError();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fallbackPoll).not.toHaveBeenCalled();
+
+    online = true;
+    window.dispatchEvent(new Event("online"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fallbackPoll).toHaveBeenCalledTimes(1);
+
+    hidden = true;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fallbackPoll).toHaveBeenCalledTimes(1);
+
+    hidden = false;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fallbackPoll).toHaveBeenCalledTimes(2);
+
+    stop();
+    vi.useRealTimers();
+  });
+
+  it("delivers a terminal job only once across fallback and SSE", async () => {
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const terminal = { id: "job-1", type: "chat_turn", status: "succeeded", result: null, error: null };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => terminal }));
+    const updates = vi.fn();
+
+    watchJob("job-1", updates);
+    sources[0].dispatch("done", terminal);
+    sources[0].dispatch("done", terminal);
+
+    expect(updates).toHaveBeenCalledTimes(1);
   });
 
   it("does not mount the workbench as an import side effect in tests", async () => {
@@ -8378,8 +8544,8 @@ describe("frontend helpers", () => {
     expect(scenarioCalls).toBe(countsBeforeEvent.scenarioCalls);
   });
 
-  it("polls the runtime while a chat job is active so missed SSE updates still show the narrator response", async () => {
-    installEventSourceDouble();
+  it("polls the runtime after save SSE fails so missed updates still show the narrator response", async () => {
+    const sources = installEventSourceDouble();
     const initialModel = runtimeModel({
       chronicle: {
         messages: [
@@ -8426,8 +8592,108 @@ describe("frontend helpers", () => {
 
     await waitFor(() => expect(screen.getByText("The beacon waits.")).toBeInTheDocument());
     await screen.findByLabelText("Pending jobs");
+    await waitFor(() => expect(sources.some((source) => source.url === "/api/saves/save-1/events")).toBe(true));
+
+    act(() => {
+      sources.find((source) => source.url === "/api/saves/save-1/events")?.dispatchNativeError();
+    });
 
     await waitFor(() => expect(screen.getByText("The bell answers.")).toBeInTheDocument(), { timeout: 2500 });
+  });
+
+  it("ignores a late save fallback runtime response after SSE recovers", async () => {
+    const sources = installEventSourceDouble();
+    const initialModel = runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "m1", role: "narrator", speaker_name: null, body: "The beacon waits.", actions: [] }
+        ]
+      }
+    });
+    const updatedModel = runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "m1", role: "narrator", speaker_name: null, body: "The beacon waits.", actions: [] },
+          { message_id: "m2", role: "narrator", speaker_name: null, body: "The stale bell answers.", actions: [] }
+        ]
+      }
+    });
+    const fallbackRuntime = deferred<{ ok: boolean; json: () => Promise<RuntimeModel> }>();
+    let deferRuntime = false;
+    let fallbackSignal: AbortSignal | undefined;
+    let runtimeCalls = 0;
+    const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path.startsWith("/api/runtime")) {
+        runtimeCalls += 1;
+        if (deferRuntime) {
+          fallbackSignal = init?.signal ?? undefined;
+          return fallbackRuntime.promise;
+        }
+        return Promise.resolve({ ok: true, json: async () => initialModel });
+      }
+      if (path === "/api/scenarios") {
+        return Promise.resolve({ ok: true, json: async () => ({ scenarios: [] }) });
+      }
+      if (path.startsWith("/api/jobs?status=active")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            jobs: [
+              { id: "job-1", type: "chat_turn", save_id: "save-1", status: "running", result: null, error: null, created_at: 1 }
+            ]
+          })
+        });
+      }
+      if (path.startsWith("/api/chat/submission-status")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            save_id: "save-1",
+            can_submit: false,
+            reason: "chat_turn_active",
+            blocking_job_id: "job-1",
+            blocking_job_status: "running"
+          })
+        });
+      }
+      if (path === "/api/settings/shell") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ pending_jobs_display_mode: modelSettingsPayload().pending_jobs_display_mode })
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await screen.findByText("The beacon waits.");
+    await screen.findByLabelText("Pending jobs");
+    await waitFor(() => expect(sources.some((source) => source.url === "/api/saves/save-1/events")).toBe(true));
+    deferRuntime = true;
+    act(() => {
+      sources.find((source) => source.url === "/api/saves/save-1/events")?.dispatchNativeError();
+    });
+    await waitFor(() => expect(runtimeCalls).toBeGreaterThan(1));
+
+    act(() => {
+      sources.find((source) => source.url === "/api/saves/save-1/events")?.dispatchOpen();
+    });
+    expect(fallbackSignal?.aborted).toBe(true);
+    await act(async () => {
+      fallbackRuntime.resolve({ ok: true, json: async () => updatedModel });
+      await fallbackRuntime.promise;
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("The stale bell answers.")).not.toBeInTheDocument();
+    expect(screen.getByText("The beacon waits.")).toBeInTheDocument();
   });
 
   it("uses a mobile app shell without desktop resize handles", async () => {

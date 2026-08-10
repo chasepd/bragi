@@ -1444,8 +1444,6 @@ const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
   "opening_message"
 ]);
 const HIDDEN_WORLD_FIELDS = new Set(["original_key", "source_message_ids", "consolidated"]);
-const ACTIVE_CHAT_RUNTIME_REFETCH_MS = 1000;
-const CHAT_SUBMISSION_STATUS_REFETCH_MS = 1000;
 const VIRTUAL_LIST_INITIAL_RECT = { width: 390, height: 520 };
 const CHRONICLE_ESTIMATED_ROW_HEIGHT = 156;
 const CHRONICLE_ROW_GAP = 16;
@@ -2823,9 +2821,9 @@ function Workbench({
   const runtimeFreshUntilRef = useRef(0);
   const runtimeFreshSaveIdRef = useRef<string | null>(null);
   const activeSaveIdRef = useRef<string | null>(null);
+  const hasTrackedChatJobRef = useRef(false);
   const currentUserId = currentUser?.id ?? null;
   const [selectedSaveId, setSelectedSaveId] = useState<string | null>(() => loadSelectedSaveId(currentUserId));
-  const [runtimeFreshUntil, setRuntimeFreshUntil] = useState(0);
   const [paintedRuntimeSaveKey, setPaintedRuntimeSaveKey] = useState<string | null>(null);
   const [seenTextMessageIdsByThread, setSeenTextMessageIdsByThread] = useState<Record<string, string>>({});
   const [pendingSaveId, setPendingSaveId] = useState<string | null>(null);
@@ -2837,8 +2835,7 @@ function Workbench({
   const isStackedWorkbench = useMediaQuery(WORKBENCH_STACKED_QUERY);
   const isMobileWorkbench = useMediaQuery(WORKBENCH_MOBILE_QUERY);
   const hasTrackedChatJob = Object.values(trackedJobs).some(({ job }) => isChatJobType(job.type));
-  const liveUpdatesAvailable = typeof EventSource !== "undefined";
-  const runtimePollingSuppressed = runtimeFreshUntil > Date.now();
+  hasTrackedChatJobRef.current = hasTrackedChatJob;
   const runtime = useQuery({
     queryKey: runtimeQueryKey(selectedSaveId),
     queryFn: async ({ signal }) => {
@@ -2856,8 +2853,7 @@ function Workbench({
     placeholderData: keepPreviousData,
     retry: (failureCount, failure) => (
       !(failure instanceof ApiError && failure.status < 500) && failureCount < 3
-    ),
-    refetchInterval: hasTrackedChatJob && !runtimePollingSuppressed ? ACTIVE_CHAT_RUNTIME_REFETCH_MS : false
+    )
   });
   const model = runtime.data;
   const runtimeLoadError = runtime.error instanceof Error ? runtime.error.message : "";
@@ -2881,14 +2877,12 @@ function Workbench({
     queryKey: ["jobs", "active", activeSaveId],
     queryFn: ({ signal }) => apiRead<{ jobs: Job[] }>(activeJobsPath(activeSaveId), signal),
     enabled: Boolean(model),
-    refetchInterval: hasTrackedChatJob || !liveUpdatesAvailable ? 2000 : false,
     retry: false
   });
   const chatSubmissionStatus = useQuery({
     queryKey: ["chat", "submission-status", activeSaveId],
     queryFn: ({ signal }) => apiRead<ChatSubmissionStatus>(chatSubmissionStatusPath(activeSaveId), signal),
     enabled: Boolean(model),
-    refetchInterval: hasTrackedChatJob || !liveUpdatesAvailable ? CHAT_SUBMISSION_STATUS_REFETCH_MS : false,
     retry: false
   });
   const characterTextsSummary = useQuery({
@@ -2997,12 +2991,10 @@ function Workbench({
     const freshUntil = Date.now() + RUNTIME_FRESH_SUPPRESS_MS;
     runtimeFreshSaveIdRef.current = saveId;
     runtimeFreshUntilRef.current = freshUntil;
-    setRuntimeFreshUntil(freshUntil);
     runtimeFreshTimerRef.current = window.setTimeout(() => {
       runtimeFreshTimerRef.current = null;
       runtimeFreshSaveIdRef.current = null;
       runtimeFreshUntilRef.current = 0;
-      setRuntimeFreshUntil(0);
     }, RUNTIME_FRESH_SUPPRESS_MS);
   }, []);
 
@@ -3064,8 +3056,35 @@ function Workbench({
     if (!activeSaveId) return undefined;
     return watchSave(activeSaveId, refreshForSaveEvent, () => {
       refreshWorkbench(activeSaveId);
+    }, async (signal) => {
+      async function refreshFallback<T>(queryKey: readonly unknown[], path: string) {
+        const value = await apiRead<T>(path, signal);
+        if (!signal.aborted && activeSaveIdRef.current === activeSaveId) {
+          client.setQueryData(queryKey, value);
+        }
+      }
+      const refreshes: Promise<unknown>[] = [
+        refreshFallback<{ jobs: Job[] }>(
+          ["jobs", "active", activeSaveId],
+          activeJobsPath(activeSaveId)
+        ),
+        refreshFallback<ChatSubmissionStatus>(
+          ["chat", "submission-status", activeSaveId],
+          chatSubmissionStatusPath(activeSaveId)
+        )
+      ];
+      if (
+        hasTrackedChatJobRef.current
+        && runtimeFreshUntilRef.current <= Date.now()
+      ) {
+        refreshes.push(refreshFallback<RuntimeModel>(
+          runtimeQueryKey(activeSaveId),
+          runtimePath(activeSaveId)
+        ));
+      }
+      await Promise.allSettled(refreshes);
     });
-  }, [activeSaveId, refreshForSaveEvent, refreshWorkbench]);
+  }, [activeSaveId, client, refreshForSaveEvent, refreshWorkbench]);
 
   useEffect(() => {
     setPendingMessage((current) => pendingMessageForActiveSave(current, activeSaveId));
