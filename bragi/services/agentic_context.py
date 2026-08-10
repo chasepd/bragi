@@ -4214,6 +4214,21 @@ def _verification_result_from_data(
                     rendered_chat_request_text(request),
                 )
             ),
+            voice_context_text="\n\n".join(
+                (
+                    *request.character_voice_profiles,
+                    *(
+                        message.body
+                        for message in request.messages
+                        if message.role == "narrator"
+                    ),
+                )
+            ),
+            repetition_context_text="\n\n".join(
+                message.body
+                for message in request.messages
+                if message.role == "narrator"
+            ),
         )
     )
     issues = _string_tuple(data.get("issues"))
@@ -4257,6 +4272,8 @@ def _narrator_quality_findings_from_data(
     *,
     narrator_body: str,
     context_text: str,
+    voice_context_text: str,
+    repetition_context_text: str,
 ) -> tuple[tuple[NarratorQualityFinding, ...], bool]:
     if not isinstance(value, list):
         return (), False
@@ -4270,13 +4287,20 @@ def _narrator_quality_findings_from_data(
         reason = _string(item.get("reason"))
         narrator_quote = _string(item.get("narrator_quote"))
         context_quote = _string(item.get("context_quote"))
+        category_context_text = (
+            voice_context_text
+            if category == "character_voice"
+            else repetition_context_text
+            if category == "semantic_repetition"
+            else context_text
+        )
         if (
             category not in NARRATOR_QUALITY_FINDING_CATEGORIES
             or not reason
             or not narrator_quote
             or not context_quote
             or narrator_quote not in narrator_body
-            or context_quote not in context_text
+            or context_quote not in category_context_text
         ):
             invalid_finding = True
             continue

@@ -3415,15 +3415,27 @@ def test_narrator_verifier_reports_typed_quality_findings(category: str) -> None
         model_id="verifier",
     )
 
+    source_request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(
+            ChatMessage(role="player", body="I test the gate."),
+            *(
+                (ChatMessage(role="narrator", body="The gate remains sealed."),)
+                if category == "semantic_repetition"
+                else ()
+            ),
+        ),
+        current_scene_recap=("The gate remains sealed.",),
+        character_voice_profiles=(
+            ("The gate remains sealed.",) if category == "character_voice" else ()
+        ),
+    )
+
     result = asyncio.run(
         verifier.verify(
             save_id="save-1",
-            source_request=ChatRequest(
-                provider="fake-chat",
-                model_id="narrator",
-                messages=(ChatMessage(role="player", body="I test the gate."),),
-                current_scene_recap=("The gate remains sealed.",),
-            ),
+            source_request=source_request,
             spec=NarratorMessageSpec(
                 intent="Resolve the attempted crossing.",
                 thesis="Keep the sealed gate physically consistent.",
@@ -3564,6 +3576,86 @@ def test_narrator_verifier_fails_closed_for_ungrounded_quality_finding(
                 evidence_source_ids=("scene:gate",),
             ),
             narrator_body="Mara crosses the sealed gate.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.quality_findings == ()
+    assert result.issues == (
+        "Narrator quality finding contained evidence not present in the "
+        "supplied draft or context.",
+    )
+
+
+@pytest.mark.parametrize(
+    ("category", "source_request"),
+    (
+        (
+            "character_voice",
+            ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I address Ilyra."),),
+                current_scene_recap=("Ilyra is standing beside the sealed gate.",),
+            ),
+        ),
+        (
+            "semantic_repetition",
+            ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I test the gate."),),
+                retrieved_recent_messages=(
+                    "Ilyra is standing beside the sealed gate.",
+                ),
+            ),
+        ),
+    ),
+)
+def test_narrator_verifier_rejects_wrong_domain_quality_evidence(
+    category: str,
+    source_request: ChatRequest,
+) -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.88,
+                "quality_findings": [
+                    {
+                        "category": category,
+                        "reason": "The draft conflicts with specialized evidence.",
+                        "narrator_quote": "Ilyra speaks in a warm drawl.",
+                        "context_quote": (
+                            "Ilyra is standing beside the sealed gate."
+                        ),
+                    }
+                ],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=source_request,
+            spec=NarratorMessageSpec(
+                intent="Let Ilyra react.",
+                thesis="Ilyra challenges Mara.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=(),
+            ),
+            narrator_body="Ilyra speaks in a warm drawl.",
         )
     )
 
