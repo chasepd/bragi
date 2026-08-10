@@ -3216,30 +3216,39 @@ function Workbench({
           applyCharacterTextJobResult(client, done.result, done.save_id ?? activeSaveIdRef.current);
         }
         if (appliesToCurrentSave && done.status === "succeeded") options.onSucceeded?.(done.result);
+        const isActionChoiceJob = (
+          done.type === "action_choice_generate"
+          || done.type === "action_choice_regenerate"
+        );
+        if (
+          appliesToCurrentSave
+          && isActionChoiceJob
+          && (done.status === "failed" || done.status === "cancelled")
+        ) {
+          const error = done.status === "failed" ? done.error || "Background job failed." : null;
+          appliedRuntimeResult = true;
+          client.setQueryData<RuntimeModel>(
+            runtimeQueryKey(done.save_id ?? activeSaveIdRef.current),
+            (current) => current?.action_choices
+              && (
+                !current.action_choices.generation_job
+                || current.action_choices.generation_job.id === done.id
+              )
+              ? {
+                ...current,
+                action_choices: {
+                  ...current.action_choices,
+                  generation_job: null,
+                  generation_error: error
+                }
+              }
+              : current
+          );
+        }
         if (appliesToCurrentSave && done.status === "failed") {
           const error = done.error || "Background job failed.";
-          if (
-            done.type === "action_choice_generate"
-            || done.type === "action_choice_regenerate"
-          ) {
+          if (isActionChoiceJob) {
             appliedRuntimeResult = true;
-            client.setQueryData<RuntimeModel>(
-              runtimeQueryKey(done.save_id ?? activeSaveIdRef.current),
-              (current) => current?.action_choices
-                && (
-                  !current.action_choices.generation_job
-                  || current.action_choices.generation_job.id === done.id
-                )
-                ? {
-                  ...current,
-                  action_choices: {
-                    ...current.action_choices,
-                    generation_job: null,
-                    generation_error: error
-                  }
-                }
-                : current
-            );
           }
           options.onFailed?.(error, done);
         }
@@ -3611,6 +3620,7 @@ function Workbench({
               job.type === "action_choice_generate"
               || job.type === "action_choice_regenerate"
             ))}
+            generationRecoveryPending={activeJobs.isPending}
             pendingAfterMessageId={pendingAfterMessageId}
             onPendingMessage={setPendingMessage}
           />
@@ -6669,6 +6679,7 @@ function CyoaActionPicker({
   activeSaveId,
   actionChoices,
   generationActive = false,
+  generationRecoveryPending = false,
   pendingAfterMessageId = null,
   onPendingMessage
 }: {
@@ -6677,6 +6688,7 @@ function CyoaActionPicker({
   activeSaveId: string | null;
   actionChoices: RuntimeModel["action_choices"];
   generationActive?: boolean;
+  generationRecoveryPending?: boolean;
   pendingAfterMessageId?: string | null;
   onPendingMessage: (message: PendingChronicleMessage | null) => void;
 }) {
@@ -6732,7 +6744,10 @@ function CyoaActionPicker({
   const choices = [...(actionChoices?.choices ?? [])].sort((left, right) => left.ordinal - right.ordinal);
   const submitBusy = submittingSaveId === activeSaveId || submittingSaveIdRef.current === activeSaveId;
   const regenerateBusy = regenerate.isPending;
-  const choicesGenerating = generationActive || Boolean(actionChoices?.generation_job) || regenerateBusy;
+  const choicesGenerating = generationActive
+    || generationRecoveryPending
+    || Boolean(actionChoices?.generation_job)
+    || regenerateBusy;
   const canSubmit = !disabled && !submitBusy;
   const canSubmitChoice = canSubmit && !choicesGenerating;
   const canRegenerate = !disabled && !submitBusy && !regenerateBusy && !choicesGenerating && Boolean(activeSaveId && actionChoices?.narrator_message_id);
