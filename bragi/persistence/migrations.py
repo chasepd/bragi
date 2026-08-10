@@ -1266,6 +1266,7 @@ def _ensure_incremental_turn_snapshot_schema(connection: sqlite3.Connection) -> 
             order_key TEXT,
             ordinal INTEGER NOT NULL,
             included INTEGER NOT NULL DEFAULT 1,
+            recheck_at TEXT,
             PRIMARY KEY(save_id, table_name, row_key)
         );
 
@@ -1316,6 +1317,45 @@ def _ensure_incremental_turn_snapshot_schema(connection: sqlite3.Connection) -> 
                 END;
                 """,
             )
+        _execute_schema_script(
+            connection,
+            f"""
+            CREATE TRIGGER IF NOT EXISTS dirty_snapshot_{table.name}_after_update_old
+            AFTER UPDATE ON {table.name}
+            FOR EACH ROW
+            WHEN OLD.save_id IS NOT NEW.save_id
+              OR OLD.{table.primary_key} IS NOT NEW.{table.primary_key}
+            BEGIN
+                INSERT INTO save_snapshot_table_state(
+                    save_id, table_name, current_generation,
+                    captured_generation, needs_rebuild
+                )
+                VALUES (OLD.save_id, '{table.name}', 1, 0, 0)
+                ON CONFLICT(save_id, table_name) DO UPDATE SET
+                    current_generation = current_generation + 1;
+
+                INSERT INTO save_snapshot_dirty_rows(
+                    save_id, table_name, row_key, generation
+                )
+                VALUES (
+                    OLD.save_id,
+                    '{table.name}',
+                    COALESCE(
+                        CAST(OLD.{table.primary_key} AS TEXT),
+                        printf('rowid:%d', OLD.rowid)
+                    ),
+                    (
+                        SELECT current_generation
+                        FROM save_snapshot_table_state
+                        WHERE save_id = OLD.save_id
+                          AND table_name = '{table.name}'
+                    )
+                )
+                ON CONFLICT(save_id, table_name, row_key) DO UPDATE SET
+                    generation = excluded.generation;
+            END;
+            """,
+        )
     for table in SNAPSHOT_TABLES:
         connection.execute(
             """

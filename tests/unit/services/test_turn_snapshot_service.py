@@ -139,6 +139,60 @@ def test_snapshot_object_decode_rejects_json_node_bomb(
         )
 
 
+def test_local_snapshot_object_rejects_oversized_declared_payload(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    snapshot = service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        """
+        UPDATE save_snapshot_objects
+        SET uncompressed_size = ?
+        WHERE object_hash = ?
+        """,
+        (
+            turn_snapshot_module._MAX_SNAPSHOT_OBJECT_UNCOMPRESSED_BYTES + 1,
+            snapshot.root_manifest_hash,
+        ),
+    )
+    repositories.commit()
+
+    with pytest.raises(ValueError, match="too large"):
+        service._snapshot_manifest(snapshot)
+
+
+def test_local_snapshot_tree_rejects_duplicate_node_reference(
+    repositories: PersistenceRepositories,
+) -> None:
+    service = TurnSnapshotService(repositories)
+    row_hash = service._store_object(
+        kind="row:messages",
+        value={"id": "message-one"},
+    )
+    child_hash = service._store_tree_node(
+        table_name="messages",
+        order_key="child",
+        row_key="message-one",
+        row_hash=row_hash,
+        priority=2,
+        left_hash=None,
+        right_hash=None,
+    )
+    root_hash = service._store_tree_node(
+        table_name="messages",
+        order_key="root",
+        row_key="message-root",
+        row_hash=row_hash,
+        priority=1,
+        left_hash=child_hash,
+        right_hash=child_hash,
+    )
+
+    with pytest.raises(ValueError, match="cycle"):
+        service._tree_entries(table_name="messages", root_hash=root_hash)
+
+
 def test_snapshot_validation_bounds_snapshot_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1494,6 +1548,67 @@ def test_snapshot_restores_curation_progress_without_reviving_worker_lease(
     assert state.lease_until is None
     assert state.last_error is None
     assert state.terminal_outcome is None
+
+
+def test_snapshot_rechecks_curation_lease_after_time_passes_without_table_write(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The beacon was relit.",
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The beacon was relit.",
+        evidence_quote="The beacon was relit.",
+        source_message_ids=[message.id],
+        scope="durable",
+        confidence=0.9,
+    )
+    repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="snapshot-worker-secret",
+        lease_seconds=600,
+    )
+    service = TurnSnapshotService(repositories)
+    original = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    repositories.connection.execute(
+        "DROP TRIGGER dirty_snapshot_context_observation_curation_state_after_update"
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_observation_curation_state
+        SET lease_until = '2000-01-01 00:00:00'
+        WHERE observation_id = ?
+        """,
+        (observation.id,),
+    )
+    repositories.connection.execute(
+        """
+        UPDATE save_snapshot_row_state
+        SET recheck_at = '2000-01-01 00:00:00'
+        WHERE save_id = ?
+          AND table_name = 'context_observation_curation_state'
+          AND row_key = ?
+        """,
+        (save.id, observation.id),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+
+    assert changed.id != original.id
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+    [state] = rows["context_observation_curation_state"]
+    assert state["attempt_count"] == 1
+    assert state["lease_token"] is None
+    assert state["lease_until"] is None
 
 
 def test_imported_snapshot_rows_clear_curation_worker_lease() -> None:
@@ -3461,6 +3576,98 @@ def test_dirty_row_capture_updates_tree_without_full_active_scan(
     [captured_state] = rows["world_state"]
     assert captured_state["id"] == state.id
     assert json.loads(str(captured_state["value_json"])) == {"color": "blue"}
+
+
+def test_deleted_row_capture_updates_cached_graph_without_full_active_scan(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens",
+        value={"color": "red"},
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute("DELETE FROM world_state WHERE id = ?", (state.id,))
+    repositories.commit()
+
+    def fail_active_scan(_save_id: str) -> object:
+        raise AssertionError("incremental deletion scanned active tables")
+
+    monkeypatch.setattr(service, "_active_rows_by_table", fail_active_scan)
+
+    changed = service.capture_current_head_if_dirty(save.id)
+
+    assert service._rows_from_manifest(service._snapshot_manifest(changed))[
+        "world_state"
+    ] == ()
+
+
+def test_primary_key_update_removes_old_snapshot_identity(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens",
+        value={"color": "red"},
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE world_state SET id = ? WHERE id = ?",
+        ("replacement-state", state.id),
+    )
+    repositories.commit()
+
+    def fail_active_scan(_save_id: str) -> object:
+        raise AssertionError("primary-key update scanned active tables")
+
+    monkeypatch.setattr(service, "_active_rows_by_table", fail_active_scan)
+    changed = service.capture_current_head_if_dirty(save.id)
+
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+    assert [row["id"] for row in rows["world_state"]] == ["replacement-state"]
+
+
+def test_incremental_reference_validation_is_scoped_to_save(
+    repositories: PersistenceRepositories,
+) -> None:
+    first = _create_save(repositories)
+    second = _create_save(repositories)
+    own_message = repositories.append_message(
+        save_id=first.id,
+        role="player",
+        body="I inspect the lens.",
+    )
+    foreign_message = repositories.append_message(
+        save_id=second.id,
+        role="player",
+        body="I inspect another lens.",
+    )
+    state = repositories.upsert_world_state(
+        save_id=first.id,
+        key="lens",
+        value={"color": "red"},
+        source_message_id=own_message.id,
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=first.id, message_id=own_message.id)
+    repositories.connection.execute(
+        "UPDATE world_state SET source_message_id = ? WHERE id = ?",
+        (foreign_message.id, state.id),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(first.id)
+
+    [captured] = service._rows_from_manifest(service._snapshot_manifest(changed))[
+        "world_state"
+    ]
+    assert captured["source_message_id"] is None
 
 
 def test_dirty_row_capture_serializes_only_changed_row(
