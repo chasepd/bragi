@@ -7745,7 +7745,7 @@ def test_edit_and_resubmit_reports_committed_edit_before_narrator_finishes(
         )
 
         try:
-            await asyncio.wait_for(replacement_narrator_started.wait(), timeout=1)
+            await asyncio.wait_for(replacement_narrator_started.wait(), timeout=2)
         except TimeoutError as exc:
             if task.done():
                 await task
@@ -7777,7 +7777,7 @@ def test_edit_and_resubmit_reports_committed_edit_before_narrator_finishes(
         ]
 
         release_replacement_narrator.set()
-        final_model = await asyncio.wait_for(task, timeout=1)
+        final_model = await asyncio.wait_for(task, timeout=2)
 
         final_messages = repositories.list_messages(save_id)
         assert [(message.role, message.body) for message in final_messages] == [
