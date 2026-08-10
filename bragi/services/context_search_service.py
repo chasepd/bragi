@@ -47,7 +47,10 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, provider_error_is_model_not_found
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
-from bragi.services.context_assembly import scenario_section_candidates
+from bragi.services.context_assembly import (
+    scenario_claim_candidates,
+    scenario_section_candidates,
+)
 from bragi.services.continuity_index_service import ContinuityIndexService
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.knowledge_boundary import (
@@ -938,6 +941,12 @@ def _snapshot_contains_selected_items(
         *(
             ("scenario_section", source_id)
             for source_id, _section_id, _text in scenario_section_candidates(
+                snapshot.details.scenario
+            )
+        ),
+        *(
+            ("scenario_claim", source_id)
+            for source_id, _section_id, _text, _metadata in scenario_claim_candidates(
                 snapshot.details.scenario
             )
         ),

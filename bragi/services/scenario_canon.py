@@ -168,6 +168,8 @@ def scenario_canon_source_sections(
 def scenario_canon_claims(
     content: Mapping[str, object],
 ) -> tuple[ScenarioCanonClaim, ...]:
+    if not scenario_canon_is_current(content):
+        return ()
     payload = content.get(CANON_CONTENT_KEY)
     if not isinstance(payload, Mapping):
         return ()
@@ -209,10 +211,10 @@ def scenario_canon_claims(
 
 
 def scenario_canon_is_current(content: Mapping[str, object]) -> bool:
+    source_sections = scenario_canon_source_sections(content)
     payload = content.get(CANON_CONTENT_KEY)
-    return _compilation_matches(
-        payload,
-        digest=_source_digest(scenario_canon_source_sections(content)),
+    return _compilation_matches(payload, digest=_source_digest(source_sections)) and (
+        _stored_claims_are_grounded(payload, source_sections=source_sections)
     )
 
 
@@ -232,6 +234,8 @@ async def ensure_scenario_canon_for_save(
     content = _loaded_content(details.scenario.content_json)
     if scenario_canon_is_current(content):
         return False
+    if not scenario_canon_source_sections(content):
+        return False
     from bragi.services.model_preferences import roleplay_model_preference
 
     preference = roleplay_model_preference(
@@ -240,10 +244,14 @@ async def ensure_scenario_canon_for_save(
         purpose="context_update",
     )
     if preference is None:
-        return False
+        raise ValueError(
+            "A Context Update model is required to compile scenario canon"
+        )
     provider: object = providers.get(preference.provider)
     if not isinstance(provider, StructuredOutputProvider):
-        return False
+        raise ValueError(
+            "The Context Update provider must support structured output"
+        )
     compiled = await ScenarioCanonCompiler(
         provider=provider,
         provider_name=preference.provider,
@@ -366,8 +374,8 @@ def _validated_claim(
 
 
 def _validated_anchors(value: object) -> list[dict[str, str]]:
-    if not isinstance(value, list):
-        raise ValueError("Scenario canon entity_anchors must be an array")
+    if not isinstance(value, list) or not value:
+        raise ValueError("Scenario canon entity_anchors must be a non-empty array")
     anchors: list[dict[str, str]] = []
     for raw in value:
         if not isinstance(raw, Mapping):
@@ -406,6 +414,7 @@ def _compiler_schema(section_ids: tuple[str, ...]) -> dict[str, Any]:
             "evidence_quote": {"type": "string"},
             "entity_anchors": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -475,6 +484,38 @@ def _compilation_matches(value: object, *, digest: str) -> bool:
         and value.get("source_digest") == digest
         and isinstance(value.get("claims"), list)
     )
+
+
+def _stored_claims_are_grounded(
+    value: object,
+    *,
+    source_sections: Mapping[str, str],
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    raw_claims = value.get("claims")
+    if not isinstance(raw_claims, list):
+        return False
+    for raw in raw_claims:
+        if not isinstance(raw, Mapping):
+            return False
+        source_section = str(raw.get("source_section", ""))
+        source = source_sections.get(source_section)
+        if source is None or raw.get("source_sha256") != _sha256(source):
+            return False
+        evidence_quote = str(raw.get("evidence_quote", "")).strip()
+        if not evidence_quote or evidence_quote not in source:
+            return False
+        try:
+            _validated_claim(
+                raw,
+                section_id=source_section,
+                source=source,
+                source_sha256=_sha256(source),
+            )
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 def _empty_payload(digest: str) -> dict[str, object]:

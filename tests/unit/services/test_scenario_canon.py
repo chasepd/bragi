@@ -8,6 +8,7 @@ from bragi.services.scenario_canon import (
     CANON_CONTENT_KEY,
     ScenarioCanonCompiler,
     scenario_canon_claims,
+    scenario_canon_is_current,
 )
 
 
@@ -117,6 +118,83 @@ def test_compiler_reuses_matching_compilation_without_provider_call() -> None:
 
     assert reused == compiled
     assert len(provider.structured_output_requests) == 1
+
+
+def test_edit_invalidates_compilation_and_regenerates_claims() -> None:
+    provider = FakeProviderClient(structured_output=_output())
+    compiler = ScenarioCanonCompiler(
+        provider=provider,
+        provider_name="fake",
+        model_id="canon-model",
+    )
+    original = asyncio.run(
+        compiler.compile(
+            scenario_type="full_roleplay",
+            content={"lore": "The beacon consumes one memory per use. "
+            "The keeper suspects the lens is alive."},
+        )
+    )
+    edited = {**original, "lore": "The beacon is cold."}
+    replacement = _output()
+    replacement_sections = replacement["sections"]
+    assert isinstance(replacement_sections, list)
+    replacement_sections[0] = {
+        "section_id": "lore",
+        "claims": [
+            {
+                "claim": "The beacon is cold.",
+                "evidence_quote": "The beacon is cold.",
+                "entity_anchors": [
+                    {
+                        "entity_type": "object",
+                        "entity_key": "beacon",
+                        "display_name": "the beacon",
+                    }
+                ],
+                "fact_type": "state",
+                "authority": "canonical",
+                "temporal_status": "current_at_scenario_start",
+                "reveal_policy": "open",
+                "known_by": [],
+            }
+        ],
+    }
+    provider.structured_output = replacement
+
+    regenerated = asyncio.run(
+        compiler.compile(scenario_type="full_roleplay", content=edited)
+    )
+
+    assert not scenario_canon_is_current(edited)
+    assert scenario_canon_is_current(regenerated)
+    assert [claim.claim for claim in scenario_canon_claims(regenerated)] == [
+        "The beacon is cold."
+    ]
+    assert len(provider.structured_output_requests) == 2
+
+
+def test_stored_claims_are_rejected_when_provenance_is_tampered() -> None:
+    provider = FakeProviderClient(structured_output=_output())
+    compiled = asyncio.run(
+        ScenarioCanonCompiler(
+            provider=provider,
+            provider_name="fake",
+            model_id="canon-model",
+        ).compile(
+            scenario_type="full_roleplay",
+            content={"lore": "The beacon consumes one memory per use. "
+            "The keeper suspects the lens is alive."},
+        )
+    )
+    payload = compiled[CANON_CONTENT_KEY]
+    assert isinstance(payload, dict)
+    claims = payload["claims"]
+    assert isinstance(claims, list)
+    assert isinstance(claims[0], dict)
+    claims[0]["evidence_quote"] = "This never appeared in the source."
+
+    assert not scenario_canon_is_current(compiled)
+    assert scenario_canon_claims(compiled) == ()
 
 
 def test_compiler_rejects_claim_without_exact_source_evidence() -> None:

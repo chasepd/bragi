@@ -47,7 +47,10 @@ from bragi.services.knowledge_boundary import (
 )
 from bragi.services.mention_matching import character_name_is_mentioned
 from bragi.services.open_threads import is_open_threads_aggregate_key
-from bragi.services.scenario_canon import scenario_canon_claims
+from bragi.services.scenario_canon import (
+    scenario_canon_claims,
+    scenario_canon_is_current,
+)
 from bragi.services.summary_safety import validate_summary_output
 from bragi.world_time_model import format_world_time_from_snapshot
 
@@ -1148,6 +1151,8 @@ def scenario_claim_candidates(
     except json.JSONDecodeError:
         return ()
     if not isinstance(loaded, dict):
+        return ()
+    if not scenario_canon_is_current(loaded):
         return ()
     candidates: list[tuple[str, str, str, dict[str, object]]] = []
     for claim in scenario_canon_claims(loaded):

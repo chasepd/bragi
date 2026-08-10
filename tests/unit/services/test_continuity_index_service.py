@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
@@ -25,29 +27,40 @@ def repositories(tmp_path: Path) -> Iterator[PersistenceRepositories]:
 def test_continuity_index_syncs_atomic_facts_with_evidence_metadata(
     repositories: PersistenceRepositories,
 ) -> None:
+    lore = "The red lens was forged under the old tower."
+    source_sha256 = hashlib.sha256(lore.encode()).hexdigest()
+    source_digest = hashlib.sha256(
+        json.dumps({"lore": lore}, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
     scenario = repositories.create_scenario(
         type="full_roleplay",
         title="Ashfall Keep",
         premise="A border keep is cut off by ash storms.",
         player_role="Signal warden",
         content={
-            "lore": "The red lens was forged under the old tower.",
+            "lore": lore,
             "_canon_claims": {
                 "version": 1,
-                "source_digest": "fixture",
+                "source_digest": source_digest,
                 "provider": "fake",
                 "model": "canon",
                 "claims": [
                     {
                         "claim_key": "lens-forged",
                         "source_section": "lore",
-                        "source_sha256": "fixture",
+                        "source_sha256": source_sha256,
                         "claim": "The red lens was forged under the old tower.",
                         "evidence_quote": (
                             "The red lens was forged under the old tower."
                         ),
-                        "entity_anchors": [],
-                        "fact_type": "historical",
+                        "entity_anchors": [
+                            {
+                                "entity_type": "object",
+                                "entity_key": "red-lens",
+                                "display_name": "the red lens",
+                            }
+                        ],
+                        "fact_type": "event",
                         "authority": "canonical",
                         "temporal_status": "historical",
                         "reveal_policy": "open",

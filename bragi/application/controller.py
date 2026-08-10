@@ -197,7 +197,10 @@ from bragi.services.scenario_bundle_service import (
     ScenarioBundlePreview,
     ScenarioBundleService,
 )
-from bragi.services.scenario_canon import ScenarioCanonCompiler
+from bragi.services.scenario_canon import (
+    ScenarioCanonCompiler,
+    scenario_canon_source_sections,
+)
 from bragi.services.scenario_content_rating import (
     metadata_with_scenario_content_ratings,
     scenario_content_rating,
@@ -1758,31 +1761,29 @@ class BragiRuntime:
         scenario_type: str,
         content: Mapping[str, object],
     ) -> dict[str, object]:
+        if not scenario_canon_source_sections(content):
+            return dict(content)
         preference = _context_update_preference_for_scenario_type(
             repositories=self.repositories,
             scenario_type=scenario_type,
         )
         if preference is None:
-            return dict(content)
+            raise ValueError(
+                "A Context Update model is required to compile scenario canon"
+            )
         provider: object = self.providers.get(preference.provider)
         if not isinstance(provider, StructuredOutputProvider):
-            return dict(content)
-        try:
-            return await ScenarioCanonCompiler(
-                provider=provider,
-                provider_name=preference.provider,
-                model_id=preference.model_id,
-            ).compile(
-                scenario_type=scenario_type,
-                content=content,
+            raise ValueError(
+                "The Context Update provider must support structured output"
             )
-        except ValueError as exc:
-            # Existing installations may have a Context Update fake or legacy
-            # provider that predates canon compilation. Preserve scenario writes;
-            # retrieval will not index broad prose while compilation is absent.
-            if "did not return sections" in str(exc):
-                return dict(content)
-            raise
+        return await ScenarioCanonCompiler(
+            provider=provider,
+            provider_name=preference.provider,
+            model_id=preference.model_id,
+        ).compile(
+            scenario_type=scenario_type,
+            content=content,
+        )
 
     def create_manual_scenario(
         self,

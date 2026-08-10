@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 from collections.abc import Callable, Iterator
@@ -3022,6 +3023,13 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
 ) -> None:
     selected_section = "The east tower lens is cracked but still catches dawn light."
     unselected_section = "The pantry guild argues about salted turnips."
+    source_sections = {
+        "factions": unselected_section,
+        "locations": selected_section,
+    }
+    source_digest = hashlib.sha256(
+        json.dumps(source_sections, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
     scenario = repositories.create_scenario(
         type="full_roleplay",
         title="Ashfall Keep",
@@ -3032,17 +3040,25 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
             "factions": unselected_section,
             "_canon_claims": {
                 "version": 1,
-                "source_digest": "fixture",
+                "source_digest": source_digest,
                 "provider": "fake",
                 "model": "canon",
                 "claims": [
                     {
                         "claim_key": "east-lens",
                         "source_section": "locations",
-                        "source_sha256": "fixture",
+                        "source_sha256": hashlib.sha256(
+                            selected_section.encode()
+                        ).hexdigest(),
                         "claim": selected_section,
                         "evidence_quote": selected_section,
-                        "entity_anchors": [],
+                        "entity_anchors": [
+                            {
+                                "entity_type": "object",
+                                "entity_key": "east-tower-lens",
+                                "display_name": "the east tower lens",
+                            }
+                        ],
                         "fact_type": "state",
                         "authority": "canonical",
                         "temporal_status": "current_at_scenario_start",
@@ -3053,10 +3069,18 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
                     {
                         "claim_key": "pantry-guild",
                         "source_section": "factions",
-                        "source_sha256": "fixture",
+                        "source_sha256": hashlib.sha256(
+                            unselected_section.encode()
+                        ).hexdigest(),
                         "claim": unselected_section,
                         "evidence_quote": unselected_section,
-                        "entity_anchors": [],
+                        "entity_anchors": [
+                            {
+                                "entity_type": "faction",
+                                "entity_key": "pantry-guild",
+                                "display_name": "the pantry guild",
+                            }
+                        ],
                         "fact_type": "relationship",
                         "authority": "canonical",
                         "temporal_status": "durable",
@@ -3970,7 +3994,7 @@ def test_context_search_offers_continuity_floor_when_index_has_no_hits(
         premise="An expedition crosses the white shelf.",
         player_role="Scout",
         content={
-            "route_options": "The lower pass is blocked by glass ice.",
+            "starting_scene": "The lower pass is blocked by glass ice.",
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="White Shelf")
