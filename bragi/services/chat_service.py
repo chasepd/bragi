@@ -356,6 +356,7 @@ POST_TURN_JOB_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "director": ("time_reconciliation",),
     "scenario": (),
     "context_precompute": (
+        "summary",
         "context",
         "time_reconciliation",
         "proactive_text",

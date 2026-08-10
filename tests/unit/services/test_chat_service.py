@@ -13367,6 +13367,7 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         "director": ["time_reconciliation"],
         "scenario": [],
         "context_precompute": [
+            "summary",
             "context",
             "time_reconciliation",
             "proactive_text",
