@@ -2618,6 +2618,252 @@ def test_narrator_planner_returns_message_spec_from_structured_output() -> None:
     assert "candidate only" in brief
 
 
+def test_planner_prompt_instructs_batched_intents_and_knowledge_candidates() -> None:
+    request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(ChatMessage(role="player", body="What do I see?"),),
+    )
+
+    messages = agentic_context_module._planner_messages(request)
+
+    system_body = messages[0].body
+    assert "npc_intents is the single batched intent artifact" in system_body
+    assert "present or entering non-player character" in system_body
+    assert "scene_presence state commit candidate" in system_body
+    assert "value.action" in system_body
+    assert "character_learned_memory or character_knowledge_edge" in system_body
+    assert "uncommitted until verified" in system_body
+    assert "never invent target ids" in system_body
+
+
+def test_narrator_planner_rejects_malformed_candidate_value_shapes(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player_message = repositories.list_messages(save.id)[0]
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="Keep it grounded while I climb toward the beacon lens.",
+    )
+    lio = repositories.add_character(save_id=save.id, name="Lio", met=True)
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_plan": {
+                "intent": "Answer the player move.",
+                "thesis": "The scene settles.",
+                "narrative_beats": [],
+                "required_facts": [],
+                "must_say": [],
+                "avoid": [],
+                "agency_constraints": [],
+                "tone": "grounded",
+                "uncertainties": [],
+                "evidence_source_ids": [f"message:{player_message.id}"],
+                "npc_intents": [],
+                "state_commit_candidates": [
+                    {
+                        "candidate_id": "presence:bad-action",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "teleport"},
+                        "character_id": lio.id,
+                        "reason": "Bad action.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "memory:no-body",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "value": {},
+                        "character_id": lio.id,
+                        "reason": "No body.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "memory:bad-knowledge-state",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "value": {
+                            "body": "Lio observed the lens.",
+                            "knowledge_state": "observed",
+                        },
+                        "character_id": lio.id,
+                        "reason": "Bad knowledge state.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "memory:bad-acquisition",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "value": {
+                            "body": "Lio learned the plan.",
+                            "acquisition_method": "guessed",
+                        },
+                        "character_id": lio.id,
+                        "reason": "Bad acquisition method.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "presence:stay-without-present",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "stay"},
+                        "character_id": lio.id,
+                        "reason": "Stay needs a present flag.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": f"scene_presence:{lio.id}:leave",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "enter"},
+                        "character_id": lio.id,
+                        "reason": "The id suffix contradicts the action.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "presence:no-character",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "enter"},
+                        "character_id": "",
+                        "reason": "Missing character id.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "knowledge:missing-target-id",
+                        "candidate_type": "character_knowledge_edge",
+                        "operation": "upsert",
+                        "state_key": "character.knowledge_edge",
+                        "value": {"target_type": "memory"},
+                        "character_id": lio.id,
+                        "reason": "Missing target id.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "knowledge:bad-acquisition",
+                        "candidate_type": "character_knowledge_edge",
+                        "operation": "upsert",
+                        "state_key": "character.knowledge_edge",
+                        "value": {
+                            "target_type": "memory",
+                            "target_id": "memory:any",
+                            "acquisition_method": "guessed",
+                        },
+                        "character_id": lio.id,
+                        "reason": "Bad acquisition method.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "presence:valid",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "enter"},
+                        "character_id": lio.id,
+                        "reason": "Lio enters.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                ],
+            }
+        }
+    )
+    planner = StructuredProviderNarratorPlanner(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="planner",
+        repositories=repositories,
+    )
+    request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(ChatMessage(role="player", body=player_message.body),),
+        context_breakdown={
+            "sources": [
+                {
+                    "source_type": "message",
+                    "source_id": player_message.id,
+                    "included": True,
+                },
+                {
+                    "source_type": "character",
+                    "source_id": lio.id,
+                    "included": True,
+                },
+            ]
+        },
+    )
+
+    spec = asyncio.run(planner.plan(save_id=save.id, request=request))
+
+    assert {
+        (rejection.candidate_id, rejection.reason)
+        for rejection in spec.planner_rejections
+    } == {
+        ("presence:bad-action", "unsupported_scene_presence_action"),
+        ("memory:no-body", "missing_memory_body"),
+        ("memory:bad-knowledge-state", "unknown_knowledge_state"),
+        ("memory:bad-acquisition", "unknown_acquisition_method"),
+        ("presence:stay-without-present", "missing_scene_presence_present"),
+        (f"scene_presence:{lio.id}:leave", "scene_presence_id_action_mismatch"),
+        ("presence:no-character", "missing_character_id"),
+        ("knowledge:missing-target-id", "missing_knowledge_edge_target"),
+        ("knowledge:bad-acquisition", "unknown_acquisition_method"),
+    }
+    assert [candidate.candidate_id for candidate in spec.state_commit_candidates] == [
+        "presence:valid"
+    ]
+
+
 def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -4589,7 +4589,7 @@ def test_submit_player_turn_commits_rendered_planned_scene_presence(
     result = asyncio.run(
         service.submit_player_turn(
             save_id=save.id,
-            body="I ask who should fetch the map.",
+            body="I ask whether Lio should fetch the map.",
             speaker_name="Ily",
             run_post_turn_jobs=False,
         )
@@ -4665,7 +4665,7 @@ def test_submit_player_turn_skips_scene_presence_with_ungrounded_evidence(
             ),
         ).submit_player_turn(
             save_id=save.id,
-            body="I ask who should fetch the map.",
+            body="I ask whether Lio should leave.",
             speaker_name="Ily",
             run_post_turn_jobs=False,
         )
@@ -5475,8 +5475,6 @@ def test_character_assessment_scene_presence_candidate_uses_presence_evidence(
                     character_name="Mara",
                     present=True,
                     enters_scene=True,
-                    action="Mara checks the corridor.",
-                    intent="inspect the corridor",
                     reason="Mara enters only if presence evidence is grounded.",
                     confidence=0.84,
                     evidence_source_ids=("message:intent",),
@@ -5493,6 +5491,305 @@ def test_character_assessment_scene_presence_candidate_uses_presence_evidence(
     assert candidates[0].evidence_source_ids == ("message:presence",)
     assert candidates[0].evidence_quote == "presence quote"
     assert candidates[0].value["evidence_quote"] == "presence quote"
+
+
+def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
+    assessment_candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={
+            "action": "leave",
+            "character_name": "Mara",
+            "evidence_quote": "presence quote",
+        },
+        reason="Mara may leave.",
+        confidence=0.9,
+        evidence_source_ids=("message:presence",),
+        evidence_quote="presence quote",
+        candidate_id="scene_presence:mara:leave",
+        candidate_type="scene_presence",
+        character_id="mara",
+    )
+    model_duplicate = replace(
+        assessment_candidate,
+        value={"action": "leave"},
+        reason="Model-authored duplicate candidate.",
+    )
+    model_conflicting = replace(
+        assessment_candidate,
+        candidate_id="scene_presence:mara:enter",
+        value={"action": "enter"},
+        reason="Model-authored conflicting candidate.",
+    )
+    model_other_character = replace(
+        assessment_candidate,
+        character_id="lio",
+        candidate_id="scene_presence:lio:enter",
+        value={"action": "enter"},
+        reason="Model-authored candidate for a different character.",
+    )
+    model_deterministic_present = replace(
+        assessment_candidate,
+        character_id="ren",
+        candidate_id="scene_presence:ren:leave",
+        value={"action": "leave"},
+        reason=(
+            "Model-authored candidate for an assessed character "
+            "without a candidate."
+        ),
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Mara leaves if rendered.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(
+            model_duplicate,
+            model_conflicting,
+            model_other_character,
+            model_deterministic_present,
+        ),
+    )
+
+    merged = chat_service_module._narrator_spec_with_commit_candidates(
+        spec,
+        (assessment_candidate,),
+    )
+
+    assert merged is not None
+    assert merged.state_commit_candidates == (
+        model_other_character,
+        model_deterministic_present,
+        assessment_candidate,
+    )
+    assert {
+        (rejection.candidate_id, rejection.reason)
+        for rejection in merged.planner_rejections
+    } == {
+        ("scene_presence:mara:leave", "superseded_by_assessment"),
+        ("scene_presence:mara:enter", "superseded_by_assessment"),
+    }
+
+
+def test_narrator_spec_keeps_model_candidate_for_character_without_candidate(
+    repositories: PersistenceRepositories,
+) -> None:
+    model_candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={"action": "leave", "character_name": "Ren"},
+        reason="Model candidate for an assessed character without a candidate.",
+        confidence=0.9,
+        evidence_source_ids=("message:source",),
+        evidence_quote="Ren leaves.",
+        candidate_id="scene_presence:ren:leave",
+        candidate_type="scene_presence",
+        character_id="ren",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Ren stays present.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(model_candidate,),
+    )
+
+    merged = chat_service_module._narrator_spec_with_commit_candidates(
+        spec,
+        (),
+    )
+
+    assert merged is not None
+    assert merged.state_commit_candidates == (model_candidate,)
+    assert merged.planner_rejections == ()
+
+
+def test_narrator_spec_keeps_model_candidate_for_ungrounded_assessment(
+    repositories: PersistenceRepositories,
+) -> None:
+    assessment_candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={
+            "action": "leave",
+            "character_name": "Mara",
+            "evidence_quote": "presence quote",
+        },
+        reason="Mara may leave.",
+        confidence=0.9,
+        evidence_source_ids=("message:presence",),
+        evidence_quote="presence quote",
+        candidate_id="scene_presence:mara:leave",
+        candidate_type="scene_presence",
+        character_id="mara",
+    )
+    model_candidate = replace(
+        assessment_candidate,
+        character_id="ren",
+        candidate_id="scene_presence:ren:leave",
+        value={"action": "leave"},
+        reason="Model candidate for an ungrounded assessment character.",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Ren leaves if rendered.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(model_candidate,),
+    )
+
+    merged = chat_service_module._narrator_spec_with_commit_candidates(
+        spec,
+        (assessment_candidate,),
+    )
+
+    assert merged is not None
+    assert merged.state_commit_candidates == (
+        model_candidate,
+        assessment_candidate,
+    )
+    assert merged.planner_rejections == ()
+
+
+def test_planned_learned_memory_candidate_skips_invalid_knowledge_metadata(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    candidate = StateCommitCandidate(
+        operation="create",
+        state_key="character.learned_memory",
+        value={
+            "body": "Mara learned the lens phrase.",
+            "knowledge_state": "observed",
+        },
+        reason="The planner offered a bad knowledge state.",
+        confidence=0.9,
+        evidence_source_ids=("message:source",),
+        evidence_quote="the lens phrase",
+        candidate_id="memory:mara:0",
+        candidate_type="character_learned_memory",
+        character_id=mara.id,
+    )
+
+    status, reason, changed = (
+        chat_service_module._apply_character_learned_memory_candidate(
+            repositories=repositories,
+            save_id=save.id,
+            player_message_id="message:player",
+            narrator_message_id="message:narrator",
+            candidate=candidate,
+            evidence_source_text_by_id={"message:source": "the lens phrase"},
+        )
+    )
+
+    assert status == "skipped"
+    assert reason == "unknown_knowledge_state"
+    assert changed is False
+    assert repositories.list_memories(save.id) == []
+
+
+def test_planned_commit_grounding_accepts_planning_scene_text(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    snapshot = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara waits by the beacon controls.",
+        present_character_ids=[mara.id],
+    )
+    assert snapshot is not None
+    candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={
+            "action": "leave",
+            "character_name": "Mara",
+            "evidence_quote": mara.id,
+        },
+        reason="Mara may leave.",
+        confidence=0.9,
+        evidence_source_ids=(f"scene_snapshot:{snapshot.id}",),
+        evidence_quote=mara.id,
+        candidate_id="scene_presence:mara:leave",
+        candidate_type="scene_presence",
+        character_id=mara.id,
+    )
+
+    situation_quote_candidate = replace(
+        candidate,
+        evidence_source_ids=(f"scene_snapshot:{snapshot.id}",),
+        evidence_quote="Mara waits by the beacon controls.",
+    )
+    grounded_via_inventory = chat_service_module._planned_commit_evidence_is_grounded(
+        repositories=repositories,
+        save_id=save.id,
+        player_message_id="message:player",
+        narrator_message_id="message:narrator",
+        candidate=situation_quote_candidate,
+        evidence_source_text_by_id={
+            f"scene_snapshot:{snapshot.id}": (
+                "Scene snapshot: situation: Mara waits by the beacon controls."
+            )
+        },
+    )
+    assert grounded_via_inventory is True
+
+    grounded_via_ids_line_fallback = (
+        chat_service_module._planned_commit_evidence_is_grounded(
+            repositories=repositories,
+            save_id=save.id,
+            player_message_id="message:player",
+            narrator_message_id="message:narrator",
+            candidate=candidate,
+            evidence_source_text_by_id={
+                f"scene_snapshot:{snapshot.id}": (
+                    "Scene snapshot: situation: Mara waits by the beacon controls."
+                )
+            },
+        )
+    )
+    assert grounded_via_ids_line_fallback is True
+
+    grounded_without_inventory_key = (
+        chat_service_module._planned_commit_evidence_is_grounded(
+            repositories=repositories,
+            save_id=save.id,
+            player_message_id="message:player",
+            narrator_message_id="message:narrator",
+            candidate=candidate,
+            evidence_source_text_by_id={},
+        )
+    )
+    assert grounded_without_inventory_key is True
 
 
 def test_submit_player_turn_queues_verified_learned_memory_when_confirmation_enabled(
@@ -17061,7 +17358,7 @@ def test_submit_player_turn_runs_character_action_planning_before_prompt(
                 "intent": "",
                 "reason": "Lio is not in the gallery.",
                 "confidence": 0.8,
-                "evidence_source_ids": ["character:lio"],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
         },
     )
@@ -17097,14 +17394,16 @@ def test_submit_player_turn_runs_character_action_planning_before_prompt(
     request = provider.chat_requests[0]
     assert provider.events == [
         "character_presence_assessment",
-        "character_intent_plan",
         "chat",
     ]
     assert request.character_action_plans == (
         "[character_action:"
-        f"{mara.id}] Mara | intent: protect the lens crew | next action: "
-        "Mara lowers the lantern and listens for the reply. | reason: Mara is "
-        "in the current scene by the controls. | confidence: 90% | evidence: "
+        f"{lio.id}] Archivist Lio | present: no | reason: Lio is not in the "
+        "gallery. | confidence: 80% | evidence: "
+        f"scene_snapshot:{original_snapshot.id}",
+        "[character_action:"
+        f"{mara.id}] Mara | present: yes | reason: Mara is in the current "
+        "scene by the controls. | confidence: 90% | evidence: "
         f"scene_snapshot:{original_snapshot.id}",
     )
     current_snapshot = repositories.get_scene_snapshot(save.id)
@@ -17258,6 +17557,7 @@ def test_submit_player_turn_overlaps_plan_first_character_planning_and_context(
             save_id: str,
             player_message_id: str,
             apply_presence_updates: bool = True,
+            intents_absorbed: bool = True,
         ) -> CharacterActionPlanningResult:
             self.apply_presence_updates.append(apply_presence_updates)
             planning_started.set()
@@ -17338,6 +17638,7 @@ def test_storyteller_character_planning_never_applies_direction_presence(
             save_id: str,
             player_message_id: str,
             apply_presence_updates: bool = True,
+            intents_absorbed: bool = True,
         ) -> CharacterActionPlanningResult:
             self.apply_presence_updates.append(apply_presence_updates)
             return CharacterActionPlanningResult(skipped_reason="test")
@@ -17359,7 +17660,7 @@ def test_storyteller_character_planning_never_applies_direction_presence(
     assert planner.apply_presence_updates == [False]
 
 
-def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
+def test_submit_player_turn_feeds_presence_assessments_to_planner(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -17387,12 +17688,6 @@ def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
         situation="Mara waits beside the beacon controls.",
         present_character_ids=[mara.id],
     )
-    memory = repositories.add_memory(
-        save_id=save.id,
-        body="The beacon lens answers to ember dawn.",
-        tags=["beacon"],
-        memory_id="memory-beacon-key",
-    )
     repositories.set_app_setting(CHARACTER_ACTION_PLANNING_ENABLED_SETTING, True)
     repositories.set_model_preference(
         task="chat",
@@ -17415,38 +17710,11 @@ def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara pockets the phrase and watches the lens.",
-                "intent": "remember the beacon phrase",
-                "reason": "The player directly tells Mara the phrase.",
+                "enters_scene": False,
+                "leaves_scene": False,
+                "reason": "The player directly addresses Mara.",
                 "confidence": 0.89,
                 "evidence_source_ids": ["message:latest"],
-                "learned_memory_candidates": [
-                    {
-                        "body": "Mara learned that ember dawn wakes the beacon lens.",
-                        "tags": ["mara", "beacon"],
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "The player told Mara directly.",
-                        "confidence": 0.87,
-                        "evidence_source_ids": ["message:latest"],
-                        "evidence_quote": "ember dawn wakes the beacon lens",
-                    }
-                ],
-                "knowledge_edge_candidates": [
-                    {
-                        "target_type": "memory",
-                        "target_id": memory.id,
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "The source message teaches this memory.",
-                        "confidence": 0.84,
-                        "evidence_source_ids": ["message:latest"],
-                        "evidence_quote": "ember dawn",
-                    }
-                ],
-                "needs_review_notes": [
-                    "Review before making Mara's learned phrase durable."
-                ],
             }
         },
     )
@@ -17478,20 +17746,9 @@ def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
 
     assert len(planner.calls) == 1
     assessment_text = "\n".join(planner.calls[0][1].character_action_plans)
-    assert "Mara pockets the phrase and watches the lens." in assessment_text
-    assert "learned memory candidate (do not persist automatically)" in (
-        assessment_text
-    )
-    assert "Mara learned that ember dawn wakes the beacon lens." in assessment_text
-    assert "knowledge edge candidate (do not persist automatically)" in (
-        assessment_text
-    )
-    assert "target: memory:memory-beacon-key" in assessment_text
-    assert "Review before making Mara's learned phrase durable." in assessment_text
-    assert [record.id for record in repositories.list_memories(save.id)] == [
-        memory.id
-    ]
-    assert repositories.list_character_knowledge_edges(save.id) == []
+    assert "present: yes" in assessment_text
+    assert "reason: The player directly addresses Mara." in assessment_text
+    assert "The player directly addresses Mara." in assessment_text
 
 
 def test_submit_player_turn_does_not_run_director_pressure_before_prompt(
@@ -17671,6 +17928,10 @@ def test_submit_player_turn_skips_character_action_planning_when_disabled(
         "prompt_guidance_count": 0,
         "skipped_reason": "disabled",
         "applied_presence_update": False,
+        "model_calls_avoided": 0,
+        "presence_calls_made": 0,
+        "deterministic_presence_count": 0,
+        "intents_absorbed": False,
     }
 
 
@@ -17742,15 +18003,13 @@ def test_submit_timeskip_turn_runs_character_action_planning(
 
     assert provider.events == [
         "character_presence_assessment",
-        "character_intent_plan",
         "chat",
     ]
     request = provider.chat_requests[0]
     assert len(request.character_action_plans) == 1
     assert request.character_action_plans[0].startswith(
         "[character_action:"
-        f"{mara.id}] Mara | intent: protect the signal | next action: "
-        "Mara shields the lantern as dawn breaks. | reason: The timeskip "
+        f"{mara.id}] Mara | present: yes | reason: The timeskip "
         "keeps Mara at the beacon. | confidence: 85% | evidence: message:"
     )
     snapshot = repositories.get_scene_snapshot(save.id)

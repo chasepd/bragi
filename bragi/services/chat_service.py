@@ -84,6 +84,7 @@ from bragi.services.character_action_planning_service import (
     character_action_planning_enabled,
     character_turn_assessment_has_prompt_guidance,
     format_character_turn_assessment,
+    planning_scene_text,
 )
 from bragi.services.character_registry_maintenance_service import (
     CharacterRegistryMaintenanceService,
@@ -140,7 +141,10 @@ from bragi.services.director_pressure_service import (
     DirectorPressureService,
     director_pressure_enabled,
 )
-from bragi.services.evidence import quote_matches_source
+from bragi.services.evidence import (
+    invalid_knowledge_metadata_field,
+    quote_matches_source,
+)
 from bragi.services.generation_settings import (
     DEFAULT_CHAT_MAX_OUTPUT_TOKENS,
     chat_generation_settings,
@@ -804,6 +808,7 @@ class CharacterActionPlanningRunner(Protocol):
         save_id: str,
         player_message_id: str,
         apply_presence_updates: bool = True,
+        intents_absorbed: bool = True,
     ) -> CharacterActionPlanningResult: ...
 
 
@@ -1729,11 +1734,14 @@ class ChatService:
                 save_id=save_id,
                 started_at=stage_started,
                 player_message_id=player_message.id,
-                plan_count=len(result.plans),
                 decision_count=len(result.decisions),
                 failed_count=len(result.failed_character_ids),
                 skipped_reason=result.skipped_reason,
                 applied_presence_update=result.applied_presence_update,
+                model_calls_avoided=result.model_calls_avoided,
+                presence_calls_made=result.presence_calls_made,
+                deterministic_presence_count=result.deterministic_presence_count,
+                intents_absorbed=result.intents_absorbed,
             )
             throw_if_cancelled_after_job()
             return result
@@ -5586,6 +5594,7 @@ class ChatService:
                         save_id=save_id,
                     )
                 ),
+                intents_absorbed=self._narrator_planner_available(save_id),
             )
         except Exception as exc:
             log_error_event(
@@ -6190,6 +6199,23 @@ class ChatService:
             retry_body=subsequent.retry_body or retry_body,
             npc_audit_result=npc_audit_result,
             verification_result=subsequent.verification_result,
+        )
+
+    def _narrator_planner_available(self, save_id: str) -> bool:
+        preference = roleplay_model_preference(
+            repositories=self.repositories,
+            save_id=save_id,
+            purpose="response_planning",
+        )
+        if preference is None:
+            return False
+        provider = self.providers.get(preference.provider)
+        if not isinstance(cast(object, provider), StructuredOutputProvider):
+            return False
+        return _model_supports_structured_output(
+            repositories=self.repositories,
+            provider=preference.provider,
+            model_id=preference.model_id,
         )
 
     def _narrator_planner_for_save(
@@ -7708,21 +7734,56 @@ def _narrator_spec_with_commit_candidates(
     spec: NarratorMessageSpec | None,
     candidates: tuple[StateCommitCandidate, ...],
 ) -> NarratorMessageSpec | None:
-    if spec is None or not candidates:
+    if spec is None:
         return spec
-    existing_ids = {
+    assessment_candidate_ids = {
         candidate.candidate_id
-        for candidate in spec.state_commit_candidates
+        for candidate in candidates
         if candidate.candidate_id
     }
-    merged = list(spec.state_commit_candidates)
-    for candidate in candidates:
-        if candidate.candidate_id and candidate.candidate_id in existing_ids:
-            continue
-        merged.append(candidate)
-        if candidate.candidate_id:
-            existing_ids.add(candidate.candidate_id)
-    return replace(spec, state_commit_candidates=tuple(merged))
+    authoritative_scene_presence_character_ids = {
+        candidate.character_id
+        for candidate in candidates
+        if candidate.candidate_type == "scene_presence"
+        and candidate.character_id
+    }
+    merged = [
+        candidate
+        for candidate in spec.state_commit_candidates
+        if not (
+            candidate.candidate_id
+            and candidate.candidate_id in assessment_candidate_ids
+        )
+        and not (
+            candidate.candidate_type == "scene_presence"
+            and candidate.character_id
+            and candidate.character_id
+            in authoritative_scene_presence_character_ids
+        )
+    ]
+    superseded = [
+        candidate
+        for candidate in spec.state_commit_candidates
+        if candidate not in merged
+    ]
+    rejections = list(spec.planner_rejections)
+    rejections.extend(
+        PlannerRejection(
+            candidate_id=candidate.candidate_id,
+            candidate_type=candidate.candidate_type or "unknown",
+            domain=_planned_commit_domain(candidate.candidate_type),
+            reason="superseded_by_assessment",
+            field="candidate_id",
+            rejected_value=candidate.candidate_id,
+        )
+        for candidate in superseded
+    )
+    merged.extend(candidates)
+    return replace(
+        spec,
+        state_commit_candidates=tuple(merged),
+        planner_rejections=tuple(rejections),
+    )
 
 
 def _character_assessment_commit_candidates(
@@ -7749,6 +7810,10 @@ def _character_assessment_commit_candidates(
                 not current_present and assessment.present
             ):
                 action = "enter"
+            if (action == "leave" and not current_present) or (
+                action == "enter" and current_present
+            ):
+                action = ""
             presence_evidence_source_ids = assessment.presence_evidence_source_ids
             presence_evidence_quote = assessment.presence_evidence_quote
             if (
@@ -7778,71 +7843,6 @@ def _character_assessment_commit_candidates(
                         character_id=assessment.character_id,
                     )
                 )
-        for index, candidate in enumerate(
-            assessment.learned_memory_candidates,
-            start=1,
-        ):
-            if (
-                not candidate.evidence_source_ids
-                or not candidate.evidence_quote.strip()
-            ):
-                continue
-            candidates.append(
-                StateCommitCandidate(
-                    operation="create",
-                    state_key="character.learned_memory",
-                    value={
-                        "body": candidate.body,
-                        "tags": list(candidate.tags),
-                        "knowledge_state": candidate.knowledge_state,
-                        "acquisition_method": candidate.acquisition_method,
-                        "evidence_quote": candidate.evidence_quote,
-                    },
-                    reason=candidate.reason,
-                    confidence=candidate.confidence,
-                    evidence_source_ids=candidate.evidence_source_ids,
-                    evidence_quote=candidate.evidence_quote,
-                    candidate_id=(
-                        "character_learned_memory:"
-                        f"{assessment.character_id}:{index}"
-                    ),
-                    candidate_type="character_learned_memory",
-                    character_id=assessment.character_id,
-                )
-            )
-        for edge_candidate in assessment.knowledge_edge_candidates:
-            if (
-                not edge_candidate.evidence_source_ids
-                or not edge_candidate.evidence_quote.strip()
-            ):
-                continue
-            candidates.append(
-                StateCommitCandidate(
-                    operation="upsert",
-                    state_key="character.knowledge_edge",
-                    value={
-                        "target_type": edge_candidate.target_type,
-                        "target_id": edge_candidate.target_id,
-                        "knowledge_state": edge_candidate.knowledge_state,
-                        "acquisition_method": edge_candidate.acquisition_method,
-                        "evidence_quote": edge_candidate.evidence_quote,
-                    },
-                    reason=edge_candidate.reason,
-                    confidence=edge_candidate.confidence,
-                    evidence_source_ids=edge_candidate.evidence_source_ids,
-                    evidence_quote=edge_candidate.evidence_quote,
-                    candidate_id=(
-                        "character_knowledge_edge:"
-                        f"{assessment.character_id}:"
-                        f"{edge_candidate.target_type}:{edge_candidate.target_id}"
-                    ),
-                    candidate_type="character_knowledge_edge",
-                    character_id=assessment.character_id,
-                    target_type=edge_candidate.target_type,
-                    target_id=edge_candidate.target_id,
-                    safe_without_narration_allowed=True,
-                )
-            )
     return tuple(candidates)
 
 
@@ -8679,6 +8679,20 @@ def _apply_scene_snapshot_field_candidate(
     return "committed", "applied_scene_snapshot_field", changed
 
 
+def _planned_knowledge_metadata_skip_reason(
+    value: Mapping[str, object],
+) -> str:
+    invalid_field = invalid_knowledge_metadata_field(
+        knowledge_state=_string_mapping_value(value, "knowledge_state"),
+        acquisition_method=_string_mapping_value(value, "acquisition_method"),
+    )
+    if invalid_field == "knowledge_state":
+        return "unknown_knowledge_state"
+    if invalid_field == "acquisition_method":
+        return "unknown_acquisition_method"
+    return ""
+
+
 def _apply_character_learned_memory_candidate(
     *,
     repositories: PersistenceRepositories,
@@ -8735,6 +8749,9 @@ def _apply_character_learned_memory_candidate(
         or "unknown",
         "evidence_quote": evidence_quote,
     }
+    knowledge_skip_reason = _planned_knowledge_metadata_skip_reason(proposed_value)
+    if knowledge_skip_reason:
+        return "skipped", knowledge_skip_reason, False
     if manual_memory_confirmation_enabled(repositories, save_id=save_id):
         suggestion = repositories.add_context_update_suggestion(
             save_id=save_id,
@@ -8836,6 +8853,14 @@ def _apply_character_knowledge_edge_candidate(
     acquisition_method = (
         _string_mapping_value(candidate.value, "acquisition_method") or "unknown"
     )
+    knowledge_skip_reason = _planned_knowledge_metadata_skip_reason(
+        {
+            "knowledge_state": knowledge_state,
+            "acquisition_method": acquisition_method,
+        }
+    )
+    if knowledge_skip_reason:
+        return "skipped", knowledge_skip_reason, False
     if _knowledge_edge_requires_scene_grounding(
         knowledge_state=knowledge_state,
         acquisition_method=acquisition_method,
@@ -8885,25 +8910,41 @@ def _planned_commit_evidence_is_grounded(
     quote = _planned_commit_evidence_quote(candidate)
     if not candidate.evidence_source_ids or not quote:
         return False
-    message_ids = {player_message_id, narrator_message_id}
-    messages_by_id = {
-        message.id: message
-        for message in repositories.list_messages(save_id)
-        if message.id in message_ids
-    }
     source_text_by_id = dict(evidence_source_text_by_id)
-    player_message = messages_by_id.get(player_message_id)
+    planning_scene_text_value = ""
+    snapshot_id = ""
+    snapshot = repositories.get_scene_snapshot(save_id)
+    if snapshot is not None:
+        snapshot_id = snapshot.id
+        planning_scene_text_value = planning_scene_text(snapshot)
+
+    def matches(source_id: str) -> bool:
+        if (
+            source_id in source_text_by_id
+            and quote_matches_source(quote, source_text_by_id[source_id])
+        ):
+            return True
+        return bool(
+            snapshot_id
+            and source_id == f"scene_snapshot:{snapshot_id}"
+            and planning_scene_text_value
+            and quote_matches_source(quote, planning_scene_text_value)
+        )
+
+    player_message = repositories.get_message(
+        save_id=save_id,
+        message_id=player_message_id,
+    )
     if player_message is not None:
         source_text_by_id[f"message:{player_message_id}"] = player_message.body
-    narrator_message = messages_by_id.get(narrator_message_id)
+    narrator_message = repositories.get_message(
+        save_id=save_id,
+        message_id=narrator_message_id,
+    )
     if narrator_message is not None:
         source_text_by_id[f"message:{narrator_message_id}"] = narrator_message.body
         source_text_by_id["message:latest"] = narrator_message.body
-    return any(
-        source_id in source_text_by_id
-        and quote_matches_source(quote, source_text_by_id[source_id])
-        for source_id in candidate.evidence_source_ids
-    )
+    return any(matches(source_id) for source_id in candidate.evidence_source_ids)
 
 
 def _planned_commit_evidence_quote(candidate: StateCommitCandidate) -> str:
@@ -9848,6 +9889,10 @@ def _character_action_planning_context_breakdown(
             ),
             "skipped_reason": result.skipped_reason,
             "applied_presence_update": result.applied_presence_update,
+            "model_calls_avoided": result.model_calls_avoided,
+            "presence_calls_made": result.presence_calls_made,
+            "deterministic_presence_count": result.deterministic_presence_count,
+            "intents_absorbed": result.intents_absorbed,
         }
     }
 
@@ -10672,7 +10717,7 @@ def _absent_character_ids(
         and decision.presence_evidence_quote.strip()
         and not decision.present
         and not decision.enters_scene
-        and not decision.action
+        and not decision.leaves_scene
     )
 
 
