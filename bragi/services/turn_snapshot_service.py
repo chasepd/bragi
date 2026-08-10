@@ -1312,7 +1312,8 @@ class TurnSnapshotService:
             )
             for table_name in _SNAPSHOT_TABLE_NAMES
         }
-        pending: list[
+        pending: dict[
+            tuple[str, str],
             tuple[
                 _SnapshotTable,
                 str,
@@ -1320,8 +1321,8 @@ class TurnSnapshotService:
                 dict[str, object] | None,
                 sqlite3.Row | None,
                 str | None,
-            ]
-        ] = []
+            ],
+        ] = {}
         projected_inclusion: dict[tuple[str, str], bool] = {}
         dirty_keys = {
             (str(row["table_name"]), str(row["row_key"])) for row in dirty_rows
@@ -1336,41 +1337,60 @@ class TurnSnapshotService:
             previous: sqlite3.Row | None,
             recheck_at: str | None,
         ) -> None:
-            pending.append(
-                (
-                    table,
-                    row_key,
-                    snapshot_row,
-                    reference_row,
-                    previous,
-                    recheck_at,
-                )
+            key = (table.name, row_key)
+            pending[key] = (
+                table,
+                row_key,
+                snapshot_row,
+                reference_row,
+                previous,
+                recheck_at,
             )
             included = snapshot_row is not None
-            projected_inclusion[(table.name, row_key)] = included
-            if previous is not None and bool(previous["included"]) != included:
-                self._queue_snapshot_reference_dependents(
+            prior_included = projected_inclusion.get(
+                key,
+                bool(previous["included"]) if previous is not None else included,
+            )
+            projected_inclusion[key] = included
+            if prior_included != included:
+                dependent_keys = self._queue_snapshot_reference_dependents(
                     save_id=save_id,
                     target_table=table.name,
                     target_key=row_key,
                 )
-                for added in self.repositories.connection.execute(
+                for dependent_key in dependent_keys:
+                    added = self.repositories.connection.execute(
                     """
                     SELECT table_name, row_key, generation
                     FROM save_snapshot_dirty_rows
-                    WHERE save_id = ?
-                    ORDER BY generation, table_name, row_key
+                    WHERE save_id = ? AND table_name = ? AND row_key = ?
                     """,
-                    (save_id,),
-                ).fetchall():
+                        (save_id, *dependent_key),
+                    ).fetchone()
+                    if added is None:
+                        continue
                     key = (str(added["table_name"]), str(added["row_key"]))
-                    if key not in dirty_keys:
-                        dirty_keys.add(key)
-                        dirty_rows.append(added)
+                    dirty_keys.add(key)
+                    dirty_rows.append(added)
 
         while dirty_index < len(dirty_rows):
             dirty = dirty_rows[dirty_index]
             dirty_index += 1
+            aggregate_keys = self._queue_snapshot_aggregate_dependents(
+                save_id,
+                [dirty],
+            )
+            for aggregate_key in aggregate_keys:
+                added = self.repositories.connection.execute(
+                    """
+                    SELECT table_name, row_key, generation
+                    FROM save_snapshot_dirty_rows
+                    WHERE save_id = ? AND table_name = ? AND row_key = ?
+                    """,
+                    (save_id, *aggregate_key),
+                ).fetchone()
+                if added is not None:
+                    dirty_rows.append(added)
             table_name = str(dirty["table_name"])
             table = _TABLES_BY_NAME.get(table_name)
             if table is None:
@@ -1426,25 +1446,53 @@ class TurnSnapshotService:
                 table.name == "character_text_threads"
                 and row.get("kind") == "group"
             ):
-                participant_count = self.repositories.connection.execute(
+                participants = self.repositories.connection.execute(
                     """
-                    SELECT COUNT(*) FROM character_text_thread_participants
-                    WHERE save_id = ? AND thread_id = ?
+                    SELECT participants.id, COALESCE(state.included, 1) AS included
+                    FROM character_text_thread_participants participants
+                    LEFT JOIN save_snapshot_row_state state
+                      ON state.save_id = participants.save_id
+                     AND state.table_name = 'character_text_thread_participants'
+                     AND state.row_key = participants.id
+                    WHERE participants.save_id = ? AND participants.thread_id = ?
                     """,
                     (save_id, row_key),
-                ).fetchone()[0]
-                if int(participant_count) < 2:
+                ).fetchall()
+                participant_count = sum(
+                    projected_inclusion.get(
+                        ("character_text_thread_participants", str(participant["id"])),
+                        bool(participant["included"]),
+                    )
+                    for participant in participants
+                )
+                if participant_count < 2:
                     add_pending(table, row_key, None, raw_row, previous, None)
                     continue
             elif table.name == "narrator_phone_activity_cursors":
-                max_ordinal = self.repositories.connection.execute(
+                activities = self.repositories.connection.execute(
                     """
-                    SELECT COALESCE(MAX(ordinal), 0)
-                    FROM character_text_activity_events
-                    WHERE save_id = ?
+                    SELECT events.id, events.ordinal,
+                           COALESCE(state.included, 1) AS included
+                    FROM character_text_activity_events events
+                    LEFT JOIN save_snapshot_row_state state
+                      ON state.save_id = events.save_id
+                     AND state.table_name = 'character_text_activity_events'
+                     AND state.row_key = events.id
+                    WHERE events.save_id = ?
                     """,
                     (save_id,),
-                ).fetchone()[0]
+                ).fetchall()
+                max_ordinal = max(
+                    (
+                        int(activity["ordinal"])
+                        for activity in activities
+                        if projected_inclusion.get(
+                            ("character_text_activity_events", str(activity["id"])),
+                            bool(activity["included"]),
+                        )
+                    ),
+                    default=0,
+                )
                 row["last_activity_ordinal"] = min(
                     _snapshot_row_int(row, "last_activity_ordinal"),
                     int(max_ordinal),
@@ -1473,7 +1521,9 @@ class TurnSnapshotService:
                 )
             add_pending(table, row_key, row, raw_row, previous, recheck_at)
 
-        for table, row_key, pending_row, reference_row, previous, recheck_at in pending:
+        for table, row_key, pending_row, reference_row, previous, recheck_at in (
+            pending.values()
+        ):
             table_name = table.name
             root_hash = table_roots[table_name]
             self._replace_snapshot_row_references(
@@ -1662,7 +1712,7 @@ class TurnSnapshotService:
         save_id: str,
         target_table: str,
         target_key: str,
-    ) -> None:
+    ) -> tuple[tuple[str, str], ...]:
         dependents = self.repositories.connection.execute(
             """
             SELECT source_table, source_key
@@ -1677,6 +1727,10 @@ class TurnSnapshotService:
                 table_name=str(dependent["source_table"]),
                 row_key=str(dependent["source_key"]),
             )
+        return tuple(
+            (str(dependent["source_table"]), str(dependent["source_key"]))
+            for dependent in dependents
+        )
 
     def _queue_snapshot_lifecycle_dependents(
         self,
@@ -1697,6 +1751,17 @@ class TurnSnapshotService:
                 (save_id, table_name, row_key),
             ).fetchone()
             if previous is None:
+                live_exists = self.repositories.connection.execute(
+                    f"SELECT 1 FROM {table.name} "
+                    f"WHERE save_id = ? AND {table.primary_key} = ?",
+                    (save_id, row_key),
+                ).fetchone()
+                if live_exists is not None:
+                    self._queue_snapshot_reference_dependents(
+                        save_id=save_id,
+                        target_table=table_name,
+                        target_key=row_key,
+                    )
                 continue
             live = self.repositories.connection.execute(
                 f"SELECT * FROM {table.name} "
@@ -1733,9 +1798,10 @@ class TurnSnapshotService:
         self,
         save_id: str,
         dirty_rows: list[sqlite3.Row],
-    ) -> None:
+    ) -> tuple[tuple[str, str], ...]:
         participant_thread_ids: set[str] = set()
         activity_changed = False
+        queued: list[tuple[str, str]] = []
         for dirty in dirty_rows:
             table_name = str(dirty["table_name"])
             row_key = str(dirty["row_key"])
@@ -1779,6 +1845,7 @@ class TurnSnapshotService:
                 table_name="character_text_threads",
                 row_key=thread_id,
             )
+            queued.append(("character_text_threads", thread_id))
         if activity_changed:
             cursors = self.repositories.connection.execute(
                 """
@@ -1794,6 +1861,13 @@ class TurnSnapshotService:
                     table_name="narrator_phone_activity_cursors",
                     row_key=str(cursor["narrator_message_id"]),
                 )
+                queued.append(
+                    (
+                        "narrator_phone_activity_cursors",
+                        str(cursor["narrator_message_id"]),
+                    )
+                )
+        return tuple(queued)
 
     def _mark_snapshot_row_dirty(
         self,

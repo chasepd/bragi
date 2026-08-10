@@ -3763,6 +3763,10 @@ def test_incremental_reference_filtering_reaches_fixed_point(
     service = TurnSnapshotService(repositories)
     service.capture_baseline_snapshot(save.id)
     repositories.connection.execute(
+        "UPDATE context_observations SET claim = claim || ' Still.' WHERE id = ?",
+        (observation.id,),
+    )
+    repositories.connection.execute(
         "UPDATE characters SET archived_at = CURRENT_TIMESTAMP WHERE id = 'mara'"
     )
     repositories.commit()
@@ -3813,6 +3817,36 @@ def test_incremental_missing_target_edge_survives_delete_and_recreate(
     assert json.loads(str(tower["connections_json"])) == ["gate"]
 
 
+def test_initially_missing_target_creation_rechecks_declared_edge(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    repositories.add_location(
+        save_id=save.id,
+        location_id="tower",
+        name="Beacon Tower",
+        connections=["future-gate"],
+    )
+    service = TurnSnapshotService(repositories)
+    baseline = service.capture_baseline_snapshot(save.id)
+    [tower] = service._rows_from_manifest(service._snapshot_manifest(baseline))[
+        "locations"
+    ]
+    assert json.loads(str(tower["connections_json"])) == []
+
+    repositories.add_location(
+        save_id=save.id,
+        location_id="future-gate",
+        name="Future Gate",
+    )
+    changed = service.capture_current_head_if_dirty(save.id)
+    locations = service._rows_from_manifest(service._snapshot_manifest(changed))[
+        "locations"
+    ]
+    tower = next(row for row in locations if row["id"] == "tower")
+    assert json.loads(str(tower["connections_json"])) == ["future-gate"]
+
+
 def test_group_thread_participant_removal_rechecks_thread_inclusion(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3841,6 +3875,34 @@ def test_group_thread_participant_removal_rechecks_thread_inclusion(
     repositories.connection.execute(
         "DELETE FROM character_text_thread_participants WHERE id = ?",
         (participant["id"],),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+
+    assert all(row["id"] != thread.id for row in rows["character_text_threads"])
+
+
+def test_character_exclusion_rechecks_group_participant_aggregate(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    for character_id in ("mara", "rowan"):
+        repositories.add_character(
+            save_id=save.id,
+            character_id=character_id,
+            name=character_id.title(),
+        )
+    thread = repositories.create_character_text_group_thread(
+        save_id=save.id,
+        title="Beacon Crew",
+        character_ids=("mara", "rowan"),
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE characters SET archived_at = CURRENT_TIMESTAMP WHERE id = 'rowan'"
     )
     repositories.commit()
 
