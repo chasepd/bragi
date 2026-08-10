@@ -65,6 +65,7 @@ from bragi.services.agentic_context import (
     PLANNED_EFFECT_TYPES,
     RESPONSE_VERIFICATION_MODE_RETRY,
     ContextCurationService,
+    EvidenceRefinementRequest,
     NarratorCommitDecision,
     NarratorMessageSpec,
     NarratorVerificationResult,
@@ -342,6 +343,7 @@ POST_TURN_JOB_ORDER = (
     "proactive_text",
     "director",
     "scenario",
+    "context_precompute",
     "image",
 )
 POST_TURN_JOB_DEPENDENCIES: dict[str, tuple[str, ...]] = {
@@ -351,6 +353,13 @@ POST_TURN_JOB_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "proactive_text": ("time_reconciliation",),
     "director": ("time_reconciliation",),
     "scenario": (),
+    "context_precompute": (
+        "context",
+        "time_reconciliation",
+        "proactive_text",
+        "director",
+        "scenario",
+    ),
     "image": (),
 }
 POST_TURN_IMAGE_CONTEXT_SEMANTICS = "pre_post_turn_updates"
@@ -2120,6 +2129,129 @@ class ChatService:
             save_id=save_id,
             request=planner_request,
         )
+        refinement_request = (
+            narrator_spec.evidence_refinement if narrator_spec is not None else None
+        )
+        if (
+            refinement_request is not None
+            and not context_result.retrieval_round_used
+        ):
+            refined_context = await self._refine_context_for_plan(
+                save_id=save_id,
+                player_message_id=player_message.id,
+                request=refinement_request,
+                prior_result=context_result,
+            )
+            refined_count = _context_result_selected_count(refined_context)
+            if refined_count > _context_result_selected_count(context_result):
+                context_result = refined_context
+                narration_snapshot = (
+                    refined_context.narration_snapshot or narration_snapshot
+                )
+                budgeted_context = _budgeted_narrator_context(
+                    repositories=self.repositories,
+                    save_id=save_id,
+                    messages=messages,
+                    context_result=context_result,
+                    player_message=player_message,
+                    continuity_index_synced=context_result.continuity_index_synced,
+                    narration_snapshot=narration_snapshot,
+                    excluded_character_voice_ids=_absent_character_ids(
+                        character_action_planning_result
+                    ),
+                    history_settings=prose_history_settings,
+                )
+                planner_budgeted_context = (
+                    budgeted_context
+                    if planner_uses_prose_context
+                    else _budgeted_narrator_context(
+                        repositories=self.repositories,
+                        save_id=save_id,
+                        messages=messages,
+                        context_result=context_result,
+                        player_message=player_message,
+                        continuity_index_synced=(
+                            context_result.continuity_index_synced
+                        ),
+                        narration_snapshot=narration_snapshot,
+                        excluded_character_voice_ids=_absent_character_ids(
+                            character_action_planning_result
+                        ),
+                        history_settings=planner_history_settings,
+                    )
+                )
+                budgeted_context = replace(
+                    budgeted_context,
+                    context_breakdown={
+                        **budgeted_context.context_breakdown,
+                        **phone_context_breakdown,
+                        **character_planning_breakdown,
+                        "planner_refinement_used": True,
+                    },
+                )
+                planner_budgeted_context = (
+                    budgeted_context
+                    if planner_uses_prose_context
+                    else replace(
+                        planner_budgeted_context,
+                        context_breakdown={
+                            **planner_budgeted_context.context_breakdown,
+                            **phone_context_breakdown,
+                            **character_planning_breakdown,
+                            "planner_refinement_used": True,
+                        },
+                    )
+                )
+                base_request = _request_with_budgeted_context(
+                    base_request,
+                    budgeted_context,
+                    messages=_narrator_messages(
+                        repositories=self.repositories,
+                        messages=messages,
+                        context_result=context_result,
+                        player_message=player_message,
+                        settings=prose_history_settings,
+                        scene_snapshot=narration_snapshot.scene_snapshot,
+                        characters=list(narration_snapshot.characters),
+                        message_visibility=list(
+                            narration_snapshot.message_visibility
+                        ),
+                    ),
+                )
+                planner_request = _request_with_budgeted_context(
+                    planner_request,
+                    planner_budgeted_context,
+                    messages=_narrator_messages(
+                        repositories=self.repositories,
+                        messages=messages,
+                        context_result=context_result,
+                        player_message=player_message,
+                        settings=planner_history_settings,
+                        scene_snapshot=narration_snapshot.scene_snapshot,
+                        characters=list(narration_snapshot.characters),
+                        message_visibility=list(
+                            narration_snapshot.message_visibility
+                        ),
+                    ),
+                )
+                planner_request = replace(
+                    planner_request,
+                    context_breakdown={
+                        **planner_request.context_breakdown,
+                        "planner_message_source_ids": list(
+                            _planner_message_source_ids(
+                                messages=messages,
+                                request_messages=planner_request.messages,
+                            )
+                        ),
+                    },
+                )
+                narrator_spec = await self._plan_narrator_message_if_configured(
+                    save_id=save_id,
+                    request=planner_request,
+                )
+        if narrator_spec is not None and narrator_spec.evidence_refinement is not None:
+            narrator_spec = replace(narrator_spec, evidence_refinement=None)
         narrator_spec = _narrator_spec_with_commit_candidates(
             narrator_spec,
             _character_assessment_commit_candidates(
@@ -4320,6 +4452,9 @@ class ChatService:
                 player_message_id=player_message_id,
                 narrator_message_id=narrator_message_id,
             ),
+            "context_precompute": lambda: self._precompute_next_turn_context(
+                save_id=save_id,
+            ),
             "image": lambda: self._generate_automatic_image_after_turn_step(
                 prepared_image=prepared_image,
                 defer_image_generation=defer_image_generation,
@@ -4356,6 +4491,7 @@ class ChatService:
                 "proactive_text",
                 "director",
                 "scenario",
+                "context_precompute",
                 "image",
             }:
                 return await run_step(
@@ -4548,6 +4684,16 @@ class ChatService:
             statuses=statuses.copy(),
         )
         return coordinator_result
+
+    def _precompute_next_turn_context(self, *, save_id: str) -> _PostTurnStepResult:
+        precompute = getattr(self.context_search_service, "precompute_next_turn", None)
+        if not callable(precompute):
+            return _PostTurnStepResult(
+                "skipped",
+                {"skipped_reason": "context_precompute_unavailable"},
+            )
+        precompute(save_id)
+        return _PostTurnStepResult("succeeded", {"cache_status": "stored"})
 
     def _run_world_context_retention(self, *, save_id: str) -> None:
         try:
@@ -5819,6 +5965,34 @@ class ChatService:
             save_id=save_id,
             focus_message=focus_message,
         )
+        return cast(ContextSearchResult, result)
+
+    async def _refine_context_for_plan(
+        self,
+        *,
+        save_id: str,
+        player_message_id: str,
+        request: EvidenceRefinementRequest,
+        prior_result: ContextSearchResult,
+    ) -> ContextSearchResult:
+        refine = getattr(self.context_search_service, "refine_for_plan", None)
+        if not callable(refine):
+            return prior_result
+        try:
+            result = await refine(
+                save_id=save_id,
+                player_message_id=player_message_id,
+                request=request,
+                prior_result=prior_result,
+            )
+        except Exception as exc:
+            log_error_event(
+                "chat.context_refinement_failed",
+                save_id=save_id,
+                player_message_id=player_message_id,
+                **exception_log_fields(exc),
+            )
+            return prior_result
         return cast(ContextSearchResult, result)
 
     async def _queue_look_around_update_suggestions(
@@ -11339,6 +11513,52 @@ def _budgeted_narrator_context(
         ),
         summary="\n".join(summaries) if summaries else None,
         context_breakdown=context_breakdown,
+    )
+
+
+def _request_with_budgeted_context(
+    request: ChatRequest,
+    context: _BudgetedNarratorContext,
+    *,
+    messages: tuple[ChatMessage, ...],
+) -> ChatRequest:
+    return replace(
+        request,
+        messages=messages,
+        scenario_instructions=context.scenario_instructions,
+        current_scene_recap=context.current_scene_recap,
+        character_voice_profiles=context.character_voice_profiles,
+        open_obligations=context.open_obligations,
+        pending_context_suggestions=context.pending_context_suggestions,
+        retrieved_scenario_sections=context.retrieved_scenario_sections,
+        retrieved_state=context.retrieved_state,
+        retrieved_state_changes=context.retrieved_state_changes,
+        retrieved_recent_messages=context.retrieved_recent_messages,
+        retrieved_media_assets=context.retrieved_media_assets,
+        retrieved_character_text_context=context.retrieved_character_text_context,
+        retrieved_memories=context.retrieved_memories,
+        retrieved_observations=context.retrieved_observations,
+        summary=context.summary,
+        context_breakdown=context.context_breakdown,
+    )
+
+
+def _context_result_selected_count(result: ContextSearchResult) -> int:
+    return sum(
+        len(items)
+        for items in (
+            result.selected_open_obligations,
+            result.selected_scenario_sections,
+            result.selected_state,
+            result.selected_state_changes,
+            result.selected_media_assets,
+            result.selected_character_text_context,
+            result.selected_memories,
+            result.selected_observations,
+            result.selected_character_voice,
+            result.selected_summaries,
+            result.selected_recent_messages,
+        )
     )
 
 

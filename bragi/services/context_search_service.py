@@ -8,6 +8,7 @@ import re
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from threading import Lock
 from time import perf_counter
 from typing import cast
 
@@ -47,6 +48,7 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, provider_error_is_model_not_found
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
+from bragi.services.agentic_context import EvidenceRefinementRequest
 from bragi.services.context_assembly import scenario_section_candidates
 from bragi.services.continuity_index_service import ContinuityIndexService
 from bragi.services.job_lifecycle import JobLifecycleService
@@ -187,6 +189,7 @@ class ContextSearchResult:
     continuity_index_synced: bool = False
     retrieval_degraded: bool = False
     retrieval_recovery: str | None = None
+    retrieval_round_used: bool = field(default=False, compare=False)
     narration_snapshot: NarrationContextSnapshot | None = field(
         default=None,
         compare=False,
@@ -268,6 +271,12 @@ class _IndexedContextSourceRetrieval:
 
 
 @dataclass(frozen=True)
+class _NextTurnContextCacheEntry:
+    fingerprint: str
+    snapshot: NarrationContextSnapshot
+
+
+@dataclass(frozen=True)
 class _ContextSelectionOutcome:
     result: ContextSearchResult
     fallback_allowed: bool = False
@@ -294,6 +303,81 @@ class ContextSearchService:
         self.repositories = repositories
         self.providers = providers
         self.jobs = JobLifecycleService(repositories=repositories)
+        self._next_turn_cache: dict[str, _NextTurnContextCacheEntry] = {}
+        self._next_turn_cache_lock = Lock()
+
+    def precompute_next_turn(self, save_id: str) -> None:
+        job = self.jobs.create_running(
+            save_id=save_id,
+            type="context_precompute",
+            payload={"scope": "next_turn_context_snapshot"},
+        )
+        try:
+            details = self.repositories.load_save_details(
+                save_id,
+                message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+            )
+            if details is None:
+                raise ValueError(f"Unknown save id: {save_id}")
+            _sync_continuity_index_for_search(self.repositories, save_id)
+            initial_fingerprint = self.repositories.context_candidate_revision_token(
+                save_id
+            )
+            snapshot = load_narration_context_snapshot(
+                self.repositories,
+                save_id=save_id,
+                details=details,
+                include_context_sources=False,
+                raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
+            )
+            if snapshot is None:
+                raise ValueError(f"Unknown save id: {save_id}")
+            final_fingerprint = self.repositories.context_candidate_revision_token(
+                save_id
+            )
+            cache_status = "skipped_stale"
+            if initial_fingerprint == final_fingerprint:
+                with self._next_turn_cache_lock:
+                    self._next_turn_cache[save_id] = _NextTurnContextCacheEntry(
+                        fingerprint=final_fingerprint,
+                        snapshot=snapshot,
+                    )
+                cache_status = "stored"
+            self.jobs.succeed(
+                job.id,
+                result={
+                    "scope": "next_turn_context_snapshot",
+                    "cache_status": cache_status,
+                },
+            )
+        except Exception as exc:
+            self.jobs.fail(
+                job.id,
+                error=redact_text(str(exc)) or exc.__class__.__name__,
+            )
+            raise
+
+    def _valid_next_turn_cache(
+        self,
+        save_id: str,
+        *,
+        player_message_id: str,
+    ) -> _NextTurnContextCacheEntry | None:
+        with self._next_turn_cache_lock:
+            entry = self._next_turn_cache.get(save_id)
+        if entry is None:
+            return None
+        fingerprint = self.repositories.context_candidate_revision_token(
+            save_id,
+            ignored_message_id=player_message_id,
+        )
+        if entry.fingerprint == fingerprint:
+            return entry
+        with self._next_turn_cache_lock:
+            if self._next_turn_cache.get(save_id) is entry:
+                self._next_turn_cache.pop(save_id, None)
+        log_event("context_search.precompute_cache_stale", save_id=save_id)
+        return None
 
     async def search(
         self,
@@ -305,7 +389,43 @@ class ContextSearchService:
             save_id=save_id,
             player_message_id=player_message_id,
             focus_message=None,
+            additional_query_terms=(),
+            allow_expansion=True,
         )
+
+    async def refine_for_plan(
+        self,
+        *,
+        save_id: str,
+        player_message_id: str,
+        request: EvidenceRefinementRequest,
+        prior_result: ContextSearchResult,
+    ) -> ContextSearchResult:
+        if prior_result.retrieval_round_used or not request.requested:
+            return prior_result
+        entity_terms: list[str] = []
+        for entity_id in request.entity_ids:
+            character = self.repositories.get_character(entity_id)
+            if character is None or character.save_id != save_id:
+                continue
+            entity_terms.extend((character.name, *character.aliases))
+        refined = await self._search(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            focus_message=None,
+            additional_query_terms=tuple(
+                dict.fromkeys(
+                    (
+                        *request.terms,
+                        *request.phrases,
+                        *entity_terms,
+                        *request.source_ids,
+                    )
+                )
+            ),
+            allow_expansion=False,
+        )
+        return _merge_context_search_results(prior_result, refined)
 
     async def search_for_focus(
         self,
@@ -317,6 +437,8 @@ class ContextSearchService:
             save_id=save_id,
             player_message_id=focus_message.id,
             focus_message=focus_message,
+            additional_query_terms=(),
+            allow_expansion=True,
         )
 
     async def _search(
@@ -325,6 +447,8 @@ class ContextSearchService:
         save_id: str,
         player_message_id: str,
         focus_message: MessageRecord | None,
+        additional_query_terms: tuple[str, ...],
+        allow_expansion: bool,
     ) -> ContextSearchResult:
         preference = roleplay_model_preference(
             repositories=self.repositories,
@@ -367,16 +491,24 @@ class ContextSearchService:
             )
             scenario = details.scenario if details is not None else None
             player_message = _message_body(messages, player_message_id)
-            narration_snapshot: NarrationContextSnapshot | None = None
-            _sync_continuity_index_for_search(self.repositories, save_id)
-            continuity_index_synced = True
-            narration_snapshot = load_narration_context_snapshot(
-                self.repositories,
-                save_id=save_id,
-                details=details,
-                include_context_sources=False,
-                raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
+            cache_entry = self._valid_next_turn_cache(
+                save_id,
+                player_message_id=player_message_id,
             )
+            cache_status = "hit" if cache_entry is not None else "miss"
+            if cache_entry is None:
+                _sync_continuity_index_for_search(self.repositories, save_id)
+                continuity_index_synced = True
+                narration_snapshot = load_narration_context_snapshot(
+                    self.repositories,
+                    save_id=save_id,
+                    details=details,
+                    include_context_sources=False,
+                    raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
+                )
+            else:
+                continuity_index_synced = True
+                narration_snapshot = replace(cache_entry.snapshot, details=details)
             if narration_snapshot is None:
                 raise ValueError(f"Unknown save id: {save_id}")
             messages = _context_search_visible_messages(
@@ -404,6 +536,8 @@ class ContextSearchService:
                 entity_links=list(narration_snapshot.entity_links),
                 recent_messages=messages,
                 message_visibility=list(narration_snapshot.message_visibility),
+                additional_query_terms=additional_query_terms,
+                allow_expansion=allow_expansion,
             )
             candidate_observations = _observations_with_indexed_sources(
                 self.repositories,
@@ -437,7 +571,6 @@ class ContextSearchService:
             )
             candidates = candidate_set.candidates
             candidate_diagnostics = candidate_set.diagnostics
-            cache_status = "miss"
             log_event(
                 "context_search.candidates_built",
                 save_id=save_id,
@@ -632,6 +765,9 @@ class ContextSearchService:
             result = replace(
                 result,
                 continuity_index_synced=continuity_index_synced,
+                retrieval_round_used=(
+                    retrieved_sources.diagnostics.get("retrieval_round_used") is True
+                ),
                 narration_snapshot=narration_snapshot,
             )
             log_event(
@@ -1112,6 +1248,9 @@ def _indexed_context_source_search_pass(
             "indexed_retrieval_enabled": True,
             "indexed_retrieval_query_term_count": len(query_terms),
             "indexed_retrieval_hit_count": len(hits),
+            "indexed_retrieval_exact_hit_count": len(exact_hits),
+            "indexed_retrieval_broad_hit_count": len(broad_hits),
+            "strong_local_recall": bool(exact_hits),
             "protected_context_source_count": len(prelude.protected),
             "indexed_retrieval_duration_ms": _elapsed_ms(started_at),
             "first_pass_source_type_counts": _context_source_type_counts(records),
@@ -1133,6 +1272,8 @@ async def _retrieve_indexed_context_sources(
     entity_links: list[EntityLinkRecord],
     recent_messages: list[MessageRecord],
     message_visibility: list[MessageVisibilityRecord],
+    additional_query_terms: tuple[str, ...] = (),
+    allow_expansion: bool = True,
 ) -> _IndexedContextSourceRetrieval:
     prelude = _indexed_context_source_retrieval_prelude(
         repositories,
@@ -1148,9 +1289,29 @@ async def _retrieve_indexed_context_sources(
         repositories,
         save_id=save_id,
         prelude=prelude,
+        additional_query_terms=additional_query_terms,
     )
+    if not allow_expansion:
+        return replace(
+            initial,
+            diagnostics={
+                **initial.diagnostics,
+                "retrieval_round_used": True,
+                "planner_refinement_used": True,
+                "retrieval_expansion_used": False,
+            },
+        )
     if not latest_player_message.strip():
         return initial
+    if initial.diagnostics.get("strong_local_recall") is True:
+        return replace(
+            initial,
+            diagnostics={
+                **initial.diagnostics,
+                "retrieval_expansion_skipped_reason": "strong_local_recall",
+                "retrieval_round_used": False,
+            },
+        )
     supports_tools = (
         isinstance(provider, ToolCallProvider)
         and _model_supports_tool_calling(
@@ -1196,7 +1357,14 @@ async def _retrieve_indexed_context_sources(
     else:
         return initial
     if not expanded_terms:
-        return initial
+        return replace(
+            initial,
+            diagnostics={
+                **initial.diagnostics,
+                "retrieval_round_used": True,
+                "retrieval_expansion_used": False,
+            },
+        )
     expanded = _indexed_context_source_search_pass(
         repositories,
         save_id=save_id,
@@ -1209,6 +1377,7 @@ async def _retrieve_indexed_context_sources(
             **expanded.diagnostics,
             "retrieval_expansion_used": True,
             "retrieval_expansion_term_count": len(expanded_terms),
+            "retrieval_round_used": True,
         },
     )
 
@@ -2993,6 +3162,70 @@ def _selected_context_items(
         *result.selected_character_voice,
         *result.selected_summaries,
         *result.selected_recent_messages,
+    )
+
+
+def _merge_context_search_results(
+    prior: ContextSearchResult,
+    refined: ContextSearchResult,
+) -> ContextSearchResult:
+    def merged(
+        first: tuple[SelectedContextItem, ...],
+        second: tuple[SelectedContextItem, ...],
+    ) -> tuple[SelectedContextItem, ...]:
+        return tuple(
+            {
+                (item.source_type, item.source_id): item
+                for item in (*first, *second)
+            }.values()
+        )
+
+    return ContextSearchResult(
+        selected_open_obligations=merged(
+            prior.selected_open_obligations,
+            refined.selected_open_obligations,
+        ),
+        selected_scenario_sections=merged(
+            prior.selected_scenario_sections,
+            refined.selected_scenario_sections,
+        ),
+        selected_state=merged(prior.selected_state, refined.selected_state),
+        selected_state_changes=merged(
+            prior.selected_state_changes,
+            refined.selected_state_changes,
+        ),
+        selected_media_assets=merged(
+            prior.selected_media_assets,
+            refined.selected_media_assets,
+        ),
+        selected_character_text_context=merged(
+            prior.selected_character_text_context,
+            refined.selected_character_text_context,
+        ),
+        selected_memories=merged(prior.selected_memories, refined.selected_memories),
+        selected_observations=merged(
+            prior.selected_observations,
+            refined.selected_observations,
+        ),
+        selected_character_voice=merged(
+            prior.selected_character_voice,
+            refined.selected_character_voice,
+        ),
+        selected_summaries=merged(
+            prior.selected_summaries,
+            refined.selected_summaries,
+        ),
+        selected_recent_messages=merged(
+            prior.selected_recent_messages,
+            refined.selected_recent_messages,
+        ),
+        continuity_index_synced=(
+            prior.continuity_index_synced or refined.continuity_index_synced
+        ),
+        retrieval_degraded=prior.retrieval_degraded or refined.retrieval_degraded,
+        retrieval_recovery=refined.retrieval_recovery or prior.retrieval_recovery,
+        retrieval_round_used=True,
+        narration_snapshot=refined.narration_snapshot or prior.narration_snapshot,
     )
 
 

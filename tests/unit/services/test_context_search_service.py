@@ -4498,6 +4498,11 @@ def test_context_search_uses_ranked_index_before_structured_selection(
         importance=0.95,
         source_message_id=source_message.id,
     )
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="ember dawn",
+    )
     for index in range(130):
         repositories.add_summary(
             save_id=save.id,
@@ -4532,6 +4537,8 @@ def test_context_search_uses_ranked_index_before_structured_selection(
     )
     assert exact_memory.body in prompt
     assert "Low-priority pantry recap 129" not in prompt
+    assert provider.expansion_requests == []
+    assert result.retrieval_round_used is False
     assert [item.source_id for item in result.selected_memories] == [exact_memory.id]
     jobs = _context_search_jobs(repositories, save.id)
     result_json = json.loads(jobs[-1]["result_json"])
@@ -4603,6 +4610,7 @@ def test_context_search_uses_structured_paraphrase_and_pronoun_expansion(
     )
 
     assert len(provider.expansion_requests) == 1
+    assert result.retrieval_round_used is True
     expansion_prompt = "\n".join(
         message.body for message in provider.expansion_requests[0].messages
     )
@@ -4613,6 +4621,55 @@ def test_context_search_uses_structured_paraphrase_and_pronoun_expansion(
     )
     assert memory.body in selection_prompt
     assert [item.source_id for item in result.selected_memories] == [memory.id]
+
+
+def test_context_search_uses_post_turn_precomputed_snapshot(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _prior_player_message = _save_with_context_search_preference(repositories)
+    provider = RecordingStructuredContextProvider({"selections": []})
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+    service.precompute_next_turn(save.id)
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I listen for the silver bell.",
+    )
+
+    asyncio.run(service.search(save_id=save.id, player_message_id=player_message.id))
+
+    result_json = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    assert result_json["diagnostics"]["cache_status"] == "hit"
+
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="scene.warning",
+        value={"active": True},
+        category="scene",
+        source_message_id=None,
+    )
+    next_player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="What changed?",
+    )
+    asyncio.run(
+        service.search(
+            save_id=save.id,
+            player_message_id=next_player_message.id,
+        )
+    )
+    stale_result_json = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    assert stale_result_json["diagnostics"]["cache_status"] == "miss"
 
 
 def test_context_search_expansion_reuses_retrieval_prelude(
