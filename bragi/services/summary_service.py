@@ -236,21 +236,15 @@ class SummaryService:
         )
         projected_player_count = state.unsummarized_player_count
         projected_narrator_count = state.unsummarized_narrator_count
-        projected_message_count = state.unsummarized_message_count
         if pending_message is not None:
-            projected_message_count += 1
             if pending_message.role == "player":
                 projected_player_count += 1
             elif pending_message.role == "narrator":
                 projected_narrator_count += 1
-        retained_message_count = min(
-            projected_player_count,
-            window_settings.player_messages,
-        ) + min(
-            projected_narrator_count,
-            window_settings.narrator_messages,
+        frontier_triggered = (
+            projected_player_count > window_settings.player_messages
+            or projected_narrator_count > window_settings.narrator_messages
         )
-        frontier_triggered = projected_message_count > retained_message_count
         should_roll_up_summaries = state.active_summary_count > 1 or (
             state.active_summary_count > 0
             and budget.should_summarize

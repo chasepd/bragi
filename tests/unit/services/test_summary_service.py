@@ -276,6 +276,10 @@ def test_summary_pressure_check_uses_persisted_state_without_chronicle_rescan(
         service.summarize_if_needed(
             save_id=save.id,
             context_window=10_000,
+            pending_message=PendingMessageEstimate(
+                body="Several quiet hours pass.",
+                role="system",
+            ),
         )
     )
 
