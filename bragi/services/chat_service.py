@@ -2739,6 +2739,10 @@ class ChatService:
             token_usage=response.token_usage,
             transport_mode=completion_diagnostics.get("transport_mode"),
             streaming_used=completion_diagnostics.get("streaming_used"),
+            delivery_mode=completion_diagnostics.get("delivery_mode"),
+            incremental_delivery_used=completion_diagnostics.get(
+                "incremental_delivery_used"
+            ),
         )
         stage_started = perf_counter()
         throw_if_cancelled_after_job()
@@ -3574,6 +3578,8 @@ class ChatService:
             "original_provider": request.provider,
             "original_model": request.model_id,
             "fallback_used": False,
+            "delivery_mode": "final_only",
+            "incremental_delivery_used": False,
             "streaming_attempted": use_streaming,
             "streaming_used": False,
             "transport_mode": "streaming" if use_streaming else "non_streaming",

@@ -3245,7 +3245,6 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 handle,
                 task_label="chat",
             )
-            draft_callback, flush_draft_progress = _narrator_draft_callback(handle)
             kwargs: dict[str, Any] = {
                 "body": payload.body,
                 "speaker_name": payload.speaker_name,
@@ -3277,11 +3276,6 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 kwargs["retry_progress_callback"] = retry_callback
             if _call_accepts_keyword(
                 state.runtime.submit_player_message_for_initial_render,
-                "narrator_stream_callback",
-            ):
-                kwargs["narrator_stream_callback"] = draft_callback
-            if _call_accepts_keyword(
-                state.runtime.submit_player_message_for_initial_render,
                 "turn_progress_callback",
             ):
                 kwargs["turn_progress_callback"] = turn_progress_callback
@@ -3291,7 +3285,6 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 )
             finally:
                 await flush_retry_progress()
-                await flush_draft_progress()
                 await flush_turn_progress()
             _raise_for_initial_chat_turn_failure(
                 turn,
@@ -3459,7 +3452,6 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 handle,
                 task_label="chat",
             )
-            draft_callback, flush_draft_progress = _narrator_draft_callback(handle)
             kwargs: dict[str, Any] = {
                 "instruction": instruction,
                 "active_save_id": submitted_save_id,
@@ -3490,11 +3482,6 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 kwargs["retry_progress_callback"] = retry_callback
             if _call_accepts_keyword(
                 state.runtime.submit_timeskip_for_initial_render,
-                "narrator_stream_callback",
-            ):
-                kwargs["narrator_stream_callback"] = draft_callback
-            if _call_accepts_keyword(
-                state.runtime.submit_timeskip_for_initial_render,
                 "turn_progress_callback",
             ):
                 kwargs["turn_progress_callback"] = turn_progress_callback
@@ -3504,7 +3491,6 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 )
             finally:
                 await flush_retry_progress()
-                await flush_draft_progress()
                 await flush_turn_progress()
             _raise_for_initial_chat_turn_failure(
                 turn,
@@ -9472,44 +9458,6 @@ def _retry_progress_callback(
             await asyncio.gather(*tasks)
 
     return callback, flush
-
-
-def _narrator_draft_callback(handle: JobHandle) -> tuple[Any, Any]:
-    loop = asyncio.get_running_loop()
-    tasks: list[asyncio.Task[None]] = []
-    last_body = ""
-
-    def callback(body: str) -> None:
-        nonlocal last_body
-        if body == last_body:
-            return
-        last_body = body
-        payload = {"message": _pending_narrator_message(body)}
-
-        def schedule() -> None:
-            tasks.append(asyncio.create_task(handle.event("narrator_draft", payload)))
-
-        loop.call_soon_threadsafe(schedule)
-
-    async def flush() -> None:
-        await asyncio.sleep(0)
-        if tasks:
-            await asyncio.gather(*tasks)
-
-    return callback, flush
-
-
-def _pending_narrator_message(body: str) -> dict[str, Any]:
-    from bragi.application.chronicle import parse_message_markdown
-
-    return {
-        "message_id": "pending-narrator-message",
-        "role": "narrator",
-        "speaker_name": "Narrator",
-        "body": body,
-        "markdown_blocks": to_jsonable(parse_message_markdown(body)),
-        "actions": [],
-    }
 
 
 def _provider_retry_status_text(progress: object, task_label: str) -> str:

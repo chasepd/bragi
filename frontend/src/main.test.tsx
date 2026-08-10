@@ -1390,6 +1390,20 @@ describe("frontend helpers", () => {
     expect(events).toHaveBeenCalledWith("chat_turn_delta", delta);
   });
 
+  it("does not expose provisional narrator draft job events", async () => {
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const events = vi.fn();
+    const stop = watchJob("job-1", vi.fn(), events, "save-1");
+
+    sources[0].dispatch("narrator_draft", {
+      message: { body: "Unchecked narrator text." }
+    });
+    stop();
+
+    expect(events).not.toHaveBeenCalled();
+  });
+
   it("delivers job completion level events", async () => {
     const { watchJob } = await import("./api");
     const sources = installEventSourceDouble();
@@ -7542,25 +7556,11 @@ describe("frontend helpers", () => {
 
     const jobSource = sources.find((source) => source.url.startsWith("/api/jobs/"));
     expect(jobSource).toBeTruthy();
-    act(() => {
-      jobSource?.dispatch("narrator_draft", {
-        message: {
-          message_id: "pending-narrator-message",
-          role: "narrator",
-          speaker_name: "Narrator",
-          body: "Save A draft in progress.",
-          markdown_blocks: [{ kind: "paragraph", spans: [{ kind: "text", text: "Save A draft in progress." }] }],
-          actions: []
-        }
-      });
-    });
-    expect(await screen.findByText("Save A draft in progress.")).toBeInTheDocument();
 
     await userEvent.click(await screen.findByRole("button", { name: "Load Signal Tower" }));
 
     await waitFor(() => expect(screen.getByText("Save B text.")).toBeInTheDocument());
     await waitFor(() => expect(screen.queryByLabelText("Pending jobs")).not.toBeInTheDocument());
-    expect(screen.queryByText("Save A draft in progress.")).not.toBeInTheDocument();
 
     act(() => {
       jobSource?.dispatch("runtime", runtimeModel({
@@ -11823,7 +11823,7 @@ describe("frontend helpers", () => {
     expect(within(tray).getByText("Character cleanup")).toBeInTheDocument();
   });
 
-  it("renders narrator draft job events as a transient chronicle message", async () => {
+  it("does not render narrator output before the final job result", async () => {
     const sources = installEventSourceDouble();
     const activeJobs = [{ id: "job-1", type: "chat_turn", status: "running", result: null, error: null, created_at: 1 } satisfies Job];
     const model = runtimeModel();
@@ -11838,32 +11838,14 @@ describe("frontend helpers", () => {
 
     expect((await screen.findAllByText("Active jobs")).length).toBeGreaterThan(0);
     const jobSources = () => sources.filter((source) => source.url.startsWith("/api/jobs/"));
-    const dispatchDraft = (body: string) => {
+
+    act(() => {
       for (const source of jobSources()) {
-        source.dispatch("narrator_draft", {
-          message: {
-            message_id: "pending-narrator-message",
-            role: "narrator",
-            speaker_name: "Narrator",
-            body,
-            markdown_blocks: [{ kind: "paragraph", spans: [{ kind: "text", text: body }] }],
-            actions: []
-          }
-        });
+        source.dispatch("progress", { label: "Checking response" });
       }
-    };
-
-    act(() => {
-      dispatchDraft("The bell");
     });
 
-    expect(await screen.findByText("The bell")).toBeInTheDocument();
-
-    act(() => {
-      dispatchDraft("The bell answers.");
-    });
-
-    expect(await screen.findByText("The bell answers.")).toBeInTheDocument();
+    expect(screen.queryByText("The bell answers.")).not.toBeInTheDocument();
 
     act(() => {
       activeJobs.splice(0);

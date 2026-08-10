@@ -700,6 +700,18 @@ class SequenceChatProvider(RecordingChatProvider):
         )
 
 
+class SequenceTransportChatProvider(SequenceChatProvider):
+    """Streaming-capable provider whose test responses use final-only chat."""
+
+    def __init__(self, provider_name: str, response_bodies: tuple[str, ...]) -> None:
+        super().__init__(provider_name, response_bodies)
+        self.stream_requests: list[ChatRequest] = []
+
+    def stream_chat(self, request: ChatRequest) -> Any:
+        self.stream_requests.append(request)
+        raise AssertionError("final-only delivery must not request transport streaming")
+
+
 class StreamingChatProvider(RecordingChatProvider):
     def __init__(
         self,
@@ -2658,7 +2670,7 @@ def test_submit_player_turn_final_guard_rejects_phrase_from_verifier_retry(
     assert [message.role for message in persisted] == ["player"]
 
 
-def test_submit_player_turn_buffers_streamed_narrator_until_script_guard_passes(
+def test_submit_player_turn_uses_final_only_transport_until_script_guard_passes(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -2678,19 +2690,11 @@ def test_submit_player_turn_buffers_streamed_narrator_until_script_guard_passes(
         provider="openrouter",
         model_id="anthropic/claude-3.5-sonnet",
     )
-    provider = SequenceStreamingChatProvider(
+    provider = SequenceTransportChatProvider(
         "openrouter",
         (
-            (
-                ChatStreamChunk(delta="玩家喜欢"),
-                ChatStreamChunk(delta="简洁叙事。", token_usage={"total": 12}),
-                ChatStreamChunk(token_usage={"total": 12}, done=True),
-            ),
-            (
-                ChatStreamChunk(delta="The lantern"),
-                ChatStreamChunk(delta=" holds.", token_usage={"total": 12}),
-                ChatStreamChunk(token_usage={"total": 12}, done=True),
-            ),
+            "玩家喜欢简洁叙事。",
+            "The lantern holds.",
         ),
     )
     service = ChatService(
@@ -2698,24 +2702,20 @@ def test_submit_player_turn_buffers_streamed_narrator_until_script_guard_passes(
         providers={"openrouter": provider},
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
-    drafts: list[str] = []
-
     result = asyncio.run(
         service.submit_player_turn(
             save_id=save.id,
             body="I climb toward the beacon lens.",
             speaker_name="Mara",
             run_post_turn_jobs=False,
-            narrator_stream_callback=drafts.append,
         )
     )
 
-    assert drafts == ["The lantern holds."]
-    assert len(provider.stream_requests) == 2
-    assert provider.chat_requests == []
+    assert provider.stream_requests == []
+    assert len(provider.chat_requests) == 2
     assert (
         "unsupported writing script"
-        in provider.stream_requests[1].regeneration_feedback
+        in provider.chat_requests[1].regeneration_feedback
     )
     assert result.narrator_message.body == "The lantern holds."
     persisted = repositories.list_messages(save.id)
@@ -8747,7 +8747,7 @@ def test_submit_player_turn_streams_narrator_drafts_and_persists_final_body(
     assert persisted_messages[1].token_estimate == 5
 
 
-def test_rated_streaming_never_publishes_draft_rejected_by_safety_agent(
+def test_rated_final_only_delivery_never_streams_body_rejected_by_safety_agent(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -8781,6 +8781,7 @@ def test_rated_streaming_never_publishes_draft_rejected_by_safety_agent(
             ),
             ChatStreamChunk(token_usage={"total": 12}, done=True),
         ),
+        fallback_body=rejected_draft,
     )
     service = ChatService(
         repositories=repositories,
@@ -8790,19 +8791,16 @@ def test_rated_streaming_never_publishes_draft_rejected_by_safety_agent(
         },
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
-    drafts: list[str] = []
-
     result = asyncio.run(
         service.submit_player_turn(
             save_id=save.id,
             body="I close the tower door.",
             run_post_turn_jobs=False,
-            narrator_stream_callback=drafts.append,
         )
     )
 
-    assert drafts == [CONTENT_FILTER_TRANSITION]
-    assert rejected_draft not in repr(drafts)
+    assert narrator_provider.stream_requests == []
+    assert len(narrator_provider.chat_requests) == 1
     assert result.narrator_message.body == CONTENT_FILTER_TRANSITION
     assert result.narrator_message.content_rating == "g"
 
@@ -11211,8 +11209,12 @@ def test_submit_player_turn_persists_chat_transport_diagnostics(
     assert len(jobs) == 2
     assert jobs[0]["result"]["transport_mode"] == "non_streaming"
     assert jobs[0]["result"]["streaming_used"] is False
+    assert jobs[0]["result"]["delivery_mode"] == "final_only"
+    assert jobs[0]["result"]["incremental_delivery_used"] is False
     assert jobs[1]["result"]["transport_mode"] == "streaming"
     assert jobs[1]["result"]["streaming_used"] is True
+    assert jobs[1]["result"]["delivery_mode"] == "final_only"
+    assert jobs[1]["result"]["incremental_delivery_used"] is False
     assert jobs[1]["result"]["context_search_failed"] is False
     assert jobs[1]["result"]["context_search_selected_counts"] == {
         "character_text_context": 0,

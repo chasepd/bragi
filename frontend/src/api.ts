@@ -1321,7 +1321,7 @@ export function watchJob(
     }
     closeWatcher();
   });
-  for (const eventName of ["progress", "completion_level", "runtime", "chat_turn_delta", "narrator_draft"]) {
+  for (const eventName of ["progress", "completion_level", "runtime", "chat_turn_delta"]) {
     events.addEventListener(eventName, (event) => {
       const parsed = parseSseJson<unknown>(event as MessageEvent, { stream: "job", eventName, jobId, saveId });
       if (!parsed.ok) {

@@ -2830,7 +2830,6 @@ function Workbench({
   const [pendingSaveId, setPendingSaveId] = useState<string | null>(null);
   const [saveSelectionError, setSaveSelectionError] = useState("");
   const [pendingMessage, setPendingMessage] = useState<PendingChronicleMessage | null>(null);
-  const [pendingNarratorMessage, setPendingNarratorMessage] = useState<PendingChronicleMessage | null>(null);
   const [layout, setLayout] = useState<WorkbenchLayout>(loadWorkbenchLayout);
   const [resizingSide, setResizingSide] = useState<ResizeSide | null>(null);
   const layoutDrag = useRef<{ side: ResizeSide; startX: number; startLayout: WorkbenchLayout } | null>(null);
@@ -3069,7 +3068,6 @@ function Workbench({
 
   useEffect(() => {
     setPendingMessage((current) => pendingMessageForActiveSave(current, activeSaveId));
-    setPendingNarratorMessage((current) => pendingMessageForActiveSave(current, activeSaveId));
     setLookAroundAnswer(null);
   }, [activeSaveId]);
 
@@ -3245,7 +3243,6 @@ function Workbench({
         if (appliesToCurrentSave) {
           if (options.clearPendingMessages !== false) {
             setPendingMessage(null);
-            setPendingNarratorMessage(null);
           }
           refreshWorkbench(
             activeSaveIdRef.current,
@@ -3257,26 +3254,15 @@ function Workbench({
       (name, data) => {
         if (name === "runtime" && isRuntimeModel(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
           setPendingMessage(null);
-          setPendingNarratorMessage(null);
           applyRuntimeModel(data);
           client.invalidateQueries({ queryKey: ["chat", "submission-status", data.active_save_id ?? activeSaveIdRef.current] });
         }
         if (name === "chat_turn_delta" && isChatTurnDelta(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
           setPendingMessage(null);
-          setPendingNarratorMessage(null);
           if (!applyChatTurnDelta(data)) {
             refreshWorkbench(data.save_id, ALL_WORKBENCH_REFRESH_TARGETS);
           }
           client.invalidateQueries({ queryKey: ["chat", "submission-status", data.save_id] });
-        }
-        if (name === "narrator_draft" && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
-          const message = narratorDraftMessage(data);
-          if (message) {
-            setPendingNarratorMessage({
-              ...message,
-              pending_save_id: created.save_id ?? activeSaveIdRef.current
-            });
-          }
         }
         if (name === "progress") {
           const phases = postTurnProgressPhases(data);
@@ -3470,8 +3456,7 @@ function Workbench({
   const persistedChronicleMessages = model?.chronicle?.messages ?? [];
   const pendingAfterMessageId = persistedChronicleMessages[persistedChronicleMessages.length - 1]?.message_id ?? null;
   const activePendingMessage = pendingMessageForActiveSave(pendingMessage, activeSaveId);
-  const activePendingNarratorMessage = pendingMessageForActiveSave(pendingNarratorMessage, activeSaveId);
-  const activePendingMessages = [activePendingMessage, activePendingNarratorMessage].filter((message): message is PendingChronicleMessage => Boolean(message));
+  const activePendingMessages = [activePendingMessage].filter((message): message is PendingChronicleMessage => Boolean(message));
   const chatInputDisabled = !activeSaveSupported || !model?.composer_enabled || Boolean(activePendingMessage) || hasActiveSaveChatBlocker || !chatCanSubmit;
 
   return (
@@ -5028,7 +5013,6 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
                 aria-label={action.label}
                 disabled={
                   message.message_id === "pending-player-message"
-                  || message.message_id === "pending-narrator-message"
                   || actionPending
                   || mutationsDisabled
                 }
@@ -9603,25 +9587,6 @@ function characterTextsModelWithUpdatedThread(model: CharacterTextsModel, thread
 
 function isCharacterRegistryModel(value: unknown): value is CharacterRegistryModel {
   return Boolean(value && typeof value === "object" && "active_save_id" in value && "characters" in value);
-}
-
-function narratorDraftMessage(value: unknown): PendingChronicleMessage | null {
-  if (!value || typeof value !== "object" || !("message" in value)) return null;
-  const message = (value as { message?: unknown }).message;
-  if (!message || typeof message !== "object") return null;
-  const candidate = message as Partial<ChronicleMessage>;
-  if (candidate.message_id !== "pending-narrator-message") return null;
-  if (candidate.role !== "narrator" || typeof candidate.body !== "string") return null;
-  return {
-    message_id: "pending-narrator-message",
-    role: "narrator",
-    speaker_name: typeof candidate.speaker_name === "string" ? candidate.speaker_name : "Narrator",
-    body: candidate.body,
-    actions: [],
-    markdown_blocks: Array.isArray(candidate.markdown_blocks)
-      ? candidate.markdown_blocks
-      : [{ kind: "paragraph", spans: [{ kind: "text", text: candidate.body }] }]
-  };
 }
 
 function scenarioFlow(model: RuntimeModel | undefined, scenarioType: string): ScenarioWizardFlow | undefined {
