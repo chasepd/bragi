@@ -8989,6 +8989,43 @@ def _active_background_post_turn_jobs(
     ]
 
 
+_POST_TURN_CATCHUP_STATUS_TEXT = {
+    "waiting": "Waiting for prior turn continuity",
+    "succeeded": "Prior turn continuity is ready",
+    "failed": "Prior turn continuity catch-up failed; repair will retry",
+    "retry_pending": (
+        "Prior turn continuity is still catching up; retry pending"
+    ),
+    "cancelled": "Prior turn continuity catch-up cancelled",
+}
+
+
+def _post_turn_catchup_progress(
+    status: str,
+    *,
+    job_ids: list[str],
+) -> dict[str, object]:
+    status_text = _POST_TURN_CATCHUP_STATUS_TEXT.get(status)
+    if status_text is None:
+        raise ValueError(f"Unsupported post-turn catch-up status: {status}")
+    degraded = status in {"failed", "retry_pending"}
+    return {
+        "kind": "post_turn_catchup",
+        "status": status,
+        "status_text": status_text,
+        "continuity_degraded": degraded,
+        "retry_pending": degraded,
+        "job_ids": list(job_ids),
+        "jobs": [
+            {
+                "name": "post_turn_catchup",
+                "status": status,
+                "category": "continuity",
+            }
+        ],
+    }
+
+
 async def _wait_for_background_post_turn_catchup(
     state: WebAppState,
     handle: JobHandle,
@@ -9011,18 +9048,10 @@ async def _wait_for_background_post_turn_catchup(
     )
     if not active_jobs and not incomplete_outbox:
         return
-    waiting_payload = {
-        "status": "waiting",
-        "completion_level": RESPONSE_COMMITTED,
-        "label": "Waiting for prior turn continuity",
-    }
-    await handle.event("progress", waiting_payload)
+    job_ids = [job.id for job in active_jobs]
     await handle.event(
-        "post_turn_catchup",
-        {
-            "status": "waiting",
-            "job_ids": [job.id for job in active_jobs],
-        },
+        "progress",
+        _post_turn_catchup_progress("waiting", job_ids=job_ids),
     )
     try:
         async with asyncio.timeout(10):
@@ -9048,31 +9077,34 @@ async def _wait_for_background_post_turn_catchup(
                 if callable(recover)
                 else None
             )
-    except Exception as exc:
+    except asyncio.CancelledError:
         await handle.event(
-            "post_turn_catchup",
-            {
-                "status": "degraded",
-                "job_ids": [job.id for job in active_jobs],
-                "error": str(exc) or exc.__class__.__name__,
-            },
+            "progress",
+            _post_turn_catchup_progress("cancelled", job_ids=job_ids),
+        )
+        raise
+    except Exception as exc:
+        observe(
+            "web.post_turn_catchup_failed",
+            level="error",
+            save_id=save_id,
+            prior_job_ids=job_ids,
+            **error_fields(exc),
+        )
+        await handle.event(
+            "progress",
+            _post_turn_catchup_progress("failed", job_ids=job_ids),
         )
         return
     if result is not None and result.continuity_degraded:
         await handle.event(
-            "post_turn_catchup",
-            {
-                "status": "degraded",
-                "job_ids": [job.id for job in active_jobs],
-            },
+            "progress",
+            _post_turn_catchup_progress("retry_pending", job_ids=job_ids),
         )
         return
     await handle.event(
-        "post_turn_catchup",
-        {
-            "status": "succeeded",
-            "job_ids": [job.id for job in active_jobs],
-        },
+        "progress",
+        _post_turn_catchup_progress("succeeded", job_ids=job_ids),
     )
 
 

@@ -82,6 +82,7 @@ import {
   Job,
   JobStepsModel,
   JobStepSummary,
+  isPostTurnCatchupProgress,
   logClientEvent,
   MarkdownBlock,
   MediaAsset,
@@ -3185,6 +3186,7 @@ function Workbench({
 
   const runJob = useCallback<RunJob>((created, options = { applyResult: true }) => {
     if (!jobBelongsToActiveSave(created, activeSaveIdRef.current)) return () => undefined;
+    if (jobWatchers.current[created.id]) return jobWatchers.current[created.id];
     setTrackedJobs((current) => {
       const existing = current[created.id];
       return {
@@ -3192,7 +3194,6 @@ function Workbench({
         [created.id]: trackedActiveJob(created, existing)
       };
     });
-    if (jobWatchers.current[created.id]) return jobWatchers.current[created.id];
     const stop = watchJob(
       created.id,
       (done) => {
@@ -3281,9 +3282,16 @@ function Workbench({
           setTrackedJobs((current) => {
             const tracked = current[created.id];
             if (!tracked) return current;
+            const replacesCatchup = isPostTurnCatchupProgress(data)
+              || isPostTurnCatchupProgress(tracked.job.latest_progress);
             return {
               ...current,
-              [created.id]: { ...tracked, progress: progressLabel(data), phases: phases ?? tracked.phases }
+              [created.id]: {
+                ...tracked,
+                job: { ...tracked.job, latest_progress: data },
+                progress: progressLabel(data),
+                phases: phases ?? (replacesCatchup ? undefined : tracked.phases)
+              }
             };
           });
         }
@@ -5450,11 +5458,13 @@ function trackedActiveJob(created: Job, existing?: TrackedJob): TrackedJob {
   const progressFromJob = latestProgress === null ? null : progressLabel(latestProgress);
   const phasesFromJob = postTurnProgressPhases(latestProgress);
   const preservedProgress = existing?.progress && !["Queued", "Running"].includes(existing.progress) ? existing.progress : null;
-  const nextProgress = phasesFromJob ? progressFromJob : null;
+  const replacesCatchup = isPostTurnCatchupProgress(latestProgress)
+    || isPostTurnCatchupProgress(existing?.job.latest_progress);
+  const nextProgress = phasesFromJob || replacesCatchup ? progressFromJob : null;
   return {
     job: created,
     progress: nextProgress ?? preservedProgress ?? progressFromJob ?? firstProgress,
-    phases: phasesFromJob ?? existing?.phases
+    phases: phasesFromJob ?? (replacesCatchup ? undefined : existing?.phases)
   };
 }
 
@@ -9303,7 +9313,8 @@ function postTurnPhaseLabel(name: string): string {
     director: "Director pressure",
     scenario: "Scenario evolution",
     characters: "Character cleanup",
-    image: "Automatic image"
+    image: "Automatic image",
+    post_turn_catchup: "Prior turn continuity"
   };
   return labels[name] ?? labelize(name);
 }

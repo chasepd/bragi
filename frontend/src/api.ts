@@ -910,6 +910,28 @@ export type Job = {
   updated_at?: number;
   latest_progress?: unknown | null;
 };
+export type PostTurnCatchupStatus = "waiting" | "succeeded" | "failed" | "retry_pending" | "cancelled";
+export type PostTurnCatchupProgress = {
+  kind: "post_turn_catchup";
+  status: PostTurnCatchupStatus;
+  status_text: string;
+  continuity_degraded: boolean;
+  retry_pending: boolean;
+  job_ids: string[];
+  jobs: [{
+    name: "post_turn_catchup";
+    status: PostTurnCatchupStatus;
+    category: "continuity";
+  }];
+};
+
+export function isPostTurnCatchupProgress(value: unknown): value is PostTurnCatchupProgress {
+  if (!value || typeof value !== "object") return false;
+  const progress = value as Partial<PostTurnCatchupProgress>;
+  return progress.kind === "post_turn_catchup"
+    && typeof progress.status === "string"
+    && typeof progress.status_text === "string";
+}
 export type ChatSubmissionStatus = {
   save_id: string | null;
   can_submit: boolean;
@@ -1273,6 +1295,12 @@ export function watchJob(
         }
         closeWatcher();
         return;
+      }
+      if (job.latest_progress !== null && job.latest_progress !== undefined) {
+        onEvent?.("progress", job.latest_progress);
+      }
+      if (job.completion_level) {
+        onEvent?.("completion_level", { completion_level: job.completion_level });
       }
     } catch (failure) {
       if (failure instanceof ApiError && failure.status === 404) {
