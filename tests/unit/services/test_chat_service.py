@@ -121,7 +121,6 @@ from bragi.services.context_update_service import (
 )
 from bragi.services.dating_route_profile_service import (
     DATING_ROUTE_PROFILE_TASK,
-    DatingRouteProfileResult,
 )
 from bragi.services.director_pressure_service import (
     DIRECTOR_PRESSURE_ENABLED_SETTING,
@@ -2930,7 +2929,6 @@ def test_submit_player_turn_reports_pre_narrator_progress_phases(
     assert "Checking submitted content" in status_texts
     assert "Checking content and history" in status_texts
     assert "Saving player input" in status_texts
-    assert "Dating route profile skipped" in status_texts
     assert "Selecting context" in status_texts
     assert "Preparing narrator prompt" in status_texts
     assert "Writing narrator response" in status_texts
@@ -2945,7 +2943,6 @@ def test_submit_player_turn_reports_pre_narrator_progress_phases(
         "classification": "succeeded",
         "history": "succeeded",
         "input": "succeeded",
-        "dating_route_profile": "skipped",
         "character_planning": "skipped",
         "context_selection": "succeeded",
         "prompt": "succeeded",
@@ -4996,7 +4993,7 @@ def test_submit_player_turn_allows_later_stage_commitment_language(
     )
 
 
-def test_submit_player_turn_profiles_dating_route_before_narrator_prompt(
+def test_submit_player_turn_uses_dating_route_fallback_without_profiling(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, _player_id, npc_id = _create_dating_chat_save(
@@ -5042,17 +5039,15 @@ def test_submit_player_turn_profiles_dating_route_before_narrator_prompt(
     )
 
     route = repositories.list_dating_route_states(save_id)[0]
-    assert provider.events[:2] == ["dating_route_profile", "chat"]
-    assert route.comfort_with_intimacy.startswith("open to physical intimacy")
-    assert route.pacing_preference == "direct and chemistry-led"
+    assert provider.events == ["chat"]
+    assert route.comfort_with_intimacy == ""
+    assert route.pacing_preference == ""
     request = provider.chat_requests[0]
     route_context = "\n".join(request.current_scene_recap)
-    assert "comfort with intimacy: open to physical intimacy" in route_context
-    assert "pacing: direct and chemistry-led" in route_context
-    assert "sexual escalation" not in route_context
+    assert "no route-specific intimacy profile is established yet" in route_context
 
 
-def test_submit_player_turn_captures_profiled_route_state_in_player_snapshot(
+def test_submit_player_turn_does_not_capture_profile_snapshot_when_routes_exist(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, _player_id, _npc_id = _create_dating_chat_save(
@@ -5071,35 +5066,10 @@ def test_submit_player_turn_captures_profiled_route_state_in_player_snapshot(
         model_id="fake-chat",
     )
 
-    class MutatingProfileRunner:
-        async def ensure_profiles_for_save(
-            self,
-            *,
-            save_id: str,
-            source_message_id: str | None = None,
-        ) -> DatingRouteProfileResult:
-            route = repositories.list_dating_route_states(save_id)[0]
-            repositories.upsert_dating_route_state(
-                save_id=save_id,
-                player_character_id=route.player_character_id,
-                npc_character_id=route.npc_character_id,
-                stage=route.stage,
-                comfort_with_intimacy="profiled before narrator prompt",
-                pacing_preference="profiled pacing",
-                source_message_id=source_message_id,
-                route_id=route.id,
-            )
-            return DatingRouteProfileResult(
-                status="succeeded",
-                updated_count=1,
-                requested_count=1,
-            )
-
     service = ChatService(
         repositories=repositories,
         providers={"fake": RecordingChatProvider("fake")},
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
-        dating_route_profile_service=MutatingProfileRunner(),
     )
 
     result = asyncio.run(
@@ -5115,11 +5085,8 @@ def test_submit_player_turn_captures_profiled_route_state_in_player_snapshot(
         save_id=save_id,
         message_id=result.player_message.id,
     )
-    route = repositories.list_dating_route_states(save_id)[0]
     assert snapshot is not None
-    assert snapshot.reason == "pre_turn_dating_route_profile"
-    assert route.comfort_with_intimacy == "profiled before narrator prompt"
-    assert route.pacing_preference == "profiled pacing"
+    assert snapshot.reason != "pre_turn_dating_route_profile"
 
 
 def test_submit_player_turn_keeps_dating_route_anchor_after_setup_ages_out(

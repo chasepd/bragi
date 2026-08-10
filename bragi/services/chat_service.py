@@ -136,10 +136,6 @@ from bragi.services.context_update_service import (
     _continuity_key_slug,
 )
 from bragi.services.continuity_index_service import ContinuityIndexService
-from bragi.services.dating_route_profile_service import (
-    DatingRouteProfileResult,
-    DatingRouteProfileService,
-)
 from bragi.services.dating_route_service import DatingRouteService
 from bragi.services.director_pressure_service import (
     DirectorPressureResult,
@@ -540,7 +536,6 @@ CHAT_TURN_PROGRESS_JOB_ORDER = (
     "classification",
     "history",
     "input",
-    "dating_route_profile",
     "character_planning",
     "context_selection",
     "prompt",
@@ -810,15 +805,6 @@ class CharacterMaintenancePostTurnRunner(Protocol):
     async def maintain_if_due(self, *, save_id: str) -> object: ...
 
 
-class DatingRouteProfileRunner(Protocol):
-    async def ensure_profiles_for_save(
-        self,
-        *,
-        save_id: str,
-        source_message_id: str | None = None,
-    ) -> DatingRouteProfileResult: ...
-
-
 class WorldContextRetentionRunner(Protocol):
     def prune(self, save_id: str) -> object: ...
 
@@ -968,7 +954,6 @@ class ChatService:
         ) = None,
         world_time_service: WorldTimeRunner | None = None,
         director_pressure_service: DirectorPressureRunner | None = None,
-        dating_route_profile_service: DatingRouteProfileRunner | None = None,
         character_maintenance_service: (
             CharacterMaintenancePostTurnRunner | None
         ) = None,
@@ -997,7 +982,6 @@ class ChatService:
         self.character_action_planning_service = character_action_planning_service
         self.world_time_service = world_time_service
         self.director_pressure_service = director_pressure_service
-        self.dating_route_profile_service = dating_route_profile_service
         self.character_maintenance_service = character_maintenance_service
         self.world_context_retention_service = (
             world_context_retention_service
@@ -1682,42 +1666,18 @@ class ChatService:
                 started_at=stage_started,
             )
 
-        stage_started = perf_counter()
-        turn_progress.publish(
-            "dating_route_profile",
-            "running",
-            "Profiling dating route pacing",
-        )
-        profile_result = await self._ensure_dating_route_profiles_if_configured(
+        seeded_route_count = DatingRouteService(
+            self.repositories
+        ).seed_routes_for_save(
             save_id=save_id,
             source_message_id=player_message.id,
+            details=details,
         )
-        profile_status = (
-            "skipped" if profile_result.skipped_reason else profile_result.status
-        )
-        turn_progress.publish(
-            "dating_route_profile",
-            profile_status,
-            (
-                "Dating route profile skipped"
-                if profile_status == "skipped"
-                else "Dating route profile checked"
-            ),
-        )
-        _log_chat_stage(
-            "chat.stage.dating_route_profile_finished",
-            save_id=save_id,
-            started_at=stage_started,
-            player_message_id=player_message.id,
-            status=profile_result.status,
-            updated_count=profile_result.updated_count,
-            requested_count=profile_result.requested_count,
-            skipped_reason=profile_result.skipped_reason,
-        )
-        TurnSnapshotService(self.repositories).capture_current_head_if_dirty(
-            save_id,
-            reason="pre_turn_dating_route_profile",
-        )
+        if seeded_route_count:
+            TurnSnapshotService(self.repositories).capture_current_head_if_dirty(
+                save_id,
+                reason="pre_turn_dating_route_seed",
+            )
         throw_if_cancelled_after_job()
 
         async def run_character_planning_stage() -> CharacterActionPlanningResult:
@@ -6216,38 +6176,6 @@ class ChatService:
                 **exception_log_fields(exc),
             )
             return CharacterActionPlanningResult(skipped_reason="failed")
-
-    async def _ensure_dating_route_profiles_if_configured(
-        self,
-        *,
-        save_id: str,
-        source_message_id: str | None,
-    ) -> DatingRouteProfileResult:
-        if _save_is_storyteller(self.repositories, save_id):
-            return DatingRouteProfileResult(
-                status="skipped",
-                skipped_reason="storyteller_mode",
-            )
-        service = self.dating_route_profile_service or DatingRouteProfileService(
-            repositories=self.repositories,
-            providers=self.providers,
-        )
-        try:
-            return await service.ensure_profiles_for_save(
-                save_id=save_id,
-                source_message_id=source_message_id,
-            )
-        except Exception as exc:  # noqa: BLE001 - best-effort prompt enrichment
-            log_error_event(
-                "chat.dating_route_profile_failed",
-                save_id=save_id,
-                source_message_id=source_message_id,
-                **exception_log_fields(exc),
-            )
-            return DatingRouteProfileResult(
-                status="skipped",
-                skipped_reason="failed",
-            )
 
     async def _assess_director_pressure_after_turn_if_configured(
         self,

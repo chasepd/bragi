@@ -11,6 +11,7 @@ from bragi.persistence.models import (
     CharacterRecord,
     DatingRouteStateRecord,
     MessageRecord,
+    SaveDetailsRecord,
     ScenarioRecord,
 )
 from bragi.persistence.repositories import PersistenceRepositories
@@ -42,8 +43,9 @@ class DatingRouteService:
         save_id: str,
         *,
         source_message_id: str | None = None,
+        details: SaveDetailsRecord | None = None,
     ) -> int:
-        details = self.repositories.load_save_details(save_id)
+        details = details or self.repositories.load_save_details(save_id)
         if (
             details is None
             or details.save.interaction_mode is InteractionMode.STORYTELLER
@@ -94,6 +96,16 @@ class DatingRouteService:
                 source_message_id=source_message_id,
             )
             seeded += 1
+        if seeded:
+            from bragi.services.dating_route_profile_service import (
+                enqueue_dating_route_profile_enrichment,
+            )
+
+            enqueue_dating_route_profile_enrichment(
+                self.repositories,
+                save_id=save_id,
+                force_due=True,
+            )
         return seeded
 
     def update_after_turn(

@@ -14,6 +14,9 @@ from bragi.persistence.models import (
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.redaction import redact_text
 from bragi.services.dating_route_policy import ROUTE_STAGE_RANK, next_reasonable_step
+from bragi.services.dating_route_profile_service import (
+    enqueue_dating_route_profile_enrichment,
+)
 from bragi.services.dating_route_service import (
     _date_completed,
     _date_planned,
@@ -403,6 +406,12 @@ class DatingSimMaintenanceService:
             source_message_id=repair.last_interaction_message_id
             or repair.first_met_message_id,
         )
+        if existing is None:
+            enqueue_dating_route_profile_enrichment(
+                self.repositories,
+                save_id=save_id,
+                force_due=True,
+            )
         self.repositories.add_context_update_audit(
             save_id=save_id,
             operation="dating_sim_maintenance_apply",

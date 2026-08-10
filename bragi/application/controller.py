@@ -161,6 +161,10 @@ from bragi.services.continuation_scenario_service import (
     ContinuationScenarioService,
     seed_continuation_characters,
 )
+from bragi.services.dating_route_profile_service import (
+    DatingRouteProfileResult,
+    DatingRouteProfileService,
+)
 from bragi.services.dating_route_service import DatingRouteService
 from bragi.services.knowledge_boundary import (
     knowledge_edge_allows_prompt_use,
@@ -3914,6 +3918,29 @@ class BragiRuntime:
             status="World state cleanup complete.",
             active_save_id=save_id,
         )
+
+    async def run_dating_route_profile_enrichment(
+        self,
+        *,
+        active_save_id: str | None | object = ...,
+    ) -> DatingRouteProfileResult:
+        save_id = (
+            self.active_save_id
+            if active_save_id is ...
+            else cast(str | None, active_save_id)
+        )
+        if save_id is None:
+            raise ValueError("No active save selected")
+        result = await DatingRouteProfileService(
+            repositories=self.repositories,
+            providers=self.providers,
+        ).ensure_profiles_for_save(save_id=save_id)
+        if result.requested_count and result.skipped_reason:
+            raise RuntimeError(
+                "Dating-route profile enrichment deferred: "
+                f"{result.skipped_reason}"
+            )
+        return result
 
     async def run_context_update_retries(
         self,
