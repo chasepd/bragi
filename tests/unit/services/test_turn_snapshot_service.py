@@ -3711,6 +3711,84 @@ def test_dirty_row_capture_serializes_only_changed_row(
     assert stored_row_kinds == ["row:world_state"]
 
 
+def test_character_text_edit_serializes_only_changed_row(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="A message arrives.",
+    )
+    character = repositories.add_character(
+        character_id="rowan",
+        save_id=save.id,
+        name="Rowan",
+        source_message_id=narrator.id,
+    )
+    thread = repositories.get_or_create_character_text_thread(
+        save_id=save.id,
+        character_id=character.id,
+        title="Rowan",
+    )
+    text_message = repositories.append_character_text_message(
+        message_id="text-one",
+        save_id=save.id,
+        thread_id=thread.id,
+        character_id=character.id,
+        sender="character",
+        body="Meet me by the south gate.",
+        in_world_sent_at="Friday evening",
+        delivered_at="2026-07-01T12:05:00+00:00",
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=save.id, message_id=narrator.id)
+    repositories.update_character_text_message_body(
+        save_id=save.id,
+        message_id=text_message.id,
+        body="Meet me by the north gate.",
+    )
+    stored_row_kinds: list[str] = []
+    original_store_object = service._store_object
+
+    def record_store(*, kind: str, value: object) -> str:
+        if kind.startswith("row:"):
+            stored_row_kinds.append(kind)
+        return original_store_object(kind=kind, value=value)
+
+    def fail_active_scan(_save_id: str) -> object:
+        raise AssertionError("character-text edit scanned active tables")
+
+    monkeypatch.setattr(service, "_store_object", record_store)
+    monkeypatch.setattr(service, "_active_rows_by_table", fail_active_scan)
+
+    service.capture_current_head_if_dirty(save.id)
+
+    assert stored_row_kinds == ["row:character_text_messages"]
+
+
+def test_snapshot_manifest_cannot_be_repointed_across_saves(
+    repositories: PersistenceRepositories,
+) -> None:
+    first = _create_save(repositories)
+    second = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    first_snapshot = service.capture_baseline_snapshot(first.id)
+    second_snapshot = service.capture_baseline_snapshot(second.id)
+    repositories.connection.execute(
+        "UPDATE save_turn_snapshots SET root_manifest_hash = ? WHERE id = ?",
+        (second_snapshot.root_manifest_hash, first_snapshot.id),
+    )
+    repositories.commit()
+
+    with pytest.raises(ValueError, match="wrong save id"):
+        service.restore_save_to_snapshot(
+            save_id=first.id,
+            snapshot_id=first_snapshot.id,
+        )
+
+
 def test_rolled_back_row_change_does_not_dirty_materialized_snapshot(
     repositories: PersistenceRepositories,
 ) -> None:

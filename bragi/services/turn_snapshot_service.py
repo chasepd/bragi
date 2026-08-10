@@ -1226,6 +1226,8 @@ class TurnSnapshotService:
         if base_row is None:
             return None
         base_snapshot = self._get_snapshot(str(base_row["base_snapshot_id"]))
+        if base_snapshot.save_id != save_id:
+            raise ValueError("Incremental snapshot base belongs to another save")
         base_manifest = self._snapshot_manifest(base_snapshot)
         if base_manifest.get("format") != SNAPSHOT_FORMAT_V2:
             return None
@@ -1243,6 +1245,25 @@ class TurnSnapshotService:
         ).fetchall()
         if not dirty_rows:
             return None
+        dirty_message_ids = tuple(
+            str(row["row_key"])
+            for row in dirty_rows
+            if row["table_name"] == "messages"
+        )
+        if dirty_message_ids:
+            self._queue_message_reference_dependents(
+                save_id,
+                dirty_message_ids,
+            )
+            dirty_rows = self.repositories.connection.execute(
+                """
+                SELECT table_name, row_key, generation
+                FROM save_snapshot_dirty_rows
+                WHERE save_id = ?
+                ORDER BY generation, table_name, row_key
+                """,
+                (save_id,),
+            ).fetchall()
         table_roots = {
             table_name: (
                 str(raw_roots[table_name])
@@ -1255,37 +1276,25 @@ class TurnSnapshotService:
             tuple[
                 _SnapshotTable,
                 str,
-                dict[str, object],
+                dict[str, object] | None,
                 sqlite3.Row | None,
                 str | None,
             ]
         ] = []
-        complex_tables = {
-            "character_text_threads",
-            "character_text_thread_participants",
-            "character_text_messages",
-            "character_text_activity_events",
-            "narrator_phone_activity_cursors",
-            "character_text_message_revisions",
-            "character_text_message_attachments",
-            "character_text_provenance",
-            "character_contact_states",
-            "character_text_proactive_triggers",
-        }
         for dirty in dirty_rows:
             table_name = str(dirty["table_name"])
             table = _TABLES_BY_NAME.get(table_name)
             if table is None:
                 return None
-            if table_name in complex_tables:
-                return self._prepare_cached_graph_incremental_snapshot(
-                    save_id=save_id,
-                    message_id=message_id,
-                    base_manifest=base_manifest,
-                    table_roots=table_roots,
-                    dirty_rows=dirty_rows,
-                )
             row_key = str(dirty["row_key"])
+            previous = self.repositories.connection.execute(
+                """
+                SELECT object_hash, order_key, ordinal, included
+                FROM save_snapshot_row_state
+                WHERE save_id = ? AND table_name = ? AND row_key = ?
+                """,
+                (save_id, table_name, row_key),
+            ).fetchone()
             live_row = self.repositories.connection.execute(
                 f"""
                 SELECT *
@@ -1295,36 +1304,21 @@ class TurnSnapshotService:
                 (save_id, row_key),
             ).fetchone()
             if live_row is None:
-                return self._prepare_cached_graph_incremental_snapshot(
-                    save_id=save_id,
-                    message_id=message_id,
-                    base_manifest=base_manifest,
-                    table_roots=table_roots,
-                    dirty_rows=dirty_rows,
-                )
+                pending.append((table, row_key, None, previous, None))
+                continue
             row = _row_dict(live_row)
             recheck_at = _snapshot_row_recheck_at(table.name, row)
             if table.name in {"messages", "character_text_messages"}:
                 if row.get("deleted_at") is not None:
-                    return self._prepare_cached_graph_incremental_snapshot(
-                        save_id=save_id,
-                        message_id=message_id,
-                        base_manifest=base_manifest,
-                        table_roots=table_roots,
-                        dirty_rows=dirty_rows,
-                    )
+                    pending.append((table, row_key, None, previous, None))
+                    continue
             elif (
                 table.active_only
                 and "archived_at" in self._column_names(table.name)
                 and row.get("archived_at") is not None
             ):
-                return self._prepare_cached_graph_incremental_snapshot(
-                    save_id=save_id,
-                    message_id=message_id,
-                    base_manifest=base_manifest,
-                    table_roots=table_roots,
-                    dirty_rows=dirty_rows,
-                )
+                pending.append((table, row_key, None, previous, None))
+                continue
             if table.name == "messages":
                 row = _sanitize_snapshot_message_row(row)
                 if is_fade_to_black_message(
@@ -1332,13 +1326,8 @@ class TurnSnapshotService:
                     body=str(row.get("body", "")),
                     safety_transition=str(row.get("safety_transition", "")),
                 ):
-                    return self._prepare_cached_graph_incremental_snapshot(
-                        save_id=save_id,
-                        message_id=message_id,
-                        base_manifest=base_manifest,
-                        table_roots=table_roots,
-                        dirty_rows=dirty_rows,
-                    )
+                    pending.append((table, row_key, None, previous, None))
+                    continue
             elif table.name == "context_observation_curation_state":
                 row = portable_context_observation_curation_state_row(row)
             elif table.name == "save_scenario_updates":
@@ -1348,26 +1337,45 @@ class TurnSnapshotService:
                 table.name,
                 row,
             ):
-                return self._prepare_cached_graph_incremental_snapshot(
-                    save_id=save_id,
-                    message_id=message_id,
-                    base_manifest=base_manifest,
-                    table_roots=table_roots,
-                    dirty_rows=dirty_rows,
+                if table.name not in _SNAPSHOT_KEEP_ENTITY_TABLES:
+                    pending.append((table, row_key, None, previous, None))
+                    continue
+                row = self._clear_incremental_scalar_references(
+                    save_id,
+                    table.name,
+                    row,
                 )
-            previous = self.repositories.connection.execute(
-                """
-                SELECT object_hash, order_key, ordinal, included
-                FROM save_snapshot_row_state
-                WHERE save_id = ? AND table_name = ? AND row_key = ?
-                """,
-                (save_id, table_name, row_key),
-            ).fetchone()
             pending.append((table, row_key, row, previous, recheck_at))
 
-        for table, row_key, row, previous, recheck_at in pending:
+        for table, row_key, pending_row, previous, recheck_at in pending:
             table_name = table.name
             root_hash = table_roots[table_name]
+            if pending_row is None:
+                if previous is not None and bool(previous["included"]):
+                    previous_order_key = cast(str | None, previous["order_key"])
+                    if previous_order_key is not None:
+                        root_hash = self._tree_delete(
+                            table_name=table_name,
+                            root_hash=root_hash,
+                            order_key=previous_order_key,
+                        )
+                table_roots[table_name] = root_hash
+                self.repositories.connection.execute(
+                    """
+                    DELETE FROM save_snapshot_row_state
+                    WHERE save_id = ? AND table_name = ? AND row_key = ?
+                    """,
+                    (save_id, table_name, row_key),
+                )
+                self.repositories.connection.execute(
+                    """
+                    UPDATE save_snapshot_table_state SET root_hash = ?
+                    WHERE save_id = ? AND table_name = ?
+                    """,
+                    (root_hash, save_id, table_name),
+                )
+                continue
+            row = pending_row
             if previous is None:
                 ordinal_row = self.repositories.connection.execute(
                     """
@@ -1456,194 +1464,6 @@ class TurnSnapshotService:
             object_count=len(pending),
         )
 
-    def _prepare_cached_graph_incremental_snapshot(
-        self,
-        *,
-        save_id: str,
-        message_id: str | None,
-        base_manifest: Mapping[str, object],
-        table_roots: dict[str, str | None],
-        dirty_rows: list[sqlite3.Row],
-    ) -> _PreparedSnapshot:
-        """Apply graph-sensitive changes to the cached snapshot, not live tables."""
-        cached_rows = self._rows_from_manifest(base_manifest)
-        mutable_rows = {
-            table_name: {
-                _snapshot_row_key(_TABLES_BY_NAME[table_name], row): dict(row)
-                for row in rows
-            }
-            for table_name, rows in cached_rows.items()
-        }
-        for dirty in dirty_rows:
-            table_name = str(dirty["table_name"])
-            table = _TABLES_BY_NAME.get(table_name)
-            if table is None:
-                continue
-            row_key = str(dirty["row_key"])
-            live_row = self.repositories.connection.execute(
-                f"SELECT * FROM {table.name} "
-                f"WHERE save_id = ? AND {table.primary_key} = ?",
-                (save_id, row_key),
-            ).fetchone()
-            row = _row_dict(live_row) if live_row is not None else None
-            excluded = row is None
-            if row is not None and table.name in {
-                "messages",
-                "character_text_messages",
-            }:
-                excluded = row.get("deleted_at") is not None
-            elif (
-                row is not None
-                and table.active_only
-                and "archived_at" in self._column_names(table.name)
-            ):
-                excluded = row.get("archived_at") is not None
-            if excluded:
-                mutable_rows.setdefault(table_name, {}).pop(row_key, None)
-            else:
-                assert row is not None
-                mutable_rows.setdefault(table_name, {})[row_key] = row
-
-        sanitized = _sanitize_snapshot_rows_for_safety(
-            {
-                table_name: tuple(table_rows.values())
-                for table_name, table_rows in mutable_rows.items()
-            }
-        )
-        object_count = 0
-        for table_name in _SNAPSHOT_TABLE_NAMES:
-            table = _TABLES_BY_NAME[table_name]
-            table_state = self.repositories.connection.execute(
-                """
-                SELECT next_ordinal FROM save_snapshot_table_state
-                WHERE save_id = ? AND table_name = ?
-                """,
-                (save_id, table_name),
-            ).fetchone()
-            next_ordinal = int(table_state["next_ordinal"] if table_state else 0)
-            previous_states = {
-                str(row["row_key"]): row
-                for row in self.repositories.connection.execute(
-                    """
-                    SELECT row_key, object_hash, order_key, ordinal, included
-                    FROM save_snapshot_row_state
-                    WHERE save_id = ? AND table_name = ?
-                    """,
-                    (save_id, table_name),
-                ).fetchall()
-            }
-            next_rows = {
-                _snapshot_row_key(table, row): row
-                for row in sanitized.get(table_name, ())
-            }
-            root_hash = table_roots[table_name]
-            for row_key, previous in previous_states.items():
-                if row_key in next_rows or not bool(previous["included"]):
-                    continue
-                previous_order_key = cast(str | None, previous["order_key"])
-                if previous_order_key is not None:
-                    root_hash = self._tree_delete(
-                        table_name=table_name,
-                        root_hash=root_hash,
-                        order_key=previous_order_key,
-                    )
-                self.repositories.connection.execute(
-                    """
-                    DELETE FROM save_snapshot_row_state
-                    WHERE save_id = ? AND table_name = ? AND row_key = ?
-                    """,
-                    (save_id, table_name, row_key),
-                )
-            for row_key, row in next_rows.items():
-                previous = previous_states.get(row_key)
-                object_hash = self._store_object(
-                    kind=f"row:{table_name}",
-                    value=row,
-                )
-                if previous is not None and str(previous["object_hash"]) == object_hash:
-                    continue
-                if previous is None:
-                    ordinal = next_ordinal
-                    next_ordinal += 1
-                else:
-                    ordinal = int(previous["ordinal"])
-                    previous_order_key = cast(str | None, previous["order_key"])
-                    if previous_order_key is not None and bool(previous["included"]):
-                        root_hash = self._tree_delete(
-                            table_name=table_name,
-                            root_hash=root_hash,
-                            order_key=previous_order_key,
-                        )
-                order_key = _snapshot_tree_order_key(
-                    table,
-                    row=row,
-                    row_key=row_key,
-                    ordinal=ordinal,
-                )
-                root_hash = self._tree_insert(
-                    table_name=table_name,
-                    root_hash=root_hash,
-                    order_key=order_key,
-                    row_key=row_key,
-                    row_hash=object_hash,
-                )
-                self.repositories.connection.execute(
-                    """
-                    INSERT INTO save_snapshot_row_state(
-                        save_id, table_name, row_key, object_hash,
-                        order_key, ordinal, included, recheck_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-                    ON CONFLICT(save_id, table_name, row_key) DO UPDATE SET
-                        object_hash = excluded.object_hash,
-                        order_key = excluded.order_key,
-                        ordinal = excluded.ordinal,
-                        included = 1,
-                        recheck_at = excluded.recheck_at
-                    """,
-                    (
-                        save_id,
-                        table_name,
-                        row_key,
-                        object_hash,
-                        order_key,
-                        ordinal,
-                        _snapshot_row_recheck_at(table_name, row),
-                    ),
-                )
-                object_count += 1
-            table_roots[table_name] = root_hash
-            self.repositories.connection.execute(
-                """
-                UPDATE save_snapshot_table_state
-                SET root_hash = ?,
-                    next_ordinal = MAX(next_ordinal, ?)
-                WHERE save_id = ? AND table_name = ?
-                """,
-                (
-                    root_hash,
-                    next_ordinal,
-                    save_id,
-                    table_name,
-                ),
-            )
-        context_revision = self._context_revision(save_id)
-        root_manifest_hash = self._store_object(
-            kind="snapshot_manifest",
-            value={
-                "format": SNAPSHOT_FORMAT_V2,
-                "save_id": save_id,
-                "message_id": message_id,
-                "context_revision": context_revision,
-                "table_roots": table_roots,
-            },
-        )
-        return _PreparedSnapshot(
-            root_manifest_hash=root_manifest_hash,
-            context_revision=context_revision,
-            table_roots=table_roots,
-            object_count=object_count,
-        )
-
     def _incremental_row_references_are_active(
         self,
         save_id: str,
@@ -1684,9 +1504,98 @@ class TurnSnapshotService:
                 (save_id, value),
             ).fetchone() is None:
                 return False
-        if table_name == "world_state" and row.get("key") != "story.director_pressure":
-            return True
-        return table_name not in _JSON_ENTITY_REFERENCE_FIELDS
+        return True
+
+    def _queue_message_reference_dependents(
+        self,
+        save_id: str,
+        message_ids: tuple[str, ...],
+    ) -> None:
+        placeholders = _placeholders(len(message_ids))
+        for table in _SNAPSHOT_TABLES:
+            columns = self._column_names(table.name)
+            reference_columns = sorted(_MESSAGE_REFERENCE_COLUMNS & columns)
+            if not reference_columns:
+                continue
+            predicate = " OR ".join(
+                f"{column} IN ({placeholders})" for column in reference_columns
+            )
+            parameters: tuple[object, ...] = (
+                save_id,
+                *(message_ids * len(reference_columns)),
+            )
+            row_keys = self.repositories.connection.execute(
+                f"SELECT {table.primary_key} FROM {table.name} "
+                f"WHERE save_id = ? AND ({predicate})",
+                parameters,
+            ).fetchall()
+            if not row_keys:
+                continue
+            self.repositories.connection.execute(
+                """
+                UPDATE save_snapshot_table_state
+                SET current_generation = current_generation + 1
+                WHERE save_id = ? AND table_name = ?
+                """,
+                (save_id, table.name),
+            )
+            for row in row_keys:
+                self.repositories.connection.execute(
+                    """
+                    INSERT INTO save_snapshot_dirty_rows(
+                        save_id, table_name, row_key, generation
+                    )
+                    SELECT ?, ?, ?, current_generation
+                    FROM save_snapshot_table_state
+                    WHERE save_id = ? AND table_name = ?
+                    ON CONFLICT(save_id, table_name, row_key) DO UPDATE SET
+                        generation = excluded.generation
+                    """,
+                    (
+                        save_id,
+                        table.name,
+                        str(row[table.primary_key]),
+                        save_id,
+                        table.name,
+                    ),
+                )
+
+    def _clear_incremental_scalar_references(
+        self,
+        save_id: str,
+        table_name: str,
+        row: Mapping[str, object],
+    ) -> dict[str, object]:
+        cleared = dict(row)
+        for column in _MESSAGE_REFERENCE_COLUMNS:
+            value = cleared.get(column)
+            if not isinstance(value, str) or not value:
+                continue
+            active = self.repositories.connection.execute(
+                """
+                SELECT 1 FROM messages
+                WHERE save_id = ? AND id = ? AND deleted_at IS NULL
+                """,
+                (save_id, value),
+            ).fetchone()
+            if active is None:
+                cleared[column] = None
+        for column, target_table_name in _TABLE_REFERENCE_COLUMNS.get(
+            table_name,
+            {},
+        ).items():
+            value = cleared.get(column)
+            if not isinstance(value, str) or not value:
+                continue
+            target = _TABLES_BY_NAME[target_table_name]
+            active = self.repositories.connection.execute(
+                f"SELECT 1 FROM {target.name} "
+                f"WHERE save_id = ? AND {target.primary_key} = ?",
+                (save_id, value),
+            ).fetchone()
+            if active is None:
+                cleared[column] = None
+        return cleared
 
     def _queue_due_snapshot_rechecks(self, save_id: str) -> None:
         due_rows = self.repositories.connection.execute(
@@ -2158,10 +2067,17 @@ class TurnSnapshotService:
         self,
         table_name: str,
         object_hash: str,
+        *,
+        byte_budget: list[int] | None = None,
+        json_node_budget: list[int] | None = None,
+        cache: dict[str, tuple[str, object]] | None = None,
     ) -> dict[str, object]:
         value = self._load_object(
             object_hash,
             expected_kind=f"snapshot_table_node:{table_name}",
+            byte_budget=byte_budget,
+            json_node_budget=json_node_budget,
+            cache=cache,
         )
         if not isinstance(value, dict) or value.get("table") != table_name:
             raise ValueError(f"Invalid snapshot table node: {object_hash}")
@@ -2172,6 +2088,9 @@ class TurnSnapshotService:
         *,
         table_name: str,
         root_hash: str | None,
+        byte_budget: list[int] | None = None,
+        json_node_budget: list[int] | None = None,
+        cache: dict[str, tuple[str, object]] | None = None,
     ) -> tuple[tuple[str, str], ...]:
         if root_hash is None:
             return ()
@@ -2186,7 +2105,13 @@ class TurnSnapshotService:
                 seen.add(object_hash)
                 if len(seen) > _MAX_SNAPSHOT_MANIFEST_ENTRIES:
                     raise ValueError("Snapshot table tree contains too many entries")
-            node = self._load_tree_node(table_name, object_hash)
+            node = self._load_tree_node(
+                table_name,
+                object_hash,
+                byte_budget=byte_budget,
+                json_node_budget=json_node_budget,
+                cache=cache,
+            )
             if expanded:
                 entries.append((_text(node, "row_key"), _text(node, "row_hash")))
                 right_hash = _optional_text(node, "right_hash")
@@ -2250,6 +2175,8 @@ class TurnSnapshotService:
             SNAPSHOT_FORMAT_V2,
         }:
             raise ValueError(f"Invalid snapshot manifest: {snapshot.id}")
+        if manifest.get("save_id") != snapshot.save_id:
+            raise ValueError(f"Snapshot manifest has wrong save id: {snapshot.id}")
         return cast(dict[str, object], manifest)
 
     def _load_object(
@@ -2257,7 +2184,15 @@ class TurnSnapshotService:
         object_hash: str,
         *,
         expected_kind: str | None = None,
+        byte_budget: list[int] | None = None,
+        json_node_budget: list[int] | None = None,
+        cache: dict[str, tuple[str, object]] | None = None,
     ) -> object:
+        if cache is not None and object_hash in cache:
+            cached_kind, cached_value = cache[object_hash]
+            if expected_kind is not None and cached_kind != expected_kind:
+                raise ValueError(f"Unexpected snapshot object kind: {object_hash}")
+            return cached_value
         row = self.repositories.connection.execute(
             """
             SELECT kind, encoding, payload, uncompressed_size
@@ -2279,6 +2214,15 @@ class TurnSnapshotService:
             or declared_size > _MAX_SNAPSHOT_OBJECT_UNCOMPRESSED_BYTES
         ):
             raise ValueError(f"Snapshot object is too large: {object_hash}")
+        if byte_budget is not None:
+            if declared_size > byte_budget[0]:
+                raise ValueError("Snapshot objects exceed total size limit")
+            byte_budget[0] -= declared_size
+        remaining_json_nodes = _MAX_SNAPSHOT_OBJECT_JSON_NODES
+        if json_node_budget is not None:
+            remaining_json_nodes = min(remaining_json_nodes, json_node_budget[0])
+            if remaining_json_nodes <= 0:
+                raise ValueError("Snapshot JSON contains too many values")
         try:
             decompressor = zlib.decompressobj()
             payload = decompressor.decompress(
@@ -2292,9 +2236,9 @@ class TurnSnapshotService:
             ):
                 raise ValueError(f"Snapshot object size mismatch: {object_hash}")
             payload += decompressor.flush()
-            validate_json_structure(
+            node_count = validate_json_structure(
                 payload,
-                max_nodes=_MAX_SNAPSHOT_OBJECT_JSON_NODES,
+                max_nodes=remaining_json_nodes,
                 max_depth=_MAX_SNAPSHOT_OBJECT_JSON_DEPTH,
             )
             value = json.loads(payload.decode("utf-8"))
@@ -2312,6 +2256,10 @@ class TurnSnapshotService:
             payload=payload,
         ) != object_hash:
             raise ValueError(f"Snapshot object hash mismatch: {object_hash}")
+        if json_node_budget is not None:
+            json_node_budget[0] -= node_count
+        if cache is not None:
+            cache[object_hash] = (kind, value)
         return value
 
     def _reachable_snapshot_object_hashes(self) -> set[str]:
@@ -2323,8 +2271,18 @@ class TurnSnapshotService:
             """
         ).fetchall()
         reachable = {str(row["root_manifest_hash"]) for row in rows}
+        byte_budget = [_MAX_SNAPSHOT_TOTAL_UNCOMPRESSED_BYTES]
+        json_node_budget = [_MAX_SNAPSHOT_TOTAL_JSON_NODES]
+        object_cache: dict[str, tuple[str, object]] = {}
+        tree_node_count = 0
         for object_hash in tuple(reachable):
-            manifest = self._load_object(object_hash)
+            manifest = self._load_object(
+                object_hash,
+                expected_kind="snapshot_manifest",
+                byte_budget=byte_budget,
+                json_node_budget=json_node_budget,
+                cache=object_cache,
+            )
             if not isinstance(manifest, Mapping):
                 raise ValueError(
                     f"Snapshot manifest object is not valid: {object_hash}"
@@ -2344,7 +2302,18 @@ class TurnSnapshotService:
                         if node_hash in reachable:
                             continue
                         reachable.add(node_hash)
-                        node = self._load_tree_node(str(table_name), node_hash)
+                        tree_node_count += 1
+                        if tree_node_count > _MAX_SNAPSHOT_MANIFEST_ENTRIES:
+                            raise ValueError(
+                                "Snapshot table trees contain too many entries"
+                            )
+                        node = self._load_tree_node(
+                            str(table_name),
+                            node_hash,
+                            byte_budget=byte_budget,
+                            json_node_budget=json_node_budget,
+                            cache=object_cache,
+                        )
                         reachable.add(_text(node, "row_hash"))
                         for child_key in ("left_hash", "right_hash"):
                             child_hash = _optional_text(node, child_key)
@@ -2360,6 +2329,12 @@ class TurnSnapshotService:
         self,
         manifest: Mapping[str, object],
     ) -> dict[str, tuple[dict[str, object], ...]]:
+        expected_save_id = _text(manifest, "save_id")
+        total_entries = 0
+        seen_row_hashes: set[str] = set()
+        byte_budget = [_MAX_SNAPSHOT_TOTAL_UNCOMPRESSED_BYTES]
+        json_node_budget = [_MAX_SNAPSHOT_TOTAL_JSON_NODES]
+        object_cache: dict[str, tuple[str, object]] = {}
         rows_by_table: dict[str, tuple[dict[str, object], ...]] = {}
         if manifest.get("format") == SNAPSHOT_FORMAT_V2:
             raw_roots = manifest.get("table_roots")
@@ -2372,15 +2347,29 @@ class TurnSnapshotService:
                 for _row_key, row_hash in self._tree_entries(
                     table_name=table_name,
                     root_hash=root_hash,
+                    byte_budget=byte_budget,
+                    json_node_budget=json_node_budget,
+                    cache=object_cache,
                 ):
+                    total_entries += 1
+                    if total_entries > _MAX_SNAPSHOT_MANIFEST_ENTRIES:
+                        raise ValueError("Snapshot manifest contains too many entries")
+                    if row_hash in seen_row_hashes:
+                        raise ValueError("Duplicate snapshot row object")
+                    seen_row_hashes.add(row_hash)
                     value = self._load_object(
                         row_hash,
                         expected_kind=f"row:{table_name}",
+                        byte_budget=byte_budget,
+                        json_node_budget=json_node_budget,
+                        cache=object_cache,
                     )
                     if not isinstance(value, dict):
                         raise ValueError(
                             f"Snapshot row object is not a row: {row_hash}"
                         )
+                    if value.get("save_id") != expected_save_id:
+                        raise ValueError("Snapshot row has wrong save id")
                     table_rows.append(cast(dict[str, object], value))
                 rows_by_table[table_name] = tuple(table_rows)
             return rows_by_table
@@ -2388,12 +2377,23 @@ class TurnSnapshotService:
             rows: list[dict[str, object]] = []
             for entry in entries:
                 object_hash = _text(entry, "object_hash")
+                total_entries += 1
+                if total_entries > _MAX_SNAPSHOT_MANIFEST_ENTRIES:
+                    raise ValueError("Snapshot manifest contains too many entries")
+                if object_hash in seen_row_hashes:
+                    raise ValueError("Duplicate snapshot row object")
+                seen_row_hashes.add(object_hash)
                 value = self._load_object(
                     object_hash,
                     expected_kind=f"row:{table_name}",
+                    byte_budget=byte_budget,
+                    json_node_budget=json_node_budget,
+                    cache=object_cache,
                 )
                 if not isinstance(value, dict):
                     raise ValueError(f"Snapshot row object is not a row: {object_hash}")
+                if value.get("save_id") != expected_save_id:
+                    raise ValueError("Snapshot row has wrong save id")
                 rows.append(cast(dict[str, object], value))
             rows_by_table[table_name] = tuple(rows)
         return rows_by_table
