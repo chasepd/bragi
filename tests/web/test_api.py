@@ -8161,7 +8161,7 @@ def test_chat_turn_uses_runtime_pre_narrator_phase_progress(
             turn_progress_callback(
                 _expected_chat_turn_progress(
                     "Selecting context",
-                    succeeded=("submission", "history", "input"),
+                    succeeded=("submission", "classification", "history", "input"),
                     running="context_selection",
                 )
             )
@@ -8199,7 +8199,7 @@ def test_chat_turn_uses_runtime_pre_narrator_phase_progress(
     assert job["status"] == "running"
     assert job["latest_progress"] == _expected_chat_turn_progress(
         "Selecting context",
-        succeeded=("submission", "history", "input"),
+        succeeded=("submission", "classification", "history", "input"),
         running="context_selection",
     )
 
@@ -9119,7 +9119,7 @@ def test_chat_turn_waits_for_background_continuity_before_persisting_input(
             turn_progress_callback(
                 _expected_chat_turn_progress(
                     "Player input saved",
-                    succeeded=("submission", "history", "input"),
+                    succeeded=("submission", "classification", "history", "input"),
                 )
             )
             return SimpleNamespace(
@@ -14587,6 +14587,7 @@ def _chat_model(body: str) -> dict[str, object]:
 
 _EXPECTED_CHAT_TURN_PHASES = (
     "submission",
+    "classification",
     "history",
     "input",
     "character_planning",

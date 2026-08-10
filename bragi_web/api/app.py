@@ -241,6 +241,7 @@ _POST_TURN_PROGRESS_JOB_ORDER = (
 )
 _CHAT_TURN_PROGRESS_JOB_ORDER = (
     "submission",
+    "classification",
     "history",
     "input",
     "character_planning",

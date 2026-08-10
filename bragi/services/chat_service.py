@@ -537,6 +537,7 @@ class LookAroundResult:
 
 CHAT_TURN_PROGRESS_JOB_ORDER = (
     "submission",
+    "classification",
     "history",
     "input",
     "dating_route_profile",
@@ -1074,32 +1075,16 @@ class ChatService:
             if cancellation_requested is not None and cancellation_requested():
                 raise ChatTurnCancelled(CHAT_TURN_CANCELLED_ERROR)
 
-        stage_started = perf_counter()
         throw_if_cancelled()
-        player_content_rating = await self._classify_submitted_content(
+        player_content_rating = await self._prepare_submitted_input(
             body=body,
             save_id=save_id,
             current_user_id=current_user_id,
             provider=preference.provider,
             model_id=preference.model_id,
-        )
-        turn_progress.publish("history", "running", "Checking history")
-        try:
-            await self._summarize_if_needed(
-                save_id=save_id,
-                provider=preference.provider,
-                model_id=preference.model_id,
-                pending_message=PendingMessageEstimate(body=body, role="player"),
-                current_user_id=current_user_id,
-            )
-        except Exception:
-            turn_progress.publish("history", "failed", "History check failed")
-            raise
-        turn_progress.publish("history", "succeeded", "History checked")
-        _log_chat_stage(
-            "chat.stage.summarization_finished",
-            save_id=save_id,
-            started_at=stage_started,
+            pending_message=PendingMessageEstimate(body=body, role="player"),
+            cancellation_token=cancellation_token,
+            turn_progress=turn_progress,
         )
         throw_if_cancelled()
         stage_started = perf_counter()
@@ -1196,32 +1181,16 @@ class ChatService:
             if cancellation_requested is not None and cancellation_requested():
                 raise ChatTurnCancelled(CHAT_TURN_CANCELLED_ERROR)
 
-        stage_started = perf_counter()
         throw_if_cancelled()
-        timeskip_content_rating = await self._classify_submitted_content(
+        timeskip_content_rating = await self._prepare_submitted_input(
             body=directive,
             save_id=save_id,
             current_user_id=current_user_id,
             provider=preference.provider,
             model_id=preference.model_id,
-        )
-        turn_progress.publish("history", "running", "Checking history")
-        try:
-            await self._summarize_if_needed(
-                save_id=save_id,
-                provider=preference.provider,
-                model_id=preference.model_id,
-                pending_message=PendingMessageEstimate(body=directive, role="system"),
-                current_user_id=current_user_id,
-            )
-        except Exception:
-            turn_progress.publish("history", "failed", "History check failed")
-            raise
-        turn_progress.publish("history", "succeeded", "History checked")
-        _log_chat_stage(
-            "chat.stage.summarization_finished",
-            save_id=save_id,
-            started_at=stage_started,
+            pending_message=PendingMessageEstimate(body=directive, role="system"),
+            cancellation_token=cancellation_token,
+            turn_progress=turn_progress,
         )
         throw_if_cancelled()
         stage_started = perf_counter()
@@ -3924,6 +3893,127 @@ class ChatService:
         if safety.action is not ContentSafetyAction.ALLOW:
             return "prohibited"
         return safety.minimum_rating
+
+    async def _prepare_submitted_input(
+        self,
+        *,
+        body: str,
+        save_id: str,
+        current_user_id: str | None,
+        provider: str,
+        model_id: str,
+        pending_message: PendingMessageEstimate,
+        cancellation_token: CancellationToken,
+        turn_progress: _TurnProgressPublisher,
+    ) -> str:
+        async def classify() -> str:
+            stage_started = perf_counter()
+            turn_progress.publish(
+                "classification",
+                "running",
+                "Checking submitted content",
+            )
+            try:
+                content_rating = await self._classify_submitted_content(
+                    body=body,
+                    save_id=save_id,
+                    current_user_id=current_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+            except asyncio.CancelledError:
+                turn_progress.publish(
+                    "classification",
+                    "cancelled",
+                    "Content check cancelled",
+                )
+                raise
+            except Exception:
+                turn_progress.publish(
+                    "classification",
+                    "failed",
+                    "Content check failed",
+                )
+                raise
+            turn_progress.publish(
+                "classification",
+                "succeeded",
+                "Content checked",
+            )
+            _log_chat_stage(
+                "chat.stage.content_classification_finished",
+                save_id=save_id,
+                started_at=stage_started,
+            )
+            return content_rating
+
+        async def summarize() -> None:
+            stage_started = perf_counter()
+            turn_progress.publish(
+                "history",
+                "running",
+                "Checking content and history",
+            )
+            try:
+                await self._summarize_if_needed(
+                    save_id=save_id,
+                    provider=provider,
+                    model_id=model_id,
+                    pending_message=pending_message,
+                    current_user_id=current_user_id,
+                )
+            except asyncio.CancelledError:
+                turn_progress.publish(
+                    "history",
+                    "cancelled",
+                    "History check cancelled",
+                )
+                raise
+            except Exception:
+                turn_progress.publish(
+                    "history",
+                    "failed",
+                    "History check failed",
+                )
+                raise
+            turn_progress.publish("history", "succeeded", "History checked")
+            _log_chat_stage(
+                "chat.stage.summarization_finished",
+                save_id=save_id,
+                started_at=stage_started,
+            )
+
+        classification_task = asyncio.create_task(classify())
+        summary_task = asyncio.create_task(summarize())
+        tasks = (classification_task, summary_task)
+        loop = asyncio.get_running_loop()
+
+        def cancel_tasks() -> None:
+            def cancel_on_loop() -> None:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+
+            try:
+                loop.call_soon_threadsafe(cancel_on_loop)
+            except RuntimeError:
+                if not loop.is_closed():
+                    raise
+
+        cancellation_token.on_cancel(cancel_tasks)
+        try:
+            content_rating, _summary_result = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if cancellation_token.cancelled:
+                raise ChatTurnCancelled(CHAT_TURN_CANCELLED_ERROR) from None
+            raise
+        finally:
+            cancellation_token.remove_callback(cancel_tasks)
+        return content_rating
 
     async def _complete_fallback_chat_for_provider_error(
         self,
