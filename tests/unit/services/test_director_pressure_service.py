@@ -504,6 +504,76 @@ def test_director_pressure_skips_during_cooldown_and_decrements_counter(
     assert provider.structured_output_requests == []
 
 
+def test_director_pressure_waits_until_turn_after_cooldown_reaches_zero(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id = _seed_save(repositories)
+    repositories.upsert_world_state(
+        save_id=save_id,
+        key=DIRECTOR_PRESSURE_STATE_KEY,
+        value={"stall_turns": 1, "cooldown_turns": 1},
+        category="director_pressure",
+        confidence=1.0,
+        source_message_id=player_message_id,
+    )
+    _configure_director(repositories)
+    provider = DirectorPressureProvider({})
+    service = DirectorPressureService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+    cooling_narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon room stays quiet through the final cooldown turn.",
+    )
+    _add_turn_outcome(
+        repositories,
+        save_id=save_id,
+        narrator_message_id=cooling_narrator.id,
+    )
+
+    cooling_result = asyncio.run(
+        service.assess_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=cooling_narrator.id,
+        )
+    )
+    service.commit_after_narration(
+        result=cooling_result,
+        narrator_message_id=cooling_narrator.id,
+    )
+
+    assert cooling_result.skipped_reason == "cooldown"
+    assert cooling_result.state.cooldown_turns == 0
+    assert provider.structured_output_requests == []
+
+    eligible_narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon room remains quiet on the following turn.",
+    )
+    _add_turn_outcome(
+        repositories,
+        save_id=save_id,
+        narrator_message_id=eligible_narrator.id,
+    )
+
+    eligible_result = asyncio.run(
+        service.assess_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=eligible_narrator.id,
+        )
+    )
+
+    assert eligible_result.skipped_reason == "model_abstained"
+    assert len(provider.structured_output_requests) == 1
+
+
 def test_director_pressure_preserves_counters_for_unverified_turn(
     repositories: PersistenceRepositories,
 ) -> None:

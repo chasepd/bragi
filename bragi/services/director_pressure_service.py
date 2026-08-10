@@ -290,6 +290,7 @@ def _director_pressure_gate(
             state=previous_state,
         )
 
+    cooling_down = previous_state.cooldown_turns > 0
     cooldown = max(previous_state.cooldown_turns - 1, 0)
     pacing_signal = _turn_pacing_signal(outcome)
     if pacing_signal == "resolving":
@@ -323,7 +324,7 @@ def _director_pressure_gate(
         stall_turns=min(previous_state.stall_turns + 1, 99),
         cooldown_turns=cooldown,
     )
-    if cooldown > 0:
+    if cooling_down:
         return _DirectorPressureGate(False, "cooldown", "stalled", state)
     if state.stall_turns < DIRECTOR_PRESSURE_STALL_THRESHOLD:
         return _DirectorPressureGate(False, "stall_threshold", "stalled", state)
