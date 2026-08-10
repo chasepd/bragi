@@ -4589,7 +4589,7 @@ def test_submit_player_turn_commits_rendered_planned_scene_presence(
     result = asyncio.run(
         service.submit_player_turn(
             save_id=save.id,
-            body="I ask who should fetch the map.",
+            body="I ask whether Lio should fetch the map.",
             speaker_name="Ily",
             run_post_turn_jobs=False,
         )
@@ -4665,7 +4665,7 @@ def test_submit_player_turn_skips_scene_presence_with_ungrounded_evidence(
             ),
         ).submit_player_turn(
             save_id=save.id,
-            body="I ask who should fetch the map.",
+            body="I ask whether Lio should leave.",
             speaker_name="Ily",
             run_post_turn_jobs=False,
         )
@@ -5574,6 +5574,53 @@ def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
         ("scene_presence:mara:enter", "superseded_by_assessment"),
         ("scene_presence:ren:leave", "superseded_by_assessment"),
     }
+
+
+def test_narrator_spec_drops_model_candidate_for_assessed_character_without_candidates(
+    repositories: PersistenceRepositories,
+) -> None:
+    model_candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={"action": "leave", "character_name": "Ren"},
+        reason="Model candidate for an assessed character.",
+        confidence=0.9,
+        evidence_source_ids=("message:source",),
+        evidence_quote="Ren leaves.",
+        candidate_id="scene_presence:ren:leave",
+        candidate_type="scene_presence",
+        character_id="ren",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Ren stays present.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(model_candidate,),
+    )
+
+    merged = chat_service_module._narrator_spec_with_commit_candidates(
+        spec,
+        (),
+        assessed_character_ids=frozenset({"ren"}),
+    )
+
+    assert merged is not None
+    assert merged.state_commit_candidates == ()
+    assert merged.planner_rejections == (
+        PlannerRejection(
+            candidate_id="scene_presence:ren:leave",
+            candidate_type="scene_presence",
+            domain="scene_presence",
+            reason="superseded_by_assessment",
+            field="candidate_id",
+            rejected_value="scene_presence:ren:leave",
+        ),
+    )
 
 
 def test_narrator_spec_keeps_model_candidate_for_ungrounded_assessment(

@@ -3371,6 +3371,13 @@ def _state_commit_candidate_value_shape_rejection(
     rejections instead of silent apply-time skips.
     """
     if candidate.candidate_type == "scene_presence":
+        if not candidate.character_id:
+            return _planner_rejection(
+                candidate=candidate,
+                reason="missing_character_id",
+                field_name="character_id",
+                rejected_value="",
+            )
         action = _string(candidate.value.get("action")).lower()
         if action not in _SCENE_PRESENCE_VALUE_ACTIONS:
             return _planner_rejection(
@@ -3396,6 +3403,13 @@ def _state_commit_candidate_value_shape_rejection(
             )
         return None
     if candidate.candidate_type == "character_learned_memory":
+        if not candidate.character_id:
+            return _planner_rejection(
+                candidate=candidate,
+                reason="missing_character_id",
+                field_name="character_id",
+                rejected_value="",
+            )
         body = _string(candidate.value.get("body"))
         if not body:
             return _planner_rejection(
@@ -3409,6 +3423,13 @@ def _state_commit_candidate_value_shape_rejection(
             return knowledge_rejection
         return None
     if candidate.candidate_type == "character_knowledge_edge":
+        if not candidate.character_id:
+            return _planner_rejection(
+                candidate=candidate,
+                reason="missing_character_id",
+                field_name="character_id",
+                rejected_value="",
+            )
         knowledge_rejection = _candidate_knowledge_metadata_rejection(candidate)
         if knowledge_rejection is not None:
             return knowledge_rejection

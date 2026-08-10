@@ -7754,7 +7754,7 @@ def _narrator_spec_with_commit_candidates(
     *,
     assessed_character_ids: frozenset[str] = frozenset(),
 ) -> NarratorMessageSpec | None:
-    if spec is None or not candidates:
+    if spec is None:
         return spec
     assessment_candidate_ids = {
         candidate.candidate_id
