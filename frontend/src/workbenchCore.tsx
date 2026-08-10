@@ -3604,7 +3604,10 @@ function Workbench({
             runJob={runJob}
             activeSaveId={activeSaveId}
             actionChoices={model?.action_choices ?? null}
-            generationActive={pendingJobs.some(({ job }) => job.type === "action_choice_generate")}
+            generationActive={pendingJobs.some(({ job }) => (
+              job.type === "action_choice_generate"
+              || job.type === "action_choice_regenerate"
+            ))}
             pendingAfterMessageId={pendingAfterMessageId}
             onPendingMessage={setPendingMessage}
           />

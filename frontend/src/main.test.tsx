@@ -15263,6 +15263,37 @@ describe("frontend helpers", () => {
     expect(runJob).toHaveBeenCalledWith(job);
   });
 
+  it("guards generated choices while a tracked regeneration job remains active", async () => {
+    installEventSourceDouble();
+    const regenerationJob = {
+      id: "job-choice-regeneration",
+      type: "action_choice_regenerate",
+      save_id: "save-1",
+      status: "running",
+      result: null,
+      error: null
+    } satisfies Job;
+    const model = runtimeModel({
+      action_choices_enabled: true,
+      action_choices: cyoaActionChoices()
+    });
+    vi.stubGlobal("fetch", workbenchFetch([regenerationJob], model));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Generating choices..."
+    );
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Open the brass door" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+  });
+
   it("submits a selected CYOA action as a normal chat message", async () => {
     const { CyoaActionPicker } = await import("./main");
     const job = { id: "job-1", type: "chat_turn", save_id: "save-1", status: "queued", result: null, error: null };
