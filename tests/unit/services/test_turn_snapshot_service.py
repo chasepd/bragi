@@ -3365,6 +3365,173 @@ def test_dirty_head_capture_tracks_message_body_edits_without_context_change(
     assert repositories.list_messages(save.id)[0].body == "I polish the lens."
 
 
+def test_clean_head_capture_does_not_prepare_active_snapshot_rows(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    baseline = service.capture_baseline_snapshot(save.id)
+
+    def fail_active_scan(_save_id: str) -> object:
+        raise AssertionError("clean snapshot capture scanned active tables")
+
+    monkeypatch.setattr(service, "_active_rows_by_table", fail_active_scan)
+
+    captured = service.capture_current_head_if_dirty(save.id)
+
+    assert captured.id == baseline.id
+
+
+def test_snapshot_v2_manifest_reuses_unchanged_table_roots(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    baseline = service.capture_baseline_snapshot(save.id)
+    baseline_manifest = service._snapshot_manifest(baseline)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I check the lens.",
+    )
+
+    changed = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    changed_manifest = service._snapshot_manifest(changed)
+
+    assert baseline_manifest["format"] == "bragi-turn-snapshot-v2"
+    assert changed_manifest["format"] == "bragi-turn-snapshot-v2"
+    baseline_tables = baseline_manifest["table_roots"]
+    changed_tables = changed_manifest["table_roots"]
+    assert isinstance(baseline_tables, dict)
+    assert isinstance(changed_tables, dict)
+    assert changed_tables["messages"] != baseline_tables["messages"]
+    assert changed_tables["world_state"] == baseline_tables["world_state"]
+
+
+def test_dirty_row_capture_updates_tree_without_full_active_scan(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I check the lens.",
+    )
+    state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens",
+        value={"color": "red"},
+        source_message_id=message.id,
+    )
+    service = TurnSnapshotService(repositories)
+    original = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    original_manifest = service._snapshot_manifest(original)
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens",
+        value={"color": "blue"},
+        source_message_id=message.id,
+    )
+
+    def fail_active_scan(_save_id: str) -> object:
+        raise AssertionError("incremental snapshot capture scanned active tables")
+
+    monkeypatch.setattr(service, "_active_rows_by_table", fail_active_scan)
+
+    changed = service.capture_current_head_if_dirty(save.id)
+
+    changed_manifest = service._snapshot_manifest(changed)
+    original_roots = original_manifest["table_roots"]
+    changed_roots = changed_manifest["table_roots"]
+    assert isinstance(original_roots, dict)
+    assert isinstance(changed_roots, dict)
+    assert changed_roots["world_state"] != original_roots["world_state"]
+    assert changed_roots["messages"] == original_roots["messages"]
+    rows = service._rows_from_manifest(changed_manifest)
+    [captured_state] = rows["world_state"]
+    assert captured_state["id"] == state.id
+    assert json.loads(str(captured_state["value_json"])) == {"color": "blue"}
+
+
+def test_dirty_row_capture_serializes_only_changed_row(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I inventory the lenses.",
+    )
+    for index in range(32):
+        repositories.upsert_world_state(
+            save_id=save.id,
+            key=f"lens.{index:02d}",
+            value={"color": "red"},
+            source_message_id=message.id,
+        )
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=save.id, message_id=message.id)
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens.17",
+        value={"color": "blue"},
+        source_message_id=message.id,
+    )
+    stored_row_kinds: list[str] = []
+    original_store_object = service._store_object
+
+    def record_store(*, kind: str, value: object) -> str:
+        if kind.startswith("row:"):
+            stored_row_kinds.append(kind)
+        return original_store_object(kind=kind, value=value)
+
+    monkeypatch.setattr(service, "_store_object", record_store)
+
+    service.capture_current_head_if_dirty(save.id)
+
+    assert stored_row_kinds == ["row:world_state"]
+
+
+def test_rolled_back_row_change_does_not_dirty_materialized_snapshot(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I inspect the lens.",
+    )
+    service = TurnSnapshotService(repositories)
+    original = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    repositories.begin_transaction()
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=message.id,
+        body="This edit is rolled back.",
+    )
+    repositories.rollback_transaction()
+
+    clean = service.capture_current_head_if_dirty(save.id)
+
+    assert clean.id == original.id
+
+
 def test_restore_snapshot_strips_deprecated_scenario_update_sections(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3389,25 +3556,38 @@ def test_restore_snapshot_strips_deprecated_scenario_update_sections(
     service = TurnSnapshotService(repositories)
     snapshot = service.capture_baseline_snapshot(save.id)
     manifest = service._snapshot_manifest(snapshot)  # noqa: SLF001 - legacy fixture
-    tables = manifest["tables"]
-    assert isinstance(tables, dict)
-    update_entries = tables["save_scenario_updates"]
-    assert isinstance(update_entries, list)
-    [update_entry] = update_entries
-    assert isinstance(update_entry, dict)
+    rows_by_table = service._rows_from_manifest(manifest)  # noqa: SLF001
     row = repositories.connection.execute(
         "SELECT * FROM save_scenario_updates WHERE id = ?",
         (update.id,),
     ).fetchone()
     legacy_row = dict(row)
     legacy_row["content_json"] = json.dumps(legacy_content, sort_keys=True)
-    update_entry["object_hash"] = service._store_object(  # noqa: SLF001 - fixture
-        kind="row:save_scenario_updates",
-        value=legacy_row,
-    )
+    tables: dict[str, list[dict[str, str]]] = {}
+    for table_name, table_rows in rows_by_table.items():
+        entries: list[dict[str, str]] = []
+        for table_row in table_rows:
+            value = legacy_row if table_name == "save_scenario_updates" else table_row
+            entries.append(
+                {
+                    "id": str(value.get("id", "")),
+                    "object_hash": service._store_object(  # noqa: SLF001
+                        kind=f"row:{table_name}",
+                        value=value,
+                    ),
+                }
+            )
+        tables[table_name] = entries
     legacy_manifest_hash = service._store_object(  # noqa: SLF001 - fixture
         kind="snapshot_manifest",
-        value=manifest,
+        value={
+            "format": "bragi-turn-snapshot-v1",
+            "save_id": save.id,
+            "message_id": None,
+            "active_message_ids": [],
+            "context_revision": snapshot.context_revision,
+            "tables": tables,
+        },
     )
     repositories.connection.execute(
         "UPDATE save_turn_snapshots SET root_manifest_hash = ? WHERE id = ?",
@@ -3843,43 +4023,13 @@ def _snapshot_rows_by_table(
     repositories: PersistenceRepositories,
     snapshot_id: str,
 ) -> dict[str, list[dict[str, object]]]:
-    snapshot_row = repositories.connection.execute(
-        """
-        SELECT root_manifest_hash
-        FROM save_turn_snapshots
-        WHERE id = ?
-        """,
-        (snapshot_id,),
-    ).fetchone()
-    assert snapshot_row is not None
-    manifest_payload = repositories.connection.execute(
-        """
-        SELECT payload
-        FROM save_snapshot_objects
-        WHERE object_hash = ?
-        """,
-        (str(snapshot_row["root_manifest_hash"]),),
-    ).fetchone()
-    assert manifest_payload is not None
-    manifest = json.loads(zlib.decompress(bytes(manifest_payload["payload"])))
-    rows_by_table: dict[str, list[dict[str, object]]] = {}
-    for table_name, entries in manifest["tables"].items():
-        table_rows: list[dict[str, object]] = []
-        for entry in entries:
-            payload = repositories.connection.execute(
-                """
-                SELECT payload
-                FROM save_snapshot_objects
-                WHERE object_hash = ?
-                """,
-                (entry["object_hash"],),
-            ).fetchone()
-            assert payload is not None
-            decoded = json.loads(zlib.decompress(bytes(payload["payload"])))
-            assert isinstance(decoded, dict)
-            table_rows.append(decoded)
-        rows_by_table[str(table_name)] = table_rows
-    return rows_by_table
+    service = TurnSnapshotService(repositories)
+    snapshot = service._get_snapshot(snapshot_id)  # noqa: SLF001
+    manifest = service._snapshot_manifest(snapshot)  # noqa: SLF001
+    return {
+        table_name: list(rows)
+        for table_name, rows in service._rows_from_manifest(manifest).items()  # noqa: SLF001
+    }
 
 
 def _assert_snapshot_objects_do_not_store_media_bytes(

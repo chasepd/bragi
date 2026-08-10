@@ -47,14 +47,21 @@ DATING_ROUTE_PROFILE_ENRICHMENT_INTERVAL_SECONDS = 60
 @dataclass(frozen=True)
 class DatingRouteProfileResult:
     status: str = "skipped"
+    seeded_count: int = 0
     updated_count: int = 0
     requested_count: int = 0
     stale_count: int = 0
     skipped_reason: str = ""
 
+    @property
+    def changed_count(self) -> int:
+        return self.seeded_count + self.updated_count
+
     def to_json(self) -> dict[str, object]:
         return {
             "status": self.status,
+            "seeded_count": self.seeded_count,
+            "changed_count": self.changed_count,
             "updated_count": self.updated_count,
             "requested_count": self.requested_count,
             "stale_count": self.stale_count,
@@ -126,36 +133,48 @@ class DatingRouteProfileService:
             self.repositories,
             save_id,
         )
+        seeded_count = 0
         if supports_dating_routes:
-            DatingRouteService(self.repositories).seed_routes_for_save(
+            seeded_count = DatingRouteService(self.repositories).seed_routes_for_save(
                 save_id,
                 source_message_id=source_message_id,
             )
         routes = tuple(self.repositories.list_dating_route_states(save_id))
         if not routes and not supports_dating_routes:
-            return DatingRouteProfileResult(skipped_reason="no_dating_routes")
+            return DatingRouteProfileResult(
+                seeded_count=seeded_count,
+                skipped_reason="no_dating_routes",
+            )
         routes = tuple(
             route
             for route in routes
             if _route_needs_profile(route)
         )
         if not routes:
-            return DatingRouteProfileResult(skipped_reason="no_missing_profiles")
+            return DatingRouteProfileResult(
+                seeded_count=seeded_count,
+                skipped_reason="no_missing_profiles",
+            )
         details = self.repositories.load_save_details(save_id)
         if details is None:
-            return DatingRouteProfileResult(skipped_reason="unknown_save")
+            return DatingRouteProfileResult(
+                seeded_count=seeded_count,
+                skipped_reason="unknown_save",
+            )
         preference = _dating_route_profile_model_preference(
             repositories=self.repositories,
             save_id=save_id,
         )
         if preference is None:
             return DatingRouteProfileResult(
+                seeded_count=seeded_count,
                 requested_count=len(routes),
                 skipped_reason="no_model_preference",
             )
         _provider, skipped_reason = self._structured_provider(preference)
         if skipped_reason is not None:
             return DatingRouteProfileResult(
+                seeded_count=seeded_count,
                 requested_count=len(routes),
                 skipped_reason=skipped_reason,
             )
@@ -191,6 +210,7 @@ class DatingRouteProfileService:
         )
         if skipped_reason:
             return DatingRouteProfileResult(
+                seeded_count=seeded_count,
                 requested_count=len(routes),
                 skipped_reason=skipped_reason,
             )
@@ -203,6 +223,7 @@ class DatingRouteProfileService:
         )
         return DatingRouteProfileResult(
             status="succeeded",
+            seeded_count=seeded_count,
             updated_count=updated_count,
             requested_count=len(routes),
             stale_count=stale_count,

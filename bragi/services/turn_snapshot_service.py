@@ -26,6 +26,11 @@ from bragi.persistence.repositories import (
     canonical_claim_fingerprint,
     validate_context_source_index_budget,
 )
+from bragi.persistence.snapshot_contract import (
+    SNAPSHOT_TABLES,
+    SNAPSHOT_TABLES_BY_NAME,
+    SnapshotTable,
+)
 from bragi.safety import (
     CONTENT_FILTER_TRANSITION,
     CONTENT_FILTER_TRANSITION_KIND,
@@ -48,6 +53,11 @@ from bragi.services.sexual_content_safety import (
 )
 
 SNAPSHOT_FORMAT = "bragi-turn-snapshot-v1"
+SNAPSHOT_FORMAT_V2 = "bragi-turn-snapshot-v2"
+_SnapshotTable = SnapshotTable
+_SNAPSHOT_TABLES = SNAPSHOT_TABLES
+_TABLES_BY_NAME = SNAPSHOT_TABLES_BY_NAME
+_SNAPSHOT_TABLE_NAMES = tuple(table.name for table in _SNAPSHOT_TABLES)
 _MAX_SNAPSHOT_PROVENANCE_GROUPS = 64
 _MAX_SNAPSHOT_PROVENANCE_GROUP_MEMBERS = 64
 _MAX_SNAPSHOT_OBJECT_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
@@ -91,63 +101,8 @@ class SnapshotForkResult:
 class _PreparedSnapshot:
     root_manifest_hash: str
     context_revision: int
-    tables: dict[str, list[dict[str, str]]]
-
-
-@dataclass(frozen=True)
-class _SnapshotTable:
-    name: str
-    active_only: bool = False
-    order_by: str = "rowid"
-
-
-_SNAPSHOT_TABLES: tuple[_SnapshotTable, ...] = (
-    _SnapshotTable("messages", order_by="rowid"),
-    _SnapshotTable("world_state", active_only=True, order_by="key, rowid"),
-    _SnapshotTable(
-        "context_sources",
-        active_only=True,
-        order_by="source_type, source_id, rowid",
-    ),
-    _SnapshotTable("context_observations", active_only=True),
-    _SnapshotTable("context_observation_curation_state"),
-    _SnapshotTable("locations", active_only=True),
-    _SnapshotTable("characters", active_only=True),
-    _SnapshotTable("scene_snapshots"),
-    _SnapshotTable("scene_facts", active_only=True, order_by="created_at, rowid"),
-    _SnapshotTable("scene_fact_sources", order_by="created_at, rowid"),
-    _SnapshotTable("active_threads", active_only=True),
-    _SnapshotTable("entity_links"),
-    _SnapshotTable("context_update_suggestions"),
-    _SnapshotTable("context_update_audit"),
-    _SnapshotTable("state_changes"),
-    _SnapshotTable("memories", active_only=True),
-    _SnapshotTable("summaries"),
-    _SnapshotTable("save_scenario_updates", active_only=True),
-    _SnapshotTable("save_loss_conditions", active_only=True),
-    _SnapshotTable("save_loss_condition_changes", active_only=True),
-    _SnapshotTable("save_loss_outcomes", active_only=True),
-    _SnapshotTable("media_assets", active_only=True),
-    _SnapshotTable("character_knowledge_edges", active_only=True),
-    _SnapshotTable("message_visibility"),
-    _SnapshotTable("message_scene_presence"),
-    _SnapshotTable("message_action_choices"),
-    _SnapshotTable("dating_route_states", active_only=True),
-    _SnapshotTable("character_text_threads", active_only=True),
-    _SnapshotTable("character_text_thread_participants", active_only=True),
-    _SnapshotTable("character_text_messages"),
-    _SnapshotTable("character_text_activity_events"),
-    _SnapshotTable("narrator_phone_activity_cursors"),
-    _SnapshotTable("character_text_message_revisions"),
-    _SnapshotTable("character_text_message_attachments"),
-    _SnapshotTable("character_text_provenance"),
-    _SnapshotTable("character_contact_states", active_only=True),
-    _SnapshotTable("character_text_proactive_triggers"),
-    _SnapshotTable("turn_outcomes"),
-)
-
-_TABLES_BY_NAME = {table.name: table for table in _SNAPSHOT_TABLES}
-_SNAPSHOT_TABLE_NAMES = tuple(table.name for table in _SNAPSHOT_TABLES)
+    table_roots: dict[str, str | None]
+    object_count: int
 
 _RESTORE_DELETE_ORDER = (
     "character_text_proactive_triggers",
@@ -430,30 +385,29 @@ class TurnSnapshotService:
         *,
         reason: str = "dirty_head",
     ) -> TurnSnapshotRecord:
-        message = self._latest_active_message(save_id)
-        message_id = message.id if message is not None else None
-        current_revision = self._context_revision(save_id)
-        latest = self.latest_snapshot_for_message(
-            save_id=save_id,
-            message_id=message_id,
-        )
-        prepared = self._prepare_snapshot(
-            save_id=save_id,
-            message_id=message_id,
-        )
-        if (
-            latest is not None
-            and latest.context_revision == current_revision
-            and latest.root_manifest_hash == prepared.root_manifest_hash
-        ):
-            self.repositories.commit()
-            return latest
-        return self._insert_prepared_snapshot(
-            save_id=save_id,
-            message_id=message_id,
-            reason=reason,
-            prepared=prepared,
-        )
+        self.repositories.begin_immediate_transaction()
+        try:
+            clean = self._clean_materialized_snapshot(save_id)
+            if clean is not None:
+                self.repositories.commit_transaction()
+                return clean
+            message = self._latest_active_message(save_id)
+            message_id = message.id if message is not None else None
+            prepared = self._prepare_snapshot(
+                save_id=save_id,
+                message_id=message_id,
+            )
+            snapshot = self._insert_prepared_snapshot(
+                save_id=save_id,
+                message_id=message_id,
+                reason=reason,
+                prepared=prepared,
+            )
+            self.repositories.commit_transaction()
+            return snapshot
+        except BaseException:
+            self.repositories.rollback_transaction()
+            raise
 
     def latest_snapshot_for_message(
         self,
@@ -567,8 +521,10 @@ class TurnSnapshotService:
         raw_active_message_ids = manifest.get("active_message_ids", [])
         if not isinstance(raw_active_message_ids, list):
             raw_active_message_ids = []
-        active_message_ids = tuple(
-            str(message_id) for message_id in raw_active_message_ids
+        active_message_ids = (
+            tuple(str(message_id) for message_id in raw_active_message_ids)
+            if manifest.get("format") == SNAPSHOT_FORMAT
+            else _snapshot_message_ids_from_rows(rows_by_table)
         )
         self.repositories.begin_transaction()
         try:
@@ -795,7 +751,13 @@ class TurnSnapshotService:
                 objects_by_hash,
                 kind="snapshot_manifest",
                 value={
-                    **manifest,
+                    "format": SNAPSHOT_FORMAT,
+                    "save_id": snapshot.save_id,
+                    "message_id": snapshot.message_id,
+                    "active_message_ids": _snapshot_message_ids_from_rows(
+                        rows_by_table
+                    ),
+                    "context_revision": snapshot.context_revision,
                     "tables": tables,
                 },
                 created_at=snapshot.created_at,
@@ -1102,15 +1064,37 @@ class TurnSnapshotService:
         message_id: str | None,
         reason: str,
     ) -> TurnSnapshotRecord:
-        if self.repositories.get_save(save_id) is None:
-            raise ValueError(f"Unknown save id: {save_id}")
-        prepared = self._prepare_snapshot(save_id=save_id, message_id=message_id)
-        return self._insert_prepared_snapshot(
-            save_id=save_id,
-            message_id=message_id,
-            reason=reason,
-            prepared=prepared,
-        )
+        self.repositories.begin_immediate_transaction()
+        try:
+            if self.repositories.get_save(save_id) is None:
+                raise ValueError(f"Unknown save id: {save_id}")
+            if message_id is not None:
+                row = self.repositories.connection.execute(
+                    """
+                    SELECT 1
+                    FROM messages
+                    WHERE save_id = ? AND id = ? AND deleted_at IS NULL
+                    """,
+                    (save_id, message_id),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"Unknown active message id: {message_id}")
+            clean = self._clean_materialized_snapshot(save_id, message_id=message_id)
+            if clean is not None:
+                self.repositories.commit_transaction()
+                return clean
+            prepared = self._prepare_snapshot(save_id=save_id, message_id=message_id)
+            snapshot = self._insert_prepared_snapshot(
+                save_id=save_id,
+                message_id=message_id,
+                reason=reason,
+                prepared=prepared,
+            )
+            self.repositories.commit_transaction()
+            return snapshot
+        except BaseException:
+            self.repositories.rollback_transaction()
+            raise
 
     def _prepare_snapshot(
         self,
@@ -1122,36 +1106,88 @@ class TurnSnapshotService:
             self.repositories.connection,
             save_id=save_id,
         )
+        incremental = self._prepare_incremental_snapshot(
+            save_id=save_id,
+            message_id=message_id,
+        )
+        if incremental is not None:
+            return incremental
         rows_by_table = _sanitize_snapshot_rows_for_safety(
             self._active_rows_by_table(save_id)
         )
-        active_message_ids = [
-            str(row["id"]) for row in rows_by_table.get("messages", ())
-        ]
-        tables: dict[str, list[dict[str, str]]] = {}
+        self.repositories.connection.execute(
+            "DELETE FROM save_snapshot_row_state WHERE save_id = ?",
+            (save_id,),
+        )
+        table_roots: dict[str, str | None] = {}
+        object_count = 0
         for table_name in _SNAPSHOT_TABLE_NAMES:
-            table_entries: list[dict[str, str]] = []
-            for row in rows_by_table.get(table_name, ()):
-                row_id = row.get("id")
+            root_hash: str | None = None
+            table = _TABLES_BY_NAME[table_name]
+            for ordinal, row in enumerate(rows_by_table.get(table_name, ())):
+                row_key = _snapshot_row_key(table, row)
                 object_hash = self._store_object(
                     kind=f"row:{table_name}",
                     value=row,
                 )
-                table_entries.append(
-                    {
-                        "id": str(row_id) if row_id is not None else "",
-                        "object_hash": object_hash,
-                    }
+                order_key = _snapshot_tree_order_key(
+                    table,
+                    row=row,
+                    row_key=row_key,
+                    ordinal=ordinal,
                 )
-            tables[table_name] = table_entries
+                root_hash = self._tree_insert(
+                    table_name=table_name,
+                    root_hash=root_hash,
+                    order_key=order_key,
+                    row_key=row_key,
+                    row_hash=object_hash,
+                )
+                self.repositories.connection.execute(
+                    """
+                    INSERT INTO save_snapshot_row_state(
+                        save_id, table_name, row_key, object_hash,
+                        order_key, ordinal, included
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, 1)
+                    """,
+                    (
+                        save_id,
+                        table_name,
+                        row_key,
+                        object_hash,
+                        order_key,
+                        ordinal,
+                    ),
+                )
+                object_count += 1
+            table_roots[table_name] = root_hash
+            self.repositories.connection.execute(
+                """
+                INSERT INTO save_snapshot_table_state(
+                    save_id, table_name, current_generation,
+                    captured_generation, root_hash, next_ordinal, needs_rebuild
+                )
+                VALUES (?, ?, 0, 0, ?, ?, 0)
+                ON CONFLICT(save_id, table_name) DO UPDATE SET
+                    root_hash = excluded.root_hash,
+                    next_ordinal = excluded.next_ordinal,
+                    needs_rebuild = 0
+                """,
+                (
+                    save_id,
+                    table_name,
+                    root_hash,
+                    len(rows_by_table.get(table_name, ())),
+                ),
+            )
         context_revision = self._context_revision(save_id)
         manifest = {
-            "format": SNAPSHOT_FORMAT,
+            "format": SNAPSHOT_FORMAT_V2,
             "save_id": save_id,
             "message_id": message_id,
-            "active_message_ids": active_message_ids,
             "context_revision": context_revision,
-            "tables": tables,
+            "table_roots": table_roots,
         }
         root_manifest_hash = self._store_object(
             kind="snapshot_manifest",
@@ -1160,8 +1196,256 @@ class TurnSnapshotService:
         return _PreparedSnapshot(
             root_manifest_hash=root_manifest_hash,
             context_revision=context_revision,
-            tables=tables,
+            table_roots=table_roots,
+            object_count=object_count,
         )
+
+    def _prepare_incremental_snapshot(
+        self,
+        *,
+        save_id: str,
+        message_id: str | None,
+    ) -> _PreparedSnapshot | None:
+        base_row = self.repositories.connection.execute(
+            """
+            SELECT state.base_snapshot_id
+            FROM save_snapshot_state state
+            WHERE state.save_id = ? AND state.base_snapshot_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM save_snapshot_table_state tables
+                  WHERE tables.save_id = state.save_id
+                    AND tables.needs_rebuild != 0
+              )
+            """,
+            (save_id,),
+        ).fetchone()
+        if base_row is None:
+            return None
+        base_snapshot = self._get_snapshot(str(base_row["base_snapshot_id"]))
+        base_manifest = self._snapshot_manifest(base_snapshot)
+        if base_manifest.get("format") != SNAPSHOT_FORMAT_V2:
+            return None
+        raw_roots = base_manifest.get("table_roots")
+        if not isinstance(raw_roots, Mapping):
+            return None
+        dirty_rows = self.repositories.connection.execute(
+            """
+            SELECT dirty.table_name, dirty.row_key, dirty.generation
+            FROM save_snapshot_dirty_rows dirty
+            WHERE dirty.save_id = ?
+            ORDER BY dirty.generation, dirty.table_name, dirty.row_key
+            """,
+            (save_id,),
+        ).fetchall()
+        if not dirty_rows:
+            return None
+        table_roots = {
+            table_name: (
+                str(raw_roots[table_name])
+                if isinstance(raw_roots.get(table_name), str)
+                else None
+            )
+            for table_name in _SNAPSHOT_TABLE_NAMES
+        }
+        pending: list[
+            tuple[
+                _SnapshotTable,
+                str,
+                dict[str, object],
+                sqlite3.Row | None,
+            ]
+        ] = []
+        complex_tables = {
+            "character_text_threads",
+            "character_text_thread_participants",
+            "character_text_messages",
+            "character_text_activity_events",
+            "narrator_phone_activity_cursors",
+            "character_text_message_revisions",
+            "character_text_message_attachments",
+            "character_text_provenance",
+            "character_contact_states",
+            "character_text_proactive_triggers",
+        }
+        for dirty in dirty_rows:
+            table_name = str(dirty["table_name"])
+            table = _TABLES_BY_NAME.get(table_name)
+            if table is None or table_name in complex_tables:
+                return None
+            row_key = str(dirty["row_key"])
+            live_row = self.repositories.connection.execute(
+                f"""
+                SELECT *
+                FROM {table.name}
+                WHERE save_id = ? AND {table.primary_key} = ?
+                """,
+                (save_id, row_key),
+            ).fetchone()
+            if live_row is None:
+                return None
+            row = _row_dict(live_row)
+            if table.name in {"messages", "character_text_messages"}:
+                if row.get("deleted_at") is not None:
+                    return None
+            elif (
+                table.active_only
+                and "archived_at" in self._column_names(table.name)
+                and row.get("archived_at") is not None
+            ):
+                return None
+            if table.name == "messages":
+                row = _sanitize_snapshot_message_row(row)
+                if is_fade_to_black_message(
+                    role=str(row.get("role", "")),
+                    body=str(row.get("body", "")),
+                    safety_transition=str(row.get("safety_transition", "")),
+                ):
+                    return None
+            elif table.name == "context_observation_curation_state":
+                row = portable_context_observation_curation_state_row(row)
+            elif table.name == "save_scenario_updates":
+                row = _sanitize_snapshot_scenario_update_row(row)
+            if not self._incremental_row_references_are_active(table.name, row):
+                return None
+            previous = self.repositories.connection.execute(
+                """
+                SELECT object_hash, order_key, ordinal, included
+                FROM save_snapshot_row_state
+                WHERE save_id = ? AND table_name = ? AND row_key = ?
+                """,
+                (save_id, table_name, row_key),
+            ).fetchone()
+            pending.append((table, row_key, row, previous))
+
+        for table, row_key, row, previous in pending:
+            table_name = table.name
+            root_hash = table_roots[table_name]
+            if previous is None:
+                ordinal_row = self.repositories.connection.execute(
+                    """
+                    SELECT next_ordinal
+                    FROM save_snapshot_table_state
+                    WHERE save_id = ? AND table_name = ?
+                    """,
+                    (save_id, table_name),
+                ).fetchone()
+                ordinal = int(ordinal_row["next_ordinal"] if ordinal_row else 0)
+            else:
+                ordinal = int(previous["ordinal"])
+                previous_order_key = cast(str | None, previous["order_key"])
+                if previous_order_key is not None and bool(previous["included"]):
+                    root_hash = self._tree_delete(
+                        table_name=table_name,
+                        root_hash=root_hash,
+                        order_key=previous_order_key,
+                    )
+            object_hash = self._store_object(
+                kind=f"row:{table_name}",
+                value=row,
+            )
+            order_key = _snapshot_tree_order_key(
+                table,
+                row=row,
+                row_key=row_key,
+                ordinal=ordinal,
+            )
+            root_hash = self._tree_insert(
+                table_name=table_name,
+                root_hash=root_hash,
+                order_key=order_key,
+                row_key=row_key,
+                row_hash=object_hash,
+            )
+            table_roots[table_name] = root_hash
+            self.repositories.connection.execute(
+                """
+                INSERT INTO save_snapshot_row_state(
+                    save_id, table_name, row_key, object_hash,
+                    order_key, ordinal, included
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(save_id, table_name, row_key) DO UPDATE SET
+                    object_hash = excluded.object_hash,
+                    order_key = excluded.order_key,
+                    ordinal = excluded.ordinal,
+                    included = 1
+                """,
+                (
+                    save_id,
+                    table_name,
+                    row_key,
+                    object_hash,
+                    order_key,
+                    ordinal,
+                ),
+            )
+            self.repositories.connection.execute(
+                """
+                UPDATE save_snapshot_table_state
+                SET root_hash = ?,
+                    next_ordinal = MAX(next_ordinal, ?)
+                WHERE save_id = ? AND table_name = ?
+                """,
+                (root_hash, ordinal + 1, save_id, table_name),
+            )
+        context_revision = self._context_revision(save_id)
+        root_manifest_hash = self._store_object(
+            kind="snapshot_manifest",
+            value={
+                "format": SNAPSHOT_FORMAT_V2,
+                "save_id": save_id,
+                "message_id": message_id,
+                "context_revision": context_revision,
+                "table_roots": table_roots,
+            },
+        )
+        return _PreparedSnapshot(
+            root_manifest_hash=root_manifest_hash,
+            context_revision=context_revision,
+            table_roots=table_roots,
+            object_count=len(pending),
+        )
+
+    def _incremental_row_references_are_active(
+        self,
+        table_name: str,
+        row: Mapping[str, object],
+    ) -> bool:
+        for column in _MESSAGE_REFERENCE_COLUMNS:
+            value = row.get(column)
+            if not isinstance(value, str) or not value:
+                continue
+            if self.repositories.connection.execute(
+                "SELECT 1 FROM messages WHERE id = ? AND deleted_at IS NULL",
+                (value,),
+            ).fetchone() is None:
+                return False
+        for column, target_table_name in _TABLE_REFERENCE_COLUMNS.get(
+            table_name,
+            {},
+        ).items():
+            value = row.get(column)
+            if not isinstance(value, str) or not value:
+                continue
+            target = _TABLES_BY_NAME.get(target_table_name)
+            if target is None:
+                continue
+            where = f"{target.primary_key} = ?"
+            if target.name in {"messages", "character_text_messages"}:
+                where += " AND deleted_at IS NULL"
+            elif target.active_only and "archived_at" in self._column_names(
+                target.name
+            ):
+                where += " AND archived_at IS NULL"
+            if self.repositories.connection.execute(
+                f"SELECT 1 FROM {target.name} WHERE {where}",
+                (value,),
+            ).fetchone() is None:
+                return False
+        if table_name == "world_state" and row.get("key") != "story.director_pressure":
+            return True
+        return table_name not in _JSON_ENTITY_REFERENCE_FIELDS
 
     def _insert_prepared_snapshot(
         self,
@@ -1191,6 +1475,32 @@ class TurnSnapshotService:
                 reason,
             ),
         )
+        self.repositories.connection.execute(
+            """
+            INSERT INTO save_snapshot_state(
+                save_id, base_snapshot_id, base_message_id, updated_at
+            )
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(save_id) DO UPDATE SET
+                base_snapshot_id = excluded.base_snapshot_id,
+                base_message_id = excluded.base_message_id,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (save_id, snapshot_id, message_id),
+        )
+        self.repositories.connection.execute(
+            """
+            UPDATE save_snapshot_table_state
+            SET captured_generation = current_generation,
+                needs_rebuild = 0
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        )
+        self.repositories.connection.execute(
+            "DELETE FROM save_snapshot_dirty_rows WHERE save_id = ?",
+            (save_id,),
+        )
         self.repositories.commit()
         snapshot = self._get_snapshot(snapshot_id)
         log_event(
@@ -1200,9 +1510,45 @@ class TurnSnapshotService:
             message_id=message_id,
             context_revision=prepared.context_revision,
             reason=reason,
-            object_count=sum(len(entries) for entries in prepared.tables.values()),
+            object_count=prepared.object_count,
         )
         return snapshot
+
+    def _clean_materialized_snapshot(
+        self,
+        save_id: str,
+        *,
+        message_id: str | None | object = ...,
+    ) -> TurnSnapshotRecord | None:
+        row = self.repositories.connection.execute(
+            """
+            SELECT state.base_snapshot_id, state.base_message_id
+            FROM save_snapshot_state state
+            WHERE state.save_id = ?
+              AND state.base_snapshot_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM save_snapshot_table_state tables
+                  WHERE tables.save_id = state.save_id
+                    AND (
+                        tables.needs_rebuild != 0
+                        OR tables.current_generation != tables.captured_generation
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM save_snapshot_dirty_rows dirty
+                  WHERE dirty.save_id = state.save_id
+              )
+            """,
+            (save_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        base_message_id = cast(str | None, row["base_message_id"])
+        if message_id is not ... and base_message_id != message_id:
+            return None
+        return self._get_snapshot(str(row["base_snapshot_id"]))
 
     def _active_rows_by_table(
         self,
@@ -1262,6 +1608,276 @@ class TurnSnapshotService:
         )
         return object_hash
 
+    def _tree_insert(
+        self,
+        *,
+        table_name: str,
+        root_hash: str | None,
+        order_key: str,
+        row_key: str,
+        row_hash: str,
+    ) -> str:
+        priority = _snapshot_tree_priority(table_name, row_key)
+        if root_hash is None:
+            return self._store_tree_node(
+                table_name=table_name,
+                order_key=order_key,
+                row_key=row_key,
+                row_hash=row_hash,
+                priority=priority,
+                left_hash=None,
+                right_hash=None,
+            )
+        node = self._load_tree_node(table_name, root_hash)
+        node_order_key = _text(node, "order_key")
+        if order_key == node_order_key:
+            return self._store_tree_node(
+                table_name=table_name,
+                order_key=order_key,
+                row_key=row_key,
+                row_hash=row_hash,
+                priority=priority,
+                left_hash=_optional_text(node, "left_hash"),
+                right_hash=_optional_text(node, "right_hash"),
+            )
+        if priority < _int(node, "priority"):
+            left_hash, right_hash = self._tree_split(
+                table_name=table_name,
+                root_hash=root_hash,
+                order_key=order_key,
+            )
+            return self._store_tree_node(
+                table_name=table_name,
+                order_key=order_key,
+                row_key=row_key,
+                row_hash=row_hash,
+                priority=priority,
+                left_hash=left_hash,
+                right_hash=right_hash,
+            )
+        if order_key < node_order_key:
+            left_hash = self._tree_insert(
+                table_name=table_name,
+                root_hash=_optional_text(node, "left_hash"),
+                order_key=order_key,
+                row_key=row_key,
+                row_hash=row_hash,
+            )
+            return self._store_tree_node_from_value(
+                table_name=table_name,
+                node=node,
+                left_hash=left_hash,
+            )
+        right_hash = self._tree_insert(
+            table_name=table_name,
+            root_hash=_optional_text(node, "right_hash"),
+            order_key=order_key,
+            row_key=row_key,
+            row_hash=row_hash,
+        )
+        return self._store_tree_node_from_value(
+            table_name=table_name,
+            node=node,
+            right_hash=right_hash,
+        )
+
+    def _tree_split(
+        self,
+        *,
+        table_name: str,
+        root_hash: str | None,
+        order_key: str,
+    ) -> tuple[str | None, str | None]:
+        if root_hash is None:
+            return None, None
+        node = self._load_tree_node(table_name, root_hash)
+        if _text(node, "order_key") < order_key:
+            left_of_right, right_hash = self._tree_split(
+                table_name=table_name,
+                root_hash=_optional_text(node, "right_hash"),
+                order_key=order_key,
+            )
+            return (
+                self._store_tree_node_from_value(
+                    table_name=table_name,
+                    node=node,
+                    right_hash=left_of_right,
+                ),
+                right_hash,
+            )
+        left_hash, right_of_left = self._tree_split(
+            table_name=table_name,
+            root_hash=_optional_text(node, "left_hash"),
+            order_key=order_key,
+        )
+        return (
+            left_hash,
+            self._store_tree_node_from_value(
+                table_name=table_name,
+                node=node,
+                left_hash=right_of_left,
+            ),
+        )
+
+    def _tree_delete(
+        self,
+        *,
+        table_name: str,
+        root_hash: str | None,
+        order_key: str,
+    ) -> str | None:
+        if root_hash is None:
+            return None
+        node = self._load_tree_node(table_name, root_hash)
+        node_order_key = _text(node, "order_key")
+        if order_key == node_order_key:
+            return self._tree_merge(
+                table_name=table_name,
+                left_hash=_optional_text(node, "left_hash"),
+                right_hash=_optional_text(node, "right_hash"),
+            )
+        if order_key < node_order_key:
+            left_hash = self._tree_delete(
+                table_name=table_name,
+                root_hash=_optional_text(node, "left_hash"),
+                order_key=order_key,
+            )
+            return self._store_tree_node_from_value(
+                table_name=table_name,
+                node=node,
+                left_hash=left_hash,
+            )
+        right_hash = self._tree_delete(
+            table_name=table_name,
+            root_hash=_optional_text(node, "right_hash"),
+            order_key=order_key,
+        )
+        return self._store_tree_node_from_value(
+            table_name=table_name,
+            node=node,
+            right_hash=right_hash,
+        )
+
+    def _tree_merge(
+        self,
+        *,
+        table_name: str,
+        left_hash: str | None,
+        right_hash: str | None,
+    ) -> str | None:
+        if left_hash is None:
+            return right_hash
+        if right_hash is None:
+            return left_hash
+        left = self._load_tree_node(table_name, left_hash)
+        right = self._load_tree_node(table_name, right_hash)
+        if _int(left, "priority") < _int(right, "priority"):
+            merged_right = self._tree_merge(
+                table_name=table_name,
+                left_hash=_optional_text(left, "right_hash"),
+                right_hash=right_hash,
+            )
+            return self._store_tree_node_from_value(
+                table_name=table_name,
+                node=left,
+                right_hash=merged_right,
+            )
+        merged_left = self._tree_merge(
+            table_name=table_name,
+            left_hash=left_hash,
+            right_hash=_optional_text(right, "left_hash"),
+        )
+        return self._store_tree_node_from_value(
+            table_name=table_name,
+            node=right,
+            left_hash=merged_left,
+        )
+
+    def _store_tree_node_from_value(
+        self,
+        *,
+        table_name: str,
+        node: Mapping[str, object],
+        left_hash: str | None | object = ...,
+        right_hash: str | None | object = ...,
+    ) -> str:
+        return self._store_tree_node(
+            table_name=table_name,
+            order_key=_text(node, "order_key"),
+            row_key=_text(node, "row_key"),
+            row_hash=_text(node, "row_hash"),
+            priority=_int(node, "priority"),
+            left_hash=(
+                _optional_text(node, "left_hash")
+                if left_hash is ...
+                else cast(str | None, left_hash)
+            ),
+            right_hash=(
+                _optional_text(node, "right_hash")
+                if right_hash is ...
+                else cast(str | None, right_hash)
+            ),
+        )
+
+    def _store_tree_node(
+        self,
+        *,
+        table_name: str,
+        order_key: str,
+        row_key: str,
+        row_hash: str,
+        priority: int,
+        left_hash: str | None,
+        right_hash: str | None,
+    ) -> str:
+        return self._store_object(
+            kind=f"snapshot_table_node:{table_name}",
+            value={
+                "table": table_name,
+                "order_key": order_key,
+                "row_key": row_key,
+                "row_hash": row_hash,
+                "priority": priority,
+                "left_hash": left_hash,
+                "right_hash": right_hash,
+            },
+        )
+
+    def _load_tree_node(
+        self,
+        table_name: str,
+        object_hash: str,
+    ) -> dict[str, object]:
+        value = self._load_object(object_hash)
+        if not isinstance(value, dict) or value.get("table") != table_name:
+            raise ValueError(f"Invalid snapshot table node: {object_hash}")
+        return cast(dict[str, object], value)
+
+    def _tree_entries(
+        self,
+        *,
+        table_name: str,
+        root_hash: str | None,
+    ) -> tuple[tuple[str, str], ...]:
+        if root_hash is None:
+            return ()
+        entries: list[tuple[str, str]] = []
+        pending: list[tuple[str, bool]] = [(root_hash, False)]
+        while pending:
+            object_hash, visited = pending.pop()
+            node = self._load_tree_node(table_name, object_hash)
+            if visited:
+                entries.append((_text(node, "row_key"), _text(node, "row_hash")))
+                right_hash = _optional_text(node, "right_hash")
+                if right_hash is not None:
+                    pending.append((right_hash, False))
+                continue
+            pending.append((object_hash, True))
+            left_hash = _optional_text(node, "left_hash")
+            if left_hash is not None:
+                pending.append((left_hash, False))
+        return tuple(entries)
+
     def _get_snapshot(self, snapshot_id: str) -> TurnSnapshotRecord:
         row = self.repositories.connection.execute(
             """
@@ -1305,7 +1921,10 @@ class TurnSnapshotService:
 
     def _snapshot_manifest(self, snapshot: TurnSnapshotRecord) -> dict[str, object]:
         manifest = self._load_object(snapshot.root_manifest_hash)
-        if not isinstance(manifest, dict) or manifest.get("format") != SNAPSHOT_FORMAT:
+        if not isinstance(manifest, dict) or manifest.get("format") not in {
+            SNAPSHOT_FORMAT,
+            SNAPSHOT_FORMAT_V2,
+        }:
             raise ValueError(f"Invalid snapshot manifest: {snapshot.id}")
         return cast(dict[str, object], manifest)
 
@@ -1347,9 +1966,31 @@ class TurnSnapshotService:
                 raise ValueError(
                     f"Snapshot manifest object is not valid: {object_hash}"
                 )
-            for table_rows in _manifest_tables(manifest).values():
-                for entry in table_rows:
-                    reachable.add(_text(entry, "object_hash"))
+            if manifest.get("format") == SNAPSHOT_FORMAT_V2:
+                raw_roots = manifest.get("table_roots", {})
+                if not isinstance(raw_roots, Mapping):
+                    raise ValueError("Snapshot manifest is missing table roots")
+                for table_name, raw_root_hash in raw_roots.items():
+                    if table_name not in _TABLES_BY_NAME or not isinstance(
+                        raw_root_hash, str
+                    ):
+                        continue
+                    pending = [raw_root_hash]
+                    while pending:
+                        node_hash = pending.pop()
+                        if node_hash in reachable:
+                            continue
+                        reachable.add(node_hash)
+                        node = self._load_tree_node(str(table_name), node_hash)
+                        reachable.add(_text(node, "row_hash"))
+                        for child_key in ("left_hash", "right_hash"):
+                            child_hash = _optional_text(node, child_key)
+                            if child_hash is not None:
+                                pending.append(child_hash)
+            else:
+                for table_rows in _manifest_tables(manifest).values():
+                    for entry in table_rows:
+                        reachable.add(_text(entry, "object_hash"))
         return reachable
 
     def _rows_from_manifest(
@@ -1357,6 +1998,26 @@ class TurnSnapshotService:
         manifest: Mapping[str, object],
     ) -> dict[str, tuple[dict[str, object], ...]]:
         rows_by_table: dict[str, tuple[dict[str, object], ...]] = {}
+        if manifest.get("format") == SNAPSHOT_FORMAT_V2:
+            raw_roots = manifest.get("table_roots")
+            if not isinstance(raw_roots, Mapping):
+                raise ValueError("Snapshot manifest is missing table roots")
+            for table_name in _SNAPSHOT_TABLE_NAMES:
+                raw_root_hash = raw_roots.get(table_name)
+                root_hash = raw_root_hash if isinstance(raw_root_hash, str) else None
+                table_rows: list[dict[str, object]] = []
+                for _row_key, row_hash in self._tree_entries(
+                    table_name=table_name,
+                    root_hash=root_hash,
+                ):
+                    value = self._load_object(row_hash)
+                    if not isinstance(value, dict):
+                        raise ValueError(
+                            f"Snapshot row object is not a row: {row_hash}"
+                        )
+                    table_rows.append(cast(dict[str, object], value))
+                rows_by_table[table_name] = tuple(table_rows)
+            return rows_by_table
         for table_name, entries in _manifest_tables(manifest).items():
             rows: list[dict[str, object]] = []
             for entry in entries:
@@ -2518,6 +3179,45 @@ def _canonical_json_bytes(value: object) -> bytes:
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
+
+
+def _snapshot_row_key(
+    table: _SnapshotTable,
+    row: Mapping[str, object],
+) -> str:
+    value = row.get(table.primary_key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            f"Snapshot row is missing {table.name}.{table.primary_key}"
+        )
+    return value
+
+
+def _snapshot_tree_order_key(
+    table: _SnapshotTable,
+    *,
+    row: Mapping[str, object],
+    row_key: str,
+    ordinal: int,
+) -> str:
+    logical: tuple[str, ...]
+    if table.name == "world_state":
+        logical = (str(row.get("key", "")),)
+    elif table.name == "context_sources":
+        logical = (
+            str(row.get("source_type", "")),
+            str(row.get("source_id", "")),
+        )
+    elif table.name in {"scene_facts", "scene_fact_sources"}:
+        logical = (str(row.get("created_at", "")),)
+    else:
+        logical = ()
+    return _compact_json([*logical, f"{ordinal:020d}", row_key])
+
+
+def _snapshot_tree_priority(table_name: str, row_key: str) -> int:
+    digest = sha256(f"{table_name}\0{row_key}".encode()).hexdigest()
+    return int(digest[:15], 16)
 
 
 def _compact_json(value: object) -> str:

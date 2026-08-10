@@ -13,6 +13,7 @@ from pathlib import Path
 from bragi.model_tasks import is_retired_model_task
 from bragi.observation_types import normalize_observation_type
 from bragi.persistence.context_provenance import merge_context_source_metadata
+from bragi.persistence.snapshot_contract import SNAPSHOT_TABLES
 from bragi.private_files import ensure_private_file
 from bragi.text_search import (
     MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS,
@@ -777,10 +778,12 @@ def migrate_database(database_path: Path | str) -> None:
                 current = CURRENT_SCHEMA_VERSION
             elif current == 79:
                 _migrate_schema_79_to_80(connection)
+                _migrate_schema_80_to_81(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 78:
                 _migrate_schema_78_to_79(connection)
                 _migrate_schema_79_to_80(connection)
+                _migrate_schema_80_to_81(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 77:
                 _migrate_schema_77_to_78(connection)
@@ -1056,6 +1059,7 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         _ensure_turn_snapshot_schema(connection)
         _ensure_chat_turn_submission_schema(connection)
         _ensure_summary_pressure_state_schema(connection)
+        _ensure_incremental_turn_snapshot_schema(connection)
         _ensure_context_revision_schema(connection)
         _ensure_continuity_index_revision_schema(connection)
         _ensure_character_contact_name_schema(connection)
@@ -1219,6 +1223,110 @@ def _ensure_turn_snapshot_schema(connection: sqlite3.Connection) -> None:
         ON save_turn_snapshots(root_manifest_hash);
         """
     )
+
+
+def _ensure_incremental_turn_snapshot_schema(connection: sqlite3.Connection) -> None:
+    if not _table_exists(connection, "saves"):
+        return
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS save_snapshot_state (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            base_snapshot_id TEXT REFERENCES save_turn_snapshots(id)
+                ON DELETE SET NULL,
+            base_message_id TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS save_snapshot_table_state (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            table_name TEXT NOT NULL,
+            current_generation INTEGER NOT NULL DEFAULT 0,
+            captured_generation INTEGER NOT NULL DEFAULT 0,
+            root_hash TEXT,
+            next_ordinal INTEGER NOT NULL DEFAULT 0,
+            needs_rebuild INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(save_id, table_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS save_snapshot_dirty_rows (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            table_name TEXT NOT NULL,
+            row_key TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            PRIMARY KEY(save_id, table_name, row_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS save_snapshot_row_state (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            table_name TEXT NOT NULL,
+            row_key TEXT NOT NULL,
+            object_hash TEXT,
+            order_key TEXT,
+            ordinal INTEGER NOT NULL,
+            included INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(save_id, table_name, row_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_snapshot_dirty_rows_generation
+        ON save_snapshot_dirty_rows(save_id, table_name, generation);
+        """,
+    )
+    for table in SNAPSHOT_TABLES:
+        if not _table_exists(connection, table.name):
+            continue
+        for event in ("INSERT", "UPDATE", "DELETE"):
+            row_ref = "OLD" if event == "DELETE" else "NEW"
+            trigger_name = f"dirty_snapshot_{table.name}_after_{event.lower()}"
+            _execute_schema_script(
+                connection,
+                f"""
+                CREATE TRIGGER IF NOT EXISTS {trigger_name}
+                AFTER {event} ON {table.name}
+                FOR EACH ROW
+                BEGIN
+                    INSERT INTO save_snapshot_table_state(
+                        save_id, table_name, current_generation,
+                        captured_generation, needs_rebuild
+                    )
+                    VALUES ({row_ref}.save_id, '{table.name}', 1, 0, 0)
+                    ON CONFLICT(save_id, table_name) DO UPDATE SET
+                        current_generation = current_generation + 1;
+
+                    INSERT INTO save_snapshot_dirty_rows(
+                        save_id, table_name, row_key, generation
+                    )
+                    VALUES (
+                        {row_ref}.save_id,
+                        '{table.name}',
+                        COALESCE(
+                            CAST({row_ref}.{table.primary_key} AS TEXT),
+                            printf('rowid:%d', {row_ref}.rowid)
+                        ),
+                        (
+                            SELECT current_generation
+                            FROM save_snapshot_table_state
+                            WHERE save_id = {row_ref}.save_id
+                              AND table_name = '{table.name}'
+                        )
+                    )
+                    ON CONFLICT(save_id, table_name, row_key) DO UPDATE SET
+                        generation = excluded.generation;
+                END;
+                """,
+            )
+    for table in SNAPSHOT_TABLES:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO save_snapshot_table_state(
+                save_id, table_name, current_generation,
+                captured_generation, needs_rebuild
+            )
+            SELECT id, ?, 1, 0, 1 FROM saves
+            """,
+            (table.name,),
+        )
 
 
 def _ensure_context_observation_schema(connection: sqlite3.Connection) -> None:
@@ -2384,6 +2492,7 @@ def _migrate_schema_76_to_77(connection: sqlite3.Connection) -> None:
     _migrate_schema_77_to_78(connection)
     _migrate_schema_78_to_79(connection)
     _migrate_schema_79_to_80(connection)
+    _migrate_schema_80_to_81(connection)
 
 
 def _migrate_schema_79_to_80(connection: sqlite3.Connection) -> None:
@@ -2453,12 +2562,16 @@ def _ensure_post_turn_outbox_schema(connection: sqlite3.Connection) -> None:
         ON post_turn_outbox(save_id, status, updated_at);
         """,
     )
-
-
 def _migrate_schema_77_to_78(connection: sqlite3.Connection) -> None:
     _ensure_summary_pressure_state_schema(connection)
     _backfill_summary_pressure_state(connection)
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (78)")
+    _migrate_schema_78_to_79(connection)
+
+
+def _migrate_schema_80_to_81(connection: sqlite3.Connection) -> None:
+    _ensure_incremental_turn_snapshot_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (81)")
 
 
 def _ensure_summary_pressure_state_schema(connection: sqlite3.Connection) -> None:
