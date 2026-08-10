@@ -4042,6 +4042,64 @@ def test_character_exclusion_rechecks_group_participant_aggregate(
     assert all(row["id"] != thread.id for row in rows["character_text_threads"])
 
 
+def test_group_reference_cycle_revives_after_characters_are_unarchived(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    for character_id in ("mara", "rowan"):
+        repositories.add_character(
+            save_id=save.id,
+            character_id=character_id,
+            name=character_id.title(),
+        )
+    thread = repositories.create_character_text_group_thread(
+        save_id=save.id,
+        title="Beacon Crew",
+        character_ids=("mara", "rowan"),
+    )
+    participant_ids = {
+        str(row["id"])
+        for row in repositories.connection.execute(
+            """
+            SELECT id FROM character_text_thread_participants
+            WHERE save_id = ? AND thread_id = ?
+            """,
+            (save.id, thread.id),
+        )
+    }
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE characters SET archived_at = CURRENT_TIMESTAMP "
+        "WHERE id IN ('mara', 'rowan')"
+    )
+    repositories.commit()
+    excluded = service.capture_current_head_if_dirty(save.id)
+    excluded_rows = service._rows_from_manifest(
+        service._snapshot_manifest(excluded)
+    )
+    assert all(
+        row["id"] != thread.id
+        for row in excluded_rows["character_text_threads"]
+    )
+
+    repositories.connection.execute(
+        "UPDATE characters SET archived_at = NULL "
+        "WHERE id IN ('mara', 'rowan')"
+    )
+    repositories.commit()
+    revived = service.capture_current_head_if_dirty(save.id)
+    revived_rows = service._rows_from_manifest(service._snapshot_manifest(revived))
+
+    assert thread.id in {
+        row["id"] for row in revived_rows["character_text_threads"]
+    }
+    assert participant_ids <= {
+        row["id"]
+        for row in revived_rows["character_text_thread_participants"]
+    }
+
+
 def test_participant_move_rechecks_old_and_new_group_threads(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -1286,6 +1286,13 @@ def _ensure_incremental_turn_snapshot_schema(connection: sqlite3.Connection) -> 
             max_ordinal INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS save_snapshot_included_activity_events (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            event_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY(save_id, event_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_snapshot_dirty_rows_generation
         ON save_snapshot_dirty_rows(save_id, table_name, generation);
 
@@ -1297,6 +1304,9 @@ def _ensure_incremental_turn_snapshot_schema(connection: sqlite3.Connection) -> 
         ON save_snapshot_row_references(
             save_id, target_table, target_key, source_table, source_key
         );
+
+        CREATE INDEX IF NOT EXISTS idx_snapshot_included_activity_max
+        ON save_snapshot_included_activity_events(save_id, ordinal DESC);
         """,
     )
     for table in SNAPSHOT_TABLES:
