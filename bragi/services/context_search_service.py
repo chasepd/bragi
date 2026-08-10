@@ -653,6 +653,51 @@ class ContextSearchService:
                 )
                 if narration_snapshot is None:
                     raise ValueError(f"Unknown save id: {save_id}")
+                retry_archived_stale_scratch = (
+                    _archive_stale_scene_scratch_for_search(
+                        self.repositories,
+                        save_id,
+                        current_scene_snapshot_id=(
+                            narration_snapshot.scene_snapshot.id
+                            if narration_snapshot.scene_snapshot is not None
+                            else None
+                        ),
+                        current_scene_generation=(
+                            narration_snapshot.scene_snapshot.scene_generation
+                            if narration_snapshot.scene_snapshot is not None
+                            else None
+                        ),
+                    )
+                )
+                if retry_archived_stale_scratch:
+                    _sync_continuity_index_for_search(self.repositories, save_id)
+                    build_start_revision = (
+                        self.repositories.context_candidate_revision_token(
+                            save_id,
+                            ignored_message_id=player_message_id,
+                        )
+                    )
+                    details = self.repositories.load_save_details(
+                        save_id,
+                        message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+                    )
+                    if details is None:
+                        raise ValueError(f"Unknown save id: {save_id}")
+                    scenario = details.scenario
+                    messages = (
+                        details.messages
+                        if focus_message is None
+                        else [*details.messages, focus_message]
+                    )
+                    narration_snapshot = load_narration_context_snapshot(
+                        self.repositories,
+                        save_id=save_id,
+                        details=details,
+                        include_context_sources=False,
+                        raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
+                    )
+                    if narration_snapshot is None:
+                        raise ValueError(f"Unknown save id: {save_id}")
                 messages = _context_search_visible_messages(
                     self.repositories,
                     save_id=save_id,
