@@ -2058,15 +2058,6 @@ def _active_linked_fact_sources(
             message_positions=message_positions,
         )
     }
-    scenario_candidates = scenario_section_candidates(scenario)
-    scenario_sections = {
-        source_id: (section_id, text)
-        for source_id, section_id, text in scenario_candidates
-    }
-    scenario_sections_by_key = {
-        section_id: (source_id, text)
-        for source_id, section_id, text in scenario_candidates
-    }
     character_names = {
         character.id: character.name
         for character in character_records
@@ -2082,8 +2073,6 @@ def _active_linked_fact_sources(
             memory_by_id=knowledge_memory_by_id,
             state_by_id=knowledge_state_by_id,
             summary_by_id=knowledge_summary_by_id,
-            scenario_sections=scenario_sections,
-            scenario_sections_by_key=scenario_sections_by_key,
             character_names=character_names,
         )
         if source is None:
@@ -2118,8 +2107,6 @@ def _active_linked_fact_sources(
             memory_by_id=memory_by_id,
             state_by_id=state_by_id,
             summary_by_id=summary_by_id,
-            scenario_sections=scenario_sections,
-            scenario_sections_by_key=scenario_sections_by_key,
             character_names=character_names,
         )
         if source is None:
@@ -2157,8 +2144,6 @@ def _linked_fact_source(
     memory_by_id: dict[str, MemoryRecord],
     state_by_id: dict[str, WorldStateRecord],
     summary_by_id: dict[str, SummaryRecord],
-    scenario_sections: dict[str, tuple[str, str]],
-    scenario_sections_by_key: dict[str, tuple[str, str]],
     character_names: dict[str, str],
 ) -> ContextSource | None:
     target_type = _normalized_link_type(link.target_type)
@@ -2199,24 +2184,6 @@ def _linked_fact_source(
             text=f"{prefix}summary: {summary.body}",
             reason=_link_reason(link),
         )
-    if target_type == "scenario_section":
-        section = scenario_sections.get(link.target_id)
-        source_id = link.target_id
-        if section is None:
-            by_key = scenario_sections_by_key.get(link.target_id)
-            if by_key is None:
-                return None
-            source_id, text = by_key
-            section_id = link.target_id
-        else:
-            section_id, text = section
-        return ContextSource(
-            tier="active_linked_facts",
-            source_type="scenario_section",
-            source_id=source_id,
-            text=f"{prefix}scenario section ({section_id}): {text}",
-            reason=_link_reason(link),
-        )
     return None
 
 
@@ -2235,8 +2202,6 @@ def _knowledge_edge_source(
     memory_by_id: dict[str, MemoryRecord],
     state_by_id: dict[str, WorldStateRecord],
     summary_by_id: dict[str, SummaryRecord],
-    scenario_sections: dict[str, tuple[str, str]],
-    scenario_sections_by_key: dict[str, tuple[str, str]],
     character_names: dict[str, str],
 ) -> ContextSource | None:
     if not _knowledge_edge_allows_prompt_use(edge):
@@ -2278,24 +2243,6 @@ def _knowledge_edge_source(
             source_type="summary",
             source_id=summary.id,
             text=f"{prefix}summary: {summary.body}",
-            reason=reason,
-        )
-    if target_type == "scenario_section":
-        section = scenario_sections.get(edge.target_id)
-        source_id = edge.target_id
-        if section is None:
-            by_key = scenario_sections_by_key.get(edge.target_id)
-            if by_key is None:
-                return None
-            source_id, text = by_key
-            section_id = edge.target_id
-        else:
-            section_id, text = section
-        return ContextSource(
-            tier="active_linked_facts",
-            source_type="scenario_section",
-            source_id=source_id,
-            text=f"{prefix}scenario section ({section_id}): {text}",
             reason=reason,
         )
     return None

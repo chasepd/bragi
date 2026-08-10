@@ -97,6 +97,48 @@ def test_compiler_preserves_source_and_builds_atomic_grounded_claims() -> None:
     assert json.loads(json.dumps(request.schema))["additionalProperties"] is False
 
 
+def test_compiler_normalizes_punctuated_evidence_into_atomic_claim() -> None:
+    output = _output()
+    sections = output["sections"]
+    assert isinstance(sections, list)
+    section = sections[0]
+    assert isinstance(section, dict)
+    section["claims"] = [
+        {
+            "claim": "Mira knows the route.",
+            "evidence_quote": "Mira, the captain, knows the route.",
+            "entity_anchors": [
+                {
+                    "entity_type": "character",
+                    "entity_key": "mira",
+                    "display_name": "Mira",
+                }
+            ],
+            "fact_type": "knowledge",
+            "fact_key": "route-knowledge",
+            "authority": "canonical",
+            "temporal_status": "durable",
+            "reveal_policy": "player_known",
+            "known_by": ["mira"],
+        }
+    ]
+
+    compiled = asyncio.run(
+        ScenarioCanonCompiler(
+            provider=FakeProviderClient(structured_output=output),
+            provider_name="fake",
+            model_id="canon-model",
+        ).compile(
+            scenario_type="full_roleplay",
+            content={"lore": "Mira, the captain, knows the route."},
+        )
+    )
+
+    claims = scenario_canon_claims(compiled)
+    assert [claim.claim for claim in claims] == ["Mira knows the route."]
+    assert claims[0].evidence_quote == "Mira, the captain, knows the route."
+
+
 def test_compiler_reuses_matching_compilation_without_provider_call() -> None:
     provider = FakeProviderClient(structured_output=_output())
     compiler = ScenarioCanonCompiler(
@@ -283,7 +325,7 @@ def test_compiler_rejects_claim_without_exact_source_evidence() -> None:
         (
             "The beacon grants every wish.",
             "The beacon consumes one memory per use.",
-            "exactly match",
+            "adds facts absent",
         ),
         (
             "The duke is dead and the royal seal is missing.",

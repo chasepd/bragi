@@ -127,7 +127,10 @@ class ScenarioCanonCompiler:
                     role="system",
                     body=(
                         "Compile scenario prose into concise atomic canon claims. "
-                        "Use only exact evidence from the supplied source sections. "
+                        "Each claim may normalize its exact evidence quote into one "
+                        "atomic statement, but must not add factual words absent from "
+                        "that evidence. Use only exact evidence from the supplied "
+                        "source sections. "
                         "Separate established facts, beliefs, rumors, and hypotheses; "
                         "mark time and reveal boundaries conservatively. For known_by, "
                         "use only entity_key values from that claim's entity_anchors."
@@ -355,10 +358,10 @@ def _validated_claim(
     evidence_quote = str(raw.get("evidence_quote", "")).strip()
     if not claim or not evidence_quote or evidence_quote not in source:
         raise ValueError("Scenario canon claim lacks exact source evidence")
-    if claim != evidence_quote:
-        raise ValueError("Scenario canon claim must exactly match its source evidence")
     if not _claim_is_atomic(claim):
         raise ValueError("Scenario canon claim must contain one atomic sentence")
+    if not _claim_is_grounded(claim, evidence_quote):
+        raise ValueError("Scenario canon claim adds facts absent from its evidence")
     fact_type = _enum(raw, "fact_type", FACT_TYPES)
     fact_key = str(raw.get("fact_key", "")).strip()
     if not fact_key:
@@ -433,6 +436,12 @@ def _claim_is_atomic(value: str) -> bool:
     if re.search(r"[.!?]\s", without_terminal) is not None:
         return False
     return not _contains_coordinated_clauses(without_terminal)
+
+
+def _claim_is_grounded(claim: str, evidence_quote: str) -> bool:
+    evidence_tokens = set(re.findall(r"[a-z0-9]+", evidence_quote.casefold()))
+    claim_tokens = set(re.findall(r"[a-z0-9]+", claim.casefold()))
+    return claim_tokens <= evidence_tokens
 
 
 def _contains_coordinated_clauses(value: str) -> bool:

@@ -811,6 +811,14 @@ def test_deterministic_context_sources_include_active_linked_facts(
                 target_type=target_type,
                 target_id=target_id,
             )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=present_character.id,
+        target_type="scenario_section",
+        target_id=active_scenario_target,
+        knowledge_state="knows",
+        acquisition_method="witnessed",
+    )
     for entity_type, entity_id in (
         ("location", inactive_location.id),
         ("character", non_present_character.id),
@@ -839,13 +847,13 @@ def test_deterministic_context_sources_include_active_linked_facts(
         active_memory_text,
         active_world_state_text,
         active_summary_text,
-        active_scenario_text,
     ):
         assert expected in active_linked_text
     for excluded in (
         inactive_memory_text,
         inactive_world_state_key,
         inactive_summary_text,
+        active_scenario_text,
         inactive_scenario_text,
     ):
         assert excluded not in active_linked_text
