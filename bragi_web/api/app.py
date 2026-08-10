@@ -3374,6 +3374,23 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         async with state.lock.async_access():
             submitted_save_id = _require_save_id(payload.save_id)
             _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
+        request_fingerprint = _chat_turn_request_fingerprint(
+            "continue",
+            {
+                "body": STORY_CONTINUATION_DIRECTION,
+                "speaker_name": STORY_CONTINUATION_SPEAKER_NAME,
+            },
+        )
+        replay = _chat_turn_submission_replay(
+            state,
+            save_id=submitted_save_id,
+            client_turn_id=str(payload.client_turn_id),
+            operation="continue",
+            request_fingerprint=request_fingerprint,
+        )
+        if replay is not None:
+            return replay
+        async with state.lock.async_access():
             save = state.repositories.get_save(submitted_save_id)
             if (
                 save is None

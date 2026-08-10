@@ -7890,6 +7890,45 @@ def test_continue_story_rejects_roleplay_save(tmp_path: Path) -> None:
     )
 
 
+def test_continue_story_replays_before_current_mode_check(tmp_path: Path) -> None:
+    client_turn_id = "11111111-1111-4111-8111-111111111111"
+    job = JobRecord(
+        id="continue-1",
+        type="chat_turn",
+        status="succeeded",
+        save_id="save-1",
+    )
+    state = _state_double(tmp_path)
+    state.jobs._jobs = {job.id: job}  # noqa: SLF001 - replay fixture
+    state.repositories = SimpleNamespace(
+        get_chat_turn_submission=lambda *, save_id, client_turn_id: SimpleNamespace(
+            operation="continue",
+            request_fingerprint=api_app._chat_turn_request_fingerprint(
+                "continue",
+                {
+                    "body": api_app.STORY_CONTINUATION_DIRECTION,
+                    "speaker_name": api_app.STORY_CONTINUATION_SPEAKER_NAME,
+                },
+            ),
+            job=job,
+            player_message_id=None,
+            narrator_message_id=None,
+        ),
+        get_save=lambda _save_id: SimpleNamespace(
+            interaction_mode=InteractionMode.ROLEPLAY
+        ),
+    )
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.post(
+            "/api/chat/continue",
+            json={"client_turn_id": client_turn_id, "save_id": "save-1"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == job.id
+
+
 def test_timeskip_post_records_save_id_on_created_job(tmp_path: Path) -> None:
     class RuntimeWithTimeskip(_RuntimeDouble):
         def __init__(self) -> None:

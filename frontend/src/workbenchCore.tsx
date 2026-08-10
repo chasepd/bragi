@@ -3187,27 +3187,15 @@ function Workbench({
   const runJob = useCallback<RunJob>((created, options = { applyResult: true }) => {
     if (!jobBelongsToActiveSave(created, activeSaveIdRef.current)) return () => undefined;
     if (jobWatchers.current[created.id]) return jobWatchers.current[created.id];
-    if (["succeeded", "failed", "cancelled"].includes(created.status)) {
-      let appliedRuntimeResult = false;
-      if (options.applyResult !== false && created.status === "succeeded") {
-        if (isRuntimeModel(created.result)) {
-          appliedRuntimeResult = true;
-          applyRuntimeModel(created.result);
-        } else if (isChatTurnDelta(created.result)) {
-          appliedRuntimeResult = applyChatTurnDelta(created.result);
-        }
+    if (created.status !== "queued" && created.status !== "running") {
+      if (created.status === "succeeded") {
+        options.onSucceeded?.(created.result);
       }
-      if (created.status === "succeeded") options.onSucceeded?.(created.result);
       if (created.status === "failed") {
         options.onFailed?.(created.error || "Background job failed.", created);
       }
       if (options.clearPendingMessages !== false) setPendingMessage(null);
-      refreshWorkbench(
-        activeSaveIdRef.current,
-        appliedRuntimeResult
-          ? RUNTIME_MODEL_SIDE_EFFECT_REFRESH_TARGETS
-          : ALL_WORKBENCH_REFRESH_TARGETS,
-      );
+      refreshWorkbench(activeSaveIdRef.current, ALL_WORKBENCH_REFRESH_TARGETS);
       return () => undefined;
     }
     setTrackedJobs((current) => {
@@ -6248,6 +6236,16 @@ type ChatSubmitVariables = {
   key: string;
 };
 
+function clientTurnId(): string {
+  return crypto.randomUUID?.() ?? "10000000-1000-4000-8000-100000000000".replace(
+    /[018]/g,
+    (digit) => (
+      Number(digit)
+      ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (Number(digit) / 4)))
+    ).toString(16)
+  );
+}
+
 function chatSubmitVariables(
   body: string,
   saveId: string | null,
@@ -6256,7 +6254,7 @@ function chatSubmitVariables(
   if (previous && previous.saveId === saveId && previous.body.trim() === body.trim()) {
     return previous;
   }
-  return { body, saveId, key: crypto.randomUUID() };
+  return { body, saveId, key: clientTurnId() };
 }
 
 function pendingPlayerChronicleMessage(
@@ -6682,7 +6680,7 @@ function Composer({
                   continueStory.mutate(
                     previous?.saveId === activeSaveId
                       ? previous
-                      : { saveId: activeSaveId, key: crypto.randomUUID() }
+                      : { saveId: activeSaveId, key: clientTurnId() }
                   );
                 }}
               >
@@ -6742,7 +6740,7 @@ function Composer({
             ) ? { ...previous, instruction } : {
               instruction,
               saveId: activeSaveId,
-              key: crypto.randomUUID()
+              key: clientTurnId()
             };
             timeskip.mutate(submitted);
           }}

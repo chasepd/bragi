@@ -1986,6 +1986,8 @@ describe("frontend helpers", () => {
   });
 
   it("continues a storyteller chronicle without clearing drafted guidance", async () => {
+    const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto);
+    vi.stubGlobal("crypto", { getRandomValues });
     const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
       ok: true,
       json: async () => path === "/api/chat/continue"
@@ -2034,7 +2036,9 @@ describe("frontend helpers", () => {
     ));
     const continueCall = fetchMock.mock.calls.find(([path]) => path === "/api/chat/continue");
     expect(JSON.parse(String(continueCall?.[1].body))).toMatchObject({
-      client_turn_id: expect.any(String),
+      client_turn_id: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      ),
       save_id: "save-1"
     });
     expect(textarea).toHaveValue("Bring the rival back in the following scene.");
