@@ -601,6 +601,7 @@ class TurnSnapshotService:
                 self.repositories.connection,
                 save_id=save_id,
             )
+            self.repositories.rebuild_summary_pressure_state(save_id)
             self.repositories.commit_transaction()
         except Exception:
             self.repositories.rollback_transaction()
@@ -735,6 +736,7 @@ class TurnSnapshotService:
                     message_id=forked_trailing_messages[-1].id,
                     reason="fork_trailing_message",
                 )
+            self.repositories.rebuild_summary_pressure_state(fork_save.id)
             self.repositories.commit_transaction()
         except Exception:
             self.repositories.rollback_transaction()

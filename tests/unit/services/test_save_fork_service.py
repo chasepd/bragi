@@ -133,6 +133,10 @@ def test_fork_from_player_message_includes_selected_player_message(
     assert forked_prior_summary["archived_at"] is not None
     assert forked_summary.source_message_ids == (forked_player.id,)
     assert forked_summary.source_summary_ids == (forked_prior_summary["id"],)
+    pressure = repositories.get_summary_pressure_state(result.save.id)
+    assert pressure.active_summary_count == 1
+    assert pressure.summarized_through_message_id == forked_player.id
+    assert pressure.unsummarized_message_count == 0
 
 
 def test_fork_from_player_message_uses_preceding_turn_snapshot(

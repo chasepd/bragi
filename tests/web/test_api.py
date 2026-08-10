@@ -9049,6 +9049,7 @@ def test_post_turn_jobs_expose_initial_phase_progress_before_runtime_callback(
     assert job["latest_progress"] == {
         "status_text": "Updating world state",
         "jobs": [
+            {"name": "summary", "status": "pending", "category": "continuity"},
             {"name": "state", "status": "pending", "category": "continuity"},
             {
                 "name": "context",

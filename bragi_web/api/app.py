@@ -232,6 +232,7 @@ _CHAT_JOB_TYPES = frozenset(
     }
 )
 _POST_TURN_PROGRESS_JOB_ORDER = (
+    "summary",
     "state",
     "context",
     "time_reconciliation",

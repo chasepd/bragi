@@ -336,6 +336,7 @@ LOOK_AROUND_TURN_DIRECTIVE = (
     "support."
 )
 POST_TURN_JOB_ORDER = (
+    "summary",
     "state",
     "context",
     "time_reconciliation",
@@ -345,6 +346,7 @@ POST_TURN_JOB_ORDER = (
     "image",
 )
 POST_TURN_JOB_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "summary": (),
     "state": (),
     "context": ("state",),
     "time_reconciliation": ("context",),
@@ -355,6 +357,7 @@ POST_TURN_JOB_DEPENDENCIES: dict[str, tuple[str, ...]] = {
 }
 POST_TURN_IMAGE_CONTEXT_SEMANTICS = "pre_post_turn_updates"
 POST_TURN_PROVIDER_TASKS = {
+    "summary": "summarization",
     "state": "state_memory",
     "context": "context_update",
     "time_reconciliation": "context_update",
@@ -723,6 +726,14 @@ class SummaryRunner(Protocol):
         save_id: str,
         model_context_window: int | None,
         pending_message: PendingMessageEstimate | None = None,
+        current_user_id: str | None = None,
+    ) -> object: ...
+
+    async def prepare_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
         current_user_id: str | None = None,
     ) -> object: ...
 
@@ -4135,6 +4146,8 @@ class ChatService:
             return status
 
         def pressure_gate_enabled(name: str) -> bool:
+            if name == "summary":
+                return self.summary_service is not None
             if name == "context":
                 return (
                     agentic_context_pipeline_enabled(
@@ -4281,6 +4294,10 @@ class ChatService:
         publish("state", "pending")
 
         callbacks: dict[str, Callable[[], Any]] = {
+            "summary": lambda: self._prepare_summary_for_next_turn(
+                save_id=save_id,
+                current_user_id=current_user_id,
+            ),
             "state": lambda: self._extract_state_and_memory_if_configured(
                 save_id=save_id,
                 player_message_id=player_message_id,
@@ -4333,6 +4350,7 @@ class ChatService:
             ),
         }
         pressure_sensitive_jobs = {
+            "summary",
             "context",
             "time_reconciliation",
             "proactive_text",
@@ -4358,6 +4376,7 @@ class ChatService:
                     ),
                 )
             if stale_rebase and name in {
+                "summary",
                 "time_reconciliation",
                 "proactive_text",
                 "director",
@@ -5982,6 +6001,47 @@ class ChatService:
                 **exception_log_fields(exc),
             )
             return
+
+    async def _prepare_summary_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        current_user_id: str | None,
+    ) -> _PostTurnStepResult:
+        if self.summary_service is None:
+            return _PostTurnStepResult(
+                "skipped",
+                {"skipped_reason": "summary_service_unavailable"},
+            )
+        preference = _chat_model_preference_for_save(
+            repositories=self.repositories,
+            save_id=save_id,
+        )
+        if preference is None:
+            return _PostTurnStepResult(
+                "skipped",
+                {"skipped_reason": "chat_model_unavailable"},
+            )
+        summary = await self.summary_service.prepare_for_next_turn(
+            save_id=save_id,
+            model_context_window=_model_context_window(
+                repositories=self.repositories,
+                provider=preference.provider,
+                model_id=preference.model_id,
+            ),
+            current_user_id=current_user_id,
+        )
+        return _PostTurnStepResult(
+            "succeeded" if summary is not None else "skipped",
+            {
+                "summary_prepared": summary is not None,
+                **(
+                    {"summary_id": summary.id}
+                    if isinstance(summary, SummaryRecord)
+                    else {}
+                ),
+            },
+        )
 
     async def _plan_narrator_message_if_configured(
         self,

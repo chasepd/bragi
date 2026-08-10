@@ -1831,6 +1831,15 @@ class RecordingSummaryService:
         self.summary_id = summary.id
         return summary
 
+    async def prepare_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
+        current_user_id: str | None = None,
+    ) -> object:
+        return None
+
 
 class FailingSummaryService:
     def __init__(self, *, events: list[str], error: Exception) -> None:
@@ -1850,6 +1859,15 @@ class FailingSummaryService:
         self.events.append("summarization")
         self.calls.append((save_id, model_context_window))
         self.pending_messages.append(pending_message)
+        raise self.error
+
+    async def prepare_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
+        current_user_id: str | None = None,
+    ) -> object:
         raise self.error
 
 
@@ -12890,6 +12908,64 @@ def test_run_post_turn_jobs_skips_context_update_with_missing_catalog_row(
     assert "state" in provider.structured_output_requests[0].schema_name.casefold()
 
 
+def test_run_post_turn_jobs_waits_for_summary_preparation_barrier(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I tend the beacon.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The flame steadies.",
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prepare(**_kwargs: object) -> str:
+        started.set()
+        await release.wait()
+        return "succeeded"
+
+    monkeypatch.setattr(service, "_prepare_summary_for_next_turn", prepare)
+
+    async def run() -> dict[str, object]:
+        task = asyncio.create_task(
+            service.run_post_turn_jobs(
+                save_id=save.id,
+                player_message_id=player_message.id,
+                narrator_message_id=narrator_message.id,
+            )
+        )
+        await started.wait()
+        assert task.done() is False
+        release.set()
+        return await task
+
+    result = asyncio.run(run())
+
+    result_jobs = result["jobs"]
+    assert isinstance(result_jobs, list)
+    statuses = {str(job["name"]): str(job["status"]) for job in result_jobs}
+    assert statuses["summary"] == "succeeded"
+
+
 def test_run_post_turn_jobs_leaves_character_maintenance_for_scheduler(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -12950,6 +13026,7 @@ def test_run_post_turn_jobs_leaves_character_maintenance_for_scheduler(
     jobs = _post_turn_jobs(repositories, save.id)
     assert len(jobs) == 1
     assert [job["name"] for job in jobs[0]["result"]["jobs"]] == [
+        "summary",
         "state",
         "context",
         "time_reconciliation",
@@ -13079,10 +13156,9 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         )
     )
 
-    final_statuses = {
-        job.name: job.status for job in progress_updates[-1].jobs
-    }
+    final_statuses = {job.name: job.status for job in progress_updates[-1].jobs}
     assert final_statuses == {
+        "summary": "skipped",
         "state": "succeeded",
         "context": "failed",
         "time_reconciliation": "blocked_dependency",
@@ -13092,13 +13168,14 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         "image": "failed",
     }
     assert progress_updates[-1].status_text == (
-        "Post-turn: state succeeded, context failed, "
+        "Post-turn: summary skipped, state succeeded, context failed, "
         "time_reconciliation blocked_dependency, proactive_text blocked_dependency, "
         "director blocked_dependency, scenario skipped, image failed"
     )
     assert all(
         [job.name for job in progress.jobs]
         == [
+            "summary",
             "state",
             "context",
             "time_reconciliation",
@@ -13125,6 +13202,7 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
     assert len(jobs) == 1
     assert jobs[0]["status"] == "succeeded"
     expected_dependencies = {
+        "summary": [],
         "state": [],
         "context": ["state"],
         "time_reconciliation": ["context"],
@@ -13139,6 +13217,7 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
     assert jobs[0]["result"]["image_context_semantics"] == "pre_post_turn_updates"
     result_jobs = jobs[0]["result"]["jobs"]
     assert [(job["name"], job["status"]) for job in result_jobs] == [
+        ("summary", "skipped"),
         ("state", "succeeded"),
         ("context", "failed"),
         ("time_reconciliation", "blocked_dependency"),
@@ -13147,14 +13226,15 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         ("scenario", "skipped"),
         ("image", "failed"),
     ]
-    assert result_jobs[2]["result"]["blocked_by"] == "context"
-    assert result_jobs[3]["result"]["blocked_by"] == "time_reconciliation"
+    assert result_jobs[3]["result"]["blocked_by"] == "context"
+    assert result_jobs[4]["result"]["blocked_by"] == "time_reconciliation"
     steps = repositories.list_job_steps(jobs[0]["id"])
     step_by_name = {step.name: step for step in steps}
     assert {
         name: (step.status, step.task)
         for name, step in step_by_name.items()
     } == {
+        "summary": ("skipped", "summarization"),
         "state": ("succeeded", "state_memory"),
         "context": ("failed", "context_update"),
         "time_reconciliation": ("blocked_dependency", "context_update"),
@@ -13660,6 +13740,7 @@ def test_run_post_turn_jobs_leaves_world_context_retention_for_scheduler(
     assert retention.calls == []
     coordinator = _post_turn_jobs(repositories, save.id)[0]
     assert [job["name"] for job in coordinator["result"]["jobs"]] == [
+        "summary",
         "state",
         "context",
         "time_reconciliation",

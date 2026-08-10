@@ -2135,3 +2135,67 @@ def test_migration_77_keeps_existing_turn_outcome_rows(tmp_path: Path) -> None:
         ).fetchall()
         assert len(rows) == 1
         assert rows[0][0] == "o-1"
+
+
+def test_migration_77_to_78_backfills_summary_pressure_state(tmp_path: Path) -> None:
+    database_path = tmp_path / "summary-pressure.db"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version = 78")
+        connection.execute("DROP TRIGGER init_summary_pressure_state_after_save_insert")
+        connection.execute("DROP TABLE summary_pressure_state")
+        connection.execute(
+            "INSERT INTO scenarios(id, type, title, content_json) VALUES (?, ?, ?, ?)",
+            ("scenario-1", "full_roleplay", "Bridge", "{}"),
+        )
+        connection.execute(
+            "INSERT INTO saves(id, scenario_id, title) VALUES (?, ?, ?)",
+            ("save-1", "scenario-1", "Crossing"),
+        )
+        connection.executemany(
+            """
+            INSERT INTO messages(
+                id, save_id, role, body, token_estimate, deleted_at
+            ) VALUES (?, 'save-1', ?, ?, ?, NULL)
+            """,
+            (
+                ("player-1", "player", "Old player input", 10),
+                ("narrator-1", "narrator", "Old narration", 20),
+                ("player-2", "player", "Fresh player input", None),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO summaries(
+                id, save_id, covers_message_start_id, covers_message_end_id,
+                body, provider, model
+            ) VALUES (?, 'save-1', ?, ?, ?, ?, ?)
+            """,
+            (
+                "summary-1",
+                "player-1",
+                "narrator-1",
+                "The bridge was crossed.",
+                "fake",
+                "fake-summary",
+            ),
+        )
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM summary_pressure_state WHERE save_id = 'save-1'"
+        ).fetchone()
+        assert row is not None
+        assert row["summarized_through_message_id"] == "narrator-1"
+        assert row["unsummarized_message_count"] == 1
+        assert row["unsummarized_player_count"] == 1
+        assert row["unsummarized_narrator_count"] == 0
+        assert row["unsummarized_other_count"] == 0
+        assert row["unsummarized_token_estimate"] == 5
+        assert row["active_summary_count"] == 1
+        assert row["active_summary_token_estimate"] == 6
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
