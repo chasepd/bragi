@@ -3023,39 +3023,45 @@ class CharacterTextService:
             history=tuple(recent_history),
             current_user_id=current_user_id,
         )
-        message = self.repositories.complete_character_text_message_delivery(
-            save_id=save_id,
-            message_id=pending_message.id,
-            body=response_body,
-            provider=response.provider,
-            model=response.model_id,
-            token_estimate=response.token_usage.get("total"),
-            in_world_sent_at=message_sent_at,
-            content_rating=generation.minimum_rating,
-        )
+        self.repositories.begin_transaction()
+        try:
+            message = self.repositories.complete_character_text_message_delivery(
+                save_id=save_id,
+                message_id=pending_message.id,
+                body=response_body,
+                provider=response.provider,
+                model=response.model_id,
+                token_estimate=response.token_usage.get("total"),
+                in_world_sent_at=message_sent_at,
+                content_rating=generation.minimum_rating,
+            )
+            self.repositories.add_character_text_proactive_trigger(
+                save_id=save_id,
+                character_id=character.id,
+                trigger_key=candidate.trigger_key,
+                trigger_type=candidate.trigger_type,
+                thread_id=thread.id,
+                text_message_id=message.id,
+                source_type=candidate.source_type,
+                source_id=candidate.source_id,
+                source_message_id=candidate.source_message_id,
+                reason=candidate.reason,
+            )
+            _grant_player_has_character_number_from_inbound_text(
+                repositories=self.repositories,
+                save_id=save_id,
+                character_id=character.id,
+                source_text_message_id=message.id,
+            )
+        except Exception:
+            self.repositories.rollback_transaction()
+            raise
+        self.repositories.commit_transaction()
         _capture_character_text_prompt(
             prompt_inspection_store=self.prompt_inspection_store,
             message_id=message.id,
             request=request,
             response=response,
-        )
-        self.repositories.add_character_text_proactive_trigger(
-            save_id=save_id,
-            character_id=character.id,
-            trigger_key=candidate.trigger_key,
-            trigger_type=candidate.trigger_type,
-            thread_id=thread.id,
-            text_message_id=message.id,
-            source_type=candidate.source_type,
-            source_id=candidate.source_id,
-            source_message_id=candidate.source_message_id,
-            reason=candidate.reason,
-        )
-        _grant_player_has_character_number_from_inbound_text(
-            repositories=self.repositories,
-            save_id=save_id,
-            character_id=character.id,
-            source_text_message_id=message.id,
         )
         world_update = await CharacterTextWorldUpdateService(
             repositories=self.repositories,

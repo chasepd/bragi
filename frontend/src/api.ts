@@ -24,6 +24,8 @@ export type RuntimeModel = {
   scenario_draft?: ScenarioDraft | null;
   scenario_wizard?: ScenarioWizard | null;
   interaction_mode?: InteractionMode;
+  continuity_degraded?: boolean;
+  retry_pending?: boolean;
 };
 
 export type RuntimeWorldTime = {
@@ -259,6 +261,8 @@ export type ChatTurnDelta = {
   fallback_used: boolean;
   context_trimmed: boolean;
   requires_full_refresh?: boolean;
+  continuity_degraded?: boolean;
+  retry_pending?: boolean;
 };
 export type MarkdownSpan = { kind: string; text: string; target?: string | null };
 export type MarkdownBlock = {
