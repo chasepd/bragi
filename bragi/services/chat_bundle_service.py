@@ -1174,6 +1174,7 @@ class ChatBundleService:
                 ),
             )
             self.repositories.rebuild_context_source_search_terms(imported.save_id)
+            self.repositories.rebuild_summary_pressure_state(imported.save_id)
             self.repositories.commit_transaction()
         except Exception:
             self.repositories.rollback_transaction()

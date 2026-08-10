@@ -22,7 +22,7 @@ from bragi.text_search import (
     unicode_word_terms,
 )
 
-CURRENT_SCHEMA_VERSION = 77
+CURRENT_SCHEMA_VERSION = 78
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
@@ -494,6 +494,20 @@ CREATE TABLE IF NOT EXISTS summaries (
     archived_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS summary_pressure_state (
+    save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+    history_revision INTEGER NOT NULL DEFAULT 0,
+    summarized_through_message_id TEXT,
+    unsummarized_message_count INTEGER NOT NULL DEFAULT 0,
+    unsummarized_player_count INTEGER NOT NULL DEFAULT 0,
+    unsummarized_narrator_count INTEGER NOT NULL DEFAULT 0,
+    unsummarized_other_count INTEGER NOT NULL DEFAULT 0,
+    unsummarized_token_estimate INTEGER NOT NULL DEFAULT 0,
+    active_summary_count INTEGER NOT NULL DEFAULT 0,
+    active_summary_token_estimate INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS save_scenario_updates (
     id TEXT PRIMARY KEY,
     save_id TEXT NOT NULL REFERENCES saves(id),
@@ -720,7 +734,10 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 76:
+            if current == 77:
+                _migrate_schema_77_to_78(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 76:
                 _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 75:
@@ -925,6 +942,8 @@ def migrate_database(database_path: Path | str) -> None:
         _migrate_schema_75_to_76(connection)
         if not _schema_migration_applied(connection, 77):
             _migrate_schema_76_to_77(connection)
+        if not _schema_migration_applied(connection, 78):
+            _migrate_schema_77_to_78(connection)
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
         _ensure_context_observation_curation_schema(connection)
@@ -978,6 +997,7 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         _ensure_character_text_message_revision_schema(connection)
         _ensure_character_text_message_attachment_schema(connection)
         _ensure_turn_snapshot_schema(connection)
+        _ensure_summary_pressure_state_schema(connection)
         _ensure_context_revision_schema(connection)
         _ensure_continuity_index_revision_schema(connection)
         _ensure_character_contact_name_schema(connection)
@@ -2303,6 +2323,116 @@ def _ensure_scene_fact_schema(connection: sqlite3.Connection) -> None:
 def _migrate_schema_76_to_77(connection: sqlite3.Connection) -> None:
     _ensure_turn_outcome_schema(connection)
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (77)")
+
+
+def _migrate_schema_77_to_78(connection: sqlite3.Connection) -> None:
+    _ensure_summary_pressure_state_schema(connection)
+    _backfill_summary_pressure_state(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (78)")
+
+
+def _ensure_summary_pressure_state_schema(connection: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS summary_pressure_state (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            history_revision INTEGER NOT NULL DEFAULT 0,
+            summarized_through_message_id TEXT,
+            unsummarized_message_count INTEGER NOT NULL DEFAULT 0,
+            unsummarized_player_count INTEGER NOT NULL DEFAULT 0,
+            unsummarized_narrator_count INTEGER NOT NULL DEFAULT 0,
+            unsummarized_other_count INTEGER NOT NULL DEFAULT 0,
+            unsummarized_token_estimate INTEGER NOT NULL DEFAULT 0,
+            active_summary_count INTEGER NOT NULL DEFAULT 0,
+            active_summary_token_estimate INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TRIGGER IF NOT EXISTS init_summary_pressure_state_after_save_insert
+        AFTER INSERT ON saves
+        FOR EACH ROW
+        BEGIN
+            INSERT OR IGNORE INTO summary_pressure_state(save_id) VALUES (NEW.id);
+        END;
+        """,
+    )
+
+
+def _backfill_summary_pressure_state(connection: sqlite3.Connection) -> None:
+    for (save_id,) in connection.execute("SELECT id FROM saves").fetchall():
+        messages = connection.execute(
+            """
+            SELECT id, role, body, token_estimate
+            FROM messages
+            WHERE save_id = ? AND deleted_at IS NULL
+            ORDER BY rowid
+            """,
+            (save_id,),
+        ).fetchall()
+        summaries = connection.execute(
+            """
+            SELECT covers_message_end_id, body
+            FROM summaries
+            WHERE save_id = ? AND archived_at IS NULL
+            ORDER BY created_at, rowid
+            """,
+            (save_id,),
+        ).fetchall()
+        summarized_through = summaries[-1][0] if summaries else None
+        start_index = 0
+        if summarized_through is not None:
+            for index, message in enumerate(messages):
+                if message[0] == summarized_through:
+                    start_index = index + 1
+                    break
+        unsummarized = messages[start_index:]
+        player_count = sum(1 for message in unsummarized if message[1] == "player")
+        narrator_count = sum(
+            1 for message in unsummarized if message[1] == "narrator"
+        )
+        token_estimate = sum(
+            int(message[3])
+            if message[3] is not None
+            else max(1, (len(str(message[2])) + 3) // 4)
+            for message in unsummarized
+        )
+        summary_tokens = sum(
+            max(1, (len(str(summary[1])) + 3) // 4) for summary in summaries
+        )
+        connection.execute(
+            """
+            INSERT INTO summary_pressure_state(
+                save_id, history_revision, summarized_through_message_id,
+                unsummarized_message_count, unsummarized_player_count,
+                unsummarized_narrator_count, unsummarized_other_count,
+                unsummarized_token_estimate, active_summary_count,
+                active_summary_token_estimate, updated_at
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(save_id) DO UPDATE SET
+                history_revision = summary_pressure_state.history_revision + 1,
+                summarized_through_message_id = excluded.summarized_through_message_id,
+                unsummarized_message_count = excluded.unsummarized_message_count,
+                unsummarized_player_count = excluded.unsummarized_player_count,
+                unsummarized_narrator_count = excluded.unsummarized_narrator_count,
+                unsummarized_other_count = excluded.unsummarized_other_count,
+                unsummarized_token_estimate = excluded.unsummarized_token_estimate,
+                active_summary_count = excluded.active_summary_count,
+                active_summary_token_estimate = excluded.active_summary_token_estimate,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                save_id,
+                summarized_through,
+                len(unsummarized),
+                player_count,
+                narrator_count,
+                len(unsummarized) - player_count - narrator_count,
+                token_estimate,
+                len(summaries),
+                summary_tokens,
+            ),
+        )
 
 
 def _ensure_turn_outcome_schema(connection: sqlite3.Connection) -> None:

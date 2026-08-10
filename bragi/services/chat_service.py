@@ -335,6 +335,7 @@ LOOK_AROUND_TURN_DIRECTIVE = (
     "support."
 )
 POST_TURN_JOB_ORDER = (
+    "summary",
     "state",
     "context",
     "time_reconciliation",
@@ -344,6 +345,7 @@ POST_TURN_JOB_ORDER = (
     "image",
 )
 POST_TURN_JOB_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "summary": (),
     "state": (),
     "context": ("state",),
     "time_reconciliation": ("context",),
@@ -354,6 +356,7 @@ POST_TURN_JOB_DEPENDENCIES: dict[str, tuple[str, ...]] = {
 }
 POST_TURN_IMAGE_CONTEXT_SEMANTICS = "pre_post_turn_updates"
 POST_TURN_PROVIDER_TASKS = {
+    "summary": "summarization",
     "state": "state_memory",
     "context": "context_update",
     "time_reconciliation": "context_update",
@@ -722,6 +725,14 @@ class SummaryRunner(Protocol):
         save_id: str,
         model_context_window: int | None,
         pending_message: PendingMessageEstimate | None = None,
+        current_user_id: str | None = None,
+    ) -> object: ...
+
+    async def prepare_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
         current_user_id: str | None = None,
     ) -> object: ...
 
@@ -2738,6 +2749,10 @@ class ChatService:
             token_usage=response.token_usage,
             transport_mode=completion_diagnostics.get("transport_mode"),
             streaming_used=completion_diagnostics.get("streaming_used"),
+            delivery_mode=completion_diagnostics.get("delivery_mode"),
+            incremental_delivery_used=completion_diagnostics.get(
+                "incremental_delivery_used"
+            ),
         )
         stage_started = perf_counter()
         throw_if_cancelled_after_job()
@@ -3573,6 +3588,8 @@ class ChatService:
             "original_provider": request.provider,
             "original_model": request.model_id,
             "fallback_used": False,
+            "delivery_mode": "final_only",
+            "incremental_delivery_used": False,
             "streaming_attempted": use_streaming,
             "streaming_used": False,
             "transport_mode": "streaming" if use_streaming else "non_streaming",
@@ -4128,6 +4145,8 @@ class ChatService:
             return status
 
         def pressure_gate_enabled(name: str) -> bool:
+            if name == "summary":
+                return self.summary_service is not None
             if name == "context":
                 return (
                     agentic_context_pipeline_enabled(
@@ -4274,6 +4293,10 @@ class ChatService:
         publish("state", "pending")
 
         callbacks: dict[str, Callable[[], Any]] = {
+            "summary": lambda: self._prepare_summary_for_next_turn(
+                save_id=save_id,
+                current_user_id=current_user_id,
+            ),
             "state": lambda: self._extract_state_and_memory_if_configured(
                 save_id=save_id,
                 player_message_id=player_message_id,
@@ -4326,6 +4349,7 @@ class ChatService:
             ),
         }
         pressure_sensitive_jobs = {
+            "summary",
             "context",
             "time_reconciliation",
             "proactive_text",
@@ -4351,6 +4375,7 @@ class ChatService:
                     ),
                 )
             if stale_rebase and name in {
+                "summary",
                 "time_reconciliation",
                 "proactive_text",
                 "director",
@@ -5976,6 +6001,47 @@ class ChatService:
             )
             return
 
+    async def _prepare_summary_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        current_user_id: str | None,
+    ) -> _PostTurnStepResult:
+        if self.summary_service is None:
+            return _PostTurnStepResult(
+                "skipped",
+                {"skipped_reason": "summary_service_unavailable"},
+            )
+        preference = _chat_model_preference_for_save(
+            repositories=self.repositories,
+            save_id=save_id,
+        )
+        if preference is None:
+            return _PostTurnStepResult(
+                "skipped",
+                {"skipped_reason": "chat_model_unavailable"},
+            )
+        summary = await self.summary_service.prepare_for_next_turn(
+            save_id=save_id,
+            model_context_window=_model_context_window(
+                repositories=self.repositories,
+                provider=preference.provider,
+                model_id=preference.model_id,
+            ),
+            current_user_id=current_user_id,
+        )
+        return _PostTurnStepResult(
+            "succeeded" if summary is not None else "skipped",
+            {
+                "summary_prepared": summary is not None,
+                **(
+                    {"summary_id": summary.id}
+                    if isinstance(summary, SummaryRecord)
+                    else {}
+                ),
+            },
+        )
+
     async def _plan_narrator_message_if_configured(
         self,
         *,
@@ -6081,6 +6147,7 @@ class ChatService:
             and (
                 not result.passed
                 or bool(result.npc_passivity_issues)
+                or bool(result.quality_findings)
                 or _verification_commit_decisions_need_retry(result)
             )
         )
@@ -6110,10 +6177,7 @@ class ChatService:
             )
         feedback_parts: list[str] = []
         if retry_for_verification:
-            feedback_parts.append(
-                result.retry_feedback.strip()
-                or _verification_retry_feedback(result)
-            )
+            feedback_parts.append(_verification_retry_feedback(result))
         if retry_for_npc:
             feedback_parts.append(_npc_knowledge_retry_feedback(first_audit))
         feedback = "\n\n".join(part for part in feedback_parts if part.strip())
@@ -11563,6 +11627,13 @@ def _director_pressure_result_mapping(
     payload: dict[str, object] = {
         "applied": result.applied,
         "commit_state": result.commit_state,
+        "provider_called": result.provider_called,
+        "pacing_signal": result.pacing_signal,
+        "pacing_state": {
+            "tension_trend": result.state.tension_trend,
+            "stall_turns": result.state.stall_turns,
+            "cooldown_turns": result.state.cooldown_turns,
+        },
     }
     for key in (
         "pressure_kind",
@@ -11607,6 +11678,8 @@ def _verification_retry_feedback(result: NarratorVerificationResult) -> str:
     lines = [
         "Revise the previous draft so it follows the narrator message brief."
     ]
+    if result.retry_feedback.strip():
+        lines.append(result.retry_feedback.strip())
     for issue in result.issues[:5]:
         lines.append(f"- {issue}")
     for issue in result.npc_agency_issues[:5]:
@@ -11623,6 +11696,13 @@ def _verification_retry_feedback(result: NarratorVerificationResult) -> str:
             f"- Dating route stage: {violation.character_name} at "
             f"{violation.route_stage} exceeded {violation.escalation}. "
             f"Reason: {violation.reason}"
+        )
+    for finding in result.quality_findings:
+        label = finding.category.replace("_", " ").capitalize()
+        lines.append(
+            f"- {label}: {finding.reason} Offending draft: "
+            f"{finding.narrator_quote!r}. Supplied comparison: "
+            f"{finding.context_quote!r}."
         )
     for leak in result.npc_knowledge_leaks[:5]:
         lines.append(
@@ -11674,6 +11754,16 @@ def _narrator_verifier_diagnostics(
                 "evidence_quote": violation.evidence_quote,
             }
             for violation in result.dating_route_stage_violations
+        ],
+        "quality_finding_count": len(result.quality_findings),
+        "quality_findings": [
+            {
+                "category": finding.category,
+                "reason": finding.reason,
+                "narrator_quote": finding.narrator_quote,
+                "context_quote": finding.context_quote,
+            }
+            for finding in result.quality_findings
         ],
         "npc_knowledge_leak_count": len(result.npc_knowledge_leaks),
         "npc_knowledge_leaks": [

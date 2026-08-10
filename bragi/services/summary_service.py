@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
 from time import perf_counter
@@ -42,6 +43,7 @@ from bragi.services.summary_safety import validate_summary_output
 
 SUMMARY_OUTPUT_TOKEN_RESERVE = 10_000
 SUMMARY_BATCH_OVERHEAD_TOKENS = 768
+SUMMARY_PRECOMPUTE_MARGIN = 0.05
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,42 @@ class SummaryService:
         pending_message: PendingMessageEstimate | None = None,
         current_user_id: str | None = None,
     ) -> SummaryRecord | None:
+        return await self._summarize_if_needed(
+            save_id=save_id,
+            context_window=context_window,
+            model_context_window=model_context_window,
+            pending_message=pending_message,
+            current_user_id=current_user_id,
+            threshold_margin=0.0,
+        )
+
+    async def prepare_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        context_window: int | None = None,
+        model_context_window: int | None = None,
+        current_user_id: str | None = None,
+    ) -> SummaryRecord | None:
+        return await self._summarize_if_needed(
+            save_id=save_id,
+            context_window=context_window,
+            model_context_window=model_context_window,
+            pending_message=None,
+            current_user_id=current_user_id,
+            threshold_margin=SUMMARY_PRECOMPUTE_MARGIN,
+        )
+
+    async def _summarize_if_needed(
+        self,
+        *,
+        save_id: str,
+        context_window: int | None,
+        model_context_window: int | None,
+        pending_message: PendingMessageEstimate | None,
+        current_user_id: str | None,
+        threshold_margin: float,
+    ) -> SummaryRecord | None:
         enabled = _automatic_summarization_enabled(
             self.repositories,
             save_id=save_id,
@@ -158,24 +196,82 @@ class SummaryService:
                 reason="no_context_window",
             )
             return None
+        state = self.repositories.get_summary_pressure_state(save_id)
+        configured_threshold = _summary_threshold(
+            self.repositories,
+            save_id=save_id,
+            default=self.threshold,
+        )
+        resolved_threshold = (
+            configured_threshold
+            if threshold_margin == 0.0
+            else max(0.10, configured_threshold - threshold_margin)
+        )
+        pending_tokens = 0
+        if pending_message is not None:
+            pending_tokens = (
+                pending_message.token_estimate
+                if pending_message.token_estimate is not None
+                else estimate_message_body_tokens(pending_message.body)
+            )
+        token_estimate = (
+            state.unsummarized_token_estimate
+            + state.active_summary_token_estimate
+            + pending_tokens
+        )
+        pressure = (
+            token_estimate / resolved_context_window
+            if resolved_context_window
+            else 1.0
+        )
+        budget = ContextBudget(
+            token_estimate=token_estimate,
+            context_window=resolved_context_window,
+            pressure=pressure,
+            should_summarize=pressure >= resolved_threshold,
+        )
+        window_settings = _strictest_raw_history_window_settings(
+            self.repositories,
+            save_id=save_id,
+        )
+        projected_player_count = state.unsummarized_player_count
+        projected_narrator_count = state.unsummarized_narrator_count
+        if pending_message is not None:
+            if pending_message.role == "player":
+                projected_player_count += 1
+            elif pending_message.role == "narrator":
+                projected_narrator_count += 1
+        frontier_triggered = (
+            projected_player_count > window_settings.player_messages
+            or projected_narrator_count > window_settings.narrator_messages
+        )
+        should_roll_up_summaries = state.active_summary_count > 1 or (
+            state.active_summary_count > 0
+            and budget.should_summarize
+            and state.unsummarized_message_count == 0
+        )
+        if (
+            not budget.should_summarize
+            and not frontier_triggered
+            and not should_roll_up_summaries
+        ):
+            log_event(
+                "summarization.skipped",
+                save_id=save_id,
+                reason="below_threshold_or_no_messages",
+                token_estimate=budget.token_estimate,
+                context_window=budget.context_window,
+                pressure=budget.pressure,
+                covered_message_count=0,
+                frontier_triggered=False,
+            )
+            return None
+
+        expected_history_revision = state.history_revision
         messages = self.repositories.list_messages(save_id)
         summaries = self.repositories.list_summaries(save_id) if messages else []
         prior_summary = _last_summary(summaries)
-        unsummarized_messages = self._unsummarized_messages(
-            messages,
-            prior_summary,
-        )
-        budget = self.estimate_context_budget(
-            messages=unsummarized_messages,
-            context_window=resolved_context_window,
-            pending_message=pending_message,
-            summary_bodies=[summary.body for summary in summaries],
-            threshold=_summary_threshold(
-                self.repositories,
-                save_id=save_id,
-                default=self.threshold,
-            ),
-        )
+        unsummarized_messages = self._unsummarized_messages(messages, prior_summary)
         covered_messages = self._messages_crossing_raw_history_frontier(
             unsummarized_messages,
             save_id=save_id,
@@ -229,6 +325,13 @@ class SummaryService:
         )
         if preference is None:
             raise ValueError("No summarization model preference configured")
+        expected_configuration = _summary_configuration_fingerprint(
+            enabled=enabled,
+            threshold=configured_threshold,
+            context_window=resolved_context_window,
+            window_settings=window_settings,
+            preference=preference,
+        )
         job = self.jobs.create_running(
             save_id=save_id,
             type="summarization",
@@ -285,6 +388,15 @@ class SummaryService:
                 body=safety.body,
                 content_rating=safety.reviewed_content_rating,
             )
+        except asyncio.CancelledError:
+            self.jobs.cancel(job.id, error="Summarization cancelled")
+            log_event(
+                "job.cancelled",
+                job_id=job.id,
+                job_type=job.type,
+                save_id=save_id,
+            )
+            raise
         except Exception as exc:
             self.jobs.fail(
                 job.id,
@@ -304,6 +416,45 @@ class SummaryService:
 
         self.repositories.begin_transaction()
         try:
+            current_state = self.repositories.get_summary_pressure_state(save_id)
+            current_preference = roleplay_model_preference(
+                repositories=self.repositories,
+                save_id=save_id,
+                purpose="summarization",
+            )
+            current_configuration = _summary_configuration_fingerprint(
+                enabled=_automatic_summarization_enabled(
+                    self.repositories,
+                    save_id=save_id,
+                    default=self.enabled,
+                ),
+                threshold=_summary_threshold(
+                    self.repositories,
+                    save_id=save_id,
+                    default=self.threshold,
+                ),
+                context_window=resolved_context_window,
+                window_settings=_strictest_raw_history_window_settings(
+                    self.repositories,
+                    save_id=save_id,
+                ),
+                preference=current_preference,
+            )
+            if (
+                current_state.history_revision != expected_history_revision
+                or current_configuration != expected_configuration
+            ):
+                self.jobs.succeed(
+                    job.id,
+                    result={"status": "stale_inputs"},
+                )
+                self.repositories.commit_transaction()
+                log_event(
+                    "summarization.skipped",
+                    save_id=save_id,
+                    reason="stale_inputs",
+                )
+                return None
             summary = self.repositories.add_summary(
                 save_id=save_id,
                 covers_message_start_id=_summary_start_id(
@@ -833,6 +984,25 @@ def _summary_threshold(
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return min(max(float(value), 0.10), 1.00)
     return default
+
+
+def _summary_configuration_fingerprint(
+    *,
+    enabled: bool,
+    threshold: float,
+    context_window: int,
+    window_settings: ChatHistoryWindowSettings,
+    preference: ModelPreferenceRecord | None,
+) -> tuple[object, ...]:
+    return (
+        enabled,
+        threshold,
+        context_window,
+        window_settings.player_messages,
+        window_settings.narrator_messages,
+        preference.provider if preference is not None else None,
+        preference.model_id if preference is not None else None,
+    )
 
 
 def _message_index(

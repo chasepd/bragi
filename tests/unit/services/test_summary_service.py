@@ -97,6 +97,18 @@ class FailingSummaryProvider(RecordingSummaryProvider):
         raise self.error
 
 
+class BlockingSummaryProvider(RecordingSummaryProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def chat(self, request: ChatRequest) -> ChatResponse:
+        self.started.set()
+        await self.release.wait()
+        return await super().chat(request)
+
+
 class SequenceSummaryProvider(RecordingSummaryProvider):
     def __init__(self, response_bodies: list[str]) -> None:
         super().__init__()
@@ -231,6 +243,177 @@ def test_summary_service_configured_threshold_controls_generation(
     assert len(jobs) == 1
     assert jobs[0]["status"] == "succeeded"
     assert summary.id in jobs[0]["result_json"]
+
+
+def test_summary_pressure_check_uses_persisted_state_without_chronicle_rescan(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save, _messages = _save_with_summary_preference(repositories)
+    repositories.rebuild_summary_pressure_state(save.id)
+    service = SummaryService(
+        repositories=repositories,
+        providers={"fake": RecordingSummaryProvider()},
+        threshold=0.90,
+    )
+
+    monkeypatch.setattr(
+        repositories,
+        "list_messages",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ordinary pressure checks must not rescan messages")
+        ),
+    )
+    monkeypatch.setattr(
+        repositories,
+        "list_summaries",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ordinary pressure checks must not reload summaries")
+        ),
+    )
+
+    summary = asyncio.run(
+        service.summarize_if_needed(
+            save_id=save.id,
+            context_window=10_000,
+            pending_message=PendingMessageEstimate(
+                body="Several quiet hours pass.",
+                role="system",
+            ),
+        )
+    )
+
+    assert summary is None
+
+
+def test_prepare_for_next_turn_uses_five_percentage_point_margin(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _messages = _save_with_summary_preference(repositories)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key="summarization_context_pressure_threshold",
+        value=0.75,
+    )
+    provider = RecordingSummaryProvider()
+    service = SummaryService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    summary = asyncio.run(
+        service.prepare_for_next_turn(
+            save_id=save.id,
+            context_window=300,
+        )
+    )
+
+    assert summary is not None
+    assert len(provider.chat_requests) == 1
+
+
+def test_prepare_for_next_turn_discards_result_when_history_changes(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _messages = _save_with_summary_preference(repositories)
+    provider = BlockingSummaryProvider()
+    service = SummaryService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    async def run() -> object:
+        task = asyncio.create_task(
+            service.prepare_for_next_turn(
+                save_id=save.id,
+                context_window=300,
+            )
+        )
+        await provider.started.wait()
+        repositories.append_message(
+            save_id=save.id,
+            role="player",
+            body="I change the chronicle while preparation is running.",
+        )
+        provider.release.set()
+        return await task
+
+    result = asyncio.run(run())
+
+    assert result is None
+    assert repositories.list_summaries(save.id) == []
+    jobs = _summarization_jobs(repositories, save.id)
+    assert len(jobs) == 1
+    assert jobs[0]["status"] == "succeeded"
+    assert "stale_inputs" in jobs[0]["result_json"]
+
+
+def test_prepare_for_next_turn_discards_result_when_configuration_changes(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _messages = _save_with_summary_preference(repositories)
+    provider = BlockingSummaryProvider()
+    service = SummaryService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    async def run() -> object:
+        task = asyncio.create_task(
+            service.prepare_for_next_turn(
+                save_id=save.id,
+                context_window=300,
+            )
+        )
+        await provider.started.wait()
+        repositories.set_scoped_setting(
+            scope="save",
+            scope_id=save.id,
+            key="summarization_context_pressure_threshold",
+            value=0.95,
+        )
+        provider.release.set()
+        return await task
+
+    result = asyncio.run(run())
+
+    assert result is None
+    assert repositories.list_summaries(save.id) == []
+    jobs = _summarization_jobs(repositories, save.id)
+    assert len(jobs) == 1
+    assert jobs[0]["status"] == "succeeded"
+    assert "stale_inputs" in jobs[0]["result_json"]
+
+
+def test_prepare_for_next_turn_cancellation_does_not_advance_coverage(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _messages = _save_with_summary_preference(repositories)
+    provider = BlockingSummaryProvider()
+    service = SummaryService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    async def run() -> None:
+        task = asyncio.create_task(
+            service.prepare_for_next_turn(
+                save_id=save.id,
+                context_window=300,
+            )
+        )
+        await provider.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+
+    assert repositories.list_summaries(save.id) == []
+    jobs = _summarization_jobs(repositories, save.id)
+    assert len(jobs) == 1
+    assert jobs[0]["status"] == "cancelled"
 
 
 def test_summary_service_summarizes_messages_crossing_raw_history_frontier(

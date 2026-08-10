@@ -76,6 +76,7 @@ from bragi.persistence.models import (
     ScheduledTaskRecord,
     ScopedSettingRecord,
     StateChangeRecord,
+    SummaryPressureStateRecord,
     SummaryRecord,
     TurnOutcomeRecord,
     UserRecord,
@@ -2498,6 +2499,7 @@ class PersistenceRepositories:
                 )["narrator"],
             )
             self.archive_stale_scene_facts(save_id=save_id)
+        self._advance_summary_pressure_state_for_message(record)
         self.commit()
         row = self._fetch_one(
             """
@@ -2933,6 +2935,7 @@ class PersistenceRepositories:
             """,
             (body, safety_transition, content_rating, save_id, message_id),
         )
+        self.rebuild_summary_pressure_state(save_id)
         self.commit()
         row = self._fetch_one(
             """
@@ -3154,6 +3157,7 @@ class PersistenceRepositories:
                 save_id=str(row["save_id"]),
                 message_ids={message_id},
             )
+            self.rebuild_summary_pressure_state(str(row["save_id"]))
         self.commit()
 
     def archive_messages_from(
@@ -3200,12 +3204,18 @@ class PersistenceRepositories:
             save_id=save_id,
             message_ids={record.id for record in records},
         )
+        self.rebuild_summary_pressure_state(save_id)
         self.commit()
         return records
 
     def restore_messages(self, message_ids: set[str] | frozenset[str]) -> None:
         if not message_ids:
             return
+        save_rows = self._fetch_all(
+            f"SELECT DISTINCT save_id FROM messages "
+            f"WHERE id IN ({_placeholders(len(message_ids))})",
+            tuple(message_ids),
+        )
         self.connection.execute(
             f"""
             UPDATE messages
@@ -3214,6 +3224,8 @@ class PersistenceRepositories:
             """,
             tuple(message_ids),
         )
+        for row in save_rows:
+            self.rebuild_summary_pressure_state(str(row["save_id"]))
         self.commit()
 
     def upsert_world_state(
@@ -12460,6 +12472,7 @@ class PersistenceRepositories:
                 _dump_json(list(record.source_summary_ids)),
             ),
         )
+        self.rebuild_summary_pressure_state(save_id)
         self.commit()
         return record
 
@@ -12480,6 +12493,12 @@ class PersistenceRepositories:
             """,
             (body, content_rating, summary_id),
         )
+        save_row = self._fetch_one(
+            "SELECT save_id FROM summaries WHERE id = ?",
+            (summary_id,),
+        )
+        if save_row is not None:
+            self.rebuild_summary_pressure_state(str(save_row["save_id"]))
         self.commit()
         row = self._fetch_one(
             """
@@ -12496,6 +12515,10 @@ class PersistenceRepositories:
         return _summary_from_row(row)
 
     def archive_summary(self, summary_id: str) -> None:
+        save_row = self._fetch_one(
+            "SELECT save_id FROM summaries WHERE id = ?",
+            (summary_id,),
+        )
         self.connection.execute(
             """
             UPDATE summaries
@@ -12504,11 +12527,18 @@ class PersistenceRepositories:
             """,
             (summary_id,),
         )
+        if save_row is not None:
+            self.rebuild_summary_pressure_state(str(save_row["save_id"]))
         self.commit()
 
     def restore_summaries(self, summary_ids: set[str] | frozenset[str]) -> None:
         if not summary_ids:
             return
+        save_rows = self._fetch_all(
+            f"SELECT DISTINCT save_id FROM summaries "
+            f"WHERE id IN ({_placeholders(len(summary_ids))})",
+            tuple(summary_ids),
+        )
         self.connection.execute(
             f"""
             UPDATE summaries
@@ -12517,7 +12547,152 @@ class PersistenceRepositories:
             """,
             tuple(summary_ids),
         )
+        for row in save_rows:
+            self.rebuild_summary_pressure_state(str(row["save_id"]))
         self.commit()
+
+    def get_summary_pressure_state(
+        self,
+        save_id: str,
+    ) -> SummaryPressureStateRecord:
+        row = self._fetch_one(
+            """
+            SELECT save_id, history_revision, summarized_through_message_id,
+                   unsummarized_message_count, unsummarized_player_count,
+                   unsummarized_narrator_count, unsummarized_other_count,
+                   unsummarized_token_estimate, active_summary_count,
+                   active_summary_token_estimate
+            FROM summary_pressure_state
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        )
+        if row is None:
+            return self.rebuild_summary_pressure_state(save_id)
+        return SummaryPressureStateRecord(**dict(row))
+
+    def rebuild_summary_pressure_state(
+        self,
+        save_id: str,
+    ) -> SummaryPressureStateRecord:
+        if self.get_save(save_id) is None:
+            raise ValueError(f"Unknown save id: {save_id}")
+        messages = self.list_messages(save_id)
+        summaries = self.list_summaries(save_id)
+        summarized_through = (
+            summaries[-1].covers_message_end_id if summaries else None
+        )
+        start_index = 0
+        if summarized_through is not None:
+            for index, message in enumerate(messages):
+                if message.id == summarized_through:
+                    start_index = index + 1
+                    break
+        unsummarized = messages[start_index:]
+        player_count = sum(
+            1 for message in unsummarized if message.role == "player"
+        )
+        narrator_count = sum(
+            1 for message in unsummarized if message.role == "narrator"
+        )
+        existing = self._fetch_one(
+            "SELECT history_revision FROM summary_pressure_state WHERE save_id = ?",
+            (save_id,),
+        )
+        revision = int(existing["history_revision"]) + 1 if existing else 1
+        values = (
+            save_id,
+            revision,
+            summarized_through,
+            len(unsummarized),
+            player_count,
+            narrator_count,
+            len(unsummarized) - player_count - narrator_count,
+            sum(_message_body_token_estimate(message) for message in unsummarized),
+            len(summaries),
+            sum(_estimated_text_tokens(summary.body) for summary in summaries),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO summary_pressure_state(
+                save_id, history_revision, summarized_through_message_id,
+                unsummarized_message_count, unsummarized_player_count,
+                unsummarized_narrator_count, unsummarized_other_count,
+                unsummarized_token_estimate, active_summary_count,
+                active_summary_token_estimate, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(save_id) DO UPDATE SET
+                history_revision = excluded.history_revision,
+                summarized_through_message_id = excluded.summarized_through_message_id,
+                unsummarized_message_count = excluded.unsummarized_message_count,
+                unsummarized_player_count = excluded.unsummarized_player_count,
+                unsummarized_narrator_count = excluded.unsummarized_narrator_count,
+                unsummarized_other_count = excluded.unsummarized_other_count,
+                unsummarized_token_estimate = excluded.unsummarized_token_estimate,
+                active_summary_count = excluded.active_summary_count,
+                active_summary_token_estimate = excluded.active_summary_token_estimate,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            values,
+        )
+        return SummaryPressureStateRecord(
+            save_id=save_id,
+            history_revision=revision,
+            summarized_through_message_id=summarized_through,
+            unsummarized_message_count=len(unsummarized),
+            unsummarized_player_count=player_count,
+            unsummarized_narrator_count=narrator_count,
+            unsummarized_other_count=(
+                len(unsummarized) - player_count - narrator_count
+            ),
+            unsummarized_token_estimate=sum(
+                _message_body_token_estimate(message) for message in unsummarized
+            ),
+            active_summary_count=len(summaries),
+            active_summary_token_estimate=sum(
+                _estimated_text_tokens(summary.body) for summary in summaries
+            ),
+        )
+
+    def _advance_summary_pressure_state_for_message(
+        self,
+        message: MessageRecord,
+    ) -> None:
+        player_increment = 1 if message.role == "player" else 0
+        narrator_increment = 1 if message.role == "narrator" else 0
+        other_increment = 1 - player_increment - narrator_increment
+        self.connection.execute(
+            """
+            INSERT INTO summary_pressure_state(
+                save_id, history_revision, unsummarized_message_count,
+                unsummarized_player_count, unsummarized_narrator_count,
+                unsummarized_other_count, unsummarized_token_estimate
+            ) VALUES (?, 1, 1, ?, ?, ?, ?)
+            ON CONFLICT(save_id) DO UPDATE SET
+                history_revision = history_revision + 1,
+                unsummarized_message_count = unsummarized_message_count + 1,
+                unsummarized_player_count =
+                    unsummarized_player_count
+                    + excluded.unsummarized_player_count,
+                unsummarized_narrator_count =
+                    unsummarized_narrator_count
+                    + excluded.unsummarized_narrator_count,
+                unsummarized_other_count =
+                    unsummarized_other_count
+                    + excluded.unsummarized_other_count,
+                unsummarized_token_estimate =
+                    unsummarized_token_estimate
+                    + excluded.unsummarized_token_estimate,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                message.save_id,
+                player_increment,
+                narrator_increment,
+                other_increment,
+                _message_body_token_estimate(message),
+            ),
+        )
 
     def list_summaries(
         self,
@@ -14781,6 +14956,16 @@ def _sqlite_error_mentions(error: sqlite3.IntegrityError, text: str) -> bool:
 
 def _new_id() -> str:
     return uuid4().hex
+
+
+def _estimated_text_tokens(text: str) -> int:
+    return max(1, (len(text) + 3) // 4)
+
+
+def _message_body_token_estimate(message: MessageRecord) -> int:
+    if message.token_estimate is not None:
+        return max(1, message.token_estimate)
+    return _estimated_text_tokens(message.body)
 
 
 def canonical_claim_fingerprint(value: object) -> str:

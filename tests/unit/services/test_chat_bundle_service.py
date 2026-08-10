@@ -428,6 +428,17 @@ def test_chat_bundle_round_trips_storyteller_mode_and_defaults_legacy_mode(
     imported_save = repositories.get_save(_imported_save_id(imported))
     assert imported_save is not None
     assert imported_save.interaction_mode is InteractionMode.STORYTELLER
+    source_pressure = repositories.get_summary_pressure_state(save.id)
+    imported_pressure = repositories.get_summary_pressure_state(imported_save.id)
+    assert imported_pressure.unsummarized_message_count == (
+        source_pressure.unsummarized_message_count
+    )
+    assert imported_pressure.unsummarized_token_estimate == (
+        source_pressure.unsummarized_token_estimate
+    )
+    assert imported_pressure.active_summary_count == (
+        source_pressure.active_summary_count
+    )
 
     del data["scenario"]["interaction_mode"]
     del data["save"]["interaction_mode"]
