@@ -7621,7 +7621,9 @@ def test_timeskip_post_records_save_id_on_created_job(tmp_path: Path) -> None:
             *,
             instruction: str,
             active_save_id: object,
+            narrator_stream_callback: Callable[[str], None] | None = None,
         ) -> object:
+            assert narrator_stream_callback is None
             self.submissions.append((instruction, active_save_id))
             return SimpleNamespace(
                 model=_chat_model("Dawn catches on the city gates."),
@@ -9499,8 +9501,8 @@ def test_provider_retry_progress_events_are_sent_before_sse_done(
     assert retry_index < event_names.index("event: done")
 
 
-def test_chat_turn_emits_narrator_draft_before_runtime(tmp_path: Path) -> None:
-    class StreamingRuntime(_RuntimeDouble):
+def test_chat_turn_uses_final_only_narrator_delivery(tmp_path: Path) -> None:
+    class FinalOnlyRuntime(_RuntimeDouble):
         async def submit_player_message_for_initial_render(
             self,
             *,
@@ -9510,9 +9512,7 @@ def test_chat_turn_emits_narrator_draft_before_runtime(tmp_path: Path) -> None:
             narrator_stream_callback: Callable[[str], None] | None = None,
         ) -> SimpleNamespace:
             assert body == "Light the beacon"
-            if narrator_stream_callback is not None:
-                narrator_stream_callback("The bell")
-                narrator_stream_callback("The bell answers.")
+            assert narrator_stream_callback is None
             return SimpleNamespace(
                 model=_chat_model("The bell answers."),
                 has_post_turn_jobs=False,
@@ -9521,7 +9521,7 @@ def test_chat_turn_emits_narrator_draft_before_runtime(tmp_path: Path) -> None:
                 narrator_message_id="narrator-1",
             )
 
-    state = _state_double(tmp_path, StreamingRuntime())
+    state = _state_double(tmp_path, FinalOnlyRuntime())
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
@@ -9539,13 +9539,8 @@ def test_chat_turn_emits_narrator_draft_before_runtime(tmp_path: Path) -> None:
     snapshot = state.jobs.get(job_id)
     assert snapshot is not None
     event_names = [event["event"] for event in snapshot.events]
-    drafts = [
-        event["payload"]["message"]["body"]
-        for event in snapshot.events
-        if event["event"] == "narrator_draft"
-    ]
-    assert drafts == ["The bell", "The bell answers."]
-    assert event_names.index("narrator_draft") < event_names.index("runtime")
+    assert "narrator_draft" not in event_names
+    assert event_names.index("progress") < event_names.index("runtime")
 
 
 def test_client_log_endpoint_sanitizes_sensitive_metadata(
