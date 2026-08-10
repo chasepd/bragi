@@ -6727,9 +6727,9 @@ function CyoaActionPicker({
   }, [activeSaveId, actionChoices?.narrator_message_id]);
 
   const choices = [...(actionChoices?.choices ?? [])].sort((left, right) => left.ordinal - right.ordinal);
-  const choicesGenerating = generationActive || Boolean(actionChoices?.generation_job);
   const submitBusy = submittingSaveId === activeSaveId || submittingSaveIdRef.current === activeSaveId;
   const regenerateBusy = regenerate.isPending;
+  const choicesGenerating = generationActive || Boolean(actionChoices?.generation_job) || regenerateBusy;
   const canSubmit = !disabled && !submitBusy;
   const canSubmitChoice = canSubmit && !choicesGenerating;
   const canRegenerate = !disabled && !submitBusy && !regenerateBusy && !choicesGenerating && Boolean(activeSaveId && actionChoices?.narrator_message_id);

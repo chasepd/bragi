@@ -15228,10 +15228,21 @@ describe("frontend helpers", () => {
       result: null,
       error: null
     };
-    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
-      ok: true,
-      json: async () => path === "/api/action-choices/regenerate" ? job : {}
-    }));
+    let resolveRegeneration!: (response: {
+      ok: boolean;
+      json: () => Promise<typeof job>;
+    }) => void;
+    const regenerationResponse = new Promise<{
+      ok: boolean;
+      json: () => Promise<typeof job>;
+    }>((resolve) => {
+      resolveRegeneration = resolve;
+    });
+    const fetchMock = vi.fn().mockImplementation((path: string) => (
+      path === "/api/action-choices/regenerate"
+        ? regenerationResponse
+        : Promise.resolve({ ok: true, json: async () => ({}) })
+    ));
     const runJob = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
@@ -15260,7 +15271,17 @@ describe("frontend helpers", () => {
         })
       })
     ));
-    expect(runJob).toHaveBeenCalledWith(job);
+    expect(screen.getByRole("status")).toHaveTextContent("Generating choices...");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Open the brass door" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+    expect(runJob).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveRegeneration({ ok: true, json: async () => job });
+      await regenerationResponse;
+    });
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(job));
   });
 
   it("guards generated choices while a tracked regeneration job remains active", async () => {
