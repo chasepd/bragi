@@ -1664,18 +1664,18 @@ class ChatService:
         if summarize_before_context:
             stage_started = perf_counter()
             turn_progress.publish("history", "running", "Checking history")
-            try:
-                await self._summarize_if_needed(
-                    save_id=save_id,
-                    provider=preference.provider,
-                    model_id=preference.model_id,
-                    pending_message=None,
-                    current_user_id=current_user_id,
-                )
-            except Exception:
-                turn_progress.publish("history", "failed", "History check failed")
-                raise
-            turn_progress.publish("history", "succeeded", "History checked")
+            summary_succeeded = await self._summarize_if_needed(
+                save_id=save_id,
+                provider=preference.provider,
+                model_id=preference.model_id,
+                pending_message=None,
+                current_user_id=current_user_id,
+            )
+            turn_progress.publish(
+                "history",
+                "succeeded" if summary_succeeded else "failed",
+                "History checked" if summary_succeeded else "History check failed",
+            )
             _log_chat_stage(
                 "chat.stage.summarization_finished",
                 save_id=save_id,
@@ -3955,7 +3955,7 @@ class ChatService:
                 "Checking content and history",
             )
             try:
-                await self._summarize_if_needed(
+                summary_succeeded = await self._summarize_if_needed(
                     save_id=save_id,
                     provider=provider,
                     model_id=model_id,
@@ -3976,7 +3976,11 @@ class ChatService:
                     "History check failed",
                 )
                 raise
-            turn_progress.publish("history", "succeeded", "History checked")
+            turn_progress.publish(
+                "history",
+                "succeeded" if summary_succeeded else "failed",
+                "History checked" if summary_succeeded else "History check failed",
+            )
             _log_chat_stage(
                 "chat.stage.summarization_finished",
                 save_id=save_id,
@@ -6572,9 +6576,9 @@ class ChatService:
         model_id: str,
         pending_message: PendingMessageEstimate | None,
         current_user_id: str | None,
-    ) -> None:
+    ) -> bool:
         if self.summary_service is None:
-            return
+            return True
         try:
             await self.summary_service.summarize_if_needed(
                 save_id=save_id,
@@ -6592,7 +6596,8 @@ class ChatService:
                 save_id=save_id,
                 **exception_log_fields(exc),
             )
-            return
+            return False
+        return True
 
     async def _prepare_summary_for_next_turn(
         self,

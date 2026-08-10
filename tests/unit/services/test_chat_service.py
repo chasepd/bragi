@@ -2967,6 +2967,20 @@ def test_submit_player_turn_overlaps_classification_and_history_before_persistin
         content={"starting_scene": "The beacon gutters in the tower."},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    older_player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I cross the ash bridge.",
+    )
+    older_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="A windless bell answers beneath the span.",
+        provider="fake",
+        model="fake-chat",
+    )
     repositories.set_model_preference(
         task="chat",
         provider="fake",
@@ -3008,8 +3022,13 @@ def test_submit_player_turn_overlaps_classification_and_history_before_persistin
         await asyncio.wait_for(classification_started.wait(), timeout=1.0)
         await asyncio.wait_for(summary_started.wait(), timeout=1.0)
 
-        assert repositories.list_messages(save.id) == []
-        assert summary.message_bodies_at_start == [[]]
+        assert repositories.list_messages(save.id) == [older_player, older_narrator]
+        assert summary.message_bodies_at_start == [
+            [
+                "I cross the ash bridge.",
+                "A windless bell answers beneath the span.",
+            ]
+        ]
         assert summary.pending_messages == [
             PendingMessageEstimate(
                 body="I climb toward the beacon lens.",
@@ -3033,7 +3052,7 @@ def test_submit_player_turn_overlaps_classification_and_history_before_persistin
         summary_release.set()
         await asyncio.wait_for(summary.finished.wait(), timeout=1.0)
         assert not task.done()
-        assert repositories.list_messages(save.id) == []
+        assert repositories.list_messages(save.id) == [older_player, older_narrator]
 
         classification_release.set()
         result = await asyncio.wait_for(task, timeout=1.0)
@@ -3167,6 +3186,81 @@ def test_submit_player_turn_no_summary_fast_path_waits_only_for_classification(
     asyncio.run(run())
 
 
+def test_submit_player_turn_reports_summary_failure_but_waits_for_classification(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        history_failed = asyncio.Event()
+        progress_events: list[Any] = []
+
+        def record_progress(progress: object) -> None:
+            progress_events.append(progress)
+            jobs = getattr(progress, "jobs", ())
+            if any(
+                getattr(job, "name", None) == "history"
+                and getattr(job, "status", None) == "failed"
+                for job in jobs
+            ):
+                history_failed.set()
+
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=FailingSummaryService(
+                events=[],
+                error=RuntimeError("summary backend is down"),
+            ),
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+                turn_progress_callback=record_progress,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(history_failed.wait(), timeout=1.0)
+        assert not task.done()
+        assert repositories.list_messages(save.id) == []
+
+        classification_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert result.player_message.content_rating == "pg"
+        final_statuses = {
+            job.name: job.status
+            for job in getattr(progress_events[-1], "jobs", ())
+        }
+        assert final_statuses["history"] == "failed"
+
+    asyncio.run(run())
+
+
 def test_submit_player_turn_cancels_both_pre_input_branches(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3223,6 +3317,70 @@ def test_submit_player_turn_cancels_both_pre_input_branches(
         await asyncio.wait_for(classification_started.wait(), timeout=1.0)
         await asyncio.wait_for(summary_started.wait(), timeout=1.0)
         assert token.cancel() is True
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(classification_cancelled.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_cancelled.wait(), timeout=1.0)
+        assert repositories.list_messages(save.id) == []
+
+    asyncio.run(run())
+
+
+def test_submit_player_turn_task_cancellation_cleans_up_pre_input_branches(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        classification_cancelled = asyncio.Event()
+        summary_started = asyncio.Event()
+        summary_release = asyncio.Event()
+        summary_cancelled = asyncio.Event()
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=ControlledSummaryService(
+                repositories=repositories,
+                started=summary_started,
+                release=summary_release,
+                cancelled=summary_cancelled,
+            ),
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                    cancelled=classification_cancelled,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_started.wait(), timeout=1.0)
+        task.cancel()
 
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=1.0)
@@ -3291,6 +3449,10 @@ def test_submit_timeskip_turn_overlaps_pre_input_checks(
         ]
 
         summary_release.set()
+        await asyncio.wait_for(summary.finished.wait(), timeout=1.0)
+        assert not task.done()
+        assert repositories.list_messages(save.id) == []
+
         classification_release.set()
         result = await asyncio.wait_for(task, timeout=1.0)
         assert result.player_message.role == "system"
