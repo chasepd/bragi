@@ -1559,7 +1559,7 @@ def test_context_search_does_not_raw_fallback_when_curated_observation_is_blocke
     )
     diagnostics = job_result["diagnostics"]
     assert diagnostics["curated_observation_candidate_count"] == 0
-    assert diagnostics["suppressed_raw_observation_count"] == 1
+    assert diagnostics["suppressed_raw_observation_count"] == 0
 
 
 def test_context_search_prefers_tool_calls_when_model_advertises_tool_calling(

@@ -313,16 +313,16 @@ class ContextSearchService:
             payload={"scope": "next_turn_context_snapshot"},
         )
         try:
+            _sync_continuity_index_for_search(self.repositories, save_id)
+            initial_fingerprint = self.repositories.context_candidate_revision_token(
+                save_id
+            )
             details = self.repositories.load_save_details(
                 save_id,
                 message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
             )
             if details is None:
                 raise ValueError(f"Unknown save id: {save_id}")
-            _sync_continuity_index_for_search(self.repositories, save_id)
-            initial_fingerprint = self.repositories.context_candidate_revision_token(
-                save_id
-            )
             snapshot = load_narration_context_snapshot(
                 self.repositories,
                 save_id=save_id,
@@ -484,19 +484,6 @@ class ContextSearchService:
                     ignored_message_id=player_message_id,
                 )
             )
-            details = self.repositories.load_save_details(
-                save_id,
-                message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
-            )
-            if details is None:
-                raise ValueError(f"Unknown save id: {save_id}")
-            messages = (
-                details.messages
-                if focus_message is None
-                else [*details.messages, focus_message]
-            )
-            scenario = details.scenario if details is not None else None
-            player_message = _message_body(messages, player_message_id)
             cache_entry = self._valid_next_turn_cache(
                 save_id,
                 player_message_id=player_message_id,
@@ -510,18 +497,22 @@ class ContextSearchService:
                         ignored_message_id=player_message_id,
                     )
                 )
-                details = self.repositories.load_save_details(
-                    save_id,
-                    message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
-                )
-                if details is None:
-                    raise ValueError(f"Unknown save id: {save_id}")
-                scenario = details.scenario
-                messages = (
-                    details.messages
-                    if focus_message is None
-                    else [*details.messages, focus_message]
-                )
+            else:
+                build_start_revision = cache_entry.fingerprint
+            details = self.repositories.load_save_details(
+                save_id,
+                message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+            )
+            if details is None:
+                raise ValueError(f"Unknown save id: {save_id}")
+            messages = (
+                details.messages
+                if focus_message is None
+                else [*details.messages, focus_message]
+            )
+            scenario = details.scenario
+            player_message = _message_body(messages, player_message_id)
+            if cache_entry is None:
                 continuity_index_synced = True
                 narration_snapshot = load_narration_context_snapshot(
                     self.repositories,
@@ -531,7 +522,6 @@ class ContextSearchService:
                     raw_record_limit=RAW_CONTEXT_RECORD_LIMIT,
                 )
             else:
-                build_start_revision = cache_entry.fingerprint
                 continuity_index_synced = True
                 narration_snapshot = replace(cache_entry.snapshot, details=details)
             if narration_snapshot is None:
@@ -543,9 +533,19 @@ class ContextSearchService:
                 )
                 != build_start_revision
             )
-            _archive_stale_scene_scratch_for_search(
+            archived_stale_scratch = _archive_stale_scene_scratch_for_search(
                 self.repositories,
                 save_id,
+                current_scene_snapshot_id=(
+                    narration_snapshot.scene_snapshot.id
+                    if narration_snapshot.scene_snapshot is not None
+                    else None
+                ),
+                current_scene_generation=(
+                    narration_snapshot.scene_snapshot.scene_generation
+                    if narration_snapshot.scene_snapshot is not None
+                    else None
+                ),
             )
             build_start_revision = (
                 self.repositories.context_candidate_revision_token(
@@ -621,6 +621,7 @@ class ContextSearchService:
             )
             if (
                 snapshot_changed_during_build
+                or archived_stale_scratch
                 or preselection_revision != build_start_revision
             ):
                 cache_status = "stale" if cache_entry is not None else "retried"
@@ -986,22 +987,21 @@ def _sync_continuity_index_for_search(
 def _archive_stale_scene_scratch_for_search(
     repositories: PersistenceRepositories,
     save_id: str,
-) -> None:
-    scene_snapshot = repositories.get_scene_snapshot(save_id)
+    *,
+    current_scene_snapshot_id: str | None,
+    current_scene_generation: int | None,
+) -> bool:
     current_turn_number = repositories.count_active_messages_by_role(
         save_id,
         roles=("narrator",),
     )["narrator"]
-    repositories.archive_stale_scene_scratch(
+    archived_ids = repositories.archive_stale_scene_scratch(
         save_id=save_id,
-        current_scene_snapshot_id=(
-            scene_snapshot.id if scene_snapshot is not None else None
-        ),
-        current_scene_generation=(
-            scene_snapshot.scene_generation if scene_snapshot is not None else None
-        ),
+        current_scene_snapshot_id=current_scene_snapshot_id,
+        current_scene_generation=current_scene_generation,
         current_turn_number=current_turn_number,
     )
+    return bool(archived_ids)
 
 
 def _rehydrate_selected_context(
@@ -1013,6 +1013,7 @@ def _rehydrate_selected_context(
     result: ContextSearchResult,
     fallback_snapshot: NarrationContextSnapshot | None,
     preselection_revision: str,
+    reload_attempt: int = 0,
 ) -> tuple[ContextSearchResult, NarrationContextSnapshot | None]:
     selected_items = _selected_context_items(result)
     current_revision = repositories.context_candidate_revision_token(
@@ -1029,6 +1030,10 @@ def _rehydrate_selected_context(
         return result, fallback_snapshot
     if current_revision != preselection_revision:
         _sync_continuity_index_for_search(repositories, save_id)
+    reload_start_revision = repositories.context_candidate_revision_token(
+        save_id,
+        ignored_message_id=player_message_id,
+    )
     details = repositories.load_save_details(
         save_id,
         message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
@@ -1197,6 +1202,25 @@ def _rehydrate_selected_context(
             ],
         )
     rehydrated = _context_result_from_items(rehydrated_items)
+    reload_end_revision = repositories.context_candidate_revision_token(
+        save_id,
+        ignored_message_id=player_message_id,
+    )
+    if reload_end_revision != reload_start_revision:
+        if reload_attempt == 0:
+            return _rehydrate_selected_context(
+                repositories=repositories,
+                save_id=save_id,
+                player_message_id=player_message_id,
+                focus_message=focus_message,
+                result=result,
+                fallback_snapshot=None,
+                preselection_revision=reload_end_revision,
+                reload_attempt=1,
+            )
+        raise RuntimeError(
+            "Context changed repeatedly during rehydration; retry the turn"
+        )
     return (
         replace(
             rehydrated,
