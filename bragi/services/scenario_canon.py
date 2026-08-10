@@ -439,9 +439,23 @@ def _claim_is_atomic(value: str) -> bool:
 
 
 def _claim_is_grounded(claim: str, evidence_quote: str) -> bool:
-    evidence_tokens = set(re.findall(r"[a-z0-9]+", evidence_quote.casefold()))
-    claim_tokens = set(re.findall(r"[a-z0-9]+", claim.casefold()))
-    return claim_tokens <= evidence_tokens
+    claim_tokens = re.findall(r"[a-z0-9]+", claim.casefold())
+    evidence_tokens = re.findall(r"[a-z0-9]+", evidence_quote.casefold())
+    if _is_contiguous_subsequence(claim_tokens, evidence_tokens):
+        return True
+    without_appositives = re.sub(r",[^,]+,", " ", evidence_quote)
+    normalized_evidence = re.findall(r"[a-z0-9]+", without_appositives.casefold())
+    return claim_tokens == normalized_evidence
+
+
+def _is_contiguous_subsequence(needle: list[str], haystack: list[str]) -> bool:
+    if not needle:
+        return False
+    width = len(needle)
+    return any(
+        haystack[index : index + width] == needle
+        for index in range(len(haystack) - width + 1)
+    )
 
 
 def _contains_coordinated_clauses(value: str) -> bool:

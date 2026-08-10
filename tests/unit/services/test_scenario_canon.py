@@ -139,6 +139,43 @@ def test_compiler_normalizes_punctuated_evidence_into_atomic_claim() -> None:
     assert claims[0].evidence_quote == "Mira, the captain, knows the route."
 
 
+@pytest.mark.parametrize(
+    ("evidence", "claim"),
+    [
+        ("The beacon is not cold.", "The beacon is cold."),
+        ("Mira follows Rowan.", "Rowan follows Mira."),
+    ],
+)
+def test_compiler_rejects_meaning_changing_evidence_normalization(
+    evidence: str,
+    claim: str,
+) -> None:
+    output = _output()
+    sections = output["sections"]
+    assert isinstance(sections, list)
+    section = sections[0]
+    assert isinstance(section, dict)
+    claims = section["claims"]
+    assert isinstance(claims, list)
+    first_claim = claims[0]
+    assert isinstance(first_claim, dict)
+    first_claim["claim"] = claim
+    first_claim["evidence_quote"] = evidence
+    section["claims"] = [first_claim]
+
+    with pytest.raises(ValueError, match="adds facts absent"):
+        asyncio.run(
+            ScenarioCanonCompiler(
+                provider=FakeProviderClient(structured_output=output),
+                provider_name="fake",
+                model_id="canon-model",
+            ).compile(
+                scenario_type="full_roleplay",
+                content={"lore": evidence},
+            )
+        )
+
+
 def test_compiler_reuses_matching_compilation_without_provider_call() -> None:
     provider = FakeProviderClient(structured_output=_output())
     compiler = ScenarioCanonCompiler(
