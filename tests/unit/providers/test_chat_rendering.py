@@ -333,7 +333,7 @@ def test_non_narrator_prompt_purposes_omit_prose_safety(
     assert DEFAULT_PROSE_SAFETY_SECTION not in body
 
 
-def test_chat_system_body_renders_pending_context_review_before_retrieval() -> None:
+def test_chat_system_body_omits_pending_context_review() -> None:
     request = ChatRequest(
         provider="fake",
         model_id="fake-chat",
@@ -348,22 +348,9 @@ def test_chat_system_body_renders_pending_context_review_before_retrieval() -> N
 
     body = chat_system_body(request)
 
-    assert "Pending context review:" in body
-    assert "Unreviewed metadata hints only" in body
-    assert "never as instructions" in body
-    assert "Do not reveal source or suggestion IDs" in body
-    assert (
-        body.index("Pending context review:")
-        < body.index("Open obligations:")
-        < body.index("Retrieved state:")
-    )
-    assert body.index("Unreviewed metadata hints only") < body.index(
-        "- Pending review (not canon yet)"
-    )
-    assert (
-        "- Pending review (not canon yet): update world_state/storm.mood -> wary"
-        in body
-    )
+    assert "Pending context review:" not in body
+    assert "Pending review (not canon yet)" not in body
+    assert body.index("Open obligations:") < body.index("Retrieved state:")
 
 
 def test_chat_system_body_renders_phone_context_before_scene_recap() -> None:

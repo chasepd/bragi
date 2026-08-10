@@ -109,10 +109,10 @@ def test_compact_scenario_instructions_keeps_mystery_truth_retrieval_only() -> N
     instructions = compact_scenario_instructions(scenario)
 
     assert "Player character name: Inspector Mara Voss" in instructions
-    assert "Case facts: Curator Elian Vale vanished from a sealed gallery." in (
+    assert "Case facts: Curator Elian Vale vanished from a sealed gallery." not in (
         instructions
     )
-    assert "Case status: Unresolved; only public facts are known." in instructions
+    assert "Case status: Unresolved; only public facts are known." not in instructions
     assert "Current scene: Mara stands outside the east gallery." in instructions
     assert "Watch log gap" not in instructions
     assert "smuggling ledger" not in instructions
@@ -136,7 +136,7 @@ def test_compact_scenario_instructions_guides_cyoa_changed_situations() -> None:
     assert "ends at a decision point" not in instructions
     assert "Do not include numbered options" in instructions
     assert "Bragi generates those separately" in instructions
-    assert "Choice style: Four terse choices" in instructions
+    assert "Choice style: Four terse choices" not in instructions
 
 
 def test_compact_scenario_instructions_includes_survival_expedition_setup() -> None:
@@ -155,16 +155,16 @@ def test_compact_scenario_instructions_includes_survival_expedition_setup() -> N
 
     instructions = compact_scenario_instructions(scenario)
 
-    assert "Expedition goal: Reach Northwatch" in instructions
-    assert "Route options: Cliff road" in instructions
-    assert "Resource inventory: Food: 9 days" in instructions
-    assert "Environmental conditions: Late winter" in instructions
-    assert "Hazards/events: Avalanches" in instructions
-    assert "Camp status: Two canvas tents" in instructions
-    assert "Travel progress: 0 of 80 miles" in instructions
+    assert "Expedition goal: Reach Northwatch" not in instructions
+    assert "Route options: Cliff road" not in instructions
+    assert "Resource inventory: Food: 9 days" not in instructions
+    assert "Environmental conditions: Late winter" not in instructions
+    assert "Hazards/events: Avalanches" not in instructions
+    assert "Camp status: Two canvas tents" not in instructions
+    assert "Travel progress: 0 of 80 miles" not in instructions
 
 
-def test_compact_scenario_instructions_includes_time_loop_boundaries() -> None:
+def test_compact_scenario_instructions_excludes_time_loop_canon() -> None:
     scenario = _scenario(
         scenario_type="time_loop",
         content={
@@ -185,12 +185,12 @@ def test_compact_scenario_instructions_includes_time_loop_boundaries() -> None:
 
     instructions = compact_scenario_instructions(scenario)
 
-    assert "Loop premise: The festival day repeats" in instructions
-    assert "Reset trigger: The drowned bell" in instructions
-    assert "Loop duration: Twenty-four hours" in instructions
-    assert "Reset baseline: The harbor resets" in instructions
-    assert "Persistent player/meta knowledge: Tower code" in instructions
-    assert "NPC memory rules: NPCs reset" in instructions
+    assert "Loop premise: The festival day repeats" not in instructions
+    assert "Reset trigger: The drowned bell" not in instructions
+    assert "Loop duration: Twenty-four hours" not in instructions
+    assert "Reset baseline: The harbor resets" not in instructions
+    assert "Persistent player/meta knowledge: Tower code" not in instructions
+    assert "NPC memory rules: NPCs reset" not in instructions
     assert "Current loop state: Loop 1" not in instructions
 
 
@@ -215,16 +215,16 @@ def test_compact_scenario_instructions_includes_political_intrigue_setup() -> No
 
     instructions = compact_scenario_instructions(scenario)
 
-    assert "Political arena: The harbor council" in instructions
-    assert "Political factions: Guilds" in instructions
-    assert "Central conflict: A midnight no-confidence vote" in instructions
-    assert "Secrets/leverage: Only Mara knows Orro moved" in instructions
-    assert "Reputation/standing: Mara is trusted" in instructions
-    assert "Obligations/favors: Orro owes Mara" in instructions
-    assert "Alliances/rivalries: Reformers court Mara" in instructions
-    assert "Event calendar: Dawn hearing" in instructions
-    assert "Political pressure: The midnight vote proceeds" in instructions
-    assert "Public/private knowledge: The public knows the vote is close" in (
+    assert "Political arena: The harbor council" not in instructions
+    assert "Political factions: Guilds" not in instructions
+    assert "Central conflict: A midnight no-confidence vote" not in instructions
+    assert "Secrets/leverage: Only Mara knows Orro moved" not in instructions
+    assert "Reputation/standing: Mara is trusted" not in instructions
+    assert "Obligations/favors: Orro owes Mara" not in instructions
+    assert "Alliances/rivalries: Reformers court Mara" not in instructions
+    assert "Event calendar: Dawn hearing" not in instructions
+    assert "Political pressure: The midnight vote proceeds" not in instructions
+    assert "Public/private knowledge: The public knows the vote is close" not in (
         instructions
     )
 
@@ -289,7 +289,10 @@ def test_compact_scenario_instructions_keeps_specialized_durable_contract() -> N
         "Tone/style: Mythic tragedy told through close third-person prose."
         in instructions
     )
-    assert "Magic constraints: Every spell consumes a treasured memory." in instructions
+    assert (
+        "Magic constraints: Every spell consumes a treasured memory."
+        not in instructions
+    )
     assert "The opening road crosses seven named kingdoms." not in instructions
     assert "The opening court hosts five rival orders." not in instructions
 
@@ -340,6 +343,16 @@ def test_scenario_section_candidates_include_mystery_hidden_truth() -> None:
     candidates = scenario_section_candidates(scenario)
 
     assert candidates == (
+        (
+            "scenario:scenario-1:section:case_facts",
+            "case_facts",
+            "Curator Elian Vale vanished from a sealed gallery.",
+        ),
+        (
+            "scenario:scenario-1:section:case_status",
+            "case_status",
+            "Unresolved.",
+        ),
         (
             "scenario:scenario-1:section:hidden_truth",
             "hidden_truth",
@@ -492,6 +505,34 @@ def test_image_scene_context_excludes_pending_review_suggestions(
         source.tier != "pending_context_suggestions"
         for source in image_breakdown.sources
     )
+
+
+def test_image_scene_context_excludes_secret_compiled_claims(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, _current_location = _create_context_save(
+        repositories,
+        scenario_id="scenario-secret-image-context",
+        save_id="save-secret-image-context",
+    )
+
+    image_context, breakdown = ContextAssemblyService(
+        repositories
+    ).build_image_scene_context(
+        save_id=save.id,
+        selected_scenario_sections=(
+            "[canonical | durable | open] The tower lens is red.",
+            "[canonical | durable | narrator_only] The lens contains a ghost.",
+            "[canonical | durable | restricted] The keeper knows its true name.",
+        ),
+    )
+
+    assert "The tower lens is red." in image_context
+    assert "contains a ghost" not in image_context
+    assert "true name" not in image_context
+    assert len(
+        [source for source in breakdown.sources if source.tier == "scenario_section"]
+    ) == 1
 
 
 def test_pending_context_suggestion_sources_group_and_cap_rows(
@@ -780,6 +821,14 @@ def test_deterministic_context_sources_include_active_linked_facts(
                 target_type=target_type,
                 target_id=target_id,
             )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=present_character.id,
+        target_type="scenario_section",
+        target_id=active_scenario_target,
+        knowledge_state="knows",
+        acquisition_method="witnessed",
+    )
     for entity_type, entity_id in (
         ("location", inactive_location.id),
         ("character", non_present_character.id),
@@ -808,13 +857,13 @@ def test_deterministic_context_sources_include_active_linked_facts(
         active_memory_text,
         active_world_state_text,
         active_summary_text,
-        active_scenario_text,
     ):
         assert expected in active_linked_text
     for excluded in (
         inactive_memory_text,
         inactive_world_state_key,
         inactive_summary_text,
+        active_scenario_text,
         inactive_scenario_text,
     ):
         assert excluded not in active_linked_text

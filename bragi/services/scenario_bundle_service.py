@@ -115,6 +115,7 @@ class ScenarioBundleService:
             f"Unknown scenario id: {scenario_id}",
         )
         content = _json_object_from_text(row["content_json"], "content_json")
+        compiled_canon = content.get("_canon_claims")
         safe_title = _redacted_text(row["title"])
         safe_type = _text_value(row["type"])
         if scenario_record_is_retired(safe_type, content):
@@ -147,6 +148,9 @@ class ScenarioBundleService:
                 "updated_at": safe_updated_at,
             }
         )
+        exported_content = scenario_payload.get("content")
+        if isinstance(exported_content, dict) and compiled_canon is not None:
+            exported_content["_canon_claims"] = redact_log_value(compiled_canon)
         exported_at = datetime.now(UTC).isoformat()
         manifest_payload = _redacted_mapping(
             {
@@ -220,6 +224,7 @@ class ScenarioBundleService:
                 content=_object(scenario.get("content"), "scenario content"),
             )
         )
+        compiled_canon = scenario_content.get("_canon_claims")
         original_title = _text(scenario, "title").strip() or "Imported scenario"
         title = _unique_scenario_title(self.repositories, original_title)
         premise, content = normalize_scenario_definition(
@@ -227,6 +232,8 @@ class ScenarioBundleService:
             premise=_text(scenario, "premise"),
             content=scenario_content,
         )
+        if compiled_canon is not None:
+            content["_canon_claims"] = compiled_canon
         content = _quarantine_imported_scenario_content(content)
         materialized_paths: list[str] = []
         try:

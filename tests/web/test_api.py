@@ -14874,7 +14874,7 @@ def _submit_chat_and_wait(
     )
     assert submitted.status_code == 200
     job = _wait_for_terminal_job(client, submitted.json()["id"], save_id=save_id)
-    assert job["status"] == "succeeded"
+    assert job["status"] == "succeeded", job
     assert job["error"] is None
     assert isinstance(job["result"], dict)
     assert job["result"]["error"] is None

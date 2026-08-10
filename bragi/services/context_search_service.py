@@ -49,7 +49,10 @@ from bragi.providers.errors import ProviderError, provider_error_is_model_not_fo
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.services.agentic_context import EvidenceRefinementRequest
-from bragi.services.context_assembly import scenario_section_candidates
+from bragi.services.context_assembly import (
+    scenario_claim_candidates,
+    scenario_section_candidates,
+)
 from bragi.services.continuity_index_service import ContinuityIndexService
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.knowledge_boundary import (
@@ -92,6 +95,7 @@ from bragi.services.request_budget import (
     budget_structured_output_request,
     budget_tool_call_request,
 )
+from bragi.services.scenario_canon import ensure_scenario_canon_for_save
 from bragi.services.tool_call_helpers import (
     CONTEXT_SEARCH_TOOL_RETRY_INSTRUCTION,
     accepted_tool_result,
@@ -124,7 +128,6 @@ CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT = 64
 RAW_CONTEXT_RECORD_LIMIT = 512
 CONTINUITY_FLOOR_STATE_LIMIT = 4
 CONTINUITY_FLOOR_MEMORY_LIMIT = 4
-CONTINUITY_FLOOR_SCENARIO_SECTION_LIMIT = 3
 CONTINUITY_FLOOR_MEMORY_MIN_IMPORTANCE = 0.8
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
@@ -132,6 +135,7 @@ INDEXED_CONTEXT_SOURCE_TYPES = frozenset(
     {
         "character_text_thread",
         "open_obligation",
+        "scenario_claim",
         "scenario_section",
         "state",
         "world_state",
@@ -505,6 +509,19 @@ class ContextSearchService:
             )
             if details is None:
                 raise ValueError(f"Unknown save id: {save_id}")
+            scenario_compiled = await ensure_scenario_canon_for_save(
+                repositories=self.repositories,
+                providers=self.providers,
+                save_id=save_id,
+                details=details,
+            )
+            if scenario_compiled:
+                details = self.repositories.load_save_details(
+                    save_id,
+                    message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
+                )
+                if details is None:
+                    raise ValueError(f"Unknown save id: {save_id}")
             messages = (
                 details.messages
                 if focus_message is None
@@ -1315,6 +1332,12 @@ def _snapshot_contains_selected_items(
                 snapshot.details.scenario
             )
         ),
+        *(
+            ("scenario_claim", source_id)
+            for source_id, _section_id, _text, _metadata in scenario_claim_candidates(
+                snapshot.details.scenario
+            )
+        ),
     }
     return all(
         (item.source_type, item.source_id) in available_keys
@@ -1976,6 +1999,17 @@ def _context_candidate_set(
             and character.is_player_character
         )
     )
+    known_by_character_identifiers = frozenset(
+        identifier.casefold()
+        for character_id in turn_scope.reference_character_ids
+        for character in [characters_by_id.get(character_id)]
+        for identifier in (
+            character_id,
+            *(character.aliases if character is not None else ()),
+            *((character.name,) if character is not None else ()),
+        )
+        if identifier
+    )
     message_candidates = _message_candidates(
         recent_messages,
         player_message_id,
@@ -2003,13 +2037,19 @@ def _context_candidate_set(
     )
     indexed_candidates = _indexed_context_candidates(
         context_source_records,
+        world_state=world_state,
         scoped_targets=scoped_targets,
         reference_character_ids=audience_reference_character_ids,
+        known_by_character_identifiers=known_by_character_identifiers,
         accepted_observation_ids=accepted_observation_ids,
         present_character_ids=turn_scope.present_character_ids,
         message_visibility=message_visibility or [],
     )
-    scenario_candidates = _scenario_section_candidates(scenario)
+    scenario_candidates = tuple(
+        candidate
+        for candidate in indexed_candidates
+        if candidate.source_type == "scenario_claim"
+    )
     raw_state_candidates = _state_candidates(
         world_state,
         scoped_targets=scoped_targets,
@@ -2053,7 +2093,6 @@ def _context_candidate_set(
             state_candidates=raw_state_candidates,
             memories=memories,
             memory_candidates=raw_memory_candidates,
-            scenario_candidates=scenario_candidates,
         )
     )
     observation_candidates = _observation_candidates(
@@ -3024,6 +3063,7 @@ def _context_selection_schema(
                             "type": "string",
                             "enum": [
                                 "open_obligation",
+                                "scenario_claim",
                                 "scenario_section",
                                 "world_state",
                                 "state_change",
@@ -3343,7 +3383,7 @@ def _context_result_from_items(
     for item in items:
         if item.source_type == "open_obligation":
             selected_open_obligations.append(item)
-        elif item.source_type == "scenario_section":
+        elif item.source_type in {"scenario_claim", "scenario_section"}:
             selected_scenario_sections.append(item)
         elif item.source_type == "world_state":
             selected_state.append(item)
@@ -3557,7 +3597,7 @@ def _candidate_count_fields(
         "recent_message_candidate_count": 0,
     }
     for candidate in candidates:
-        if candidate.source_type == "scenario_section":
+        if candidate.source_type in {"scenario_claim", "scenario_section"}:
             counts["scenario_section_candidate_count"] += 1
         elif candidate.source_type == "open_obligation":
             counts["open_obligation_candidate_count"] += 1
@@ -3789,8 +3829,10 @@ def _model_requirement_error(
 def _indexed_context_candidates(
     records: list[ContextSourceRecord],
     *,
+    world_state: list[WorldStateRecord],
     scoped_targets: ScopedTargets,
     reference_character_ids: frozenset[str],
+    known_by_character_identifiers: frozenset[str] = frozenset(),
     accepted_observation_ids: frozenset[str],
     present_character_ids: frozenset[str],
     message_visibility: list[MessageVisibilityRecord],
@@ -3806,9 +3848,21 @@ def _indexed_context_candidates(
         )
         if source_type is None:
             continue
+        if source_type == "scenario_claim" and _scenario_claim_is_superseded(
+            record,
+            world_state=world_state,
+        ):
+            continue
         if _audience_candidate_blocked(record, reference_character_ids):
             continue
-        if _known_by_candidate_blocked(record, scoped_targets):
+        if (
+            record.metadata.get("reveal_policy") != "narrator_only"
+            and _known_by_candidate_blocked(
+                record,
+                scoped_targets,
+                character_identifiers=known_by_character_identifiers,
+            )
+        ):
             continue
         source_text = _indexed_context_candidate_text(record, source_type=source_type)
         if not source_text.strip():
@@ -3835,6 +3889,42 @@ def _indexed_context_candidates(
             )
         )
     return tuple(candidates)
+
+
+def _scenario_claim_is_superseded(
+    record: ContextSourceRecord,
+    *,
+    world_state: list[WorldStateRecord],
+) -> bool:
+    if record.metadata.get("temporal_status") != "current_at_scenario_start":
+        return False
+    fact_key = _normalize_key_component(str(record.metadata.get("fact_key", "")))
+    if not fact_key:
+        return False
+    anchors = record.metadata.get("entity_anchors")
+    if not isinstance(anchors, list):
+        return False
+    anchor_keys = {
+        _normalize_key_component(str(anchor.get("entity_key", "")))
+        for anchor in anchors
+        if isinstance(anchor, Mapping)
+    }
+    anchor_keys.discard("")
+    if not anchor_keys:
+        return False
+    for state in world_state:
+        key_parts = state.key.split(".")
+        for index, entity_part in enumerate(key_parts[:-1]):
+            if _normalize_key_component(entity_part) not in anchor_keys:
+                continue
+            state_fact_key = _normalize_key_component(".".join(key_parts[index + 1 :]))
+            if state_fact_key == fact_key:
+                return True
+    return False
+
+
+def _normalize_key_component(value: str) -> str:
+    return "".join(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
 def _indexed_context_source_is_continuity_critical(
@@ -3883,7 +3973,6 @@ def _continuity_floor_candidates(
     state_candidates: tuple[_ContextCandidate, ...],
     memories: list[MemoryRecord],
     memory_candidates: tuple[_ContextCandidate, ...],
-    scenario_candidates: tuple[_ContextCandidate, ...],
 ) -> tuple[_ContextCandidate, ...]:
     return tuple(
         _mark_continuity_critical(candidate)
@@ -3896,7 +3985,6 @@ def _continuity_floor_candidates(
                 memories=memories,
                 memory_candidates=memory_candidates,
             ),
-            *scenario_candidates[:CONTINUITY_FLOOR_SCENARIO_SECTION_LIMIT],
         )
     )
 
@@ -4084,20 +4172,36 @@ def _bounded_structured_identifiers(text: str) -> tuple[str, ...]:
 def _known_by_candidate_blocked(
     record: ContextSourceRecord,
     scoped_targets: ScopedTargets,
+    *,
+    character_identifiers: frozenset[str] = frozenset(),
 ) -> bool:
     audience_character_ids = record.metadata.get("audience_character_ids")
     if isinstance(audience_character_ids, list) and audience_character_ids:
         return False
     known_by = record.metadata.get("known_by")
     if not isinstance(known_by, list) or not known_by:
-        return False
+        return record.metadata.get("reveal_policy") == "restricted"
     allowed_owners = {
         scoped_owner_name(owner).casefold()
         for owners in scoped_targets.allowed.values()
         for owner in owners
     }
+    allowed_identifiers = {
+        str(target_id).casefold()
+        for _target_type, target_id in scoped_targets.allowed
+    } | allowed_owners | set(character_identifiers)
     normalized_known_by = {str(item).casefold() for item in known_by}
-    return not bool(normalized_known_by & allowed_owners)
+    anchors = record.metadata.get("entity_anchors")
+    known_identifiers = set(normalized_known_by)
+    if isinstance(anchors, list):
+        known_identifiers.update(
+            str(anchor.get(field, "")).casefold()
+            for anchor in anchors
+            if isinstance(anchor, Mapping)
+            and str(anchor.get("entity_key", "")).casefold() in normalized_known_by
+            for field in ("entity_key", "display_name")
+        )
+    return not bool(known_identifiers & allowed_identifiers)
 
 
 def _audience_candidate_blocked(
@@ -4139,6 +4243,7 @@ def _indexed_candidate_source_type(
     if normalized_source_type in {
         "character_text_thread",
         "open_obligation",
+        "scenario_claim",
         "scenario_section",
         "world_state",
         "memory",
@@ -4369,6 +4474,7 @@ def _candidate_rank(
         "state_change": 5.5,
         "media_asset": 4.5,
         "message": 4.0,
+        "scenario_claim": 3.0,
         "scenario_section": 3.0,
         "summary": 1.5,
     }.get(candidate.source_type, 0.0)

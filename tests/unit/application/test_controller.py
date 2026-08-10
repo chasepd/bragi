@@ -124,6 +124,52 @@ class RuntimeFakeProvider:
             image_bytes=b"runtime fake scene image",
         )
 
+
+class RuntimeCanonProvider(RuntimeFakeProvider):
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        payload = json.loads(request.messages[-1].body)
+        sections = payload["sections"]
+        return StructuredOutputResponse(
+            data={
+                "sections": [
+                    {
+                        "section_id": section_id,
+                        "claims": [
+                            {
+                                "claim": evidence,
+                                "evidence_quote": evidence,
+                                "entity_anchors": [
+                                    {
+                                        "entity_type": "concept",
+                                        "entity_key": section_id,
+                                        "display_name": section_id,
+                                    }
+                                ],
+                                "fact_type": "other",
+                                "fact_key": section_id,
+                                "authority": "canonical",
+                                "temporal_status": "durable",
+                                "reveal_policy": "open",
+                                "known_by": [],
+                            }
+                            for evidence in re.split(
+                                r"(?<=[.!?])\s+|[;,]\s*|\n+|\s+(?:and|but|while|whereas)\s+",
+                                text,
+                            )
+                            if evidence.strip()
+                        ],
+                    }
+                    for section_id, text in sections.items()
+                ]
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
 class RuntimeContentSafetyProvider(RuntimeFakeProvider):
     def __init__(self, action: str = "block") -> None:
         super().__init__()
@@ -297,6 +343,8 @@ class RuntimeStructuredCleanupProvider(RuntimeFakeProvider):
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_requests.append(request)
+        if request.schema_name == "scenario_canon_claims":
+            return await RuntimeCanonProvider().generate_structured_output(request)
         if not self.responses:
             raise AssertionError(
                 f"unexpected structured request: {request.schema_name}"
@@ -728,7 +776,6 @@ def test_manual_action_choice_scenario_generates_opening_action_choices(
         tmp_path,
         providers={"fake": provider},
     )
-
     model = controller.create_manual_scenario(
         runtime.ManualScenarioInput(
             scenario_type="full_roleplay",
@@ -775,7 +822,6 @@ def test_manual_storyteller_scenario_ignores_stale_player_fields_and_choices(
 ) -> None:
     runtime = _import_runtime_without_gtk(monkeypatch)
     controller = _runtime_controller(runtime, repositories, tmp_path)
-
     model = controller.create_manual_scenario(
         runtime.ManualScenarioInput(
             scenario_type="full_roleplay",
@@ -887,6 +933,7 @@ def test_save_action_choice_scenario_draft_returns_opening_action_choices(
         )
     )
 
+    assert _value(model, "error") is None
     choices = _value(model, "action_choices")
     assert [_value(choice, "body") for choice in _value(choices, "choices")] == [
         "Open the brass atlas.",
@@ -895,7 +942,6 @@ def test_save_action_choice_scenario_draft_returns_opening_action_choices(
         "Step through the blue shelf-door.",
     ]
     assert provider.structured_requests
-    assert _value(model, "error") is None
 
 
 def test_save_action_choice_scenario_draft_can_defer_opening_action_choices(
@@ -921,6 +967,7 @@ def test_save_action_choice_scenario_draft_can_defer_opening_action_choices(
         tmp_path,
         providers={"fake": provider},
     )
+    _configure_test_canon_compiler(controller, repositories)
 
     model = asyncio.run(
         controller.save_scenario_draft(
@@ -3271,7 +3318,9 @@ def test_save_scenario_draft_persists_reviewed_sections_creates_active_save_and_
     assert scenario.player_role == "Reef investigator"
     content = json.loads(scenario.content_json)
     assert {
-        key: value for key, value in content.items() if key != "_source"
+        key: value
+        for key, value in content.items()
+        if key not in {"_source", "_canon_claims"}
     } == reviewed_sections
     assert content["_source"] == {
         "content_rating": "g",
@@ -3301,6 +3350,7 @@ def test_save_scenario_draft_preserves_opening_at_adult_rating(
 ) -> None:
     runtime = _import_runtime_without_gtk(monkeypatch)
     controller = _runtime_controller(runtime, repositories, tmp_path)
+    _configure_test_canon_compiler(controller, repositories)
     adult = repositories.create_user(
         username="Ilyra",
         role="user",
@@ -3707,6 +3757,7 @@ def test_save_management_scenario_draft_seeds_template_state(
         )
     )
 
+    assert _value(model, "error") is None
     save = repositories.list_saves()[0]
     assert _value(model, "active_save_id") == save.id
     scenario = repositories.get_scenario(save.scenario_id)
@@ -4094,6 +4145,7 @@ def test_save_scenario_draft_reviews_submitted_character_starter_content(
             "safety": safety_provider,
         },
     )
+    _configure_test_canon_compiler(controller, repositories)
     sections = {
         **_reviewed_full_roleplay_sections(),
         "characters": "Captain Ilyra, the exiled commander.",
@@ -11321,6 +11373,7 @@ async def _save_scenario_draft(
     source_metadata: dict[str, object] | None = None,
     character_starters: list[dict[str, object]] | None = None,
 ) -> object:
+    _configure_test_canon_compiler(controller, controller.repositories)
     model = await controller.save_scenario_draft(
         scenario_type=scenario_type,
         scenario_types=scenario_types,
@@ -11348,6 +11401,26 @@ async def _save_scenario_draft(
     return await controller.generate_initial_scenario_image(
         source_message_id=opening_message_id,
         active_save_id=save_id,
+    )
+
+
+def _configure_test_canon_compiler(
+    controller: Any,
+    repositories: PersistenceRepositories,
+) -> None:
+    if repositories.get_model_preference("context_update") is not None:
+        return
+    controller.providers["canon"] = RuntimeCanonProvider()
+    repositories.set_model_preference(
+        task="context_update",
+        provider="canon",
+        model_id="fake-canon",
+    )
+    repositories.save_provider_model(
+        provider="canon",
+        model_id="fake-canon",
+        display_name="Fake Canon",
+        capabilities=["structured_output"],
     )
 
 

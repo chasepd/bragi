@@ -1514,6 +1514,29 @@ class PersistenceRepositories:
         )
         return SaveScenarioUpdateRecord(**dict(row)) if row else None
 
+    def update_active_save_scenario_content(
+        self,
+        *,
+        save_id: str,
+        content: dict[str, object],
+    ) -> SaveScenarioUpdateRecord:
+        update = self.get_active_save_scenario_update(save_id)
+        if update is None:
+            raise ValueError(f"Save has no active scenario update: {save_id}")
+        self.connection.execute(
+            """
+            UPDATE save_scenario_updates
+            SET content_json = ?
+            WHERE id = ? AND archived_at IS NULL
+            """,
+            (_dump_json(content), update.id),
+        )
+        self.commit()
+        refreshed = self.get_active_save_scenario_update(save_id)
+        if refreshed is None:
+            raise ValueError(f"Save has no active scenario update: {save_id}")
+        return refreshed
+
     def list_save_scenario_updates(
         self,
         save_id: str,

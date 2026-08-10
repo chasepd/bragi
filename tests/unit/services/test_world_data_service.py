@@ -278,6 +278,46 @@ def test_world_data_service_exposes_generation_prompt_without_editable_source(
     )
 
 
+def test_world_data_service_hides_and_preserves_compiled_canon(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    world_data = _import_world_data_service_without_gtk(monkeypatch)
+    canon = {
+        "version": 1,
+        "source_digest": "digest",
+        "provider": "fake",
+        "model": "canon-model",
+        "claims": [],
+    }
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"rumor_board": "Fresh ash marks.", "_canon_claims": canon},
+    )
+    service = world_data.WorldDataService(repositories=repositories)
+    model = service.build_scenario_definition_model(scenario.id)
+    assert model.scenario is not None
+    assert model.scenario.content_sections == (("rumor_board", "Fresh ash marks."),)
+
+    service.apply_scenario_definition_edit(
+        scenario.id,
+        world_data.WorldDataScenarioEdit(
+            title="Ashfall Keep Revised",
+            premise=model.scenario.premise,
+            player_character_name=model.scenario.player_character_name,
+            player_role=model.scenario.player_role,
+            content_sections=model.scenario.content_sections,
+        ),
+    )
+
+    updated = repositories.get_scenario(scenario.id)
+    assert updated is not None
+    assert json.loads(updated.content_json)["_canon_claims"] == canon
+
+
 def test_world_data_service_uses_snapshotted_save_interaction_mode(
     repositories: PersistenceRepositories,
     monkeypatch: MonkeyPatch,

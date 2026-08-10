@@ -22,7 +22,7 @@ from bragi.text_search import (
     unicode_word_terms,
 )
 
-CURRENT_SCHEMA_VERSION = 79
+CURRENT_SCHEMA_VERSION = 80
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
@@ -756,12 +756,17 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 78:
+            if current == 79:
+                _migrate_schema_79_to_80(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 78:
                 _migrate_schema_78_to_79(connection)
+                _migrate_schema_79_to_80(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 77:
                 _migrate_schema_77_to_78(connection)
                 _migrate_schema_78_to_79(connection)
+                _migrate_schema_79_to_80(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 76:
                 _migrate_schema_76_to_77(connection)
@@ -972,6 +977,8 @@ def migrate_database(database_path: Path | str) -> None:
             _migrate_schema_77_to_78(connection)
         if not _schema_migration_applied(connection, 79):
             _migrate_schema_78_to_79(connection)
+        if not _schema_migration_applied(connection, 80):
+            _migrate_schema_79_to_80(connection)
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
         _ensure_context_observation_curation_schema(connection)
@@ -2354,11 +2361,13 @@ def _migrate_schema_76_to_77(connection: sqlite3.Connection) -> None:
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (77)")
     _migrate_schema_77_to_78(connection)
     _migrate_schema_78_to_79(connection)
+    _migrate_schema_79_to_80(connection)
 
 
-def _migrate_schema_78_to_79(connection: sqlite3.Connection) -> None:
+def _migrate_schema_79_to_80(connection: sqlite3.Connection) -> None:
     _ensure_post_turn_outbox_schema(connection)
-    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (79)")
+    _ensure_message_action_choice_generation_claim_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (80)")
 
 
 def _ensure_post_turn_outbox_schema(connection: sqlite3.Connection) -> None:

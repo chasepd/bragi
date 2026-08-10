@@ -127,6 +127,7 @@ class PromptInspectionStore:
 def format_chat_request(request: ChatRequest) -> str:
     payload = asdict(request)
     payload.pop("retry_progress_callback", None)
+    payload.pop("pending_context_suggestions", None)
     return json.dumps(payload, indent=2, sort_keys=True)
 
 
@@ -233,11 +234,6 @@ def _chat_request_source_cards(
     _append_tuple_cards(cards, "Character voice", request.character_voice_profiles)
     _append_tuple_cards(cards, "Character action plans", request.character_action_plans)
     _append_tuple_cards(cards, "Open obligations", request.open_obligations)
-    _append_tuple_cards(
-        cards,
-        "Pending context review",
-        request.pending_context_suggestions,
-    )
     _append_tuple_cards(cards, "Scenario sections", request.retrieved_scenario_sections)
     _append_tuple_cards(cards, "World state", request.retrieved_state)
     _append_tuple_cards(cards, "State changes", request.retrieved_state_changes)

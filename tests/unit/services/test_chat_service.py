@@ -8669,7 +8669,7 @@ def test_submit_player_turn_falls_back_to_legacy_npc_audit_when_verifier_unavail
     )
 
 
-def test_submit_player_turn_includes_pending_context_suggestions_without_applying(
+def test_submit_player_turn_omits_pending_context_suggestions_without_applying(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -8720,23 +8720,13 @@ def test_submit_player_turn_includes_pending_context_suggestions_without_applyin
     )
 
     request = provider.chat_requests[0]
-    assert request.pending_context_suggestions == (
-        "Pending review (not canon yet): update world_state/state-storm-mood "
-        'storm.mood -> {"mood": "wary"}; confidence=91%',
-    )
-    assert source_message.id not in "\n".join(request.pending_context_suggestions)
-    assert "The narrator described the storm as wary" not in "\n".join(
-        request.pending_context_suggestions
-    )
+    assert request.pending_context_suggestions == ()
     assert repositories.list_world_state(save.id) == []
     assert repositories.list_context_update_suggestions(save.id, status="pending") == [
         suggestion
     ]
-    assert any(
-        source["tier"] == "pending_context_suggestions"
-        and source["source_type"] == "context_update_suggestion"
-        and source["source_id"] == suggestion.id
-        and source["included"] is True
+    assert all(
+        source["tier"] != "pending_context_suggestions"
         for source in request.context_breakdown["sources"]
     )
 
@@ -11567,10 +11557,7 @@ def test_submit_player_turn_cancels_running_context_search_child_task(
         title="Ashfall Keep",
         premise="A border keep is cut off by ash storms.",
         player_role="Signal warden",
-        content={
-            "starting_scene": "The beacon gutters in the tower.",
-            "lore": "The buried lens code hums under the ash.",
-        },
+        content={"starting_scene": "The beacon gutters in the tower."},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
     repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
@@ -11672,10 +11659,7 @@ def test_submit_player_turn_cancels_context_search_from_another_thread(
         title="Ashfall Keep",
         premise="A border keep is cut off by ash storms.",
         player_role="Signal warden",
-        content={
-            "starting_scene": "The beacon gutters in the tower.",
-            "lore": "The buried lens code hums under the ash.",
-        },
+        content={"starting_scene": "The beacon gutters in the tower."},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
     repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
@@ -17755,7 +17739,7 @@ def test_submit_player_turn_keeps_contract_after_opening_leaves_prompt_windows(
         assert f"Player role: {long_player_role}" in seen_request.scenario_instructions
         assert (
             "Magic constraints: Reading a star map consumes one treasured memory."
-            in seen_request.scenario_instructions
+            not in seen_request.scenario_instructions
         )
         assert "The opening ferry crosses seven archive districts." not in (
             seen_request.scenario_instructions
@@ -20658,7 +20642,7 @@ def test_submit_player_turn_final_prompt_budget_trims_recap_and_baseline(
     ]
 
 
-def test_final_prompt_budget_trims_pending_suggestions_before_messages() -> None:
+def test_final_prompt_budget_discards_pending_suggestions_before_messages() -> None:
     request = chat_service_module._apply_final_prompt_budget(
         ChatRequest(
             provider="fake",
@@ -20682,7 +20666,7 @@ def test_final_prompt_budget_trims_pending_suggestions_before_messages() -> None
         "Brief prior beat.",
         "I wait for the signal.",
     ]
-    assert trimmed_sections[0] == "pending_context_suggestions"
+    assert "pending_context_suggestions" not in trimmed_sections
     assert "messages" not in trimmed_sections
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 from collections.abc import Callable, Iterator
@@ -51,6 +52,7 @@ from bragi.services.context_search_service import (
 from bragi.services.continuity_index_service import ContinuityIndexService
 from bragi.services.knowledge_boundary import ScopedTargets
 from bragi.services.narration_context import load_narration_context_snapshot
+from bragi.services.scenario_canon import scenario_canon_is_current
 
 
 class RecordingStructuredContextProvider:
@@ -347,18 +349,18 @@ class ScenarioSectionSelectingProvider(RecordingStructuredContextProvider):
         selection_properties = request.schema["properties"]["selections"]["items"][
             "properties"
         ]
-        assert "scenario_section" in selection_properties["source_type"]["enum"]
+        assert "scenario_claim" in selection_properties["source_type"]["enum"]
         prompt = "\n".join(message.body for message in request.messages)
         source_id = _candidate_source_id(
             prompt,
-            source_type="scenario_section",
+            source_type="scenario_claim",
             expected_text=self.selected_text,
         )
         return StructuredOutputResponse(
             data={
                 "selections": [
                     {
-                        "source_type": "scenario_section",
+                        "source_type": "scenario_claim",
                         "source_id": source_id,
                         "relevance_note": "The tower details shape the next beat.",
                     },
@@ -1247,6 +1249,7 @@ def test_context_search_uses_one_structured_selection_request_and_provider_order
         "scenario_section",
         "state_change",
         "media_asset",
+        "scenario_claim",
     }
     assert "source_id" in selection_properties
     prompt = "\n".join(message.body for message in request.messages)
@@ -2753,6 +2756,7 @@ def test_context_search_keeps_qualified_hidden_derivatives_for_narrator(
     indexed = repositories.list_context_sources(save.id, source_type="observation")
     candidates = context_search_module._indexed_context_candidates(
         indexed,
+        world_state=[],
         scoped_targets=ScopedTargets(allowed={}, blocked=set()),
         reference_character_ids=frozenset({nira.id, mara.id}),
         accepted_observation_ids=frozenset({observation.id}),
@@ -3024,8 +3028,15 @@ def test_context_search_does_not_unlock_scoped_context_for_absent_alias_mention(
 def test_context_search_exposes_scenario_sections_as_selectable_context(
     repositories: PersistenceRepositories,
 ) -> None:
-    selected_section = "The east tower lens is cracked but still catches dawn light."
+    selected_section = "The east tower lens is cracked."
     unselected_section = "The pantry guild argues about salted turnips."
+    source_sections = {
+        "factions": unselected_section,
+        "locations": selected_section,
+    }
+    source_digest = hashlib.sha256(
+        json.dumps(source_sections, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
     scenario = repositories.create_scenario(
         type="full_roleplay",
         title="Ashfall Keep",
@@ -3034,9 +3045,64 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
         content={
             "locations": selected_section,
             "factions": unselected_section,
+            "_canon_claims": {
+                "version": 1,
+                "source_digest": source_digest,
+                "provider": "fake",
+                "model": "canon",
+                "claims": [
+                    {
+                        "claim_key": "east-lens",
+                        "source_section": "locations",
+                        "source_sha256": hashlib.sha256(
+                            selected_section.encode()
+                        ).hexdigest(),
+                        "claim": selected_section,
+                        "evidence_quote": selected_section,
+                        "entity_anchors": [
+                            {
+                                "entity_type": "object",
+                                "entity_key": "east-tower-lens",
+                                "display_name": "the east tower lens",
+                            }
+                        ],
+                        "fact_type": "state",
+                        "fact_key": "condition",
+                        "authority": "canonical",
+                        "temporal_status": "current_at_scenario_start",
+                        "reveal_policy": "open",
+                        "known_by": [],
+                        "importance": 0.45,
+                    },
+                    {
+                        "claim_key": "pantry-guild",
+                        "source_section": "factions",
+                        "source_sha256": hashlib.sha256(
+                            unselected_section.encode()
+                        ).hexdigest(),
+                        "claim": unselected_section,
+                        "evidence_quote": unselected_section,
+                        "entity_anchors": [
+                            {
+                                "entity_type": "faction",
+                                "entity_key": "pantry-guild",
+                                "display_name": "the pantry guild",
+                            }
+                        ],
+                        "fact_type": "relationship",
+                        "fact_key": "turnip-dispute",
+                        "authority": "canonical",
+                        "temporal_status": "durable",
+                        "reveal_policy": "open",
+                        "known_by": [],
+                        "importance": 0.65,
+                    },
+                ],
+            },
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    assert scenario_canon_is_current(json.loads(scenario.content_json))
     repositories.append_message(
         save_id=save.id,
         role="narrator",
@@ -3073,21 +3139,239 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
     prompt = "\n".join(
         message.body for message in provider.structured_output_requests[0].messages
     )
-    assert "[scenario_section:" in prompt
+    assert "[scenario_claim:" in prompt
     assert selected_section in prompt
     assert unselected_section not in prompt
     assert [item.source_type for item in result.selected_scenario_sections] == [
-        "scenario_section",
+        "scenario_claim",
     ]
-    assert [item.text for item in result.selected_scenario_sections] == [
-        selected_section,
-    ]
+    assert selected_section in result.selected_scenario_sections[0].text
+    assert "Scenario-start state" in result.selected_scenario_sections[0].text
     assert result.selected_scenario_sections[0].relevance_note == (
         "The tower details shape the next beat."
     )
 
     jobs = _context_search_jobs(repositories, save.id)
     assert "selected_scenario_sections" in jobs[-1]["result_json"]
+
+
+def test_scenario_start_claim_is_superseded_by_matching_accepted_state(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="east-tower-lens.condition",
+        value={"condition": "repaired"},
+        category="object",
+    )
+    claim = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="scenario_claim",
+        source_id="scenario-claim-lens-start",
+        title="Lens at scenario start",
+        body="[canonical | current_at_scenario_start | open] The lens is cracked.",
+        metadata={
+            "temporal_status": "current_at_scenario_start",
+            "fact_key": "condition",
+            "entity_anchors": [
+                {
+                    "entity_type": "object",
+                    "entity_key": "east-tower-lens",
+                    "display_name": "the east tower lens",
+                }
+            ],
+        },
+    )
+
+    assert context_search_module._scenario_claim_is_superseded(
+        claim,
+        world_state=[state],
+    )
+    adjacent_state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="east-tower-lens.location",
+        value={"location": "workbench"},
+        category="object",
+    )
+    assert not context_search_module._scenario_claim_is_superseded(
+        claim,
+        world_state=[adjacent_state],
+    )
+    prefixed_state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="object.east-tower-lens.condition",
+        value={"condition": "repaired"},
+        category="object",
+    )
+    assert context_search_module._scenario_claim_is_superseded(
+        claim,
+        world_state=[prefixed_state],
+    )
+
+
+def test_narrator_only_claim_bypasses_character_known_by_filter(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    claim = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="scenario_claim",
+        source_id="scenario-secret",
+        title="Secret",
+        body="[canonical | durable | narrator_only] The lens contains a ghost.",
+        metadata={
+            "reveal_policy": "narrator_only",
+            "known_by": ["absent-character"],
+        },
+    )
+
+    candidates = context_search_module._indexed_context_candidates(
+        [claim],
+        world_state=[],
+        scoped_targets=ScopedTargets(allowed={}, blocked=set()),
+        reference_character_ids=frozenset(),
+        accepted_observation_ids=frozenset(),
+        present_character_ids=frozenset(),
+        message_visibility=[],
+    )
+
+    assert [candidate.source_id for candidate in candidates] == ["scenario-secret"]
+
+
+def test_restricted_claim_matches_anchor_key_or_display_name_to_scope(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    claim = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="scenario_claim",
+        source_id="restricted-claim",
+        title="Restricted",
+        body="[canonical | durable | restricted] Mira knows the signal.",
+        metadata={
+            "reveal_policy": "restricted",
+            "known_by": ["mira"],
+            "entity_anchors": [
+                {
+                    "entity_type": "character",
+                    "entity_key": "mira",
+                    "display_name": "Mira",
+                }
+            ],
+        },
+    )
+
+    allowed = ScopedTargets(
+        allowed={("character", "mira-id"): ("Mira knows",)},
+        blocked=set(),
+    )
+    assert not context_search_module._known_by_candidate_blocked(claim, allowed)
+    assert context_search_module._known_by_candidate_blocked(
+        claim,
+        ScopedTargets(allowed={}, blocked=set()),
+    )
+    assert not context_search_module._known_by_candidate_blocked(
+        claim,
+        ScopedTargets(allowed={}, blocked=set()),
+        character_identifiers=frozenset({"mira-id", "mira"}),
+    )
+
+
+def test_restricted_claim_without_known_by_is_blocked(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    claim = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="scenario_claim",
+        source_id="restricted-without-audience",
+        title="Restricted",
+        body="[canonical | durable | restricted] The lens contains a ghost.",
+        metadata={"reveal_policy": "restricted", "known_by": []},
+    )
+
+    assert context_search_module._known_by_candidate_blocked(
+        claim,
+        ScopedTargets(allowed={}, blocked=set()),
+        character_identifiers=frozenset({"mira"}),
+    )
+
+
+def test_scenario_supersession_key_boundaries_do_not_collide(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    claim = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="scenario_claim",
+        source_id="boundary-claim",
+        title="Boundary claim",
+        body="An old condition.",
+        metadata={
+            "temporal_status": "current_at_scenario_start",
+            "fact_key": "c",
+            "entity_anchors": [
+                {"entity_type": "object", "entity_key": "ab", "display_name": "AB"}
+            ],
+        },
+    )
+    state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="a.bc",
+        value={"value": "new"},
+        category="object",
+    )
+
+    assert not context_search_module._scenario_claim_is_superseded(
+        claim,
+        world_state=[state],
+    )
+
+
+def test_degraded_fallback_does_not_inject_arbitrary_scenario_claim() -> None:
+    claim = context_search_module._ContextCandidate(
+        source_type="scenario_claim",
+        source_id="irrelevant-claim",
+        text="An unrelated old fact.",
+    )
+
+    assert context_search_module._fallback_candidates((claim,)) == ()
 
 
 def test_context_search_exposes_state_changes_and_skips_duplicate_current_upserts(
@@ -3939,7 +4223,7 @@ def test_context_search_offers_continuity_floor_when_index_has_no_hits(
         premise="An expedition crosses the white shelf.",
         player_role="Scout",
         content={
-            "route_options": "The lower pass is blocked by glass ice.",
+            "starting_scene": "The lower pass is blocked by glass ice.",
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="White Shelf")
@@ -4006,14 +4290,14 @@ def test_context_search_offers_continuity_floor_when_index_has_no_hits(
     assert "scene.location" in prompt
     assert state.id in prompt
     assert memory.body in prompt
-    assert "The lower pass is blocked by glass ice." in prompt
+    assert "The lower pass is blocked by glass ice." not in prompt
     assert [item.source_id for item in result.selected_memories] == [memory.id]
     jobs = _context_search_jobs(repositories, save.id)
     job_result = json.loads(jobs[-1]["result_json"])
     diagnostics = job_result["diagnostics"]
     assert diagnostics["indexed_retrieval_hit_count"] == 0
     assert diagnostics["protected_context_source_count"] >= 1
-    assert diagnostics["continuity_floor_candidate_count"] >= 3
+    assert diagnostics["continuity_floor_candidate_count"] >= 2
 
 
 def test_context_search_rehydrates_selected_items_beyond_selector_excerpt(

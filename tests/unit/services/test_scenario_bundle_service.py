@@ -78,6 +78,7 @@ def test_export_scenario_writes_manifest_and_definition_only(
             "origin": "ai_draft",
             "generation_prompt": "A border keep cut off by ash storms.",
         }
+        assert data["scenario"]["content"]["_canon_claims"]["version"] == 1
         assert "starting_scene" not in data["scenario"]["content"]
         assert "messages" not in data
         assert "saves" not in data
@@ -123,6 +124,7 @@ def test_import_scenario_creates_new_id_and_unique_duplicate_title(
     assert imported.premise == "A border keep is cut off by ash."
     assert imported.player_role == "Signal warden"
     imported_content = json.loads(imported.content_json)
+    assert imported_content["_canon_claims"]["version"] == 1
     assert "starting_scene" not in imported_content
     assert imported_content["opening_message"] == (
         "Ash falls over the gatehouse.\n\nThe beacon lens wakes red."
@@ -190,6 +192,11 @@ def test_export_import_scenario_bundle_preserves_starter_reference_images(
             "premise": "A border keep is cut off by ash.",
             "player_role": "Signal warden",
             "opening_message": "The beacon lens wakes red.",
+            "_canon_claims": {
+                "version": 1,
+                "source_digest": "derived-content-is-rebuilt-on-import",
+                "claims": [],
+            },
             "character_starters": [
                 {
                     "starter_id": "starter-ilyra",
@@ -1054,6 +1061,11 @@ def _seed_scenario(repositories: PersistenceRepositories) -> Any:
             "tone_genre": "Tense frontier mystery.",
             "starting_scene": "Ash falls over the gatehouse.",
             "opening_message": "The beacon lens wakes red.",
+            "_canon_claims": {
+                "version": 1,
+                "source_digest": "derived-content-is-preserved-on-import",
+                "claims": [],
+            },
             "_source": {
                 "origin": "ai_draft",
                 "generation_prompt": "A border keep cut off by ash storms.",
