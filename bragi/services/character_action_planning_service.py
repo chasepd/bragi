@@ -111,7 +111,7 @@ class CharacterActionPlanningService:
         save_id: str,
         player_message_id: str,
         apply_presence_updates: bool = True,
-        intents_absorbed: bool = True,
+        intents_absorbed: bool = False,
     ) -> CharacterActionPlanningResult:
         if not character_action_planning_enabled(
             self.repositories,

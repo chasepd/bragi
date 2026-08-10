@@ -66,7 +66,11 @@ def test_character_action_planning_deterministic_presence_skips_model_calls(
         CharacterActionPlanningService(
             repositories=repositories,
             providers={"fake": provider},
-        ).plan_for_turn(save_id=save_id, player_message_id=player_message.id)
+        ).plan_for_turn(
+            save_id=save_id,
+            player_message_id=player_message.id,
+            intents_absorbed=True,
+        )
     )
 
     assert provider.structured_output_requests == []
@@ -210,7 +214,11 @@ def test_character_action_planning_mentions_ambiguous_present_character(
         CharacterActionPlanningService(
             repositories=repositories,
             providers={"fake": provider},
-        ).plan_for_turn(save_id=save_id, player_message_id=player_message_id)
+        ).plan_for_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            intents_absorbed=True,
+        )
     )
 
     assert [request.schema_name for request in provider.structured_output_requests] == [
@@ -376,7 +384,11 @@ def test_character_action_planning_batch_failure_falls_back_to_per_character_cal
         CharacterActionPlanningService(
             repositories=repositories,
             providers={"fake": provider},
-        ).plan_for_turn(save_id=save_id, player_message_id=player_message.id)
+        ).plan_for_turn(
+            save_id=save_id,
+            player_message_id=player_message.id,
+            intents_absorbed=True,
+        )
     )
 
     assert provider.batch_attempts == 1
