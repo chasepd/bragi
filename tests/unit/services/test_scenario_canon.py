@@ -9,6 +9,7 @@ from bragi.services.scenario_canon import (
     ScenarioCanonCompiler,
     scenario_canon_claims,
     scenario_canon_is_current,
+    scenario_canon_source_sections,
 )
 
 
@@ -122,6 +123,18 @@ def test_compiler_reuses_matching_compilation_without_provider_call() -> None:
     assert len(provider.structured_output_requests) == 1
 
 
+def test_config_fields_are_not_compiled_as_canon_sections() -> None:
+    assert scenario_canon_source_sections(
+        {
+            "opening_message": "The bell rings.",
+            "action_choices_enabled": True,
+            "choice_style": "Four risky options.",
+            "character_starters": [{"name": "Mara"}],
+            "lore": "The old bell answers only at dusk.",
+        }
+    ) == {"lore": "The old bell answers only at dusk."}
+
+
 def test_edit_invalidates_compilation_and_regenerates_claims() -> None:
     provider = FakeProviderClient(structured_output=_output())
     compiler = ScenarioCanonCompiler(
@@ -207,6 +220,32 @@ def test_stored_claims_are_rejected_when_provenance_is_tampered() -> None:
         ).compile(scenario_type="full_roleplay", content=compiled)
     )
 
+    assert scenario_canon_is_current(repaired)
+    assert len(provider.structured_output_requests) == 2
+
+
+def test_empty_matching_payload_is_recompiled() -> None:
+    provider = FakeProviderClient(structured_output=_output())
+    compiler = ScenarioCanonCompiler(
+        provider=provider,
+        provider_name="fake",
+        model_id="canon-model",
+    )
+    content = asyncio.run(
+        compiler.compile(
+            scenario_type="full_roleplay",
+            content={"lore": "The beacon consumes one memory per use. "
+            "The keeper suspects the lens is alive."},
+        )
+    )
+    payload = content[CANON_CONTENT_KEY]
+    assert isinstance(payload, dict)
+    payload["claims"] = []
+
+    assert not scenario_canon_is_current(content)
+    repaired = asyncio.run(
+        compiler.compile(scenario_type="full_roleplay", content=content)
+    )
     assert scenario_canon_is_current(repaired)
     assert len(provider.structured_output_requests) == 2
 

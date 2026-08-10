@@ -52,6 +52,7 @@ from bragi.services.context_search_service import (
 from bragi.services.continuity_index_service import ContinuityIndexService
 from bragi.services.knowledge_boundary import ScopedTargets
 from bragi.services.narration_context import load_narration_context_snapshot
+from bragi.services.scenario_canon import scenario_canon_is_current
 
 
 class RecordingStructuredContextProvider:
@@ -3022,7 +3023,7 @@ def test_context_search_does_not_unlock_scoped_context_for_absent_alias_mention(
 def test_context_search_exposes_scenario_sections_as_selectable_context(
     repositories: PersistenceRepositories,
 ) -> None:
-    selected_section = "The east tower lens is cracked but still catches dawn light."
+    selected_section = "The east tower lens is cracked."
     unselected_section = "The pantry guild argues about salted turnips."
     source_sections = {
         "factions": unselected_section,
@@ -3096,6 +3097,7 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
         },
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    assert scenario_canon_is_current(json.loads(scenario.content_json))
     repositories.append_message(
         save_id=save.id,
         role="narrator",
@@ -3188,6 +3190,62 @@ def test_scenario_start_claim_is_superseded_by_matching_accepted_state(
         claim,
         world_state=[state],
     )
+    adjacent_state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="east-tower-lens.location",
+        value={"location": "workbench"},
+        category="object",
+    )
+    assert not context_search_module._scenario_claim_is_superseded(
+        claim,
+        world_state=[adjacent_state],
+    )
+
+
+def test_narrator_only_claim_bypasses_character_known_by_filter(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    claim = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="scenario_claim",
+        source_id="scenario-secret",
+        title="Secret",
+        body="[canonical | durable | narrator_only] The lens contains a ghost.",
+        metadata={
+            "reveal_policy": "narrator_only",
+            "known_by": ["absent-character"],
+        },
+    )
+
+    candidates = context_search_module._indexed_context_candidates(
+        [claim],
+        world_state=[],
+        scoped_targets=ScopedTargets(allowed={}, blocked=set()),
+        reference_character_ids=frozenset(),
+        accepted_observation_ids=frozenset(),
+        present_character_ids=frozenset(),
+        message_visibility=[],
+    )
+
+    assert [candidate.source_id for candidate in candidates] == ["scenario-secret"]
+
+
+def test_degraded_fallback_does_not_inject_arbitrary_scenario_claim() -> None:
+    claim = context_search_module._ContextCandidate(
+        source_type="scenario_claim",
+        source_id="irrelevant-claim",
+        text="An unrelated old fact.",
+    )
+
+    assert context_search_module._fallback_candidates((claim,)) == ()
 
 
 def test_context_search_exposes_state_changes_and_skips_duplicate_current_upserts(

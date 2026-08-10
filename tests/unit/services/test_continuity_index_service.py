@@ -157,7 +157,8 @@ def test_continuity_index_syncs_atomic_facts_with_evidence_metadata(
         for source_type, source_id in by_source
         if source_type == "scenario_claim"
     ]
-    assert scenario_claim_ids == [f"scenario:{scenario.id}:claim:lens-forged"]
+    assert len(scenario_claim_ids) == 1
+    assert scenario_claim_ids[0].startswith(f"scenario:{scenario.id}:claim:")
 
     repositories.archive_memory(memory.id)
     ContinuityIndexService(repositories).sync_save(save.id)

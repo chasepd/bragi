@@ -88,6 +88,8 @@ SCENARIO_CORE_CONTENT_KEYS = frozenset(
         "current_scene",
         "relationship_seed",
         "character_starters",
+        "action_choices_enabled",
+        "choice_style",
         "case_facts",
         "case_status",
     )

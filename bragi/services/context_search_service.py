@@ -3066,7 +3066,6 @@ def _fallback_candidates(
         "state_change",
         "media_asset",
         "message",
-        "scenario_claim",
         "scenario_section",
     ):
         candidate = _fallback_candidate_for_type(candidates, source_type)
@@ -3363,7 +3362,10 @@ def _indexed_context_candidates(
             continue
         if _audience_candidate_blocked(record, reference_character_ids):
             continue
-        if _known_by_candidate_blocked(record, scoped_targets):
+        if (
+            record.metadata.get("reveal_policy") != "narrator_only"
+            and _known_by_candidate_blocked(record, scoped_targets)
+        ):
             continue
         source_text = _indexed_context_candidate_text(record, source_type=source_type)
         if not source_text.strip():
@@ -3413,14 +3415,11 @@ def _scenario_claim_is_superseded(
     anchor_keys.discard("")
     if not anchor_keys:
         return False
+    expected_state_keys = {
+        f"{anchor_key}{fact_key}" for anchor_key in anchor_keys
+    }
     for state in world_state:
-        state_key = _normalized_match_key(state.key)
-        if fact_key not in state_key:
-            continue
-        if any(
-            anchor_key in state_key or state_key in anchor_key
-            for anchor_key in anchor_keys
-        ):
+        if _normalized_match_key(state.key) in expected_state_keys:
             return True
     return False
 

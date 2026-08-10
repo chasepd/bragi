@@ -32,6 +32,8 @@ SCENARIO_CORE_CONTENT_KEYS = frozenset(
         "current_scene",
         "relationship_seed",
         "character_starters",
+        "action_choices_enabled",
+        "choice_style",
         "case_facts",
         "case_status",
     }
@@ -180,18 +182,29 @@ def scenario_canon_claims(
     if not isinstance(raw_claims, list):
         return ()
     claims: list[ScenarioCanonClaim] = []
+    source_sections = scenario_canon_source_sections(content)
     for raw in raw_claims:
         if not isinstance(raw, Mapping):
             continue
-        anchors = raw.get("entity_anchors")
-        known_by = raw.get("known_by")
+        section_id = str(raw.get("source_section", ""))
+        source = source_sections.get(section_id)
+        if source is None:
+            continue
+        normalized = _validated_claim(
+            raw,
+            section_id=section_id,
+            source=source,
+            source_sha256=_sha256(source),
+        )
+        anchors = normalized["entity_anchors"]
+        known_by = normalized["known_by"]
         claims.append(
             ScenarioCanonClaim(
-                claim_key=str(raw.get("claim_key", "")),
-                source_section=str(raw.get("source_section", "")),
-                source_sha256=str(raw.get("source_sha256", "")),
-                claim=str(raw.get("claim", "")),
-                evidence_quote=str(raw.get("evidence_quote", "")),
+                claim_key=str(normalized["claim_key"]),
+                source_section=str(normalized["source_section"]),
+                source_sha256=str(normalized["source_sha256"]),
+                claim=str(normalized["claim"]),
+                evidence_quote=str(normalized["evidence_quote"]),
                 entity_anchors=tuple(
                     {
                         "entity_type": str(anchor.get("entity_type", "")),
@@ -200,15 +213,15 @@ def scenario_canon_claims(
                     }
                     for anchor in anchors if isinstance(anchor, Mapping)
                 ) if isinstance(anchors, list) else (),
-                fact_type=str(raw.get("fact_type", "")),
-                fact_key=str(raw.get("fact_key", "")),
-                authority=str(raw.get("authority", "")),
-                temporal_status=str(raw.get("temporal_status", "")),
-                reveal_policy=str(raw.get("reveal_policy", "")),
+                fact_type=str(normalized["fact_type"]),
+                fact_key=str(normalized["fact_key"]),
+                authority=str(normalized["authority"]),
+                temporal_status=str(normalized["temporal_status"]),
+                reveal_policy=str(normalized["reveal_policy"]),
                 known_by=tuple(str(value) for value in known_by)
                 if isinstance(known_by, list)
                 else (),
-                importance=float(raw.get("importance", 0.0)),
+                importance=cast(float, normalized["importance"]),
             )
         )
     return tuple(claims)
@@ -414,24 +427,12 @@ def _claim_is_atomic(value: str) -> bool:
     return not _contains_coordinated_clauses(without_terminal)
 
 
-_CLAUSE_VERB = re.compile(
-    r"\b(?:am|is|are|was|were|be|been|being|has|have|had|can|could|will|would|"
-    r"shall|should|may|might|must|do|does|did|[a-z]+(?:ed|ing))\b",
-    re.IGNORECASE,
-)
-
-
 def _contains_coordinated_clauses(value: str) -> bool:
-    for match in re.finditer(
+    return re.search(
         r"\s+(?:and|but|while|whereas)\s+",
         value,
         re.IGNORECASE,
-    ):
-        if _CLAUSE_VERB.search(value[: match.start()]) and _CLAUSE_VERB.search(
-            value[match.end() :]
-        ):
-            return True
-    return False
+    ) is not None
 
 
 def _claims_cover_source(
@@ -566,6 +567,7 @@ def _stored_claims_are_grounded(
     raw_claims = value.get("claims")
     if not isinstance(raw_claims, list):
         return False
+    validated_claims: list[dict[str, object]] = []
     for raw in raw_claims:
         if not isinstance(raw, Mapping):
             return False
@@ -577,13 +579,23 @@ def _stored_claims_are_grounded(
         if not evidence_quote or evidence_quote not in source:
             return False
         try:
-            _validated_claim(
+            validated = _validated_claim(
                 raw,
                 section_id=source_section,
                 source=source,
                 source_sha256=_sha256(source),
             )
         except (TypeError, ValueError):
+            return False
+        validated_claims.append(validated)
+    if source_sections and not validated_claims:
+        return False
+    for section_id, source in source_sections.items():
+        if not _claims_cover_source(
+            source,
+            validated_claims,
+            section_id=section_id,
+        ):
             return False
     return True
 
