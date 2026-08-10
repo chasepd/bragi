@@ -11274,10 +11274,7 @@ def test_submit_player_turn_cancels_running_context_search_child_task(
         title="Ashfall Keep",
         premise="A border keep is cut off by ash storms.",
         player_role="Signal warden",
-        content={
-            "starting_scene": "The beacon gutters in the tower.",
-            "lore": "The buried lens code hums under the ash.",
-        },
+        content={"starting_scene": "The beacon gutters in the tower."},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
     repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
@@ -11379,10 +11376,7 @@ def test_submit_player_turn_cancels_context_search_from_another_thread(
         title="Ashfall Keep",
         premise="A border keep is cut off by ash storms.",
         player_role="Signal warden",
-        content={
-            "starting_scene": "The beacon gutters in the tower.",
-            "lore": "The buried lens code hums under the ash.",
-        },
+        content={"starting_scene": "The beacon gutters in the tower."},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
     repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
