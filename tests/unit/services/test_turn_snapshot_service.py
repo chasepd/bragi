@@ -4139,6 +4139,68 @@ def test_activity_removal_rechecks_narrator_cursor_aggregate(
     assert cursor["last_activity_ordinal"] == 0
 
 
+def test_low_ordinal_activity_change_does_not_rewrite_cursors(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The phone display dims.",
+    )
+    character = repositories.add_character(
+        save_id=save.id,
+        character_id="rowan",
+        name="Rowan",
+    )
+    thread = repositories.get_or_create_character_text_thread(
+        save_id=save.id,
+        character_id=character.id,
+        title="Rowan",
+    )
+    repositories.connection.executemany(
+        """
+        INSERT INTO character_text_activity_events(
+            id, save_id, ordinal, thread_id, activity_type
+        ) VALUES (?, ?, ?, ?, 'message_sent')
+        """,
+        (
+            ("activity-low", save.id, 5, thread.id),
+            ("activity-high", save.id, 10, thread.id),
+        ),
+    )
+    repositories.connection.execute(
+        """
+        INSERT INTO narrator_phone_activity_cursors(
+            narrator_message_id, save_id, last_activity_ordinal
+        ) VALUES (?, ?, 10)
+        """,
+        (narrator.id, save.id),
+    )
+    repositories.commit()
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=save.id, message_id=narrator.id)
+    repositories.connection.execute(
+        "UPDATE character_text_activity_events SET read_count = 1 "
+        "WHERE id = 'activity-low'"
+    )
+    repositories.commit()
+    stored_row_kinds: list[str] = []
+    original_store = service._store_object
+
+    def record_store(*, kind: str, value: object) -> str:
+        if kind.startswith("row:"):
+            stored_row_kinds.append(kind)
+        return original_store(kind=kind, value=value)
+
+    monkeypatch.setattr(service, "_store_object", record_store)
+
+    service.capture_current_head_if_dirty(save.id)
+
+    assert stored_row_kinds == ["row:character_text_activity_events"]
+
+
 def test_incremental_fade_transition_removes_dependents(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -1281,6 +1281,11 @@ def _ensure_incremental_turn_snapshot_schema(connection: sqlite3.Connection) -> 
             )
         );
 
+        CREATE TABLE IF NOT EXISTS save_snapshot_activity_state (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            max_ordinal INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_snapshot_dirty_rows_generation
         ON save_snapshot_dirty_rows(save_id, table_name, generation);
 

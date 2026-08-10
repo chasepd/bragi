@@ -1232,6 +1232,22 @@ class TurnSnapshotService:
                     next_ordinal,
                 ),
             )
+        activity_max_ordinal = max(
+            (
+                _snapshot_row_int(row, "ordinal")
+                for row in rows_by_table.get("character_text_activity_events", ())
+            ),
+            default=0,
+        )
+        self.repositories.connection.execute(
+            """
+            INSERT INTO save_snapshot_activity_state(save_id, max_ordinal)
+            VALUES (?, ?)
+            ON CONFLICT(save_id) DO UPDATE SET
+                max_ordinal = excluded.max_ordinal
+            """,
+            (save_id, activity_max_ordinal),
+        )
         context_revision = self._context_revision(save_id)
         manifest = {
             "format": SNAPSHOT_FORMAT_V2,
@@ -1402,8 +1418,53 @@ class TurnSnapshotService:
                 )
                 if isinstance(thread_id, str):
                     group_participant_count_cache.pop(thread_id, None)
+                dirty_source = self.repositories.connection.execute(
+                    """
+                    SELECT table_name, row_key, generation
+                    FROM save_snapshot_dirty_rows
+                    WHERE save_id = ? AND table_name = ? AND row_key = ?
+                    """,
+                    (save_id, table.name, row_key),
+                ).fetchone()
+                aggregate_keys = (
+                    self._queue_snapshot_aggregate_dependents(
+                        save_id,
+                        [dirty_source],
+                        already_queued=aggregate_dependents_queued,
+                    )
+                    if dirty_source is not None
+                    else ()
+                )
+                for aggregate_key in aggregate_keys:
+                    added = self.repositories.connection.execute(
+                        """
+                        SELECT table_name, row_key, generation
+                        FROM save_snapshot_dirty_rows
+                        WHERE save_id = ? AND table_name = ? AND row_key = ?
+                        """,
+                        (save_id, *aggregate_key),
+                    ).fetchone()
+                    if added is not None and aggregate_key not in queued_work_keys:
+                        queued_work_keys.add(aggregate_key)
+                        dirty_rows.append(added)
             elif table.name == "character_text_activity_events":
                 activity_max_ordinal_cache[0] = None
+                cursor_keys = self._queue_activity_cursors_if_max_changed(
+                    save_id,
+                    projected_inclusion,
+                )
+                for cursor_key in cursor_keys:
+                    added = self.repositories.connection.execute(
+                        """
+                        SELECT table_name, row_key, generation
+                        FROM save_snapshot_dirty_rows
+                        WHERE save_id = ? AND table_name = ? AND row_key = ?
+                        """,
+                        (save_id, *cursor_key),
+                    ).fetchone()
+                    if added is not None and cursor_key not in queued_work_keys:
+                        queued_work_keys.add(cursor_key)
+                        dirty_rows.append(added)
             if prior_included != included:
                 dependent_keys = self._queue_snapshot_reference_dependents(
                     save_id=save_id,
@@ -1431,6 +1492,7 @@ class TurnSnapshotService:
             dirty_index += 1
             dirty_key = (str(dirty["table_name"]), str(dirty["row_key"]))
             queued_work_keys.discard(dirty_key)
+            aggregate_dependents_queued.discard(dirty_key)
             aggregate_keys = self._queue_snapshot_aggregate_dependents(
                 save_id,
                 [dirty],
@@ -1534,50 +1596,10 @@ class TurnSnapshotService:
             elif table.name == "narrator_phone_activity_cursors":
                 max_ordinal = activity_max_ordinal_cache[0]
                 if max_ordinal is None:
-                    projected_events = {
-                        key: included
-                        for (target_table, key), included in projected_inclusion.items()
-                        if target_table == "character_text_activity_events"
-                    }
-                    projected_true = tuple(
-                        key for key, included in projected_events.items() if included
+                    max_ordinal = self._projected_activity_max_ordinal(
+                        save_id,
+                        projected_inclusion,
                     )
-                    projected_false = tuple(
-                        key
-                        for key, included in projected_events.items()
-                        if not included
-                    )
-                    where_parts = [
-                        "events.save_id = ?",
-                        "COALESCE(state.included, 1) = 1",
-                    ]
-                    parameters: list[object] = [save_id]
-                    if projected_true:
-                        where_parts[-1] = (
-                            f"({where_parts[-1]} OR events.id IN "
-                            f"({_placeholders(len(projected_true))}))"
-                        )
-                        parameters.extend(projected_true)
-                    if projected_false:
-                        where_parts.append(
-                            f"events.id NOT IN ({_placeholders(len(projected_false))})"
-                        )
-                        parameters.extend(projected_false)
-                    activity = self.repositories.connection.execute(
-                        f"""
-                        SELECT events.ordinal
-                        FROM character_text_activity_events events
-                        LEFT JOIN save_snapshot_row_state state
-                          ON state.save_id = events.save_id
-                         AND state.table_name = 'character_text_activity_events'
-                         AND state.row_key = events.id
-                        WHERE {' AND '.join(where_parts)}
-                        ORDER BY events.ordinal DESC
-                        LIMIT 1
-                        """,
-                        tuple(parameters),
-                    ).fetchone()
-                    max_ordinal = int(activity["ordinal"]) if activity else 0
                     activity_max_ordinal_cache[0] = max_ordinal
                 row["last_activity_ordinal"] = min(
                     _snapshot_row_int(row, "last_activity_ordinal"),
@@ -1910,13 +1932,10 @@ class TurnSnapshotService:
         already_queued: set[tuple[str, str]],
     ) -> tuple[tuple[str, str], ...]:
         participant_thread_ids: set[str] = set()
-        activity_changed = False
         queued: list[tuple[str, str]] = []
         for dirty in dirty_rows:
             table_name = str(dirty["table_name"])
             row_key = str(dirty["row_key"])
-            if table_name == "character_text_activity_events":
-                activity_changed = True
             if table_name != "character_text_thread_participants":
                 continue
             live = self.repositories.connection.execute(
@@ -1959,31 +1978,101 @@ class TurnSnapshotService:
             )
             already_queued.add(dependent_key)
             queued.append(dependent_key)
-        cursor_aggregate_marker = ("__aggregate__", "activity_cursors")
-        cursor_aggregate_already_queued = cursor_aggregate_marker in already_queued
-        if activity_changed and not cursor_aggregate_already_queued:
-            cursors = self.repositories.connection.execute(
-                """
-                SELECT narrator_message_id
-                FROM narrator_phone_activity_cursors
-                WHERE save_id = ?
-                """,
-                (save_id,),
-            ).fetchall()
-            already_queued.add(cursor_aggregate_marker)
-            for cursor in cursors:
-                dependent_key = (
-                    "narrator_phone_activity_cursors",
-                    str(cursor["narrator_message_id"]),
-                )
-                self._mark_snapshot_row_dirty(
-                    save_id=save_id,
-                    table_name="narrator_phone_activity_cursors",
-                    row_key=str(cursor["narrator_message_id"]),
-                )
-                already_queued.add(dependent_key)
-                queued.append(dependent_key)
         return tuple(queued)
+
+    def _projected_activity_max_ordinal(
+        self,
+        save_id: str,
+        projected_inclusion: Mapping[tuple[str, str], bool],
+    ) -> int:
+        projected_events = {
+            key: included
+            for (target_table, key), included in projected_inclusion.items()
+            if target_table == "character_text_activity_events"
+        }
+        projected_true = tuple(
+            key for key, included in projected_events.items() if included
+        )
+        projected_false = tuple(
+            key for key, included in projected_events.items() if not included
+        )
+        where_parts = [
+            "events.save_id = ?",
+            "COALESCE(state.included, 1) = 1",
+        ]
+        parameters: list[object] = [save_id]
+        if projected_true:
+            where_parts[-1] = (
+                f"({where_parts[-1]} OR events.id IN "
+                f"({_placeholders(len(projected_true))}))"
+            )
+            parameters.extend(projected_true)
+        if projected_false:
+            where_parts.append(
+                f"events.id NOT IN ({_placeholders(len(projected_false))})"
+            )
+            parameters.extend(projected_false)
+        activity = self.repositories.connection.execute(
+            f"""
+            SELECT events.ordinal
+            FROM character_text_activity_events events
+            LEFT JOIN save_snapshot_row_state state
+              ON state.save_id = events.save_id
+             AND state.table_name = 'character_text_activity_events'
+             AND state.row_key = events.id
+            WHERE {' AND '.join(where_parts)}
+            ORDER BY events.ordinal DESC
+            LIMIT 1
+            """,
+            tuple(parameters),
+        ).fetchone()
+        return int(activity["ordinal"]) if activity else 0
+
+    def _queue_activity_cursors_if_max_changed(
+        self,
+        save_id: str,
+        projected_inclusion: Mapping[tuple[str, str], bool],
+    ) -> tuple[tuple[str, str], ...]:
+        new_max = self._projected_activity_max_ordinal(
+            save_id,
+            projected_inclusion,
+        )
+        state = self.repositories.connection.execute(
+            """
+            SELECT max_ordinal FROM save_snapshot_activity_state
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        ).fetchone()
+        old_max = int(state["max_ordinal"]) if state is not None else 0
+        if new_max == old_max:
+            return ()
+        self.repositories.connection.execute(
+            """
+            INSERT INTO save_snapshot_activity_state(save_id, max_ordinal)
+            VALUES (?, ?)
+            ON CONFLICT(save_id) DO UPDATE SET
+                max_ordinal = excluded.max_ordinal
+            """,
+            (save_id, new_max),
+        )
+        cursors = self.repositories.connection.execute(
+            """
+            SELECT narrator_message_id FROM narrator_phone_activity_cursors
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        ).fetchall()
+        keys: list[tuple[str, str]] = []
+        for cursor in cursors:
+            row_key = str(cursor["narrator_message_id"])
+            self._mark_snapshot_row_dirty(
+                save_id=save_id,
+                table_name="narrator_phone_activity_cursors",
+                row_key=row_key,
+            )
+            keys.append(("narrator_phone_activity_cursors", row_key))
+        return tuple(keys)
 
     def _mark_snapshot_row_dirty(
         self,

@@ -2304,6 +2304,7 @@ def test_migration_80_to_81_backfills_incremental_snapshot_tracking(
         for (trigger_name,) in trigger_names:
             connection.execute(f'DROP TRIGGER "{trigger_name}"')
         for table_name in (
+            "save_snapshot_activity_state",
             "save_snapshot_row_references",
             "save_snapshot_row_state",
             "save_snapshot_dirty_rows",
@@ -2324,6 +2325,7 @@ def test_migration_80_to_81_backfills_incremental_snapshot_tracking(
             "save_snapshot_dirty_rows",
             "save_snapshot_row_state",
             "save_snapshot_row_references",
+            "save_snapshot_activity_state",
         } <= tables
         indexes = _object_names(connection, "index")
         assert {
