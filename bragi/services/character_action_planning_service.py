@@ -292,6 +292,11 @@ class CharacterActionPlanningService:
             presence_preference is not None and presence_provider is not None
         )
         if presence_configured:
+            # Compared against the previous pipeline: batched presence calls
+            # (same batch cap and fallback costs, so the presence-phase delta
+            # is clamped at zero when the fallback costs more) plus one intent
+            # call per grounded present/entering/leaving character, which the
+            # narrator plan now absorbs into its single structured call.
             model_calls_avoided = (
                 max(0, previous_presence_calls - presence_calls_made)
                 + intent_wave_size

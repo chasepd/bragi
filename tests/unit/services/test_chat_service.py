@@ -5529,6 +5529,16 @@ def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
         value={"action": "enter"},
         reason="Model-authored candidate for a different character.",
     )
+    model_deterministic_present = replace(
+        assessment_candidate,
+        character_id="ren",
+        candidate_id="scene_presence:ren:leave",
+        value={"action": "leave"},
+        reason=(
+            "Model-authored candidate for an assessed character "
+            "without a candidate."
+        ),
+    )
     spec = NarratorMessageSpec(
         intent="Answer the player move.",
         thesis="Mara leaves if rendered.",
@@ -5541,12 +5551,14 @@ def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
             model_duplicate,
             model_conflicting,
             model_other_character,
+            model_deterministic_present,
         ),
     )
 
     merged = chat_service_module._narrator_spec_with_commit_candidates(
         spec,
         (assessment_candidate,),
+        assessed_character_ids=frozenset({"mara", "ren"}),
     )
 
     assert merged is not None

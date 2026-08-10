@@ -2942,7 +2942,7 @@ def _planner_messages(request: ChatRequest) -> tuple[ChatMessage, ...]:
                 "\"enter\" or \"leave\" for that character, grounded in the "
                 "cited assessment evidence, and candidate_id "
                 "\"scene_presence:{character_id}:enter\" or "
-                "\"scene_presence:{character_id}:leave\". " 
+                "\"scene_presence:{character_id}:leave\". "
                 "Per-character knowledge changes also belong in "
                 "state_commit_candidates: when a cited source supports a "
                 "character_learned_memory or character_knowledge_edge "

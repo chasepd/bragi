@@ -2110,6 +2110,10 @@ class ChatService:
                     save_id=save_id,
                 ),
             ),
+            assessed_character_ids=frozenset(
+                assessment.character_id
+                for assessment in character_action_planning_result.assessments
+            ),
         )
         if (
             save.interaction_mode is InteractionMode.STORYTELLER
@@ -7746,6 +7750,8 @@ def _rich_narrator_request_with_plan(
 def _narrator_spec_with_commit_candidates(
     spec: NarratorMessageSpec | None,
     candidates: tuple[StateCommitCandidate, ...],
+    *,
+    assessed_character_ids: frozenset[str] = frozenset(),
 ) -> NarratorMessageSpec | None:
     if spec is None or not candidates:
         return spec
@@ -7754,7 +7760,7 @@ def _narrator_spec_with_commit_candidates(
         for candidate in candidates
         if candidate.candidate_id
     }
-    assessment_scene_presence_character_ids = {
+    authoritative_scene_presence_character_ids = assessed_character_ids | {
         candidate.character_id
         for candidate in candidates
         if candidate.candidate_type == "scene_presence"
@@ -7771,7 +7777,7 @@ def _narrator_spec_with_commit_candidates(
             candidate.candidate_type == "scene_presence"
             and candidate.character_id
             and candidate.character_id
-            in assessment_scene_presence_character_ids
+            in authoritative_scene_presence_character_ids
         )
     ]
     merged.extend(candidates)
