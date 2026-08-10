@@ -5056,7 +5056,6 @@ def _quarantine_imported_scenario_content(
     content: Mapping[str, object],
 ) -> dict[str, object]:
     quarantined = dict(content)
-    quarantined.pop("_canon_claims", None)
     source = quarantined.get("_source")
     quarantined["_source"] = metadata_with_scenario_content_ratings(
         source if isinstance(source, Mapping) else None,

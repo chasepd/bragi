@@ -3238,6 +3238,85 @@ def test_narrator_only_claim_bypasses_character_known_by_filter(
     assert [candidate.source_id for candidate in candidates] == ["scenario-secret"]
 
 
+def test_restricted_claim_matches_anchor_key_or_display_name_to_scope(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    claim = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="scenario_claim",
+        source_id="restricted-claim",
+        title="Restricted",
+        body="[canonical | durable | restricted] Mira knows the signal.",
+        metadata={
+            "reveal_policy": "restricted",
+            "known_by": ["mira"],
+            "entity_anchors": [
+                {
+                    "entity_type": "character",
+                    "entity_key": "mira",
+                    "display_name": "Mira",
+                }
+            ],
+        },
+    )
+
+    allowed = ScopedTargets(
+        allowed={("character", "mira-id"): ("Mira knows",)},
+        blocked=set(),
+    )
+    assert not context_search_module._known_by_candidate_blocked(claim, allowed)
+    assert context_search_module._known_by_candidate_blocked(
+        claim,
+        ScopedTargets(allowed={}, blocked=set()),
+    )
+
+
+def test_scenario_supersession_key_boundaries_do_not_collide(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    claim = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="scenario_claim",
+        source_id="boundary-claim",
+        title="Boundary claim",
+        body="An old condition.",
+        metadata={
+            "temporal_status": "current_at_scenario_start",
+            "fact_key": "c",
+            "entity_anchors": [
+                {"entity_type": "object", "entity_key": "ab", "display_name": "AB"}
+            ],
+        },
+    )
+    state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="a.bc",
+        value={"value": "new"},
+        category="object",
+    )
+
+    assert not context_search_module._scenario_claim_is_superseded(
+        claim,
+        world_state=[state],
+    )
+
+
 def test_degraded_fallback_does_not_inject_arbitrary_scenario_claim() -> None:
     claim = context_search_module._ContextCandidate(
         source_type="scenario_claim",

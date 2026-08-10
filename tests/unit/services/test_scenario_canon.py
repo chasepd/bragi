@@ -355,3 +355,29 @@ def test_compiler_rejects_partial_section_coverage() -> None:
                 },
             )
         )
+
+
+def test_compiler_rejects_known_by_outside_entity_anchors() -> None:
+    output = _output()
+    sections = output["sections"]
+    assert isinstance(sections, list)
+    section = sections[0]
+    assert isinstance(section, dict)
+    claims = section["claims"]
+    assert isinstance(claims, list)
+    first_claim = claims[0]
+    assert isinstance(first_claim, dict)
+    first_claim["known_by"] = ["unanchored-character"]
+
+    with pytest.raises(ValueError, match="entity anchor keys"):
+        asyncio.run(
+            ScenarioCanonCompiler(
+                provider=FakeProviderClient(structured_output=output),
+                provider_name="fake",
+                model_id="canon-model",
+            ).compile(
+                scenario_type="full_roleplay",
+                content={"lore": "The beacon consumes one memory per use. "
+                "The keeper suspects the lens is alive."},
+            )
+        )

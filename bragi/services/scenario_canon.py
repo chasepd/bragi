@@ -129,7 +129,8 @@ class ScenarioCanonCompiler:
                         "Compile scenario prose into concise atomic canon claims. "
                         "Use only exact evidence from the supplied source sections. "
                         "Separate established facts, beliefs, rumors, and hypotheses; "
-                        "mark time and reveal boundaries conservatively."
+                        "mark time and reveal boundaries conservatively. For known_by, "
+                        "use only entity_key values from that claim's entity_anchors."
                     ),
                 ),
                 ChatMessage(
@@ -372,6 +373,9 @@ def _validated_claim(
             if str(value).strip()
         }
     )
+    anchor_keys = {anchor["entity_key"] for anchor in anchors}
+    if not set(known_by) <= anchor_keys:
+        raise ValueError("Scenario canon known_by must reference entity anchor keys")
     canonical = {
         "source_section": section_id,
         "source_sha256": source_sha256,

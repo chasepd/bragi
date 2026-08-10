@@ -3401,31 +3401,29 @@ def _scenario_claim_is_superseded(
 ) -> bool:
     if record.metadata.get("temporal_status") != "current_at_scenario_start":
         return False
-    fact_key = _normalized_match_key(str(record.metadata.get("fact_key", "")))
+    fact_key = _match_key_parts(str(record.metadata.get("fact_key", "")))
     if not fact_key:
         return False
     anchors = record.metadata.get("entity_anchors")
     if not isinstance(anchors, list):
         return False
     anchor_keys = {
-        _normalized_match_key(str(anchor.get("entity_key", "")))
+        _match_key_parts(str(anchor.get("entity_key", "")))
         for anchor in anchors
         if isinstance(anchor, Mapping)
     }
     anchor_keys.discard("")
     if not anchor_keys:
         return False
-    expected_state_keys = {
-        f"{anchor_key}{fact_key}" for anchor_key in anchor_keys
-    }
+    expected_state_keys = {(*anchor_key, *fact_key) for anchor_key in anchor_keys}
     for state in world_state:
-        if _normalized_match_key(state.key) in expected_state_keys:
+        if _match_key_parts(state.key) in expected_state_keys:
             return True
     return False
 
 
-def _normalized_match_key(value: str) -> str:
-    return "".join(character for character in value.casefold() if character.isalnum())
+def _match_key_parts(value: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
 def _indexed_context_source_is_continuity_critical(
@@ -3685,8 +3683,22 @@ def _known_by_candidate_blocked(
         for owners in scoped_targets.allowed.values()
         for owner in owners
     }
+    allowed_identifiers = {
+        str(target_id).casefold()
+        for _target_type, target_id in scoped_targets.allowed
+    } | allowed_owners
     normalized_known_by = {str(item).casefold() for item in known_by}
-    return not bool(normalized_known_by & allowed_owners)
+    anchors = record.metadata.get("entity_anchors")
+    known_identifiers = set(normalized_known_by)
+    if isinstance(anchors, list):
+        known_identifiers.update(
+            str(anchor.get(field, "")).casefold()
+            for anchor in anchors
+            if isinstance(anchor, Mapping)
+            and str(anchor.get("entity_key", "")).casefold() in normalized_known_by
+            for field in ("entity_key", "display_name")
+        )
+    return not bool(known_identifiers & allowed_identifiers)
 
 
 def _audience_candidate_blocked(

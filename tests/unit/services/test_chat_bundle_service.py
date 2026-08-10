@@ -3097,7 +3097,7 @@ def test_import_save_remaps_colliding_ids_and_preserves_bundle_data(
     base_scenario = repositories.get_scenario(imported_save.scenario_id)
     assert base_scenario is not None
     assert base_scenario.title == "Ashfall Keep"
-    assert "_canon_claims" not in json.loads(base_scenario.content_json)
+    assert json.loads(base_scenario.content_json)["_canon_claims"]["version"] == 1
     loaded = repositories.load_save_details(imported_save_id)
     assert loaded is not None
     assert loaded.scenario.id == imported_save.scenario_id
