@@ -3216,27 +3216,39 @@ function Workbench({
           applyCharacterTextJobResult(client, done.result, done.save_id ?? activeSaveIdRef.current);
         }
         if (appliesToCurrentSave && done.status === "succeeded") options.onSucceeded?.(done.result);
+        const isActionChoiceJob = (
+          done.type === "action_choice_generate"
+          || done.type === "action_choice_regenerate"
+        );
+        if (
+          appliesToCurrentSave
+          && isActionChoiceJob
+          && (done.status === "failed" || done.status === "cancelled")
+        ) {
+          const error = done.status === "failed" ? done.error || "Background job failed." : null;
+          appliedRuntimeResult = true;
+          client.setQueryData<RuntimeModel>(
+            runtimeQueryKey(done.save_id ?? activeSaveIdRef.current),
+            (current) => current?.action_choices
+              && (
+                !current.action_choices.generation_job
+                || current.action_choices.generation_job.id === done.id
+              )
+              ? {
+                ...current,
+                action_choices: {
+                  ...current.action_choices,
+                  generation_job: null,
+                  generation_error: error
+                }
+              }
+              : current
+          );
+        }
         if (appliesToCurrentSave && done.status === "failed") {
           const error = done.error || "Background job failed.";
-          if (done.type === "action_choice_generate") {
+          if (isActionChoiceJob) {
             appliedRuntimeResult = true;
-            client.setQueryData<RuntimeModel>(
-              runtimeQueryKey(done.save_id ?? activeSaveIdRef.current),
-              (current) => current?.action_choices
-                && (
-                  !current.action_choices.generation_job
-                  || current.action_choices.generation_job.id === done.id
-                )
-                ? {
-                  ...current,
-                  action_choices: {
-                    ...current.action_choices,
-                    generation_job: null,
-                    generation_error: error
-                  }
-                }
-                : current
-            );
           }
           options.onFailed?.(error, done);
         }
@@ -3609,7 +3621,11 @@ function Workbench({
             runJob={runJob}
             activeSaveId={activeSaveId}
             actionChoices={model?.action_choices ?? null}
-            generationActive={pendingJobs.some(({ job }) => job.type === "action_choice_generate")}
+            generationActive={pendingJobs.some(({ job }) => (
+              job.type === "action_choice_generate"
+              || job.type === "action_choice_regenerate"
+            ))}
+            generationRecoveryPending={activeJobs.isPending}
             pendingAfterMessageId={pendingAfterMessageId}
             onPendingMessage={setPendingMessage}
           />
@@ -6668,6 +6684,7 @@ function CyoaActionPicker({
   activeSaveId,
   actionChoices,
   generationActive = false,
+  generationRecoveryPending = false,
   pendingAfterMessageId = null,
   onPendingMessage
 }: {
@@ -6676,6 +6693,7 @@ function CyoaActionPicker({
   activeSaveId: string | null;
   actionChoices: RuntimeModel["action_choices"];
   generationActive?: boolean;
+  generationRecoveryPending?: boolean;
   pendingAfterMessageId?: string | null;
   onPendingMessage: (message: PendingChronicleMessage | null) => void;
 }) {
@@ -6729,15 +6747,18 @@ function CyoaActionPicker({
   }, [activeSaveId, actionChoices?.narrator_message_id]);
 
   const choices = [...(actionChoices?.choices ?? [])].sort((left, right) => left.ordinal - right.ordinal);
-  const choicesGenerating = generationActive || Boolean(actionChoices?.generation_job);
-  const customActionLabel = choicesGenerating ? "Generating choices..." : "Write your own";
   const submitBusy = submittingSaveId === activeSaveId || submittingSaveIdRef.current === activeSaveId;
   const regenerateBusy = regenerate.isPending;
-  const canSubmit = !disabled && !submitBusy && !choicesGenerating;
+  const choicesGenerating = generationActive
+    || generationRecoveryPending
+    || Boolean(actionChoices?.generation_job)
+    || regenerateBusy;
+  const canSubmit = !disabled && !submitBusy;
+  const canSubmitChoice = canSubmit && !choicesGenerating;
   const canRegenerate = !disabled && !submitBusy && !regenerateBusy && !choicesGenerating && Boolean(activeSaveId && actionChoices?.narrator_message_id);
-  const submitBody = (body: string) => {
+  const submitBody = (body: string, allowed = canSubmit) => {
     const submittedBody = body.trim();
-    if (!canSubmit || !submittedBody) return;
+    if (!allowed || !submittedBody) return;
     const submittedSaveId = activeSaveId;
     submittingSaveIdRef.current = submittedSaveId;
     setSubmittingSaveId(submittedSaveId);
@@ -6762,8 +6783,8 @@ function CyoaActionPicker({
             <button
               type="button"
               className="cyoa-choice-button"
-              disabled={!canSubmit}
-              onClick={() => submitBody(choice.body)}
+              disabled={!canSubmitChoice}
+              onClick={() => submitBody(choice.body, canSubmitChoice)}
             >
               <span className="cyoa-choice-ordinal" aria-hidden="true">{index + 1}</span>
               <span className="cyoa-choice-body">{choice.body}</span>
@@ -6776,15 +6797,17 @@ function CyoaActionPicker({
           <button
             type="button"
             className="cyoa-custom-toggle"
-            disabled={disabled || submitBusy || choicesGenerating}
-            aria-label={customActionLabel}
-            aria-live="polite"
+            disabled={disabled || submitBusy}
+            aria-label="Write your own"
             aria-expanded={manualOpen}
             onClick={() => setManualOpen((current) => !current)}
           >
             <Edit3 size={17} aria-hidden="true" />
-            <span>{customActionLabel}</span>
+            <span>Write your own</span>
           </button>
+          {choicesGenerating ? (
+            <span className="cyoa-generation-status" role="status">Generating choices...</span>
+          ) : null}
           {manualOpen ? (
             <form
               className="cyoa-manual-form"
@@ -9366,8 +9389,6 @@ function isChatJobType(type: string) {
   return type === "chat_turn"
     || type === "look_around"
     || type === "chat_regenerate"
-    || type === "action_choice_generate"
-    || type === "action_choice_regenerate"
     || type === "chat_edit"
     || type === "message_edit"
     || type === "narrator_edit"

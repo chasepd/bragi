@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
+from uuid import uuid4
 
 from bragi.interaction_mode import InteractionMode
 from bragi.persistence.models import (
@@ -53,6 +54,8 @@ ACTION_CHOICE_COUNT = 4
 class PreparedActionChoiceGeneration:
     save_id: str
     narrator_message_id: str
+    narrator_updated_at: str
+    generation_token: str
     request: StructuredOutputRequest
     current_user_id: str | None = None
 
@@ -125,6 +128,9 @@ class ActionChoiceService:
             raise ValueError(
                 f"Unknown active narrator message id: {narrator_message_id}"
             )
+        narrator_updated_at = narrator_message.updated_at
+        if narrator_updated_at is None:
+            raise ValueError("Narrator message is missing its revision timestamp")
         preference = _action_choice_model_preference(
             repositories=self.repositories,
             save_id=save_id,
@@ -175,6 +181,8 @@ class ActionChoiceService:
         return PreparedActionChoiceGeneration(
             save_id=save_id,
             narrator_message_id=narrator_message_id,
+            narrator_updated_at=narrator_updated_at,
+            generation_token=uuid4().hex,
             request=request,
             current_user_id=current_user_id,
         )
@@ -195,6 +203,27 @@ class ActionChoiceService:
         )
         if requirement_error is not None:
             raise ValueError(requirement_error)
+        claimed = self.repositories.claim_message_action_choice_generation(
+            save_id=prepared.save_id,
+            message_id=prepared.narrator_message_id,
+            narrator_updated_at=prepared.narrator_updated_at,
+            generation_token=prepared.generation_token,
+        )
+        if not claimed:
+            return []
+        try:
+            return await self._generate_claimed(prepared)
+        finally:
+            self.repositories.release_message_action_choice_generation(
+                save_id=prepared.save_id,
+                message_id=prepared.narrator_message_id,
+                generation_token=prepared.generation_token,
+            )
+
+    async def _generate_claimed(
+        self,
+        prepared: PreparedActionChoiceGeneration,
+    ) -> list[MessageActionChoiceRecord]:
         response = await structured_output_with_fallback(
             repositories=self.repositories,
             providers=self.providers,
@@ -210,30 +239,29 @@ class ActionChoiceService:
             self.repositories,
             user_id=prepared.current_user_id,
         )
-        reviewed_choices: list[str] = []
-        content_ratings: list[str] = []
-        for choice in choices:
-            safety = await self.content_safety_service.review_narration(
-                body=choice,
-                content_rating=policy.rating,
-                fade_to_black_enabled=False,
-                save_id=prepared.save_id,
-                source_request=ChatRequest(
-                    provider=response.provider,
-                    model_id=response.model_id,
-                    messages=(),
-                ),
-            )
-            reviewed_choices.append(safety.body)
-            content_ratings.append(safety.reviewed_content_rating)
+        safety_results = await self.content_safety_service.review_narrations(
+            bodies=choices,
+            content_rating=policy.rating,
+            fade_to_black_enabled=False,
+            save_id=prepared.save_id,
+            source_request=ChatRequest(
+                provider=response.provider,
+                model_id=response.model_id,
+                messages=(),
+            ),
+        )
         return self.repositories.replace_message_action_choices(
             save_id=prepared.save_id,
             message_id=prepared.narrator_message_id,
-            choices=reviewed_choices,
+            choices=[result.body for result in safety_results],
             provider=response.provider,
             model=response.model_id,
-            content_ratings=content_ratings,
+            content_ratings=[
+                result.reviewed_content_rating for result in safety_results
+            ],
             expected_head_message_id=prepared.narrator_message_id,
+            expected_narrator_updated_at=prepared.narrator_updated_at,
+            generation_token=prepared.generation_token,
         )
 
 

@@ -222,8 +222,6 @@ _CHAT_JOB_TYPES = frozenset(
         "chat_turn",
         "look_around",
         "chat_regenerate",
-        "action_choice_generate",
-        "action_choice_regenerate",
         "chat_edit",
         "message_edit",
         "narrator_edit",
@@ -3233,6 +3231,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             if status["reason"] == "no_save":
                 raise HTTPException(status_code=400, detail="No save loaded")
             raise HTTPException(status_code=409, detail=_CHAT_TURN_ACTIVE_DETAIL)
+        await _cancel_action_choice_jobs_for_save(state, submitted_save_id)
 
         async def worker(handle: JobHandle) -> Any:
             initial_progress = _initial_chat_turn_progress("Submitting turn")
@@ -3552,6 +3551,12 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             if not status["can_submit"]:
                 raise HTTPException(status_code=409, detail=_CHAT_TURN_ACTIVE_DETAIL)
 
+        await _cancel_action_choice_jobs_for_save(
+            state,
+            action_save_id,
+            narrator_message_id=payload.message_id,
+        )
+
         return await _create_action_choice_job_summary(
             state,
             save_id=action_save_id,
@@ -3606,8 +3611,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             job_type,
             worker,
             save_id=save_id,
-            exclusive_key=_chat_turn_exclusive_key(save_id),
-            operation_queue_key=save_id,
+            operation_queue_key=_action_choice_operation_queue_key(
+                save_id,
+                narrator_message_id,
+            ),
         )
 
     @app.get("/api/messages/{message_id}/scene-presence")
@@ -8864,6 +8871,42 @@ def _chat_turn_exclusive_key(save_id: str | None) -> str | None:
     return f"chat_turn:{save_id}" if save_id is not None else None
 
 
+def _action_choice_operation_queue_key(
+    save_id: str,
+    narrator_message_id: str,
+) -> str:
+    return f"action_choices:{save_id}:{narrator_message_id}"
+
+
+async def _cancel_action_choice_jobs_for_save(
+    state: WebAppState,
+    save_id: str,
+    *,
+    narrator_message_id: str | None = None,
+) -> None:
+    expected_queue_key = (
+        _action_choice_operation_queue_key(save_id, narrator_message_id)
+        if narrator_message_id is not None
+        else None
+    )
+    for job in state.jobs.list_active(save_id=save_id):
+        if job.type not in {"action_choice_generate", "action_choice_regenerate"}:
+            continue
+        if (
+            expected_queue_key is not None
+            and job.operation_queue_key != expected_queue_key
+        ):
+            continue
+        await state.jobs.cancel(job.id)
+    invalidate = getattr(
+        state.repositories,
+        "invalidate_message_action_choice_generations",
+        None,
+    )
+    if callable(invalidate):
+        invalidate(save_id)
+
+
 def _character_text_thread_job_key(thread_id: str) -> str:
     return f"character_text_thread:{thread_id}"
 
@@ -9048,7 +9091,7 @@ async def _queue_post_turn_jobs_background(
     async def worker(post_turn_handle: JobHandle) -> Any:
         await post_turn_handle.advance_completion_level(RESPONSE_COMMITTED)
         optional_jobs: list[JobRecord] = []
-        action_choice_job = await _queue_prepared_action_choices_if_available(
+        await _queue_prepared_action_choices_if_available(
             state,
             post_turn_handle,
             save_id=save_id,
@@ -9056,8 +9099,6 @@ async def _queue_post_turn_jobs_background(
             prepared_action_choices=prepared_action_choices,
             current_user_id=current_user_id,
         )
-        if action_choice_job is not None:
-            optional_jobs.append(action_choice_job)
         result = await _run_post_turn_jobs_with_ordered_progress(
             state,
             post_turn_handle,
@@ -9194,7 +9235,7 @@ async def _run_post_turn_jobs_inline_fallback(
     current_user_id: str | None = None,
 ) -> Any:
     optional_jobs: list[JobRecord] = []
-    action_choice_job = await _queue_prepared_action_choices_if_available(
+    await _queue_prepared_action_choices_if_available(
         state,
         handle,
         save_id=save_id,
@@ -9202,8 +9243,6 @@ async def _run_post_turn_jobs_inline_fallback(
         prepared_action_choices=prepared_action_choices,
         current_user_id=current_user_id,
     )
-    if action_choice_job is not None:
-        optional_jobs.append(action_choice_job)
     result = await _run_post_turn_jobs_with_ordered_progress(
         state,
         handle,
@@ -9262,12 +9301,13 @@ async def _queue_prepared_action_choices_if_available(
 
     try:
         record = await state.jobs.create(
-            "automatic_action_choice_generation",
+            "action_choice_generate",
             worker,
             save_id=save_id,
             creator_user_id=current_user_id,
-            operation_queue_key=(
-                f"automatic_action_choices:{save_id}:{narrator_message_id}"
+            operation_queue_key=_action_choice_operation_queue_key(
+                save_id,
+                narrator_message_id,
             ),
         )
     except Exception as exc:

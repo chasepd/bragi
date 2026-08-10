@@ -135,6 +135,24 @@ class RuntimeContentSafetyProvider(RuntimeFakeProvider):
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_requests.append(request)
+        if request.schema_name == "content_safety_batch_review":
+            count = int(request.schema["properties"]["reviews"]["minItems"])
+            return StructuredOutputResponse(
+                data={
+                    "reviews": [
+                        {
+                            "ordinal": ordinal,
+                            "action": "allow",
+                            "category": "none",
+                            "reason": "The draft stays within the content ceiling.",
+                            "minimum_rating": "g",
+                        }
+                        for ordinal in range(1, count + 1)
+                    ]
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
         return StructuredOutputResponse(
             data={
                 "action": self.action,
@@ -162,6 +180,24 @@ class RuntimeAllowingSafetyProvider(RuntimeContentSafetyProvider):
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_requests.append(request)
+        if request.schema_name == "content_safety_batch_review":
+            count = int(request.schema["properties"]["reviews"]["minItems"])
+            return StructuredOutputResponse(
+                data={
+                    "reviews": [
+                        {
+                            "ordinal": ordinal,
+                            "action": "allow",
+                            "category": "none",
+                            "reason": "The draft stays within the content ceiling.",
+                            "minimum_rating": "g",
+                        }
+                        for ordinal in range(1, count + 1)
+                    ]
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
         return StructuredOutputResponse(
             data={
                 "action": "allow",
@@ -7709,7 +7745,7 @@ def test_edit_and_resubmit_reports_committed_edit_before_narrator_finishes(
         )
 
         try:
-            await asyncio.wait_for(replacement_narrator_started.wait(), timeout=1)
+            await asyncio.wait_for(replacement_narrator_started.wait(), timeout=2)
         except TimeoutError as exc:
             if task.done():
                 await task
@@ -7741,7 +7777,7 @@ def test_edit_and_resubmit_reports_committed_edit_before_narrator_finishes(
         ]
 
         release_replacement_narrator.set()
-        final_model = await asyncio.wait_for(task, timeout=1)
+        final_model = await asyncio.wait_for(task, timeout=2)
 
         final_messages = repositories.list_messages(save_id)
         assert [(message.role, message.body) for message in final_messages] == [

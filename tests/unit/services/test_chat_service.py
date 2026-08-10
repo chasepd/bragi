@@ -205,6 +205,26 @@ class RecordingChatProvider:
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_batch_review":
+            count = int(request.schema["properties"]["reviews"]["minItems"])
+            return StructuredOutputResponse(
+                data={
+                    "reviews": [
+                        {
+                            "ordinal": ordinal,
+                            "action": "allow",
+                            "category": "none",
+                            "reason": (
+                                "The narration stays within the content ceiling."
+                            ),
+                            "minimum_rating": "g",
+                        }
+                        for ordinal in range(1, count + 1)
+                    ]
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
         return StructuredOutputResponse(
             data={
                 "action": "allow",
@@ -506,7 +526,10 @@ class RecordingCyoaChatProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
-        if request.schema_name == "content_safety_review":
+        if request.schema_name in {
+            "content_safety_review",
+            "content_safety_batch_review",
+        }:
             return await RecordingChatProvider.generate_structured_output(
                 self,
                 request,

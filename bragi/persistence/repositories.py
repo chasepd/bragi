@@ -10240,6 +10240,8 @@ class PersistenceRepositories:
         model: str = "",
         content_ratings: list[str] | tuple[str, ...] | None = None,
         expected_head_message_id: str | None = None,
+        expected_narrator_updated_at: str | None = None,
+        generation_token: str | None = None,
     ) -> list[MessageActionChoiceRecord]:
         normalized_choices = tuple(
             choice.strip() for choice in choices if choice.strip()
@@ -10253,6 +10255,38 @@ class PersistenceRepositories:
             ):
                 self.rollback_transaction()
                 return []
+            if expected_narrator_updated_at is not None:
+                narrator_row = self._fetch_one(
+                    """
+                    SELECT updated_at
+                    FROM messages
+                    WHERE save_id = ? AND id = ? AND role = 'narrator'
+                      AND deleted_at IS NULL
+                    """,
+                    (save_id, message_id),
+                )
+                if (
+                    narrator_row is None
+                    or str(narrator_row["updated_at"])
+                    != expected_narrator_updated_at
+                ):
+                    self.rollback_transaction()
+                    return []
+            if generation_token is not None:
+                claim_row = self._fetch_one(
+                    """
+                    SELECT generation_token
+                    FROM message_action_choice_generation_claims
+                    WHERE save_id = ? AND message_id = ?
+                    """,
+                    (save_id, message_id),
+                )
+                if (
+                    claim_row is None
+                    or str(claim_row["generation_token"]) != generation_token
+                ):
+                    self.rollback_transaction()
+                    return []
             self.connection.execute(
                 """
                 DELETE FROM message_action_choices
@@ -10289,11 +10323,95 @@ class PersistenceRepositories:
                         content_rating,
                     ),
                 )
+            if generation_token is not None:
+                self.connection.execute(
+                    """
+                    DELETE FROM message_action_choice_generation_claims
+                    WHERE save_id = ? AND message_id = ? AND generation_token = ?
+                    """,
+                    (save_id, message_id, generation_token),
+                )
             self.commit_transaction()
         except Exception:
             self.rollback_transaction()
             raise
         return self.list_message_action_choices(save_id, message_id=message_id)
+
+    def claim_message_action_choice_generation(
+        self,
+        *,
+        save_id: str,
+        message_id: str,
+        narrator_updated_at: str,
+        generation_token: str,
+    ) -> bool:
+        self.begin_immediate_transaction()
+        try:
+            head_id = self.latest_active_message_id(save_id)
+            narrator_row = self._fetch_one(
+                """
+                SELECT updated_at
+                FROM messages
+                WHERE save_id = ? AND id = ? AND role = 'narrator'
+                  AND deleted_at IS NULL
+                """,
+                (save_id, message_id),
+            )
+            if (
+                head_id != message_id
+                or narrator_row is None
+                or str(narrator_row["updated_at"]) != narrator_updated_at
+            ):
+                self.rollback_transaction()
+                return False
+            self.connection.execute(
+                """
+                INSERT INTO message_action_choice_generation_claims(
+                    save_id, message_id, narrator_updated_at, generation_token,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    save_id = excluded.save_id,
+                    narrator_updated_at = excluded.narrator_updated_at,
+                    generation_token = excluded.generation_token,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (save_id, message_id, narrator_updated_at, generation_token),
+            )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return True
+
+    def release_message_action_choice_generation(
+        self,
+        *,
+        save_id: str,
+        message_id: str,
+        generation_token: str,
+    ) -> bool:
+        cursor = self.connection.execute(
+            """
+            DELETE FROM message_action_choice_generation_claims
+            WHERE save_id = ? AND message_id = ? AND generation_token = ?
+            """,
+            (save_id, message_id, generation_token),
+        )
+        self.commit()
+        return cursor.rowcount > 0
+
+    def invalidate_message_action_choice_generations(self, save_id: str) -> int:
+        cursor = self.connection.execute(
+            """
+            DELETE FROM message_action_choice_generation_claims
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        )
+        self.commit()
+        return cursor.rowcount
 
     def list_message_action_choices(
         self,

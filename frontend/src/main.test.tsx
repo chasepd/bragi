@@ -14990,7 +14990,11 @@ describe("frontend helpers", () => {
 
   it("shows opening action choice generation before choices are ready", async () => {
     const { CyoaActionPicker } = await import("./main");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }));
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "chat-job", type: "chat_turn", status: "queued" })
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
     render(
       <QueryClientProvider client={new QueryClient()}>
@@ -15015,8 +15019,19 @@ describe("frontend helpers", () => {
       </QueryClientProvider>
     );
 
-    expect(screen.getByRole("button", { name: "Generating choices..." })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Generating choices...");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: "Write your own" }));
+    await userEvent.type(screen.getByRole("textbox", { name: "Custom action" }), "Take another path");
+    await userEvent.click(screen.getByTitle("Send"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/chat",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ body: "Take another path", speaker_name: null, save_id: "save-1" })
+      })
+    ));
   });
 
   it("keeps empty opening choices retryable after generation fails", async () => {
@@ -15193,7 +15208,8 @@ describe("frontend helpers", () => {
         } : current
       );
     });
-    expect(screen.getByRole("button", { name: "Generating choices..." })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Generating choices...");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
     act(() => {
       jobSource.dispatch("done", {
         ...generationJob,
@@ -15247,10 +15263,21 @@ describe("frontend helpers", () => {
       result: null,
       error: null
     };
-    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
-      ok: true,
-      json: async () => path === "/api/action-choices/regenerate" ? job : {}
-    }));
+    let resolveRegeneration!: (response: {
+      ok: boolean;
+      json: () => Promise<typeof job>;
+    }) => void;
+    const regenerationResponse = new Promise<{
+      ok: boolean;
+      json: () => Promise<typeof job>;
+    }>((resolve) => {
+      resolveRegeneration = resolve;
+    });
+    const fetchMock = vi.fn().mockImplementation((path: string) => (
+      path === "/api/action-choices/regenerate"
+        ? regenerationResponse
+        : Promise.resolve({ ok: true, json: async () => ({}) })
+    ));
     const runJob = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
@@ -15279,7 +15306,147 @@ describe("frontend helpers", () => {
         })
       })
     ));
-    expect(runJob).toHaveBeenCalledWith(job);
+    expect(screen.getByRole("status")).toHaveTextContent("Generating choices...");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Open the brass door" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+    expect(runJob).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveRegeneration({ ok: true, json: async () => job });
+      await regenerationResponse;
+    });
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(job));
+  });
+
+  it("guards generated choices while a tracked regeneration job remains active", async () => {
+    const sources = installEventSourceDouble();
+    const regenerationJob = {
+      id: "job-choice-regeneration",
+      type: "action_choice_regenerate",
+      save_id: "save-1",
+      status: "running",
+      result: null,
+      error: null
+    } satisfies Job;
+    const model = runtimeModel({
+      action_choices_enabled: true,
+      action_choices: cyoaActionChoices()
+    });
+    vi.stubGlobal("fetch", workbenchFetch([regenerationJob], model));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Generating choices..."
+    );
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Open the brass door" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+    const jobSource = sources.find(
+      (source) => source.url === "/api/jobs/job-choice-regeneration/events?save_id=save-1"
+    );
+    if (!jobSource) throw new Error("regeneration job watcher was not created");
+    act(() => {
+      jobSource.dispatch("done", {
+        ...regenerationJob,
+        status: "failed",
+        error: "Action choices could not be regenerated."
+      });
+    });
+    expect(
+      await screen.findByText("Action choices could not be regenerated.")
+    ).toBeInTheDocument();
+  });
+
+  it("guards generated choices while active action choice jobs are being recovered", async () => {
+    const model = runtimeModel({
+      action_choices_enabled: true,
+      action_choices: cyoaActionChoices()
+    });
+    let resolveActiveJobs!: (response: {
+      ok: boolean;
+      json: () => Promise<{ jobs: Job[] }>;
+    }) => void;
+    const activeJobsResponse = new Promise<{
+      ok: boolean;
+      json: () => Promise<{ jobs: Job[] }>;
+    }>((resolve) => {
+      resolveActiveJobs = resolve;
+    });
+    const fallbackFetch = workbenchFetch([], model);
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string, init?: RequestInit) => (
+      path.startsWith("/api/jobs?status=active")
+        ? activeJobsResponse
+        : fallbackFetch(path, init)
+    )));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Generating choices...");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Open the brass door" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+
+    await act(async () => {
+      resolveActiveJobs({ ok: true, json: async () => ({ jobs: [] }) });
+      await activeJobsResponse;
+    });
+
+    await waitFor(() => expect(
+      screen.getByRole("button", { name: "Open the brass door" })
+    ).toBeEnabled());
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeEnabled();
+  });
+
+  it("clears an embedded opening generation marker when its job is cancelled", async () => {
+    const sources = installEventSourceDouble();
+    const generationJob = {
+      id: "job-opening-choices-cancelled",
+      type: "action_choice_generate",
+      save_id: "save-1",
+      status: "running",
+      result: null,
+      error: null
+    } satisfies Job;
+    const model = runtimeModel({
+      action_choices_enabled: true,
+      action_choices: cyoaActionChoices({ generation_job: generationJob })
+    });
+    vi.stubGlobal("fetch", workbenchFetch([], model));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Generating choices...");
+    const jobSource = await waitFor(() => {
+      const source = sources.find(
+        (candidate) => candidate.url === "/api/jobs/job-opening-choices-cancelled/events?save_id=save-1"
+      );
+      if (!source) throw new Error("opening action choice watcher was not created");
+      return source;
+    });
+    act(() => {
+      jobSource.dispatch("done", { ...generationJob, status: "cancelled" });
+    });
+
+    await waitFor(() => expect(screen.queryByRole("status")).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Open the brass door" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeEnabled();
   });
 
   it("submits a selected CYOA action as a normal chat message", async () => {
