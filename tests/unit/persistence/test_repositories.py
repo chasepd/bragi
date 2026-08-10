@@ -97,6 +97,88 @@ def test_message_safety_transition_round_trips_and_edits_clear_it(
     assert edited.safety_transition == ""
     assert edited.content_rating == "g"
 
+
+def test_message_narration_state_round_trips_and_recovers_interrupted_work(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Interrupted Turn Test",
+        premise="A neutral test scenario.",
+        player_role="Traveler",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Test Save")
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="Open the sealed gate.",
+        narration_status="pending",
+    )
+
+    state = repositories.get_message_narration_state(
+        save_id=save.id,
+        message_id=player.id,
+    )
+    assert state is not None
+    assert state.status == "pending"
+    assert state.error is None
+
+    repositories.set_message_narration_state(
+        save_id=save.id,
+        message_id=player.id,
+        status="retrying",
+    )
+    recovered = repositories.recover_interrupted_message_narrations(
+        error="The turn was interrupted before a narrator response was saved.",
+    )
+
+    assert recovered == [player.id]
+    state = repositories.get_message_narration_state(
+        save_id=save.id,
+        message_id=player.id,
+    )
+    assert state is not None
+    assert state.status == "cancelled"
+    assert state.error == (
+        "The turn was interrupted before a narrator response was saved."
+    )
+
+
+def test_active_interrupted_message_narration_uses_latest_visible_head(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Interrupted Turn Test",
+        premise="A neutral test scenario.",
+        player_role="Traveler",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Test Save")
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="Open the sealed gate.",
+        narration_status="failed",
+        narration_error="Bragi could not finish the narrator response.",
+    )
+
+    state = repositories.get_active_interrupted_message_narration(save.id)
+
+    assert state is not None
+    assert state.message_id == player.id
+    assert state.status == "failed"
+    assert state.source_kind == "player"
+
+    repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The gate opens.",
+    )
+
+    assert repositories.get_active_interrupted_message_narration(save.id) is None
+
     raw_body = "He thrust into her before the scene changed."
     raw = repositories.append_message(
         save_id=save.id,

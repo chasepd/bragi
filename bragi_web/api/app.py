@@ -3232,6 +3232,117 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             )
         return await _submit_chat(payload, state, operation="chat")
 
+    @app.post("/api/chat/retry")
+    async def retry_interrupted_chat(
+        payload: EditMessageRequest,
+        state: StateDep,
+    ) -> dict[str, Any]:
+        async with state.lock.async_access():
+            submitted_save_id = _require_save_id(payload.save_id)
+            interrupted = (
+                state.repositories.get_active_interrupted_message_narration(
+                    submitted_save_id
+                )
+            )
+            if interrupted is None or interrupted.message_id != payload.message_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This turn is no longer interrupted.",
+                )
+            _raise_unless_save_action_allowed(
+                state,
+                submitted_save_id,
+                "mutate" if interrupted.source_kind == "timeskip" else "chat",
+            )
+            active = _active_chat_turn_for_save(
+                state.jobs.list_active(save_id=submitted_save_id),
+                submitted_save_id,
+            )
+            if active is not None:
+                raise HTTPException(status_code=409, detail=_CHAT_TURN_ACTIVE_DETAIL)
+            current_user_id = _owner_user_id_for_request(state)
+
+        async def worker(handle: JobHandle) -> Any:
+            initial_progress = _initial_chat_turn_progress("Retrying turn")
+            await handle.event("progress", initial_progress)
+            (
+                turn_progress_callback,
+                flush_turn_progress,
+                latest_turn_progress_jobs,
+            ) = _turn_progress_callback(handle, initial_progress)
+            retry_callback, flush_retry_progress = _retry_progress_callback(
+                handle,
+                task_label="chat",
+            )
+            await _wait_for_background_post_turn_catchup(
+                state,
+                handle,
+                save_id=submitted_save_id,
+            )
+            try:
+                turn = await state.runtime.retry_interrupted_turn_for_initial_render(
+                    message_id=payload.message_id,
+                    edited_body=payload.body.strip() or None,
+                    active_save_id=submitted_save_id,
+                    current_user_id=current_user_id,
+                    retry_progress_callback=retry_callback,
+                    turn_progress_callback=turn_progress_callback,
+                )
+            finally:
+                await flush_retry_progress()
+                await flush_turn_progress()
+            _raise_for_initial_chat_turn_failure(
+                turn,
+                failure_message="Retry did not produce a narrator response",
+            )
+            await _emit_initial_chat_turn_event(handle, turn)
+            await handle.advance_completion_level(RESPONSE_COMMITTED)
+            if turn.has_post_turn_jobs:
+                queued = await _queue_post_turn_jobs_background(
+                    state,
+                    handle,
+                    save_id=turn.save_id or "",
+                    player_message_id=turn.player_message_id or "",
+                    narrator_message_id=turn.narrator_message_id or "",
+                    turn_revision=getattr(turn, "turn_revision", None),
+                    prepared_action_choices=getattr(
+                        turn,
+                        "prepared_action_choices",
+                        None,
+                    ),
+                    prior_phase_jobs=_completed_chat_turn_phase_jobs(
+                        latest_turn_progress_jobs()
+                    ),
+                    current_user_id=current_user_id,
+                )
+                if queued is None:
+                    return await _run_post_turn_jobs_inline_fallback(
+                        state,
+                        handle,
+                        save_id=turn.save_id or "",
+                        player_message_id=turn.player_message_id or "",
+                        narrator_message_id=turn.narrator_message_id or "",
+                        turn_revision=getattr(turn, "turn_revision", None),
+                        prepared_action_choices=getattr(
+                            turn,
+                            "prepared_action_choices",
+                            None,
+                        ),
+                        prior_phase_jobs=_completed_chat_turn_phase_jobs(
+                            latest_turn_progress_jobs()
+                        ),
+                        current_user_id=current_user_id,
+                    )
+            return _initial_chat_turn_result(turn)
+
+        return await _create_job_summary(
+            state,
+            "chat_turn",
+            worker,
+            save_id=submitted_save_id,
+            exclusive_key=_chat_turn_exclusive_key(submitted_save_id),
+        )
+
     async def _submit_chat(
         payload: ChatRequest,
         state: StateDep,
@@ -8207,6 +8318,15 @@ def _scrub_message_payload_for_role(
     _scrub_latest_message_preview(payload, content_safety=content_safety)
     if _looks_like_chronicle_message(payload):
         blocked_action_ids = _blocked_chronicle_action_ids(current_user_role)
+        interrupted_turn = payload.get("interrupted_turn")
+        if (
+            current_user_role == "child"
+            and isinstance(interrupted_turn, dict)
+            and interrupted_turn.get("source_kind") == "timeskip"
+        ):
+            blocked_action_ids = blocked_action_ids | frozenset(
+                {"retry-interrupted-turn"}
+            )
         if current_user_role != "admin":
             payload.pop("debug_prompt", None)
             payload.pop("debug_provider_payload", None)
@@ -8893,6 +9013,7 @@ def _chat_submission_status(
             "reason": "no_save",
             "blocking_job_id": None,
             "blocking_job_status": None,
+            "blocking_message_id": None,
         }
     blocking = _active_chat_turn_for_save(
         state.jobs.list_active(save_id=save_id),
@@ -8905,6 +9026,17 @@ def _chat_submission_status(
             "reason": "chat_turn_active",
             "blocking_job_id": blocking.id,
             "blocking_job_status": blocking.status,
+            "blocking_message_id": None,
+        }
+    interrupted = state.repositories.get_active_interrupted_message_narration(save_id)
+    if interrupted is not None:
+        return {
+            "save_id": save_id,
+            "can_submit": False,
+            "reason": "interrupted_turn",
+            "blocking_job_id": None,
+            "blocking_job_status": None,
+            "blocking_message_id": interrupted.message_id,
         }
     return {
         "save_id": save_id,
@@ -8912,6 +9044,7 @@ def _chat_submission_status(
         "reason": None,
         "blocking_job_id": None,
         "blocking_job_status": None,
+        "blocking_message_id": None,
     }
 
 

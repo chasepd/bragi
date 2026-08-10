@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 
-from bragi.persistence.models import MessageRecord
+from bragi.persistence.models import MessageNarrationStateRecord, MessageRecord
 from bragi_common.story_continuation import is_story_continuation_message
 
 
@@ -68,6 +68,13 @@ class MessageRevisionMetadata:
 
 
 @dataclass(frozen=True)
+class InterruptedTurnModel:
+    status: str
+    reason: str
+    source_kind: str
+
+
+@dataclass(frozen=True)
 class ChronicleMessageModel:
     message_id: str
     role: str
@@ -80,6 +87,7 @@ class ChronicleMessageModel:
     debug_prompt: str | None = None
     debug_provider_payload: str | None = None
     content_rating: str = "unclassified"
+    interrupted_turn: InterruptedTurnModel | None = None
 
     @property
     def role_label(self) -> str:
@@ -110,6 +118,7 @@ def build_chronicle_model(
     debug_prompt_text_by_message_id: dict[str, str] | None = None,
     debug_provider_payload_text_by_message_id: dict[str, str] | None = None,
     revision_metadata_by_message_id: dict[str, MessageRevisionMetadata] | None = None,
+    interrupted_narration: MessageNarrationStateRecord | None = None,
     debug_prompts_enabled: bool = False,
 ) -> ChronicleModel:
     debug_prompts = debug_prompt_text_by_message_id or {}
@@ -132,6 +141,10 @@ def build_chronicle_model(
             markdown_blocks=parse_message_markdown(message.body),
             actions=_message_actions(
                 message,
+                interrupted=(
+                    interrupted_narration is not None
+                    and interrupted_narration.message_id == message.id
+                ),
                 character_image_actions_enabled=character_image_actions_enabled,
                 character_image_eligible=(
                     character_image_message_ids is not None
@@ -163,6 +176,19 @@ def build_chronicle_model(
             debug_provider_payload=(
                 debug_provider_payloads.get(message.id)
                 if debug_prompts_enabled
+                else None
+            ),
+            interrupted_turn=(
+                InterruptedTurnModel(
+                    status=interrupted_narration.status,
+                    reason=(
+                        interrupted_narration.error
+                        or "The turn stopped before a narrator response was saved."
+                    ),
+                    source_kind=interrupted_narration.source_kind,
+                )
+                if interrupted_narration is not None
+                and interrupted_narration.message_id == message.id
                 else None
             ),
             content_rating=message.content_rating,
@@ -391,6 +417,7 @@ def _is_thematic_break(text: str) -> bool:
 def _message_actions(
     message: MessageRecord,
     *,
+    interrupted: bool = False,
     character_image_actions_enabled: bool = False,
     character_image_eligible: bool = False,
     scene_presence_actions_enabled: bool = False,
@@ -424,13 +451,20 @@ def _message_actions(
             label="Fork from here",
         )
     )
+    if interrupted:
+        actions.append(
+            ChronicleMessageAction(
+                action_id="retry-interrupted-turn",
+                label="Retry response",
+            )
+        )
     actions.append(
         ChronicleMessageAction(
             action_id="delete-messages-from-here",
             label="Delete from here",
         )
     )
-    if message.role != "player":
+    if message.role == "narrator":
         actions.append(
             ChronicleMessageAction(
                 action_id="edit-narrator-message",
@@ -449,7 +483,7 @@ def _message_actions(
                 label="Regenerate with feedback",
             )
         )
-    if message.role == "player":
+    if message.role == "player" or (message.role == "system" and interrupted):
         actions.append(
             ChronicleMessageAction(
                 action_id="edit-and-resubmit-message",

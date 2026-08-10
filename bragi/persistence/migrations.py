@@ -23,7 +23,7 @@ from bragi.text_search import (
     unicode_word_terms,
 )
 
-CURRENT_SCHEMA_VERSION = 82
+CURRENT_SCHEMA_VERSION = 83
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
@@ -131,7 +131,9 @@ CREATE TABLE IF NOT EXISTS messages (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at TEXT,
     safety_transition TEXT NOT NULL DEFAULT '',
-    content_rating TEXT NOT NULL DEFAULT 'unclassified'
+    content_rating TEXT NOT NULL DEFAULT 'unclassified',
+    narration_status TEXT NOT NULL DEFAULT 'complete',
+    narration_error TEXT
 );
 
 CREATE TABLE IF NOT EXISTS message_revisions (
@@ -773,7 +775,10 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 81:
+            if current == 82:
+                _migrate_schema_82_to_83(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 81:
                 _migrate_schema_81_to_82(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 80:
@@ -795,6 +800,7 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_77_to_78(connection)
                 _migrate_schema_78_to_79(connection)
                 _migrate_schema_79_to_80(connection)
+                _migrate_schema_80_to_81(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 76:
                 _migrate_schema_76_to_77(connection)
@@ -1011,6 +1017,8 @@ def migrate_database(database_path: Path | str) -> None:
             _migrate_schema_80_to_81(connection)
         if not _schema_migration_applied(connection, 82):
             _migrate_schema_81_to_82(connection)
+        if not _schema_migration_applied(connection, 83):
+            _migrate_schema_82_to_83(connection)
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
         _ensure_context_observation_curation_schema(connection)
@@ -2612,6 +2620,16 @@ def _ensure_chat_turn_submission_schema(connection: sqlite3.Connection) -> None:
         """,
     )
 
+def _migrate_schema_82_to_83(connection: sqlite3.Connection) -> None:
+    _add_column_if_missing(
+        connection,
+        "messages",
+        "narration_status",
+        "TEXT NOT NULL DEFAULT 'complete'",
+    )
+    _add_column_if_missing(connection, "messages", "narration_error", "TEXT")
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (83)")
+
 
 def _ensure_post_turn_outbox_schema(connection: sqlite3.Connection) -> None:
     _execute_schema_script(
@@ -2656,6 +2674,7 @@ def _migrate_schema_77_to_78(connection: sqlite3.Connection) -> None:
 def _migrate_schema_81_to_82(connection: sqlite3.Connection) -> None:
     _ensure_incremental_turn_snapshot_schema(connection)
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (82)")
+    _migrate_schema_82_to_83(connection)
 
 
 def _ensure_summary_pressure_state_schema(connection: sqlite3.Connection) -> None:

@@ -2172,6 +2172,23 @@ def test_migration_79_to_80_adds_post_turn_outbox(tmp_path: Path) -> None:
         assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
 
 
+def test_migration_82_to_83_adds_message_narration_state(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("ALTER TABLE messages DROP COLUMN narration_error")
+        connection.execute("ALTER TABLE messages DROP COLUMN narration_status")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 83")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = _column_names(connection, "messages")
+        assert {"narration_status", "narration_error"} <= columns
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
 def test_migration_77_keeps_existing_turn_outcome_rows(tmp_path: Path) -> None:
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)

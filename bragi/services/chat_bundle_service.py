@@ -371,7 +371,8 @@ class ChatBundleService:
                 """
                 SELECT id, save_id, role, speaker_name, body, provider, model,
                        token_estimate, created_at, updated_at, deleted_at,
-                       safety_transition, content_rating
+                       safety_transition, content_rating, narration_status,
+                       narration_error
                 FROM messages
                 WHERE save_id = ? AND deleted_at IS NULL
                 ORDER BY created_at, rowid
@@ -1298,11 +1299,27 @@ class ChatBundleService:
         for message_data in messages_data:
             original_id = _text(message_data, "id")
             role = _text(message_data, "role")
-            if role not in {"player", "narrator"}:
+            if role not in {"player", "narrator", "system"}:
                 raise ChatBundleError(
                     f"Unsupported message role in chat bundle: {role}"
                 )
             body = _text(message_data, "body")
+            if role == "system" and (
+                _optional_text(message_data, "speaker_name") != "Timeskip"
+                or not body.startswith("Timeskip request: ")
+            ):
+                raise ChatBundleError(
+                    "Unsupported system message in chat bundle"
+                )
+            narration_status = (
+                _optional_text(message_data, "narration_status") or "complete"
+            )
+            narration_error = _optional_text(message_data, "narration_error")
+            if narration_status in {"pending", "retrying"}:
+                narration_status = "cancelled"
+                narration_error = (
+                    "The response was interrupted before this save was exported."
+                )
             safety_transition = _optional_text(message_data, "safety_transition") or ""
             content_rating = "unclassified"
             message = self.repositories.append_message(
@@ -1317,6 +1334,8 @@ class ChatBundleService:
                 updated_at=_optional_text(message_data, "updated_at"),
                 safety_transition=safety_transition,
                 content_rating=content_rating,
+                narration_status=narration_status,
+                narration_error=narration_error,
                 touch_save_updated_at=False,
             )
             safety_transition = message.safety_transition

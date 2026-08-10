@@ -217,6 +217,15 @@ class MessageRecord:
 
 
 @dataclass(frozen=True)
+class MessageNarrationStateRecord:
+    message_id: str
+    save_id: str
+    status: str
+    error: str | None
+    source_kind: str
+
+
+@dataclass(frozen=True)
 class MessagePageRecord:
     messages: list[MessageRecord]
     has_more_before: bool = False

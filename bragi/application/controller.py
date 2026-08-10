@@ -131,6 +131,7 @@ from bragi.services.chat_bundle_service import (
 )
 from bragi.services.chat_service import (
     CHAT_TURN_CANCELLED_ERROR,
+    TIMESKIP_MESSAGE_PREFIX,
     TIMESKIP_SPEAKER_NAME,
     CancellationToken,
     ChatService,
@@ -620,6 +621,13 @@ class BragiRuntime:
             else cast(int | None, chronicle_message_limit)
         )
         active_save = _active_save(self.repositories, requested_save_id)
+        interrupted_narration = (
+            self.repositories.get_active_interrupted_message_narration(
+                active_save.id
+            )
+            if active_save is not None
+            else None
+        )
         continuity_degraded = bool(
             active_save
             and self.repositories.list_post_turn_outbox_steps(
@@ -697,6 +705,7 @@ class BragiRuntime:
                     if active_save is not None
                     else {}
                 ),
+                interrupted_narration=interrupted_narration,
                 debug_prompts_enabled=bool(
                     self.repositories.get_app_setting("debug_logging_enabled")
                 ),
@@ -721,7 +730,9 @@ class BragiRuntime:
             scenario_draft=None,
             model_indicator=_model_indicator(self.repositories),
             failed_save=False,
-            composer_enabled=active_save is not None,
+            composer_enabled=(
+                active_save is not None and interrupted_narration is None
+            ),
             failure_text=None,
             status=status,
             error=error,
@@ -753,6 +764,13 @@ class BragiRuntime:
             else cast(int | None, chronicle_message_limit)
         )
         active_save = _active_save(self.repositories, requested_save_id)
+        interrupted_narration = (
+            self.repositories.get_active_interrupted_message_narration(
+                active_save.id
+            )
+            if active_save is not None
+            else None
+        )
         continuity_degraded = bool(
             active_save
             and self.repositories.list_post_turn_outbox_steps(
@@ -830,6 +848,7 @@ class BragiRuntime:
                     if active_save is not None
                     else {}
                 ),
+                interrupted_narration=interrupted_narration,
                 debug_prompts_enabled=bool(
                     self.repositories.get_app_setting("debug_logging_enabled")
                 ),
@@ -845,7 +864,9 @@ class BragiRuntime:
             scenario_draft=None,
             model_indicator=_model_indicator(self.repositories),
             failed_save=False,
-            composer_enabled=active_save is not None,
+            composer_enabled=(
+                active_save is not None and interrupted_narration is None
+            ),
             failure_text=None,
             status=status,
             error=error,
@@ -908,6 +929,9 @@ class BragiRuntime:
                     messages=messages,
                 ).items()
             },
+            interrupted_narration=(
+                self.repositories.get_active_interrupted_message_narration(save_id)
+            ),
             debug_prompts_enabled=bool(
                 self.repositories.get_app_setting("debug_logging_enabled")
             ),
@@ -3586,6 +3610,169 @@ class BragiRuntime:
             post_input_catchup=post_input_catchup,
         )
 
+    async def retry_interrupted_turn_for_initial_render(
+        self,
+        *,
+        message_id: str,
+        active_save_id: str | None | object = ...,
+        current_user_id: str | None = None,
+        edited_body: str | None = None,
+        retry_progress_callback: ProviderRetryProgressCallback | None = None,
+        turn_progress_callback: TurnProgressCallback | None = None,
+    ) -> SubmittedRuntimeTurn:
+        save_id = (
+            self.active_save_id
+            if active_save_id is ...
+            else cast(str | None, active_save_id)
+        )
+        if save_id is None:
+            return SubmittedRuntimeTurn(model=self.build_model(error="No save loaded"))
+        interrupted = self.repositories.get_active_interrupted_message_narration(
+            save_id
+        )
+        if interrupted is None or interrupted.message_id != message_id:
+            return SubmittedRuntimeTurn(
+                model=self.build_model(
+                    error="This turn is no longer interrupted.",
+                    active_save_id=save_id,
+                ),
+                save_id=save_id,
+            )
+        source = self.repositories.get_message(
+            save_id=save_id,
+            message_id=message_id,
+        )
+        if source is None:
+            return SubmittedRuntimeTurn(
+                model=self.build_model(
+                    error="The interrupted input is no longer available.",
+                    active_save_id=save_id,
+                ),
+                save_id=save_id,
+            )
+        if edited_body is not None and source.role != "system":
+            return SubmittedRuntimeTurn(
+                model=self.build_model(
+                    error="Only an interrupted timeskip can be edited here.",
+                    active_save_id=save_id,
+                ),
+                save_id=save_id,
+                player_message_id=message_id,
+            )
+
+        self._queued_chat_submissions.add(save_id)
+        try:
+            async with self._save_operation_lock(save_id):
+                if edited_body is not None:
+                    instruction = edited_body
+                    if instruction.startswith(TIMESKIP_MESSAGE_PREFIX):
+                        instruction = instruction[len(TIMESKIP_MESSAGE_PREFIX) :]
+                    safety = await self._review_actor_content(
+                        body=instruction,
+                        save_id=save_id,
+                        current_user_id=current_user_id,
+                    )
+                    source = self.repositories.update_message_body(
+                        save_id=save_id,
+                        message_id=message_id,
+                        body=timeskip_message_body(safety.body),
+                        content_rating=safety.minimum_rating,
+                    )
+                cancellation_token = CancellationToken()
+                self._active_chat_cancellations[save_id] = cancellation_token
+                self._queued_chat_submissions.discard(save_id)
+                try:
+                    chat_service = ChatService(
+                        repositories=self.repositories,
+                        providers=self.providers,
+                        context_search_service=self.context_search_service,
+                        summary_service=self._summary_service(),
+                        media_service=self._media_service(),
+                        prompt_inspection_store=(
+                            self._prompt_inspection_store_if_enabled()
+                        ),
+                    )
+                    submitted_turn = await chat_service.submit_existing_player_turn(
+                        save_id=save_id,
+                        player_message_id=message_id,
+                        source_message_role=source.role,
+                        run_post_turn_jobs=False,
+                        defer_action_choices=True,
+                        turn_directive=(source.body if source.role == "system" else ""),
+                        current_user_id=current_user_id,
+                        cancellation_token=cancellation_token,
+                        retry_progress_callback=retry_progress_callback,
+                        turn_progress_callback=turn_progress_callback,
+                    )
+                except (ChatTurnCancelled, asyncio.CancelledError):
+                    cancellation_token.cancel()
+                    self._mark_interrupted_narration(
+                        save_id=save_id,
+                        message_id=message_id,
+                        status="cancelled",
+                    )
+                    return SubmittedRuntimeTurn(
+                        model=self.build_model(
+                            error=CHAT_TURN_CANCELLED_ERROR,
+                            active_save_id=save_id,
+                        ),
+                        save_id=save_id,
+                        player_message_id=message_id,
+                    )
+                except Exception as exc:
+                    self._mark_interrupted_narration(
+                        save_id=save_id,
+                        message_id=message_id,
+                        status="failed",
+                    )
+                    return SubmittedRuntimeTurn(
+                        model=self.build_model(
+                            error=_user_visible_error(exc),
+                            active_save_id=save_id,
+                        ),
+                        save_id=save_id,
+                        player_message_id=message_id,
+                    )
+                finally:
+                    self._active_chat_cancellations.pop(save_id, None)
+
+                fallback_used = bool(
+                    getattr(submitted_turn, "fallback_used", False)
+                ) or _chat_completion_used_fallback(
+                    repositories=self.repositories,
+                    narrator_message_id=submitted_turn.narrator_message.id,
+                )
+                context_trimmed = bool(
+                    getattr(submitted_turn, "context_trimmed", False)
+                )
+                status = _turn_complete_status(
+                    fallback_used=fallback_used,
+                    context_trimmed=context_trimmed,
+                )
+                return SubmittedRuntimeTurn(
+                    save_id=save_id,
+                    player_message_id=message_id,
+                    narrator_message_id=submitted_turn.narrator_message.id,
+                    turn_revision=getattr(submitted_turn, "turn_revision", None),
+                    context_trimmed=context_trimmed,
+                    prepared_action_choices=getattr(
+                        submitted_turn,
+                        "prepared_action_choices",
+                        None,
+                    ),
+                    delta=self.build_chat_turn_delta(
+                        save_id=save_id,
+                        player_message=submitted_turn.player_message,
+                        narrator_message=submitted_turn.narrator_message,
+                        status=status,
+                        fallback_used=fallback_used,
+                        context_trimmed=context_trimmed,
+                    ),
+                )
+        finally:
+            self._queued_chat_submissions.discard(save_id)
+            self._pending_chat_cancellations.discard(save_id)
+
     async def submit_timeskip(
         self,
         *,
@@ -4901,6 +5088,41 @@ class BragiRuntime:
                 self._queued_chat_submissions.discard(submitted_save_id)
                 self._pending_chat_cancellations.discard(submitted_save_id)
 
+    def _mark_interrupted_narration(
+        self,
+        *,
+        save_id: str,
+        message_id: str | None,
+        status: str,
+    ) -> None:
+        if message_id is None:
+            return
+        reason = (
+            "This turn was cancelled before a narrator response was saved. "
+            "Your input was saved."
+            if status == "cancelled"
+            else "Bragi could not finish the narrator response. Your input was saved."
+        )
+        try:
+            self.repositories.set_message_narration_state(
+                save_id=save_id,
+                message_id=message_id,
+                status=status,
+                error=reason,
+                expected_statuses=("pending", "retrying"),
+            )
+            TurnSnapshotService(self.repositories).capture_current_head_if_dirty(
+                save_id,
+                reason="interrupted_narration",
+            )
+        except ValueError as exc:
+            log_error_event(
+                "runtime.interrupted_narration_persist_failed",
+                save_id=save_id,
+                message_id=message_id,
+                **exception_log_fields(exc),
+            )
+
     async def _submit_player_message_unlocked(
         self,
         *,
@@ -4966,6 +5188,11 @@ class BragiRuntime:
                     body=body,
                     speaker_name=display_speaker_name,
                 )
+                self._mark_interrupted_narration(
+                    save_id=submitted_save_id,
+                    message_id=player_message_id,
+                    status="cancelled",
+                )
                 return SubmittedRuntimeTurn(
                     model=self.build_model(
                         error=CHAT_TURN_CANCELLED_ERROR,
@@ -4988,6 +5215,11 @@ class BragiRuntime:
                     body=body,
                     speaker_name=display_speaker_name,
                 )
+                self._mark_interrupted_narration(
+                    save_id=submitted_save_id,
+                    message_id=player_message_id,
+                    status="cancelled",
+                )
                 return SubmittedRuntimeTurn(
                     model=self.build_model(
                         error=CHAT_TURN_CANCELLED_ERROR,
@@ -5009,6 +5241,11 @@ class BragiRuntime:
                     role="player",
                     body=body,
                     speaker_name=display_speaker_name,
+                )
+                self._mark_interrupted_narration(
+                    save_id=submitted_save_id,
+                    message_id=player_message_id,
+                    status="failed",
                 )
                 return SubmittedRuntimeTurn(
                     model=self.build_model(
@@ -5134,6 +5371,11 @@ class BragiRuntime:
                     body=timeskip_body,
                     speaker_name=TIMESKIP_SPEAKER_NAME,
                 )
+                self._mark_interrupted_narration(
+                    save_id=submitted_save_id,
+                    message_id=source_message_id,
+                    status="cancelled",
+                )
                 return SubmittedRuntimeTurn(
                     model=self.build_model(
                         error=CHAT_TURN_CANCELLED_ERROR,
@@ -5156,6 +5398,11 @@ class BragiRuntime:
                     body=timeskip_body,
                     speaker_name=TIMESKIP_SPEAKER_NAME,
                 )
+                self._mark_interrupted_narration(
+                    save_id=submitted_save_id,
+                    message_id=source_message_id,
+                    status="cancelled",
+                )
                 return SubmittedRuntimeTurn(
                     model=self.build_model(
                         error=CHAT_TURN_CANCELLED_ERROR,
@@ -5177,6 +5424,11 @@ class BragiRuntime:
                     role="system",
                     body=timeskip_body,
                     speaker_name=TIMESKIP_SPEAKER_NAME,
+                )
+                self._mark_interrupted_narration(
+                    save_id=submitted_save_id,
+                    message_id=source_message_id,
+                    status="failed",
                 )
                 return SubmittedRuntimeTurn(
                     model=self.build_model(
@@ -5609,6 +5861,7 @@ class BragiRuntime:
                     role="player",
                     speaker_name=display_speaker_name,
                     body=revision.body,
+                    narration_status="pending",
                 )
                 replacement_player_message_id = replacement_player.id
             self.repositories.commit_transaction()
@@ -5773,6 +6026,11 @@ class BragiRuntime:
                 action=action_name,
             )
             restore_resubmission_after_failure()
+            self._mark_interrupted_narration(
+                save_id=save_id,
+                message_id=replacement_player_message_id,
+                status="cancelled",
+            )
             raise
         except Exception as exc:
             log_error_event(
@@ -5783,6 +6041,11 @@ class BragiRuntime:
                 **exception_log_fields(exc),
             )
             restore_resubmission_after_failure()
+            self._mark_interrupted_narration(
+                save_id=save_id,
+                message_id=replacement_player_message_id,
+                status="failed",
+            )
             return SubmittedRuntimeTurn(
                 model=self.build_model(
                     error=_user_visible_error(exc),

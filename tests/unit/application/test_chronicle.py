@@ -8,7 +8,7 @@ from typing import Any
 
 from pytest import MonkeyPatch
 
-from bragi.persistence.models import MessageRecord
+from bragi.persistence.models import MessageNarrationStateRecord, MessageRecord
 from bragi_common.story_continuation import (
     STORY_CONTINUATION_DIRECTION,
     STORY_CONTINUATION_SPEAKER_NAME,
@@ -57,6 +57,43 @@ def test_chronicle_model_renders_persisted_message_fields(
         "I climb toward the beacon lens.",
         "Ash scratches the glass as the stair shakes.",
     ]
+
+
+def test_chronicle_model_exposes_interrupted_turn_recovery_actions(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    chronicle = _import_chronicle_without_gtk(monkeypatch)
+    message = _message(
+        role="player",
+        speaker_name="Mara",
+        body="I open the observatory door.",
+        message_id="player-1",
+    )
+
+    model = chronicle.build_chronicle_model(
+        messages=(message,),
+        interrupted_narration=MessageNarrationStateRecord(
+            message_id=message.id,
+            save_id=message.save_id,
+            status="failed",
+            error="The response could not be completed. Retry or edit this turn.",
+            source_kind="player",
+        ),
+    )
+
+    [rendered] = list(_value(model, "messages", "items"))
+    interruption = _value(rendered, "interrupted_turn")
+    assert _value(interruption, "status") == "failed"
+    assert _value(interruption, "reason") == (
+        "The response could not be completed. Retry or edit this turn."
+    )
+    assert {
+        _value(action, "action_id", "id") for action in _value(rendered, "actions")
+    } >= {
+        "retry-interrupted-turn",
+        "edit-and-resubmit-message",
+        "delete-messages-from-here",
+    }
 
 
 def test_chronicle_model_hides_internal_story_continuation_direction(

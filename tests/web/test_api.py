@@ -7463,6 +7463,7 @@ def test_chat_submission_status_blocks_same_save_active_chat_turn(
         "reason": "chat_turn_active",
         "blocking_job_id": "chat-1",
         "blocking_job_status": "running",
+        "blocking_message_id": None,
     }
     assert allowed.status_code == 200
     assert allowed.json() == {
@@ -7471,6 +7472,7 @@ def test_chat_submission_status_blocks_same_save_active_chat_turn(
         "reason": None,
         "blocking_job_id": None,
         "blocking_job_status": None,
+        "blocking_message_id": None,
     }
     assert jobs.list_active_save_ids == ["save-1", "save-3"]
 
@@ -7492,6 +7494,7 @@ def test_chat_submission_status_blocks_when_no_save_is_available(
         "reason": "no_save",
         "blocking_job_id": None,
         "blocking_job_status": None,
+        "blocking_message_id": None,
     }
 
 
@@ -7937,6 +7940,71 @@ def test_chat_post_records_save_id_on_created_job(tmp_path: Path) -> None:
 
     assert created.status_code == 200
     assert created.json()["save_id"] == "save-1"
+
+
+def test_retry_interrupted_chat_queues_source_scoped_turn_without_new_input(
+    tmp_path: Path,
+) -> None:
+    class RetryRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.retry_calls: list[tuple[str, object]] = []
+
+        async def retry_interrupted_turn_for_initial_render(
+            self,
+            *,
+            message_id: str,
+            active_save_id: object,
+            **_kwargs: object,
+        ) -> object:
+            self.retry_calls.append((message_id, active_save_id))
+            return SimpleNamespace(
+                model=_chat_model("The observatory door opens."),
+                has_post_turn_jobs=False,
+                save_id="save-1",
+                player_message_id=message_id,
+                narrator_message_id="narrator-1",
+            )
+
+    runtime = RetryRuntime()
+    state = _state_double(tmp_path, runtime)
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(
+        sqlite3.connect(database_path, check_same_thread=False)
+    )
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Observatory",
+        premise="A sealed observatory waits above the city.",
+        player_role="Keeper",
+        content={},
+    )
+    repositories.create_save(
+        save_id="save-1",
+        scenario_id=scenario.id,
+        title="Observatory",
+    )
+    source = repositories.append_message(
+        save_id="save-1",
+        role="player",
+        speaker_name="Mara",
+        body="I open the observatory door.",
+        narration_status="failed",
+        narration_error="Bragi could not finish the narrator response.",
+    )
+    state.repositories = repositories
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        created = client.post(
+            "/api/chat/retry",
+            json={"message_id": source.id, "save_id": "save-1"},
+        )
+        job = _wait_for_terminal_job(client, created.json()["id"], save_id="save-1")
+
+    assert created.status_code == 200
+    assert job["status"] == "succeeded"
+    assert runtime.retry_calls == [(source.id, "save-1")]
 
 
 def test_chat_post_rejects_internal_story_continuation_speaker(
@@ -17093,6 +17161,7 @@ def _state_double(tmp_path: Path, runtime: object | None = None) -> SimpleNamesp
         repositories=SimpleNamespace(
             list_saves=lambda: [],
             list_media_assets=lambda _save_id: [],
+            get_active_interrupted_message_narration=lambda _save_id: None,
         ),
         settings_service=lambda: SimpleNamespace(secret_storage_warning=lambda: None),
         secret_store=SimpleNamespace(),
