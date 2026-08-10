@@ -344,6 +344,16 @@ def test_scenario_section_candidates_include_mystery_hidden_truth() -> None:
 
     assert candidates == (
         (
+            "scenario:scenario-1:section:case_facts",
+            "case_facts",
+            "Curator Elian Vale vanished from a sealed gallery.",
+        ),
+        (
+            "scenario:scenario-1:section:case_status",
+            "case_status",
+            "Unresolved.",
+        ),
+        (
             "scenario:scenario-1:section:hidden_truth",
             "hidden_truth",
             "Sera hid the ledger in the restoration lift.",

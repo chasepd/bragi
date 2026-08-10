@@ -218,6 +218,19 @@ def test_config_fields_are_not_compiled_as_canon_sections() -> None:
     ) == {"lore": "The old bell answers only at dusk."}
 
 
+def test_mystery_case_fields_are_compiled_as_canon_sections() -> None:
+    assert scenario_canon_source_sections(
+        {
+            "case_facts": "Curator Vale vanished from a sealed gallery.",
+            "case_status": "The disappearance remains unresolved.",
+            "current_scene": "Mara stands outside the gallery.",
+        }
+    ) == {
+        "case_facts": "Curator Vale vanished from a sealed gallery.",
+        "case_status": "The disappearance remains unresolved.",
+    }
+
+
 def test_edit_invalidates_compilation_and_regenerates_claims() -> None:
     provider = FakeProviderClient(structured_output=_output())
     compiler = ScenarioCanonCompiler(

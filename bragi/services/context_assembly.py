@@ -90,8 +90,6 @@ SCENARIO_CORE_CONTENT_KEYS = frozenset(
         "character_starters",
         "action_choices_enabled",
         "choice_style",
-        "case_facts",
-        "case_status",
     )
 )
 _MISSING = object()
