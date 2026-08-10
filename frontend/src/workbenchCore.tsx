@@ -5014,6 +5014,13 @@ function chronicleJobActionRequest(
       fallbackError: "Could not regenerate message"
     };
   }
+  if (actionId === "retry-interrupted-turn") {
+    return {
+      path: "/api/chat/retry",
+      body: { message_id: messageId, save_id: activeSaveId },
+      fallbackError: "Could not retry response"
+    };
+  }
   if (actionId === "generate-scene-image") {
     return {
       path: "/api/media/generate",
@@ -5056,7 +5063,13 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
         <span>{isDirection ? "Direction" : message.speaker_name || message.role}</span>
         {message.revision_count ? <small className="message-edited">Edited</small> : null}
         <div className="message-actions">
-          {message.actions.map((action) => {
+          {message.actions
+            .filter((action) => !message.interrupted_turn || ![
+              "retry-interrupted-turn",
+              "edit-and-resubmit-message",
+              "delete-messages-from-here"
+            ].includes(action.action_id))
+            .map((action) => {
             const actionKey = chronicleJobActionKey(message.message_id, action.action_id);
             const jobRequest = chronicleJobActionRequest(action.action_id, message.message_id, activeSaveId);
             const actionPending = Boolean(jobRequest && pendingJobActionKeys.has(actionKey));
@@ -5087,6 +5100,49 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
         error ? <InlineNotice key={key} className="message-action-error">{error}</InlineNotice> : null
       ))}
       <MarkdownView message={message} />
+      {message.interrupted_turn ? (
+        <div className="interrupted-turn" role="alert">
+          <div>
+            <strong>
+              {message.interrupted_turn.status === "cancelled"
+                ? "Turn cancelled"
+                : "Turn interrupted"}
+            </strong>
+            <p>{message.interrupted_turn.reason}</p>
+          </div>
+          <div className="interrupted-turn-actions">
+            {message.actions
+              .filter((action) => [
+                "retry-interrupted-turn",
+                "edit-and-resubmit-message",
+                "delete-messages-from-here"
+              ].includes(action.action_id))
+              .map((action) => {
+                const actionKey = chronicleJobActionKey(
+                  message.message_id,
+                  action.action_id
+                );
+                const actionPending = pendingJobActionKeys.has(actionKey);
+                return (
+                  <button
+                    key={action.action_id}
+                    type="button"
+                    className={touchActionClassName(
+                      action.action_id === "delete-messages-from-here"
+                        && "destructive-action"
+                    )}
+                    disabled={actionPending || mutationsDisabled}
+                    title={action.label}
+                    aria-label={action.label}
+                    onClick={() => onAction(action.action_id, message)}
+                  >
+                    {actionPending ? "Working…" : action.label}
+                  </button>
+                );
+              })}
+          </div>
+        </div>
+      ) : null}
     </article>
   );
 });
@@ -5843,14 +5899,18 @@ function EditMessageModal({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const titleId = React.useId();
-  const isNarratorEdit = message.role !== "player";
+  const isNarratorEdit = message.role === "narrator";
+  const isSystemEdit = message.role === "system";
   const unchanged = body.trim() === message.body.trim();
   const submitEdit = async (mode: "save" | "resubmit") => {
     setBusy(true);
     setError("");
     try {
       if (mode === "resubmit") {
-        runJob(await postJson<Job>("/api/chat/edit", { message_id: message.message_id, body, save_id: activeSaveId }));
+        runJob(await postJson<Job>(
+          message.role === "system" ? "/api/chat/retry" : "/api/chat/edit",
+          { message_id: message.message_id, body, save_id: activeSaveId }
+        ));
       } else if (isNarratorEdit) {
         runJob(await postJson<Job>("/api/chat/narrator-edit", {
           message_id: message.message_id,
@@ -5900,9 +5960,11 @@ function EditMessageModal({
             </button>
           ) : (
             <>
-              <button type="button" className="primary-command compact" disabled={busy || !body.trim() || unchanged} onClick={() => submitEdit("save")}>
-                <Save size={15} /> Edit without Resubmit
-              </button>
+              {!isSystemEdit ? (
+                <button type="button" className="primary-command compact" disabled={busy || !body.trim() || unchanged} onClick={() => submitEdit("save")}>
+                  <Save size={15} /> Edit without Resubmit
+                </button>
+              ) : null}
               <button type="submit" className="primary-command compact" disabled={busy || !body.trim()}>
                 <RefreshCw size={15} /> Resubmit
               </button>
@@ -6091,6 +6153,7 @@ function splitInspectionText(text: string): { sources: string; raw: string | nul
 }
 
 function actionIcon(actionId: string) {
+  if (actionId === "retry-interrupted-turn") return <RefreshCw size={14} />;
   if (actionId === "edit-and-resubmit-message") return <Edit3 size={14} />;
   if (actionId === "edit-text-message") return <Edit3 size={14} />;
   if (actionId === "correct-character-text-message") return <Edit3 size={14} />;

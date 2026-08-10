@@ -6781,6 +6781,68 @@ def test_timeskip_initial_render_persists_system_request_and_defers_post_turn_jo
 
 
 @pytest.mark.parametrize(
+    ("role", "speaker_name", "body"),
+    [
+        ("player", "Mara", "I open the observatory door."),
+        ("system", "Timeskip", "Timeskip request: Skip to dawn."),
+    ],
+)
+def test_retry_interrupted_turn_reuses_committed_source_message(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    role: str,
+    speaker_name: str,
+    body: str,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, _ = _persist_runtime_save(repositories, include_messages=False)
+    _configure_chat_and_context_preferences(repositories)
+    source = repositories.append_message(
+        save_id=save_id,
+        role=role,
+        speaker_name=speaker_name,
+        body=body,
+        narration_status="failed",
+        narration_error="Bragi could not finish the narrator response.",
+    )
+    provider = RuntimeFakeProvider()
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        provider=provider,
+        context_search_service=NoopContextSearch(),
+    )
+    controller.load_save(save_id)
+
+    turn = asyncio.run(
+        controller.retry_interrupted_turn_for_initial_render(
+            message_id=source.id,
+            edited_body=(
+                "Timeskip request: Skip to midnight."
+                if role == "system"
+                else None
+            ),
+        )
+    )
+
+    persisted_messages = repositories.list_messages(save_id)
+    assert [message.id for message in persisted_messages[:1]] == [source.id]
+    assert [message.role for message in persisted_messages] == [role, "narrator"]
+    if role == "system":
+        assert persisted_messages[0].body == "Timeskip request: Skip to midnight."
+    assert _value(turn, "player_message_id") == source.id
+    assert repositories.get_active_interrupted_message_narration(save_id) is None
+    state = repositories.get_message_narration_state(
+        save_id=save_id,
+        message_id=source.id,
+    )
+    assert state is not None
+    assert state.status == "complete"
+
+
+@pytest.mark.parametrize(
     ("player_character_name", "expected_speaker_name"),
     [
         ("Mara Voss", "Mara Voss"),

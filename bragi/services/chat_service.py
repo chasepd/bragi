@@ -1081,6 +1081,7 @@ class ChatService:
                 body=body,
                 content_rating=player_content_rating,
                 reason="player_message",
+                narration_status="pending",
             )
         except Exception:
             turn_progress.publish("input", "failed", "Saving player input failed")
@@ -1187,6 +1188,7 @@ class ChatService:
                 body=directive,
                 content_rating=timeskip_content_rating,
                 reason="system_message",
+                narration_status="pending",
             )
         except Exception:
             turn_progress.publish("input", "failed", "Saving timeskip failed")
@@ -1228,6 +1230,7 @@ class ChatService:
         body: str,
         content_rating: str,
         reason: str,
+        narration_status: str = "complete",
     ) -> MessageRecord:
         self.repositories.begin_immediate_transaction()
         try:
@@ -1237,6 +1240,7 @@ class ChatService:
                 speaker_name=speaker_name,
                 body=body,
                 content_rating=content_rating,
+                narration_status=narration_status,
             )
             TurnSnapshotService(self.repositories).capture_message_snapshot(
                 save_id=save_id,
@@ -1519,6 +1523,25 @@ class ChatService:
             )
         if player_message is None:
             raise ValueError(f"Unknown active source message id: {player_message_id}")
+        narration_state = self.repositories.get_message_narration_state(
+            save_id=save_id,
+            message_id=player_message.id,
+        )
+        if narration_state is not None:
+            if narration_state.status in {"failed", "cancelled"}:
+                self.repositories.set_message_narration_state(
+                    save_id=save_id,
+                    message_id=player_message.id,
+                    status="retrying",
+                    expected_statuses=("failed", "cancelled"),
+                )
+            elif narration_state.status == "complete":
+                self.repositories.set_message_narration_state(
+                    save_id=save_id,
+                    message_id=player_message.id,
+                    status="pending",
+                    expected_statuses=("complete",),
+                )
         if log_turn_started:
             log_event(
                 "chat.turn_started",
@@ -2843,6 +2866,12 @@ class ChatService:
                 ),
                 safety_transition=completion.safety_transition,
                 content_rating=completion.content_rating,
+            )
+            self.repositories.set_message_narration_state(
+                save_id=save_id,
+                message_id=player_message.id,
+                status="complete",
+                expected_statuses=("pending", "retrying"),
             )
             activity_cursor = (
                 phone_activity_context.next_cursor

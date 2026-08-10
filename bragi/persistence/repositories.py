@@ -55,6 +55,7 @@ from bragi.persistence.models import (
     MediaAssetRecord,
     MemoryRecord,
     MessageActionChoiceRecord,
+    MessageNarrationStateRecord,
     MessagePageRecord,
     MessageRecord,
     MessageRevisionMetadataRecord,
@@ -198,6 +199,9 @@ JOB_STEP_STATUSES = frozenset(
 _JOB_INITIAL_STATUSES = frozenset({"queued", "running"})
 _JOB_TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 _JOB_UPDATE_STATUSES = frozenset({"succeeded", "failed"})
+_MESSAGE_NARRATION_STATUSES = frozenset(
+    {"complete", "pending", "retrying", "failed", "cancelled"}
+)
 _SAFE_TEXT_METADATA_KEYS = frozenset(
     {
         "evidence_quote",
@@ -2422,8 +2426,11 @@ class PersistenceRepositories:
         updated_at: str | None = None,
         safety_transition: str = "",
         content_rating: str = "unclassified",
+        narration_status: str = "complete",
+        narration_error: str | None = None,
         touch_save_updated_at: bool = True,
     ) -> MessageRecord:
+        _validate_message_narration_status(narration_status)
         body, safety_transition = normalize_message_safety(
             body=body,
             role=role,
@@ -2447,13 +2454,13 @@ class PersistenceRepositories:
             INSERT INTO messages(
                 id, save_id, role, speaker_name, body, provider, model,
                 token_estimate, created_at, updated_at, safety_transition,
-                content_rating
+                content_rating, narration_status, narration_error
             )
             VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?,
                 COALESCE(?, CURRENT_TIMESTAMP),
                 COALESCE(?, strftime('%Y-%m-%d %H:%M:%f', 'now')),
-                ?, ?
+                ?, ?, ?, ?
             )
             """,
             (
@@ -2469,6 +2476,8 @@ class PersistenceRepositories:
                 updated_at,
                 record.safety_transition,
                 record.content_rating,
+                narration_status,
+                redact_text(narration_error),
             ),
         )
         if touch_save_updated_at:
@@ -2542,6 +2551,120 @@ class PersistenceRepositories:
             (save_id, message_id),
         )
         return MessageRecord(**dict(row)) if row else None
+
+    def get_message_narration_state(
+        self,
+        *,
+        save_id: str,
+        message_id: str,
+    ) -> MessageNarrationStateRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, role, narration_status, narration_error
+            FROM messages
+            WHERE save_id = ? AND id = ? AND deleted_at IS NULL
+            """,
+            (save_id, message_id),
+        )
+        return _message_narration_state_from_row(row) if row is not None else None
+
+    def get_active_interrupted_message_narration(
+        self,
+        save_id: str,
+    ) -> MessageNarrationStateRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, role, speaker_name, body,
+                   narration_status, narration_error
+            FROM messages
+            WHERE save_id = ? AND deleted_at IS NULL
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (save_id,),
+        )
+        if row is None or row["narration_status"] not in {"failed", "cancelled"}:
+            return None
+        if (
+            row["role"] == "player"
+            and row["speaker_name"] == STORY_CONTINUATION_SPEAKER_NAME
+            and row["body"] == STORY_CONTINUATION_DIRECTION
+        ):
+            return None
+        if row["role"] not in {"player", "system"}:
+            return None
+        return _message_narration_state_from_row(row)
+
+    def set_message_narration_state(
+        self,
+        *,
+        save_id: str,
+        message_id: str,
+        status: str,
+        error: str | None = None,
+        expected_statuses: tuple[str, ...] = (),
+    ) -> MessageNarrationStateRecord:
+        _validate_message_narration_status(status)
+        for expected_status in expected_statuses:
+            _validate_message_narration_status(expected_status)
+        expected_clause = ""
+        params: list[object] = [status, redact_text(error), save_id, message_id]
+        if expected_statuses:
+            expected_clause = (
+                f"AND narration_status IN ({_placeholders(len(expected_statuses))})"
+            )
+            params.extend(expected_statuses)
+        cursor = self.connection.execute(
+            f"""
+            UPDATE messages
+            SET narration_status = ?, narration_error = ?
+            WHERE save_id = ? AND id = ? AND deleted_at IS NULL
+              {expected_clause}
+            """,
+            tuple(params),
+        )
+        self.commit()
+        if cursor.rowcount != 1:
+            raise ValueError(
+                f"Message narration state did not transition: {message_id}"
+            )
+        state = self.get_message_narration_state(
+            save_id=save_id,
+            message_id=message_id,
+        )
+        if state is None:
+            raise ValueError(f"Unknown active message id: {message_id}")
+        return state
+
+    def recover_interrupted_message_narrations(
+        self,
+        *,
+        error: str,
+    ) -> list[str]:
+        rows = self._fetch_all(
+            """
+            SELECT id
+            FROM messages
+            WHERE deleted_at IS NULL
+              AND narration_status IN ('pending', 'retrying')
+            ORDER BY rowid
+            """,
+            (),
+        )
+        message_ids = [str(row["id"]) for row in rows]
+        if not message_ids:
+            return []
+        self.connection.execute(
+            """
+            UPDATE messages
+            SET narration_status = 'cancelled', narration_error = ?
+            WHERE deleted_at IS NULL
+              AND narration_status IN ('pending', 'retrying')
+            """,
+            (redact_text(error),),
+        )
+        self.commit()
+        return message_ids
 
     def list_messages(
         self,
@@ -16444,6 +16567,24 @@ def _setting_scope_id(scope: str, scope_id: str | None) -> str:
     if not scope_id:
         raise ValueError(f"{scope} setting scope requires scope_id")
     return scope_id
+
+
+def _validate_message_narration_status(status: str) -> None:
+    if status not in _MESSAGE_NARRATION_STATUSES:
+        raise ValueError(f"Unsupported message narration status: {status}")
+
+
+def _message_narration_state_from_row(
+    row: sqlite3.Row,
+) -> MessageNarrationStateRecord:
+    role = str(row["role"])
+    return MessageNarrationStateRecord(
+        message_id=str(row["id"]),
+        save_id=str(row["save_id"]),
+        status=str(row["narration_status"]),
+        error=(str(row["narration_error"]) if row["narration_error"] else None),
+        source_kind="timeskip" if role == "system" else "player",
+    )
 
 
 def _scoped_setting_from_row(row: sqlite3.Row) -> ScopedSettingRecord:

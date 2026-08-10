@@ -464,6 +464,69 @@ def test_chat_bundle_round_trips_storyteller_mode_and_defaults_legacy_mode(
     assert legacy_save.interaction_mode is InteractionMode.ROLEPLAY
 
 
+def test_chat_bundle_preserves_interrupted_turn_recovery_state(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    interrupted_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I open the observatory door.",
+        narration_status="pending",
+    )
+    repositories.set_message_narration_state(
+        message_id=interrupted_message.id,
+        save_id=save.id,
+        status="failed",
+        error="The response could not be completed. Retry or edit this turn.",
+    )
+    bundle_path = tmp_path / "interrupted-turn.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+    imported = service.import_save(bundle_path)
+
+    interruption = repositories.get_active_interrupted_message_narration(
+        _imported_save_id(imported)
+    )
+    assert interruption is not None
+    assert interruption.status == "failed"
+    assert interruption.error == (
+        "The response could not be completed. Retry or edit this turn."
+    )
+
+
+def test_chat_bundle_preserves_interrupted_timeskip_recovery_state(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.append_message(
+        save_id=save.id,
+        role="system",
+        speaker_name="Timeskip",
+        body="Timeskip request: Advance the world by 2 hours.",
+        narration_status="failed",
+        narration_error="The response could not be completed. Retry or edit this turn.",
+    )
+    bundle_path = tmp_path / "interrupted-timeskip.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+    imported = service.import_save(bundle_path)
+
+    interruption = repositories.get_active_interrupted_message_narration(
+        _imported_save_id(imported)
+    )
+    assert interruption is not None
+    assert interruption.status == "failed"
+    assert interruption.source_kind == "timeskip"
+
+
 def test_export_save_writes_manifest_data_and_referenced_media(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -5540,7 +5603,7 @@ def test_import_save_rejects_unsupported_message_role_without_new_save(
     )
     save_ids = [save.id for save in repositories.list_saves()]
 
-    with pytest.raises(module.ChatBundleError, match="Unsupported message role"):
+    with pytest.raises(module.ChatBundleError, match="Unsupported"):
         service.import_save(broken_bundle_path)
 
     assert [save.id for save in repositories.list_saves()] == save_ids

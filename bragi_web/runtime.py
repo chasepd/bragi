@@ -488,6 +488,18 @@ def create_state() -> WebAppState:
             recover_text_deliveries(
                 error="Text delivery was interrupted before completion",
             )
+        recover_message_narrations = getattr(
+            repositories,
+            "recover_interrupted_message_narrations",
+            None,
+        )
+        if callable(recover_message_narrations):
+            recover_message_narrations(
+                error=(
+                    "This turn was interrupted before a narrator response was "
+                    "saved. Your input was saved."
+                ),
+            )
         _seed_fake_models_if_requested(repositories, providers)
     providers = bindings.wrap_provider_clients_for_telemetry(
         providers,

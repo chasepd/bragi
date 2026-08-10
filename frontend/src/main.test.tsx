@@ -2111,6 +2111,194 @@ describe("frontend helpers", () => {
     });
   });
 
+  it.each(["failed", "cancelled"] as const)(
+    "restores a %s committed turn and retries without duplicating it",
+    async (status) => {
+      const retryJob = {
+        id: "job-retry-1",
+        type: "chat_turn",
+        status: "queued",
+        result: null,
+        error: null
+      };
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => retryJob
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const runJob = vi.fn();
+      const { Chronicle } = await import("./main");
+      const model = runtimeModel({
+        composer_enabled: false,
+        chronicle: {
+          messages: [
+            {
+              message_id: "player-interrupted-1",
+              role: "player",
+              speaker_name: "Mara",
+              body: "I open the observatory door.",
+              interrupted_turn: {
+                status,
+                reason: status === "cancelled"
+                  ? "The response was cancelled. Retry or edit this turn."
+                  : "The response could not be completed. Retry or edit this turn.",
+                source_kind: "player"
+              },
+              actions: [
+                { action_id: "retry-interrupted-turn", label: "Retry response" },
+                { action_id: "edit-and-resubmit-message", label: "Edit and resubmit" },
+                { action_id: "delete-messages-from-here", label: "Delete from here" }
+              ]
+            }
+          ]
+        }
+      });
+
+      render(<Chronicle model={model} runJob={runJob} pendingMessage={null} />);
+
+      expect(screen.getAllByText("I open the observatory door.")).toHaveLength(1);
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        status === "cancelled" ? "Turn cancelled" : "Turn interrupted"
+      );
+      const retryButtons = screen.getAllByRole("button", { name: "Retry response" });
+      await userEvent.click(retryButtons[retryButtons.length - 1]);
+
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        "/api/chat/retry",
+        expect.anything()
+      ));
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1].body))).toEqual({
+        message_id: "player-interrupted-1",
+        save_id: "save-1"
+      });
+      expect(runJob).toHaveBeenCalledWith(retryJob);
+    }
+  );
+
+  it("edits an interrupted timeskip through the retry endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        id: "job-timeskip-edit",
+        type: "chat_turn",
+        status: "queued",
+        result: null,
+        error: null
+      })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Chronicle } = await import("./main");
+    render(<Chronicle model={runtimeModel({
+      chronicle: { messages: [{
+        message_id: "timeskip-1",
+        role: "system",
+        speaker_name: "Timeskip",
+        body: "Timeskip request: Skip to dawn.",
+        interrupted_turn: {
+          status: "failed",
+          reason: "The response was interrupted.",
+          source_kind: "timeskip"
+        },
+        actions: [
+          { action_id: "retry-interrupted-turn", label: "Retry response" },
+          { action_id: "edit-and-resubmit-message", label: "Edit this message" },
+          { action_id: "delete-messages-from-here", label: "Delete from here" }
+        ]
+      }] }
+    })} runJob={vi.fn()} pendingMessage={null} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit this message" }));
+    expect(screen.queryByRole("button", { name: "Edit without Resubmit" })).not.toBeInTheDocument();
+    const editor = screen.getByLabelText("Message");
+    await userEvent.clear(editor);
+    await userEvent.type(editor, "Timeskip request: Skip to midnight.");
+    await userEvent.click(screen.getByRole("button", { name: "Resubmit" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/chat/retry",
+      expect.anything()
+    ));
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1].body))).toMatchObject({
+      message_id: "timeskip-1",
+      body: "Timeskip request: Skip to midnight."
+    });
+  });
+
+  it.each(["failed", "cancelled"] as const)(
+    "refreshes the committed turn after a chat job reports %s",
+    async (status) => {
+      const sources = installEventSourceDouble();
+      const chatJob = {
+        id: `job-chat-${status}`,
+        type: "chat_turn",
+        save_id: "save-1",
+        status: "running",
+        result: null,
+        error: null
+      } satisfies Job;
+      let currentModel = runtimeModel();
+      const fallbackFetch = workbenchFetch([chatJob], currentModel);
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(
+        (path: string, init?: RequestInit) => path.startsWith("/api/runtime")
+          ? Promise.resolve({ ok: true, json: async () => currentModel })
+          : fallbackFetch(path, init)
+      ));
+      const { Workbench } = await import("./main");
+
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <Workbench />
+        </QueryClientProvider>
+      );
+
+      const jobSource = await waitFor(() => {
+        const source = sources.find((candidate) => candidate.url.includes(chatJob.id));
+        if (!source) throw new Error("chat job watcher was not created");
+        return source;
+      });
+      currentModel = runtimeModel({
+        composer_enabled: false,
+        chronicle: {
+          messages: [
+            {
+              message_id: "player-committed-1",
+              role: "player",
+              speaker_name: "Mara",
+              body: "I open the observatory door.",
+              interrupted_turn: {
+                status,
+                reason: "The response was interrupted. Retry or edit this turn.",
+                source_kind: "player"
+              },
+              actions: [
+                { action_id: "retry-interrupted-turn", label: "Retry response" },
+                { action_id: "edit-and-resubmit-message", label: "Edit and resubmit" },
+                { action_id: "delete-messages-from-here", label: "Delete from here" }
+              ]
+            }
+          ]
+        }
+      });
+
+      act(() => {
+        jobSource.dispatch("done", {
+          ...chatJob,
+          status,
+          error: status === "failed" ? "Background job failed." : null
+        });
+      });
+
+      const interruptionTitle = await screen.findByText(
+        status === "cancelled" ? "Turn cancelled" : "Turn interrupted"
+      );
+      expect(interruptionTitle.closest('[role="alert"]')).toHaveTextContent(
+        "The response was interrupted."
+      );
+      expect(screen.getAllByText("I open the observatory door.")).toHaveLength(1);
+      expect(screen.getAllByRole("button", { name: "Retry response" })).toHaveLength(1);
+    }
+  );
+
   it("renders storyteller human messages as directions with guiding composer copy", async () => {
     const { Chronicle, Composer } = await import("./main");
     const model = runtimeModel({

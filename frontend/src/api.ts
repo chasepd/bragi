@@ -241,6 +241,11 @@ export type ChronicleMessage = {
   markdown_blocks?: MarkdownBlock[];
   debug_prompt?: unknown;
   debug_provider_payload?: unknown;
+  interrupted_turn?: {
+    status: "failed" | "cancelled";
+    reason: string;
+    source_kind: "player" | "timeskip";
+  } | null;
 };
 export type ChronicleModel = {
   messages: ChronicleMessage[];
@@ -935,9 +940,10 @@ export function isPostTurnCatchupProgress(value: unknown): value is PostTurnCatc
 export type ChatSubmissionStatus = {
   save_id: string | null;
   can_submit: boolean;
-  reason: "no_save" | "chat_turn_active" | null;
+  reason: "no_save" | "chat_turn_active" | "interrupted_turn" | null;
   blocking_job_id: string | null;
   blocking_job_status: Job["status"] | null;
+  blocking_message_id?: string | null;
 };
 export type WorldDataModel = {
   active_save_id: string | null;
