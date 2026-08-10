@@ -109,7 +109,9 @@ def test_profile_service_applies_generated_character_route_profile(
     updated = repositories.get_dating_route_state(route.id)
     assert updated is not None
     assert result.status == "succeeded"
+    assert result.seeded_count == 0
     assert result.updated_count == 1
+    assert result.changed_count == 1
     assert updated.comfort_with_intimacy.startswith("open to physical")
     assert updated.pacing_preference == "direct and chemistry-led"
     assert updated.known_boundaries == [

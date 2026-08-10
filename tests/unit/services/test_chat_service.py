@@ -5089,6 +5089,65 @@ def test_submit_player_turn_does_not_capture_profile_snapshot_when_routes_exist(
     assert snapshot.reason != "pre_turn_dating_route_profile"
 
 
+def test_submit_player_turn_skips_snapshot_check_when_route_profile_is_unchanged(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _player_id, _npc_id = _create_dating_chat_save(
+        repositories,
+        stage="introduced",
+    )
+    route = repositories.list_dating_route_states(save_id)[0]
+    repositories.upsert_dating_route_state(
+        save_id=save_id,
+        player_character_id=route.player_character_id,
+        npc_character_id=route.npc_character_id,
+        stage=route.stage,
+        comfort_with_intimacy="already profiled",
+        pacing_preference="already paced",
+        route_id=route.id,
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-chat",
+        display_name="Fake Chat",
+        capabilities=[ProviderCapability.CHAT.value],
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    def fail_dirty_capture(
+        self: TurnSnapshotService,
+        save_id: str,
+        *,
+        reason: str = "dirty_head",
+    ) -> object:
+        raise AssertionError(f"unexpected dirty snapshot capture: {save_id} {reason}")
+
+    monkeypatch.setattr(
+        TurnSnapshotService,
+        "capture_current_head_if_dirty",
+        fail_dirty_capture,
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": RecordingChatProvider("fake")},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    asyncio.run(
+        service.submit_player_turn(
+            save_id=save_id,
+            body="I ask Mika about the gate.",
+            speaker_name="Lio",
+            run_post_turn_jobs=False,
+        )
+    )
+
+
 def test_submit_player_turn_keeps_dating_route_anchor_after_setup_ages_out(
     repositories: PersistenceRepositories,
 ) -> None:

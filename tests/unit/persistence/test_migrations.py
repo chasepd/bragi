@@ -2279,3 +2279,77 @@ def test_migration_77_to_78_backfills_summary_pressure_state(tmp_path: Path) -> 
         assert row["active_summary_count"] == 1
         assert row["active_summary_token_estimate"] == 6
         assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_81_to_82_backfills_incremental_snapshot_tracking(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "incremental-snapshots.db"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO scenarios(id, type, title, content_json) VALUES (?, ?, ?, ?)",
+            ("scenario-1", "full_roleplay", "Bridge", "{}"),
+        )
+        connection.execute(
+            "INSERT INTO saves(id, scenario_id, title) VALUES (?, ?, ?)",
+            ("save-1", "scenario-1", "Crossing"),
+        )
+        trigger_names = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'trigger' AND name LIKE 'dirty_snapshot_%'
+            """
+        ).fetchall()
+        for (trigger_name,) in trigger_names:
+            connection.execute(f'DROP TRIGGER "{trigger_name}"')
+        for table_name in (
+            "save_snapshot_activity_state",
+            "save_snapshot_included_activity_events",
+            "save_snapshot_row_references",
+            "save_snapshot_row_state",
+            "save_snapshot_dirty_rows",
+            "save_snapshot_table_state",
+            "save_snapshot_state",
+        ):
+            connection.execute(f"DROP TABLE {table_name}")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 82")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        tables = _object_names(connection, "table")
+        assert {
+            "save_snapshot_state",
+            "save_snapshot_table_state",
+            "save_snapshot_dirty_rows",
+            "save_snapshot_row_state",
+            "save_snapshot_row_references",
+            "save_snapshot_activity_state",
+            "save_snapshot_included_activity_events",
+        } <= tables
+        indexes = _object_names(connection, "index")
+        assert {
+            "idx_snapshot_row_recheck_due",
+            "idx_snapshot_reference_target",
+        } <= indexes
+        trigger_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'trigger' AND name LIKE 'dirty_snapshot_%'
+            """
+        ).fetchone()[0]
+        assert trigger_count > 0
+        state = connection.execute(
+            """
+            SELECT COUNT(*), MIN(needs_rebuild)
+            FROM save_snapshot_table_state
+            WHERE save_id = ?
+            """,
+            ("save-1",),
+        ).fetchone()
+        assert state is not None
+        assert state[0] > 0
+        assert state[1] == 1
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
