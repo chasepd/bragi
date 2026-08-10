@@ -3284,6 +3284,33 @@ def test_restricted_claim_matches_anchor_key_or_display_name_to_scope(
     )
 
 
+def test_restricted_claim_without_known_by_is_blocked(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    claim = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="scenario_claim",
+        source_id="restricted-without-audience",
+        title="Restricted",
+        body="[canonical | durable | restricted] The lens contains a ghost.",
+        metadata={"reveal_policy": "restricted", "known_by": []},
+    )
+
+    assert context_search_module._known_by_candidate_blocked(
+        claim,
+        ScopedTargets(allowed={}, blocked=set()),
+        character_identifiers=frozenset({"mira"}),
+    )
+
+
 def test_scenario_supersession_key_boundaries_do_not_collide(
     repositories: PersistenceRepositories,
 ) -> None:

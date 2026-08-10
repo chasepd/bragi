@@ -3703,7 +3703,7 @@ def _known_by_candidate_blocked(
         return False
     known_by = record.metadata.get("known_by")
     if not isinstance(known_by, list) or not known_by:
-        return False
+        return record.metadata.get("reveal_policy") == "restricted"
     allowed_owners = {
         scoped_owner_name(owner).casefold()
         for owners in scoped_targets.allowed.values()

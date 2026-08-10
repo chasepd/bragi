@@ -383,6 +383,8 @@ def _validated_claim(
     anchor_keys = {anchor["entity_key"] for anchor in anchors}
     if not set(known_by) <= anchor_keys:
         raise ValueError("Scenario canon known_by must reference entity anchor keys")
+    if reveal_policy == "restricted" and not known_by:
+        raise ValueError("Restricted scenario canon claims require known_by")
     canonical = {
         "source_section": section_id,
         "source_sha256": source_sha256,

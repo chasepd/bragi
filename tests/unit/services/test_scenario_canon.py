@@ -464,3 +464,30 @@ def test_compiler_rejects_known_by_outside_entity_anchors() -> None:
                 "The keeper suspects the lens is alive."},
             )
         )
+
+
+def test_compiler_rejects_restricted_claim_without_known_by() -> None:
+    output = _output()
+    sections = output["sections"]
+    assert isinstance(sections, list)
+    section = sections[0]
+    assert isinstance(section, dict)
+    claims = section["claims"]
+    assert isinstance(claims, list)
+    first_claim = claims[0]
+    assert isinstance(first_claim, dict)
+    first_claim["reveal_policy"] = "restricted"
+    first_claim["known_by"] = []
+
+    with pytest.raises(ValueError, match="require known_by"):
+        asyncio.run(
+            ScenarioCanonCompiler(
+                provider=FakeProviderClient(structured_output=output),
+                provider_name="fake",
+                model_id="canon-model",
+            ).compile(
+                scenario_type="full_roleplay",
+                content={"lore": "The beacon consumes one memory per use. "
+                "The keeper suspects the lens is alive."},
+            )
+        )
