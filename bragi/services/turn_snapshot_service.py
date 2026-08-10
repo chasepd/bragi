@@ -1293,7 +1293,12 @@ class TurnSnapshotService:
         ).fetchall()
         if not dirty_rows:
             return None
-        self._queue_snapshot_aggregate_dependents(save_id, dirty_rows)
+        aggregate_dependents_queued: set[tuple[str, str]] = set()
+        self._queue_snapshot_aggregate_dependents(
+            save_id,
+            dirty_rows,
+            already_queued=aggregate_dependents_queued,
+        )
         self._queue_snapshot_lifecycle_dependents(save_id, dirty_rows)
         dirty_rows = self.repositories.connection.execute(
             """
@@ -1327,6 +1332,7 @@ class TurnSnapshotService:
         initial_dirty_keys = {
             (str(row["table_name"]), str(row["row_key"])) for row in dirty_rows
         }
+        queued_work_keys = set(initial_dirty_keys)
         for table_name, row_key in initial_dirty_keys:
             table = _TABLES_BY_NAME.get(table_name)
             if table is None:
@@ -1409,14 +1415,19 @@ class TurnSnapshotService:
                     if added is None:
                         continue
                     key = (str(added["table_name"]), str(added["row_key"]))
-                    dirty_rows.append(added)
+                    if key not in queued_work_keys:
+                        queued_work_keys.add(key)
+                        dirty_rows.append(added)
 
         while dirty_index < len(dirty_rows):
             dirty = dirty_rows[dirty_index]
             dirty_index += 1
+            dirty_key = (str(dirty["table_name"]), str(dirty["row_key"]))
+            queued_work_keys.discard(dirty_key)
             aggregate_keys = self._queue_snapshot_aggregate_dependents(
                 save_id,
                 [dirty],
+                already_queued=aggregate_dependents_queued,
             )
             for aggregate_key in aggregate_keys:
                 added = self.repositories.connection.execute(
@@ -1427,7 +1438,8 @@ class TurnSnapshotService:
                     """,
                     (save_id, *aggregate_key),
                 ).fetchone()
-                if added is not None:
+                if added is not None and aggregate_key not in queued_work_keys:
+                    queued_work_keys.add(aggregate_key)
                     dirty_rows.append(added)
             table_name = str(dirty["table_name"])
             table = _TABLES_BY_NAME.get(table_name)
@@ -1848,6 +1860,8 @@ class TurnSnapshotService:
         self,
         save_id: str,
         dirty_rows: list[sqlite3.Row],
+        *,
+        already_queued: set[tuple[str, str]],
     ) -> tuple[tuple[str, str], ...]:
         participant_thread_ids: set[str] = set()
         activity_changed = False
@@ -1890,13 +1904,19 @@ class TurnSnapshotService:
             ):
                 participant_thread_ids.add(str(previous["thread_id"]))
         for thread_id in participant_thread_ids:
+            dependent_key = ("character_text_threads", thread_id)
+            if dependent_key in already_queued:
+                continue
             self._mark_snapshot_row_dirty(
                 save_id=save_id,
                 table_name="character_text_threads",
                 row_key=thread_id,
             )
-            queued.append(("character_text_threads", thread_id))
-        if activity_changed:
+            already_queued.add(dependent_key)
+            queued.append(dependent_key)
+        cursor_aggregate_marker = ("__aggregate__", "activity_cursors")
+        cursor_aggregate_already_queued = cursor_aggregate_marker in already_queued
+        if activity_changed and not cursor_aggregate_already_queued:
             cursors = self.repositories.connection.execute(
                 """
                 SELECT narrator_message_id
@@ -1905,18 +1925,19 @@ class TurnSnapshotService:
                 """,
                 (save_id,),
             ).fetchall()
+            already_queued.add(cursor_aggregate_marker)
             for cursor in cursors:
+                dependent_key = (
+                    "narrator_phone_activity_cursors",
+                    str(cursor["narrator_message_id"]),
+                )
                 self._mark_snapshot_row_dirty(
                     save_id=save_id,
                     table_name="narrator_phone_activity_cursors",
                     row_key=str(cursor["narrator_message_id"]),
                 )
-                queued.append(
-                    (
-                        "narrator_phone_activity_cursors",
-                        str(cursor["narrator_message_id"]),
-                    )
-                )
+                already_queued.add(dependent_key)
+                queued.append(dependent_key)
         return tuple(queued)
 
     def _mark_snapshot_row_dirty(
@@ -2049,7 +2070,18 @@ class TurnSnapshotService:
             target.name: set() for target in _SNAPSHOT_TABLES
         }
         for target_table, target_key in references:
-            if projected_inclusion.get((target_table, target_key), True):
+            key = (target_table, target_key)
+            included = projected_inclusion.get(key)
+            if included is None:
+                state = self.repositories.connection.execute(
+                    """
+                    SELECT included FROM save_snapshot_row_state
+                    WHERE save_id = ? AND table_name = ? AND row_key = ?
+                    """,
+                    (save_id, target_table, target_key),
+                ).fetchone()
+                included = state is None or bool(state["included"])
+            if included:
                 active_ids[target_table].add(target_key)
         return {
             target_table: frozenset(target_keys)

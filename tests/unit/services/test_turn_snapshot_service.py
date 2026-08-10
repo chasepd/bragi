@@ -3804,6 +3804,45 @@ def test_incremental_reference_filtering_reaches_fixed_point(
     )
 
 
+def test_dirty_source_does_not_resurrect_persistently_excluded_target(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    repositories.add_character(
+        save_id=save.id,
+        character_id="mara",
+        name="Mara",
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="belief",
+        claim="Mara believes the beacon is lit.",
+        epistemic_actor_id="mara",
+        status="pending",
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE characters SET archived_at = CURRENT_TIMESTAMP WHERE id = 'mara'"
+    )
+    repositories.commit()
+    service.capture_current_head_if_dirty(save.id)
+    repositories.connection.execute(
+        """
+        UPDATE context_observation_curation_state
+        SET attempt_count = attempt_count + 1
+        WHERE observation_id = ?
+        """,
+        (observation.id,),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+
+    assert rows["context_observation_curation_state"] == ()
+
+
 def test_incremental_missing_target_edge_survives_delete_and_recreate(
     repositories: PersistenceRepositories,
 ) -> None:
