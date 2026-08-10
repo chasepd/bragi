@@ -922,8 +922,7 @@ def migrate_database(database_path: Path | str) -> None:
             _migrate_schema_73_to_74(connection)
         if not _schema_migration_applied(connection, 75):
             _migrate_schema_74_to_75(connection)
-        if not _schema_migration_applied(connection, 76):
-            _migrate_schema_75_to_76(connection)
+        _migrate_schema_75_to_76(connection)
         if not _schema_migration_applied(connection, 77):
             _migrate_schema_76_to_77(connection)
         _ensure_runtime_telemetry_schema(connection)

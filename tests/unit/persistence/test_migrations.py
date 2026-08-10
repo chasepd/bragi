@@ -2076,12 +2076,12 @@ def _save_context_revision(connection: sqlite3.Connection) -> int:
     )
 
 
-def test_migration_75_to_76_adds_turn_outcomes_schema(tmp_path: Path) -> None:
+def test_migration_76_to_77_adds_turn_outcomes_schema(tmp_path: Path) -> None:
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)
     with sqlite3.connect(database_path) as connection:
         connection.execute("DROP TABLE turn_outcomes")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 76")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 77")
         connection.commit()
 
     migrate_database(database_path)
@@ -2092,7 +2092,7 @@ def test_migration_75_to_76_adds_turn_outcomes_schema(tmp_path: Path) -> None:
         assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
 
 
-def test_migration_76_keeps_existing_turn_outcome_rows(tmp_path: Path) -> None:
+def test_migration_77_keeps_existing_turn_outcome_rows(tmp_path: Path) -> None:
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)
     with sqlite3.connect(database_path) as connection:
@@ -2124,7 +2124,7 @@ def test_migration_76_keeps_existing_turn_outcome_rows(tmp_path: Path) -> None:
             """,
             (message_id,),
         )
-        connection.execute("DELETE FROM schema_migrations WHERE version = 76")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 77")
         connection.commit()
 
     migrate_database(database_path)
