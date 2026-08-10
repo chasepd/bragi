@@ -1066,13 +1066,25 @@ def _rehydrate_selected_context(
         ignored_message_id=player_message_id,
     )
     if not selected_items and current_revision == preselection_revision:
-        return result, fallback_snapshot
+        confirmed_revision = repositories.context_candidate_revision_token(
+            save_id,
+            ignored_message_id=player_message_id,
+        )
+        if confirmed_revision == current_revision:
+            return result, fallback_snapshot
+        current_revision = confirmed_revision
     if (
         current_revision == preselection_revision
         and fallback_snapshot is not None
         and _snapshot_contains_selected_items(fallback_snapshot, selected_items)
     ):
-        return result, fallback_snapshot
+        confirmed_revision = repositories.context_candidate_revision_token(
+            save_id,
+            ignored_message_id=player_message_id,
+        )
+        if confirmed_revision == current_revision:
+            return result, fallback_snapshot
+        current_revision = confirmed_revision
     if current_revision != preselection_revision:
         _sync_continuity_index_for_search(repositories, save_id)
     reload_start_revision = repositories.context_candidate_revision_token(
@@ -1259,7 +1271,7 @@ def _rehydrate_selected_context(
                 player_message_id=player_message_id,
                 focus_message=focus_message,
                 result=result,
-                fallback_snapshot=None,
+                fallback_snapshot=snapshot,
                 preselection_revision=reload_end_revision,
                 reload_attempt=1,
             )
