@@ -3370,8 +3370,11 @@ def _state_commit_candidate_value_shape_rejection(
     deterministically here so malformed candidates are visible planner
     rejections instead of silent apply-time skips.
     """
+    character_id = candidate.character_id or _string(
+        candidate.value.get("character_id")
+    )
     if candidate.candidate_type == "scene_presence":
-        if not candidate.character_id:
+        if not character_id:
             return _planner_rejection(
                 candidate=candidate,
                 reason="missing_character_id",
@@ -3403,7 +3406,7 @@ def _state_commit_candidate_value_shape_rejection(
             )
         return None
     if candidate.candidate_type == "character_learned_memory":
-        if not candidate.character_id:
+        if not character_id:
             return _planner_rejection(
                 candidate=candidate,
                 reason="missing_character_id",
@@ -3423,7 +3426,7 @@ def _state_commit_candidate_value_shape_rejection(
             return knowledge_rejection
         return None
     if candidate.candidate_type == "character_knowledge_edge":
-        if not candidate.character_id:
+        if not character_id:
             return _planner_rejection(
                 candidate=candidate,
                 reason="missing_character_id",

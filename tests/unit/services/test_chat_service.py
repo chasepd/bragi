@@ -17927,7 +17927,7 @@ def test_submit_player_turn_skips_character_action_planning_when_disabled(
         "model_calls_avoided": 0,
         "presence_calls_made": 0,
         "deterministic_presence_count": 0,
-        "intents_absorbed": True,
+        "intents_absorbed": False,
     }
 
 

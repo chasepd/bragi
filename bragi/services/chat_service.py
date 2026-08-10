@@ -84,9 +84,7 @@ from bragi.services.character_action_planning_service import (
     character_action_planning_enabled,
     character_turn_assessment_has_prompt_guidance,
     format_character_turn_assessment,
-)
-from bragi.services.character_action_planning_service import (
-    _scene_text as _planning_scene_text,
+    planning_scene_text,
 )
 from bragi.services.character_registry_maintenance_service import (
     CharacterRegistryMaintenanceService,
@@ -5597,14 +5595,7 @@ class ChatService:
                         save_id=save_id,
                     )
                 ),
-                intents_absorbed=(
-                    roleplay_model_preference(
-                        repositories=self.repositories,
-                        save_id=save_id,
-                        purpose="response_planning",
-                    )
-                    is not None
-                ),
+                intents_absorbed=self._narrator_planner_available(save_id),
             )
         except Exception as exc:
             log_error_event(
@@ -6209,6 +6200,23 @@ class ChatService:
             retry_body=subsequent.retry_body or retry_body,
             npc_audit_result=npc_audit_result,
             verification_result=subsequent.verification_result,
+        )
+
+    def _narrator_planner_available(self, save_id: str) -> bool:
+        preference = roleplay_model_preference(
+            repositories=self.repositories,
+            save_id=save_id,
+            purpose="response_planning",
+        )
+        if preference is None:
+            return False
+        provider = self.providers.get(preference.provider)
+        if not isinstance(cast(object, provider), StructuredOutputProvider):
+            return False
+        return _model_supports_structured_output(
+            repositories=self.repositories,
+            provider=preference.provider,
+            model_id=preference.model_id,
         )
 
     def _narrator_planner_for_save(
@@ -8934,12 +8942,12 @@ def _planned_commit_evidence_is_grounded(
     if not candidate.evidence_source_ids or not quote:
         return False
     source_text_by_id = dict(evidence_source_text_by_id)
-    planning_scene_text = ""
+    planning_scene_text_value = ""
     snapshot_id = ""
     snapshot = repositories.get_scene_snapshot(save_id)
     if snapshot is not None:
         snapshot_id = snapshot.id
-        planning_scene_text = _planning_scene_text(snapshot)
+        planning_scene_text_value = planning_scene_text(snapshot)
 
     def matches(source_id: str) -> bool:
         if (
@@ -8950,8 +8958,8 @@ def _planned_commit_evidence_is_grounded(
         return bool(
             snapshot_id
             and source_id == f"scene_snapshot:{snapshot_id}"
-            and planning_scene_text
-            and quote_matches_source(quote, planning_scene_text)
+            and planning_scene_text_value
+            and quote_matches_source(quote, planning_scene_text_value)
         )
 
     player_message = repositories.get_message(

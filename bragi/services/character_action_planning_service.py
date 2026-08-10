@@ -88,7 +88,7 @@ class CharacterActionPlanningResult:
     model_calls_avoided: int = 0
     presence_calls_made: int = 0
     deterministic_presence_count: int = 0
-    intents_absorbed: bool = True
+    intents_absorbed: bool = False
 
     @property
     def assessments(self) -> tuple[CharacterTurnAssessment, ...]:
@@ -650,7 +650,7 @@ def _character_presence_messages(
                 part
                 for part in (
                     _scenario_text(scenario),
-                    _scene_text(snapshot),
+                    planning_scene_text(snapshot),
                     (
                         ""
                         if storyteller_mode
@@ -745,7 +745,7 @@ def _character_presence_batch_messages(
                 part
                 for part in (
                     _scenario_text(scenario),
-                    _scene_text(snapshot),
+                    planning_scene_text(snapshot),
                     (
                         ""
                         if storyteller_mode
@@ -963,7 +963,7 @@ def _planning_evidence_sources(
 
     snapshot = repositories.get_scene_snapshot(save_id)
     if snapshot is not None:
-        add(f"scene_snapshot:{snapshot.id}", _scene_text(snapshot))
+        add(f"scene_snapshot:{snapshot.id}", planning_scene_text(snapshot))
     add(f"character:{character.id}", _character_text(character))
     for thread in repositories.list_active_threads(save_id):
         if (
@@ -1273,7 +1273,7 @@ def _scenario_text(scenario: object | None) -> str:
     )
 
 
-def _scene_text(snapshot: object | None) -> str:
+def planning_scene_text(snapshot: object | None) -> str:
     if snapshot is None:
         return "Current scene: no scene snapshot"
     parts = [
