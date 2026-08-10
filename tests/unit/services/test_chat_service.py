@@ -67,6 +67,7 @@ from bragi.services.agentic_context import (
     NarrativeBeat,
     NarratorCommitDecision,
     NarratorMessageSpec,
+    NarratorQualityFinding,
     NarratorVerificationResult,
     NpcIntent,
     ObservationResult,
@@ -698,6 +699,18 @@ class SequenceChatProvider(RecordingChatProvider):
             model_id=request.model_id,
             token_usage={"prompt": 11, "completion": 23, "total": 34},
         )
+
+
+class SequenceTransportChatProvider(SequenceChatProvider):
+    """Streaming-capable provider whose test responses use final-only chat."""
+
+    def __init__(self, provider_name: str, response_bodies: tuple[str, ...]) -> None:
+        super().__init__(provider_name, response_bodies)
+        self.stream_requests: list[ChatRequest] = []
+
+    def stream_chat(self, request: ChatRequest) -> Any:
+        self.stream_requests.append(request)
+        raise AssertionError("final-only delivery must not request transport streaming")
 
 
 class StreamingChatProvider(RecordingChatProvider):
@@ -1856,6 +1869,15 @@ class RecordingSummaryService:
         self.summary_id = summary.id
         return summary
 
+    async def prepare_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
+        current_user_id: str | None = None,
+    ) -> object:
+        return None
+
 
 class FailingSummaryService:
     def __init__(self, *, events: list[str], error: Exception) -> None:
@@ -1875,6 +1897,15 @@ class FailingSummaryService:
         self.events.append("summarization")
         self.calls.append((save_id, model_context_window))
         self.pending_messages.append(pending_message)
+        raise self.error
+
+    async def prepare_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
+        current_user_id: str | None = None,
+    ) -> object:
         raise self.error
 
 
@@ -2695,7 +2726,7 @@ def test_submit_player_turn_final_guard_rejects_phrase_from_verifier_retry(
     assert [message.role for message in persisted] == ["player"]
 
 
-def test_submit_player_turn_buffers_streamed_narrator_until_script_guard_passes(
+def test_submit_player_turn_uses_final_only_transport_until_script_guard_passes(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -2715,19 +2746,11 @@ def test_submit_player_turn_buffers_streamed_narrator_until_script_guard_passes(
         provider="openrouter",
         model_id="anthropic/claude-3.5-sonnet",
     )
-    provider = SequenceStreamingChatProvider(
+    provider = SequenceTransportChatProvider(
         "openrouter",
         (
-            (
-                ChatStreamChunk(delta="玩家喜欢"),
-                ChatStreamChunk(delta="简洁叙事。", token_usage={"total": 12}),
-                ChatStreamChunk(token_usage={"total": 12}, done=True),
-            ),
-            (
-                ChatStreamChunk(delta="The lantern"),
-                ChatStreamChunk(delta=" holds.", token_usage={"total": 12}),
-                ChatStreamChunk(token_usage={"total": 12}, done=True),
-            ),
+            "玩家喜欢简洁叙事。",
+            "The lantern holds.",
         ),
     )
     service = ChatService(
@@ -2735,24 +2758,20 @@ def test_submit_player_turn_buffers_streamed_narrator_until_script_guard_passes(
         providers={"openrouter": provider},
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
-    drafts: list[str] = []
-
     result = asyncio.run(
         service.submit_player_turn(
             save_id=save.id,
             body="I climb toward the beacon lens.",
             speaker_name="Mara",
             run_post_turn_jobs=False,
-            narrator_stream_callback=drafts.append,
         )
     )
 
-    assert drafts == ["The lantern holds."]
-    assert len(provider.stream_requests) == 2
-    assert provider.chat_requests == []
+    assert provider.stream_requests == []
+    assert len(provider.chat_requests) == 2
     assert (
         "unsupported writing script"
-        in provider.stream_requests[1].regeneration_feedback
+        in provider.chat_requests[1].regeneration_feedback
     )
     assert result.narrator_message.body == "The lantern holds."
     persisted = repositories.list_messages(save.id)
@@ -3598,6 +3617,133 @@ def test_submit_player_turn_uses_seven_attempts_after_narrator_verifier_failure(
     assert "The lens burns red." in retry_request.narration_brief
     assert retry_request.narration_evidence == ("observation:warning",)
     assert result.narrator_message.body == "The lens burns red above the stair."
+
+
+def test_submit_player_turn_retries_typed_narrator_quality_finding(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting(
+        RESPONSE_VERIFICATION_MODE_SETTING,
+        RESPONSE_VERIFICATION_MODE_RETRY_ONCE,
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = SequenceChatProvider(
+        "fake",
+        (
+            "Mara steps through the sealed gate.",
+            "The sealed gate stops Mara at the threshold.",
+        ),
+    )
+    spec = NarratorMessageSpec(
+        intent="Resolve Mara's attempt to cross the gate.",
+        thesis="The sealed gate blocks the crossing.",
+        must_say=(),
+        avoid=(),
+        tone="tense and grounded",
+        uncertainties=(),
+        evidence_source_ids=("scene:gate",),
+    )
+    finding = NarratorQualityFinding(
+        category="spatial_continuity",
+        reason="The supplied scene says the gate is sealed.",
+        narrator_quote="Mara steps through the sealed gate.",
+        context_quote="The gate remains sealed.",
+    )
+    verifier = ScriptedNarratorVerifier(
+        NarratorVerificationResult(
+            passed=True,
+            retry_feedback="Keep the gate consistent.",
+            confidence=0.94,
+            quality_findings=(finding,),
+        )
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+        narrator_planner=ScriptedNarratorPlanner(spec),
+        narrator_verifier=verifier,
+    )
+
+    result = asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I try to walk through the sealed gate.",
+            speaker_name="Mara",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    assert len(provider.chat_requests) == 7
+    feedback = provider.chat_requests[1].regeneration_feedback
+    assert "Keep the gate consistent." in feedback
+    assert "Spatial continuity" in feedback
+    assert "Mara steps through the sealed gate." in feedback
+    assert "The gate remains sealed." in feedback
+    assert "The supplied scene says the gate is sealed." in feedback
+    assert result.narrator_message.body == (
+        "The sealed gate stops Mara at the threshold."
+    )
+    job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
+    assert job_result["narrator_verifier"]["quality_finding_count"] == 1
+    assert job_result["narrator_verifier"]["quality_findings"] == [
+        {
+            "category": "spatial_continuity",
+            "reason": "The supplied scene says the gate is sealed.",
+            "narrator_quote": "Mara steps through the sealed gate.",
+            "context_quote": "The gate remains sealed.",
+        }
+    ]
+
+
+def test_narrator_quality_retry_feedback_includes_every_typed_finding() -> None:
+    findings = tuple(
+        NarratorQualityFinding(
+            category=category,
+            reason=f"Reason {index}.",
+            narrator_quote=f"Draft quote {index}.",
+            context_quote=f"Context quote {index}.",
+        )
+        for index, category in enumerate(
+            (
+                "spatial_continuity",
+                "possession_continuity",
+                "injury_resource_continuity",
+                "action_feasibility",
+                "causality",
+                "elapsed_time",
+                "character_voice",
+                "semantic_repetition",
+                "forward_movement",
+            ),
+            start=1,
+        )
+    )
+
+    feedback = chat_service_module._verification_retry_feedback(
+        NarratorVerificationResult(
+            passed=False,
+            quality_findings=findings,
+        )
+    )
+
+    for index in range(1, 10):
+        assert f"Reason {index}." in feedback
+        assert f"Draft quote {index}." in feedback
+        assert f"Context quote {index}." in feedback
 
 
 def test_submit_player_turn_uses_seven_attempts_after_narrator_passivity_issue(
@@ -8731,7 +8877,7 @@ def test_submit_player_turn_streams_narrator_drafts_and_persists_final_body(
     assert persisted_messages[1].token_estimate == 5
 
 
-def test_rated_streaming_never_publishes_draft_rejected_by_safety_agent(
+def test_rated_final_only_delivery_never_streams_body_rejected_by_safety_agent(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -8765,6 +8911,7 @@ def test_rated_streaming_never_publishes_draft_rejected_by_safety_agent(
             ),
             ChatStreamChunk(token_usage={"total": 12}, done=True),
         ),
+        fallback_body=rejected_draft,
     )
     service = ChatService(
         repositories=repositories,
@@ -8774,19 +8921,16 @@ def test_rated_streaming_never_publishes_draft_rejected_by_safety_agent(
         },
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
-    drafts: list[str] = []
-
     result = asyncio.run(
         service.submit_player_turn(
             save_id=save.id,
             body="I close the tower door.",
             run_post_turn_jobs=False,
-            narrator_stream_callback=drafts.append,
         )
     )
 
-    assert drafts == [CONTENT_FILTER_TRANSITION]
-    assert rejected_draft not in repr(drafts)
+    assert narrator_provider.stream_requests == []
+    assert len(narrator_provider.chat_requests) == 1
     assert result.narrator_message.body == CONTENT_FILTER_TRANSITION
     assert result.narrator_message.content_rating == "g"
 
@@ -11195,8 +11339,12 @@ def test_submit_player_turn_persists_chat_transport_diagnostics(
     assert len(jobs) == 2
     assert jobs[0]["result"]["transport_mode"] == "non_streaming"
     assert jobs[0]["result"]["streaming_used"] is False
+    assert jobs[0]["result"]["delivery_mode"] == "final_only"
+    assert jobs[0]["result"]["incremental_delivery_used"] is False
     assert jobs[1]["result"]["transport_mode"] == "streaming"
     assert jobs[1]["result"]["streaming_used"] is True
+    assert jobs[1]["result"]["delivery_mode"] == "final_only"
+    assert jobs[1]["result"]["incremental_delivery_used"] is False
     assert jobs[1]["result"]["context_search_failed"] is False
     assert jobs[1]["result"]["context_search_selected_counts"] == {
         "character_text_context": 0,
@@ -12872,6 +13020,64 @@ def test_run_post_turn_jobs_skips_context_update_with_missing_catalog_row(
     assert "state" in provider.structured_output_requests[0].schema_name.casefold()
 
 
+def test_run_post_turn_jobs_waits_for_summary_preparation_barrier(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I tend the beacon.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The flame steadies.",
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prepare(**_kwargs: object) -> str:
+        started.set()
+        await release.wait()
+        return "succeeded"
+
+    monkeypatch.setattr(service, "_prepare_summary_for_next_turn", prepare)
+
+    async def run() -> dict[str, object]:
+        task = asyncio.create_task(
+            service.run_post_turn_jobs(
+                save_id=save.id,
+                player_message_id=player_message.id,
+                narrator_message_id=narrator_message.id,
+            )
+        )
+        await started.wait()
+        assert task.done() is False
+        release.set()
+        return await task
+
+    result = asyncio.run(run())
+
+    result_jobs = result["jobs"]
+    assert isinstance(result_jobs, list)
+    statuses = {str(job["name"]): str(job["status"]) for job in result_jobs}
+    assert statuses["summary"] == "succeeded"
+
+
 def test_run_post_turn_jobs_leaves_character_maintenance_for_scheduler(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -12932,6 +13138,7 @@ def test_run_post_turn_jobs_leaves_character_maintenance_for_scheduler(
     jobs = _post_turn_jobs(repositories, save.id)
     assert len(jobs) == 1
     assert [job["name"] for job in jobs[0]["result"]["jobs"]] == [
+        "summary",
         "state",
         "context",
         "time_reconciliation",
@@ -13103,10 +13310,9 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         )
     )
 
-    final_statuses = {
-        job.name: job.status for job in progress_updates[-1].jobs
-    }
+    final_statuses = {job.name: job.status for job in progress_updates[-1].jobs}
     assert final_statuses == {
+        "summary": "skipped",
         "state": "succeeded",
         "context": "failed",
         "time_reconciliation": "blocked_dependency",
@@ -13117,7 +13323,7 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         "image": "failed",
     }
     assert progress_updates[-1].status_text == (
-        "Post-turn: state succeeded, context failed, "
+        "Post-turn: summary skipped, state succeeded, context failed, "
         "time_reconciliation blocked_dependency, proactive_text blocked_dependency, "
         "director blocked_dependency, scenario skipped, "
         "context_precompute blocked_dependency, image failed"
@@ -13125,6 +13331,7 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
     assert all(
         [job.name for job in progress.jobs]
         == [
+            "summary",
             "state",
             "context",
             "time_reconciliation",
@@ -13152,6 +13359,7 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
     assert len(jobs) == 1
     assert jobs[0]["status"] == "succeeded"
     expected_dependencies = {
+        "summary": [],
         "state": [],
         "context": ["state"],
         "time_reconciliation": ["context"],
@@ -13173,6 +13381,7 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
     assert jobs[0]["result"]["image_context_semantics"] == "pre_post_turn_updates"
     result_jobs = jobs[0]["result"]["jobs"]
     assert [(job["name"], job["status"]) for job in result_jobs] == [
+        ("summary", "skipped"),
         ("state", "succeeded"),
         ("context", "failed"),
         ("time_reconciliation", "blocked_dependency"),
@@ -13182,14 +13391,15 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         ("context_precompute", "blocked_dependency"),
         ("image", "failed"),
     ]
-    assert result_jobs[2]["result"]["blocked_by"] == "context"
-    assert result_jobs[3]["result"]["blocked_by"] == "time_reconciliation"
+    assert result_jobs[3]["result"]["blocked_by"] == "context"
+    assert result_jobs[4]["result"]["blocked_by"] == "time_reconciliation"
     steps = repositories.list_job_steps(jobs[0]["id"])
     step_by_name = {step.name: step for step in steps}
     assert {
         name: (step.status, step.task)
         for name, step in step_by_name.items()
     } == {
+        "summary": ("skipped", "summarization"),
         "state": ("succeeded", "state_memory"),
         "context": ("failed", "context_update"),
         "time_reconciliation": ("blocked_dependency", "context_update"),
@@ -13696,6 +13906,7 @@ def test_run_post_turn_jobs_leaves_world_context_retention_for_scheduler(
     assert retention.calls == []
     coordinator = _post_turn_jobs(repositories, save.id)[0]
     assert [job["name"] for job in coordinator["result"]["jobs"]] == [
+        "summary",
         "state",
         "context",
         "time_reconciliation",

@@ -38,6 +38,7 @@ from bragi.services.agentic_context import (
     NarrativeBeat,
     NarratorCommitDecision,
     NarratorMessageSpec,
+    NarratorQualityFinding,
     NpcIntent,
     ObservationService,
     PlayerAgencyConstraint,
@@ -3398,6 +3399,360 @@ def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
     assert "hostile" in prompt_text
     assert "unreasonable" in prompt_text
     assert "Ilyra" in prompt_text
+
+
+@pytest.mark.parametrize(
+    "category",
+    (
+        "spatial_continuity",
+        "possession_continuity",
+        "injury_resource_continuity",
+        "action_feasibility",
+        "causality",
+        "elapsed_time",
+        "character_voice",
+        "semantic_repetition",
+        "forward_movement",
+    ),
+)
+def test_narrator_verifier_reports_typed_quality_findings(category: str) -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "Revise the contradiction.",
+                "confidence": 0.91,
+                "quality_findings": [
+                    {
+                        "category": category,
+                        "reason": "The draft contradicts supplied context.",
+                        "narrator_quote": "Mara crosses the sealed gate.",
+                        "context_quote": "The gate remains sealed.",
+                    }
+                ],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    source_request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(
+            ChatMessage(role="player", body="I test the gate."),
+            *(
+                (ChatMessage(role="narrator", body="The gate remains sealed."),)
+                if category == "semantic_repetition"
+                else ()
+            ),
+        ),
+        current_scene_recap=("The gate remains sealed.",),
+        character_voice_profiles=(
+            ("The gate remains sealed.",) if category == "character_voice" else ()
+        ),
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=source_request,
+            spec=NarratorMessageSpec(
+                intent="Resolve the attempted crossing.",
+                thesis="Keep the sealed gate physically consistent.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=("scene:gate",),
+            ),
+            narrator_body="Mara crosses the sealed gate.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.quality_findings == (
+        NarratorQualityFinding(
+            category=category,
+            reason="The draft contradicts supplied context.",
+            narrator_quote="Mara crosses the sealed gate.",
+            context_quote="The gate remains sealed.",
+        ),
+    )
+    quality_schema = provider.structured_output_requests[0].schema["properties"][
+        "quality_findings"
+    ]
+    assert quality_schema["maxItems"] == 9
+    assert quality_schema["items"]["properties"]["category"]["enum"] == [
+        "spatial_continuity",
+        "possession_continuity",
+        "injury_resource_continuity",
+        "action_feasibility",
+        "causality",
+        "elapsed_time",
+        "character_voice",
+        "semantic_repetition",
+        "forward_movement",
+    ]
+    for field_name in ("reason", "narrator_quote", "context_quote"):
+        assert quality_schema["items"]["properties"][field_name]["minLength"] == 1
+
+
+def test_narrator_verifier_clean_response_has_no_quality_findings() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.96,
+                "quality_findings": [],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I wait."),),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Advance the scene.",
+                thesis="The watch changes.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=(),
+            ),
+            narrator_body="The watch bell rings and fresh guards enter.",
+        )
+    )
+
+    assert result.passed is True
+    assert result.quality_findings == ()
+
+
+@pytest.mark.parametrize(
+    ("narrator_quote", "context_quote"),
+    (
+        ("A quote absent from the draft.", "The gate remains sealed."),
+        ("Mara crosses the sealed gate.", "A quote absent from supplied context."),
+        ("`Mara crosses the sealed gate.`", "The gate remains sealed."),
+        ("Mara crosses the sealed gate.", "The gate   remains sealed."),
+    ),
+)
+def test_narrator_verifier_fails_closed_for_ungrounded_quality_finding(
+    narrator_quote: str,
+    context_quote: str,
+) -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.9,
+                "quality_findings": [
+                    {
+                        "category": "spatial_continuity",
+                        "reason": "The draft contradicts the sealed gate.",
+                        "narrator_quote": narrator_quote,
+                        "context_quote": context_quote,
+                    }
+                ],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I test the gate."),),
+                current_scene_recap=("The gate remains sealed.",),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Resolve the attempted crossing.",
+                thesis="Keep the sealed gate physically consistent.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=("scene:gate",),
+            ),
+            narrator_body="Mara crosses the sealed gate.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.quality_findings == ()
+    assert result.issues == (
+        "Narrator quality finding contained evidence not present in the "
+        "supplied draft or context.",
+    )
+
+
+@pytest.mark.parametrize(
+    ("category", "source_request"),
+    (
+        (
+            "character_voice",
+            ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I address Ilyra."),),
+                current_scene_recap=("Ilyra is standing beside the sealed gate.",),
+            ),
+        ),
+        (
+            "semantic_repetition",
+            ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I test the gate."),),
+                retrieved_recent_messages=(
+                    "Ilyra is standing beside the sealed gate.",
+                ),
+            ),
+        ),
+    ),
+)
+def test_narrator_verifier_rejects_wrong_domain_quality_evidence(
+    category: str,
+    source_request: ChatRequest,
+) -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.88,
+                "quality_findings": [
+                    {
+                        "category": category,
+                        "reason": "The draft conflicts with specialized evidence.",
+                        "narrator_quote": "Ilyra speaks in a warm drawl.",
+                        "context_quote": (
+                            "Ilyra is standing beside the sealed gate."
+                        ),
+                    }
+                ],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=source_request,
+            spec=NarratorMessageSpec(
+                intent="Let Ilyra react.",
+                thesis="Ilyra challenges Mara.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=(),
+            ),
+            narrator_body="Ilyra speaks in a warm drawl.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.quality_findings == ()
+    assert result.issues == (
+        "Narrator quality finding contained evidence not present in the "
+        "supplied draft or context.",
+    )
+
+
+def test_narrator_verifier_labels_bounded_narrator_repetition_evidence() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.95,
+                "quality_findings": [],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(
+                    ChatMessage(role="narrator", body="Ash whispers at the glass."),
+                    ChatMessage(role="player", body="I shield the lantern."),
+                    ChatMessage(role="narrator", body="The red lens pulses once."),
+                    ChatMessage(role="player", body="I approach Ilyra."),
+                ),
+                character_voice_profiles=(
+                    "Ilyra voice profile; voice: clipped and precise",
+                ),
+                retrieved_recent_messages=(
+                    "An older narrator turn uses the phrase iron silence.",
+                ),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Let Ilyra react.",
+                thesis="Ilyra challenges Mara.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=("character_voice:ilyra",),
+            ),
+            narrator_body="Ilyra asks for Mara's authority in clipped terms.",
+        )
+    )
+
+    prompt_text = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    baseline = prompt_text.split("Recent narrator prose baseline:\n", 1)[1].split(
+        "\n\nSource request:", 1
+    )[0]
+    assert baseline == "1. Ash whispers at the glass.\n2. The red lens pulses once."
+    assert "I shield the lantern." not in baseline
+    assert "An older narrator turn" not in baseline
+    assert "use only supplied voice profiles and established dialogue" in prompt_text
+    assert "never stereotypes" in prompt_text
 
 
 def test_narrator_verifier_reports_commit_decisions() -> None:
