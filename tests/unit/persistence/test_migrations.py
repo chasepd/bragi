@@ -2304,6 +2304,7 @@ def test_migration_78_to_79_backfills_incremental_snapshot_tracking(
         for (trigger_name,) in trigger_names:
             connection.execute(f'DROP TRIGGER "{trigger_name}"')
         for table_name in (
+            "save_snapshot_row_references",
             "save_snapshot_row_state",
             "save_snapshot_dirty_rows",
             "save_snapshot_table_state",
@@ -2322,7 +2323,13 @@ def test_migration_78_to_79_backfills_incremental_snapshot_tracking(
             "save_snapshot_table_state",
             "save_snapshot_dirty_rows",
             "save_snapshot_row_state",
+            "save_snapshot_row_references",
         } <= tables
+        indexes = _object_names(connection, "index")
+        assert {
+            "idx_snapshot_row_recheck_due",
+            "idx_snapshot_reference_target",
+        } <= indexes
         trigger_count = connection.execute(
             """
             SELECT COUNT(*) FROM sqlite_master

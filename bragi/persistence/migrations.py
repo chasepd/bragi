@@ -1270,8 +1270,28 @@ def _ensure_incremental_turn_snapshot_schema(connection: sqlite3.Connection) -> 
             PRIMARY KEY(save_id, table_name, row_key)
         );
 
+        CREATE TABLE IF NOT EXISTS save_snapshot_row_references (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            source_table TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            target_table TEXT NOT NULL,
+            target_key TEXT NOT NULL,
+            PRIMARY KEY(
+                save_id, source_table, source_key, target_table, target_key
+            )
+        );
+
         CREATE INDEX IF NOT EXISTS idx_snapshot_dirty_rows_generation
         ON save_snapshot_dirty_rows(save_id, table_name, generation);
+
+        CREATE INDEX IF NOT EXISTS idx_snapshot_row_recheck_due
+        ON save_snapshot_row_state(save_id, recheck_at)
+        WHERE recheck_at IS NOT NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_snapshot_reference_target
+        ON save_snapshot_row_references(
+            save_id, target_table, target_key, source_table, source_key
+        );
         """,
     )
     for table in SNAPSHOT_TABLES:

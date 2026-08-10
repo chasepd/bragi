@@ -193,6 +193,40 @@ def test_local_snapshot_tree_rejects_duplicate_node_reference(
         service._tree_entries(table_name="messages", root_hash=root_hash)
 
 
+def test_incremental_tree_mutation_rejects_excessive_depth(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TurnSnapshotService(repositories)
+    row_hash = service._store_object(
+        kind="row:messages",
+        value={"id": "message-one", "save_id": "save-one"},
+    )
+    root_hash: str | None = None
+    for index, order_key in enumerate(("a", "b", "c")):
+        root_hash = service._store_tree_node(
+            table_name="messages",
+            order_key=order_key,
+            row_key=f"message-{order_key}",
+            row_hash=row_hash,
+            priority=index,
+            left_hash=root_hash,
+            right_hash=None,
+        )
+    monkeypatch.setattr(
+        turn_snapshot_module,
+        "_MAX_SNAPSHOT_TREE_MUTATION_DEPTH",
+        1,
+    )
+
+    with pytest.raises(ValueError, match="too deep"):
+        service._tree_delete(
+            table_name="messages",
+            root_hash=root_hash,
+            order_key="0",
+        )
+
+
 def test_snapshot_validation_bounds_snapshot_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3668,6 +3702,46 @@ def test_incremental_reference_validation_is_scoped_to_save(
         "world_state"
     ]
     assert captured["source_message_id"] is None
+
+
+def test_incremental_reference_is_restored_when_target_reactivates(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    repositories.add_location(
+        save_id=save.id,
+        location_id="tower",
+        name="Beacon Tower",
+    )
+    repositories.add_character(
+        save_id=save.id,
+        character_id="mara",
+        name="Mara",
+        location_id="tower",
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE locations SET archived_at = CURRENT_TIMESTAMP WHERE id = 'tower'"
+    )
+    repositories.commit()
+
+    archived = service.capture_current_head_if_dirty(save.id)
+    [archived_character] = service._rows_from_manifest(
+        service._snapshot_manifest(archived)
+    )["characters"]
+    assert archived_character["location_id"] is None
+
+    repositories.connection.execute(
+        "UPDATE locations SET archived_at = NULL WHERE id = 'tower'"
+    )
+    repositories.commit()
+    restored = service.capture_current_head_if_dirty(save.id)
+
+    [restored_character] = service._rows_from_manifest(
+        service._snapshot_manifest(restored)
+    )["characters"]
+    assert restored_character["location_id"] == "tower"
 
 
 def test_dirty_row_capture_serializes_only_changed_row(
