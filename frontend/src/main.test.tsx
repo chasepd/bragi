@@ -14955,7 +14955,11 @@ describe("frontend helpers", () => {
 
   it("shows opening action choice generation before choices are ready", async () => {
     const { CyoaActionPicker } = await import("./main");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }));
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "chat-job", type: "chat_turn", status: "queued" })
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
     render(
       <QueryClientProvider client={new QueryClient()}>
@@ -14980,8 +14984,19 @@ describe("frontend helpers", () => {
       </QueryClientProvider>
     );
 
-    expect(screen.getByRole("button", { name: "Generating choices..." })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Generating choices...");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: "Write your own" }));
+    await userEvent.type(screen.getByRole("textbox", { name: "Custom action" }), "Take another path");
+    await userEvent.click(screen.getByTitle("Send"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/chat",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ body: "Take another path", speaker_name: null, save_id: "save-1" })
+      })
+    ));
   });
 
   it("keeps empty opening choices retryable after generation fails", async () => {
@@ -15158,7 +15173,8 @@ describe("frontend helpers", () => {
         } : current
       );
     });
-    expect(screen.getByRole("button", { name: "Generating choices..." })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Generating choices...");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
     act(() => {
       jobSource.dispatch("done", {
         ...generationJob,

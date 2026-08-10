@@ -6725,14 +6725,14 @@ function CyoaActionPicker({
 
   const choices = [...(actionChoices?.choices ?? [])].sort((left, right) => left.ordinal - right.ordinal);
   const choicesGenerating = generationActive || Boolean(actionChoices?.generation_job);
-  const customActionLabel = choicesGenerating ? "Generating choices..." : "Write your own";
   const submitBusy = submittingSaveId === activeSaveId || submittingSaveIdRef.current === activeSaveId;
   const regenerateBusy = regenerate.isPending;
-  const canSubmit = !disabled && !submitBusy && !choicesGenerating;
+  const canSubmit = !disabled && !submitBusy;
+  const canSubmitChoice = canSubmit && !choicesGenerating;
   const canRegenerate = !disabled && !submitBusy && !regenerateBusy && !choicesGenerating && Boolean(activeSaveId && actionChoices?.narrator_message_id);
-  const submitBody = (body: string) => {
+  const submitBody = (body: string, allowed = canSubmit) => {
     const submittedBody = body.trim();
-    if (!canSubmit || !submittedBody) return;
+    if (!allowed || !submittedBody) return;
     const submittedSaveId = activeSaveId;
     submittingSaveIdRef.current = submittedSaveId;
     setSubmittingSaveId(submittedSaveId);
@@ -6757,8 +6757,8 @@ function CyoaActionPicker({
             <button
               type="button"
               className="cyoa-choice-button"
-              disabled={!canSubmit}
-              onClick={() => submitBody(choice.body)}
+              disabled={!canSubmitChoice}
+              onClick={() => submitBody(choice.body, canSubmitChoice)}
             >
               <span className="cyoa-choice-ordinal" aria-hidden="true">{index + 1}</span>
               <span className="cyoa-choice-body">{choice.body}</span>
@@ -6771,15 +6771,17 @@ function CyoaActionPicker({
           <button
             type="button"
             className="cyoa-custom-toggle"
-            disabled={disabled || submitBusy || choicesGenerating}
-            aria-label={customActionLabel}
-            aria-live="polite"
+            disabled={disabled || submitBusy}
+            aria-label="Write your own"
             aria-expanded={manualOpen}
             onClick={() => setManualOpen((current) => !current)}
           >
             <Edit3 size={17} aria-hidden="true" />
-            <span>{customActionLabel}</span>
+            <span>Write your own</span>
           </button>
+          {choicesGenerating ? (
+            <span className="cyoa-generation-status" role="status">Generating choices...</span>
+          ) : null}
           {manualOpen ? (
             <form
               className="cyoa-manual-form"
@@ -9361,8 +9363,6 @@ function isChatJobType(type: string) {
   return type === "chat_turn"
     || type === "look_around"
     || type === "chat_regenerate"
-    || type === "action_choice_generate"
-    || type === "action_choice_regenerate"
     || type === "chat_edit"
     || type === "message_edit"
     || type === "narrator_edit"

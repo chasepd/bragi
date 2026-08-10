@@ -143,6 +143,26 @@ class FakeProviderClient:
                 "reason": "Fake provider content is suitable for general audiences.",
                 "minimum_rating": "g",
             }
+        if (
+            request.schema_name == "content_safety_batch_review"
+            and "reviews" not in data
+        ):
+            reviews = request.schema["properties"]["reviews"]
+            count = int(reviews["minItems"])
+            data = {
+                "reviews": [
+                    {
+                        "ordinal": ordinal,
+                        "action": "allow",
+                        "category": "none",
+                        "reason": (
+                            "Fake provider content is suitable for general audiences."
+                        ),
+                        "minimum_rating": "g",
+                    }
+                    for ordinal in range(1, count + 1)
+                ]
+            }
         return StructuredOutputResponse(
             data=data,
             provider=request.provider,

@@ -2091,6 +2091,102 @@ def test_repositories_store_latest_active_message_action_choices(
     ] == ["Wait", "Run", "Ask", "Touch", "Climb", "Read", "Listen", "Knock"]
 
 
+def test_action_choice_write_requires_current_revision_and_generation_claim(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Library of Falling Doors",
+        premise="Every shelf is a door.",
+        player_role="Courier",
+        content={"action_choices_enabled": True},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Library")
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The first shelf opens.",
+    )
+    assert narrator.updated_at is not None
+    narrator_updated_at = narrator.updated_at
+    assert repositories.claim_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        narrator_updated_at=narrator_updated_at,
+        generation_token="older-token",
+    )
+    assert repositories.claim_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        narrator_updated_at=narrator_updated_at,
+        generation_token="newer-token",
+    )
+
+    stale = repositories.replace_message_action_choices(
+        save_id=save.id,
+        message_id=narrator.id,
+        choices=("Old one", "Old two", "Old three", "Old four"),
+        expected_head_message_id=narrator.id,
+        expected_narrator_updated_at=narrator_updated_at,
+        generation_token="older-token",
+    )
+    current = repositories.replace_message_action_choices(
+        save_id=save.id,
+        message_id=narrator.id,
+        choices=("New one", "New two", "New three", "New four"),
+        expected_head_message_id=narrator.id,
+        expected_narrator_updated_at=narrator_updated_at,
+        generation_token="newer-token",
+    )
+
+    assert stale == []
+    assert [choice.body for choice in current] == [
+        "New one",
+        "New two",
+        "New three",
+        "New four",
+    ]
+    assert not repositories.release_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        generation_token="newer-token",
+    )
+
+
+def test_action_choice_claim_rejects_edited_narrator_revision(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Library of Falling Doors",
+        premise="Every shelf is a door.",
+        player_role="Courier",
+        content={"action_choices_enabled": True},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Library")
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The first shelf opens.",
+    )
+    assert narrator.updated_at is not None
+    narrator_updated_at = narrator.updated_at
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=narrator.id,
+        body="The corrected shelf opens.",
+    )
+
+    assert not repositories.claim_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        narrator_updated_at=narrator_updated_at,
+        generation_token="stale-revision",
+    )
+
+
 def test_repositories_find_active_message_after_marker(
     repositories: PersistenceRepositories,
 ) -> None:

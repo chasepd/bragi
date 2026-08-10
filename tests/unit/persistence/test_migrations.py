@@ -2092,6 +2092,34 @@ def test_migration_76_to_77_adds_turn_outcomes_schema(tmp_path: Path) -> None:
         assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
 
 
+def test_migration_78_to_79_adds_action_choice_generation_claims(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE message_action_choice_generation_claims")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 79")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = _column_names(
+            connection,
+            "message_action_choice_generation_claims",
+        )
+        assert {
+            "message_id",
+            "save_id",
+            "narrator_updated_at",
+            "generation_token",
+            "created_at",
+            "updated_at",
+        } <= columns
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
 def test_migration_77_keeps_existing_turn_outcome_rows(tmp_path: Path) -> None:
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)

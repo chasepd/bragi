@@ -3695,11 +3695,18 @@ class BragiRuntime:
             return "failed"
         if records:
             return "succeeded"
+        narrator_message = self.repositories.get_message(
+            save_id=prepared_action_choices.save_id,
+            message_id=prepared_action_choices.narrator_message_id,
+        )
         if (
             self.repositories.latest_active_message_id(
                 prepared_action_choices.save_id
             )
             != prepared_action_choices.narrator_message_id
+            or narrator_message is None
+            or narrator_message.updated_at
+            != prepared_action_choices.narrator_updated_at
         ):
             return "obsolete"
         return "skipped"
