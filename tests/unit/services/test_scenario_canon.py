@@ -29,6 +29,7 @@ def _output() -> dict[str, object]:
                             }
                         ],
                         "fact_type": "rule",
+                        "fact_key": "memory-cost",
                         "authority": "canonical",
                         "temporal_status": "durable",
                         "reveal_policy": "open",
@@ -45,6 +46,7 @@ def _output() -> dict[str, object]:
                             }
                         ],
                         "fact_type": "knowledge",
+                        "fact_key": "lens-suspicion",
                         "authority": "hypothesis",
                         "temporal_status": "current_at_scenario_start",
                         "reveal_policy": "narrator_only",
@@ -152,6 +154,7 @@ def test_edit_invalidates_compilation_and_regenerates_claims() -> None:
                     }
                 ],
                 "fact_type": "state",
+                "fact_key": "temperature",
                 "authority": "canonical",
                 "temporal_status": "current_at_scenario_start",
                 "reveal_policy": "open",
@@ -196,6 +199,17 @@ def test_stored_claims_are_rejected_when_provenance_is_tampered() -> None:
     assert not scenario_canon_is_current(compiled)
     assert scenario_canon_claims(compiled) == ()
 
+    repaired = asyncio.run(
+        ScenarioCanonCompiler(
+            provider=provider,
+            provider_name="fake",
+            model_id="canon-model",
+        ).compile(scenario_type="full_roleplay", content=compiled)
+    )
+
+    assert scenario_canon_is_current(repaired)
+    assert len(provider.structured_output_requests) == 2
+
 
 def test_compiler_rejects_claim_without_exact_source_evidence() -> None:
     output = _output()
@@ -233,8 +247,8 @@ def test_compiler_rejects_claim_without_exact_source_evidence() -> None:
             "exactly match",
         ),
         (
-            "The beacon consumes one memory; the keeper loses her name.",
-            "The beacon consumes one memory; the keeper loses her name.",
+            "The duke is dead and the royal seal is missing.",
+            "The duke is dead and the royal seal is missing.",
             "one atomic sentence",
         ),
     ],
@@ -268,7 +282,35 @@ def test_compiler_rejects_unsupported_or_compound_claims(
                 content={
                     "lore": (
                         "The beacon consumes one memory per use. "
-                        "The beacon consumes one memory; the keeper loses her name. "
+                        "The duke is dead and the royal seal is missing. "
+                        "The keeper suspects the lens is alive."
+                    )
+                },
+            )
+        )
+
+
+def test_compiler_rejects_partial_section_coverage() -> None:
+    output = _output()
+    sections = output["sections"]
+    assert isinstance(sections, list)
+    section = sections[0]
+    assert isinstance(section, dict)
+    claims = section["claims"]
+    assert isinstance(claims, list)
+    section["claims"] = claims[:1]
+
+    with pytest.raises(ValueError, match="do not cover"):
+        asyncio.run(
+            ScenarioCanonCompiler(
+                provider=FakeProviderClient(structured_output=output),
+                provider_name="fake",
+                model_id="canon-model",
+            ).compile(
+                scenario_type="full_roleplay",
+                content={
+                    "lore": (
+                        "The beacon consumes one memory per use. "
                         "The keeper suspects the lens is alive."
                     )
                 },

@@ -87,6 +87,7 @@ SCENARIO_CORE_CONTENT_KEYS = frozenset(
         "opening_message",
         "current_scene",
         "relationship_seed",
+        "character_starters",
         "case_facts",
         "case_status",
     )
@@ -1188,6 +1189,7 @@ def scenario_claim_candidates(
                     "evidence_quote": claim.evidence_quote,
                     "entity_anchors": list(claim.entity_anchors),
                     "fact_type": claim.fact_type,
+                    "fact_key": claim.fact_key,
                     "authority": claim.authority,
                     "temporal_status": claim.temporal_status,
                     "reveal_policy": claim.reveal_policy,

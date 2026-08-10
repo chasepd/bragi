@@ -31,6 +31,7 @@ SCENARIO_CORE_CONTENT_KEYS = frozenset(
         "opening_message",
         "current_scene",
         "relationship_seed",
+        "character_starters",
         "case_facts",
         "case_status",
     }
@@ -82,6 +83,7 @@ class ScenarioCanonClaim:
     evidence_quote: str
     entity_anchors: tuple[dict[str, str], ...]
     fact_type: str
+    fact_key: str
     authority: str
     temporal_status: str
     reveal_policy: str
@@ -109,8 +111,7 @@ class ScenarioCanonCompiler:
     ) -> dict[str, object]:
         source_sections = scenario_canon_source_sections(content)
         digest = _source_digest(source_sections)
-        existing = content.get(CANON_CONTENT_KEY)
-        if _compilation_matches(existing, digest=digest):
+        if scenario_canon_is_current(content):
             return dict(content)
         if not source_sections:
             return {**content, CANON_CONTENT_KEY: _empty_payload(digest)}
@@ -200,6 +201,7 @@ def scenario_canon_claims(
                     for anchor in anchors if isinstance(anchor, Mapping)
                 ) if isinstance(anchors, list) else (),
                 fact_type=str(raw.get("fact_type", "")),
+                fact_key=str(raw.get("fact_key", "")),
                 authority=str(raw.get("authority", "")),
                 temporal_status=str(raw.get("temporal_status", "")),
                 reveal_policy=str(raw.get("reveal_policy", "")),
@@ -308,6 +310,8 @@ def _validated_payload(
                 source_sha256=source_sha256,
             )
             claims.append(claim)
+        if not _claims_cover_source(source, claims, section_id=section_id):
+            raise ValueError("Scenario canon claims do not cover their source section")
     if returned_sections != set(source_sections):
         raise ValueError("Scenario canon compilation omitted a non-empty section")
     claims.sort(key=lambda item: (str(item["source_section"]), str(item["claim_key"])))
@@ -338,6 +342,9 @@ def _validated_claim(
     if not _claim_is_atomic(claim):
         raise ValueError("Scenario canon claim must contain one atomic sentence")
     fact_type = _enum(raw, "fact_type", FACT_TYPES)
+    fact_key = str(raw.get("fact_key", "")).strip()
+    if not fact_key:
+        raise ValueError("Scenario canon fact_key is required")
     authority = _enum(raw, "authority", AUTHORITIES)
     temporal_status = _enum(raw, "temporal_status", TEMPORAL_STATUSES)
     reveal_policy = _enum(raw, "reveal_policy", REVEAL_POLICIES)
@@ -359,6 +366,7 @@ def _validated_claim(
         "evidence_quote": evidence_quote,
         "entity_anchors": anchors,
         "fact_type": fact_type,
+        "fact_key": fact_key,
         "authority": authority,
         "temporal_status": temporal_status,
         "reveal_policy": reveal_policy,
@@ -398,10 +406,61 @@ def _validated_anchors(value: object) -> list[dict[str, str]]:
 
 
 def _claim_is_atomic(value: str) -> bool:
-    if "\n" in value or ";" in value:
+    if "\n" in value or ";" in value or "," in value:
         return False
     without_terminal = value.rstrip().rstrip(".!?")
-    return re.search(r"[.!?]\s", without_terminal) is None
+    if re.search(r"[.!?]\s", without_terminal) is not None:
+        return False
+    return not _contains_coordinated_clauses(without_terminal)
+
+
+_CLAUSE_VERB = re.compile(
+    r"\b(?:am|is|are|was|were|be|been|being|has|have|had|can|could|will|would|"
+    r"shall|should|may|might|must|do|does|did|[a-z]+(?:ed|ing))\b",
+    re.IGNORECASE,
+)
+
+
+def _contains_coordinated_clauses(value: str) -> bool:
+    for match in re.finditer(
+        r"\s+(?:and|but|while|whereas)\s+",
+        value,
+        re.IGNORECASE,
+    ):
+        if _CLAUSE_VERB.search(value[: match.start()]) and _CLAUSE_VERB.search(
+            value[match.end() :]
+        ):
+            return True
+    return False
+
+
+def _claims_cover_source(
+    source: str,
+    claims: list[dict[str, object]],
+    *,
+    section_id: str,
+) -> bool:
+    intervals = sorted(
+        (
+            match.start(),
+            match.end(),
+        )
+        for claim in claims
+        if claim.get("source_section") == section_id
+        for match in [re.search(re.escape(str(claim["evidence_quote"])), source)]
+        if match is not None
+    )
+    cursor = 0
+    uncovered: list[str] = []
+    for start, end in intervals:
+        if end <= cursor:
+            continue
+        uncovered.append(source[cursor:start])
+        cursor = max(cursor, end)
+    uncovered.append(source[cursor:])
+    residue = " ".join(uncovered)
+    residue = re.sub(r"\b(?:and|but|while|whereas)\b", " ", residue, flags=re.I)
+    return re.sub(r"[^\w]+", "", residue) == ""
 
 
 def _enum(raw: Mapping[str, object], key: str, values: tuple[str, ...]) -> str:
@@ -436,6 +495,7 @@ def _compiler_schema(section_ids: tuple[str, ...]) -> dict[str, Any]:
                 },
             },
             "fact_type": string_enum(FACT_TYPES),
+            "fact_key": {"type": "string"},
             "authority": string_enum(AUTHORITIES),
             "temporal_status": string_enum(TEMPORAL_STATUSES),
             "reveal_policy": string_enum(REVEAL_POLICIES),
@@ -446,6 +506,7 @@ def _compiler_schema(section_ids: tuple[str, ...]) -> dict[str, Any]:
             "evidence_quote",
             "entity_anchors",
             "fact_type",
+            "fact_key",
             "authority",
             "temporal_status",
             "reveal_policy",

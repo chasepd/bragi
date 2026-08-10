@@ -3061,6 +3061,7 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
                             }
                         ],
                         "fact_type": "state",
+                        "fact_key": "condition",
                         "authority": "canonical",
                         "temporal_status": "current_at_scenario_start",
                         "reveal_policy": "open",
@@ -3083,6 +3084,7 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
                             }
                         ],
                         "fact_type": "relationship",
+                        "fact_key": "turnip-dispute",
                         "authority": "canonical",
                         "temporal_status": "durable",
                         "reveal_policy": "open",
@@ -3171,6 +3173,7 @@ def test_scenario_start_claim_is_superseded_by_matching_accepted_state(
         body="[canonical | current_at_scenario_start | open] The lens is cracked.",
         metadata={
             "temporal_status": "current_at_scenario_start",
+            "fact_key": "condition",
             "entity_anchors": [
                 {
                     "entity_type": "object",

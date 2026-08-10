@@ -61,6 +61,7 @@ def test_continuity_index_syncs_atomic_facts_with_evidence_metadata(
                             }
                         ],
                         "fact_type": "event",
+                        "fact_key": "forging-history",
                         "authority": "canonical",
                         "temporal_status": "historical",
                         "reveal_policy": "open",

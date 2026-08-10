@@ -152,13 +152,14 @@ class CrossChannelProvider:
                                         }
                                     ],
                                     "fact_type": "other",
+                                    "fact_key": section_id,
                                     "authority": "canonical",
                                     "temporal_status": "durable",
                                     "reveal_policy": "open",
                                     "known_by": [],
                                 }
                                 for evidence in re.split(
-                                    r"(?<=[.!?])\s+|;\s*|\n+",
+                                    r"(?<=[.!?])\s+|[;,]\s*|\n+|\s+(?:and|but|while|whereas)\s+",
                                     text,
                                 )
                                 if evidence.strip()

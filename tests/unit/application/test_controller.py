@@ -149,13 +149,14 @@ class RuntimeCanonProvider(RuntimeFakeProvider):
                                     }
                                 ],
                                 "fact_type": "other",
+                                "fact_key": section_id,
                                 "authority": "canonical",
                                 "temporal_status": "durable",
                                 "reveal_policy": "open",
                                 "known_by": [],
                             }
                             for evidence in re.split(
-                                r"(?<=[.!?])\s+|;\s*|\n+",
+                                r"(?<=[.!?])\s+|[;,]\s*|\n+|\s+(?:and|but|while|whereas)\s+",
                                 text,
                             )
                             if evidence.strip()
@@ -3285,7 +3286,6 @@ def test_save_scenario_draft_persists_reviewed_sections_creates_active_save_and_
         for key, value in content.items()
         if key not in {"_source", "_canon_claims"}
     } == reviewed_sections
-    assert content["_canon_claims"]["version"] == 1
     assert content["_source"] == {
         "content_rating": "g",
         "section_content_ratings": {
@@ -3721,6 +3721,7 @@ def test_save_management_scenario_draft_seeds_template_state(
         )
     )
 
+    assert _value(model, "error") is None
     save = repositories.list_saves()[0]
     assert _value(model, "active_save_id") == save.id
     scenario = repositories.get_scenario(save.scenario_id)

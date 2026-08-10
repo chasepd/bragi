@@ -3399,6 +3399,9 @@ def _scenario_claim_is_superseded(
 ) -> bool:
     if record.metadata.get("temporal_status") != "current_at_scenario_start":
         return False
+    fact_key = _normalized_match_key(str(record.metadata.get("fact_key", "")))
+    if not fact_key:
+        return False
     anchors = record.metadata.get("entity_anchors")
     if not isinstance(anchors, list):
         return False
@@ -3412,6 +3415,8 @@ def _scenario_claim_is_superseded(
         return False
     for state in world_state:
         state_key = _normalized_match_key(state.key)
+        if fact_key not in state_key:
+            continue
         if any(
             anchor_key in state_key or state_key in anchor_key
             for anchor_key in anchor_keys
