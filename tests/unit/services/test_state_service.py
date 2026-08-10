@@ -33,6 +33,7 @@ from bragi.services.state_service import (
     _state_extraction_from_structured_data,
     _state_extraction_instruction,
     _state_extraction_schema,
+    _state_extraction_tool_schemas,
 )
 
 
@@ -415,6 +416,106 @@ def test_extract_and_apply_turn_preserves_replaced_durable_state_as_memory(
         player_message.id,
         narrator_message.id,
     ]
+
+
+def test_player_claim_lie_and_contradicted_attempt_do_not_become_world_truth(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    extraction = StateExtraction(
+        state_changes=(
+            ExtractedStateChange(
+                operation="upsert",
+                key="vault.open",
+                value={"open": True},
+                category="scene",
+                confidence=0.9,
+                source_message_id=player_message.id,
+                epistemic_status="claim",
+            ),
+            ExtractedStateChange(
+                operation="upsert",
+                key="guard.bribed",
+                value={"bribed": True},
+                category="scene",
+                confidence=0.9,
+                source_message_id=player_message.id,
+                epistemic_status="attempted_action",
+            ),
+            ExtractedStateChange(
+                operation="upsert",
+                key="vault.locked",
+                value={"locked": True},
+                category="scene",
+                confidence=0.9,
+                source_message_id=narrator_message.id,
+                epistemic_status="objective_outcome",
+            ),
+        )
+    )
+
+    result = StateService(
+        repositories=repositories,
+        extractor=StructuredFakeExtractor(extraction),
+    ).apply_extraction(save_id=save.id, extraction=extraction)
+
+    assert [state.key for state in result.world_state] == ["vault.locked"]
+    assert result.suppressed_state_change_count == 2
+
+
+def test_hearsay_memory_retains_actor_and_epistemic_status(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message, _ = _save_with_completed_turn(repositories)
+    extraction = StateExtraction(
+        memories=(
+            ExtractedMemory(
+                body="The courier says the northern gate is unguarded.",
+                tags=("hearsay",),
+                importance=0.7,
+                source_message_id=player_message.id,
+                epistemic_status="reported_speech",
+                epistemic_actor_name="Courier",
+            ),
+        )
+    )
+
+    StateService(
+        repositories=repositories,
+        extractor=StructuredFakeExtractor(extraction),
+    ).apply_extraction(save_id=save.id, extraction=extraction)
+
+    memory = repositories.list_memories(save.id)[0]
+    assert memory.epistemic_status == "reported_speech"
+    assert memory.epistemic_actor_name == "Courier"
+    assert repositories.list_world_state(save.id) == []
+
+
+def test_invalid_model_authored_memory_actor_id_falls_back_to_name(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message, _ = _save_with_completed_turn(repositories)
+    extraction = StateExtraction(
+        memories=(
+            ExtractedMemory(
+                body="A courier reports movement at the north gate.",
+                tags=("hearsay",),
+                importance=0.7,
+                source_message_id=player_message.id,
+                epistemic_status="reported_speech",
+                epistemic_actor_id="invented-character-id",
+                epistemic_actor_name="Courier",
+            ),
+        )
+    )
+
+    result = StateService(
+        repositories=repositories,
+        extractor=StructuredFakeExtractor(extraction),
+    ).apply_extraction(save_id=save.id, extraction=extraction)
+
+    assert result.memories[0].epistemic_actor_id is None
+    assert result.memories[0].epistemic_actor_name == "Courier"
 
 
 def test_extract_and_apply_turn_does_not_preserve_scene_state_overwrites(
@@ -966,6 +1067,7 @@ def test_structured_state_parser_wraps_string_values_and_keeps_dict_values() -> 
                     "confidence": 0.8,
                     "source_message_id": "message-1",
                     "evidence_quote": "urgent and brittle",
+                    "epistemic_status": "objective_outcome",
                 },
                 {
                     "operation": "upsert",
@@ -975,6 +1077,7 @@ def test_structured_state_parser_wraps_string_values_and_keeps_dict_values() -> 
                     "confidence": 0.9,
                     "source_message_id": "message-2",
                     "evidence_quote": "Beacon tower",
+                    "epistemic_status": "objective_outcome",
                 },
             ],
             "memories": [],
@@ -998,6 +1101,7 @@ def test_structured_state_parser_keeps_memory_grounding_quotes() -> None:
                     "importance": 0.74,
                     "source_message_id": "message-1",
                     "evidence_quote": "promise to relight",
+                    "epistemic_status": "objective_outcome",
                 }
             ],
         }
@@ -1019,6 +1123,7 @@ def test_structured_state_parser_records_conflicts_and_suppresses_same_key_patch
                     "confidence": 0.8,
                     "source_message_id": "message-1",
                     "evidence_quote": "Elian's post is empty.",
+                    "epistemic_status": "objective_outcome",
                 },
                 {
                     "operation": "upsert",
@@ -1028,6 +1133,7 @@ def test_structured_state_parser_records_conflicts_and_suppresses_same_key_patch
                     "confidence": 0.9,
                     "source_message_id": "message-1",
                     "evidence_quote": "Beacon tower",
+                    "epistemic_status": "objective_outcome",
                 },
             ],
             "memories": [],
@@ -1078,6 +1184,7 @@ def test_structured_state_conflict_does_not_overwrite_existing_world_state(
                         "confidence": 0.8,
                         "source_message_id": narrator_message.id,
                         "evidence_quote": "empty post",
+                        "epistemic_status": "objective_outcome",
                     }
                 ],
                 "memories": [],
@@ -1133,6 +1240,7 @@ def test_structured_state_only_request_omits_memory_schema_and_accepts_absent_me
                         "confidence": 0.87,
                         "source_message_id": narrator_message.id,
                         "evidence_quote": "lens flares",
+                        "epistemic_status": "objective_outcome",
                     }
                 ],
                 "conflicts": [
@@ -1376,6 +1484,18 @@ def test_structured_schema_requires_grounding_for_state_memories_and_conflicts(
     assert "evidence_quote" in _schema_required_fields(properties, "state_changes")
     assert "evidence_quote" in _schema_required_fields(properties, "memories")
     assert "new_evidence" in _schema_required_fields(properties, "conflicts")
+
+    tool_schemas = _state_extraction_tool_schemas(
+        StateExtractionRequest(
+            save_id=save.id,
+            messages=(player_message, narrator_message),
+            current_state=(),
+        )
+    )
+    patch_required = cast(list[str], tool_schemas["patch_world_state"]["required"])
+    memory_required = cast(list[str], tool_schemas["record_memory_fact"]["required"])
+    assert "epistemic_status" in patch_required
+    assert "epistemic_status" in memory_required
     assert _schema_source_enum(properties, "state_changes") == [
         player_message.id,
         narrator_message.id,
@@ -1489,6 +1609,7 @@ def test_tool_calling_state_extractor_applies_valid_exact_quote_calls(
                             "category": "npc",
                             "source_message_id": narrator_message.id,
                             "evidence_quote": "empty post",
+                            "epistemic_status": "objective_outcome",
                             "confidence": 0.83,
                         }
                     ),
@@ -1503,6 +1624,7 @@ def test_tool_calling_state_extractor_applies_valid_exact_quote_calls(
                             "importance": 0.71,
                             "source_message_id": player_message.id,
                             "evidence_quote": "promise to relight",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -1553,6 +1675,7 @@ def test_tool_calling_state_extractor_retries_unexpected_generated_script(
                             "importance": 0.71,
                             "source_message_id": player_message.id,
                             "evidence_quote": "promise to relight",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -1613,6 +1736,7 @@ def test_tool_calling_state_extractor_accepts_format_normalized_quotes(
                             "category": "npc",
                             "source_message_id": formatted_narrator_message.id,
                             "evidence_quote": "Warden Elian's empty post",
+                            "epistemic_status": "objective_outcome",
                             "confidence": 0.83,
                         }
                     ),
@@ -1662,6 +1786,7 @@ def test_tool_calling_state_extractor_keeps_independent_valid_calls_after_bad_qu
                                 if index == 0
                                 else "empty post"
                             ),
+                            "epistemic_status": "objective_outcome",
                             "confidence": 0.83,
                         }
                     ),
@@ -1674,6 +1799,7 @@ def test_tool_calling_state_extractor_keeps_independent_valid_calls_after_bad_qu
                             "body": "Mara promised to guard the lower stair.",
                             "source_message_id": player_message.id,
                             "evidence_quote": "guard the lower stair",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -1740,6 +1866,7 @@ def test_tool_calling_state_extractor_drops_partial_patch_for_unsafe_key(
                             "value_patch": {"status": "missing"},
                             "source_message_id": narrator_message.id,
                             "evidence_quote": "empty post",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -1764,6 +1891,7 @@ def test_tool_calling_state_extractor_drops_partial_patch_for_unsafe_key(
                             "body": "Mara promised to relight the beacon.",
                             "source_message_id": player_message.id,
                             "evidence_quote": "promise to relight",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -1816,6 +1944,7 @@ def test_tool_calling_state_extractor_drops_partial_state_when_rejected_key_unkn
                             "value_patch": {"status": "missing"},
                             "source_message_id": narrator_message.id,
                             "evidence_quote": "empty post",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -1832,6 +1961,7 @@ def test_tool_calling_state_extractor_drops_partial_state_when_rejected_key_unkn
                             "body": "Mara promised to relight the beacon.",
                             "source_message_id": player_message.id,
                             "evidence_quote": "promise to relight",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -1882,6 +2012,7 @@ def test_tool_calling_state_extractor_records_prompt_inspection(
                             "body": "Mara promised to relight the beacon.",
                             "source_message_id": player_message.id,
                             "evidence_quote": "promise to relight",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -1931,6 +2062,7 @@ def test_tool_calling_state_extractor_rejects_invalid_source_message_id(
                             "body": "Mara promised to relight the beacon.",
                             "source_message_id": "missing-message",
                             "evidence_quote": "promise to relight",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -2234,6 +2366,7 @@ def test_tool_calling_state_extractor_keeps_fallback_result_when_fallback_succee
                             "value_patch": {"name": "Beacon lens", "danger": "high"},
                             "source_message_id": narrator_message.id,
                             "evidence_quote": "lens flares",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -2291,6 +2424,7 @@ def test_tool_calling_state_patch_only_changes_supported_keys(
                             "value_patch": {"danger": "high"},
                             "source_message_id": narrator_message.id,
                             "evidence_quote": "lens flares",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -2346,6 +2480,7 @@ def test_tool_calling_state_patch_strips_unchanged_fields(
                             },
                             "source_message_id": narrator_message.id,
                             "evidence_quote": "lens flares",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -2412,6 +2547,7 @@ def test_tool_calling_state_conflict_does_not_apply_reconciliation_patch(
                             "value_patch": {"status": "missing"},
                             "source_message_id": narrator_message.id,
                             "evidence_quote": "empty post",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -2468,6 +2604,7 @@ def test_tool_calling_state_conflict_supersedes_previous_retry_patch(
                             "value_patch": {"status": "missing"},
                             "source_message_id": narrator_message.id,
                             "evidence_quote": "empty post",
+                            "epistemic_status": "objective_outcome",
                         }
                     ),
                 ),
@@ -3236,6 +3373,7 @@ def _grounded_structured_response(
                 "confidence": 0.87,
                 "source_message_id": narrator_message.id,
                 "evidence_quote": "lens flares",
+                "epistemic_status": "objective_outcome",
             }
         ],
         "memories": [
@@ -3245,6 +3383,7 @@ def _grounded_structured_response(
                 "importance": 0.74,
                 "source_message_id": player_message.id,
                 "evidence_quote": "promise to relight",
+                "epistemic_status": "objective_outcome",
             }
         ],
         "conflicts": [

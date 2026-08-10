@@ -12,7 +12,10 @@ from typing import Any
 from uuid import uuid4
 
 from bragi.persistence.models import SaveRecord
-from bragi.persistence.repositories import PersistenceRepositories
+from bragi.persistence.repositories import (
+    PersistenceRepositories,
+    _epistemic_claim_fingerprint,
+)
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 
 
@@ -461,6 +464,17 @@ class SaveForkService:
             reference_columns={"suggestion_id": "context_update_suggestions"},
         )
         self._copy_table(
+            "context_observations",
+            source_save_id,
+            fork_save_id,
+            message_id_map,
+            prefix_ids,
+            exclude_archived=True,
+            json_columns=("tags_json", "metadata_json", "source_message_ids_json"),
+            message_list_columns=("source_message_ids_json",),
+            reference_columns={"epistemic_actor_id": "characters"},
+        )
+        self._copy_table(
             "memories",
             source_save_id,
             fork_save_id,
@@ -470,9 +484,27 @@ class SaveForkService:
             json_columns=(
                 "tags_json",
                 "source_message_ids_json",
+                "source_observation_ids_json",
             ),
             message_list_columns=("source_message_ids_json",),
+            reference_columns={"epistemic_actor_id": "characters"},
+            reference_list_columns={
+                "source_observation_ids_json": "context_observations"
+            },
         )
+        for memory in self.repositories.list_memories(fork_save_id):
+            self.repositories.connection.execute(
+                "UPDATE memories SET claim_fingerprint = ? WHERE id = ?",
+                (
+                    _epistemic_claim_fingerprint(
+                        memory.body,
+                        epistemic_status=memory.epistemic_status,
+                        epistemic_actor_id=memory.epistemic_actor_id,
+                        epistemic_actor_name=memory.epistemic_actor_name,
+                    ),
+                    memory.id,
+                ),
+            )
         self._copy_table(
             "summaries",
             source_save_id,
@@ -640,9 +672,11 @@ class SaveForkService:
         message_columns: tuple[str, ...] = ("source_message_id",),
         message_list_columns: tuple[str, ...] = (),
         reference_columns: dict[str, str] | None = None,
+        reference_list_columns: dict[str, str] | None = None,
         source_id_message_types: frozenset[str] = frozenset(),
     ) -> None:
         reference_columns = reference_columns or {}
+        reference_list_columns = reference_list_columns or {}
         columns = self._column_names(table_name)
         insert_columns = tuple(
             column
@@ -685,6 +719,29 @@ class SaveForkService:
                     value = self._mapped_optional_table_id(
                         reference_columns[column],
                         value,
+                    )
+                elif column in reference_list_columns:
+                    raw_ids = json.loads(value or "[]")
+                    reference_map = self._id_maps.get(
+                        reference_list_columns[column], {}
+                    )
+                    value = json.dumps(
+                        [
+                            reference_map[item]
+                            for item in raw_ids
+                            if isinstance(item, str) and item in reference_map
+                        ],
+                        sort_keys=True,
+                    )
+                elif table_name == "memories" and column == "claim_fingerprint":
+                    actor_id = self._mapped_optional_table_id(
+                        "characters", row["epistemic_actor_id"]
+                    )
+                    value = _epistemic_claim_fingerprint(
+                        str(row["body"]),
+                        epistemic_status=str(row["epistemic_status"]),
+                        epistemic_actor_id=actor_id,
+                        epistemic_actor_name=str(row["epistemic_actor_name"]),
                     )
                 elif (
                     column == "source_id"

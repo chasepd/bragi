@@ -26,6 +26,7 @@ from bragi.persistence.repositories import (
     MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD,
     MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD,
     PersistenceRepositories,
+    _epistemic_claim_fingerprint,
     canonical_claim_fingerprint,
     validate_context_source_index_budget,
 )
@@ -442,6 +443,8 @@ class ChatBundleService:
                 SELECT id, save_id, body, tags_json, importance,
                        source_message_id, source_message_ids_json,
                        claim_fingerprint, source_observation_ids_json,
+                       epistemic_status, epistemic_actor_id,
+                       epistemic_actor_name,
                        created_at, updated_at, archived_at
                 FROM memories
                 WHERE save_id = ? AND archived_at IS NULL
@@ -524,7 +527,9 @@ class ChatBundleService:
                 """
                 SELECT id, save_id, observation_type, claim, evidence_quote,
                        source_message_ids_json, scope, status, confidence,
-                       tags_json, metadata_json, created_at, updated_at,
+                       tags_json, metadata_json, epistemic_status,
+                       epistemic_actor_id, epistemic_actor_name,
+                       created_at, updated_at,
                        archived_at
                 FROM context_observations
                 WHERE save_id = ? AND archived_at IS NULL
@@ -1383,6 +1388,8 @@ class ChatBundleService:
         imported_id_maps["world_state"] = world_state_id_map
         imported_id_maps["world_state_key"] = world_state_key_map
 
+        pending_epistemic_actor_refs: list[tuple[str, str, str]] = []
+        pending_memory_actor_details: dict[str, tuple[str, str, str]] = {}
         memory_id_map: dict[str, str] = {}
         for row in _list_of_objects(data.get("memories"), "memories"):
             original_id = _text(row, "id")
@@ -1391,6 +1398,18 @@ class ChatBundleService:
                 transitioned_original_message_ids,
             ):
                 continue
+            actor_id = _optional_text(row, "epistemic_actor_id")
+            actor_name = _optional_text(row, "epistemic_actor_name") or ""
+            epistemic_status = (
+                _text(row, "epistemic_status")
+                if "epistemic_status" in row
+                else "legacy_unclassified"
+            )
+            temporary_actor_name = (
+                f"bundle-import-actor:{actor_id}"
+                if actor_id is not None
+                else actor_name
+            )
             memory = self.repositories.add_memory(
                 save_id=save.id,
                 body=_text(row, "body"),
@@ -1410,8 +1429,18 @@ class ChatBundleService:
                     repair_tracker=repair_tracker,
                 ),
                 claim_fingerprint=canonical_claim_fingerprint(_text(row, "body")),
+                epistemic_status=epistemic_status,
+                epistemic_actor_id=None,
+                epistemic_actor_name=temporary_actor_name,
             )
             memory_id_map[original_id] = memory.id
+            if actor_id is not None:
+                pending_epistemic_actor_refs.append(("memories", memory.id, actor_id))
+                pending_memory_actor_details[memory.id] = (
+                    memory.body,
+                    epistemic_status,
+                    actor_name,
+                )
         imported_id_maps["memory"] = memory_id_map
         imported_id_maps["memories"] = memory_id_map
 
@@ -1516,8 +1545,19 @@ class ChatBundleService:
                 confidence=_float(row, "confidence"),
                 tags=_json_string_list(row, "tags_json"),
                 metadata=_optional_json_object(row, "metadata_json") or {},
+                epistemic_status=(
+                    _text(row, "epistemic_status")
+                    if "epistemic_status" in row
+                    else "legacy_unclassified"
+                ),
+                epistemic_actor_id=None,
+                epistemic_actor_name=_optional_text(row, "epistemic_actor_name") or "",
             )
             observation_id_map[original_id] = observation.id
+            if actor_id := _optional_text(row, "epistemic_actor_id"):
+                pending_epistemic_actor_refs.append(
+                    ("context_observations", observation.id, actor_id)
+                )
         imported_id_maps["observation"] = observation_id_map
         imported_id_maps["context_observations"] = observation_id_map
         imported_memories = {
@@ -1875,6 +1915,40 @@ class ChatBundleService:
             live_media_asset_id_map=live_media_asset_id_map,
             repair_tracker=repair_tracker,
         )
+        imported_character_ids = imported_id_maps.get("characters", {})
+        for table_name, record_id, original_actor_id in pending_epistemic_actor_refs:
+            mapped_actor_id = imported_character_ids.get(original_actor_id)
+            if mapped_actor_id is None:
+                continue
+            if table_name == "memories":
+                body, epistemic_status, actor_name = pending_memory_actor_details[
+                    record_id
+                ]
+                self.repositories.connection.execute(
+                    """
+                    UPDATE memories
+                    SET epistemic_actor_id = ?, epistemic_actor_name = ?,
+                        claim_fingerprint = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        mapped_actor_id,
+                        actor_name,
+                        _epistemic_claim_fingerprint(
+                            body,
+                            epistemic_status=epistemic_status,
+                            epistemic_actor_id=mapped_actor_id,
+                            epistemic_actor_name=actor_name,
+                        ),
+                        record_id,
+                    ),
+                )
+            else:
+                self.repositories.connection.execute(
+                    f"UPDATE {table_name} SET epistemic_actor_id = ? WHERE id = ?",
+                    (mapped_actor_id, record_id),
+                )
+        self.repositories.commit()
         try:
             imported_snapshot_count = TurnSnapshotService(
                 self.repositories
@@ -5696,6 +5770,25 @@ def _remapped_context_update_suggestion_proposed_value_json(
                 repair_tracker=repair_tracker,
             )
         )
+    if "epistemic_actor_id" in remapped:
+        actor_id = remapped["epistemic_actor_id"]
+        if actor_id is None or actor_id == "":
+            remapped["epistemic_actor_id"] = None
+        elif not isinstance(actor_id, str):
+            raise ChatBundleError(
+                "Bundle context_update_suggestions.proposed_value_json."
+                "epistemic_actor_id must be a character id"
+            )
+        else:
+            remapped["epistemic_actor_id"] = _mapped_optional_id(
+                entity_id_maps.get("character", {}),
+                actor_id,
+                field_name=(
+                    "context_update_suggestions.proposed_value_json."
+                    "epistemic_actor_id"
+                ),
+                repair_tracker=repair_tracker,
+            )
     if "location_id" in remapped:
         location_id = remapped["location_id"]
         if location_id is None or location_id == "":

@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, cast
 from uuid import uuid4
 
+from bragi.epistemics import normalize_epistemic_status
 from bragi.interaction_mode import InteractionMode, normalize_interaction_mode
 from bragi.observation_types import normalize_observation_type
 from bragi.persistence.context_provenance import merge_context_source_metadata
@@ -4778,7 +4779,14 @@ class PersistenceRepositories:
         tags: list[str] | tuple[str, ...] | None = None,
         metadata: dict[str, object] | None = None,
         observation_id: str | None = None,
+        epistemic_status: str = "legacy_unclassified",
+        epistemic_actor_id: str | None = None,
+        epistemic_actor_name: str = "",
     ) -> ContextObservationRecord:
+        epistemic_actor_id = self._validated_epistemic_actor_id(
+            save_id=save_id,
+            actor_id=epistemic_actor_id,
+        )
         original_observation_type = observation_type.strip()
         normalized_observation_type = normalize_observation_type(
             original_observation_type
@@ -4801,15 +4809,19 @@ class PersistenceRepositories:
             confidence=confidence,
             tags=_unique_strings(tags or ()),
             metadata=normalized_metadata,
+            epistemic_status=normalize_epistemic_status(epistemic_status),
+            epistemic_actor_id=epistemic_actor_id,
+            epistemic_actor_name=epistemic_actor_name.strip()[:200],
         )
         self.connection.execute(
             """
             INSERT INTO context_observations(
                 id, save_id, observation_type, claim, evidence_quote,
                 source_message_ids_json, scope, status, confidence, tags_json,
-                metadata_json
+                metadata_json, epistemic_status, epistemic_actor_id,
+                epistemic_actor_name
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -4823,6 +4835,9 @@ class PersistenceRepositories:
                 record.confidence,
                 _dump_json(record.tags),
                 _dump_json(record.metadata),
+                record.epistemic_status,
+                record.epistemic_actor_id,
+                record.epistemic_actor_name,
             ),
         )
         self.connection.execute(
@@ -4857,7 +4872,8 @@ class PersistenceRepositories:
             """
             SELECT id, save_id, observation_type, claim, evidence_quote,
                    source_message_ids_json, scope, status, confidence, tags_json,
-                   metadata_json, created_at, updated_at, archived_at
+                   metadata_json, created_at, updated_at, archived_at,
+                   epistemic_status, epistemic_actor_id, epistemic_actor_name
             FROM context_observations
             WHERE id = ? AND archived_at IS NULL
             """,
@@ -4895,7 +4911,8 @@ class PersistenceRepositories:
             f"""
             SELECT id, save_id, observation_type, claim, evidence_quote,
                    source_message_ids_json, scope, status, confidence, tags_json,
-                   metadata_json, created_at, updated_at, archived_at
+                   metadata_json, created_at, updated_at, archived_at,
+                   epistemic_status, epistemic_actor_id, epistemic_actor_name
             FROM context_observations
             WHERE {' AND '.join(filters)}
             {order_sql}
@@ -4955,7 +4972,9 @@ class PersistenceRepositories:
                    observation.status, observation.confidence,
                    observation.tags_json, observation.metadata_json,
                    observation.created_at, observation.updated_at,
-                   observation.archived_at
+                   observation.archived_at, observation.epistemic_status,
+                   observation.epistemic_actor_id,
+                   observation.epistemic_actor_name
             FROM context_observations observation
             JOIN context_observation_curation_state curation
               ON curation.observation_id = observation.id
@@ -5195,7 +5214,8 @@ class PersistenceRepositories:
                 f"""
                 SELECT id, save_id, observation_type, claim, evidence_quote,
                        source_message_ids_json, scope, status, confidence,
-                       tags_json, metadata_json, created_at, updated_at, archived_at
+                       tags_json, metadata_json, created_at, updated_at, archived_at,
+                       epistemic_status, epistemic_actor_id, epistemic_actor_name
                 FROM context_observations
                 WHERE id IN (
                     SELECT observation_id
@@ -11032,12 +11052,25 @@ class PersistenceRepositories:
         memory_id: str | None = None,
         claim_fingerprint: str | None = None,
         source_observation_ids: list[str] | tuple[str, ...] | None = None,
+        epistemic_status: str = "legacy_unclassified",
+        epistemic_actor_id: str | None = None,
+        epistemic_actor_name: str = "",
     ) -> MemoryRecord:
+        epistemic_actor_id = self._validated_epistemic_actor_id(
+            save_id=save_id,
+            actor_id=epistemic_actor_id,
+        )
         resolved_source_message_ids = _memory_source_message_ids(
             source_message_id=source_message_id,
             source_message_ids=source_message_ids,
         )
-        resolved_fingerprint = canonical_claim_fingerprint(body)
+        normalized_epistemic_status = normalize_epistemic_status(epistemic_status)
+        resolved_fingerprint = _epistemic_claim_fingerprint(
+            body,
+            epistemic_status=normalized_epistemic_status,
+            epistemic_actor_id=epistemic_actor_id,
+            epistemic_actor_name=epistemic_actor_name,
+        )
         self.begin_immediate_transaction()
         try:
             existing = self.get_memory_by_claim_fingerprint(
@@ -11045,6 +11078,69 @@ class PersistenceRepositories:
                 claim_fingerprint=resolved_fingerprint,
             )
             if existing is not None:
+                if (
+                    existing.epistemic_status != normalized_epistemic_status
+                    or existing.epistemic_actor_id != epistemic_actor_id
+                    or existing.epistemic_actor_name
+                    != epistemic_actor_name.strip()[:200]
+                ):
+                    self.connection.execute(
+                        """
+                        UPDATE memories
+                        SET epistemic_status = ?, epistemic_actor_id = ?,
+                            epistemic_actor_name = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (
+                            normalized_epistemic_status,
+                            epistemic_actor_id,
+                            epistemic_actor_name.strip()[:200],
+                            existing.id,
+                        ),
+                    )
+                    existing = replace(
+                        existing,
+                        epistemic_status=normalized_epistemic_status,
+                        epistemic_actor_id=epistemic_actor_id,
+                        epistemic_actor_name=epistemic_actor_name.strip()[:200],
+                    )
+                if existing.epistemic_status != "legacy_unclassified":
+                    merged_source_ids = list(
+                        dict.fromkeys(
+                            (*existing.source_message_ids, *resolved_source_message_ids)
+                        )
+                    )
+                    merged_observation_ids = list(
+                        dict.fromkeys(
+                            (
+                                *existing.source_observation_ids,
+                                *(source_observation_ids or ()),
+                            )
+                        )
+                    )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS]
+                    self.connection.execute(
+                        """
+                        UPDATE memories
+                        SET tags_json = ?, importance = ?,
+                            source_message_ids_json = ?,
+                            source_observation_ids_json = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (
+                            _dump_json(list(dict.fromkeys((*existing.tags, *tags)))),
+                            max(existing.importance, importance),
+                            _dump_json(merged_source_ids),
+                            _dump_json(merged_observation_ids),
+                            existing.id,
+                        ),
+                    )
+                    self.commit_transaction()
+                    return next(
+                        memory
+                        for memory in self.list_memories(save_id)
+                        if memory.id == existing.id
+                    )
                 record = self.update_memory(
                     memory_id=existing.id,
                     body=existing.body,
@@ -11082,15 +11178,19 @@ class PersistenceRepositories:
                 source_observation_ids=_unique_strings(
                     source_observation_ids or ()
                 )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS],
+                epistemic_status=normalized_epistemic_status,
+                epistemic_actor_id=epistemic_actor_id,
+                epistemic_actor_name=epistemic_actor_name.strip()[:200],
             )
             self.connection.execute(
                 """
                 INSERT INTO memories(
                     id, save_id, body, tags_json, importance, source_message_id,
                     source_message_ids_json, claim_fingerprint,
-                    source_observation_ids_json
+                    source_observation_ids_json, epistemic_status,
+                    epistemic_actor_id, epistemic_actor_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.id,
@@ -11102,6 +11202,9 @@ class PersistenceRepositories:
                     _dump_json(record.source_message_ids),
                     record.claim_fingerprint,
                     _dump_json(record.source_observation_ids),
+                    record.epistemic_status,
+                    record.epistemic_actor_id,
+                    record.epistemic_actor_name,
                 ),
             )
             self.commit_transaction()
@@ -11109,6 +11212,20 @@ class PersistenceRepositories:
         except BaseException:
             self.rollback_transaction()
             raise
+
+    def _validated_epistemic_actor_id(
+        self,
+        *,
+        save_id: str,
+        actor_id: str | None,
+    ) -> str | None:
+        if not actor_id:
+            return None
+        row = self._fetch_one(
+            "SELECT 1 FROM characters WHERE id = ? AND save_id = ?",
+            (actor_id, save_id),
+        )
+        return actor_id if row is not None else None
 
     def update_memory(
         self,
@@ -11155,7 +11272,8 @@ class PersistenceRepositories:
         current = self._fetch_one(
             """
             SELECT save_id, source_message_id, source_message_ids_json,
-                   source_observation_ids_json, claim_fingerprint, archived_at
+                   source_observation_ids_json, claim_fingerprint, archived_at,
+                   epistemic_status, epistemic_actor_id, epistemic_actor_name
             FROM memories
             WHERE id = ?
             """,
@@ -11187,7 +11305,12 @@ class PersistenceRepositories:
                 else source_observation_ids
             )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS]
         )
-        resolved_fingerprint = canonical_claim_fingerprint(body)
+        resolved_fingerprint = _epistemic_claim_fingerprint(
+            body,
+            epistemic_status=str(current["epistemic_status"]),
+            epistemic_actor_id=current["epistemic_actor_id"],
+            epistemic_actor_name=str(current["epistemic_actor_name"]),
+        )
         save_id = str(current["save_id"])
         collision = self.get_memory_by_claim_fingerprint(
             save_id=save_id,
@@ -11230,7 +11353,8 @@ class PersistenceRepositories:
             """
             SELECT id, save_id, body, tags_json, importance, source_message_id,
                    source_message_ids_json, claim_fingerprint,
-                   source_observation_ids_json
+                   source_observation_ids_json, epistemic_status,
+                   epistemic_actor_id, epistemic_actor_name
             FROM memories
             WHERE id = ?
             """,
@@ -11251,6 +11375,9 @@ class PersistenceRepositories:
             ),
             claim_fingerprint=row["claim_fingerprint"],
             source_observation_ids=_load_list(row["source_observation_ids_json"]),
+            epistemic_status=row["epistemic_status"],
+            epistemic_actor_id=row["epistemic_actor_id"],
+            epistemic_actor_name=row["epistemic_actor_name"],
         )
 
     def _merge_colliding_memory_update(
@@ -11370,7 +11497,9 @@ class PersistenceRepositories:
                 f"""
                 SELECT id, save_id, body, tags_json, importance,
                        source_message_id, source_message_ids_json,
-                       source_observation_ids_json, archived_at
+                       source_observation_ids_json, archived_at,
+                       epistemic_status, epistemic_actor_id,
+                       epistemic_actor_name
                 FROM memories
                 WHERE id IN ({_placeholders(len(memory_ids))})
                 ORDER BY created_at, rowid
@@ -11382,7 +11511,12 @@ class PersistenceRepositories:
                     continue
                 memory_id = str(row["id"])
                 save_id = str(row["save_id"])
-                fingerprint = canonical_claim_fingerprint(row["body"])
+                fingerprint = _epistemic_claim_fingerprint(
+                    str(row["body"]),
+                    epistemic_status=str(row["epistemic_status"]),
+                    epistemic_actor_id=row["epistemic_actor_id"],
+                    epistemic_actor_name=str(row["epistemic_actor_name"]),
+                )
                 collision = self.get_memory_by_claim_fingerprint(
                     save_id=save_id,
                     claim_fingerprint=fingerprint,
@@ -11505,7 +11639,8 @@ class PersistenceRepositories:
             f"""
             SELECT id, save_id, body, tags_json, importance, source_message_id,
                    source_message_ids_json, claim_fingerprint,
-                   source_observation_ids_json
+                   source_observation_ids_json, epistemic_status,
+                   epistemic_actor_id, epistemic_actor_name
             FROM memories
             WHERE save_id = ? AND archived_at IS NULL
             {order_sql}
@@ -11531,6 +11666,9 @@ class PersistenceRepositories:
                 source_observation_ids=_load_list(
                     row["source_observation_ids_json"]
                 ),
+                epistemic_status=row["epistemic_status"],
+                epistemic_actor_id=row["epistemic_actor_id"],
+                epistemic_actor_name=row["epistemic_actor_name"],
             )
             for row in rows
         ]
@@ -11540,7 +11678,8 @@ class PersistenceRepositories:
             """
             SELECT id, save_id, body, tags_json, importance, source_message_id,
                    source_message_ids_json, claim_fingerprint,
-                   source_observation_ids_json
+                   source_observation_ids_json, epistemic_status,
+                   epistemic_actor_id, epistemic_actor_name
             FROM memories
             WHERE save_id = ? AND id = ? AND archived_at IS NULL
             """,
@@ -11563,6 +11702,9 @@ class PersistenceRepositories:
             source_observation_ids=_load_list(
                 row["source_observation_ids_json"]
             ),
+            epistemic_status=row["epistemic_status"],
+            epistemic_actor_id=row["epistemic_actor_id"],
+            epistemic_actor_name=row["epistemic_actor_name"],
         )
 
     def list_memories_for_continuity_index(
@@ -11699,7 +11841,8 @@ class PersistenceRepositories:
                 observations.status, observations.confidence,
                 observations.tags_json, observations.metadata_json,
                 observations.created_at, observations.updated_at,
-                observations.archived_at
+                observations.archived_at, observations.epistemic_status,
+                observations.epistemic_actor_id, observations.epistemic_actor_name
             FROM context_observations AS observations
             JOIN json_each(?) selected
               ON observations.id = CAST(selected.value AS TEXT)
@@ -11721,7 +11864,8 @@ class PersistenceRepositories:
             """
             SELECT id, save_id, body, tags_json, importance, source_message_id,
                    source_message_ids_json, claim_fingerprint,
-                   source_observation_ids_json
+                   source_observation_ids_json, epistemic_status,
+                   epistemic_actor_id, epistemic_actor_name
             FROM memories
             WHERE save_id = ?
               AND claim_fingerprint = ?
@@ -11748,6 +11892,9 @@ class PersistenceRepositories:
             source_observation_ids=_load_list(
                 row["source_observation_ids_json"]
             ),
+            epistemic_status=row["epistemic_status"],
+            epistemic_actor_id=row["epistemic_actor_id"],
+            epistemic_actor_name=row["epistemic_actor_name"],
         )
 
     def consolidate_active_memory_duplicates(
@@ -14548,6 +14695,20 @@ def canonical_claim_fingerprint(value: object) -> str:
     return sha256(canonical.encode("utf-8")).hexdigest() if canonical else ""
 
 
+def _epistemic_claim_fingerprint(
+    body: str,
+    *,
+    epistemic_status: str,
+    epistemic_actor_id: str | None,
+    epistemic_actor_name: str,
+) -> str:
+    fingerprint = canonical_claim_fingerprint(body)
+    if epistemic_status == "legacy_unclassified":
+        return fingerprint
+    actor_key = epistemic_actor_id or epistemic_actor_name.strip().casefold()
+    return f"{fingerprint}:{epistemic_status}:{actor_key}"
+
+
 def _transaction_savepoint_name(depth: int) -> str:
     return f"bragi_tx_{depth}"
 
@@ -15015,8 +15176,13 @@ def _context_source_eligibility_sql(
         params.extend(visibility_ids)
         params.extend(visibility_ids)
         params.extend(visibility_ids)
-    if visibility_character_ids is not None:
-        scope_ids_json = _dump_json(sorted(visibility_character_ids))
+    scope_character_ids = (
+        reference_character_ids
+        if reference_character_ids is not None
+        else visibility_character_ids
+    )
+    if scope_character_ids is not None:
+        scope_ids_json = _dump_json(sorted(scope_character_ids))
         source_target_type_sql = (
             f"(CASE WHEN {alias}.source_type IN ('state', 'world_state') "
             "THEN 'world_state' "
@@ -15079,9 +15245,7 @@ def _context_source_eligibility_sql(
             "SELECT 1 FROM message_visibility hidden "
             f"WHERE hidden.save_id = {alias}.save_id "
             "AND hidden.visibility = 'not_visible' "
-            "AND hidden.character_id IN ("
-            "SELECT CAST(value AS TEXT) FROM json_each(?)"
-            ") "
+            "AND hidden.character_id = edge.character_id "
             "AND (hidden.message_id = edge.source_message_id OR "
             "hidden.message_id IN ("
             "SELECT CAST(value AS TEXT) "
@@ -15110,9 +15274,7 @@ def _context_source_eligibility_sql(
             "SELECT 1 FROM message_visibility hidden "
             f"WHERE hidden.save_id = {alias}.save_id "
             "AND hidden.visibility = 'not_visible' "
-            "AND hidden.character_id IN ("
-            "SELECT CAST(value AS TEXT) FROM json_each(?)"
-            ") "
+            "AND hidden.character_id = link.entity_id "
             "AND hidden.message_id = link.source_message_id"
             ")"
             ")"
@@ -15120,8 +15282,6 @@ def _context_source_eligibility_sql(
         )
         params.extend(
             (
-                scope_ids_json,
-                scope_ids_json,
                 scope_ids_json,
                 scope_ids_json,
             )
@@ -16138,6 +16298,9 @@ def _context_observation_from_row(row: sqlite3.Row) -> ContextObservationRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         archived_at=row["archived_at"],
+        epistemic_status=row["epistemic_status"],
+        epistemic_actor_id=row["epistemic_actor_id"],
+        epistemic_actor_name=row["epistemic_actor_name"],
     )
 
 

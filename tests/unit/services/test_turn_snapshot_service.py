@@ -767,6 +767,45 @@ def test_legacy_memory_normalization_preserves_other_id_namespaces() -> None:
     assert trigger["source_id"] == "memory-duplicate"
 
 
+def test_snapshot_memory_normalization_preserves_epistemic_identity() -> None:
+    rows = turn_snapshot_module._normalize_legacy_snapshot_memories(
+        {
+            "memories": (
+                {
+                    "id": "memory-first",
+                    "body": "The north gate is unguarded.",
+                    "tags_json": "[]",
+                    "importance": 0.8,
+                    "source_message_ids_json": "[]",
+                    "source_observation_ids_json": "[]",
+                    "epistemic_status": "reported_speech",
+                    "epistemic_actor_id": "character-first",
+                    "epistemic_actor_name": "Courier",
+                    "archived_at": None,
+                },
+                {
+                    "id": "memory-second",
+                    "body": "The north gate is unguarded.",
+                    "tags_json": "[]",
+                    "importance": 0.8,
+                    "source_message_ids_json": "[]",
+                    "source_observation_ids_json": "[]",
+                    "epistemic_status": "reported_speech",
+                    "epistemic_actor_id": "character-second",
+                    "epistemic_actor_name": "Courier",
+                    "archived_at": None,
+                },
+            )
+        }
+    )
+
+    assert [row["id"] for row in rows["memories"]] == [
+        "memory-first",
+        "memory-second",
+    ]
+    assert len({row["claim_fingerprint"] for row in rows["memories"]}) == 2
+
+
 def test_legacy_memory_normalization_bounds_merged_provenance() -> None:
     rows = turn_snapshot_module._normalize_legacy_snapshot_memories(
         {

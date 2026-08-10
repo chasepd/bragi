@@ -49,6 +49,7 @@ from bragi.services.context_search_service import (
     _memory_provenance_visible_to_present_characters,
 )
 from bragi.services.continuity_index_service import ContinuityIndexService
+from bragi.services.knowledge_boundary import ScopedTargets
 from bragi.services.narration_context import load_narration_context_snapshot
 
 
@@ -2587,7 +2588,7 @@ def test_context_search_uses_character_knowledge_graph_for_scoped_context(
     assert "Tarin knows Avery made the archive-code joke" not in prompt
 
 
-def test_context_search_omits_recent_message_hidden_from_active_npc(
+def test_context_search_keeps_recent_message_for_omniscient_narrator(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -2652,11 +2653,11 @@ def test_context_search_omits_recent_message_hidden_from_active_npc(
     prompt = "\n".join(
         message.body for message in provider.structured_output_requests[0].messages
     )
-    assert hidden.body not in prompt
+    assert hidden.body in prompt
     assert player_message.body in prompt
 
 
-def test_context_search_omits_observation_derivatives_hidden_from_active_npc(
+def test_context_search_keeps_qualified_hidden_derivatives_for_narrator(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -2672,6 +2673,12 @@ def test_context_search_omits_observation_derivatives_hidden_from_active_npc(
         role="narrator",
         body="The private lens code is cobalt-seven.",
     )
+    for index in range(60):
+        repositories.append_message(
+            save_id=save.id,
+            role="narrator",
+            body=f"Routine archive beat {index}.",
+        )
     player_message = repositories.append_message(
         save_id=save.id,
         role="player",
@@ -2683,9 +2690,14 @@ def test_context_search_omits_observation_derivatives_hidden_from_active_npc(
         name="Nira",
         met=True,
     )
+    mara = repositories.add_character(
+        save_id=save.id,
+        name="Mara",
+        met=True,
+    )
     repositories.upsert_scene_snapshot(
         save_id=save.id,
-        present_character_ids=[nira.id],
+        present_character_ids=[nira.id, mara.id],
     )
     repositories.add_message_visibility(
         save_id=save.id,
@@ -2705,12 +2717,21 @@ def test_context_search_omits_observation_derivatives_hidden_from_active_npc(
         scope="durable",
         status="accepted",
     )
-    repositories.add_memory(
+    memory = repositories.add_memory(
         save_id=save.id,
         body="The private lens code is cobalt-seven.",
         tags=["lens"],
         source_message_ids=[hidden.id],
         source_observation_ids=[observation.id],
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=mara.id,
+        target_type="memory",
+        target_id=memory.id,
+        knowledge_state="knows",
+        acquisition_method="witnessed",
+        source_message_id=hidden.id,
     )
     repositories.upsert_context_source(
         save_id=save.id,
@@ -2724,6 +2745,19 @@ def test_context_search_omits_observation_derivatives_hidden_from_active_npc(
             "source_message_ids": [hidden.id],
         },
     )
+    indexed = repositories.list_context_sources(save.id, source_type="observation")
+    candidates = context_search_module._indexed_context_candidates(
+        indexed,
+        scoped_targets=ScopedTargets(allowed={}, blocked=set()),
+        reference_character_ids=frozenset({nira.id, mara.id}),
+        accepted_observation_ids=frozenset({observation.id}),
+        present_character_ids=frozenset({nira.id, mara.id}),
+        message_visibility=repositories.list_message_visibility(save.id),
+    )
+
+    assert "cobalt-seven" in candidates[0].text
+    assert "epistemic status: legacy_unclassified" in candidates[0].text
+
     repositories.set_model_preference(
         task="context_search",
         provider="fake",
@@ -2736,17 +2770,16 @@ def test_context_search_omits_observation_derivatives_hidden_from_active_npc(
         capabilities=[ProviderCapability.STRUCTURED_OUTPUT.value],
     )
     provider = RecordingStructuredContextProvider()
-    service = ContextSearchService(
-        repositories=repositories,
-        providers={"fake": provider},
+    asyncio.run(
+        ContextSearchService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).search(save_id=save.id, player_message_id=player_message.id)
     )
-
-    asyncio.run(service.search(save_id=save.id, player_message_id=player_message.id))
-
     prompt = "\n".join(
         message.body for message in provider.structured_output_requests[0].messages
     )
-    assert "cobalt-seven" not in prompt
+    assert "private lens code is cobalt-seven" in prompt
 
 
 def test_context_search_keeps_message_hidden_only_from_absent_mention(
@@ -3368,10 +3401,10 @@ def test_context_search_filters_state_changes_by_scope_and_message_visibility(
     )
     assert f"[state_change:{scoped_change.id}]" not in prompt
     assert f"[state_change:{archived_scoped_change.id}]" not in prompt
-    assert f"[state_change:{hidden_source_change.id}]" not in prompt
+    assert f"[state_change:{hidden_source_change.id}]" in prompt
     assert "drowned ledger" not in prompt
     assert "forgotten gate" not in prompt
-    assert "ash bridge route" not in prompt
+    assert "ash bridge route" in prompt
     assert "crypt.map" not in prompt
     assert "crypt.route" not in prompt
 

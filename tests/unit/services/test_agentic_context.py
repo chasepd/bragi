@@ -12,7 +12,7 @@ from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import ContextObservationRecord, SaveRecord
 from bragi.persistence.repositories import (
     PersistenceRepositories,
-    canonical_claim_fingerprint,
+    _epistemic_claim_fingerprint,
 )
 from bragi.providers.contracts import (
     ChatMessage,
@@ -260,6 +260,76 @@ def test_observation_extractor_returns_evidence_backed_candidates(
     assert provider.structured_output_requests[0].schema_name == (
         "context_observation_extraction"
     )
+    observation_schema = provider.structured_output_requests[0].schema["properties"][
+        "observations"
+    ]["items"]
+    assert {
+        "epistemic_status",
+        "epistemic_actor_id",
+        "epistemic_actor_name",
+    } <= set(observation_schema["required"])
+
+
+def test_observation_service_preserves_actor_distinct_matching_claims(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    messages = tuple(repositories.list_messages(save.id))
+    base = {
+        "observation_type": "character_fact",
+        "claim": "Keep it grounded.",
+        "evidence_quote": "Keep it grounded",
+        "source_message_ids": [messages[0].id],
+        "scope": "save",
+        "confidence": 0.7,
+        "tags": ["report"],
+        "epistemic_status": "claim",
+    }
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        **base,
+                        "epistemic_actor_id": "actor-one",
+                        "epistemic_actor_name": "First Courier",
+                    },
+                    {
+                        **base,
+                        "epistemic_actor_id": "actor-two",
+                        "epistemic_actor_name": "Second Courier",
+                        "epistemic_status": "reported_speech",
+                    },
+                    {
+                        **base,
+                        "epistemic_actor_id": "actor-one",
+                        "epistemic_actor_name": "First Courier",
+                        "epistemic_status": "objective_outcome",
+                    },
+                ]
+            }
+        }
+    )
+
+    result = asyncio.run(
+        ObservationService(
+            repositories=repositories,
+            extractor=StructuredProviderObservationExtractor(
+                provider=provider,
+                provider_name=provider.provider_name,
+                model_id="observer",
+            ),
+        ).observe_turn(
+            save_id=save.id,
+            source_message_ids=tuple(message.id for message in messages),
+        )
+    )
+
+    assert result.observed_count == 2
+    assert {item.epistemic_actor_name for item in result.observations} == {
+        "First Courier",
+        "Second Courier",
+    }
 
 
 def test_observation_extractor_normalizes_type_confidence_and_candidate_limit(
@@ -354,6 +424,47 @@ def test_observation_service_drops_ungrounded_evidence_quotes(
     )
 
     assert result.observed_count == 1
+
+
+def test_observation_service_downgrades_mixed_source_player_lie(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, narrator = repositories.list_messages(save.id)
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        "observation_type": "player_preference",
+                        "claim": "Keep it grounded.",
+                        "evidence_quote": "Keep it grounded",
+                        "source_message_ids": [player.id, narrator.id],
+                        "scope": "durable",
+                        "confidence": 0.9,
+                        "tags": ["ownership"],
+                        "epistemic_status": "objective_outcome",
+                    }
+                ]
+            }
+        }
+    )
+
+    result = asyncio.run(
+        ObservationService(
+            repositories=repositories,
+            extractor=StructuredProviderObservationExtractor(
+                provider=provider,
+                provider_name=provider.provider_name,
+                model_id="observer",
+            ),
+        ).observe_turn(
+            save_id=save.id,
+            source_message_ids=(player.id, narrator.id),
+        )
+    )
+
+    assert result.observations[0].epistemic_status == "claim"
     assert result.observations[0].claim == "Keep it grounded."
 
 
@@ -2100,6 +2211,8 @@ def test_context_curation_queues_durable_memory_when_confirmation_enabled(
         scope="durable",
         confidence=0.9,
         tags=["tone"],
+        epistemic_status="claim",
+        epistemic_actor_name="Mara",
     )
     provider = RecordingStructuredProvider(
         {
@@ -2145,9 +2258,15 @@ def test_context_curation_queues_durable_memory_when_confirmation_enabled(
         "source_message_ids": [player.id],
         "source_observation_id": observation.id,
         "source_observation_ids": [observation.id],
-        "claim_fingerprint": canonical_claim_fingerprint(
-            "Keep it grounded."
+        "claim_fingerprint": _epistemic_claim_fingerprint(
+            "Keep it grounded.",
+            epistemic_status="claim",
+            epistemic_actor_id=None,
+            epistemic_actor_name="Mara",
         ),
+        "epistemic_status": "claim",
+        "epistemic_actor_id": None,
+        "epistemic_actor_name": "Mara",
     }
     updated_observation = repositories.get_context_observation(observation.id)
     assert updated_observation is not None

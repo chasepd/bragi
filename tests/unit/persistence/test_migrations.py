@@ -987,7 +987,7 @@ def test_migration_74_to_75_adds_scene_fact_tables(tmp_path: Path) -> None:
     with sqlite3.connect(database_path) as connection:
         connection.execute("DROP TABLE scene_fact_sources")
         connection.execute("DROP TABLE scene_facts")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 75")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 75")
         connection.commit()
 
     migrate_database(database_path)
@@ -1000,6 +1000,72 @@ def test_migration_74_to_75_adds_scene_fact_tables(tmp_path: Path) -> None:
             )
         }
         assert {"scene_facts", "scene_fact_sources"} <= tables
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_75_to_76_marks_existing_knowledge_legacy_unclassified(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Legacy",
+            premise="",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(scenario_id=scenario.id, title="Legacy")
+        repositories.add_memory(save_id=save.id, body="An old fact.", tags=[])
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="world_fact",
+            claim="An old observation.",
+        )
+        for table_name in ("memories", "context_observations"):
+            connection.execute(
+                f"ALTER TABLE {table_name} DROP COLUMN epistemic_actor_name"
+            )
+            connection.execute(
+                f"ALTER TABLE {table_name} DROP COLUMN epistemic_actor_id"
+            )
+            connection.execute(
+                f"ALTER TABLE {table_name} DROP COLUMN epistemic_status"
+            )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 76")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT epistemic_status FROM memories"
+        ).fetchone() == ("legacy_unclassified",)
+        assert connection.execute(
+            "SELECT epistemic_status FROM context_observations"
+        ).fetchone() == ("legacy_unclassified",)
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_current_schema_repairs_missing_epistemic_columns(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "ALTER TABLE context_observations DROP COLUMN epistemic_actor_name"
+        )
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(context_observations)")
+        }
+        assert "epistemic_actor_name" in columns
         assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
 
 
