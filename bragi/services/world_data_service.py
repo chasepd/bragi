@@ -43,6 +43,7 @@ from bragi.services.character_profile_completion import (
     normalize_scenario_character_starters,
     scenario_character_starter_to_json,
 )
+from bragi.services.scenario_canon import CANON_CONTENT_KEY
 from bragi.services.scenario_content_rating import (
     metadata_with_scenario_content_ratings,
     scenario_content_rating,
@@ -1500,7 +1501,12 @@ _SCENARIO_CORE_CONTENT_KEYS = frozenset(
     )
 )
 _SCENARIO_NON_SECTION_CONTENT_KEYS = frozenset(
-    (*_SCENARIO_CORE_CONTENT_KEYS, CHARACTER_STARTERS_CONTENT_KEY, "_source")
+    (
+        *_SCENARIO_CORE_CONTENT_KEYS,
+        CHARACTER_STARTERS_CONTENT_KEY,
+        CANON_CONTENT_KEY,
+        "_source",
+    )
 )
 
 
@@ -1543,6 +1549,9 @@ def _content_with_preserved_metadata(
     if scenario is None:
         return normalized
     scenario_content = dict(_scenario_content(scenario.content_json))
+    compiled_canon = scenario_content.get(CANON_CONTENT_KEY)
+    if isinstance(compiled_canon, Mapping):
+        normalized[CANON_CONTENT_KEY] = dict(compiled_canon)
     source = scenario_content.get("_source")
     resolved_section_ratings = dict(section_ratings or {})
     if not resolved_section_ratings:
