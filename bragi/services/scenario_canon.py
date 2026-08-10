@@ -462,16 +462,20 @@ def _claims_cover_source(
     *,
     section_id: str,
 ) -> bool:
-    intervals = sorted(
-        (
-            match.start(),
-            match.end(),
-        )
-        for claim in claims
-        if claim.get("source_section") == section_id
-        for match in [re.search(re.escape(str(claim["evidence_quote"])), source)]
-        if match is not None
-    )
+    intervals: list[tuple[int, int]] = []
+    used_occurrences: set[tuple[int, int]] = set()
+    for claim in claims:
+        if claim.get("source_section") != section_id:
+            continue
+        matches = re.finditer(re.escape(str(claim["evidence_quote"])), source)
+        for match in matches:
+            interval = (match.start(), match.end())
+            if interval in used_occurrences:
+                continue
+            used_occurrences.add(interval)
+            intervals.append(interval)
+            break
+    intervals.sort()
     cursor = 0
     uncovered: list[str] = []
     for start, end in intervals:

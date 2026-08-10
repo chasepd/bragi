@@ -3432,17 +3432,14 @@ def _scenario_claim_is_superseded(
     anchor_keys.discard("")
     if not anchor_keys:
         return False
-    expected_state_keys = {(anchor_key, fact_key) for anchor_key in anchor_keys}
     for state in world_state:
-        entity_path, separator, state_fact_key = state.key.rpartition(".")
-        if not separator:
-            continue
-        canonical_state_key = (
-            _normalize_key_component(entity_path),
-            _normalize_key_component(state_fact_key),
-        )
-        if canonical_state_key in expected_state_keys:
-            return True
+        key_parts = state.key.split(".")
+        for index, entity_part in enumerate(key_parts[:-1]):
+            if _normalize_key_component(entity_part) not in anchor_keys:
+                continue
+            state_fact_key = _normalize_key_component(".".join(key_parts[index + 1 :]))
+            if state_fact_key == fact_key:
+                return True
     return False
 
 

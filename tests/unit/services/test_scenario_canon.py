@@ -453,6 +453,37 @@ def test_compiler_rejects_partial_section_coverage() -> None:
         )
 
 
+def test_compiler_assigns_repeated_evidence_to_distinct_occurrences() -> None:
+    output = _output()
+    sections = output["sections"]
+    assert isinstance(sections, list)
+    section = sections[0]
+    assert isinstance(section, dict)
+    claims = section["claims"]
+    assert isinstance(claims, list)
+    first_claim = claims[0]
+    assert isinstance(first_claim, dict)
+    section["claims"] = [dict(first_claim), dict(first_claim)]
+
+    compiled = asyncio.run(
+        ScenarioCanonCompiler(
+            provider=FakeProviderClient(structured_output=output),
+            provider_name="fake",
+            model_id="canon-model",
+        ).compile(
+            scenario_type="full_roleplay",
+            content={
+                "lore": (
+                    "The beacon consumes one memory per use. "
+                    "The beacon consumes one memory per use."
+                )
+            },
+        )
+    )
+
+    assert len(scenario_canon_claims(compiled)) == 2
+
+
 def test_compiler_rejects_known_by_outside_entity_anchors() -> None:
     output = _output()
     sections = output["sections"]

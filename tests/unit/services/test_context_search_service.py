@@ -3200,6 +3200,16 @@ def test_scenario_start_claim_is_superseded_by_matching_accepted_state(
         claim,
         world_state=[adjacent_state],
     )
+    prefixed_state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="object.east-tower-lens.condition",
+        value={"condition": "repaired"},
+        category="object",
+    )
+    assert context_search_module._scenario_claim_is_superseded(
+        claim,
+        world_state=[prefixed_state],
+    )
 
 
 def test_narrator_only_claim_bypasses_character_known_by_filter(
