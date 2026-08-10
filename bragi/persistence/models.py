@@ -912,6 +912,25 @@ class JobStepRecord:
 
 
 @dataclass(frozen=True)
+class PostTurnOutboxRecord:
+    id: str
+    save_id: str
+    player_message_id: str
+    narrator_message_id: str
+    turn_revision: str
+    step: str
+    status: str
+    attempt_count: int
+    payload: dict[str, object]
+    result: dict[str, object] | None
+    last_error: str | None
+    created_at: str | None = None
+    updated_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+
+
+@dataclass(frozen=True)
 class RuntimePerformanceRecord:
     job_type: str | None = None
     step_name: str | None = None

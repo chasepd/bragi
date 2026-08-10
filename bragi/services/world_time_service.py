@@ -319,6 +319,8 @@ class WorldTimeService:
         snapshot = self.repositories.get_scene_snapshot(save_id)
         if snapshot is None:
             return WorldTimeResult("skipped", skipped_reason="missing_scene_snapshot")
+        if snapshot.world_time_source_message_id == narrator_message.id:
+            return WorldTimeResult("skipped", skipped_reason="already_reconciled")
         if not completed_turn_may_advance_time(
             player_message.body,
             narrator_message.body,

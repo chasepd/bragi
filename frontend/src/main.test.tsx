@@ -1381,7 +1381,9 @@ describe("frontend helpers", () => {
         scenario_title: "Lantern Keep"
       },
       fallback_used: false,
-      context_trimmed: false
+      context_trimmed: false,
+      continuity_degraded: true,
+      retry_pending: true
     };
 
     sources[0].dispatch("chat_turn_delta", delta);
@@ -1646,7 +1648,9 @@ describe("frontend helpers", () => {
         scenario_title: "Lantern Keep"
       },
       fallback_used: false,
-      context_trimmed: false
+      context_trimmed: false,
+      continuity_degraded: true,
+      retry_pending: true
     };
 
     const once = applyChatTurnDeltaToRuntimeModel(model, delta);
@@ -1662,6 +1666,16 @@ describe("frontend helpers", () => {
     expect(twice.saves[0].title).toBe("Lantern Keep Updated");
     expect(twice.status).toBe("Turn complete");
     expect(twice.error).toBeNull();
+    expect(twice.continuity_degraded).toBe(true);
+    expect(twice.retry_pending).toBe(true);
+
+    const repaired = applyChatTurnDeltaToRuntimeModel(twice, {
+      ...delta,
+      continuity_degraded: false,
+      retry_pending: false
+    });
+    expect(repaired.continuity_degraded).toBe(false);
+    expect(repaired.retry_pending).toBe(false);
   });
 
   it("hides pending character text rows even after reply text exists", async () => {
@@ -7352,6 +7366,27 @@ describe("frontend helpers", () => {
     expect(screen.getByTitle("Timeskip")).toBeDisabled();
     expect(screen.getByTitle("Open phone")).toBeDisabled();
     expect(screen.queryByRole("button", { name: "Generate opening image" })).not.toBeInTheDocument();
+  });
+
+  it("warns when durable continuity repair is pending", async () => {
+    installEventSourceDouble();
+    const fetchMock = workbenchFetch(
+      [],
+      runtimeModel({ continuity_degraded: true, retry_pending: true }),
+      [],
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(
+      await screen.findByText(/Continuity updates are still catching up/),
+    ).toBeInTheDocument();
   });
 
   it("shows a retryable composer notice when chat submission status fails and recovers", async () => {

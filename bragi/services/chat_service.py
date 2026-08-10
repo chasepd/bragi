@@ -29,6 +29,7 @@ from bragi.persistence.models import (
     MessageRecord,
     MessageVisibilityRecord,
     ModelPreferenceRecord,
+    PostTurnOutboxRecord,
     SaveScenarioUpdateRecord,
     SceneSnapshotRecord,
     SummaryRecord,
@@ -365,6 +366,13 @@ POST_TURN_JOB_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     ),
     "image": (),
 }
+POST_TURN_DURABLE_STEPS = (
+    "state",
+    "context",
+    "time_reconciliation",
+    "proactive_text",
+    "director",
+)
 POST_TURN_IMAGE_CONTEXT_SEMANTICS = "pre_post_turn_updates"
 POST_TURN_PROVIDER_TASKS = {
     "summary": "summarization",
@@ -2949,6 +2957,23 @@ class ChatService:
                     verification_result=verification_diagnostics.verification_result,
                 )
             )
+            outbox_boundary = self._turn_revision_boundary(
+                save_id=save_id,
+                player_message_id=player_message.id,
+                narrator_message_id=narrator_message.id,
+            )
+            self.repositories.ensure_post_turn_outbox_steps(
+                save_id=save_id,
+                player_message_id=player_message.id,
+                narrator_message_id=narrator_message.id,
+                turn_revision=outbox_boundary.expected_revision_token,
+                steps=POST_TURN_DURABLE_STEPS,
+                payload={
+                    "turn_revision": outbox_boundary.to_json(),
+                    "verified_plan_coverage": verified_plan_coverage.to_json(),
+                    "current_user_id": current_user_id,
+                },
+            )
             _log_chat_stage(
                 "chat.stage.narrator_message_persisted",
                 save_id=save_id,
@@ -4081,6 +4106,7 @@ class ChatService:
         verified_coverage: VerifiedPostTurnCoverage | None = None,
         current_user_id: str | None = None,
         defer_image_generation: bool = False,
+        resume_only: bool = False,
     ) -> dict[str, object]:
         boundary = self._coerce_turn_revision(
             turn_revision,
@@ -4110,6 +4136,42 @@ class ChatService:
             configured_mode=configured_inference_mode,
             verified_coverage=verified_coverage,
         )
+        paired_outbox_rows = [
+            row
+            for row in self.repositories.list_post_turn_outbox_steps(save_id=save_id)
+            if row.player_message_id == player_message_id
+            and row.narrator_message_id == narrator_message_id
+        ]
+        outbox_rows = [
+            row
+            for row in paired_outbox_rows
+            if row.turn_revision == boundary.expected_revision_token
+        ]
+        for obsolete in paired_outbox_rows:
+            if (
+                obsolete.turn_revision != boundary.expected_revision_token
+                and obsolete.status not in {"succeeded", "skipped", "superseded"}
+            ):
+                self.repositories.complete_post_turn_outbox_step(
+                    obsolete.id,
+                    status="superseded",
+                    result={"superseded_by": boundary.expected_revision_token},
+                    expected_statuses=("pending", "failed"),
+                )
+        if not outbox_rows:
+            outbox_rows = self.repositories.ensure_post_turn_outbox_steps(
+                save_id=save_id,
+                player_message_id=player_message_id,
+                narrator_message_id=narrator_message_id,
+                turn_revision=boundary.expected_revision_token,
+                steps=POST_TURN_DURABLE_STEPS,
+                payload={
+                    "turn_revision": boundary.to_json(),
+                    "verified_plan_coverage": verified_coverage.to_json(),
+                    "current_user_id": current_user_id,
+                },
+            )
+        outbox_by_step = {row.step: row for row in outbox_rows}
 
         def start_jobs() -> tuple[JobRecord, object | None]:
             coordinator = self.jobs.create_running(
@@ -4132,6 +4194,10 @@ class ChatService:
                     "turn_revision_status": (
                         "current_head" if current_head else "stale_rebase"
                     ),
+                    "post_turn_outbox_step_ids": {
+                        name: row.id for name, row in outbox_by_step.items()
+                    },
+                    "resume_only": resume_only,
                 },
                 collect_provider_diagnostics=True,
             )
@@ -4151,6 +4217,12 @@ class ChatService:
             async with world_update_context():
                 coordinator, prepared_image = start_jobs()
         statuses = {name: "pending" for name in POST_TURN_JOB_ORDER}
+        for name, row in outbox_by_step.items():
+            if row.status in {"succeeded", "skipped", "superseded"}:
+                statuses[name] = row.status
+        if resume_only:
+            statuses["scenario"] = "skipped"
+            statuses["image"] = "skipped"
         step_results: dict[str, dict[str, object]] = {}
         current_pressure = self._recent_provider_pressure(save_id=save_id)
 
@@ -4227,6 +4299,31 @@ class ChatService:
             callback: Callable[[], Any],
         ) -> str:
             step_started = perf_counter()
+            outbox_row = outbox_by_step.get(name)
+            if outbox_row is not None:
+                claimed = self.repositories.claim_post_turn_outbox_step(
+                    outbox_row.id
+                )
+                if claimed is None:
+                    current = next(
+                        (
+                            row
+                            for row in self.repositories.list_post_turn_outbox_steps(
+                                save_id=save_id
+                            )
+                            if row.id == outbox_row.id
+                        ),
+                        None,
+                    )
+                    if current is not None and current.status in {
+                        "succeeded",
+                        "skipped",
+                        "superseded",
+                    }:
+                        publish(name, current.status)
+                        return current.status
+                    return "pending"
+                outbox_by_step[name] = claimed
             publish(name, "running")
             try:
                 with runtime_telemetry_context(
@@ -4238,6 +4335,15 @@ class ChatService:
                         result = callback()
                         if asyncio.iscoroutine(result):
                             result = await result
+            except asyncio.CancelledError:
+                if outbox_row is not None:
+                    outbox_by_step[name] = (
+                        self.repositories.requeue_post_turn_outbox_step(
+                            outbox_row.id,
+                            error=f"Post-turn {name} was interrupted",
+                        )
+                    )
+                raise
             except Exception as exc:
                 log_error_event(
                     "chat.post_turn_job_failed",
@@ -4257,6 +4363,14 @@ class ChatService:
                     step_started,
                     error=str(exc) or exc.__class__.__name__,
                 )
+                if outbox_row is not None:
+                    outbox_by_step[name] = (
+                        self.repositories.complete_post_turn_outbox_step(
+                            outbox_row.id,
+                            status="failed",
+                            error=str(exc) or exc.__class__.__name__,
+                        )
+                    )
                 return "failed"
             if isinstance(result, _PostTurnStepResult):
                 status = result.status
@@ -4276,6 +4390,32 @@ class ChatService:
                 step_started,
                 metadata=step_results.get(name),
             )
+            if outbox_row is not None:
+                if status in POST_TURN_DEPENDENCY_SATISFYING_STATUSES:
+                    terminal_status = "skipped" if status == "skipped" else "succeeded"
+                    outbox_by_step[name] = (
+                        self.repositories.complete_post_turn_outbox_step(
+                            outbox_row.id,
+                            status=terminal_status,
+                            result=step_results.get(name),
+                        )
+                    )
+                elif status == "failed":
+                    outbox_by_step[name] = (
+                        self.repositories.complete_post_turn_outbox_step(
+                            outbox_row.id,
+                            status="failed",
+                            result=step_results.get(name),
+                            error=f"Post-turn {name} failed",
+                        )
+                    )
+                else:
+                    outbox_by_step[name] = (
+                        self.repositories.requeue_post_turn_outbox_step(
+                            outbox_row.id,
+                            error=f"Post-turn {name} remains {status}",
+                        )
+                    )
             return status
 
         def pressure_gate_enabled(name: str) -> bool:
@@ -4495,22 +4635,9 @@ class ChatService:
             "image",
         }
 
-        async def run_named_step(name: str) -> str:
+        async def run_named_step_unlocked(name: str) -> str:
             if stale_rebase and name == "context":
-                return await run_step(
-                    name,
-                    lambda: _PostTurnStepResult(
-                        "succeeded",
-                        {
-                            "source_scoped_rebased": True,
-                            "turn_revision_status": "stale_rebase",
-                            "source_message_ids": [
-                                player_message_id,
-                                narrator_message_id,
-                            ],
-                        },
-                    ),
-                )
+                return await run_step(name, run_stale_context_step)
             if stale_rebase and name in {
                 "summary",
                 "time_reconciliation",
@@ -4538,6 +4665,9 @@ class ChatService:
                 return await run_pressure_sensitive_step(name, callbacks[name])
             return await run_step(name, callbacks[name])
 
+        async def run_named_step(name: str) -> str:
+            return await run_named_step_unlocked(name)
+
         def run_context_barrier() -> None:
             self._run_post_turn_context_barrier(
                 save_id=save_id,
@@ -4547,8 +4677,48 @@ class ChatService:
                 source_scoped_only=stale_rebase,
             )
 
-        pending = set(POST_TURN_JOB_ORDER)
-        satisfied: set[str] = set()
+        def run_stale_context_step() -> _PostTurnStepResult:
+            run_context_barrier()
+            return _PostTurnStepResult(
+                "succeeded",
+                {
+                    "source_scoped_rebased": True,
+                    "turn_revision_status": "stale_rebase",
+                    "source_message_ids": [
+                        player_message_id,
+                        narrator_message_id,
+                    ],
+                },
+            )
+
+        async def run_context_step() -> object:
+            try:
+                return await self._update_context_if_configured(
+                    save_id=save_id,
+                    player_message_id=player_message_id,
+                    narrator_message_id=narrator_message_id,
+                    inference_mode=inference_mode,
+                    verified_coverage=verified_coverage,
+                    turn_revision=boundary,
+                )
+            finally:
+                run_context_barrier()
+
+        callbacks["context"] = run_context_step
+
+        pending = {
+            name
+            for name in POST_TURN_JOB_ORDER
+            if statuses[name]
+            not in POST_TURN_DEPENDENCY_SATISFYING_STATUSES
+            and statuses[name] != "superseded"
+        }
+        satisfied: set[str] = {
+            name
+            for name in POST_TURN_JOB_ORDER
+            if statuses[name] in POST_TURN_DEPENDENCY_SATISFYING_STATUSES
+            or statuses[name] == "superseded"
+        }
         running: dict[asyncio.Task[str], str] = {}
 
         def start_ready_steps() -> None:
@@ -4621,8 +4791,6 @@ class ChatService:
                 for task in done:
                     name = running.pop(task)
                     status = await task
-                    if name == "context":
-                        run_context_barrier()
                     if status in POST_TURN_DEPENDENCY_SATISFYING_STATUSES:
                         satisfied.add(name)
                 block_pending_dependents()
@@ -4668,6 +4836,20 @@ class ChatService:
                 save_id=save_id
             ),
         }
+        refreshed_outbox = [
+            row
+            for row in self.repositories.list_post_turn_outbox_steps(save_id=save_id)
+            if row.player_message_id == player_message_id
+            and row.narrator_message_id == narrator_message_id
+            and row.turn_revision == boundary.expected_revision_token
+        ]
+        incomplete_outbox = [
+            row
+            for row in refreshed_outbox
+            if row.status not in {"succeeded", "skipped", "superseded"}
+        ]
+        coordinator_result["continuity_degraded"] = bool(incomplete_outbox)
+        coordinator_result["retry_pending"] = bool(incomplete_outbox)
         maintenance_failed_jobs = [
             name
             for name in ("state", "context", "proactive_text", "director", "scenario")
@@ -4696,7 +4878,14 @@ class ChatService:
 
         def finish_coordinator() -> None:
             finalize_current_head_snapshot()
-            self.jobs.succeed(coordinator.id, result=coordinator_result)
+            if incomplete_outbox:
+                self.jobs.fail(
+                    coordinator.id,
+                    result=coordinator_result,
+                    error="Post-turn continuity is degraded; retry pending",
+                )
+            else:
+                self.jobs.succeed(coordinator.id, result=coordinator_result)
 
         if world_update_context is None:
             finish_coordinator()
@@ -4730,6 +4919,78 @@ class ChatService:
                 save_id=save_id,
                 **exception_log_fields(exc),
             )
+
+    async def run_post_turn_outbox_recovery(
+        self,
+        *,
+        save_id: str | None = None,
+    ) -> int:
+        """Resume each turn whose durable post-turn pipeline is incomplete."""
+        rows = self.repositories.list_post_turn_outbox_steps(
+            save_id=save_id,
+            statuses=("pending", "failed"),
+        )
+        turns: dict[tuple[str, str, str, str], PostTurnOutboxRecord] = {}
+        for row in rows:
+            turns.setdefault(
+                (
+                    row.save_id,
+                    row.player_message_id,
+                    row.narrator_message_id,
+                    row.turn_revision,
+                ),
+                row,
+            )
+        completed = 0
+        for row in turns.values():
+            payload = row.payload
+            try:
+                await self.run_post_turn_jobs(
+                    save_id=row.save_id,
+                    player_message_id=row.player_message_id,
+                    narrator_message_id=row.narrator_message_id,
+                    turn_revision=(
+                        cast(Mapping[str, object], payload.get("turn_revision"))
+                        if isinstance(payload.get("turn_revision"), Mapping)
+                        else None
+                    ),
+                    verified_coverage=verified_post_turn_coverage_from_mapping(
+                        payload.get("verified_plan_coverage")
+                    ),
+                    current_user_id=(
+                        str(payload["current_user_id"])
+                        if payload.get("current_user_id") is not None
+                        else None
+                    ),
+                    defer_image_generation=True,
+                    resume_only=True,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                for running in self.repositories.list_post_turn_outbox_steps(
+                    save_id=row.save_id,
+                    statuses=("running",),
+                ):
+                    if (
+                        running.player_message_id == row.player_message_id
+                        and running.narrator_message_id == row.narrator_message_id
+                        and running.turn_revision == row.turn_revision
+                    ):
+                        self.repositories.requeue_post_turn_outbox_step(
+                            running.id,
+                            error=_safe_error_text(exc),
+                        )
+                log_error_event(
+                    "chat.post_turn_outbox_turn_recovery_failed",
+                    save_id=row.save_id,
+                    player_message_id=row.player_message_id,
+                    narrator_message_id=row.narrator_message_id,
+                    **exception_log_fields(exc),
+                )
+                continue
+            completed += 1
+        return completed
 
     async def run_state_extraction_retries(self, *, save_id: str | None = None) -> int:
         retry_jobs = [
@@ -4819,6 +5080,17 @@ class ChatService:
                     already_applied_result["turn_revision_status"] = (
                         "stale_rebase" if stale_rebase else "current_head"
                     )
+                self.repositories.complete_post_turn_outbox_step_for_turn(
+                    save_id=retry_save_id,
+                    source_message_ids=source_message_ids,
+                    step="state",
+                    result=already_applied_result,
+                    turn_revision=(
+                        boundary.expected_revision_token
+                        if explicit_turn_revision
+                        else None
+                    ),
+                )
                 self.jobs.succeed(running.id, result=already_applied_result)
                 completed += 1
                 continue
@@ -4961,6 +5233,15 @@ class ChatService:
                 success_result["suppressed_state_change_count"] = (
                     applied.suppressed_state_change_count
                 )
+            self.repositories.complete_post_turn_outbox_step_for_turn(
+                save_id=retry_save_id,
+                source_message_ids=source_message_ids,
+                step="state",
+                result=success_result,
+                turn_revision=(
+                    boundary.expected_revision_token if explicit_turn_revision else None
+                ),
+            )
             self.jobs.succeed(running.id, result=success_result)
             completed += 1
         return completed
@@ -5027,6 +5308,13 @@ class ChatService:
                     source="context_retry",
                     base_snapshot_id=boundary.base_snapshot_id,
                     source_scoped_only=True,
+                )
+                self.repositories.complete_post_turn_outbox_step_for_turn(
+                    save_id=retry_save_id,
+                    source_message_ids=source_message_ids,
+                    step="context",
+                    result={"source_scoped_rebased": True},
+                    turn_revision=boundary.expected_revision_token,
                 )
                 self.jobs.succeed(
                     running.id,
@@ -5134,6 +5422,17 @@ class ChatService:
                         result=full_context_result_payload,
                     )
                     continue
+                self.repositories.complete_post_turn_outbox_step_for_turn(
+                    save_id=retry_save_id,
+                    source_message_ids=source_message_ids,
+                    step="context",
+                    result=full_context_result_payload,
+                    turn_revision=(
+                        boundary.expected_revision_token
+                        if explicit_turn_revision
+                        else None
+                    ),
+                )
                 self.jobs.succeed(running.id, result=full_context_result_payload)
                 completed += 1
                 continue
@@ -5261,6 +5560,15 @@ class ChatService:
                 source="context_retry",
                 base_snapshot_id=boundary.base_snapshot_id,
                 source_scoped_only=False,
+            )
+            self.repositories.complete_post_turn_outbox_step_for_turn(
+                save_id=retry_save_id,
+                source_message_ids=source_message_ids,
+                step="context",
+                result=success_result,
+                turn_revision=(
+                    boundary.expected_revision_token if explicit_turn_revision else None
+                ),
             )
             self.jobs.succeed(
                 running.id,
@@ -5963,7 +6271,27 @@ class ChatService:
         if cancellation_token is not None:
             cancellation_token.on_cancel(cancel_search)
         try:
-            return await search_task
+            result = await search_task
+            continuity_degraded = bool(
+                self.repositories.list_post_turn_outbox_steps(
+                    save_id=save_id,
+                    statuses=("pending", "running", "failed"),
+                )
+            )
+            if not continuity_degraded:
+                return result
+            return replace(
+                result,
+                selected_state=(),
+                selected_state_changes=(),
+                selected_memories=(),
+                selected_observations=(),
+                retrieval_degraded=True,
+                retrieval_recovery=(
+                    "Continuity repair is pending; unresolved derived context was "
+                    "excluded and the recent chronicle remains authoritative."
+                ),
+            )
         except asyncio.CancelledError:
             if cancellation_token is not None and cancellation_token.cancelled:
                 raise ChatTurnCancelled(CHAT_TURN_CANCELLED_ERROR) from None

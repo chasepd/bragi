@@ -13357,7 +13357,9 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
 
     jobs = _post_turn_jobs(repositories, save.id)
     assert len(jobs) == 1
-    assert jobs[0]["status"] == "succeeded"
+    assert jobs[0]["status"] == "failed"
+    assert jobs[0]["result"]["continuity_degraded"] is True
+    assert jobs[0]["result"]["retry_pending"] is True
     expected_dependencies = {
         "summary": [],
         "state": [],
@@ -13413,6 +13415,27 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
     assert all(step.duration_ms is not None for step in steps)
     assert step_by_name["context"].error == "context updater unavailable"
     assert step_by_name["image"].error == "image provider unavailable"
+
+    async def repaired_context_step(**_kwargs: object) -> str:
+        return "succeeded"
+
+    monkeypatch.setattr(
+        service,
+        "_update_context_if_configured",
+        repaired_context_step,
+    )
+    assert asyncio.run(
+        service.run_post_turn_outbox_recovery(save_id=save.id)
+    ) == 1
+    recovered = repositories.list_post_turn_outbox_steps(save_id=save.id)
+    assert {row.step: row.status for row in recovered} == {
+        "state": "succeeded",
+        "context": "succeeded",
+        "time_reconciliation": "skipped",
+        "proactive_text": "skipped",
+        "director": "skipped",
+    }
+    assert next(row for row in recovered if row.step == "state").attempt_count == 1
 
 
 def test_run_post_turn_jobs_records_world_time_reconciliation_metadata(

@@ -3575,6 +3575,11 @@ function Workbench({
         {!activeSaveSupported ? (
           <InlineNotice>{activeSave?.unsupported_reason || "This save is no longer supported. Export or delete it from the library."}</InlineNotice>
         ) : null}
+        {model?.continuity_degraded ? (
+          <InlineNotice polite>
+            Continuity updates are still catching up. Bragi is using the recent chronicle as the source of truth until repair completes.
+          </InlineNotice>
+        ) : null}
         <Chronicle
           model={model}
           runJob={runJob}
@@ -9536,7 +9541,9 @@ export function applyChatTurnDeltaToRuntimeModel(model: RuntimeModel, delta: Cha
     action_choices: delta.action_choices,
     saves,
     status: delta.status,
-    error: delta.error
+    error: delta.error,
+    continuity_degraded: delta.continuity_degraded ?? model.continuity_degraded,
+    retry_pending: delta.retry_pending ?? model.retry_pending
   };
 }
 

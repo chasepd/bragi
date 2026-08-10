@@ -61,6 +61,7 @@ from bragi.persistence.models import (
     MessageScenePresenceRecord,
     MessageVisibilityRecord,
     ModelPreferenceRecord,
+    PostTurnOutboxRecord,
     ProviderCatalogEntryRecord,
     ProviderConfigRecord,
     ProviderModelRecord,
@@ -138,6 +139,9 @@ MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD = 4 * 1024 * 1024
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
+POST_TURN_OUTBOX_STATUSES = frozenset(
+    {"pending", "running", "succeeded", "skipped", "failed", "superseded"}
+)
 _CJK_SUBSTRING_OPTIONAL_QUERY_TERMS = frozenset(
     {
         "a",
@@ -13894,6 +13898,228 @@ class PersistenceRepositories:
         self.commit()
         return self._get_job(record.id)
 
+    def ensure_post_turn_outbox_steps(
+        self,
+        *,
+        save_id: str,
+        player_message_id: str,
+        narrator_message_id: str,
+        turn_revision: str,
+        steps: tuple[str, ...],
+        payload: dict[str, object],
+    ) -> list[PostTurnOutboxRecord]:
+        for step in steps:
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO post_turn_outbox(
+                    id, save_id, player_message_id, narrator_message_id,
+                    turn_revision, step, status, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    _new_id(),
+                    save_id,
+                    player_message_id,
+                    narrator_message_id,
+                    turn_revision,
+                    step,
+                    _dump_json(payload),
+                ),
+            )
+        self.commit()
+        rows = self._fetch_all(
+            """
+            SELECT id, save_id, player_message_id, narrator_message_id,
+                   turn_revision, step, status, attempt_count, payload_json,
+                   result_json, last_error, created_at, updated_at, started_at,
+                   completed_at
+            FROM post_turn_outbox
+            WHERE save_id = ? AND player_message_id = ?
+              AND narrator_message_id = ? AND turn_revision = ?
+            ORDER BY rowid
+            """,
+            (save_id, player_message_id, narrator_message_id, turn_revision),
+        )
+        return [_post_turn_outbox_from_row(row) for row in rows]
+
+    def list_post_turn_outbox_steps(
+        self,
+        *,
+        save_id: str | None = None,
+        statuses: tuple[str, ...] = (),
+    ) -> list[PostTurnOutboxRecord]:
+        conditions: list[str] = []
+        params: list[object] = []
+        if save_id is not None:
+            conditions.append("save_id = ?")
+            params.append(save_id)
+        if statuses:
+            for status in statuses:
+                _validate_post_turn_outbox_status(status)
+            conditions.append(f"status IN ({_placeholders(len(statuses))})")
+            params.extend(statuses)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = self._fetch_all(
+            f"""
+            SELECT id, save_id, player_message_id, narrator_message_id,
+                   turn_revision, step, status, attempt_count, payload_json,
+                   result_json, last_error, created_at, updated_at, started_at,
+                   completed_at
+            FROM post_turn_outbox
+            {where}
+            ORDER BY created_at, rowid
+            """,
+            tuple(params),
+        )
+        return [_post_turn_outbox_from_row(row) for row in rows]
+
+    def claim_post_turn_outbox_step(
+        self,
+        step_id: str,
+    ) -> PostTurnOutboxRecord | None:
+        cursor = self.connection.execute(
+            """
+            UPDATE post_turn_outbox
+            SET status = 'running', attempt_count = attempt_count + 1,
+                started_at = CURRENT_TIMESTAMP, completed_at = NULL,
+                last_error = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status IN ('pending', 'failed')
+            """,
+            (step_id,),
+        )
+        self.commit()
+        if cursor.rowcount != 1:
+            return None
+        return self._get_post_turn_outbox_step(step_id)
+
+    def complete_post_turn_outbox_step(
+        self,
+        step_id: str,
+        *,
+        status: str,
+        result: dict[str, object] | None = None,
+        error: str | None = None,
+        expected_statuses: tuple[str, ...] = ("running",),
+    ) -> PostTurnOutboxRecord:
+        _validate_post_turn_outbox_status(status)
+        if status in {"pending", "running"}:
+            raise ValueError(f"Outbox completion status is not terminal: {status}")
+        self._get_post_turn_outbox_step(step_id)
+        for expected_status in expected_statuses:
+            _validate_post_turn_outbox_status(expected_status)
+        self.connection.execute(
+            f"""
+            UPDATE post_turn_outbox
+            SET status = ?, result_json = ?, last_error = ?,
+                completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status IN ({_placeholders(len(expected_statuses))})
+            """,
+            (
+                status,
+                _dump_json(result) if result is not None else None,
+                redact_text(error),
+                step_id,
+                *expected_statuses,
+            ),
+        )
+        self.commit()
+        return self._get_post_turn_outbox_step(step_id)
+
+    def requeue_post_turn_outbox_step(
+        self,
+        step_id: str,
+        *,
+        error: str | None = None,
+    ) -> PostTurnOutboxRecord:
+        self._get_post_turn_outbox_step(step_id)
+        self.connection.execute(
+            """
+            UPDATE post_turn_outbox
+            SET status = 'pending', last_error = ?, completed_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'running'
+            """,
+            (redact_text(error), step_id),
+        )
+        self.commit()
+        return self._get_post_turn_outbox_step(step_id)
+
+    def requeue_running_post_turn_outbox_steps(
+        self,
+    ) -> list[PostTurnOutboxRecord]:
+        rows = self.list_post_turn_outbox_steps(statuses=("running",))
+        for row in rows:
+            self.connection.execute(
+                """
+                UPDATE post_turn_outbox
+                SET status = 'pending', last_error = ?, completed_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'running'
+                """,
+                ("Interrupted before continuity completed", row.id),
+            )
+        self.commit()
+        return [self._get_post_turn_outbox_step(row.id) for row in rows]
+
+    def complete_post_turn_outbox_step_for_turn(
+        self,
+        *,
+        save_id: str,
+        source_message_ids: tuple[str, ...],
+        step: str,
+        result: dict[str, object] | None = None,
+        turn_revision: str | None = None,
+    ) -> PostTurnOutboxRecord | None:
+        if len(source_message_ids) < 2:
+            return None
+        row = self._fetch_one(
+            """
+            SELECT id
+            FROM post_turn_outbox
+            WHERE save_id = ? AND player_message_id = ?
+              AND narrator_message_id = ? AND step = ?
+              AND (? IS NULL OR turn_revision = ?)
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (
+                save_id,
+                source_message_ids[0],
+                source_message_ids[-1],
+                step,
+                turn_revision,
+                turn_revision,
+            ),
+        )
+        if row is None:
+            return None
+        return self.complete_post_turn_outbox_step(
+            str(row["id"]),
+            status="succeeded",
+            result=result,
+            expected_statuses=("pending", "running", "failed"),
+        )
+
+    def _get_post_turn_outbox_step(
+        self,
+        step_id: str,
+    ) -> PostTurnOutboxRecord:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, player_message_id, narrator_message_id,
+                   turn_revision, step, status, attempt_count, payload_json,
+                   result_json, last_error, created_at, updated_at, started_at,
+                   completed_at
+            FROM post_turn_outbox
+            WHERE id = ?
+            """,
+            (step_id,),
+        )
+        if row is None:
+            raise ValueError(f"Unknown post-turn outbox step: {step_id}")
+        return _post_turn_outbox_from_row(row)
+
     def start_job(self, job_id: str) -> JobRecord:
         existing = self._get_job(job_id)
         if existing.status != "queued":
@@ -15643,6 +15869,11 @@ def _validate_job_status(status: str) -> None:
         raise ValueError(f"Unknown job status: {status}")
 
 
+def _validate_post_turn_outbox_status(status: str) -> None:
+    if status not in POST_TURN_OUTBOX_STATUSES:
+        raise ValueError(f"Unknown post-turn outbox status: {status}")
+
+
 def _validate_character_text_delivery_status(status: str) -> None:
     if status not in CHARACTER_TEXT_DELIVERY_STATUSES:
         raise ValueError(f"Unknown character text delivery status: {status}")
@@ -16868,6 +17099,30 @@ def _job_step_from_row(row: sqlite3.Row) -> JobStepRecord:
         duration_ms=row["duration_ms"],
         error=row["error"],
         metadata=_load_object(row["metadata_json"]),
+    )
+
+
+def _post_turn_outbox_from_row(row: sqlite3.Row) -> PostTurnOutboxRecord:
+    return PostTurnOutboxRecord(
+        id=str(row["id"]),
+        save_id=str(row["save_id"]),
+        player_message_id=str(row["player_message_id"]),
+        narrator_message_id=str(row["narrator_message_id"]),
+        turn_revision=str(row["turn_revision"]),
+        step=str(row["step"]),
+        status=str(row["status"]),
+        attempt_count=int(row["attempt_count"]),
+        payload=_load_object(row["payload_json"]),
+        result=(
+            _load_object(row["result_json"])
+            if row["result_json"] is not None
+            else None
+        ),
+        last_error=_row_value(row, "last_error"),
+        created_at=_row_value(row, "created_at"),
+        updated_at=_row_value(row, "updated_at"),
+        started_at=_row_value(row, "started_at"),
+        completed_at=_row_value(row, "completed_at"),
     )
 
 
