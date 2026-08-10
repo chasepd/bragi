@@ -3744,6 +3744,162 @@ def test_incremental_reference_is_restored_when_target_reactivates(
     assert restored_character["location_id"] == "tower"
 
 
+def test_incremental_reference_filtering_reaches_fixed_point(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    repositories.add_character(
+        save_id=save.id,
+        character_id="mara",
+        name="Mara",
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="belief",
+        claim="Mara believes the beacon is lit.",
+        epistemic_actor_id="mara",
+        status="pending",
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE characters SET archived_at = CURRENT_TIMESTAMP WHERE id = 'mara'"
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+
+    assert rows["context_observations"] == ()
+    assert all(
+        row["observation_id"] != observation.id
+        for row in rows["context_observation_curation_state"]
+    )
+
+
+def test_incremental_missing_target_edge_survives_delete_and_recreate(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    repositories.add_location(
+        save_id=save.id,
+        location_id="tower",
+        name="Beacon Tower",
+        connections=["gate"],
+    )
+    repositories.add_location(
+        save_id=save.id,
+        location_id="gate",
+        name="South Gate",
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute("DELETE FROM locations WHERE id = 'gate'")
+    repositories.commit()
+
+    deleted = service.capture_current_head_if_dirty(save.id)
+    deleted_rows = service._rows_from_manifest(service._snapshot_manifest(deleted))
+    tower = next(row for row in deleted_rows["locations"] if row["id"] == "tower")
+    assert json.loads(str(tower["connections_json"])) == []
+
+    repositories.add_location(
+        save_id=save.id,
+        location_id="gate",
+        name="South Gate",
+    )
+    restored = service.capture_current_head_if_dirty(save.id)
+    restored_rows = service._rows_from_manifest(service._snapshot_manifest(restored))
+    tower = next(row for row in restored_rows["locations"] if row["id"] == "tower")
+    assert json.loads(str(tower["connections_json"])) == ["gate"]
+
+
+def test_group_thread_participant_removal_rechecks_thread_inclusion(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    for character_id in ("mara", "rowan"):
+        repositories.add_character(
+            save_id=save.id,
+            character_id=character_id,
+            name=character_id.title(),
+        )
+    thread = repositories.create_character_text_group_thread(
+        save_id=save.id,
+        title="Beacon Crew",
+        character_ids=("mara", "rowan"),
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    participant = repositories.connection.execute(
+        """
+        SELECT id FROM character_text_thread_participants
+        WHERE save_id = ? AND thread_id = ? AND character_id = 'rowan'
+        """,
+        (save.id, thread.id),
+    ).fetchone()
+    assert participant is not None
+    repositories.connection.execute(
+        "DELETE FROM character_text_thread_participants WHERE id = ?",
+        (participant["id"],),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+
+    assert all(row["id"] != thread.id for row in rows["character_text_threads"])
+
+
+def test_activity_removal_rechecks_narrator_cursor_aggregate(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The phone display dims.",
+    )
+    character = repositories.add_character(
+        save_id=save.id,
+        character_id="rowan",
+        name="Rowan",
+    )
+    thread = repositories.get_or_create_character_text_thread(
+        save_id=save.id,
+        character_id=character.id,
+        title="Rowan",
+    )
+    repositories.connection.execute(
+        """
+        INSERT INTO character_text_activity_events(
+            id, save_id, ordinal, thread_id, activity_type
+        ) VALUES ('activity-1', ?, 5, ?, 'message_sent')
+        """,
+        (save.id, thread.id),
+    )
+    repositories.connection.execute(
+        """
+        INSERT INTO narrator_phone_activity_cursors(
+            narrator_message_id, save_id, last_activity_ordinal
+        ) VALUES (?, ?, 5)
+        """,
+        (narrator.id, save.id),
+    )
+    repositories.commit()
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=save.id, message_id=narrator.id)
+    repositories.connection.execute(
+        "DELETE FROM character_text_activity_events WHERE id = 'activity-1'"
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+
+    [cursor] = rows["narrator_phone_activity_cursors"]
+    assert cursor["last_activity_ordinal"] == 0
+
+
 def test_incremental_fade_transition_removes_dependents(
     repositories: PersistenceRepositories,
 ) -> None:

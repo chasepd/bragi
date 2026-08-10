@@ -1123,9 +1123,8 @@ class TurnSnapshotService:
         if incremental is not None:
             return incremental
         recheck_deadlines = self._snapshot_recheck_deadlines(save_id)
-        rows_by_table = _sanitize_snapshot_rows_for_safety(
-            self._active_rows_by_table(save_id)
-        )
+        raw_rows_by_table = self._active_rows_by_table(save_id)
+        rows_by_table = _sanitize_snapshot_rows_for_safety(raw_rows_by_table)
         self.repositories.connection.execute(
             "DELETE FROM save_snapshot_row_state WHERE save_id = ?",
             (save_id,),
@@ -1139,8 +1138,14 @@ class TurnSnapshotService:
         for table_name in _SNAPSHOT_TABLE_NAMES:
             root_hash: str | None = None
             table = _TABLES_BY_NAME[table_name]
+            raw_rows = {
+                _snapshot_row_key(table, row): row
+                for row in raw_rows_by_table.get(table_name, ())
+            }
+            included_keys: set[str] = set()
             for ordinal, row in enumerate(rows_by_table.get(table_name, ())):
                 row_key = _snapshot_row_key(table, row)
+                included_keys.add(row_key)
                 object_hash = self._store_object(
                     kind=f"row:{table_name}",
                     value=row,
@@ -1180,9 +1185,33 @@ class TurnSnapshotService:
                     save_id=save_id,
                     table_name=table_name,
                     row_key=row_key,
-                    row=row,
+                    row=raw_rows.get(row_key, row),
                 )
                 object_count += 1
+            next_ordinal = len(included_keys)
+            for row_key, raw_row in raw_rows.items():
+                if row_key in included_keys:
+                    continue
+                raw_hash = self._store_object(
+                    kind=f"row:{table_name}",
+                    value=raw_row,
+                )
+                self.repositories.connection.execute(
+                    """
+                    INSERT INTO save_snapshot_row_state(
+                        save_id, table_name, row_key, object_hash,
+                        order_key, ordinal, included, recheck_at
+                    ) VALUES (?, ?, ?, ?, NULL, ?, 0, NULL)
+                    """,
+                    (save_id, table_name, row_key, raw_hash, next_ordinal),
+                )
+                self._replace_snapshot_row_references(
+                    save_id=save_id,
+                    table_name=table_name,
+                    row_key=row_key,
+                    row=raw_row,
+                )
+                next_ordinal += 1
             table_roots[table_name] = root_hash
             self.repositories.connection.execute(
                 """
@@ -1200,7 +1229,7 @@ class TurnSnapshotService:
                     save_id,
                     table_name,
                     root_hash,
-                    len(rows_by_table.get(table_name, ())),
+                    next_ordinal,
                 ),
             )
         context_revision = self._context_revision(save_id)
@@ -1264,6 +1293,7 @@ class TurnSnapshotService:
         ).fetchall()
         if not dirty_rows:
             return None
+        self._queue_snapshot_aggregate_dependents(save_id, dirty_rows)
         self._queue_snapshot_lifecycle_dependents(save_id, dirty_rows)
         dirty_rows = self.repositories.connection.execute(
             """
@@ -1292,7 +1322,55 @@ class TurnSnapshotService:
                 str | None,
             ]
         ] = []
-        for dirty in dirty_rows:
+        projected_inclusion: dict[tuple[str, str], bool] = {}
+        dirty_keys = {
+            (str(row["table_name"]), str(row["row_key"])) for row in dirty_rows
+        }
+        dirty_index = 0
+
+        def add_pending(
+            table: _SnapshotTable,
+            row_key: str,
+            snapshot_row: dict[str, object] | None,
+            reference_row: dict[str, object] | None,
+            previous: sqlite3.Row | None,
+            recheck_at: str | None,
+        ) -> None:
+            pending.append(
+                (
+                    table,
+                    row_key,
+                    snapshot_row,
+                    reference_row,
+                    previous,
+                    recheck_at,
+                )
+            )
+            included = snapshot_row is not None
+            projected_inclusion[(table.name, row_key)] = included
+            if previous is not None and bool(previous["included"]) != included:
+                self._queue_snapshot_reference_dependents(
+                    save_id=save_id,
+                    target_table=table.name,
+                    target_key=row_key,
+                )
+                for added in self.repositories.connection.execute(
+                    """
+                    SELECT table_name, row_key, generation
+                    FROM save_snapshot_dirty_rows
+                    WHERE save_id = ?
+                    ORDER BY generation, table_name, row_key
+                    """,
+                    (save_id,),
+                ).fetchall():
+                    key = (str(added["table_name"]), str(added["row_key"]))
+                    if key not in dirty_keys:
+                        dirty_keys.add(key)
+                        dirty_rows.append(added)
+
+        while dirty_index < len(dirty_rows):
+            dirty = dirty_rows[dirty_index]
+            dirty_index += 1
             table_name = str(dirty["table_name"])
             table = _TABLES_BY_NAME.get(table_name)
             if table is None:
@@ -1315,21 +1393,21 @@ class TurnSnapshotService:
                 (save_id, row_key),
             ).fetchone()
             if live_row is None:
-                pending.append((table, row_key, None, None, previous, None))
+                add_pending(table, row_key, None, None, previous, None)
                 continue
             raw_row = _row_dict(live_row)
             row = dict(raw_row)
             recheck_at = _snapshot_row_recheck_at(table.name, row)
             if table.name in {"messages", "character_text_messages"}:
                 if row.get("deleted_at") is not None:
-                    pending.append((table, row_key, None, raw_row, previous, None))
+                    add_pending(table, row_key, None, raw_row, previous, None)
                     continue
             elif (
                 table.active_only
                 and "archived_at" in self._column_names(table.name)
                 and row.get("archived_at") is not None
             ):
-                pending.append((table, row_key, None, raw_row, previous, None))
+                add_pending(table, row_key, None, raw_row, previous, None)
                 continue
             if table.name == "messages":
                 row = _sanitize_snapshot_message_row(row)
@@ -1338,16 +1416,44 @@ class TurnSnapshotService:
                     body=str(row.get("body", "")),
                     safety_transition=str(row.get("safety_transition", "")),
                 ):
-                    pending.append((table, row_key, None, raw_row, previous, None))
+                    add_pending(table, row_key, None, raw_row, previous, None)
                     continue
             elif table.name == "context_observation_curation_state":
                 row = portable_context_observation_curation_state_row(row)
             elif table.name == "save_scenario_updates":
                 row = _sanitize_snapshot_scenario_update_row(row)
+            elif (
+                table.name == "character_text_threads"
+                and row.get("kind") == "group"
+            ):
+                participant_count = self.repositories.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM character_text_thread_participants
+                    WHERE save_id = ? AND thread_id = ?
+                    """,
+                    (save_id, row_key),
+                ).fetchone()[0]
+                if int(participant_count) < 2:
+                    add_pending(table, row_key, None, raw_row, previous, None)
+                    continue
+            elif table.name == "narrator_phone_activity_cursors":
+                max_ordinal = self.repositories.connection.execute(
+                    """
+                    SELECT COALESCE(MAX(ordinal), 0)
+                    FROM character_text_activity_events
+                    WHERE save_id = ?
+                    """,
+                    (save_id,),
+                ).fetchone()[0]
+                row["last_activity_ordinal"] = min(
+                    _snapshot_row_int(row, "last_activity_ordinal"),
+                    int(max_ordinal),
+                )
             if not self._incremental_row_references_are_active(
                 save_id,
                 table.name,
                 row,
+                projected_inclusion,
             ):
                 if (
                     table.name not in _SNAPSHOT_KEEP_ENTITY_TABLES
@@ -1357,14 +1463,15 @@ class TurnSnapshotService:
                         row,
                     )
                 ):
-                    pending.append((table, row_key, None, raw_row, previous, None))
+                    add_pending(table, row_key, None, raw_row, previous, None)
                     continue
                 row = self._clear_incremental_scalar_references(
                     save_id,
                     table.name,
                     row,
+                    projected_inclusion,
                 )
-            pending.append((table, row_key, row, raw_row, previous, recheck_at))
+            add_pending(table, row_key, row, raw_row, previous, recheck_at)
 
         for table, row_key, pending_row, reference_row, previous, recheck_at in pending:
             table_name = table.name
@@ -1535,11 +1642,17 @@ class TurnSnapshotService:
         save_id: str,
         table_name: str,
         row: Mapping[str, object],
+        projected_inclusion: Mapping[tuple[str, str], bool],
     ) -> bool:
         return not _snapshot_row_has_unresolved_references(
             table_name,
             row,
-            self._incremental_active_ids(save_id, table_name, row),
+            self._incremental_active_ids(
+                save_id,
+                table_name,
+                row,
+                projected_inclusion,
+            ),
         )
 
 
@@ -1616,6 +1729,72 @@ class TurnSnapshotService:
                     target_key=row_key,
                 )
 
+    def _queue_snapshot_aggregate_dependents(
+        self,
+        save_id: str,
+        dirty_rows: list[sqlite3.Row],
+    ) -> None:
+        participant_thread_ids: set[str] = set()
+        activity_changed = False
+        for dirty in dirty_rows:
+            table_name = str(dirty["table_name"])
+            row_key = str(dirty["row_key"])
+            if table_name == "character_text_activity_events":
+                activity_changed = True
+            if table_name != "character_text_thread_participants":
+                continue
+            live = self.repositories.connection.execute(
+                """
+                SELECT thread_id FROM character_text_thread_participants
+                WHERE save_id = ? AND id = ?
+                """,
+                (save_id, row_key),
+            ).fetchone()
+            if live is not None:
+                participant_thread_ids.add(str(live["thread_id"]))
+                continue
+            state = self.repositories.connection.execute(
+                """
+                SELECT object_hash FROM save_snapshot_row_state
+                WHERE save_id = ?
+                  AND table_name = 'character_text_thread_participants'
+                  AND row_key = ?
+                """,
+                (save_id, row_key),
+            ).fetchone()
+            if state is None or state["object_hash"] is None:
+                continue
+            previous = self._load_object(
+                str(state["object_hash"]),
+                expected_kind="row:character_text_thread_participants",
+            )
+            if isinstance(previous, Mapping) and isinstance(
+                previous.get("thread_id"),
+                str,
+            ):
+                participant_thread_ids.add(str(previous["thread_id"]))
+        for thread_id in participant_thread_ids:
+            self._mark_snapshot_row_dirty(
+                save_id=save_id,
+                table_name="character_text_threads",
+                row_key=thread_id,
+            )
+        if activity_changed:
+            cursors = self.repositories.connection.execute(
+                """
+                SELECT narrator_message_id
+                FROM narrator_phone_activity_cursors
+                WHERE save_id = ?
+                """,
+                (save_id,),
+            ).fetchall()
+            for cursor in cursors:
+                self._mark_snapshot_row_dirty(
+                    save_id=save_id,
+                    table_name="narrator_phone_activity_cursors",
+                    row_key=str(cursor["narrator_message_id"]),
+                )
+
     def _mark_snapshot_row_dirty(
         self,
         *,
@@ -1687,7 +1866,11 @@ class TurnSnapshotService:
         active_only: bool = False,
     ) -> frozenset[tuple[str, str]]:
         candidates = _snapshot_reference_candidates(table_name, row)
-        references: set[tuple[str, str]] = set()
+        references = (
+            set()
+            if active_only
+            else set(_declared_snapshot_row_references(table_name, row))
+        )
         if not candidates:
             return frozenset()
         candidate_values = tuple(candidates)
@@ -1730,6 +1913,7 @@ class TurnSnapshotService:
         save_id: str,
         table_name: str,
         row: Mapping[str, object],
+        projected_inclusion: Mapping[tuple[str, str], bool],
     ) -> dict[str, frozenset[str]]:
         references = self._snapshot_row_references(
             save_id,
@@ -1741,7 +1925,8 @@ class TurnSnapshotService:
             target.name: set() for target in _SNAPSHOT_TABLES
         }
         for target_table, target_key in references:
-            active_ids[target_table].add(target_key)
+            if projected_inclusion.get((target_table, target_key), True):
+                active_ids[target_table].add(target_key)
         return {
             target_table: frozenset(target_keys)
             for target_table, target_keys in active_ids.items()
@@ -1785,11 +1970,17 @@ class TurnSnapshotService:
         save_id: str,
         table_name: str,
         row: Mapping[str, object],
+        projected_inclusion: Mapping[tuple[str, str], bool],
     ) -> dict[str, object]:
         return _clear_snapshot_row_unresolved_references(
             table_name,
             row,
-            self._incremental_active_ids(save_id, table_name, row),
+            self._incremental_active_ids(
+                save_id,
+                table_name,
+                row,
+                projected_inclusion,
+            ),
         )
 
 
@@ -3615,6 +3806,109 @@ def _manifest_tables(
 
 def _row_dict(row: sqlite3.Row) -> dict[str, object]:
     return {key: row[key] for key in row.keys()}
+
+
+def _declared_snapshot_row_references(
+    table_name: str,
+    row: Mapping[str, object],
+) -> frozenset[tuple[str, str]]:
+    references: set[tuple[str, str]] = set()
+    for column in _MESSAGE_REFERENCE_COLUMNS:
+        value = row.get(column)
+        if isinstance(value, str) and value:
+            references.add(("messages", value))
+    for column, target_table in _TABLE_REFERENCE_COLUMNS.get(table_name, {}).items():
+        value = row.get(column)
+        if isinstance(value, str) and value:
+            references.add((target_table, value))
+
+    key_targets = {
+        "message_id": "messages",
+        "source_message_id": "messages",
+        "narrator_message_id": "messages",
+        "character_id": "characters",
+        "sender_character_id": "characters",
+        "player_character_id": "characters",
+        "location_id": "locations",
+        "current_location_id": "locations",
+        "connection": "locations",
+        "present_character_id": "characters",
+        "observation_id": "context_observations",
+        "source_observation_id": "context_observations",
+        "summary_id": "summaries",
+        "source_summary_id": "summaries",
+        "text_message_id": "character_text_messages",
+        "source_text_message_id": "character_text_messages",
+        "thread_id": "character_text_threads",
+        "media_asset_id": "media_assets",
+        "source_media_asset_id": "media_assets",
+    }
+
+    def collect(value: object, key: str | None = None) -> None:
+        if isinstance(value, str):
+            text_message_id = parse_character_text_source_ref(value)
+            if text_message_id is not None:
+                references.add(("character_text_messages", text_message_id))
+            target_table = key_targets.get(key or "")
+            if target_table is not None and value:
+                references.add((target_table, value))
+            entity_type, separator, entity_id = value.partition(":")
+            entity_table = _ENTITY_TABLES.get(entity_type)
+            if separator and entity_table is not None and entity_id:
+                references.add((entity_table, entity_id))
+            if value[:1] in {"[", "{"}:
+                try:
+                    collect(json.loads(value), key)
+                except json.JSONDecodeError:
+                    pass
+            return
+        if isinstance(value, Mapping):
+            for nested_key, nested in value.items():
+                collect(nested, str(nested_key))
+            return
+        if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
+            singular_key = key.removesuffix("s") if isinstance(key, str) else key
+            for nested in value:
+                collect(nested, singular_key)
+
+    for column, value in row.items():
+        collect(value, column.removesuffix("_json"))
+    for id_column, type_column in (
+        ("entity_id", "entity_type"),
+        ("target_id", "target_type"),
+        ("subject_id", "subject_type"),
+        ("source_id", "source_type"),
+    ):
+        value = row.get(id_column)
+        entity_type = row.get(type_column)
+        typed_target_table = _ENTITY_TABLES.get(
+            entity_type if isinstance(entity_type, str) else ""
+        )
+        if isinstance(value, str) and value and typed_target_table is not None:
+            references.add((typed_target_table, value))
+    if table_name == "context_sources":
+        source_type = row.get("source_type")
+        source_id = row.get("source_id")
+        if isinstance(source_type, str) and isinstance(source_id, str):
+            direct_table = {
+                "character_voice": "characters",
+                "open_obligation": "active_threads",
+                "character_text_thread": "character_text_threads",
+            }.get(source_type, _ENTITY_TABLES.get(source_type))
+            if direct_table is not None and source_id:
+                references.add((direct_table, source_id))
+            if source_type == "world_state" and source_id.startswith("location:"):
+                references.add(("locations", source_id.removeprefix("location:")))
+            if source_type == "memory" and source_id.startswith(
+                "character_profile:"
+            ):
+                references.add(
+                    ("characters", source_id.removeprefix("character_profile:"))
+                )
+            relationship = re.fullmatch(r"relationship:([^:]+):(.+)", source_id)
+            if source_type == "memory" and relationship is not None:
+                references.add(("characters", relationship.group(1)))
+    return frozenset(references)
 
 
 def _snapshot_reference_candidates(
