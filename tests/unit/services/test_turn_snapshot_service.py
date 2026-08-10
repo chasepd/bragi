@@ -77,6 +77,29 @@ def test_snapshot_import_coalesces_many_to_one_memory_remaps() -> None:
     ]
 
 
+def test_snapshot_reference_filter_converges_beyond_eight_hops() -> None:
+    summaries = tuple(
+        {
+            "id": f"summary-{index}",
+            "save_id": "save-one",
+            "source_message_ids_json": "[]",
+            "source_summary_ids_json": json.dumps(
+                ["missing-summary" if index == 0 else f"summary-{index - 1}"]
+            ),
+        }
+        for index in range(12)
+    )
+
+    rows = _sanitize_snapshot_rows_for_safety(
+        {
+            "messages": (),
+            "summaries": summaries,
+        }
+    )
+
+    assert rows["summaries"] == ()
+
+
 def test_snapshot_object_decode_rejects_declared_size_bomb() -> None:
     payload = json.dumps("x" * (1024 * 1024)).encode("utf-8")
 

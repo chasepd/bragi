@@ -1324,10 +1324,39 @@ class TurnSnapshotService:
             ],
         ] = {}
         projected_inclusion: dict[tuple[str, str], bool] = {}
-        dirty_keys = {
+        initial_dirty_keys = {
             (str(row["table_name"]), str(row["row_key"])) for row in dirty_rows
         }
+        for table_name, row_key in initial_dirty_keys:
+            table = _TABLES_BY_NAME.get(table_name)
+            if table is None:
+                continue
+            live = self.repositories.connection.execute(
+                f"SELECT * FROM {table.name} "
+                f"WHERE save_id = ? AND {table.primary_key} = ?",
+                (save_id, row_key),
+            ).fetchone()
+            eligible = live is not None
+            if live is not None:
+                live_value = _row_dict(live)
+                if table.name in {"messages", "character_text_messages"}:
+                    eligible = live_value.get("deleted_at") is None
+                elif (
+                    table.active_only
+                    and "archived_at" in self._column_names(table.name)
+                ):
+                    eligible = live_value.get("archived_at") is None
+                if table.name == "messages" and eligible:
+                    sanitized = _sanitize_snapshot_message_row(live_value)
+                    eligible = not is_fade_to_black_message(
+                        role=str(sanitized.get("role", "")),
+                        body=str(sanitized.get("body", "")),
+                        safety_transition=str(sanitized.get("safety_transition", "")),
+                    )
+            projected_inclusion[(table_name, row_key)] = eligible
         dirty_index = 0
+        group_participant_count_cache: dict[str, int] = {}
+        activity_max_ordinal_cache: list[int | None] = [None]
 
         def add_pending(
             table: _SnapshotTable,
@@ -1352,6 +1381,16 @@ class TurnSnapshotService:
                 bool(previous["included"]) if previous is not None else included,
             )
             projected_inclusion[key] = included
+            if table.name == "character_text_thread_participants":
+                thread_id = (
+                    reference_row.get("thread_id")
+                    if reference_row is not None
+                    else None
+                )
+                if isinstance(thread_id, str):
+                    group_participant_count_cache.pop(thread_id, None)
+            elif table.name == "character_text_activity_events":
+                activity_max_ordinal_cache[0] = None
             if prior_included != included:
                 dependent_keys = self._queue_snapshot_reference_dependents(
                     save_id=save_id,
@@ -1370,7 +1409,6 @@ class TurnSnapshotService:
                     if added is None:
                         continue
                     key = (str(added["table_name"]), str(added["row_key"]))
-                    dirty_keys.add(key)
                     dirty_rows.append(added)
 
         while dirty_index < len(dirty_rows):
@@ -1446,7 +1484,9 @@ class TurnSnapshotService:
                 table.name == "character_text_threads"
                 and row.get("kind") == "group"
             ):
-                participants = self.repositories.connection.execute(
+                participant_count = group_participant_count_cache.get(row_key)
+                if participant_count is None:
+                    participants = self.repositories.connection.execute(
                     """
                     SELECT participants.id, COALESCE(state.included, 1) AS included
                     FROM character_text_thread_participants participants
@@ -1457,19 +1497,25 @@ class TurnSnapshotService:
                     WHERE participants.save_id = ? AND participants.thread_id = ?
                     """,
                     (save_id, row_key),
-                ).fetchall()
-                participant_count = sum(
-                    projected_inclusion.get(
-                        ("character_text_thread_participants", str(participant["id"])),
-                        bool(participant["included"]),
+                    ).fetchall()
+                    participant_count = sum(
+                        projected_inclusion.get(
+                            (
+                                "character_text_thread_participants",
+                                str(participant["id"]),
+                            ),
+                            bool(participant["included"]),
+                        )
+                        for participant in participants
                     )
-                    for participant in participants
-                )
+                    group_participant_count_cache[row_key] = participant_count
                 if participant_count < 2:
                     add_pending(table, row_key, None, raw_row, previous, None)
                     continue
             elif table.name == "narrator_phone_activity_cursors":
-                activities = self.repositories.connection.execute(
+                max_ordinal = activity_max_ordinal_cache[0]
+                if max_ordinal is None:
+                    activities = self.repositories.connection.execute(
                     """
                     SELECT events.id, events.ordinal,
                            COALESCE(state.included, 1) AS included
@@ -1481,18 +1527,22 @@ class TurnSnapshotService:
                     WHERE events.save_id = ?
                     """,
                     (save_id,),
-                ).fetchall()
-                max_ordinal = max(
-                    (
-                        int(activity["ordinal"])
-                        for activity in activities
-                        if projected_inclusion.get(
-                            ("character_text_activity_events", str(activity["id"])),
-                            bool(activity["included"]),
-                        )
-                    ),
-                    default=0,
-                )
+                    ).fetchall()
+                    max_ordinal = max(
+                        (
+                            int(activity["ordinal"])
+                            for activity in activities
+                            if projected_inclusion.get(
+                                (
+                                    "character_text_activity_events",
+                                    str(activity["id"]),
+                                ),
+                                bool(activity["included"]),
+                            )
+                        ),
+                        default=0,
+                    )
+                    activity_max_ordinal_cache[0] = max_ordinal
                 row["last_activity_ordinal"] = min(
                     _snapshot_row_int(row, "last_activity_ordinal"),
                     int(max_ordinal),
@@ -4387,7 +4437,8 @@ def _sanitize_snapshot_rows_for_safety(
 def _filter_snapshot_rows_for_unresolved_references(
     rows: dict[str, tuple[dict[str, object], ...]],
 ) -> None:
-    for _ in range(_MAX_SNAPSHOT_REFERENCE_FILTER_PASSES):
+    total_rows = sum(len(table_rows) for table_rows in rows.values())
+    for _ in range(max(total_rows + 1, 1)):
         active_ids = {
             table_name: _row_ids(rows.get(table_name, ()))
             for table_name in _SNAPSHOT_TABLE_NAMES
@@ -4437,6 +4488,7 @@ def _filter_snapshot_rows_for_unresolved_references(
                     rows[table_name] = cleared_rows
         if not changed:
             return
+    raise ValueError("Snapshot reference filtering did not converge")
 
 
 _SNAPSHOT_MESSAGE_SCOPED_TABLES = frozenset(
@@ -4476,8 +4528,6 @@ _SNAPSHOT_KEEP_ENTITY_TABLES = frozenset(
         "dating_route_states",
     }
 )
-
-_MAX_SNAPSHOT_REFERENCE_FILTER_PASSES = 8
 
 _JSON_ENTITY_REFERENCE_FIELDS: dict[str, frozenset[str]] = {
     "scene_snapshots": frozenset({"present_character_ids_json"}),
