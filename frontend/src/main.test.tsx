@@ -15285,7 +15285,7 @@ describe("frontend helpers", () => {
   });
 
   it("guards generated choices while a tracked regeneration job remains active", async () => {
-    installEventSourceDouble();
+    const sources = installEventSourceDouble();
     const regenerationJob = {
       id: "job-choice-regeneration",
       type: "action_choice_regenerate",
@@ -15313,6 +15313,20 @@ describe("frontend helpers", () => {
     expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Open the brass door" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+    const jobSource = sources.find(
+      (source) => source.url === "/api/jobs/job-choice-regeneration/events?save_id=save-1"
+    );
+    if (!jobSource) throw new Error("regeneration job watcher was not created");
+    act(() => {
+      jobSource.dispatch("done", {
+        ...regenerationJob,
+        status: "failed",
+        error: "Action choices could not be regenerated."
+      });
+    });
+    expect(
+      await screen.findByText("Action choices could not be regenerated.")
+    ).toBeInTheDocument();
   });
 
   it("submits a selected CYOA action as a normal chat message", async () => {
