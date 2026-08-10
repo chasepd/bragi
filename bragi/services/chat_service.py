@@ -6082,6 +6082,7 @@ class ChatService:
             and (
                 not result.passed
                 or bool(result.npc_passivity_issues)
+                or bool(result.quality_findings)
                 or _verification_commit_decisions_need_retry(result)
             )
         )
@@ -6111,10 +6112,7 @@ class ChatService:
             )
         feedback_parts: list[str] = []
         if retry_for_verification:
-            feedback_parts.append(
-                result.retry_feedback.strip()
-                or _verification_retry_feedback(result)
-            )
+            feedback_parts.append(_verification_retry_feedback(result))
         if retry_for_npc:
             feedback_parts.append(_npc_knowledge_retry_feedback(first_audit))
         feedback = "\n\n".join(part for part in feedback_parts if part.strip())
@@ -11642,6 +11640,8 @@ def _verification_retry_feedback(result: NarratorVerificationResult) -> str:
     lines = [
         "Revise the previous draft so it follows the narrator message brief."
     ]
+    if result.retry_feedback.strip():
+        lines.append(result.retry_feedback.strip())
     for issue in result.issues[:5]:
         lines.append(f"- {issue}")
     for issue in result.npc_agency_issues[:5]:
@@ -11658,6 +11658,13 @@ def _verification_retry_feedback(result: NarratorVerificationResult) -> str:
             f"- Dating route stage: {violation.character_name} at "
             f"{violation.route_stage} exceeded {violation.escalation}. "
             f"Reason: {violation.reason}"
+        )
+    for finding in result.quality_findings:
+        label = finding.category.replace("_", " ").capitalize()
+        lines.append(
+            f"- {label}: {finding.reason} Offending draft: "
+            f"{finding.narrator_quote!r}. Supplied comparison: "
+            f"{finding.context_quote!r}."
         )
     for leak in result.npc_knowledge_leaks[:5]:
         lines.append(
@@ -11709,6 +11716,16 @@ def _narrator_verifier_diagnostics(
                 "evidence_quote": violation.evidence_quote,
             }
             for violation in result.dating_route_stage_violations
+        ],
+        "quality_finding_count": len(result.quality_findings),
+        "quality_findings": [
+            {
+                "category": finding.category,
+                "reason": finding.reason,
+                "narrator_quote": finding.narrator_quote,
+                "context_quote": finding.context_quote,
+            }
+            for finding in result.quality_findings
         ],
         "npc_knowledge_leak_count": len(result.npc_knowledge_leaks),
         "npc_knowledge_leaks": [
