@@ -3909,6 +3909,74 @@ def test_initially_missing_target_creation_rechecks_declared_edge(
     assert json.loads(str(tower["connections_json"])) == ["future-gate"]
 
 
+def test_target_creation_restores_persisted_excluded_reference_cycle(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The archive opens.",
+    )
+    repositories.connection.executemany(
+        """
+        INSERT INTO summaries(
+            id, save_id, covers_message_start_id, covers_message_end_id,
+            body, provider, model, source_message_ids_json,
+            source_summary_ids_json
+        ) VALUES (?, ?, ?, ?, ?, 'fake', 'fake', ?, ?)
+        """,
+        (
+            (
+                "summary-a",
+                save.id,
+                message.id,
+                message.id,
+                "A",
+                json.dumps([message.id]),
+                json.dumps(["summary-b", "summary-c"]),
+            ),
+            (
+                "summary-b",
+                save.id,
+                message.id,
+                message.id,
+                "B",
+                json.dumps([message.id]),
+                json.dumps(["summary-a"]),
+            ),
+        ),
+    )
+    repositories.commit()
+    service = TurnSnapshotService(repositories)
+    baseline = service.capture_message_snapshot(save_id=save.id, message_id=message.id)
+    assert service._rows_from_manifest(service._snapshot_manifest(baseline))[
+        "summaries"
+    ] == ()
+    repositories.connection.execute(
+        """
+        INSERT INTO summaries(
+            id, save_id, covers_message_start_id, covers_message_end_id,
+            body, provider, model, source_message_ids_json,
+            source_summary_ids_json
+        ) VALUES ('summary-c', ?, ?, ?, 'C', 'fake', 'fake', ?, '[]')
+        """,
+        (save.id, message.id, message.id, json.dumps([message.id])),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    summaries = service._rows_from_manifest(service._snapshot_manifest(changed))[
+        "summaries"
+    ]
+
+    assert {str(row["id"]) for row in summaries} == {
+        "summary-a",
+        "summary-b",
+        "summary-c",
+    }
+
+
 def test_group_thread_participant_removal_rechecks_thread_inclusion(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3972,6 +4040,53 @@ def test_character_exclusion_rechecks_group_participant_aggregate(
     rows = service._rows_from_manifest(service._snapshot_manifest(changed))
 
     assert all(row["id"] != thread.id for row in rows["character_text_threads"])
+
+
+def test_participant_move_rechecks_old_and_new_group_threads(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    for character_id in ("mara", "rowan", "inez", "tomas"):
+        repositories.add_character(
+            save_id=save.id,
+            character_id=character_id,
+            name=character_id.title(),
+        )
+    old_thread = repositories.create_character_text_group_thread(
+        save_id=save.id,
+        title="Old Crew",
+        character_ids=("mara", "rowan"),
+    )
+    new_thread = repositories.create_character_text_group_thread(
+        save_id=save.id,
+        title="New Crew",
+        character_ids=("inez", "tomas"),
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    participant = repositories.connection.execute(
+        """
+        SELECT id FROM character_text_thread_participants
+        WHERE save_id = ? AND thread_id = ? AND character_id = 'rowan'
+        """,
+        (save.id, old_thread.id),
+    ).fetchone()
+    assert participant is not None
+    repositories.connection.execute(
+        """
+        UPDATE character_text_thread_participants
+        SET thread_id = ? WHERE id = ?
+        """,
+        (new_thread.id, participant["id"]),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+    thread_ids = {str(row["id"]) for row in rows["character_text_threads"]}
+
+    assert old_thread.id not in thread_ids
+    assert new_thread.id in thread_ids
 
 
 def test_activity_removal_rechecks_narrator_cursor_aggregate(
