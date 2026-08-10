@@ -4275,8 +4275,8 @@ def _narrator_quality_findings_from_data(
             or not reason
             or not narrator_quote
             or not context_quote
-            or not quote_matches_source(narrator_quote, narrator_body)
-            or not quote_matches_source(context_quote, context_text)
+            or narrator_quote not in narrator_body
+            or context_quote not in context_text
         ):
             invalid_finding = True
             continue

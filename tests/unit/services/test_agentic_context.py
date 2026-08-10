@@ -3513,6 +3513,8 @@ def test_narrator_verifier_clean_response_has_no_quality_findings() -> None:
     (
         ("A quote absent from the draft.", "The gate remains sealed."),
         ("Mara crosses the sealed gate.", "A quote absent from supplied context."),
+        ("`Mara crosses the sealed gate.`", "The gate remains sealed."),
+        ("Mara crosses the sealed gate.", "The gate   remains sealed."),
     ),
 )
 def test_narrator_verifier_fails_closed_for_ungrounded_quality_finding(
