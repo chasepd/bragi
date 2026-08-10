@@ -11688,7 +11688,7 @@ describe("frontend helpers", () => {
     expect(shell.style.getPropertyValue("--right-panel-width")).toBe("370px");
   });
 
-  it("cancels chat jobs through the job and runtime cancel endpoints", async () => {
+  it("cancels tracked chat jobs through one job cancellation request", async () => {
     installEventSourceDouble();
     const fetchMock = workbenchFetch([
       { id: "job-1", type: "chat_turn", save_id: "save-1", status: "running", result: null, error: null, created_at: 1 }
@@ -11706,9 +11706,42 @@ describe("frontend helpers", () => {
     await userEvent.click(cancelButtons[cancelButtons.length - 1]);
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/jobs/job-1/cancel?save_id=save-1", expect.objectContaining({ method: "POST" })));
-    const chatCancel = fetchMock.mock.calls.find(([path]) => path === "/api/chat/cancel");
-    expect(chatCancel).toBeTruthy();
-    expect(JSON.parse(String(chatCancel?.[1].body))).toEqual({ save_id: "save-1" });
+    const cancellationCalls = fetchMock.mock.calls.filter(([path]) => String(path).includes("/cancel"));
+    expect(cancellationCalls).toHaveLength(1);
+    expect(fetchMock.mock.calls.some(([path]) => path === "/api/chat/cancel")).toBe(false);
+  });
+
+  it("surfaces a tracked job cancellation failure", async () => {
+    installEventSourceDouble();
+    const activeJobs = [
+      { id: "job-1", type: "chat_turn", save_id: "save-1", status: "running", result: null, error: null, created_at: 1 } satisfies Job
+    ];
+    const baseFetch = workbenchFetch(activeJobs);
+    const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/api/jobs/job-1/cancel?save_id=save-1") {
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          statusText: "Conflict",
+          json: async () => ({ detail: "Job cancellation could not be requested" })
+        });
+      }
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    const cancelButtons = await screen.findAllByRole("button", { name: "Cancel Chat turn" });
+    await userEvent.click(cancelButtons[cancelButtons.length - 1]);
+
+    expect(await screen.findByText("Job cancellation could not be requested")).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([path]) => path === "/api/chat/cancel")).toBe(false);
   });
 
   it("cancels non-chat jobs without runtime chat cancellation", async () => {

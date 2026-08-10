@@ -139,7 +139,7 @@ or per user/session before using a save ID.
 | `/api/character-texts/delete-from-here` | Save-scoped | Delete character text conversation suffixes only in an accessible save; child blocked. |
 | `/api/character-texts/edit` | Save-scoped | Edit and replay player character texts only in an accessible save; child blocked. |
 | `/api/chat/timeskip` | Save-scoped | Timeskip only when role can write to the save. |
-| `/api/chat/cancel` | Save-scoped | Cancel only the current user's accessible save job; child cannot cancel another user's active chat job. |
+| `/api/chat/cancel` | Save-scoped | Compatibility fallback for callers without a tracked job ID; cancel only the current user's accessible save job, and prefer `/api/jobs/{job_id}/cancel` when a job ID is available. Child cannot cancel another user's active chat job. |
 | `/api/action-choices/regenerate` | Save-scoped | Regenerate generated action choices only for an accessible save; child allowed as normal chat participation. |
 | `/api/chat/regenerate` | Save-scoped | Regenerate only messages in an accessible save. |
 | `/api/runtime/custom-instructions` | Save-scoped | Update only accessible save instructions; child blocked. |

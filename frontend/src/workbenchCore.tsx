@@ -3396,9 +3396,6 @@ function Workbench({
       const jobSaveId = tracked.job.save_id ?? null;
       const saveQuery = jobSaveId ? `?save_id=${encodeURIComponent(jobSaveId)}` : "";
       await postJson(`/api/jobs/${encodeURIComponent(tracked.job.id)}/cancel${saveQuery}`, {});
-      if (tracked.job.type === "chat_turn") {
-        await postJson("/api/chat/cancel", { save_id: jobSaveId ?? model?.active_save_id ?? null });
-      }
     } catch (failure) {
       setTrackedJobs((current) => ({
         ...current,
