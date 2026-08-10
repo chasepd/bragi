@@ -1253,6 +1253,38 @@ def test_world_time_service_queues_ambiguous_narrator_only_time_jump(
     }
 
 
+def test_world_time_service_checks_ambiguous_time_at_sentence_boundary(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id, narrator_message_id = _save_with_completed_turn(
+        repositories,
+        player_body="I keep working on the beacon lens.",
+        narrator_body=(
+            "The repair continues without interruption. "
+            "Evening shadows cross the tower windows."
+        ),
+    )
+    provider = RecordingStructuredTimeProvider({"changed": False})
+
+    result = asyncio.run(
+        WorldTimeService(
+            repositories=repositories,
+            checker=StructuredProviderWorldTimeChecker(
+                provider=provider,
+                provider_name="fake",
+                model_id="fake-time",
+            ),
+        ).reconcile_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+        )
+    )
+
+    assert result.skipped_reason == "assessment_unchanged"
+    assert len(provider.requests) == 1
+
+
 def test_world_time_service_queues_conflicting_completed_turn_time_evidence(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -41,7 +41,12 @@ WORLD_TIME_RECONCILIATION_SCHEMA_NAME = "world_time_reconciliation"
 WORLD_TIME_CONFIDENCE_THRESHOLD = 0.65
 NARRATOR_ONLY_WORLD_TIME_CONFIDENCE_THRESHOLD = 0.9
 _COMPLETED_TURN_AMBIGUOUS_TIME_RE = re.compile(
-    r"^\s*(?:morning|afternoon|evening|night|dawn|dusk)\b",
+    r"(?:^|[.!?]\s+)"
+    r"(?:"
+    r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"(?:\s+(?:morning|afternoon|evening|night))?"
+    r"|morning|afternoon|evening|night|dawn|dusk"
+    r")\b",
     re.IGNORECASE,
 )
 

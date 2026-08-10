@@ -542,6 +542,58 @@ def test_director_pressure_preserves_counters_for_unverified_turn(
     assert provider.structured_output_requests == []
 
 
+def test_director_pressure_does_not_treat_queued_effect_as_progress(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id = _seed_save(repositories)
+    repositories.upsert_world_state(
+        save_id=save_id,
+        key=DIRECTOR_PRESSURE_STATE_KEY,
+        value={"stall_turns": 1, "cooldown_turns": 0},
+        category="director_pressure",
+        confidence=1.0,
+        source_message_id=player_message_id,
+    )
+    _configure_director(repositories)
+    provider = DirectorPressureProvider({})
+    narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon room stays quiet while a time change awaits review.",
+    )
+    _add_turn_outcome(
+        repositories,
+        save_id=save_id,
+        narrator_message_id=narrator.id,
+        effects=(
+            _turn_effect(
+                candidate_type="world_time_change",
+                operation="update",
+                value={"time_of_day": "evening"},
+                application_status="confirmation_queued",
+                changed=False,
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        DirectorPressureService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).assess_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator.id,
+        )
+    )
+
+    assert result.skipped_reason == "model_abstained"
+    assert result.pacing_signal == "stalled"
+    assert result.state.stall_turns == 2
+    assert len(provider.structured_output_requests) == 1
+
+
 def _seed_save(repositories: PersistenceRepositories) -> tuple[str, str]:
     scenario = repositories.create_scenario(
         type="full_roleplay",
@@ -612,6 +664,8 @@ def _turn_effect(
     candidate_type: str,
     operation: str,
     value: dict[str, object],
+    application_status: str = "committed",
+    changed: bool = True,
 ) -> TurnOutcomeEffect:
     return TurnOutcomeEffect(
         candidate_id=f"{candidate_type}:test",
@@ -629,6 +683,6 @@ def _turn_effect(
         evidence_quote="",
         verifier_status="supported",
         safe_to_commit=True,
-        application_status="committed",
-        changed=True,
+        application_status=application_status,
+        changed=changed,
     )

@@ -334,8 +334,7 @@ def _turn_pacing_signal(outcome: TurnOutcome) -> str:
     accepted_effects = tuple(
         effect
         for effect in outcome.effects
-        if effect.application_status in {"committed", "confirmation_queued"}
-        and (effect.changed or effect.application_status == "confirmation_queued")
+        if effect.application_status == "committed" and effect.changed
     )
     for effect in accepted_effects:
         if effect.candidate_type != "active_thread_change":
