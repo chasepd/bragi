@@ -9,6 +9,9 @@ import pytest
 
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.services.dating_route_profile_service import (
+    DATING_ROUTE_PROFILE_ENRICHMENT_TASK,
+)
 from bragi.services.save_service import SaveService
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 
@@ -92,6 +95,59 @@ def test_rename_save_updates_trimmed_title(
     fetched = repositories.get_save(save.id)
     assert fetched is not None
     assert fetched.title == "Dawn Watch"
+
+
+def test_load_save_enqueues_missing_route_profiles_without_resetting_backoff(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="dating_sim",
+        title="Summer Paths",
+        premise="A relationship-focused summer.",
+        player_role="New student",
+        content={"player_character_name": "Ren"},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Summer")
+    player = repositories.add_character(
+        save_id=save.id,
+        name="Ren",
+        is_player_character=True,
+    )
+    npc = repositories.add_character(save_id=save.id, name="Mika")
+    repositories.upsert_dating_route_state(
+        save_id=save.id,
+        player_character_id=player.id,
+        npc_character_id=npc.id,
+        stage="introduced",
+    )
+    service = SaveService(repositories)
+
+    service.load_save(save.id)
+    task = repositories.get_scheduled_task(
+        task_type=DATING_ROUTE_PROFILE_ENRICHMENT_TASK,
+        save_id=save.id,
+    )
+    assert task is not None
+    repositories.connection.execute(
+        "UPDATE scheduled_tasks SET next_run_at = datetime('now', '+15 minutes') "
+        "WHERE id = ?",
+        (task.id,),
+    )
+    repositories.commit()
+    delayed = repositories.get_scheduled_task(
+        task_type=DATING_ROUTE_PROFILE_ENRICHMENT_TASK,
+        save_id=save.id,
+    )
+    assert delayed is not None
+
+    service.load_save(save.id)
+
+    reloaded = repositories.get_scheduled_task(
+        task_type=DATING_ROUTE_PROFILE_ENRICHMENT_TASK,
+        save_id=save.id,
+    )
+    assert reloaded is not None
+    assert reloaded.next_run_at == delayed.next_run_at
 
 
 def test_rename_save_rejects_blank_and_unknown_saves(

@@ -6,6 +6,7 @@ import json
 import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any, cast
 
 from bragi.persistence.models import (
@@ -13,6 +14,7 @@ from bragi.persistence.models import (
     DatingRouteStateRecord,
     ModelPreferenceRecord,
     ScenarioRecord,
+    ScheduledTaskRecord,
 )
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
@@ -35,8 +37,11 @@ from bragi.services.model_preferences import (
     roleplay_model_preference_with_fallbacks,
 )
 from bragi.services.provider_fallbacks import structured_output_with_fallback
+from bragi.services.turn_snapshot_service import TurnSnapshotService
 
 DATING_ROUTE_PROFILE_TASK = DATING_ROUTE_PROFILE_PURPOSE
+DATING_ROUTE_PROFILE_ENRICHMENT_TASK = "dating_route_profile_enrichment"
+DATING_ROUTE_PROFILE_ENRICHMENT_INTERVAL_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,7 @@ class DatingRouteProfileResult:
     status: str = "skipped"
     updated_count: int = 0
     requested_count: int = 0
+    stale_count: int = 0
     skipped_reason: str = ""
 
     def to_json(self) -> dict[str, object]:
@@ -51,8 +57,53 @@ class DatingRouteProfileResult:
             "status": self.status,
             "updated_count": self.updated_count,
             "requested_count": self.requested_count,
+            "stale_count": self.stale_count,
             "skipped_reason": self.skipped_reason,
         }
+
+
+def dating_route_profiles_pending(
+    repositories: PersistenceRepositories,
+    save_id: str,
+) -> bool:
+    return any(
+        _route_needs_profile(route)
+        for route in repositories.list_dating_route_states(save_id)
+    )
+
+
+def dating_route_profile_model_configured(
+    repositories: PersistenceRepositories,
+    save_id: str,
+) -> bool:
+    return _dating_route_profile_model_preference(
+        repositories=repositories,
+        save_id=save_id,
+    ) is not None
+
+
+def enqueue_dating_route_profile_enrichment(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    force_due: bool = False,
+) -> ScheduledTaskRecord | None:
+    """Persist profile work without resetting an existing retry delay."""
+    if not dating_route_profiles_pending(repositories, save_id):
+        return None
+    existing = repositories.get_scheduled_task(
+        task_type=DATING_ROUTE_PROFILE_ENRICHMENT_TASK,
+        save_id=save_id,
+    )
+    if existing is not None and not force_due:
+        return existing
+    return repositories.upsert_scheduled_task(
+        task_type=DATING_ROUTE_PROFILE_ENRICHMENT_TASK,
+        save_id=save_id,
+        interval_seconds=DATING_ROUTE_PROFILE_ENRICHMENT_INTERVAL_SECONDS,
+        payload={"active_save_only": False},
+        due_now=True,
+    )
 
 
 class DatingRouteProfileService:
@@ -109,6 +160,11 @@ class DatingRouteProfileService:
                 skipped_reason=skipped_reason,
             )
         characters = self.repositories.list_characters(save_id)
+        input_fingerprint = _profile_input_fingerprint(
+            scenario=details.scenario,
+            characters=characters,
+            routes=routes,
+        )
         request = StructuredOutputRequest(
             provider=preference.provider,
             model_id=preference.model_id,
@@ -138,16 +194,18 @@ class DatingRouteProfileService:
                 requested_count=len(routes),
                 skipped_reason=skipped_reason,
             )
-        updated_count = self._apply_profiles(
+        updated_count, stale_count = self._apply_profiles(
             save_id=save_id,
             routes=routes,
             profiles_by_npc_id=profiles_by_npc_id,
+            input_fingerprint=input_fingerprint,
             source_message_id=source_message_id,
         )
         return DatingRouteProfileResult(
             status="succeeded",
             updated_count=updated_count,
             requested_count=len(routes),
+            stale_count=stale_count,
         )
 
     def _structured_provider(
@@ -177,39 +235,97 @@ class DatingRouteProfileService:
         save_id: str,
         routes: tuple[DatingRouteStateRecord, ...],
         profiles_by_npc_id: Mapping[str, Mapping[str, object]],
+        input_fingerprint: str,
         source_message_id: str | None,
-    ) -> int:
+    ) -> tuple[int, int]:
         updated_count = 0
-        for route in routes:
-            item = profiles_by_npc_id[route.npc_character_id]
-            comfort = route.comfort_with_intimacy or _string(
-                item.get("comfort_with_intimacy")
-            )
-            pacing = route.pacing_preference or _string(
-                item.get("pacing_preference")
-            )
-            known_boundaries = _merge_strings(
-                route.known_boundaries,
-                _string_list(item.get("known_boundaries")),
-            )
-            unresolved_questions = _merge_strings(
-                route.unresolved_questions,
-                _string_list(item.get("unresolved_questions")),
-            )
-            updated = self.repositories.upsert_dating_route_state(
-                save_id=save_id,
-                player_character_id=route.player_character_id,
-                npc_character_id=route.npc_character_id,
-                stage=route.stage,
-                comfort_with_intimacy=comfort,
-                pacing_preference=pacing,
-                known_boundaries=known_boundaries,
-                unresolved_questions=unresolved_questions,
-                source_message_id=source_message_id or route.source_message_id,
-            )
-            if updated != route:
+        stale_count = 0
+        self.repositories.begin_immediate_transaction()
+        try:
+            details = self.repositories.load_save_details(save_id)
+            characters = self.repositories.list_characters(save_id)
+            current_routes: list[DatingRouteStateRecord] = []
+            batch_stale = details is None
+            for route in routes:
+                current = self.repositories.get_dating_route_state(route.id)
+                if current is None or not _route_needs_profile(current):
+                    batch_stale = True
+                    break
+                current_routes.append(current)
+            if not batch_stale and details is not None:
+                current_fingerprint = _profile_input_fingerprint(
+                    scenario=details.scenario,
+                    characters=characters,
+                    routes=tuple(current_routes),
+                )
+                batch_stale = current_fingerprint != input_fingerprint
+            if batch_stale:
+                stale_count = len(routes)
+            for current in () if batch_stale else current_routes:
+                item = profiles_by_npc_id[current.npc_character_id]
+                before = _route_profile_audit_value(current)
+                updated = self.repositories.upsert_dating_route_state(
+                    save_id=save_id,
+                    player_character_id=current.player_character_id,
+                    npc_character_id=current.npc_character_id,
+                    stage=current.stage,
+                    comfort_with_intimacy=(
+                        current.comfort_with_intimacy
+                        or _string(item.get("comfort_with_intimacy"))
+                    ),
+                    pacing_preference=(
+                        current.pacing_preference
+                        or _string(item.get("pacing_preference"))
+                    ),
+                    known_boundaries=_merge_strings(
+                        current.known_boundaries,
+                        _string_list(item.get("known_boundaries")),
+                    ),
+                    unresolved_questions=_merge_strings(
+                        current.unresolved_questions,
+                        _string_list(item.get("unresolved_questions")),
+                    ),
+                    source_message_id=(
+                        source_message_id or current.source_message_id
+                    ),
+                )
+                after = _route_profile_audit_value(updated)
+                if after == before:
+                    continue
+                self.repositories.add_context_update_audit(
+                    save_id=save_id,
+                    operation="dating_route_profile_enrichment",
+                    entity_type="dating_route_state",
+                    entity_id=updated.id,
+                    field_path="route_profile",
+                    before=before,
+                    after=after,
+                    reason="Generated durable dating-route pacing profile.",
+                    confidence=_confidence(item.get("confidence")),
+                    source_message_ids=list(
+                        dict.fromkeys(
+                            message_id
+                            for message_id in (
+                                source_message_id,
+                                current.source_message_id,
+                            )
+                            if message_id
+                        )
+                    ),
+                )
                 updated_count += 1
-        return updated_count
+            if updated_count:
+                TurnSnapshotService(
+                    self.repositories
+                ).capture_current_head_if_dirty(
+                    save_id,
+                    reason="dating_route_profile_enrichment",
+                )
+            self.repositories.commit_transaction()
+        except Exception:
+            self.repositories.rollback_transaction()
+            raise
+        return updated_count, stale_count
 
 
 def _route_needs_profile(route: DatingRouteStateRecord) -> bool:
@@ -217,6 +333,36 @@ def _route_needs_profile(route: DatingRouteStateRecord) -> bool:
         not route.comfort_with_intimacy.strip()
         or not route.pacing_preference.strip()
     )
+
+
+def _profile_input_fingerprint(
+    *,
+    scenario: ScenarioRecord,
+    characters: list[CharacterRecord],
+    routes: tuple[DatingRouteStateRecord, ...],
+) -> str:
+    messages = _dating_route_profile_messages(
+        scenario=scenario,
+        characters=characters,
+        routes=routes,
+    )
+    rendered = json.dumps(
+        [(message.role, message.body) for message in messages],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _route_profile_audit_value(
+    route: DatingRouteStateRecord,
+) -> dict[str, object]:
+    return {
+        "comfort_with_intimacy": route.comfort_with_intimacy,
+        "pacing_preference": route.pacing_preference,
+        "known_boundaries": list(route.known_boundaries),
+        "unresolved_questions": list(route.unresolved_questions),
+    }
 
 
 def _save_supports_dating_routes(
@@ -386,6 +532,12 @@ def _is_string_list_value(value: object, *, max_items: int) -> bool:
 
 def _is_number_value(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _confidence(value: object) -> float:
+    if not _is_number_value(value):
+        return 0.0
+    return float(cast(int | float, value))
 
 
 _COMMITMENT_ESCALATION_TERMS = (

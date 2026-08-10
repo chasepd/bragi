@@ -7,6 +7,10 @@ from pathlib import Path
 from bragi.app_logging import log_error_event, log_event
 from bragi.persistence.models import MediaAssetRecord, SaveDetailsRecord, SaveRecord
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.services.dating_route_profile_service import (
+    enqueue_dating_route_profile_enrichment,
+)
+from bragi.services.dating_route_service import DatingRouteService
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 
 
@@ -45,6 +49,11 @@ class SaveService:
         details = self.repositories.load_save_details(save_id)
         if details is None:
             raise ValueError(f"Unknown save id: {save_id}")
+        DatingRouteService(self.repositories).seed_routes_for_save(save_id)
+        enqueue_dating_route_profile_enrichment(
+            self.repositories,
+            save_id=save_id,
+        )
         self.repositories.touch_save_last_opened(save_id)
         log_event(
             "save.loaded",

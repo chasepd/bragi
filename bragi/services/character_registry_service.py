@@ -29,6 +29,7 @@ from bragi.services.character_locks import (
     merge_character_locked_fields,
     normalize_character_locked_fields,
 )
+from bragi.services.dating_route_service import DatingRouteService
 from bragi.services.knowledge_boundary import knowledge_edge_allows_prompt_use
 
 _KNOWS_RELATION = "knows"
@@ -512,6 +513,7 @@ class CharacterRegistryService:
         except Exception:
             self.repositories.rollback_transaction()
             raise
+        DatingRouteService(self.repositories).seed_routes_for_save(save_id)
         return CharacterRegistryApplyResult(
             model=self.build_model(active_save_id=save_id),
             created_count=created_count,
