@@ -8502,6 +8502,66 @@ def test_repository_rejects_invalid_job_statuses(
         )
 
 
+def test_repository_claims_and_links_idempotent_chat_submission(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id = _persist_repository_save(repositories)
+
+    claimed = repositories.create_chat_turn_submission_job(
+        save_id=save_id,
+        client_turn_id="11111111-1111-4111-8111-111111111111",
+        operation="chat",
+        request_fingerprint="fingerprint-1",
+        creator_user_id=None,
+        job_id="chat-job-1",
+        payload={"source": "web"},
+    )
+
+    assert claimed.job.id == "chat-job-1"
+    assert claimed.job.status == "queued"
+    assert claimed.client_turn_id == "11111111-1111-4111-8111-111111111111"
+    assert repositories.get_chat_turn_submission(
+        save_id=save_id,
+        client_turn_id=claimed.client_turn_id,
+    ) == claimed
+
+    narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        body="The beacon answers.",
+    )
+    linked = repositories.link_chat_turn_submission_messages(
+        job_id=claimed.job.id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator.id,
+    )
+
+    assert linked.player_message_id == player_message_id
+    assert linked.narrator_message_id == narrator.id
+
+    repositories.start_job(claimed.job.id)
+    repositories.update_job(claimed.job.id, status="succeeded")
+    replay = repositories.get_chat_turn_submission(
+        save_id=save_id,
+        client_turn_id=claimed.client_turn_id,
+    )
+    assert replay is not None
+    assert replay.job.status == "succeeded"
+
+    with pytest.raises(sqlite3.IntegrityError):
+        repositories.create_chat_turn_submission_job(
+            save_id=save_id,
+            client_turn_id=claimed.client_turn_id,
+            operation="chat",
+            request_fingerprint="fingerprint-2",
+            creator_user_id=None,
+            job_id="chat-job-2",
+            payload={"source": "web"},
+        )
+
+    assert repositories.get_persisted_job("chat-job-2") is None
+
+
 def test_repository_rejects_mutating_terminal_jobs(
     repositories: PersistenceRepositories,
 ) -> None:

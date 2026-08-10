@@ -2029,10 +2029,14 @@ describe("frontend helpers", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       "/api/chat/continue",
       expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({ save_id: "save-1" })
+        method: "POST"
       })
     ));
+    const continueCall = fetchMock.mock.calls.find(([path]) => path === "/api/chat/continue");
+    expect(JSON.parse(String(continueCall?.[1].body))).toMatchObject({
+      client_turn_id: expect.any(String),
+      save_id: "save-1"
+    });
     expect(textarea).toHaveValue("Bring the rival back in the following scene.");
     expect(onPendingMessage).not.toHaveBeenCalled();
     expect(runJob).toHaveBeenCalledWith(expect.objectContaining({
@@ -15157,6 +15161,7 @@ describe("frontend helpers", () => {
     const chatCall = fetchMock.mock.calls.find(([path]) => path === "/api/chat");
     expect(JSON.parse(String(chatCall?.[1].body))).toMatchObject({
       body: "Light the beacon",
+      client_turn_id: expect.any(String),
       save_id: "save-1",
       speaker_name: null
     });
@@ -15240,7 +15245,7 @@ describe("frontend helpers", () => {
       "/api/chat",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ body: "Take another path", speaker_name: null, save_id: "save-1" })
+        body: expect.stringContaining('"client_turn_id"')
       })
     ));
   });
@@ -16105,6 +16110,13 @@ describe("frontend helpers", () => {
 
     fireEvent.submit(form);
     await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+
+    const chatBodies = fetchMock.mock.calls
+      .filter(([path]) => path === "/api/chat")
+      .map(([, init]) => JSON.parse(String(init?.body)) as Record<string, string>);
+    expect(chatBodies).toHaveLength(2);
+    expect(chatBodies[0].client_turn_id).toBeTruthy();
+    expect(chatBodies[1].client_turn_id).toBe(chatBodies[0].client_turn_id);
 
     resolveSecondChat({
       ok: true,

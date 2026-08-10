@@ -649,6 +649,48 @@ def test_export_import_preserves_incomplete_post_turn_outbox(
     ]
 
 
+def test_export_import_preserves_chat_turn_idempotency_ledger(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    client_turn_id = "11111111-1111-4111-8111-111111111111"
+    submission = repositories.create_chat_turn_submission_job(
+        save_id=save.id,
+        client_turn_id=client_turn_id,
+        operation="chat",
+        request_fingerprint="fingerprint-1",
+        creator_user_id=None,
+        job_id="chat-job-export",
+        payload={"source": "web"},
+    )
+    repositories.link_chat_turn_submission_messages(
+        job_id=submission.job.id,
+        player_message_id=PLAYER_MESSAGE_ID,
+        narrator_message_id=NARRATOR_MESSAGE_ID,
+    )
+    repositories.start_job(submission.job.id)
+    repositories.update_job(submission.job.id, status="succeeded")
+    bundle_path = tmp_path / "exports" / "idempotency.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+    imported = service.import_save(bundle_path)
+    imported_submission = repositories.get_chat_turn_submission(
+        save_id=_imported_save_id(imported),
+        client_turn_id=client_turn_id,
+    )
+
+    assert imported_submission is not None
+    assert imported_submission.operation == "chat"
+    assert imported_submission.request_fingerprint == "fingerprint-1"
+    assert imported_submission.job.id != submission.job.id
+    assert imported_submission.job.status == "succeeded"
+    assert imported_submission.player_message_id != PLAYER_MESSAGE_ID
+    assert imported_submission.narrator_message_id != NARRATOR_MESSAGE_ID
+
+
 def test_export_rejects_snapshot_that_cannot_be_imported(
     repositories: PersistenceRepositories,
     tmp_path: Path,

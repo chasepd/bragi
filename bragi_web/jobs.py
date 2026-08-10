@@ -17,6 +17,7 @@ from bragi_web.serialization import to_jsonable
 
 JobWorker = Callable[["JobHandle"], Awaitable[Any]]
 JobChangeCallback = Callable[["JobRecord"], None]
+JobPersistenceCallback = Callable[["JobRecord"], None]
 RepositoryScopeFactory = Callable[[], Any]
 ACTIVE_JOB_STATUSES = frozenset({"queued", "running"})
 TERMINAL_JOB_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
@@ -134,9 +135,11 @@ class JobRegistry:
         creator_user_id: str | None = None,
         exclusive_key: str | None = None,
         operation_queue_key: str | None = None,
+        job_id: str | None = None,
+        persist_before_start: JobPersistenceCallback | None = None,
     ) -> JobRecord:
         record = JobRecord(
-            id=uuid4().hex,
+            id=job_id or uuid4().hex,
             type=job_type,
             save_id=save_id,
             creator_user_id=creator_user_id,
@@ -151,10 +154,13 @@ class JobRegistry:
                 blocking = self._active_exclusive_job_locked(exclusive_key)
                 if blocking is not None:
                     raise JobRegistryExclusiveKeyError(exclusive_key, blocking.id)
+            if persist_before_start is not None:
+                persist_before_start(record)
             self._jobs[record.id] = record
             queued_snapshot = self._snapshot_record(record)
             self._condition.notify_all()
-        self._persist_queued(record)
+        if persist_before_start is None:
+            self._persist_queued(record)
         self._notify_change(queued_snapshot)
         observe("web.job.queued", job_id=record.id, job_type=record.type)
         task = asyncio.create_task(self._run(record, worker))

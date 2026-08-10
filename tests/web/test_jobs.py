@@ -16,6 +16,7 @@ from bragi_web.jobs import (
     OPTIONAL_ENRICHMENTS_COMPLETE,
     RESPONSE_COMMITTED,
     JobHandle,
+    JobRecord,
     JobRegistry,
     JobRegistryFullError,
     JobRegistryLimits,
@@ -171,6 +172,57 @@ def test_active_exclusive_job_rejects_same_key_until_terminal() -> None:
         )
         assert retry.task is not None
         await retry.task
+
+    asyncio.run(run_test())
+
+
+def test_pre_persisted_job_is_durable_before_worker_starts() -> None:
+    async def run_test() -> None:
+        registry = JobRegistry()
+        persisted: list[str] = []
+
+        async def worker(handle: JobHandle) -> dict[str, bool]:
+            assert persisted == [handle.record.id]
+            return {"ok": True}
+
+        record = await registry.create(
+            "chat_turn",
+            worker,
+            save_id="save-1",
+            job_id="durable-job",
+            persist_before_start=lambda queued: persisted.append(queued.id),
+        )
+
+        assert record.id == "durable-job"
+        assert record.task is not None
+        await record.task
+
+    asyncio.run(run_test())
+
+
+def test_pre_persisted_job_does_not_start_when_persistence_fails() -> None:
+    async def run_test() -> None:
+        registry = JobRegistry()
+        worker_started = False
+
+        async def worker(_handle: JobHandle) -> None:
+            nonlocal worker_started
+            worker_started = True
+
+        def fail_persistence(_record: JobRecord) -> None:
+            raise sqlite3.IntegrityError("duplicate client turn")
+
+        with pytest.raises(sqlite3.IntegrityError):
+            await registry.create(
+                "chat_turn",
+                worker,
+                save_id="save-1",
+                job_id="durable-job",
+                persist_before_start=fail_persistence,
+            )
+
+        assert registry.get("durable-job") is None
+        assert not worker_started
 
     asyncio.run(run_test())
 

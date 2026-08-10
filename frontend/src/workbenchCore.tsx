@@ -3187,6 +3187,29 @@ function Workbench({
   const runJob = useCallback<RunJob>((created, options = { applyResult: true }) => {
     if (!jobBelongsToActiveSave(created, activeSaveIdRef.current)) return () => undefined;
     if (jobWatchers.current[created.id]) return jobWatchers.current[created.id];
+    if (["succeeded", "failed", "cancelled"].includes(created.status)) {
+      let appliedRuntimeResult = false;
+      if (options.applyResult !== false && created.status === "succeeded") {
+        if (isRuntimeModel(created.result)) {
+          appliedRuntimeResult = true;
+          applyRuntimeModel(created.result);
+        } else if (isChatTurnDelta(created.result)) {
+          appliedRuntimeResult = applyChatTurnDelta(created.result);
+        }
+      }
+      if (created.status === "succeeded") options.onSucceeded?.(created.result);
+      if (created.status === "failed") {
+        options.onFailed?.(created.error || "Background job failed.", created);
+      }
+      if (options.clearPendingMessages !== false) setPendingMessage(null);
+      refreshWorkbench(
+        activeSaveIdRef.current,
+        appliedRuntimeResult
+          ? RUNTIME_MODEL_SIDE_EFFECT_REFRESH_TARGETS
+          : ALL_WORKBENCH_REFRESH_TARGETS,
+      );
+      return () => undefined;
+    }
     setTrackedJobs((current) => {
       const existing = current[created.id];
       return {
@@ -6222,7 +6245,19 @@ function lookAroundAnswerFromResult(
 type ChatSubmitVariables = {
   body: string;
   saveId: string | null;
+  key: string;
 };
+
+function chatSubmitVariables(
+  body: string,
+  saveId: string | null,
+  previous: ChatSubmitVariables | null
+): ChatSubmitVariables {
+  if (previous && previous.saveId === saveId && previous.body.trim() === body.trim()) {
+    return previous;
+  }
+  return { body, saveId, key: crypto.randomUUID() };
+}
 
 function pendingPlayerChronicleMessage(
   body: string,
@@ -6501,14 +6536,19 @@ function Composer({
   const continuingSaveIdRef = useRef<string | null | undefined>(undefined);
   const [continuingSaveId, setContinuingSaveId] = useState<string | null | undefined>(undefined);
   const timeskipSubmittingRef = useRef(false);
+  const failedSubmitRef = useRef<ChatSubmitVariables | null>(null);
+  const failedContinueRef = useRef<{ saveId: string | null; key: string } | null>(null);
+  const failedTimeskipRef = useRef<{ instruction: string; saveId: string | null; key: string } | null>(null);
   const submit = useMutation({
-    mutationFn: (submitted: ChatSubmitVariables) => postJson<Job>("/api/chat", { body: submitted.body, speaker_name: null, save_id: submitted.saveId }),
+    mutationFn: (submitted: ChatSubmitVariables) => postJson<Job>("/api/chat", { body: submitted.body, speaker_name: null, save_id: submitted.saveId, client_turn_id: submitted.key }),
     onSuccess: (job, submitted) => {
+      failedSubmitRef.current = null;
       if (submitted.saveId !== activeSaveIdRef.current) return;
       setSubmitError("");
       runJob(job);
     },
     onError: (error, submitted) => {
+      failedSubmitRef.current = submitted;
       if (submitted.saveId !== activeSaveIdRef.current) return;
       setBody((currentBody) => currentBody ? currentBody : submitted.body);
       onPendingMessage(null);
@@ -6522,27 +6562,36 @@ function Composer({
     }
   });
   const timeskip = useMutation({
-    mutationFn: (instruction: string) => postJson<Job>("/api/chat/timeskip", { instruction, save_id: activeSaveId }),
+    mutationFn: (submitted: { instruction: string; saveId: string | null; key: string }) => postJson<Job>("/api/chat/timeskip", { instruction: submitted.instruction, save_id: submitted.saveId, client_turn_id: submitted.key }),
     onSuccess: (job) => {
+      failedTimeskipRef.current = null;
       runJob(job);
       setTimeskipOpen(false);
+    },
+    onError: (_error, submitted) => {
+      failedTimeskipRef.current = submitted;
     },
     onSettled: () => {
       timeskipSubmittingRef.current = false;
     }
   });
   const continueStory = useMutation({
-    mutationFn: (saveId: string | null) => postJson<Job>("/api/chat/continue", { save_id: saveId }),
-    onSuccess: (job, submittedSaveId) => {
+    mutationFn: (submitted: { saveId: string | null; key: string }) => postJson<Job>("/api/chat/continue", { save_id: submitted.saveId, client_turn_id: submitted.key }),
+    onSuccess: (job, submitted) => {
+      failedContinueRef.current = null;
+      const submittedSaveId = submitted.saveId;
       if (submittedSaveId !== activeSaveIdRef.current) return;
       setSubmitError("");
       runJob(job);
     },
-    onError: (error, submittedSaveId) => {
+    onError: (error, submitted) => {
+      failedContinueRef.current = submitted;
+      const submittedSaveId = submitted.saveId;
       if (submittedSaveId !== activeSaveIdRef.current) return;
       setSubmitError(error instanceof Error ? error.message : "Could not continue story");
     },
-    onSettled: (_data, _error, submittedSaveId) => {
+    onSettled: (_data, _error, submitted) => {
+      const submittedSaveId = submitted.saveId;
       if (continuingSaveIdRef.current === submittedSaveId) {
         continuingSaveIdRef.current = undefined;
         setContinuingSaveId(undefined);
@@ -6552,6 +6601,9 @@ function Composer({
   useEffect(() => {
     setSubmitError("");
     setTimeskipOpen(false);
+    failedSubmitRef.current = null;
+    failedContinueRef.current = null;
+    failedTimeskipRef.current = null;
   }, [activeSaveId]);
   useEffect(() => {
     if (disabled) setTimeskipOpen(false);
@@ -6593,7 +6645,7 @@ function Composer({
             setSubmitError("");
             setBody("");
             onPendingMessage(pendingPlayerChronicleMessage(submittedBody, submittedSaveId, pendingAfterMessageId));
-            submit.mutate({ body: submittedBody, saveId: submittedSaveId });
+            submit.mutate(chatSubmitVariables(submittedBody, submittedSaveId, failedSubmitRef.current));
           }
         }}
       >
@@ -6626,7 +6678,12 @@ function Composer({
                   continuingSaveIdRef.current = activeSaveId;
                   setContinuingSaveId(activeSaveId);
                   setSubmitError("");
-                  continueStory.mutate(activeSaveId);
+                  const previous = failedContinueRef.current;
+                  continueStory.mutate(
+                    previous?.saveId === activeSaveId
+                      ? previous
+                      : { saveId: activeSaveId, key: crypto.randomUUID() }
+                  );
                 }}
               >
                 {continueBusy ? (
@@ -6677,7 +6734,17 @@ function Composer({
           onSubmit={(instruction) => {
             if (timeskipDisabled || !instruction.trim()) return;
             timeskipSubmittingRef.current = true;
-            timeskip.mutate(instruction);
+            const previous = failedTimeskipRef.current;
+            const submitted = (
+              previous
+              && previous.saveId === activeSaveId
+              && previous.instruction.trim() === instruction.trim()
+            ) ? { ...previous, instruction } : {
+              instruction,
+              saveId: activeSaveId,
+              key: crypto.randomUUID()
+            };
+            timeskip.mutate(submitted);
           }}
         />
       ) : null}
@@ -6711,15 +6778,18 @@ function CyoaActionPicker({
   activeSaveIdRef.current = activeSaveId;
   const submittingSaveIdRef = useRef<string | null | undefined>(undefined);
   const [submittingSaveId, setSubmittingSaveId] = useState<string | null | undefined>(undefined);
+  const failedSubmitRef = useRef<ChatSubmitVariables | null>(null);
   const submit = useMutation({
-    mutationFn: (submitted: ChatSubmitVariables) => postJson<Job>("/api/chat", { body: submitted.body, speaker_name: null, save_id: submitted.saveId }),
+    mutationFn: (submitted: ChatSubmitVariables) => postJson<Job>("/api/chat", { body: submitted.body, speaker_name: null, save_id: submitted.saveId, client_turn_id: submitted.key }),
     onSuccess: (job, submitted) => {
+      failedSubmitRef.current = null;
       if (submitted.saveId !== activeSaveIdRef.current) return;
       setSubmitError("");
       setManualBody("");
       runJob(job);
     },
     onError: (error, submitted) => {
+      failedSubmitRef.current = submitted;
       if (submitted.saveId !== activeSaveIdRef.current) return;
       setManualBody((currentBody) => currentBody ? currentBody : submitted.body);
       onPendingMessage(null);
@@ -6751,6 +6821,7 @@ function CyoaActionPicker({
     setManualOpen(false);
     setManualBody("");
     setSubmitError("");
+    failedSubmitRef.current = null;
   }, [activeSaveId, actionChoices?.narrator_message_id]);
 
   const choices = [...(actionChoices?.choices ?? [])].sort((left, right) => left.ordinal - right.ordinal);
@@ -6771,7 +6842,7 @@ function CyoaActionPicker({
     setSubmittingSaveId(submittedSaveId);
     setSubmitError("");
     onPendingMessage(pendingPlayerChronicleMessage(submittedBody, submittedSaveId, pendingAfterMessageId));
-    submit.mutate({ body: submittedBody, saveId: submittedSaveId });
+    submit.mutate(chatSubmitVariables(submittedBody, submittedSaveId, failedSubmitRef.current));
   };
   const regenerateOptions = () => {
     if (!canRegenerate || !actionChoices?.narrator_message_id) return;
