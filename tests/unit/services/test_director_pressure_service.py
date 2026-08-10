@@ -28,6 +28,7 @@ from bragi.services.director_pressure_service import (
     director_pressure_enabled,
     format_director_pressure_directive,
 )
+from bragi.services.turn_outcome import TurnOutcome, TurnOutcomeEffect
 
 
 @pytest.fixture
@@ -159,6 +160,7 @@ def test_director_pressure_applies_after_second_stalled_turn_and_commits_state(
         speaker_name="Narrator",
         body="Boots strike the stairwell as guards begin searching the floor.",
     )
+    _add_turn_outcome(repositories, save_id=save_id, narrator_message_id=narrator.id)
 
     result = asyncio.run(
         service.assess_completed_turn(
@@ -172,7 +174,15 @@ def test_director_pressure_applies_after_second_stalled_turn_and_commits_state(
     assert "guards start searching" in format_director_pressure_directive(result)
     assert result.state.stall_turns == 0
     assert result.state.cooldown_turns == 2
+    assert result.provider_called is True
+    assert result.pacing_signal == "stalled"
     assert provider.structured_output_requests[0].schema_name == "director_pressure"
+    assert "tension_trend" not in provider.structured_output_requests[0].schema[
+        "properties"
+    ]
+    assert "player_is_resolving_existing_pressure" not in (
+        provider.structured_output_requests[0].schema["properties"]
+    )
     assert "Prior Director pressure state:" in (
         provider.structured_output_requests[0].messages[-1].body
     )
@@ -187,7 +197,7 @@ def test_director_pressure_applies_after_second_stalled_turn_and_commits_state(
         for item in repositories.list_world_state(save_id)
         if item.key == DIRECTOR_PRESSURE_STATE_KEY
     )
-    assert state.value["tension_trend"] == "stalled"
+    assert state.value["tension_trend"] == "rising"
     assert state.value["cooldown_turns"] == 2
     assert state.value["escalation_history"] == [
         {
@@ -271,6 +281,7 @@ def test_director_pressure_abstains_until_stall_threshold(
         speaker_name="Narrator",
         body="The beacon room stays quiet for another beat.",
     )
+    _add_turn_outcome(repositories, save_id=save_id, narrator_message_id=narrator.id)
 
     result = asyncio.run(
         service.assess_completed_turn(
@@ -284,6 +295,7 @@ def test_director_pressure_abstains_until_stall_threshold(
     assert result.skipped_reason == "stall_threshold"
     assert format_director_pressure_directive(result) == ""
     assert result.state.stall_turns == 1
+    assert provider.structured_output_requests == []
 
 
 def test_director_pressure_abstains_during_resolution_even_when_stalled(
@@ -326,6 +338,18 @@ def test_director_pressure_abstains_during_resolution_even_when_stalled(
         speaker_name="Narrator",
         body="The gate mechanism clicks open as the player resolves the threat.",
     )
+    _add_turn_outcome(
+        repositories,
+        save_id=save_id,
+        narrator_message_id=narrator.id,
+        effects=(
+            _turn_effect(
+                candidate_type="active_thread_change",
+                operation="update",
+                value={"title": "Beacon warning", "status": "resolved"},
+            ),
+        ),
+    )
 
     result = asyncio.run(
         service.assess_completed_turn(
@@ -339,6 +363,305 @@ def test_director_pressure_abstains_during_resolution_even_when_stalled(
     assert result.skipped_reason == "player_resolving"
     assert result.state.stall_turns == 0
     assert result.state.cooldown_turns == 0
+    assert provider.structured_output_requests == []
+
+
+def test_director_pressure_skips_rising_turn_and_resets_stall_counter(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id = _seed_save(repositories)
+    repositories.upsert_world_state(
+        save_id=save_id,
+        key=DIRECTOR_PRESSURE_STATE_KEY,
+        value={"stall_turns": 1, "cooldown_turns": 0},
+        category="director_pressure",
+        confidence=1.0,
+        source_message_id=player_message_id,
+    )
+    _configure_director(repositories)
+    provider = DirectorPressureProvider({})
+    narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Riders appear through the ash and close on the tower.",
+    )
+    _add_turn_outcome(
+        repositories,
+        save_id=save_id,
+        narrator_message_id=narrator.id,
+        effects=(
+            _turn_effect(
+                candidate_type="active_thread_change",
+                operation="create",
+                value={"title": "Riders in the ash", "status": "active"},
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        DirectorPressureService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).assess_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator.id,
+        )
+    )
+
+    assert result.skipped_reason == "tension_rising"
+    assert result.state.stall_turns == 0
+    assert result.state.tension_trend == "rising"
+    assert provider.structured_output_requests == []
+
+
+def test_director_pressure_skips_verified_temporal_progress(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id = _seed_save(repositories)
+    repositories.upsert_world_state(
+        save_id=save_id,
+        key=DIRECTOR_PRESSURE_STATE_KEY,
+        value={"stall_turns": 1, "cooldown_turns": 0},
+        category="director_pressure",
+        confidence=1.0,
+        source_message_id=player_message_id,
+    )
+    _configure_director(repositories)
+    provider = DirectorPressureProvider({})
+    narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Evening settles over the tower.",
+    )
+    _add_turn_outcome(
+        repositories,
+        save_id=save_id,
+        narrator_message_id=narrator.id,
+        effects=(
+            _turn_effect(
+                candidate_type="world_time_change",
+                operation="update",
+                value={"time_of_day": "evening"},
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        DirectorPressureService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).assess_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator.id,
+        )
+    )
+
+    assert result.skipped_reason == "temporal_progress"
+    assert result.state.stall_turns == 0
+    assert provider.structured_output_requests == []
+
+
+def test_director_pressure_skips_during_cooldown_and_decrements_counter(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id = _seed_save(repositories)
+    repositories.upsert_world_state(
+        save_id=save_id,
+        key=DIRECTOR_PRESSURE_STATE_KEY,
+        value={"stall_turns": 1, "cooldown_turns": 2},
+        category="director_pressure",
+        confidence=1.0,
+        source_message_id=player_message_id,
+    )
+    _configure_director(repositories)
+    provider = DirectorPressureProvider({})
+    narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon room stays quiet for another beat.",
+    )
+    _add_turn_outcome(repositories, save_id=save_id, narrator_message_id=narrator.id)
+
+    result = asyncio.run(
+        DirectorPressureService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).assess_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator.id,
+        )
+    )
+
+    assert result.skipped_reason == "cooldown"
+    assert result.state.stall_turns == 2
+    assert result.state.cooldown_turns == 1
+    assert provider.structured_output_requests == []
+
+
+def test_director_pressure_waits_until_turn_after_cooldown_reaches_zero(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id = _seed_save(repositories)
+    repositories.upsert_world_state(
+        save_id=save_id,
+        key=DIRECTOR_PRESSURE_STATE_KEY,
+        value={"stall_turns": 1, "cooldown_turns": 1},
+        category="director_pressure",
+        confidence=1.0,
+        source_message_id=player_message_id,
+    )
+    _configure_director(repositories)
+    provider = DirectorPressureProvider({})
+    service = DirectorPressureService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+    cooling_narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon room stays quiet through the final cooldown turn.",
+    )
+    _add_turn_outcome(
+        repositories,
+        save_id=save_id,
+        narrator_message_id=cooling_narrator.id,
+    )
+
+    cooling_result = asyncio.run(
+        service.assess_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=cooling_narrator.id,
+        )
+    )
+    service.commit_after_narration(
+        result=cooling_result,
+        narrator_message_id=cooling_narrator.id,
+    )
+
+    assert cooling_result.skipped_reason == "cooldown"
+    assert cooling_result.state.cooldown_turns == 0
+    assert provider.structured_output_requests == []
+
+    eligible_narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon room remains quiet on the following turn.",
+    )
+    _add_turn_outcome(
+        repositories,
+        save_id=save_id,
+        narrator_message_id=eligible_narrator.id,
+    )
+
+    eligible_result = asyncio.run(
+        service.assess_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=eligible_narrator.id,
+        )
+    )
+
+    assert eligible_result.skipped_reason == "model_abstained"
+    assert len(provider.structured_output_requests) == 1
+
+
+def test_director_pressure_preserves_counters_for_unverified_turn(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id = _seed_save(repositories)
+    repositories.upsert_world_state(
+        save_id=save_id,
+        key=DIRECTOR_PRESSURE_STATE_KEY,
+        value={"stall_turns": 1, "cooldown_turns": 2},
+        category="director_pressure",
+        confidence=1.0,
+        source_message_id=player_message_id,
+    )
+    _configure_director(repositories)
+    provider = DirectorPressureProvider({})
+    narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon room stays quiet.",
+    )
+
+    result = asyncio.run(
+        DirectorPressureService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).assess_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator.id,
+        )
+    )
+
+    assert result.skipped_reason == "unverified_turn_outcome"
+    assert result.state.stall_turns == 1
+    assert result.state.cooldown_turns == 2
+    assert provider.structured_output_requests == []
+
+
+def test_director_pressure_does_not_treat_queued_effect_as_progress(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id = _seed_save(repositories)
+    repositories.upsert_world_state(
+        save_id=save_id,
+        key=DIRECTOR_PRESSURE_STATE_KEY,
+        value={"stall_turns": 1, "cooldown_turns": 0},
+        category="director_pressure",
+        confidence=1.0,
+        source_message_id=player_message_id,
+    )
+    _configure_director(repositories)
+    provider = DirectorPressureProvider({})
+    narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon room stays quiet while a time change awaits review.",
+    )
+    _add_turn_outcome(
+        repositories,
+        save_id=save_id,
+        narrator_message_id=narrator.id,
+        effects=(
+            _turn_effect(
+                candidate_type="world_time_change",
+                operation="update",
+                value={"time_of_day": "evening"},
+                application_status="confirmation_queued",
+                changed=False,
+            ),
+        ),
+    )
+
+    result = asyncio.run(
+        DirectorPressureService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).assess_completed_turn(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator.id,
+        )
+    )
+
+    assert result.skipped_reason == "model_abstained"
+    assert result.pacing_signal == "stalled"
+    assert result.state.stall_turns == 2
+    assert len(provider.structured_output_requests) == 1
 
 
 def _seed_save(repositories: PersistenceRepositories) -> tuple[str, str]:
@@ -383,4 +706,53 @@ def _configure_director(repositories: PersistenceRepositories) -> None:
         task=DIRECTOR_PRESSURE_TASK,
         provider="fake",
         model_id="director",
+    )
+
+
+def _add_turn_outcome(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    narrator_message_id: str,
+    effects: tuple[TurnOutcomeEffect, ...] = (),
+) -> None:
+    repositories.add_turn_outcome(
+        save_id=save_id,
+        message_id=narrator_message_id,
+        payload=TurnOutcome(
+            save_id=save_id,
+            message_id=narrator_message_id,
+            effects=effects,
+            verification_passed=True,
+            verifier_available=True,
+        ).to_json(),
+    )
+
+
+def _turn_effect(
+    *,
+    candidate_type: str,
+    operation: str,
+    value: dict[str, object],
+    application_status: str = "committed",
+    changed: bool = True,
+) -> TurnOutcomeEffect:
+    return TurnOutcomeEffect(
+        candidate_id=f"{candidate_type}:test",
+        candidate_type=candidate_type,
+        domain="thread_clock",
+        operation=operation,
+        state_key="",
+        field_path="",
+        character_id="",
+        target_type="",
+        target_id="",
+        value=value,
+        confidence=0.9,
+        evidence_source_ids=(),
+        evidence_quote="",
+        verifier_status="supported",
+        safe_to_commit=True,
+        application_status=application_status,
+        changed=changed,
     )

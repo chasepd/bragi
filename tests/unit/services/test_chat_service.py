@@ -66,6 +66,7 @@ from bragi.services.agentic_context import (
     NarrativeBeat,
     NarratorCommitDecision,
     NarratorMessageSpec,
+    NarratorQualityFinding,
     NarratorVerificationResult,
     NpcIntent,
     ObservationResult,
@@ -3486,6 +3487,133 @@ def test_submit_player_turn_uses_seven_attempts_after_narrator_verifier_failure(
     assert "The lens burns red." in retry_request.narration_brief
     assert retry_request.narration_evidence == ("observation:warning",)
     assert result.narrator_message.body == "The lens burns red above the stair."
+
+
+def test_submit_player_turn_retries_typed_narrator_quality_finding(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting(
+        RESPONSE_VERIFICATION_MODE_SETTING,
+        RESPONSE_VERIFICATION_MODE_RETRY_ONCE,
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = SequenceChatProvider(
+        "fake",
+        (
+            "Mara steps through the sealed gate.",
+            "The sealed gate stops Mara at the threshold.",
+        ),
+    )
+    spec = NarratorMessageSpec(
+        intent="Resolve Mara's attempt to cross the gate.",
+        thesis="The sealed gate blocks the crossing.",
+        must_say=(),
+        avoid=(),
+        tone="tense and grounded",
+        uncertainties=(),
+        evidence_source_ids=("scene:gate",),
+    )
+    finding = NarratorQualityFinding(
+        category="spatial_continuity",
+        reason="The supplied scene says the gate is sealed.",
+        narrator_quote="Mara steps through the sealed gate.",
+        context_quote="The gate remains sealed.",
+    )
+    verifier = ScriptedNarratorVerifier(
+        NarratorVerificationResult(
+            passed=True,
+            retry_feedback="Keep the gate consistent.",
+            confidence=0.94,
+            quality_findings=(finding,),
+        )
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+        narrator_planner=ScriptedNarratorPlanner(spec),
+        narrator_verifier=verifier,
+    )
+
+    result = asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I try to walk through the sealed gate.",
+            speaker_name="Mara",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    assert len(provider.chat_requests) == 7
+    feedback = provider.chat_requests[1].regeneration_feedback
+    assert "Keep the gate consistent." in feedback
+    assert "Spatial continuity" in feedback
+    assert "Mara steps through the sealed gate." in feedback
+    assert "The gate remains sealed." in feedback
+    assert "The supplied scene says the gate is sealed." in feedback
+    assert result.narrator_message.body == (
+        "The sealed gate stops Mara at the threshold."
+    )
+    job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
+    assert job_result["narrator_verifier"]["quality_finding_count"] == 1
+    assert job_result["narrator_verifier"]["quality_findings"] == [
+        {
+            "category": "spatial_continuity",
+            "reason": "The supplied scene says the gate is sealed.",
+            "narrator_quote": "Mara steps through the sealed gate.",
+            "context_quote": "The gate remains sealed.",
+        }
+    ]
+
+
+def test_narrator_quality_retry_feedback_includes_every_typed_finding() -> None:
+    findings = tuple(
+        NarratorQualityFinding(
+            category=category,
+            reason=f"Reason {index}.",
+            narrator_quote=f"Draft quote {index}.",
+            context_quote=f"Context quote {index}.",
+        )
+        for index, category in enumerate(
+            (
+                "spatial_continuity",
+                "possession_continuity",
+                "injury_resource_continuity",
+                "action_feasibility",
+                "causality",
+                "elapsed_time",
+                "character_voice",
+                "semantic_repetition",
+                "forward_movement",
+            ),
+            start=1,
+        )
+    )
+
+    feedback = chat_service_module._verification_retry_feedback(
+        NarratorVerificationResult(
+            passed=False,
+            quality_findings=findings,
+        )
+    )
+
+    for index in range(1, 10):
+        assert f"Reason {index}." in feedback
+        assert f"Draft quote {index}." in feedback
+        assert f"Context quote {index}." in feedback
 
 
 def test_submit_player_turn_uses_seven_attempts_after_narrator_passivity_issue(
