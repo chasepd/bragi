@@ -1675,7 +1675,12 @@ class StructuredProviderNarratorVerifier:
             task="response_verification",
             save_id=save_id,
         )
-        return _verification_result_from_data(response.data)
+        return _verification_result_from_data(
+            response.data,
+            request=source_request,
+            spec=spec,
+            narrator_body=narrator_body,
+        )
 
 
 def format_narrator_message_spec(spec: NarratorMessageSpec) -> str:
@@ -4186,6 +4191,10 @@ def _untrusted_agent_evidence_block(label: str, body: str) -> str:
 
 def _verification_result_from_data(
     data: dict[str, object],
+    *,
+    request: ChatRequest,
+    spec: NarratorMessageSpec,
+    narrator_body: str,
 ) -> NarratorVerificationResult:
     npc_agency_issues = _string_tuple(data.get("npc_agency_issues"))
     npc_passivity_issues = _string_tuple(data.get("npc_passivity_issues"))
@@ -4195,17 +4204,34 @@ def _verification_result_from_data(
     dating_route_stage_violations = _dating_route_stage_violations_from_data(
         data.get("dating_route_stage_violations")
     )
-    quality_findings = _narrator_quality_findings_from_data(
-        data.get("quality_findings")
+    quality_findings, invalid_quality_finding = (
+        _narrator_quality_findings_from_data(
+            data.get("quality_findings"),
+            narrator_body=narrator_body,
+            context_text="\n\n".join(
+                (
+                    format_narrator_message_spec(spec),
+                    rendered_chat_request_text(request),
+                )
+            ),
+        )
     )
+    issues = _string_tuple(data.get("issues"))
+    if invalid_quality_finding:
+        issues = (
+            *issues,
+            "Narrator quality finding contained evidence not present in the "
+            "supplied draft or context.",
+        )
     return NarratorVerificationResult(
         passed=bool(data.get("passed"))
         and not npc_agency_issues
         and not npc_passivity_issues
         and not player_choice_violations
         and not dating_route_stage_violations
-        and not quality_findings,
-        issues=_string_tuple(data.get("issues")),
+        and not quality_findings
+        and not invalid_quality_finding,
+        issues=issues,
         retry_feedback=_string(data.get("retry_feedback")),
         confidence=_float(data.get("confidence")),
         post_turn_update_needed=data.get("post_turn_update_needed") is not False,
@@ -4228,12 +4254,17 @@ def _verification_result_from_data(
 
 def _narrator_quality_findings_from_data(
     value: object,
-) -> tuple[NarratorQualityFinding, ...]:
+    *,
+    narrator_body: str,
+    context_text: str,
+) -> tuple[tuple[NarratorQualityFinding, ...], bool]:
     if not isinstance(value, list):
-        return ()
+        return (), False
     findings: list[NarratorQualityFinding] = []
+    invalid_finding = False
     for item in value:
         if not isinstance(item, dict):
+            invalid_finding = True
             continue
         category = _string(item.get("category"))
         reason = _string(item.get("reason"))
@@ -4244,7 +4275,10 @@ def _narrator_quality_findings_from_data(
             or not reason
             or not narrator_quote
             or not context_quote
+            or not quote_matches_source(narrator_quote, narrator_body)
+            or not quote_matches_source(context_quote, context_text)
         ):
+            invalid_finding = True
             continue
         findings.append(
             NarratorQualityFinding(
@@ -4254,7 +4288,7 @@ def _narrator_quality_findings_from_data(
                 context_quote=context_quote,
             )
         )
-    return tuple(findings)
+    return tuple(findings), invalid_finding
 
 
 def _commit_decisions_from_data(

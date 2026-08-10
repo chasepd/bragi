@@ -3508,6 +3508,71 @@ def test_narrator_verifier_clean_response_has_no_quality_findings() -> None:
     assert result.quality_findings == ()
 
 
+@pytest.mark.parametrize(
+    ("narrator_quote", "context_quote"),
+    (
+        ("A quote absent from the draft.", "The gate remains sealed."),
+        ("Mara crosses the sealed gate.", "A quote absent from supplied context."),
+    ),
+)
+def test_narrator_verifier_fails_closed_for_ungrounded_quality_finding(
+    narrator_quote: str,
+    context_quote: str,
+) -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.9,
+                "quality_findings": [
+                    {
+                        "category": "spatial_continuity",
+                        "reason": "The draft contradicts the sealed gate.",
+                        "narrator_quote": narrator_quote,
+                        "context_quote": context_quote,
+                    }
+                ],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I test the gate."),),
+                current_scene_recap=("The gate remains sealed.",),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Resolve the attempted crossing.",
+                thesis="Keep the sealed gate physically consistent.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=("scene:gate",),
+            ),
+            narrator_body="Mara crosses the sealed gate.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.quality_findings == ()
+    assert result.issues == (
+        "Narrator quality finding contained evidence not present in the "
+        "supplied draft or context.",
+    )
+
+
 def test_narrator_verifier_labels_bounded_narrator_repetition_evidence() -> None:
     provider = RecordingStructuredProvider(
         {
