@@ -93,6 +93,7 @@ from bragi_web.scheduler import WebMaintenanceScheduler
 from bragi_web.serialization import to_jsonable
 
 _CHAT_TURN_ACTIVE_DETAIL = "A chat turn is already being processed for this save."
+_JOB_CANCELLATION_FAILED_DETAIL = "Job cancellation could not be requested"
 _SAVE_ID_REQUIRED_DETAIL = "save_id is required for this save-scoped operation"
 _RETIRED_SCENARIO_TYPE = "character_interaction"
 _RETIRED_SCENARIO_DETAIL = (
@@ -6068,7 +6069,15 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             if should_cancel_runtime_chat
             else False
         )
-        return {"cancelled": job_cancelled or runtime_cancelled}
+        if job_cancelled or runtime_cancelled:
+            return {"cancelled": True}
+        current = state.jobs.get(job_id)
+        if current is not None and current.status in TERMINAL_JOB_STATUSES:
+            return {"cancelled": False}
+        raise HTTPException(
+            status_code=409,
+            detail=_JOB_CANCELLATION_FAILED_DETAIL,
+        )
 
     @app.get("/api/jobs/{job_id}/events")
     async def job_events(
