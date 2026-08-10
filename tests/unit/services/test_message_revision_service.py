@@ -393,6 +393,10 @@ def test_edit_narrator_message_archives_summaries_covering_edited_message(
     assert archive_status[earlier.id] is None
     assert archive_status[covering.id] is not None
     assert archive_status[later.id] is None
+    pressure = repositories.get_summary_pressure_state(save_id)
+    assert pressure.active_summary_count == 2
+    assert pressure.summarized_through_message_id == ids["narrator_3"]
+    assert pressure.unsummarized_message_count == 0
 
 
 def test_edit_message_without_resubmit_updates_player_without_deleting_later_turns(
@@ -1264,6 +1268,10 @@ def test_delete_suffix_from_narrator_uses_turn_boundary_and_archives_context(
     ]
     assert repositories.list_memories(save_id) == [linked_memory]
     assert repositories.list_summaries(save_id) == []
+    pressure = repositories.get_summary_pressure_state(save_id)
+    assert pressure.unsummarized_message_count == 2
+    assert pressure.unsummarized_player_count == 1
+    assert pressure.unsummarized_narrator_count == 1
     assert repositories.list_media_assets(save_id) == []
     assert repositories.get_scene_snapshot(save_id) is None
     assert repositories.list_locations(save_id) == []

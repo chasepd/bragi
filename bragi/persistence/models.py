@@ -799,6 +799,20 @@ class SummaryRecord:
 
 
 @dataclass(frozen=True)
+class SummaryPressureStateRecord:
+    save_id: str
+    history_revision: int
+    summarized_through_message_id: str | None
+    unsummarized_message_count: int
+    unsummarized_player_count: int
+    unsummarized_narrator_count: int
+    unsummarized_other_count: int
+    unsummarized_token_estimate: int
+    active_summary_count: int
+    active_summary_token_estimate: int
+
+
+@dataclass(frozen=True)
 class ProviderModelRecord:
     id: str
     provider: str

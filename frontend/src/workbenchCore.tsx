@@ -9268,6 +9268,7 @@ function postTurnPhaseLabel(name: string): string {
     response_checks: "Response checks",
     save_narration: "Saving narration",
     action_choices: "Action choices",
+    summary: "History summary",
     state: "World state",
     context: "Context update",
     proactive_text: "Proactive text",
