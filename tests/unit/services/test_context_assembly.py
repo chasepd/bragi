@@ -109,10 +109,10 @@ def test_compact_scenario_instructions_keeps_mystery_truth_retrieval_only() -> N
     instructions = compact_scenario_instructions(scenario)
 
     assert "Player character name: Inspector Mara Voss" in instructions
-    assert "Case facts: Curator Elian Vale vanished from a sealed gallery." in (
+    assert "Case facts: Curator Elian Vale vanished from a sealed gallery." not in (
         instructions
     )
-    assert "Case status: Unresolved; only public facts are known." in instructions
+    assert "Case status: Unresolved; only public facts are known." not in instructions
     assert "Current scene: Mara stands outside the east gallery." in instructions
     assert "Watch log gap" not in instructions
     assert "smuggling ledger" not in instructions
@@ -136,7 +136,7 @@ def test_compact_scenario_instructions_guides_cyoa_changed_situations() -> None:
     assert "ends at a decision point" not in instructions
     assert "Do not include numbered options" in instructions
     assert "Bragi generates those separately" in instructions
-    assert "Choice style: Four terse choices" in instructions
+    assert "Choice style: Four terse choices" not in instructions
 
 
 def test_compact_scenario_instructions_includes_survival_expedition_setup() -> None:
@@ -155,16 +155,16 @@ def test_compact_scenario_instructions_includes_survival_expedition_setup() -> N
 
     instructions = compact_scenario_instructions(scenario)
 
-    assert "Expedition goal: Reach Northwatch" in instructions
-    assert "Route options: Cliff road" in instructions
-    assert "Resource inventory: Food: 9 days" in instructions
-    assert "Environmental conditions: Late winter" in instructions
-    assert "Hazards/events: Avalanches" in instructions
-    assert "Camp status: Two canvas tents" in instructions
-    assert "Travel progress: 0 of 80 miles" in instructions
+    assert "Expedition goal: Reach Northwatch" not in instructions
+    assert "Route options: Cliff road" not in instructions
+    assert "Resource inventory: Food: 9 days" not in instructions
+    assert "Environmental conditions: Late winter" not in instructions
+    assert "Hazards/events: Avalanches" not in instructions
+    assert "Camp status: Two canvas tents" not in instructions
+    assert "Travel progress: 0 of 80 miles" not in instructions
 
 
-def test_compact_scenario_instructions_includes_time_loop_boundaries() -> None:
+def test_compact_scenario_instructions_excludes_time_loop_canon() -> None:
     scenario = _scenario(
         scenario_type="time_loop",
         content={
@@ -185,12 +185,12 @@ def test_compact_scenario_instructions_includes_time_loop_boundaries() -> None:
 
     instructions = compact_scenario_instructions(scenario)
 
-    assert "Loop premise: The festival day repeats" in instructions
-    assert "Reset trigger: The drowned bell" in instructions
-    assert "Loop duration: Twenty-four hours" in instructions
-    assert "Reset baseline: The harbor resets" in instructions
-    assert "Persistent player/meta knowledge: Tower code" in instructions
-    assert "NPC memory rules: NPCs reset" in instructions
+    assert "Loop premise: The festival day repeats" not in instructions
+    assert "Reset trigger: The drowned bell" not in instructions
+    assert "Loop duration: Twenty-four hours" not in instructions
+    assert "Reset baseline: The harbor resets" not in instructions
+    assert "Persistent player/meta knowledge: Tower code" not in instructions
+    assert "NPC memory rules: NPCs reset" not in instructions
     assert "Current loop state: Loop 1" not in instructions
 
 
@@ -215,16 +215,16 @@ def test_compact_scenario_instructions_includes_political_intrigue_setup() -> No
 
     instructions = compact_scenario_instructions(scenario)
 
-    assert "Political arena: The harbor council" in instructions
-    assert "Political factions: Guilds" in instructions
-    assert "Central conflict: A midnight no-confidence vote" in instructions
-    assert "Secrets/leverage: Only Mara knows Orro moved" in instructions
-    assert "Reputation/standing: Mara is trusted" in instructions
-    assert "Obligations/favors: Orro owes Mara" in instructions
-    assert "Alliances/rivalries: Reformers court Mara" in instructions
-    assert "Event calendar: Dawn hearing" in instructions
-    assert "Political pressure: The midnight vote proceeds" in instructions
-    assert "Public/private knowledge: The public knows the vote is close" in (
+    assert "Political arena: The harbor council" not in instructions
+    assert "Political factions: Guilds" not in instructions
+    assert "Central conflict: A midnight no-confidence vote" not in instructions
+    assert "Secrets/leverage: Only Mara knows Orro moved" not in instructions
+    assert "Reputation/standing: Mara is trusted" not in instructions
+    assert "Obligations/favors: Orro owes Mara" not in instructions
+    assert "Alliances/rivalries: Reformers court Mara" not in instructions
+    assert "Event calendar: Dawn hearing" not in instructions
+    assert "Political pressure: The midnight vote proceeds" not in instructions
+    assert "Public/private knowledge: The public knows the vote is close" not in (
         instructions
     )
 
@@ -289,7 +289,10 @@ def test_compact_scenario_instructions_keeps_specialized_durable_contract() -> N
         "Tone/style: Mythic tragedy told through close third-person prose."
         in instructions
     )
-    assert "Magic constraints: Every spell consumes a treasured memory." in instructions
+    assert (
+        "Magic constraints: Every spell consumes a treasured memory."
+        not in instructions
+    )
     assert "The opening road crosses seven named kingdoms." not in instructions
     assert "The opening court hosts five rival orders." not in instructions
 

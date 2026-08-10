@@ -262,10 +262,14 @@ async def ensure_scenario_canon_for_save(
         purpose="context_update",
     )
     if preference is None:
-        return False
+        raise ValueError(
+            "A Context Update model is required to compile scenario canon"
+        )
     provider: object = providers.get(preference.provider)
     if not isinstance(provider, StructuredOutputProvider):
-        return False
+        raise ValueError(
+            "The Context Update provider must support structured output"
+        )
     compiled = await ScenarioCanonCompiler(
         provider=provider,
         provider_name=preference.provider,

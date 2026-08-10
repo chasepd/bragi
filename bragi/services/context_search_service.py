@@ -3401,29 +3401,36 @@ def _scenario_claim_is_superseded(
 ) -> bool:
     if record.metadata.get("temporal_status") != "current_at_scenario_start":
         return False
-    fact_key = _match_key_parts(str(record.metadata.get("fact_key", "")))
+    fact_key = _normalize_key_component(str(record.metadata.get("fact_key", "")))
     if not fact_key:
         return False
     anchors = record.metadata.get("entity_anchors")
     if not isinstance(anchors, list):
         return False
     anchor_keys = {
-        _match_key_parts(str(anchor.get("entity_key", "")))
+        _normalize_key_component(str(anchor.get("entity_key", "")))
         for anchor in anchors
         if isinstance(anchor, Mapping)
     }
     anchor_keys.discard("")
     if not anchor_keys:
         return False
-    expected_state_keys = {(*anchor_key, *fact_key) for anchor_key in anchor_keys}
+    expected_state_keys = {(anchor_key, fact_key) for anchor_key in anchor_keys}
     for state in world_state:
-        if _match_key_parts(state.key) in expected_state_keys:
+        entity_path, separator, state_fact_key = state.key.rpartition(".")
+        if not separator:
+            continue
+        canonical_state_key = (
+            _normalize_key_component(entity_path),
+            _normalize_key_component(state_fact_key),
+        )
+        if canonical_state_key in expected_state_keys:
             return True
     return False
 
 
-def _match_key_parts(value: str) -> tuple[str, ...]:
-    return tuple(re.findall(r"[a-z0-9]+", value.casefold()))
+def _normalize_key_component(value: str) -> str:
+    return "".join(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
 def _indexed_context_source_is_continuity_critical(

@@ -472,76 +472,9 @@ def compact_scenario_instructions(
     *,
     include_setup: bool = True,
 ) -> str:
-    dating_sim_identity_parts = _dating_sim_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    fantasy_identity_parts = _fantasy_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    science_fiction_identity_parts = _science_fiction_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    first_contact_identity_parts = _first_contact_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    survival_expedition_identity_parts = _survival_expedition_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    time_loop_identity_parts = _time_loop_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    mystery_identity_parts = _investigation_mystery_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    heist_identity_parts = _heist_infiltration_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    intrigue_identity_parts = _political_intrigue_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    settlement_identity_parts = _settlement_builder_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    hunt_identity_parts = _monster_hunt_bounty_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    journey_identity_parts = _road_trip_pilgrimage_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    trade_identity_parts = _merchant_trade_route_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    cyoa_identity_parts = _choose_your_own_adventure_identity_lines(scenario)
     scenario_contract_parts = (
         f"Premise: {scenario.premise}",
         _player_character_name_line(scenario),
-        *fantasy_identity_parts,
-        *science_fiction_identity_parts,
-        *first_contact_identity_parts,
-        *survival_expedition_identity_parts,
-        *time_loop_identity_parts,
-        *mystery_identity_parts,
-        *heist_identity_parts,
-        *intrigue_identity_parts,
-        *settlement_identity_parts,
-        *hunt_identity_parts,
-        *journey_identity_parts,
-        *trade_identity_parts,
-        *dating_sim_identity_parts,
-        *cyoa_identity_parts,
         _scenario_content_line(scenario, "tone_genre", "Tone/style"),
         _scenario_content_line(scenario, "current_scene", "Current scene"),
         f"Player role: {scenario.player_role}",

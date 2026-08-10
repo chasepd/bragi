@@ -150,7 +150,7 @@ class ScenarioBundleService:
         )
         exported_content = scenario_payload.get("content")
         if isinstance(exported_content, dict) and compiled_canon is not None:
-            exported_content["_canon_claims"] = compiled_canon
+            exported_content["_canon_claims"] = redact_log_value(compiled_canon)
         exported_at = datetime.now(UTC).isoformat()
         manifest_payload = _redacted_mapping(
             {

@@ -17314,7 +17314,7 @@ def test_submit_player_turn_keeps_contract_after_opening_leaves_prompt_windows(
         assert f"Player role: {long_player_role}" in seen_request.scenario_instructions
         assert (
             "Magic constraints: Reading a star map consumes one treasured memory."
-            in seen_request.scenario_instructions
+            not in seen_request.scenario_instructions
         )
         assert "The opening ferry crosses seven archive districts." not in (
             seen_request.scenario_instructions
