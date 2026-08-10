@@ -17553,6 +17553,7 @@ def test_submit_player_turn_overlaps_plan_first_character_planning_and_context(
             save_id: str,
             player_message_id: str,
             apply_presence_updates: bool = True,
+            intents_absorbed: bool = True,
         ) -> CharacterActionPlanningResult:
             self.apply_presence_updates.append(apply_presence_updates)
             planning_started.set()
@@ -17633,6 +17634,7 @@ def test_storyteller_character_planning_never_applies_direction_presence(
             save_id: str,
             player_message_id: str,
             apply_presence_updates: bool = True,
+            intents_absorbed: bool = True,
         ) -> CharacterActionPlanningResult:
             self.apply_presence_updates.append(apply_presence_updates)
             return CharacterActionPlanningResult(skipped_reason="test")
@@ -17925,6 +17927,7 @@ def test_submit_player_turn_skips_character_action_planning_when_disabled(
         "model_calls_avoided": 0,
         "presence_calls_made": 0,
         "deterministic_presence_count": 0,
+        "intents_absorbed": True,
     }
 
 

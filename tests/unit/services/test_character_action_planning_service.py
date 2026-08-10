@@ -118,6 +118,40 @@ def test_character_action_planning_deterministic_without_model_preference(
     }
 
 
+def test_character_action_planning_reports_avoided_calls_without_absorbed_intents(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _player_message_id, characters = _create_save_with_characters(
+        repositories
+    )
+    player_message = repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Ily",
+        body="I study the lantern mechanism.",
+    )
+    provider = CharacterDecisionProvider({})
+    _configure_planning(repositories)
+
+    result = asyncio.run(
+        CharacterActionPlanningService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).plan_for_turn(
+            save_id=save_id,
+            player_message_id=player_message.id,
+            intents_absorbed=False,
+        )
+    )
+
+    assert result.intents_absorbed is False
+    assert result.model_calls_avoided == 1
+    assert result.deterministic_presence_count == 2
+    assert characters["mara"] in {
+        assessment.character_id for assessment in result.assessments
+    }
+
+
 def test_character_action_planning_deterministic_assessment_is_grounded(
     repositories: PersistenceRepositories,
 ) -> None:

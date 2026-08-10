@@ -88,6 +88,7 @@ class CharacterActionPlanningResult:
     model_calls_avoided: int = 0
     presence_calls_made: int = 0
     deterministic_presence_count: int = 0
+    intents_absorbed: bool = True
 
     @property
     def assessments(self) -> tuple[CharacterTurnAssessment, ...]:
@@ -110,6 +111,7 @@ class CharacterActionPlanningService:
         save_id: str,
         player_message_id: str,
         apply_presence_updates: bool = True,
+        intents_absorbed: bool = True,
     ) -> CharacterActionPlanningResult:
         if not character_action_planning_enabled(
             self.repositories,
@@ -295,11 +297,13 @@ class CharacterActionPlanningService:
             # Compared against the previous pipeline: batched presence calls
             # (same batch cap and fallback costs, so the presence-phase delta
             # is clamped at zero when the fallback costs more) plus one intent
-            # call per grounded present/entering/leaving character, which the
-            # narrator plan now absorbs into its single structured call.
+            # call per grounded present/entering/leaving character. The intent
+            # calls only count as avoided when the narrator plan will actually
+            # absorb them (intents_absorbed); otherwise the old per-NPC intent
+            # guidance is gone rather than replaced.
             model_calls_avoided = (
                 max(0, previous_presence_calls - presence_calls_made)
-                + intent_wave_size
+                + (intent_wave_size if intents_absorbed else 0)
             )
         else:
             model_calls_avoided = 0
@@ -310,6 +314,7 @@ class CharacterActionPlanningService:
             model_calls_avoided=model_calls_avoided,
             presence_calls_made=presence_calls_made,
             deterministic_presence_count=len(deterministic_assessments),
+            intents_absorbed=intents_absorbed,
         )
 
     def _structured_provider(

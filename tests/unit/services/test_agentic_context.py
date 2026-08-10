@@ -2649,6 +2649,38 @@ def test_narrator_planner_rejects_malformed_candidate_value_shapes(
                         ),
                     },
                     {
+                        "candidate_id": "knowledge:missing-target-id",
+                        "candidate_type": "character_knowledge_edge",
+                        "operation": "upsert",
+                        "state_key": "character.knowledge_edge",
+                        "value": {"target_type": "memory"},
+                        "character_id": lio.id,
+                        "reason": "Missing target id.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "knowledge:bad-acquisition",
+                        "candidate_type": "character_knowledge_edge",
+                        "operation": "upsert",
+                        "state_key": "character.knowledge_edge",
+                        "value": {
+                            "target_type": "memory",
+                            "target_id": "memory:any",
+                            "acquisition_method": "guessed",
+                        },
+                        "character_id": lio.id,
+                        "reason": "Bad acquisition method.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
                         "candidate_id": "presence:valid",
                         "candidate_type": "scene_presence",
                         "operation": "update",
@@ -2705,6 +2737,8 @@ def test_narrator_planner_rejects_malformed_candidate_value_shapes(
         ("presence:stay-without-present", "missing_scene_presence_present"),
         (f"scene_presence:{lio.id}:leave", "scene_presence_id_action_mismatch"),
         ("presence:no-character", "missing_character_id"),
+        ("knowledge:missing-target-id", "missing_knowledge_edge_target"),
+        ("knowledge:bad-acquisition", "unknown_acquisition_method"),
     }
     assert [candidate.candidate_id for candidate in spec.state_commit_candidates] == [
         "presence:valid"

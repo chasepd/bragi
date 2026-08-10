@@ -811,6 +811,7 @@ class CharacterActionPlanningRunner(Protocol):
         save_id: str,
         player_message_id: str,
         apply_presence_updates: bool = True,
+        intents_absorbed: bool = True,
     ) -> CharacterActionPlanningResult: ...
 
 
@@ -1743,6 +1744,7 @@ class ChatService:
                 model_calls_avoided=result.model_calls_avoided,
                 presence_calls_made=result.presence_calls_made,
                 deterministic_presence_count=result.deterministic_presence_count,
+                intents_absorbed=result.intents_absorbed,
             )
             throw_if_cancelled_after_job()
             return result
@@ -5595,6 +5597,14 @@ class ChatService:
                         save_id=save_id,
                     )
                 ),
+                intents_absorbed=(
+                    roleplay_model_preference(
+                        repositories=self.repositories,
+                        save_id=save_id,
+                        purpose="response_planning",
+                    )
+                    is not None
+                ),
             )
         except Exception as exc:
             log_error_event(
@@ -7783,14 +7793,13 @@ def _narrator_spec_with_commit_candidates(
     rejections.extend(
         PlannerRejection(
             candidate_id=candidate.candidate_id,
-            candidate_type="scene_presence",
-            domain="scene_presence",
+            candidate_type=candidate.candidate_type or "unknown",
+            domain=_planned_commit_domain(candidate.candidate_type),
             reason="superseded_by_assessment",
             field="candidate_id",
             rejected_value=candidate.candidate_id,
         )
         for candidate in superseded
-        if candidate.candidate_type == "scene_presence"
     )
     merged.extend(candidates)
     return replace(
@@ -8926,8 +8935,10 @@ def _planned_commit_evidence_is_grounded(
         return False
     source_text_by_id = dict(evidence_source_text_by_id)
     planning_scene_text = ""
+    snapshot_id = ""
     snapshot = repositories.get_scene_snapshot(save_id)
     if snapshot is not None:
+        snapshot_id = snapshot.id
         planning_scene_text = _planning_scene_text(snapshot)
 
     def matches(source_id: str) -> bool:
@@ -8937,7 +8948,8 @@ def _planned_commit_evidence_is_grounded(
         ):
             return True
         return bool(
-            source_id.startswith("scene_snapshot:")
+            snapshot_id
+            and source_id == f"scene_snapshot:{snapshot_id}"
             and planning_scene_text
             and quote_matches_source(quote, planning_scene_text)
         )
@@ -9903,6 +9915,7 @@ def _character_action_planning_context_breakdown(
             "model_calls_avoided": result.model_calls_avoided,
             "presence_calls_made": result.presence_calls_made,
             "deterministic_presence_count": result.deterministic_presence_count,
+            "intents_absorbed": result.intents_absorbed,
         }
     }
 
