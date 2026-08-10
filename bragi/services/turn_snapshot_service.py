@@ -143,6 +143,7 @@ _SNAPSHOT_TABLES: tuple[_SnapshotTable, ...] = (
     _SnapshotTable("character_text_provenance"),
     _SnapshotTable("character_contact_states", active_only=True),
     _SnapshotTable("character_text_proactive_triggers"),
+    _SnapshotTable("turn_outcomes"),
 )
 
 _TABLES_BY_NAME = {table.name: table for table in _SNAPSHOT_TABLES}
@@ -150,6 +151,7 @@ _SNAPSHOT_TABLE_NAMES = tuple(table.name for table in _SNAPSHOT_TABLES)
 
 _RESTORE_DELETE_ORDER = (
     "character_text_proactive_triggers",
+    "turn_outcomes",
     "character_contact_states",
     "character_text_provenance",
     "character_text_message_attachments",
@@ -224,6 +226,7 @@ _RESTORE_INSERT_ORDER = (
     "message_visibility",
     "message_scene_presence",
     "message_action_choices",
+    "turn_outcomes",
 )
 
 _MESSAGE_REFERENCE_COLUMNS = {
@@ -352,6 +355,7 @@ _JSON_COLUMNS_BY_TABLE: dict[str, frozenset[str]] = {
         {"known_boundaries_json", "unresolved_questions_json"}
     ),
     "character_text_message_attachments": frozenset({"metadata_json"}),
+    "turn_outcomes": frozenset({"payload_json"}),
 }
 
 _ENTITY_TABLES = {
@@ -1232,6 +1236,7 @@ class TurnSnapshotService:
                 )
             else:
                 rows[table.name] = tuple(table_rows)
+        _filter_turn_outcomes_to_active_messages(rows)
         _filter_character_text_snapshot_rows(rows)
         return rows
 
@@ -1876,7 +1881,67 @@ class _SnapshotRemapper:
             )
         if table_name == "media_assets" and column == "metadata_json":
             return _compact_json(self._remap_known_metadata_ids(raw))
+        if table_name == "turn_outcomes" and column == "payload_json":
+            return _compact_json(self._remap_turn_outcome_payload(raw))
         return value
+
+    def _remap_turn_outcome_payload(self, raw: object) -> object:
+        if not isinstance(raw, dict):
+            return raw
+        remapped = dict(raw)
+        remapped["save_id"] = self.target_save_id
+        payload_message_id = raw.get("message_id")
+        if isinstance(payload_message_id, str) and payload_message_id:
+            remapped["message_id"] = self._mapped_table_id(
+                "messages",
+                payload_message_id,
+            )
+
+        def remap_refs(refs: object) -> object:
+            if not isinstance(refs, list):
+                return refs
+            return [
+                self._remapped_turn_outcome_source_ref(item)
+                if isinstance(item, str)
+                else item
+                for item in refs
+            ]
+
+        remapped["source_message_ids"] = remap_refs(raw.get("source_message_ids"))
+        remapped["attempt_evidence_source_ids"] = remap_refs(
+            raw.get("attempt_evidence_source_ids")
+        )
+        raw_effects = raw.get("effects")
+        if isinstance(raw_effects, list):
+            remapped_effects: list[object] = []
+            for item in raw_effects:
+                if not isinstance(item, dict):
+                    remapped_effects.append(item)
+                    continue
+                effect = dict(item)
+                evidence = effect.get("evidence_source_ids")
+                if isinstance(evidence, list):
+                    effect["evidence_source_ids"] = [
+                        self._remapped_turn_outcome_source_ref(ref)
+                        if isinstance(ref, str)
+                        else ref
+                        for ref in evidence
+                    ]
+                remapped_effects.append(effect)
+            remapped["effects"] = remapped_effects
+        return remapped
+
+    def _remapped_turn_outcome_source_ref(self, source_id: str) -> str:
+        if source_id.startswith("message:"):
+            message_id = source_id.removeprefix("message:")
+            mapped = self._mapped_table_id("messages", message_id)
+            if not isinstance(mapped, str) or mapped == message_id:
+                return source_id
+            return f"message:{mapped}"
+        mapped = self._mapped_table_id("messages", source_id)
+        if isinstance(mapped, str) and mapped != source_id:
+            return mapped
+        return source_id
 
     def _remap_json_id_list(self, value: object, table_name: str) -> object:
         if not isinstance(value, str):
@@ -2265,6 +2330,18 @@ def _manifest_tables(
 
 def _row_dict(row: sqlite3.Row) -> dict[str, object]:
     return {key: row[key] for key in row.keys()}
+
+
+def _filter_turn_outcomes_to_active_messages(
+    rows: dict[str, tuple[dict[str, object], ...]],
+) -> None:
+    message_ids = _row_ids(rows.get("messages", ()))
+    rows["turn_outcomes"] = tuple(
+        row
+        for row in rows.get("turn_outcomes", ())
+        if row.get("message_id") is None
+        or _optional_row_ref_active(row, "message_id", message_ids)
+    )
 
 
 def _filter_character_text_snapshot_rows(

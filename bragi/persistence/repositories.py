@@ -77,6 +77,7 @@ from bragi.persistence.models import (
     ScopedSettingRecord,
     StateChangeRecord,
     SummaryRecord,
+    TurnOutcomeRecord,
     UserRecord,
     UserSessionRecord,
     WorldStateRecord,
@@ -11040,6 +11041,80 @@ class PersistenceRepositories:
         )
         return [_context_update_audit_from_row(row) for row in rows]
 
+    def add_turn_outcome(
+        self,
+        *,
+        save_id: str,
+        message_id: str | None,
+        payload: dict[str, object],
+        outcome_id: str | None = None,
+    ) -> TurnOutcomeRecord:
+        record = TurnOutcomeRecord(
+            id=outcome_id or _new_id(),
+            save_id=save_id,
+            message_id=message_id,
+            payload=dict(payload),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO turn_outcomes(id, save_id, message_id, payload_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                record.id,
+                record.save_id,
+                record.message_id,
+                _dump_json(record.payload),
+            ),
+        )
+        self.commit()
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, message_id, payload_json, created_at
+            FROM turn_outcomes
+            WHERE id = ?
+            """,
+            (record.id,),
+        )
+        if row is None:
+            raise ValueError(f"Unknown turn outcome id: {record.id}")
+        return _turn_outcome_from_row(row)
+
+    def get_turn_outcome_for_message(
+        self,
+        *,
+        save_id: str,
+        message_id: str,
+    ) -> TurnOutcomeRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, message_id, payload_json, created_at
+            FROM turn_outcomes
+            WHERE save_id = ? AND message_id = ?
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (save_id, message_id),
+        )
+        if row is None:
+            return None
+        return _turn_outcome_from_row(row)
+
+    def list_turn_outcomes(
+        self,
+        save_id: str,
+    ) -> list[TurnOutcomeRecord]:
+        rows = self._fetch_all(
+            """
+            SELECT id, save_id, message_id, payload_json, created_at
+            FROM turn_outcomes
+            WHERE save_id = ?
+            ORDER BY created_at, rowid
+            """,
+            (save_id,),
+        )
+        return [_turn_outcome_from_row(row) for row in rows]
+
     def add_memory(
         self,
         *,
@@ -16278,6 +16353,17 @@ def _context_update_audit_from_row(row: sqlite3.Row) -> ContextUpdateAuditRecord
         reason=row["reason"],
         confidence=row["confidence"],
         source_message_ids=_load_list(row["source_message_ids_json"]),
+        created_at=row["created_at"],
+    )
+
+
+def _turn_outcome_from_row(row: sqlite3.Row) -> TurnOutcomeRecord:
+    payload = _load_json(row["payload_json"]) if row["payload_json"] else {}
+    return TurnOutcomeRecord(
+        id=row["id"],
+        save_id=row["save_id"],
+        message_id=row["message_id"],
+        payload=dict(payload) if isinstance(payload, dict) else {},
         created_at=row["created_at"],
     )
 

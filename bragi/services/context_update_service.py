@@ -97,7 +97,14 @@ from bragi.services.phone_number_exchange import (
 from bragi.services.phone_number_exchange import (
     infer_phone_number_exchanges as infer_phone_number_exchange_records,
 )
-from bragi.services.post_turn_inference import VerifiedPostTurnCoverage
+from bragi.services.post_turn_inference import (
+    POST_TURN_DOMAIN_EMOTIONAL,
+    POST_TURN_DOMAIN_KNOWLEDGE,
+    POST_TURN_DOMAIN_PHYSICAL,
+    POST_TURN_DOMAIN_RELATIONSHIP,
+    POST_TURN_DOMAIN_THREAD_CLOCK,
+    VerifiedPostTurnCoverage,
+)
 from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
@@ -433,16 +440,173 @@ def _filter_extraction_for_verified_coverage(
     coverage: VerifiedPostTurnCoverage | None,
     request: ContextUpdateRequest,
 ) -> ContextUpdateExtraction:
-    if coverage is None or coverage.empty or extraction.scene is None:
+    if coverage is None or coverage.empty:
         return extraction
-    return replace(
-        extraction,
-        scene=_filter_scene_for_verified_coverage(
+    scene = (
+        _filter_scene_for_verified_coverage(
             extraction.scene,
             coverage=coverage,
             current_snapshot=request.scene_snapshot,
             characters=request.characters,
-        ),
+        )
+        if extraction.scene is not None
+        else None
+    )
+    characters = extraction.characters
+    if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_PHYSICAL):
+        covered_physical_names = _coverage_character_names(
+            coverage,
+            "physical_state",
+            characters=request.characters,
+        )
+        if covered_physical_names:
+            characters = tuple(
+                _filter_character_physical_for_verified_coverage(character)
+                if character.name.strip().casefold() in covered_physical_names
+                else character
+                for character in characters
+            )
+    active_threads = extraction.active_threads
+    if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_THREAD_CLOCK):
+        active_threads = ()
+    entity_links = extraction.entity_links
+    if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_KNOWLEDGE):
+        entity_links = ()
+    return replace(
+        extraction,
+        scene=scene,
+        characters=characters,
+        active_threads=active_threads,
+        entity_links=entity_links,
+    )
+
+
+def _coverage_character_ids(
+    coverage: VerifiedPostTurnCoverage,
+    key_suffix: str,
+) -> frozenset[str]:
+    prefix = "character."
+    suffix = f".{key_suffix}"
+    return frozenset(
+        key[len(prefix) : -len(suffix)]
+        for key in coverage.state_keys
+        if key.startswith(prefix) and key.endswith(suffix)
+    )
+
+
+def _coverage_character_names(
+    coverage: VerifiedPostTurnCoverage,
+    key_suffix: str,
+    *,
+    characters: tuple[CharacterRecord, ...],
+) -> frozenset[str]:
+    covered_slugs = _coverage_character_ids(coverage, key_suffix)
+    if not covered_slugs:
+        return frozenset()
+    return frozenset(
+        character.name.strip().casefold()
+        for character in characters
+        if _continuity_key_slug(character.name) in covered_slugs
+        and character.name.strip()
+    )
+
+
+def _coverage_character_records(
+    coverage: VerifiedPostTurnCoverage,
+    key_suffix: str,
+    *,
+    characters: tuple[CharacterRecord, ...],
+) -> frozenset[str]:
+    covered_slugs = _coverage_character_ids(coverage, key_suffix)
+    if not covered_slugs:
+        return frozenset()
+    return frozenset(
+        character.id
+        for character in characters
+        if _continuity_key_slug(character.name) in covered_slugs
+    )
+
+
+def _filter_character_physical_for_verified_coverage(
+    character: ExtractedCharacter,
+) -> ExtractedCharacter:
+    return replace(
+        character,
+        appearance="",
+        visual_notes="",
+        current_clothing="",
+        status="",
+    )
+
+
+def _coverage_covers_domain(
+    coverage: VerifiedPostTurnCoverage,
+    domain: str,
+) -> bool:
+    # Only applied domains count as established; confirmation-queued effects
+    # are pending manual approval and legacy inference fills their domains.
+    return domain in coverage.applied_domains
+
+
+def _filter_focused_maintenance_for_verified_coverage(
+    maintenance: FocusedSceneMaintenance,
+    *,
+    coverage: VerifiedPostTurnCoverage,
+    current_snapshot: SceneSnapshotRecord | None,
+    characters: tuple[CharacterRecord, ...],
+) -> FocusedSceneMaintenance:
+    scene_updates = tuple(
+        _filter_scene_for_verified_coverage(
+            update,
+            coverage=coverage,
+            current_snapshot=current_snapshot,
+            characters=characters,
+        )
+        for update in maintenance.scene_updates
+    )
+    active_thread_updates = (
+        ()
+        if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_THREAD_CLOCK)
+        else maintenance.active_thread_updates
+    )
+    covered_relationship_ids = _coverage_character_records(
+        coverage,
+        "relationships",
+        characters=characters,
+    )
+    if (
+        _coverage_covers_domain(coverage, POST_TURN_DOMAIN_RELATIONSHIP)
+        and covered_relationship_ids
+    ):
+        character_relationships = tuple(
+            relationship
+            for relationship in maintenance.character_relationships
+            if relationship.character_id not in covered_relationship_ids
+        )
+    else:
+        character_relationships = maintenance.character_relationships
+    covered_emotion_ids = _coverage_character_records(
+        coverage,
+        "current_emotional_state",
+        characters=characters,
+    )
+    if (
+        _coverage_covers_domain(coverage, POST_TURN_DOMAIN_EMOTIONAL)
+        and covered_emotion_ids
+    ):
+        character_emotions = tuple(
+            emotion
+            for emotion in maintenance.character_emotions
+            if emotion.character_id not in covered_emotion_ids
+        )
+    else:
+        character_emotions = maintenance.character_emotions
+    return replace(
+        maintenance,
+        scene_updates=scene_updates,
+        active_thread_updates=active_thread_updates,
+        character_relationships=character_relationships,
+        character_emotions=character_emotions,
     )
 
 
@@ -3577,17 +3741,11 @@ class ContextUpdateService:
         try:
             maintenance = await self.focused_scene_maintainer.maintain(request)
             if verified_coverage is not None and not verified_coverage.empty:
-                maintenance = replace(
+                maintenance = _filter_focused_maintenance_for_verified_coverage(
                     maintenance,
-                    scene_updates=tuple(
-                        _filter_scene_for_verified_coverage(
-                            update,
-                            coverage=verified_coverage,
-                            current_snapshot=request.scene_snapshot,
-                            characters=request.characters,
-                        )
-                        for update in maintenance.scene_updates
-                    ),
+                    coverage=verified_coverage,
+                    current_snapshot=request.scene_snapshot,
+                    characters=request.characters,
                 )
             self.repositories.begin_transaction()
             applied = self.apply_focused_scene_maintenance(

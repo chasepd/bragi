@@ -3893,3 +3893,75 @@ def _assert_snapshot_objects_do_not_store_media_bytes(
     ).fetchall()
     payloads = b"\n".join(zlib.decompress(bytes(row["payload"])) for row in rows)
     assert b"image bytes stay on disk" not in payloads
+
+
+def test_snapshot_captures_and_restores_turn_outcomes(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Evening comes.",
+    )
+    repositories.add_turn_outcome(
+        save_id=save.id,
+        message_id=narrator.id,
+        payload={
+            "save_id": save.id,
+            "message_id": narrator.id,
+            "attempt_resolution": "succeeded",
+            "effects": [
+                {
+                    "candidate_id": "time:1",
+                    "candidate_type": "world_time_change",
+                    "domain": "time",
+                    "operation": "update",
+                    "state_key": "scene_snapshot.in_world_time",
+                    "field_path": "",
+                    "character_id": "",
+                    "target_type": "",
+                    "target_id": "",
+                    "value": {"time_of_day": "evening"},
+                    "confidence": 0.9,
+                    "evidence_source_ids": [f"message:{narrator.id}"],
+                    "evidence_quote": "Evening comes",
+                    "verifier_status": "rendered",
+                    "safe_to_commit": True,
+                    "application_status": "committed",
+                    "reason": "rendered",
+                    "changed": True,
+                }
+            ],
+            "applied_domains": ["time"],
+            "queued_domains": [],
+            "verification_passed": True,
+            "verifier_available": True,
+            "post_turn_update_needed": False,
+            "committed_count": 1,
+            "confirmation_queued_count": 0,
+        },
+    )
+    service = TurnSnapshotService(repositories)
+    snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=narrator.id,
+    )
+    repositories.add_turn_outcome(
+        save_id=save.id,
+        message_id=narrator.id,
+        payload={"save_id": save.id, "message_id": narrator.id, "effects": []},
+    )
+
+    service.restore_save_to_snapshot(save_id=save.id, snapshot_id=snapshot.id)
+
+    outcomes = repositories.list_turn_outcomes(save.id)
+    assert len(outcomes) == 1
+    assert outcomes[0].payload["attempt_resolution"] == "succeeded"
+    assert outcomes[0].payload["applied_domains"] == ["time"]
+    raw_effects = outcomes[0].payload["effects"]
+    assert isinstance(raw_effects, list)
+    effect = raw_effects[0]
+    assert isinstance(effect, dict)
+    assert effect["evidence_source_ids"] == [f"message:{narrator.id}"]

@@ -4208,3 +4208,229 @@ def test_context_curation_rejects_unsupported_short_name_change(
     assert result.accepted_count == 0
     assert result.confirmation_count == 1
     assert repositories.list_memories(save.id) == []
+
+
+def test_narrator_planner_parses_attempt_and_new_effect_types() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_plan": {
+                "intent": "Answer the player move.",
+                "thesis": "Evening falls and Mara changes.",
+                "narrative_beats": [],
+                "required_facts": [],
+                "must_say": [],
+                "avoid": [],
+                "agency_constraints": [],
+                "tone": "grounded",
+                "uncertainties": [],
+                "evidence_source_ids": ["message:player-1"],
+                "npc_intents": [],
+                "state_commit_candidates": [
+                    {
+                        "candidate_id": "emotional:mara",
+                        "candidate_type": "emotional_change",
+                        "operation": "upsert",
+                        "state_key": "",
+                        "field_path": "",
+                        "character_id": "mara",
+                        "target_type": "",
+                        "target_id": "",
+                        "value": {"mood": "uneasy"},
+                        "safe_without_narration_allowed": False,
+                        "reason": "Mara becomes uneasy.",
+                        "confidence": 0.9,
+                        "evidence_source_ids": ["message:player-1"],
+                        "evidence_quote": "uneasy",
+                    },
+                    {
+                        "candidate_id": "time:evening",
+                        "candidate_type": "world_time_change",
+                        "operation": "update",
+                        "state_key": "scene_snapshot.in_world_time",
+                        "field_path": "",
+                        "character_id": "",
+                        "target_type": "",
+                        "target_id": "",
+                        "value": {"time_of_day": "evening"},
+                        "safe_without_narration_allowed": False,
+                        "reason": "Evening comes.",
+                        "confidence": 0.9,
+                        "evidence_source_ids": ["message:player-1"],
+                        "evidence_quote": "evening",
+                    },
+                ],
+                "attempted_action": "I ask Mara what she knows.",
+                "attempt_feasibility": ["Mara is present."],
+                "attempt_evidence_source_ids": ["message:player-1"],
+                "attempt_evidence_quote": "I ask Mara",
+            }
+        }
+    )
+    planner = StructuredProviderNarratorPlanner(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="planner",
+    )
+    spec = asyncio.run(
+        planner.plan(
+            save_id="save-1",
+            request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I ask Mara."),),
+            ),
+        )
+    )
+
+    assert spec.attempted_action == "I ask Mara what she knows."
+    assert spec.attempt_feasibility == ("Mara is present.",)
+    assert spec.attempt_evidence_source_ids == ("message:player-1",)
+    assert spec.attempt_evidence_quote == "I ask Mara"
+    assert [candidate.candidate_type for candidate in spec.state_commit_candidates] == [
+        "emotional_change",
+        "world_time_change",
+    ]
+    schema = provider.structured_output_requests[0].schema
+    candidate_types = schema["properties"]["state_commit_candidates"]["items"][
+        "properties"
+    ]["candidate_type"]["enum"]
+    assert "physical_change" in candidate_types
+    assert "relationship_change" in candidate_types
+    assert "emotional_change" in candidate_types
+    assert "active_thread_change" in candidate_types
+    assert "resource_change" in candidate_types
+    assert "world_state_change" in candidate_types
+    assert "world_time_change" in candidate_types
+    assert "attempted_action" in schema["properties"]
+    assert "attempt_feasibility" in schema["properties"]
+    assert "attempt_evidence_source_ids" in schema["properties"]
+    assert "attempted_action" in schema["required"]
+
+
+def test_narrator_planner_rejects_ungrounded_attempt_evidence(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player_message = repositories.list_messages(save.id)[0]
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="Keep it grounded while I climb toward the beacon lens.",
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_plan": {
+                "intent": "Answer the player move.",
+                "thesis": "Mara reacts.",
+                "narrative_beats": [],
+                "required_facts": [],
+                "must_say": [],
+                "avoid": [],
+                "agency_constraints": [],
+                "tone": "grounded",
+                "uncertainties": [],
+                "evidence_source_ids": [f"message:{player_message.id}"],
+                "npc_intents": [],
+                "state_commit_candidates": [],
+                "attempted_action": "I climb toward the beacon lens.",
+                "attempt_feasibility": ["A clear route."],
+                "attempt_evidence_source_ids": ["message:missing"],
+                "attempt_evidence_quote": "no such phrase",
+            }
+        }
+    )
+    planner = StructuredProviderNarratorPlanner(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="planner",
+        repositories=repositories,
+    )
+    spec = asyncio.run(
+        planner.plan(
+            save_id=save.id,
+            request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I climb."),),
+            ),
+        )
+    )
+
+    assert spec.attempted_action == "I climb toward the beacon lens."
+    assert spec.attempt_evidence_source_ids == ()
+    assert spec.attempt_evidence_quote == ""
+    assert any(
+        rejection.candidate_id == "attempted_action"
+        and rejection.reason == "unknown_evidence_source_id"
+        for rejection in spec.planner_rejections
+    )
+    assert any(
+        rejection.candidate_id == "attempted_action"
+        and rejection.reason == "evidence_quote_not_found"
+        for rejection in spec.planner_rejections
+    )
+
+
+def test_narrator_verifier_parses_attempt_resolution() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.92,
+                "npc_agency_issues": [],
+                "npc_passivity_issues": [],
+                "player_choice_violations": [],
+                "npc_knowledge_leaks": [],
+                "commit_decisions": [],
+                "dating_route_stage_violations": [],
+                "attempt_resolution": "succeeded",
+                "attempt_evidence_source_ids": ["message:player-1"],
+                "attempt_evidence_quote": "Mara opens the gate",
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I open the gate."),),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Answer the player move.",
+                thesis="The gate opens.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=(),
+                attempted_action="I open the gate.",
+            ),
+            narrator_body="Mara opens the gate.",
+        )
+    )
+
+    assert result.attempt_resolution == "succeeded"
+    assert result.attempt_evidence_source_ids == ("message:player-1",)
+    assert result.attempt_evidence_quote == "Mara opens the gate"
+    schema = provider.structured_output_requests[0].schema
+    assert "attempt_resolution" in schema["properties"]
+    assert "attempt_resolution" in schema["required"]
+    assert set(schema["properties"]["attempt_resolution"]["enum"]) == {
+        "succeeded",
+        "partially_succeeded",
+        "failed",
+        "uncertain",
+    }
+    commit_enum = schema["properties"]["commit_decisions"]["items"]["properties"][
+        "candidate_type"
+    ]["enum"]
+    assert "emotional_change" in commit_enum

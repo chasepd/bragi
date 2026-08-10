@@ -7283,3 +7283,98 @@ def _write_bundle_member_bytes(
         bundle.writestr("manifest.json", manifest_payload)
         bundle.writestr("data.json", data_payload)
         bundle.writestr(bundle_name, payload)
+
+
+def test_chat_bundle_round_trips_turn_outcomes_with_remapped_message_refs(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.add_turn_outcome(
+        save_id=save.id,
+        message_id=NARRATOR_MESSAGE_ID,
+        payload={
+            "save_id": save.id,
+            "message_id": NARRATOR_MESSAGE_ID,
+            "source_message_ids": [PLAYER_MESSAGE_ID, NARRATOR_MESSAGE_ID],
+            "attempted_action": "I climb toward the beacon lens.",
+            "attempt_resolution": "succeeded",
+            "attempt_evidence_source_ids": [f"message:{PLAYER_MESSAGE_ID}"],
+            "effects": [
+                {
+                    "candidate_id": "scene:mood",
+                    "candidate_type": "scene_snapshot_field",
+                    "domain": "scene",
+                    "operation": "update",
+                    "state_key": "scene_snapshot.mood",
+                    "field_path": "mood",
+                    "character_id": "",
+                    "target_type": "",
+                    "target_id": "",
+                    "value": {"mood": "uneasy"},
+                    "confidence": 0.9,
+                    "evidence_source_ids": [f"message:{NARRATOR_MESSAGE_ID}"],
+                    "evidence_quote": "lens flashes red",
+                    "verifier_status": "rendered",
+                    "safe_to_commit": True,
+                    "application_status": "committed",
+                    "reason": "rendered",
+                    "changed": True,
+                }
+            ],
+            "applied_domains": ["scene"],
+            "queued_domains": [],
+            "verification_passed": True,
+            "verifier_available": True,
+            "post_turn_update_needed": False,
+            "committed_count": 1,
+            "confirmation_queued_count": 0,
+        },
+    )
+    bundle_path = tmp_path / "outcomes.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+
+    with zipfile.ZipFile(bundle_path) as bundle:
+        data = json.loads(bundle.read("data.json"))
+    assert [row["message_id"] for row in data["turn_outcomes"]] == [
+        NARRATOR_MESSAGE_ID
+    ]
+
+    imported = service.import_save(bundle_path)
+    imported_save = repositories.get_save(_imported_save_id(imported))
+    assert imported_save is not None
+    imported_messages = [
+        message
+        for message in repositories.list_messages(imported_save.id)
+        if message.role == "narrator"
+    ]
+    assert len(imported_messages) == 1
+    imported_narrator_id = imported_messages[0].id
+    imported_player_id = next(
+        message.id
+        for message in repositories.list_messages(imported_save.id)
+        if message.role == "player"
+    )
+    outcome = repositories.get_turn_outcome_for_message(
+        save_id=imported_save.id,
+        message_id=imported_narrator_id,
+    )
+    assert outcome is not None
+    assert outcome.payload["save_id"] == imported_save.id
+    assert outcome.payload["attempt_resolution"] == "succeeded"
+    assert outcome.payload["source_message_ids"] == [
+        imported_player_id,
+        imported_narrator_id,
+    ]
+    assert outcome.payload["attempt_evidence_source_ids"] == [
+        f"message:{imported_player_id}"
+    ]
+    raw_effects = outcome.payload["effects"]
+    assert isinstance(raw_effects, list)
+    effect = raw_effects[0]
+    assert isinstance(effect, dict)
+    assert effect["evidence_source_ids"] == [f"message:{imported_narrator_id}"]
+    assert effect["domain"] == "scene"
