@@ -5558,12 +5558,12 @@ def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
     merged = chat_service_module._narrator_spec_with_commit_candidates(
         spec,
         (assessment_candidate,),
-        assessed_character_ids=frozenset({"mara", "ren"}),
     )
 
     assert merged is not None
     assert merged.state_commit_candidates == (
         model_other_character,
+        model_deterministic_present,
         assessment_candidate,
     )
     assert {
@@ -5572,11 +5572,10 @@ def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
     } == {
         ("scene_presence:mara:leave", "superseded_by_assessment"),
         ("scene_presence:mara:enter", "superseded_by_assessment"),
-        ("scene_presence:ren:leave", "superseded_by_assessment"),
     }
 
 
-def test_narrator_spec_drops_model_candidate_for_assessed_character_without_candidates(
+def test_narrator_spec_keeps_model_candidate_for_character_without_candidate(
     repositories: PersistenceRepositories,
 ) -> None:
     model_candidate = StateCommitCandidate(
@@ -5584,7 +5583,7 @@ def test_narrator_spec_drops_model_candidate_for_assessed_character_without_cand
         state_key="scene.presence",
         field_path="present_character_ids",
         value={"action": "leave", "character_name": "Ren"},
-        reason="Model candidate for an assessed character.",
+        reason="Model candidate for an assessed character without a candidate.",
         confidence=0.9,
         evidence_source_ids=("message:source",),
         evidence_quote="Ren leaves.",
@@ -5606,21 +5605,11 @@ def test_narrator_spec_drops_model_candidate_for_assessed_character_without_cand
     merged = chat_service_module._narrator_spec_with_commit_candidates(
         spec,
         (),
-        assessed_character_ids=frozenset({"ren"}),
     )
 
     assert merged is not None
-    assert merged.state_commit_candidates == ()
-    assert merged.planner_rejections == (
-        PlannerRejection(
-            candidate_id="scene_presence:ren:leave",
-            candidate_type="scene_presence",
-            domain="scene_presence",
-            reason="superseded_by_assessment",
-            field="candidate_id",
-            rejected_value="scene_presence:ren:leave",
-        ),
-    )
+    assert merged.state_commit_candidates == (model_candidate,)
+    assert merged.planner_rejections == ()
 
 
 def test_narrator_spec_keeps_model_candidate_for_ungrounded_assessment(
@@ -5664,7 +5653,6 @@ def test_narrator_spec_keeps_model_candidate_for_ungrounded_assessment(
     merged = chat_service_module._narrator_spec_with_commit_candidates(
         spec,
         (assessment_candidate,),
-        assessed_character_ids=frozenset({"mara"}),
     )
 
     assert merged is not None

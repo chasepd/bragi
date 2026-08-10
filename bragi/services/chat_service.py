@@ -2110,11 +2110,6 @@ class ChatService:
                     save_id=save_id,
                 ),
             ),
-            assessed_character_ids=frozenset(
-                assessment.character_id
-                for assessment in character_action_planning_result.assessments
-                if character_turn_assessment_has_prompt_guidance(assessment)
-            ),
         )
         if (
             save.interaction_mode is InteractionMode.STORYTELLER
@@ -7751,8 +7746,6 @@ def _rich_narrator_request_with_plan(
 def _narrator_spec_with_commit_candidates(
     spec: NarratorMessageSpec | None,
     candidates: tuple[StateCommitCandidate, ...],
-    *,
-    assessed_character_ids: frozenset[str] = frozenset(),
 ) -> NarratorMessageSpec | None:
     if spec is None:
         return spec
@@ -7761,7 +7754,7 @@ def _narrator_spec_with_commit_candidates(
         for candidate in candidates
         if candidate.candidate_id
     }
-    authoritative_scene_presence_character_ids = assessed_character_ids | {
+    authoritative_scene_presence_character_ids = {
         candidate.character_id
         for candidate in candidates
         if candidate.candidate_type == "scene_presence"
