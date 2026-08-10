@@ -1059,13 +1059,18 @@ def _rehydrate_selected_context(
     fallback_snapshot: NarrationContextSnapshot | None,
     preselection_revision: str,
     reload_attempt: int = 0,
+    force_reload: bool = False,
 ) -> tuple[ContextSearchResult, NarrationContextSnapshot | None]:
     selected_items = _selected_context_items(result)
     current_revision = repositories.context_candidate_revision_token(
         save_id,
         ignored_message_id=player_message_id,
     )
-    if not selected_items and current_revision == preselection_revision:
+    if (
+        not force_reload
+        and not selected_items
+        and current_revision == preselection_revision
+    ):
         confirmed_revision = repositories.context_candidate_revision_token(
             save_id,
             ignored_message_id=player_message_id,
@@ -1074,7 +1079,8 @@ def _rehydrate_selected_context(
             return result, fallback_snapshot
         current_revision = confirmed_revision
     if (
-        current_revision == preselection_revision
+        not force_reload
+        and current_revision == preselection_revision
         and fallback_snapshot is not None
         and _snapshot_contains_selected_items(fallback_snapshot, selected_items)
     ):
@@ -1271,9 +1277,10 @@ def _rehydrate_selected_context(
                 player_message_id=player_message_id,
                 focus_message=focus_message,
                 result=result,
-                fallback_snapshot=snapshot,
+                fallback_snapshot=None,
                 preselection_revision=reload_end_revision,
                 reload_attempt=1,
+                force_reload=True,
             )
         raise RuntimeError(
             "Context changed repeatedly during rehydration; retry the turn"
