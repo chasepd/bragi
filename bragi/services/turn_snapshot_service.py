@@ -1328,11 +1328,6 @@ class TurnSnapshotService:
         if not dirty_rows:
             return None
         aggregate_dependents_queued: set[tuple[str, str]] = set()
-        self._queue_snapshot_aggregate_dependents(
-            save_id,
-            dirty_rows,
-            already_queued=aggregate_dependents_queued,
-        )
         lifecycle_dependents = self._queue_snapshot_lifecycle_dependents(
             save_id,
             dirty_rows,
@@ -1341,6 +1336,27 @@ class TurnSnapshotService:
             save_id,
             lifecycle_dependents,
         )
+        while True:
+            closure_rows = self.repositories.connection.execute(
+                """
+                SELECT table_name, row_key, generation
+                FROM save_snapshot_dirty_rows
+                WHERE save_id = ?
+                ORDER BY generation, table_name, row_key
+                """,
+                (save_id,),
+            ).fetchall()
+            aggregate_keys = self._queue_snapshot_aggregate_dependents(
+                save_id,
+                closure_rows,
+                already_queued=aggregate_dependents_queued,
+            )
+            if not aggregate_keys:
+                break
+            self._expand_snapshot_reverse_dependency_closure(
+                save_id,
+                aggregate_keys,
+            )
         dirty_rows = self.repositories.connection.execute(
             """
             SELECT table_name, row_key, generation

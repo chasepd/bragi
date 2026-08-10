@@ -4042,7 +4042,7 @@ def test_character_exclusion_rechecks_group_participant_aggregate(
     assert all(row["id"] != thread.id for row in rows["character_text_threads"])
 
 
-def test_group_reference_cycle_revives_after_characters_are_unarchived(
+def test_group_reference_cycle_revives_after_character_is_unarchived(
     repositories: PersistenceRepositories,
 ) -> None:
     save = _create_save(repositories)
@@ -4071,7 +4071,7 @@ def test_group_reference_cycle_revives_after_characters_are_unarchived(
     service.capture_baseline_snapshot(save.id)
     repositories.connection.execute(
         "UPDATE characters SET archived_at = CURRENT_TIMESTAMP "
-        "WHERE id IN ('mara', 'rowan')"
+        "WHERE id = 'mara'"
     )
     repositories.commit()
     excluded = service.capture_current_head_if_dirty(save.id)
@@ -4085,7 +4085,7 @@ def test_group_reference_cycle_revives_after_characters_are_unarchived(
 
     repositories.connection.execute(
         "UPDATE characters SET archived_at = NULL "
-        "WHERE id IN ('mara', 'rowan')"
+        "WHERE id = 'mara'"
     )
     repositories.commit()
     revived = service.capture_current_head_if_dirty(save.id)
