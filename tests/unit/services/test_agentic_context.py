@@ -3449,6 +3449,7 @@ def test_narrator_verifier_reports_typed_quality_findings(category: str) -> None
     quality_schema = provider.structured_output_requests[0].schema["properties"][
         "quality_findings"
     ]
+    assert quality_schema["maxItems"] == 9
     assert quality_schema["items"]["properties"]["category"]["enum"] == [
         "spatial_continuity",
         "possession_continuity",
@@ -3460,6 +3461,8 @@ def test_narrator_verifier_reports_typed_quality_findings(category: str) -> None
         "semantic_repetition",
         "forward_movement",
     ]
+    for field_name in ("reason", "narrator_quote", "context_quote"):
+        assert quality_schema["items"]["properties"][field_name]["minLength"] == 1
 
 
 def test_narrator_verifier_clean_response_has_no_quality_findings() -> None:

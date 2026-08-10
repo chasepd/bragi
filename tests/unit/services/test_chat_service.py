@@ -3579,6 +3579,43 @@ def test_submit_player_turn_retries_typed_narrator_quality_finding(
     ]
 
 
+def test_narrator_quality_retry_feedback_includes_every_typed_finding() -> None:
+    findings = tuple(
+        NarratorQualityFinding(
+            category=category,
+            reason=f"Reason {index}.",
+            narrator_quote=f"Draft quote {index}.",
+            context_quote=f"Context quote {index}.",
+        )
+        for index, category in enumerate(
+            (
+                "spatial_continuity",
+                "possession_continuity",
+                "injury_resource_continuity",
+                "action_feasibility",
+                "causality",
+                "elapsed_time",
+                "character_voice",
+                "semantic_repetition",
+                "forward_movement",
+            ),
+            start=1,
+        )
+    )
+
+    feedback = chat_service_module._verification_retry_feedback(
+        NarratorVerificationResult(
+            passed=False,
+            quality_findings=findings,
+        )
+    )
+
+    for index in range(1, 10):
+        assert f"Reason {index}." in feedback
+        assert f"Draft quote {index}." in feedback
+        assert f"Context quote {index}." in feedback
+
+
 def test_submit_player_turn_uses_seven_attempts_after_narrator_passivity_issue(
     repositories: PersistenceRepositories,
 ) -> None:

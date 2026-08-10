@@ -11652,7 +11652,7 @@ def _verification_retry_feedback(result: NarratorVerificationResult) -> str:
             f"{violation.route_stage} exceeded {violation.escalation}. "
             f"Reason: {violation.reason}"
         )
-    for finding in result.quality_findings[:5]:
+    for finding in result.quality_findings:
         label = finding.category.replace("_", " ").capitalize()
         lines.append(
             f"- {label}: {finding.reason} Offending draft: "

@@ -3899,9 +3899,9 @@ def _verifier_schema() -> dict[str, object]:
                 "type": "string",
                 "enum": list(NARRATOR_QUALITY_FINDING_CATEGORIES),
             },
-            "reason": {"type": "string"},
-            "narrator_quote": {"type": "string"},
-            "context_quote": {"type": "string"},
+            "reason": {"type": "string", "minLength": 1},
+            "narrator_quote": {"type": "string", "minLength": 1},
+            "context_quote": {"type": "string", "minLength": 1},
         },
         "required": [
             "category",
@@ -4022,7 +4022,7 @@ def _verifier_schema() -> dict[str, object]:
             "quality_findings": {
                 "type": "array",
                 "items": quality_finding,
-                "maxItems": 8,
+                "maxItems": len(NARRATOR_QUALITY_FINDING_CATEGORIES),
             },
             "attempt_resolution": {
                 "type": "string",
