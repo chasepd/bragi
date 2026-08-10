@@ -3744,6 +3744,39 @@ def test_incremental_reference_is_restored_when_target_reactivates(
     assert restored_character["location_id"] == "tower"
 
 
+def test_incremental_fade_transition_removes_dependents(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The beacon is lit.",
+    )
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="beacon",
+        value={"lit": True},
+        source_message_id=message.id,
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=save.id, message_id=message.id)
+    repositories.connection.execute(
+        """
+        UPDATE messages
+        SET body = ?, safety_transition = 'fade_to_black'
+        WHERE id = ?
+        """,
+        ("The scene moves forward.", message.id),
+    )
+    repositories.commit()
+
+    faded = service.capture_current_head_if_dirty(save.id)
+    faded_rows = service._rows_from_manifest(service._snapshot_manifest(faded))
+    assert faded_rows["messages"] == ()
+    assert faded_rows["world_state"] == ()
+
+
 def test_dirty_row_capture_serializes_only_changed_row(
     repositories: PersistenceRepositories,
     monkeypatch: pytest.MonkeyPatch,

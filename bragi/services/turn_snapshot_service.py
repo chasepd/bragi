@@ -1349,7 +1349,14 @@ class TurnSnapshotService:
                 table.name,
                 row,
             ):
-                if table.name not in _SNAPSHOT_KEEP_ENTITY_TABLES:
+                if (
+                    table.name not in _SNAPSHOT_KEEP_ENTITY_TABLES
+                    or self._incremental_row_references_safety_transition(
+                        save_id,
+                        table.name,
+                        row,
+                    )
+                ):
                     pending.append((table, row_key, None, raw_row, previous, None))
                     continue
                 row = self._clear_incremental_scalar_references(
@@ -1529,41 +1536,12 @@ class TurnSnapshotService:
         table_name: str,
         row: Mapping[str, object],
     ) -> bool:
-        for column in _MESSAGE_REFERENCE_COLUMNS:
-            value = row.get(column)
-            if not isinstance(value, str) or not value:
-                continue
-            if self.repositories.connection.execute(
-                """
-                SELECT 1 FROM messages
-                WHERE save_id = ? AND id = ? AND deleted_at IS NULL
-                """,
-                (save_id, value),
-            ).fetchone() is None:
-                return False
-        for column, target_table_name in _TABLE_REFERENCE_COLUMNS.get(
+        return not _snapshot_row_has_unresolved_references(
             table_name,
-            {},
-        ).items():
-            value = row.get(column)
-            if not isinstance(value, str) or not value:
-                continue
-            target = _TABLES_BY_NAME.get(target_table_name)
-            if target is None:
-                continue
-            where = f"save_id = ? AND {target.primary_key} = ?"
-            if target.name in {"messages", "character_text_messages"}:
-                where += " AND deleted_at IS NULL"
-            elif target.active_only and "archived_at" in self._column_names(
-                target.name
-            ):
-                where += " AND archived_at IS NULL"
-            if self.repositories.connection.execute(
-                f"SELECT 1 FROM {target.name} WHERE {where}",
-                (save_id, value),
-            ).fetchone() is None:
-                return False
-        return True
+            row,
+            self._incremental_active_ids(save_id, table_name, row),
+        )
+
 
     def _queue_snapshot_reference_dependents(
         self,
@@ -1617,6 +1595,15 @@ class TurnSnapshotService:
                 row = _row_dict(live)
                 if table.name in {"messages", "character_text_messages"}:
                     is_included = row.get("deleted_at") is None
+                    if table.name == "messages" and is_included:
+                        sanitized_message = _sanitize_snapshot_message_row(row)
+                        is_included = not is_fade_to_black_message(
+                            role=str(sanitized_message.get("role", "")),
+                            body=str(sanitized_message.get("body", "")),
+                            safety_transition=str(
+                                sanitized_message.get("safety_transition", "")
+                            ),
+                        )
                 elif (
                     table.active_only
                     and "archived_at" in self._column_names(table.name)
@@ -1683,12 +1670,114 @@ class TurnSnapshotService:
             """,
             (
                 (save_id, table_name, row_key, target_table, target_key)
-                for target_table, target_key in _snapshot_row_references(
+                for target_table, target_key in self._snapshot_row_references(
+                    save_id,
                     table_name,
                     row,
                 )
             ),
         )
+
+    def _snapshot_row_references(
+        self,
+        save_id: str,
+        table_name: str,
+        row: Mapping[str, object],
+        *,
+        active_only: bool = False,
+    ) -> frozenset[tuple[str, str]]:
+        candidates = _snapshot_reference_candidates(table_name, row)
+        references: set[tuple[str, str]] = set()
+        if not candidates:
+            return frozenset()
+        candidate_values = tuple(candidates)
+        for target in _SNAPSHOT_TABLES:
+            for offset in range(0, len(candidate_values), 500):
+                chunk = candidate_values[offset : offset + 500]
+                where = (
+                    f"save_id = ? AND {target.primary_key} "
+                    f"IN ({_placeholders(len(chunk))})"
+                )
+                if active_only:
+                    if target.name in {"messages", "character_text_messages"}:
+                        where += " AND deleted_at IS NULL"
+                    elif target.active_only and "archived_at" in self._column_names(
+                        target.name
+                    ):
+                        where += " AND archived_at IS NULL"
+                select_columns = target.primary_key
+                if active_only and target.name == "messages":
+                    select_columns += ", role, body, safety_transition"
+                matched = self.repositories.connection.execute(
+                    f"SELECT {select_columns} FROM {target.name} WHERE {where}",
+                    (save_id, *chunk),
+                ).fetchall()
+                references.update(
+                    (target.name, str(match[target.primary_key]))
+                    for match in matched
+                    if target.name != "messages"
+                    or not active_only
+                    or not is_fade_to_black_message(
+                        role=str(match["role"]),
+                        body=str(match["body"]),
+                        safety_transition=str(match["safety_transition"]),
+                    )
+                )
+        return frozenset(references)
+
+    def _incremental_active_ids(
+        self,
+        save_id: str,
+        table_name: str,
+        row: Mapping[str, object],
+    ) -> dict[str, frozenset[str]]:
+        references = self._snapshot_row_references(
+            save_id,
+            table_name,
+            row,
+            active_only=True,
+        )
+        active_ids: dict[str, set[str]] = {
+            target.name: set() for target in _SNAPSHOT_TABLES
+        }
+        for target_table, target_key in references:
+            active_ids[target_table].add(target_key)
+        return {
+            target_table: frozenset(target_keys)
+            for target_table, target_keys in active_ids.items()
+        }
+
+    def _incremental_row_references_safety_transition(
+        self,
+        save_id: str,
+        table_name: str,
+        row: Mapping[str, object],
+    ) -> bool:
+        message_candidates = _snapshot_reference_candidates(table_name, row)
+        if not message_candidates:
+            return False
+        candidate_values = tuple(message_candidates)
+        for offset in range(0, len(candidate_values), 500):
+            chunk = candidate_values[offset : offset + 500]
+            messages = self.repositories.connection.execute(
+                f"""
+                SELECT role, body, safety_transition
+                FROM messages
+                WHERE save_id = ? AND id IN ({_placeholders(len(chunk))})
+                  AND deleted_at IS NULL
+                """,
+                (save_id, *chunk),
+            ).fetchall()
+            if any(
+                is_fade_to_black_message(
+                    role=str(message["role"]),
+                    body=str(message["body"]),
+                    safety_transition=str(message["safety_transition"]),
+                )
+                for message in messages
+            ):
+                return True
+        return False
 
 
     def _clear_incremental_scalar_references(
@@ -1697,42 +1786,12 @@ class TurnSnapshotService:
         table_name: str,
         row: Mapping[str, object],
     ) -> dict[str, object]:
-        cleared = dict(row)
-        for column in _MESSAGE_REFERENCE_COLUMNS:
-            value = cleared.get(column)
-            if not isinstance(value, str) or not value:
-                continue
-            active = self.repositories.connection.execute(
-                """
-                SELECT 1 FROM messages
-                WHERE save_id = ? AND id = ? AND deleted_at IS NULL
-                """,
-                (save_id, value),
-            ).fetchone()
-            if active is None:
-                cleared[column] = None
-        for column, target_table_name in _TABLE_REFERENCE_COLUMNS.get(
+        return _clear_snapshot_row_unresolved_references(
             table_name,
-            {},
-        ).items():
-            value = cleared.get(column)
-            if not isinstance(value, str) or not value:
-                continue
-            target = _TABLES_BY_NAME[target_table_name]
-            where = f"save_id = ? AND {target.primary_key} = ?"
-            if target.name in {"messages", "character_text_messages"}:
-                where += " AND deleted_at IS NULL"
-            elif target.active_only and "archived_at" in self._column_names(
-                target.name
-            ):
-                where += " AND archived_at IS NULL"
-            active = self.repositories.connection.execute(
-                f"SELECT 1 FROM {target.name} WHERE {where}",
-                (save_id, value),
-            ).fetchone()
-            if active is None:
-                cleared[column] = None
-        return cleared
+            row,
+            self._incremental_active_ids(save_id, table_name, row),
+        )
+
 
     def _queue_due_snapshot_rechecks(self, save_id: str) -> None:
         due_rows = self.repositories.connection.execute(
@@ -3558,60 +3617,43 @@ def _row_dict(row: sqlite3.Row) -> dict[str, object]:
     return {key: row[key] for key in row.keys()}
 
 
-def _snapshot_row_references(
+def _snapshot_reference_candidates(
     table_name: str,
     row: Mapping[str, object],
-) -> frozenset[tuple[str, str]]:
-    references: set[tuple[str, str]] = set()
-    for column in _MESSAGE_REFERENCE_COLUMNS:
-        value = row.get(column)
-        if isinstance(value, str) and value:
-            references.add(("messages", value))
-    for column, target_table in _TABLE_REFERENCE_COLUMNS.get(table_name, {}).items():
-        value = row.get(column)
-        if isinstance(value, str) and value:
-            references.add((target_table, value))
-    json_reference_lists = {
-        "source_message_ids_json": "messages",
-        "source_observation_ids_json": "context_observations",
-        "source_summary_ids_json": "summaries",
-        "present_character_ids_json": "characters",
-        "connections_json": "locations",
-    }
-    for column, target_table in json_reference_lists.items():
-        raw = row.get(column)
-        if not isinstance(raw, str):
-            continue
-        try:
-            values = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(values, list):
-            references.update(
-                (target_table, value)
-                for value in values
-                if isinstance(value, str) and value
-            )
-    typed_columns: tuple[tuple[str, str], ...] = ()
-    if table_name == "entity_links":
-        typed_columns = (("entity_id", "entity_type"), ("target_id", "target_type"))
-    elif table_name == "scene_facts":
-        typed_columns = (("subject_id", "subject_type"), ("target_id", "target_type"))
-    elif table_name in {"context_update_suggestions", "context_update_audit"}:
-        typed_columns = (("entity_id", "entity_type"),)
-    elif table_name == "character_knowledge_edges":
-        typed_columns = (("target_id", "target_type"),)
-    elif table_name == "character_text_proactive_triggers":
-        typed_columns = (("source_id", "source_type"),)
-    for id_column, type_column in typed_columns:
-        value = row.get(id_column)
-        entity_type = row.get(type_column)
-        typed_target_table = _ENTITY_TABLES.get(
-            entity_type if isinstance(entity_type, str) else ""
-        )
-        if isinstance(value, str) and value and typed_target_table is not None:
-            references.add((typed_target_table, value))
-    return frozenset(references)
+) -> frozenset[str]:
+    del table_name
+    candidates: set[str] = set()
+
+    def collect(value: object) -> None:
+        if isinstance(value, str):
+            if not value:
+                return
+            candidates.add(value)
+            text_message_id = parse_character_text_source_ref(value)
+            if text_message_id is not None:
+                candidates.add(text_message_id)
+            for part in re.split(r"[:,]", value):
+                normalized = part.strip()
+                if normalized:
+                    candidates.add(normalized)
+            if value[:1] in {"[", "{"}:
+                try:
+                    collect(json.loads(value))
+                except json.JSONDecodeError:
+                    pass
+            return
+        if isinstance(value, Mapping):
+            for nested in value.values():
+                collect(nested)
+            return
+        if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
+            for nested in value:
+                collect(nested)
+
+    for value in row.values():
+        collect(value)
+    return frozenset(candidates)
+
 
 
 def _filter_turn_outcomes_to_active_messages(
