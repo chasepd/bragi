@@ -1768,14 +1768,10 @@ class BragiRuntime:
             scenario_type=scenario_type,
         )
         if preference is None:
-            raise ValueError(
-                "A Context Update model is required to compile scenario canon"
-            )
+            return dict(content)
         provider: object = self.providers.get(preference.provider)
         if not isinstance(provider, StructuredOutputProvider):
-            raise ValueError(
-                "The Context Update provider must support structured output"
-            )
+            return dict(content)
         return await ScenarioCanonCompiler(
             provider=provider,
             provider_name=preference.provider,

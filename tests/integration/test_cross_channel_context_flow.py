@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -127,6 +129,43 @@ class CrossChannelProvider:
                     "category": "none",
                     "reason": "Integration fixture content is within the ceiling.",
                     "minimum_rating": "g",
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
+        if request.schema_name == "scenario_canon_claims":
+            payload = json.loads(request.messages[-1].body)
+            return StructuredOutputResponse(
+                data={
+                    "sections": [
+                        {
+                            "section_id": section_id,
+                            "claims": [
+                                {
+                                    "claim": evidence,
+                                    "evidence_quote": evidence,
+                                    "entity_anchors": [
+                                        {
+                                            "entity_type": "concept",
+                                            "entity_key": section_id,
+                                            "display_name": section_id,
+                                        }
+                                    ],
+                                    "fact_type": "other",
+                                    "authority": "canonical",
+                                    "temporal_status": "durable",
+                                    "reveal_policy": "open",
+                                    "known_by": [],
+                                }
+                                for evidence in re.split(
+                                    r"(?<=[.!?])\s+|;\s*|\n+",
+                                    text,
+                                )
+                                if evidence.strip()
+                            ],
+                        }
+                        for section_id, text in payload["sections"].items()
+                    ]
                 },
                 provider=request.provider,
                 model_id=request.model_id,

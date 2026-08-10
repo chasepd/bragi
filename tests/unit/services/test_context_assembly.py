@@ -494,6 +494,34 @@ def test_image_scene_context_excludes_pending_review_suggestions(
     )
 
 
+def test_image_scene_context_excludes_secret_compiled_claims(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, _current_location = _create_context_save(
+        repositories,
+        scenario_id="scenario-secret-image-context",
+        save_id="save-secret-image-context",
+    )
+
+    image_context, breakdown = ContextAssemblyService(
+        repositories
+    ).build_image_scene_context(
+        save_id=save.id,
+        selected_scenario_sections=(
+            "[canonical | durable | open] The tower lens is red.",
+            "[canonical | durable | narrator_only] The lens contains a ghost.",
+            "[canonical | durable | restricted] The keeper knows its true name.",
+        ),
+    )
+
+    assert "The tower lens is red." in image_context
+    assert "contains a ghost" not in image_context
+    assert "true name" not in image_context
+    assert len(
+        [source for source in breakdown.sources if source.tier == "scenario_section"]
+    ) == 1
+
+
 def test_pending_context_suggestion_sources_group_and_cap_rows(
     repositories: PersistenceRepositories,
 ) -> None:

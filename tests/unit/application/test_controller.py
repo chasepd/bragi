@@ -139,8 +139,8 @@ class RuntimeCanonProvider(RuntimeFakeProvider):
                         "section_id": section_id,
                         "claims": [
                             {
-                                "claim": text,
-                                "evidence_quote": text,
+                                "claim": evidence,
+                                "evidence_quote": evidence,
                                 "entity_anchors": [
                                     {
                                         "entity_type": "concept",
@@ -154,6 +154,11 @@ class RuntimeCanonProvider(RuntimeFakeProvider):
                                 "reveal_policy": "open",
                                 "known_by": [],
                             }
+                            for evidence in re.split(
+                                r"(?<=[.!?])\s+|;\s*|\n+",
+                                text,
+                            )
+                            if evidence.strip()
                         ],
                     }
                     for section_id, text in sections.items()

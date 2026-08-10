@@ -126,7 +126,6 @@ CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT = 64
 RAW_CONTEXT_RECORD_LIMIT = 512
 CONTINUITY_FLOOR_STATE_LIMIT = 4
 CONTINUITY_FLOOR_MEMORY_LIMIT = 4
-CONTINUITY_FLOOR_SCENARIO_SECTION_LIMIT = 3
 CONTINUITY_FLOOR_MEMORY_MIN_IMPORTANCE = 0.8
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUPS = 64
 MAX_CONTEXT_SOURCE_PROVENANCE_GROUP_MEMBERS = 64
@@ -1611,6 +1610,7 @@ def _context_candidate_set(
     )
     indexed_candidates = _indexed_context_candidates(
         context_source_records,
+        world_state=world_state,
         scoped_targets=scoped_targets,
         reference_character_ids=audience_reference_character_ids,
         accepted_observation_ids=accepted_observation_ids,
@@ -1665,7 +1665,6 @@ def _context_candidate_set(
             state_candidates=raw_state_candidates,
             memories=memories,
             memory_candidates=raw_memory_candidates,
-            scenario_candidates=scenario_candidates,
         )
     )
     observation_candidates = _observation_candidates(
@@ -3339,6 +3338,7 @@ def _model_requirement_error(
 def _indexed_context_candidates(
     records: list[ContextSourceRecord],
     *,
+    world_state: list[WorldStateRecord],
     scoped_targets: ScopedTargets,
     reference_character_ids: frozenset[str],
     accepted_observation_ids: frozenset[str],
@@ -3355,6 +3355,11 @@ def _indexed_context_candidates(
             accepted_observation_ids=accepted_observation_ids,
         )
         if source_type is None:
+            continue
+        if source_type == "scenario_claim" and _scenario_claim_is_superseded(
+            record,
+            world_state=world_state,
+        ):
             continue
         if _audience_candidate_blocked(record, reference_character_ids):
             continue
@@ -3385,6 +3390,38 @@ def _indexed_context_candidates(
             )
         )
     return tuple(candidates)
+
+
+def _scenario_claim_is_superseded(
+    record: ContextSourceRecord,
+    *,
+    world_state: list[WorldStateRecord],
+) -> bool:
+    if record.metadata.get("temporal_status") != "current_at_scenario_start":
+        return False
+    anchors = record.metadata.get("entity_anchors")
+    if not isinstance(anchors, list):
+        return False
+    anchor_keys = {
+        _normalized_match_key(str(anchor.get("entity_key", "")))
+        for anchor in anchors
+        if isinstance(anchor, Mapping)
+    }
+    anchor_keys.discard("")
+    if not anchor_keys:
+        return False
+    for state in world_state:
+        state_key = _normalized_match_key(state.key)
+        if any(
+            anchor_key in state_key or state_key in anchor_key
+            for anchor_key in anchor_keys
+        ):
+            return True
+    return False
+
+
+def _normalized_match_key(value: str) -> str:
+    return "".join(character for character in value.casefold() if character.isalnum())
 
 
 def _indexed_context_source_is_continuity_critical(
@@ -3433,7 +3470,6 @@ def _continuity_floor_candidates(
     state_candidates: tuple[_ContextCandidate, ...],
     memories: list[MemoryRecord],
     memory_candidates: tuple[_ContextCandidate, ...],
-    scenario_candidates: tuple[_ContextCandidate, ...],
 ) -> tuple[_ContextCandidate, ...]:
     return tuple(
         _mark_continuity_critical(candidate)
@@ -3446,7 +3482,6 @@ def _continuity_floor_candidates(
                 memories=memories,
                 memory_candidates=memory_candidates,
             ),
-            *scenario_candidates[:CONTINUITY_FLOOR_SCENARIO_SECTION_LIMIT],
         )
     )
 

@@ -222,3 +222,55 @@ def test_compiler_rejects_claim_without_exact_source_evidence() -> None:
                 content={"title": "The Last Beacon", "lore": "A costly beacon."},
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("claim", "evidence", "error"),
+    [
+        (
+            "The beacon grants every wish.",
+            "The beacon consumes one memory per use.",
+            "exactly match",
+        ),
+        (
+            "The beacon consumes one memory; the keeper loses her name.",
+            "The beacon consumes one memory; the keeper loses her name.",
+            "one atomic sentence",
+        ),
+    ],
+)
+def test_compiler_rejects_unsupported_or_compound_claims(
+    claim: str,
+    evidence: str,
+    error: str,
+) -> None:
+    output = _output()
+    sections = output["sections"]
+    assert isinstance(sections, list)
+    section = sections[0]
+    assert isinstance(section, dict)
+    claims = section["claims"]
+    assert isinstance(claims, list)
+    first_claim = claims[0]
+    assert isinstance(first_claim, dict)
+    first_claim["claim"] = claim
+    first_claim["evidence_quote"] = evidence
+    provider = FakeProviderClient(structured_output=output)
+
+    with pytest.raises(ValueError, match=error):
+        asyncio.run(
+            ScenarioCanonCompiler(
+                provider=provider,
+                provider_name="fake",
+                model_id="canon-model",
+            ).compile(
+                scenario_type="full_roleplay",
+                content={
+                    "lore": (
+                        "The beacon consumes one memory per use. "
+                        "The beacon consumes one memory; the keeper loses her name. "
+                        "The keeper suspects the lens is alive."
+                    )
+                },
+            )
+        )

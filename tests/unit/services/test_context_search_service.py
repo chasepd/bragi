@@ -2750,6 +2750,7 @@ def test_context_search_keeps_qualified_hidden_derivatives_for_narrator(
     indexed = repositories.list_context_sources(save.id, source_type="observation")
     candidates = context_search_module._indexed_context_candidates(
         indexed,
+        world_state=[],
         scoped_targets=ScopedTargets(allowed={}, blocked=set()),
         reference_character_ids=frozenset({nira.id, mara.id}),
         accepted_observation_ids=frozenset({observation.id}),
@@ -3143,6 +3144,47 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
 
     jobs = _context_search_jobs(repositories, save.id)
     assert "selected_scenario_sections" in jobs[-1]["result_json"]
+
+
+def test_scenario_start_claim_is_superseded_by_matching_accepted_state(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="east-tower-lens.condition",
+        value={"condition": "repaired"},
+        category="object",
+    )
+    claim = repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="scenario_claim",
+        source_id="scenario-claim-lens-start",
+        title="Lens at scenario start",
+        body="[canonical | current_at_scenario_start | open] The lens is cracked.",
+        metadata={
+            "temporal_status": "current_at_scenario_start",
+            "entity_anchors": [
+                {
+                    "entity_type": "object",
+                    "entity_key": "east-tower-lens",
+                    "display_name": "the east tower lens",
+                }
+            ],
+        },
+    )
+
+    assert context_search_module._scenario_claim_is_superseded(
+        claim,
+        world_state=[state],
+    )
 
 
 def test_context_search_exposes_state_changes_and_skips_duplicate_current_upserts(

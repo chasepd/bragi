@@ -84,6 +84,7 @@ SCENARIO_CORE_CONTENT_KEYS = frozenset(
         "player_role",
         "tone_genre",
         "starting_scene",
+        "opening_message",
         "current_scene",
         "relationship_seed",
         "case_facts",
@@ -216,6 +217,7 @@ class ContextAssemblyService:
                     reason="selected scenario section",
                 )
                 for index, section in enumerate(selected_scenario_sections)
+                if _image_safe_scenario_section(section)
             ),
             *deterministic_context_sources(
                 repositories=self.repositories,
@@ -261,6 +263,11 @@ class ContextAssemblyService:
             "\n".join(source.text for source in selected_sources if source.text),
             breakdown,
         )
+
+
+def _image_safe_scenario_section(value: str) -> bool:
+    lowered = value.casefold()
+    return "| narrator_only]" not in lowered and "| restricted]" not in lowered
 
 
 def context_budget_settings(

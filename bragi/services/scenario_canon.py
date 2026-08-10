@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
@@ -27,6 +28,7 @@ SCENARIO_CORE_CONTENT_KEYS = frozenset(
         "player_role",
         "tone_genre",
         "starting_scene",
+        "opening_message",
         "current_scene",
         "relationship_seed",
         "case_facts",
@@ -244,14 +246,10 @@ async def ensure_scenario_canon_for_save(
         purpose="context_update",
     )
     if preference is None:
-        raise ValueError(
-            "A Context Update model is required to compile scenario canon"
-        )
+        return False
     provider: object = providers.get(preference.provider)
     if not isinstance(provider, StructuredOutputProvider):
-        raise ValueError(
-            "The Context Update provider must support structured output"
-        )
+        return False
     compiled = await ScenarioCanonCompiler(
         provider=provider,
         provider_name=preference.provider,
@@ -335,6 +333,10 @@ def _validated_claim(
     evidence_quote = str(raw.get("evidence_quote", "")).strip()
     if not claim or not evidence_quote or evidence_quote not in source:
         raise ValueError("Scenario canon claim lacks exact source evidence")
+    if claim != evidence_quote:
+        raise ValueError("Scenario canon claim must exactly match its source evidence")
+    if not _claim_is_atomic(claim):
+        raise ValueError("Scenario canon claim must contain one atomic sentence")
     fact_type = _enum(raw, "fact_type", FACT_TYPES)
     authority = _enum(raw, "authority", AUTHORITIES)
     temporal_status = _enum(raw, "temporal_status", TEMPORAL_STATUSES)
@@ -393,6 +395,13 @@ def _validated_anchors(value: object) -> list[dict[str, str]]:
             }
         )
     return sorted(anchors, key=lambda item: (item["entity_type"], item["entity_key"]))
+
+
+def _claim_is_atomic(value: str) -> bool:
+    if "\n" in value or ";" in value:
+        return False
+    without_terminal = value.rstrip().rstrip(".!?")
+    return re.search(r"[.!?]\s", without_terminal) is None
 
 
 def _enum(raw: Mapping[str, object], key: str, values: tuple[str, ...]) -> str:
