@@ -4720,6 +4720,42 @@ def test_context_search_reloads_cache_mutated_during_candidate_build(
     assert result_json["diagnostics"]["cache_status"] == "stale"
 
 
+def test_context_search_reloads_cache_miss_mutated_during_candidate_build(
+    repositories: PersistenceRepositories,
+) -> None:
+    counting = CountingPersistenceRepositories(repositories.connection)
+    save, player_message = _save_with_context_search_preference(counting)
+    provider = RecordingStructuredContextProvider({"selections": []})
+    service = ContextSearchService(
+        repositories=counting,
+        providers={"fake": provider},
+    )
+
+    def mutate_context() -> None:
+        counting.upsert_world_state(
+            save_id=save.id,
+            key="scene.warning",
+            value={"active": True},
+            category="scene",
+            source_message_id=None,
+        )
+
+    counting.before_context_source_search = mutate_context
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert result.narration_snapshot is not None
+    assert any(
+        state.key == "scene.warning"
+        for state in result.narration_snapshot.world_state
+    )
+    result_json = json.loads(
+        _context_search_jobs(counting, save.id)[-1]["result_json"]
+    )
+    assert result_json["diagnostics"]["cache_status"] == "retried"
+
+
 def test_context_search_expansion_reuses_retrieval_prelude(
     repositories: PersistenceRepositories,
 ) -> None:
