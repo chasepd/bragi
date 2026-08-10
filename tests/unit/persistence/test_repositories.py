@@ -2091,6 +2091,102 @@ def test_repositories_store_latest_active_message_action_choices(
     ] == ["Wait", "Run", "Ask", "Touch", "Climb", "Read", "Listen", "Knock"]
 
 
+def test_action_choice_write_requires_current_revision_and_generation_claim(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Library of Falling Doors",
+        premise="Every shelf is a door.",
+        player_role="Courier",
+        content={"action_choices_enabled": True},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Library")
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The first shelf opens.",
+    )
+    assert narrator.updated_at is not None
+    narrator_updated_at = narrator.updated_at
+    assert repositories.claim_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        narrator_updated_at=narrator_updated_at,
+        generation_token="older-token",
+    )
+    assert repositories.claim_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        narrator_updated_at=narrator_updated_at,
+        generation_token="newer-token",
+    )
+
+    stale = repositories.replace_message_action_choices(
+        save_id=save.id,
+        message_id=narrator.id,
+        choices=("Old one", "Old two", "Old three", "Old four"),
+        expected_head_message_id=narrator.id,
+        expected_narrator_updated_at=narrator_updated_at,
+        generation_token="older-token",
+    )
+    current = repositories.replace_message_action_choices(
+        save_id=save.id,
+        message_id=narrator.id,
+        choices=("New one", "New two", "New three", "New four"),
+        expected_head_message_id=narrator.id,
+        expected_narrator_updated_at=narrator_updated_at,
+        generation_token="newer-token",
+    )
+
+    assert stale == []
+    assert [choice.body for choice in current] == [
+        "New one",
+        "New two",
+        "New three",
+        "New four",
+    ]
+    assert not repositories.release_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        generation_token="newer-token",
+    )
+
+
+def test_action_choice_claim_rejects_edited_narrator_revision(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Library of Falling Doors",
+        premise="Every shelf is a door.",
+        player_role="Courier",
+        content={"action_choices_enabled": True},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Library")
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The first shelf opens.",
+    )
+    assert narrator.updated_at is not None
+    narrator_updated_at = narrator.updated_at
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=narrator.id,
+        body="The corrected shelf opens.",
+    )
+
+    assert not repositories.claim_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        narrator_updated_at=narrator_updated_at,
+        generation_token="stale-revision",
+    )
+
+
 def test_repositories_find_active_message_after_marker(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -8515,6 +8611,69 @@ def test_repository_records_job_steps_with_safe_metadata_and_redacted_errors(
     }
     assert "private phrase" not in repr(step.metadata)
     assert repositories.list_job_steps(job.id) == [step]
+
+
+def test_repository_claims_and_recovers_post_turn_outbox_steps(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower above the ash.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I light the beacon.",
+    )
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The lens answers with red fire.",
+    )
+
+    created = repositories.ensure_post_turn_outbox_steps(
+        save_id=save.id,
+        player_message_id=player.id,
+        narrator_message_id=narrator.id,
+        turn_revision="revision-1",
+        steps=("state", "context"),
+        payload={"turn_revision": {"expected_head_message_id": narrator.id}},
+    )
+    duplicate = repositories.ensure_post_turn_outbox_steps(
+        save_id=save.id,
+        player_message_id=player.id,
+        narrator_message_id=narrator.id,
+        turn_revision="revision-1",
+        steps=("state", "context"),
+        payload={},
+    )
+
+    assert [step.step for step in created] == ["state", "context"]
+    assert [step.id for step in duplicate] == [step.id for step in created]
+    claimed = repositories.claim_post_turn_outbox_step(created[0].id)
+    assert claimed is not None
+    assert claimed.status == "running"
+    assert claimed.attempt_count == 1
+    assert repositories.claim_post_turn_outbox_step(created[0].id) is None
+
+    recovered = repositories.requeue_running_post_turn_outbox_steps()
+    assert [step.id for step in recovered] == [created[0].id]
+    assert recovered[0].status == "pending"
+    reclaimed = repositories.claim_post_turn_outbox_step(created[0].id)
+    assert reclaimed is not None
+    completed = repositories.complete_post_turn_outbox_step(
+        created[0].id,
+        status="succeeded",
+        result={"applied": True},
+    )
+    assert completed.status == "succeeded"
+    assert completed.result == {"applied": True}
 
 
 def test_repository_runtime_performance_aggregates_success_durations_only(

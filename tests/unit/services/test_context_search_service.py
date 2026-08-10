@@ -466,6 +466,7 @@ class CountingPersistenceRepositories(PersistenceRepositories):
     def __init__(self, connection: sqlite3.Connection) -> None:
         super().__init__(connection)
         self.list_counts: dict[str, int] = {}
+        self.before_context_source_search: Callable[[], None] | None = None
 
     def list_world_state(
         self,
@@ -540,6 +541,10 @@ class CountingPersistenceRepositories(PersistenceRepositories):
         exact_phrases: tuple[str, ...] = (),
         exact_identifiers: tuple[str, ...] = (),
     ) -> list[ContextSourceSearchHit]:
+        callback = self.before_context_source_search
+        self.before_context_source_search = None
+        if callback is not None:
+            callback()
         self.list_counts["context_source_searches"] = (
             self.list_counts.get("context_source_searches", 0) + 1
         )
@@ -1557,7 +1562,7 @@ def test_context_search_does_not_raw_fallback_when_curated_observation_is_blocke
     )
     diagnostics = job_result["diagnostics"]
     assert diagnostics["curated_observation_candidate_count"] == 0
-    assert diagnostics["suppressed_raw_observation_count"] == 1
+    assert diagnostics["suppressed_raw_observation_count"] == 0
 
 
 def test_context_search_prefers_tool_calls_when_model_advertises_tool_calling(
@@ -4782,6 +4787,11 @@ def test_context_search_uses_ranked_index_before_structured_selection(
         importance=0.95,
         source_message_id=source_message.id,
     )
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="ember dawn",
+    )
     for index in range(130):
         repositories.add_summary(
             save_id=save.id,
@@ -4816,6 +4826,8 @@ def test_context_search_uses_ranked_index_before_structured_selection(
     )
     assert exact_memory.body in prompt
     assert "Low-priority pantry recap 129" not in prompt
+    assert provider.expansion_requests == []
+    assert result.retrieval_round_used is False
     assert [item.source_id for item in result.selected_memories] == [exact_memory.id]
     jobs = _context_search_jobs(repositories, save.id)
     result_json = json.loads(jobs[-1]["result_json"])
@@ -4887,6 +4899,7 @@ def test_context_search_uses_structured_paraphrase_and_pronoun_expansion(
     )
 
     assert len(provider.expansion_requests) == 1
+    assert result.retrieval_round_used is True
     expansion_prompt = "\n".join(
         message.body for message in provider.expansion_requests[0].messages
     )
@@ -4897,6 +4910,134 @@ def test_context_search_uses_structured_paraphrase_and_pronoun_expansion(
     )
     assert memory.body in selection_prompt
     assert [item.source_id for item in result.selected_memories] == [memory.id]
+
+
+def test_context_search_uses_post_turn_precomputed_snapshot(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _prior_player_message = _save_with_context_search_preference(repositories)
+    provider = RecordingStructuredContextProvider({"selections": []})
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+    service.precompute_next_turn(save.id)
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I listen for the silver bell.",
+    )
+
+    asyncio.run(service.search(save_id=save.id, player_message_id=player_message.id))
+
+    result_json = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    assert result_json["diagnostics"]["cache_status"] == "hit"
+
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="scene.warning",
+        value={"active": True},
+        category="scene",
+        source_message_id=None,
+    )
+    next_player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="What changed?",
+    )
+    asyncio.run(
+        service.search(
+            save_id=save.id,
+            player_message_id=next_player_message.id,
+        )
+    )
+    stale_result_json = json.loads(
+        _context_search_jobs(repositories, save.id)[-1]["result_json"]
+    )
+    assert stale_result_json["diagnostics"]["cache_status"] == "miss"
+
+
+def test_context_search_reloads_cache_mutated_during_candidate_build(
+    repositories: PersistenceRepositories,
+) -> None:
+    counting = CountingPersistenceRepositories(repositories.connection)
+    save, _prior_player_message = _save_with_context_search_preference(counting)
+    provider = RecordingStructuredContextProvider({"selections": []})
+    service = ContextSearchService(
+        repositories=counting,
+        providers={"fake": provider},
+    )
+    service.precompute_next_turn(save.id)
+    player_message = counting.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I listen for the silver bell.",
+    )
+
+    def mutate_context() -> None:
+        counting.upsert_world_state(
+            save_id=save.id,
+            key="scene.warning",
+            value={"active": True},
+            category="scene",
+            source_message_id=None,
+        )
+
+    counting.before_context_source_search = mutate_context
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert result.narration_snapshot is not None
+    assert any(
+        state.key == "scene.warning"
+        for state in result.narration_snapshot.world_state
+    )
+    result_json = json.loads(
+        _context_search_jobs(counting, save.id)[-1]["result_json"]
+    )
+    assert result_json["diagnostics"]["cache_status"] == "stale"
+
+
+def test_context_search_reloads_cache_miss_mutated_during_candidate_build(
+    repositories: PersistenceRepositories,
+) -> None:
+    counting = CountingPersistenceRepositories(repositories.connection)
+    save, player_message = _save_with_context_search_preference(counting)
+    provider = RecordingStructuredContextProvider({"selections": []})
+    service = ContextSearchService(
+        repositories=counting,
+        providers={"fake": provider},
+    )
+
+    def mutate_context() -> None:
+        counting.upsert_world_state(
+            save_id=save.id,
+            key="scene.warning",
+            value={"active": True},
+            category="scene",
+            source_message_id=None,
+        )
+
+    counting.before_context_source_search = mutate_context
+    result = asyncio.run(
+        service.search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert result.narration_snapshot is not None
+    assert any(
+        state.key == "scene.warning"
+        for state in result.narration_snapshot.world_state
+    )
+    result_json = json.loads(
+        _context_search_jobs(counting, save.id)[-1]["result_json"]
+    )
+    assert result_json["diagnostics"]["cache_status"] == "retried"
 
 
 def test_context_search_expansion_reuses_retrieval_prelude(

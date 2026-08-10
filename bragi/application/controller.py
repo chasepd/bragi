@@ -469,6 +469,8 @@ class RuntimeModel:
     status: str | None = None
     error: str | None = None
     interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
+    continuity_degraded: bool = False
+    retry_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -486,6 +488,8 @@ class ChatTurnDeltaModel:
     requires_full_refresh: bool = False
     kind: str = "chat_turn_delta"
     version: int = 1
+    continuity_degraded: bool = False
+    retry_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -612,6 +616,13 @@ class BragiRuntime:
             else cast(int | None, chronicle_message_limit)
         )
         active_save = _active_save(self.repositories, requested_save_id)
+        continuity_degraded = bool(
+            active_save
+            and self.repositories.list_post_turn_outbox_steps(
+                save_id=active_save.id,
+                statuses=("pending", "running", "failed"),
+            )
+        )
         details = (
             self.repositories.load_chronicle_details(
                 active_save.id,
@@ -715,6 +726,8 @@ class BragiRuntime:
                 if active_save is not None
                 else InteractionMode.ROLEPLAY
             ),
+            continuity_degraded=continuity_degraded,
+            retry_pending=continuity_degraded,
         )
 
     def build_shell_model(
@@ -736,6 +749,13 @@ class BragiRuntime:
             else cast(int | None, chronicle_message_limit)
         )
         active_save = _active_save(self.repositories, requested_save_id)
+        continuity_degraded = bool(
+            active_save
+            and self.repositories.list_post_turn_outbox_steps(
+                save_id=active_save.id,
+                statuses=("pending", "running", "failed"),
+            )
+        )
         details = (
             self.repositories.load_chronicle_details(
                 active_save.id,
@@ -830,6 +850,8 @@ class BragiRuntime:
                 if active_save is not None
                 else InteractionMode.ROLEPLAY
             ),
+            continuity_degraded=continuity_degraded,
+            retry_pending=continuity_degraded,
         )
 
     def build_chronicle_page_model(
@@ -966,6 +988,18 @@ class BragiRuntime:
             ),
             fallback_used=fallback_used,
             context_trimmed=context_trimmed,
+            continuity_degraded=bool(
+                self.repositories.list_post_turn_outbox_steps(
+                    save_id=save_id,
+                    statuses=("pending", "running", "failed"),
+                )
+            ),
+            retry_pending=bool(
+                self.repositories.list_post_turn_outbox_steps(
+                    save_id=save_id,
+                    statuses=("pending", "running", "failed"),
+                )
+            ),
         )
 
     def build_model_with_pending_player_message(
@@ -3739,11 +3773,18 @@ class BragiRuntime:
             return "failed"
         if records:
             return "succeeded"
+        narrator_message = self.repositories.get_message(
+            save_id=prepared_action_choices.save_id,
+            message_id=prepared_action_choices.narrator_message_id,
+        )
         if (
             self.repositories.latest_active_message_id(
                 prepared_action_choices.save_id
             )
             != prepared_action_choices.narrator_message_id
+            or narrator_message is None
+            or narrator_message.updated_at
+            != prepared_action_choices.narrator_updated_at
         ):
             return "obsolete"
         return "skipped"
@@ -3796,7 +3837,46 @@ class BragiRuntime:
                 save_id=save_id,
                 **exception_log_fields(exc),
             )
-            return "failed"
+        return "failed"
+
+    async def run_post_turn_outbox_recovery(
+        self,
+        *,
+        active_save_id: str | None | object = ...,
+    ) -> RuntimeModel:
+        save_id = (
+            self.active_save_id
+            if active_save_id is ...
+            else cast(str | None, active_save_id)
+        )
+        if save_id is None:
+            return self.build_model(error="No active save selected")
+        try:
+            async with self._save_operation_lock(save_id):
+                completed = await ChatService(
+                    repositories=self.repositories,
+                    providers=self.providers,
+                    context_search_service=self.context_search_service,
+                    summary_service=self._summary_service(),
+                    media_service=self._media_service(),
+                    prompt_inspection_store=(
+                        self._prompt_inspection_store_if_enabled()
+                    ),
+                ).run_post_turn_outbox_recovery(save_id=save_id)
+        except Exception as exc:
+            log_error_event(
+                "runtime.post_turn_outbox_recovery_failed",
+                save_id=save_id,
+                **exception_log_fields(exc),
+            )
+            return self.build_model(
+                error=_user_visible_error(exc),
+                active_save_id=save_id,
+            )
+        return self.build_model(
+            status=f"Continuity recovery finished: {completed} turns processed.",
+            active_save_id=save_id,
+        )
 
     async def run_state_pruning(
         self,

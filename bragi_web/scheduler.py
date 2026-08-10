@@ -18,6 +18,7 @@ from bragi_web.serialization import to_jsonable
 
 WORLD_SUGGESTION_REVIEW_TASK = "world_suggestion_review"
 STATE_PRUNING_TASK = "state_pruning"
+POST_TURN_OUTBOX_RECOVERY_TASK = "post_turn_outbox_recovery"
 STATE_EXTRACTION_RETRY_DRAIN_TASK = "state_extraction_retry_drain"
 CONTEXT_UPDATE_RETRY_DRAIN_TASK = "context_update_retry_drain"
 OBSERVATION_CURATION_DRAIN_TASK = "observation_curation_drain"
@@ -45,6 +46,7 @@ _RETRY_DRAIN_JOB_TYPES = {
 
 WORLD_SUGGESTION_REVIEW_INTERVAL_SECONDS = 60
 STATE_PRUNING_INTERVAL_SECONDS = 60
+POST_TURN_OUTBOX_RECOVERY_INTERVAL_SECONDS = 15
 STATE_EXTRACTION_RETRY_DRAIN_INTERVAL_SECONDS = 60
 CONTEXT_UPDATE_RETRY_DRAIN_INTERVAL_SECONDS = 60
 OBSERVATION_CURATION_DRAIN_INTERVAL_SECONDS = 60
@@ -756,6 +758,15 @@ def _context_update_retry_drain_due(repositories: Any, save_id: str) -> bool:
     )
 
 
+def _post_turn_outbox_recovery_due(repositories: Any, save_id: str) -> bool:
+    return bool(
+        repositories.list_post_turn_outbox_steps(
+            save_id=save_id,
+            statuses=("pending", "failed"),
+        )
+    )
+
+
 def _observation_curation_drain_due(repositories: Any, save_id: str) -> bool:
     from bragi.services.agentic_context import agentic_context_pipeline_enabled
 
@@ -1041,6 +1052,14 @@ _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
         should_schedule=_state_pruning_due,
         job_type=WEB_MAINTENANCE_STATE_PRUNING_JOB,
         cache_policy_checks=True,
+    ),
+    _MaintenanceTaskDefinition(
+        task_type=POST_TURN_OUTBOX_RECOVERY_TASK,
+        interval_seconds=POST_TURN_OUTBOX_RECOVERY_INTERVAL_SECONDS,
+        progress_label="Repairing turn continuity",
+        runtime_method="run_post_turn_outbox_recovery",
+        event_reason="post_turn_outbox_recovery",
+        should_schedule=_post_turn_outbox_recovery_due,
     ),
     _MaintenanceTaskDefinition(
         task_type=STATE_EXTRACTION_RETRY_DRAIN_TASK,

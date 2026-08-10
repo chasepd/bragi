@@ -29,6 +29,7 @@ from bragi.persistence.models import (
     MessageRecord,
     MessageVisibilityRecord,
     ModelPreferenceRecord,
+    PostTurnOutboxRecord,
     SaveScenarioUpdateRecord,
     SceneSnapshotRecord,
     SummaryRecord,
@@ -65,6 +66,7 @@ from bragi.services.agentic_context import (
     PLANNED_EFFECT_TYPES,
     RESPONSE_VERIFICATION_MODE_RETRY,
     ContextCurationService,
+    EvidenceRefinementRequest,
     NarratorCommitDecision,
     NarratorMessageSpec,
     NarratorVerificationResult,
@@ -342,6 +344,7 @@ POST_TURN_JOB_ORDER = (
     "proactive_text",
     "director",
     "scenario",
+    "context_precompute",
     "image",
 )
 POST_TURN_JOB_DEPENDENCIES: dict[str, tuple[str, ...]] = {
@@ -352,8 +355,23 @@ POST_TURN_JOB_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "proactive_text": ("time_reconciliation",),
     "director": ("time_reconciliation",),
     "scenario": (),
+    "context_precompute": (
+        "summary",
+        "context",
+        "time_reconciliation",
+        "proactive_text",
+        "director",
+        "scenario",
+    ),
     "image": (),
 }
+POST_TURN_DURABLE_STEPS = (
+    "state",
+    "context",
+    "time_reconciliation",
+    "proactive_text",
+    "director",
+)
 POST_TURN_IMAGE_CONTEXT_SEMANTICS = "pre_post_turn_updates"
 POST_TURN_PROVIDER_TASKS = {
     "summary": "summarization",
@@ -2130,6 +2148,129 @@ class ChatService:
             save_id=save_id,
             request=planner_request,
         )
+        refinement_request = (
+            narrator_spec.evidence_refinement if narrator_spec is not None else None
+        )
+        if (
+            refinement_request is not None
+            and not context_result.retrieval_round_used
+        ):
+            refined_context = await self._refine_context_for_plan(
+                save_id=save_id,
+                player_message_id=player_message.id,
+                request=refinement_request,
+                prior_result=context_result,
+            )
+            refined_count = _context_result_selected_count(refined_context)
+            if refined_count > _context_result_selected_count(context_result):
+                context_result = refined_context
+                narration_snapshot = (
+                    refined_context.narration_snapshot or narration_snapshot
+                )
+                budgeted_context = _budgeted_narrator_context(
+                    repositories=self.repositories,
+                    save_id=save_id,
+                    messages=messages,
+                    context_result=context_result,
+                    player_message=player_message,
+                    continuity_index_synced=context_result.continuity_index_synced,
+                    narration_snapshot=narration_snapshot,
+                    excluded_character_voice_ids=_absent_character_ids(
+                        character_action_planning_result
+                    ),
+                    history_settings=prose_history_settings,
+                )
+                planner_budgeted_context = (
+                    budgeted_context
+                    if planner_uses_prose_context
+                    else _budgeted_narrator_context(
+                        repositories=self.repositories,
+                        save_id=save_id,
+                        messages=messages,
+                        context_result=context_result,
+                        player_message=player_message,
+                        continuity_index_synced=(
+                            context_result.continuity_index_synced
+                        ),
+                        narration_snapshot=narration_snapshot,
+                        excluded_character_voice_ids=_absent_character_ids(
+                            character_action_planning_result
+                        ),
+                        history_settings=planner_history_settings,
+                    )
+                )
+                budgeted_context = replace(
+                    budgeted_context,
+                    context_breakdown={
+                        **budgeted_context.context_breakdown,
+                        **phone_context_breakdown,
+                        **character_planning_breakdown,
+                        "planner_refinement_used": True,
+                    },
+                )
+                planner_budgeted_context = (
+                    budgeted_context
+                    if planner_uses_prose_context
+                    else replace(
+                        planner_budgeted_context,
+                        context_breakdown={
+                            **planner_budgeted_context.context_breakdown,
+                            **phone_context_breakdown,
+                            **character_planning_breakdown,
+                            "planner_refinement_used": True,
+                        },
+                    )
+                )
+                base_request = _request_with_budgeted_context(
+                    base_request,
+                    budgeted_context,
+                    messages=_narrator_messages(
+                        repositories=self.repositories,
+                        messages=messages,
+                        context_result=context_result,
+                        player_message=player_message,
+                        settings=prose_history_settings,
+                        scene_snapshot=narration_snapshot.scene_snapshot,
+                        characters=list(narration_snapshot.characters),
+                        message_visibility=list(
+                            narration_snapshot.message_visibility
+                        ),
+                    ),
+                )
+                planner_request = _request_with_budgeted_context(
+                    planner_request,
+                    planner_budgeted_context,
+                    messages=_narrator_messages(
+                        repositories=self.repositories,
+                        messages=messages,
+                        context_result=context_result,
+                        player_message=player_message,
+                        settings=planner_history_settings,
+                        scene_snapshot=narration_snapshot.scene_snapshot,
+                        characters=list(narration_snapshot.characters),
+                        message_visibility=list(
+                            narration_snapshot.message_visibility
+                        ),
+                    ),
+                )
+                planner_request = replace(
+                    planner_request,
+                    context_breakdown={
+                        **planner_request.context_breakdown,
+                        "planner_message_source_ids": list(
+                            _planner_message_source_ids(
+                                messages=messages,
+                                request_messages=planner_request.messages,
+                            )
+                        ),
+                    },
+                )
+                narrator_spec = await self._plan_narrator_message_if_configured(
+                    save_id=save_id,
+                    request=planner_request,
+                )
+        if narrator_spec is not None and narrator_spec.evidence_refinement is not None:
+            narrator_spec = replace(narrator_spec, evidence_refinement=None)
         narrator_spec = _narrator_spec_with_commit_candidates(
             narrator_spec,
             _character_assessment_commit_candidates(
@@ -2814,6 +2955,23 @@ class ChatService:
                     narrator_spec=usable_narrator_spec,
                     verification_result=verification_diagnostics.verification_result,
                 )
+            )
+            outbox_boundary = self._turn_revision_boundary(
+                save_id=save_id,
+                player_message_id=player_message.id,
+                narrator_message_id=narrator_message.id,
+            )
+            self.repositories.ensure_post_turn_outbox_steps(
+                save_id=save_id,
+                player_message_id=player_message.id,
+                narrator_message_id=narrator_message.id,
+                turn_revision=outbox_boundary.expected_revision_token,
+                steps=POST_TURN_DURABLE_STEPS,
+                payload={
+                    "turn_revision": outbox_boundary.to_json(),
+                    "verified_plan_coverage": verified_plan_coverage.to_json(),
+                    "current_user_id": current_user_id,
+                },
             )
             _log_chat_stage(
                 "chat.stage.narrator_message_persisted",
@@ -3947,6 +4105,7 @@ class ChatService:
         verified_coverage: VerifiedPostTurnCoverage | None = None,
         current_user_id: str | None = None,
         defer_image_generation: bool = False,
+        resume_only: bool = False,
     ) -> dict[str, object]:
         boundary = self._coerce_turn_revision(
             turn_revision,
@@ -3976,6 +4135,42 @@ class ChatService:
             configured_mode=configured_inference_mode,
             verified_coverage=verified_coverage,
         )
+        paired_outbox_rows = [
+            row
+            for row in self.repositories.list_post_turn_outbox_steps(save_id=save_id)
+            if row.player_message_id == player_message_id
+            and row.narrator_message_id == narrator_message_id
+        ]
+        outbox_rows = [
+            row
+            for row in paired_outbox_rows
+            if row.turn_revision == boundary.expected_revision_token
+        ]
+        for obsolete in paired_outbox_rows:
+            if (
+                obsolete.turn_revision != boundary.expected_revision_token
+                and obsolete.status not in {"succeeded", "skipped", "superseded"}
+            ):
+                self.repositories.complete_post_turn_outbox_step(
+                    obsolete.id,
+                    status="superseded",
+                    result={"superseded_by": boundary.expected_revision_token},
+                    expected_statuses=("pending", "failed"),
+                )
+        if not outbox_rows:
+            outbox_rows = self.repositories.ensure_post_turn_outbox_steps(
+                save_id=save_id,
+                player_message_id=player_message_id,
+                narrator_message_id=narrator_message_id,
+                turn_revision=boundary.expected_revision_token,
+                steps=POST_TURN_DURABLE_STEPS,
+                payload={
+                    "turn_revision": boundary.to_json(),
+                    "verified_plan_coverage": verified_coverage.to_json(),
+                    "current_user_id": current_user_id,
+                },
+            )
+        outbox_by_step = {row.step: row for row in outbox_rows}
 
         def start_jobs() -> tuple[JobRecord, object | None]:
             coordinator = self.jobs.create_running(
@@ -3998,6 +4193,10 @@ class ChatService:
                     "turn_revision_status": (
                         "current_head" if current_head else "stale_rebase"
                     ),
+                    "post_turn_outbox_step_ids": {
+                        name: row.id for name, row in outbox_by_step.items()
+                    },
+                    "resume_only": resume_only,
                 },
                 collect_provider_diagnostics=True,
             )
@@ -4017,6 +4216,12 @@ class ChatService:
             async with world_update_context():
                 coordinator, prepared_image = start_jobs()
         statuses = {name: "pending" for name in POST_TURN_JOB_ORDER}
+        for name, row in outbox_by_step.items():
+            if row.status in {"succeeded", "skipped", "superseded"}:
+                statuses[name] = row.status
+        if resume_only:
+            statuses["scenario"] = "skipped"
+            statuses["image"] = "skipped"
         step_results: dict[str, dict[str, object]] = {}
         current_pressure = self._recent_provider_pressure(save_id=save_id)
 
@@ -4093,6 +4298,31 @@ class ChatService:
             callback: Callable[[], Any],
         ) -> str:
             step_started = perf_counter()
+            outbox_row = outbox_by_step.get(name)
+            if outbox_row is not None:
+                claimed = self.repositories.claim_post_turn_outbox_step(
+                    outbox_row.id
+                )
+                if claimed is None:
+                    current = next(
+                        (
+                            row
+                            for row in self.repositories.list_post_turn_outbox_steps(
+                                save_id=save_id
+                            )
+                            if row.id == outbox_row.id
+                        ),
+                        None,
+                    )
+                    if current is not None and current.status in {
+                        "succeeded",
+                        "skipped",
+                        "superseded",
+                    }:
+                        publish(name, current.status)
+                        return current.status
+                    return "pending"
+                outbox_by_step[name] = claimed
             publish(name, "running")
             try:
                 with runtime_telemetry_context(
@@ -4104,6 +4334,15 @@ class ChatService:
                         result = callback()
                         if asyncio.iscoroutine(result):
                             result = await result
+            except asyncio.CancelledError:
+                if outbox_row is not None:
+                    outbox_by_step[name] = (
+                        self.repositories.requeue_post_turn_outbox_step(
+                            outbox_row.id,
+                            error=f"Post-turn {name} was interrupted",
+                        )
+                    )
+                raise
             except Exception as exc:
                 log_error_event(
                     "chat.post_turn_job_failed",
@@ -4123,6 +4362,14 @@ class ChatService:
                     step_started,
                     error=str(exc) or exc.__class__.__name__,
                 )
+                if outbox_row is not None:
+                    outbox_by_step[name] = (
+                        self.repositories.complete_post_turn_outbox_step(
+                            outbox_row.id,
+                            status="failed",
+                            error=str(exc) or exc.__class__.__name__,
+                        )
+                    )
                 return "failed"
             if isinstance(result, _PostTurnStepResult):
                 status = result.status
@@ -4142,6 +4389,32 @@ class ChatService:
                 step_started,
                 metadata=step_results.get(name),
             )
+            if outbox_row is not None:
+                if status in POST_TURN_DEPENDENCY_SATISFYING_STATUSES:
+                    terminal_status = "skipped" if status == "skipped" else "succeeded"
+                    outbox_by_step[name] = (
+                        self.repositories.complete_post_turn_outbox_step(
+                            outbox_row.id,
+                            status=terminal_status,
+                            result=step_results.get(name),
+                        )
+                    )
+                elif status == "failed":
+                    outbox_by_step[name] = (
+                        self.repositories.complete_post_turn_outbox_step(
+                            outbox_row.id,
+                            status="failed",
+                            result=step_results.get(name),
+                            error=f"Post-turn {name} failed",
+                        )
+                    )
+                else:
+                    outbox_by_step[name] = (
+                        self.repositories.requeue_post_turn_outbox_step(
+                            outbox_row.id,
+                            error=f"Post-turn {name} remains {status}",
+                        )
+                    )
             return status
 
         def pressure_gate_enabled(name: str) -> bool:
@@ -4342,6 +4615,9 @@ class ChatService:
                 player_message_id=player_message_id,
                 narrator_message_id=narrator_message_id,
             ),
+            "context_precompute": lambda: self._precompute_next_turn_context(
+                save_id=save_id,
+            ),
             "image": lambda: self._generate_automatic_image_after_turn_step(
                 prepared_image=prepared_image,
                 defer_image_generation=defer_image_generation,
@@ -4358,28 +4634,16 @@ class ChatService:
             "image",
         }
 
-        async def run_named_step(name: str) -> str:
+        async def run_named_step_unlocked(name: str) -> str:
             if stale_rebase and name == "context":
-                return await run_step(
-                    name,
-                    lambda: _PostTurnStepResult(
-                        "succeeded",
-                        {
-                            "source_scoped_rebased": True,
-                            "turn_revision_status": "stale_rebase",
-                            "source_message_ids": [
-                                player_message_id,
-                                narrator_message_id,
-                            ],
-                        },
-                    ),
-                )
+                return await run_step(name, run_stale_context_step)
             if stale_rebase and name in {
                 "summary",
                 "time_reconciliation",
                 "proactive_text",
                 "director",
                 "scenario",
+                "context_precompute",
                 "image",
             }:
                 return await run_step(
@@ -4400,6 +4664,9 @@ class ChatService:
                 return await run_pressure_sensitive_step(name, callbacks[name])
             return await run_step(name, callbacks[name])
 
+        async def run_named_step(name: str) -> str:
+            return await run_named_step_unlocked(name)
+
         def run_context_barrier() -> None:
             self._run_post_turn_context_barrier(
                 save_id=save_id,
@@ -4409,8 +4676,48 @@ class ChatService:
                 source_scoped_only=stale_rebase,
             )
 
-        pending = set(POST_TURN_JOB_ORDER)
-        satisfied: set[str] = set()
+        def run_stale_context_step() -> _PostTurnStepResult:
+            run_context_barrier()
+            return _PostTurnStepResult(
+                "succeeded",
+                {
+                    "source_scoped_rebased": True,
+                    "turn_revision_status": "stale_rebase",
+                    "source_message_ids": [
+                        player_message_id,
+                        narrator_message_id,
+                    ],
+                },
+            )
+
+        async def run_context_step() -> object:
+            try:
+                return await self._update_context_if_configured(
+                    save_id=save_id,
+                    player_message_id=player_message_id,
+                    narrator_message_id=narrator_message_id,
+                    inference_mode=inference_mode,
+                    verified_coverage=verified_coverage,
+                    turn_revision=boundary,
+                )
+            finally:
+                run_context_barrier()
+
+        callbacks["context"] = run_context_step
+
+        pending = {
+            name
+            for name in POST_TURN_JOB_ORDER
+            if statuses[name]
+            not in POST_TURN_DEPENDENCY_SATISFYING_STATUSES
+            and statuses[name] != "superseded"
+        }
+        satisfied: set[str] = {
+            name
+            for name in POST_TURN_JOB_ORDER
+            if statuses[name] in POST_TURN_DEPENDENCY_SATISFYING_STATUSES
+            or statuses[name] == "superseded"
+        }
         running: dict[asyncio.Task[str], str] = {}
 
         def start_ready_steps() -> None:
@@ -4483,8 +4790,6 @@ class ChatService:
                 for task in done:
                     name = running.pop(task)
                     status = await task
-                    if name == "context":
-                        run_context_barrier()
                     if status in POST_TURN_DEPENDENCY_SATISFYING_STATUSES:
                         satisfied.add(name)
                 block_pending_dependents()
@@ -4530,6 +4835,20 @@ class ChatService:
                 save_id=save_id
             ),
         }
+        refreshed_outbox = [
+            row
+            for row in self.repositories.list_post_turn_outbox_steps(save_id=save_id)
+            if row.player_message_id == player_message_id
+            and row.narrator_message_id == narrator_message_id
+            and row.turn_revision == boundary.expected_revision_token
+        ]
+        incomplete_outbox = [
+            row
+            for row in refreshed_outbox
+            if row.status not in {"succeeded", "skipped", "superseded"}
+        ]
+        coordinator_result["continuity_degraded"] = bool(incomplete_outbox)
+        coordinator_result["retry_pending"] = bool(incomplete_outbox)
         maintenance_failed_jobs = [
             name
             for name in ("state", "context", "proactive_text", "director", "scenario")
@@ -4558,7 +4877,14 @@ class ChatService:
 
         def finish_coordinator() -> None:
             finalize_current_head_snapshot()
-            self.jobs.succeed(coordinator.id, result=coordinator_result)
+            if incomplete_outbox:
+                self.jobs.fail(
+                    coordinator.id,
+                    result=coordinator_result,
+                    error="Post-turn continuity is degraded; retry pending",
+                )
+            else:
+                self.jobs.succeed(coordinator.id, result=coordinator_result)
 
         if world_update_context is None:
             finish_coordinator()
@@ -4573,6 +4899,16 @@ class ChatService:
         )
         return coordinator_result
 
+    def _precompute_next_turn_context(self, *, save_id: str) -> _PostTurnStepResult:
+        precompute = getattr(self.context_search_service, "precompute_next_turn", None)
+        if not callable(precompute):
+            return _PostTurnStepResult(
+                "skipped",
+                {"skipped_reason": "context_precompute_unavailable"},
+            )
+        precompute(save_id)
+        return _PostTurnStepResult("succeeded", {"cache_status": "stored"})
+
     def _run_world_context_retention(self, *, save_id: str) -> None:
         try:
             self.world_context_retention_service.prune(save_id)
@@ -4582,6 +4918,78 @@ class ChatService:
                 save_id=save_id,
                 **exception_log_fields(exc),
             )
+
+    async def run_post_turn_outbox_recovery(
+        self,
+        *,
+        save_id: str | None = None,
+    ) -> int:
+        """Resume each turn whose durable post-turn pipeline is incomplete."""
+        rows = self.repositories.list_post_turn_outbox_steps(
+            save_id=save_id,
+            statuses=("pending", "failed"),
+        )
+        turns: dict[tuple[str, str, str, str], PostTurnOutboxRecord] = {}
+        for row in rows:
+            turns.setdefault(
+                (
+                    row.save_id,
+                    row.player_message_id,
+                    row.narrator_message_id,
+                    row.turn_revision,
+                ),
+                row,
+            )
+        completed = 0
+        for row in turns.values():
+            payload = row.payload
+            try:
+                await self.run_post_turn_jobs(
+                    save_id=row.save_id,
+                    player_message_id=row.player_message_id,
+                    narrator_message_id=row.narrator_message_id,
+                    turn_revision=(
+                        cast(Mapping[str, object], payload.get("turn_revision"))
+                        if isinstance(payload.get("turn_revision"), Mapping)
+                        else None
+                    ),
+                    verified_coverage=verified_post_turn_coverage_from_mapping(
+                        payload.get("verified_plan_coverage")
+                    ),
+                    current_user_id=(
+                        str(payload["current_user_id"])
+                        if payload.get("current_user_id") is not None
+                        else None
+                    ),
+                    defer_image_generation=True,
+                    resume_only=True,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                for running in self.repositories.list_post_turn_outbox_steps(
+                    save_id=row.save_id,
+                    statuses=("running",),
+                ):
+                    if (
+                        running.player_message_id == row.player_message_id
+                        and running.narrator_message_id == row.narrator_message_id
+                        and running.turn_revision == row.turn_revision
+                    ):
+                        self.repositories.requeue_post_turn_outbox_step(
+                            running.id,
+                            error=_safe_error_text(exc),
+                        )
+                log_error_event(
+                    "chat.post_turn_outbox_turn_recovery_failed",
+                    save_id=row.save_id,
+                    player_message_id=row.player_message_id,
+                    narrator_message_id=row.narrator_message_id,
+                    **exception_log_fields(exc),
+                )
+                continue
+            completed += 1
+        return completed
 
     async def run_state_extraction_retries(self, *, save_id: str | None = None) -> int:
         retry_jobs = [
@@ -4671,6 +5079,17 @@ class ChatService:
                     already_applied_result["turn_revision_status"] = (
                         "stale_rebase" if stale_rebase else "current_head"
                     )
+                self.repositories.complete_post_turn_outbox_step_for_turn(
+                    save_id=retry_save_id,
+                    source_message_ids=source_message_ids,
+                    step="state",
+                    result=already_applied_result,
+                    turn_revision=(
+                        boundary.expected_revision_token
+                        if explicit_turn_revision
+                        else None
+                    ),
+                )
                 self.jobs.succeed(running.id, result=already_applied_result)
                 completed += 1
                 continue
@@ -4813,6 +5232,15 @@ class ChatService:
                 success_result["suppressed_state_change_count"] = (
                     applied.suppressed_state_change_count
                 )
+            self.repositories.complete_post_turn_outbox_step_for_turn(
+                save_id=retry_save_id,
+                source_message_ids=source_message_ids,
+                step="state",
+                result=success_result,
+                turn_revision=(
+                    boundary.expected_revision_token if explicit_turn_revision else None
+                ),
+            )
             self.jobs.succeed(running.id, result=success_result)
             completed += 1
         return completed
@@ -4879,6 +5307,13 @@ class ChatService:
                     source="context_retry",
                     base_snapshot_id=boundary.base_snapshot_id,
                     source_scoped_only=True,
+                )
+                self.repositories.complete_post_turn_outbox_step_for_turn(
+                    save_id=retry_save_id,
+                    source_message_ids=source_message_ids,
+                    step="context",
+                    result={"source_scoped_rebased": True},
+                    turn_revision=boundary.expected_revision_token,
                 )
                 self.jobs.succeed(
                     running.id,
@@ -4986,6 +5421,17 @@ class ChatService:
                         result=full_context_result_payload,
                     )
                     continue
+                self.repositories.complete_post_turn_outbox_step_for_turn(
+                    save_id=retry_save_id,
+                    source_message_ids=source_message_ids,
+                    step="context",
+                    result=full_context_result_payload,
+                    turn_revision=(
+                        boundary.expected_revision_token
+                        if explicit_turn_revision
+                        else None
+                    ),
+                )
                 self.jobs.succeed(running.id, result=full_context_result_payload)
                 completed += 1
                 continue
@@ -5113,6 +5559,15 @@ class ChatService:
                 source="context_retry",
                 base_snapshot_id=boundary.base_snapshot_id,
                 source_scoped_only=False,
+            )
+            self.repositories.complete_post_turn_outbox_step_for_turn(
+                save_id=retry_save_id,
+                source_message_ids=source_message_ids,
+                step="context",
+                result=success_result,
+                turn_revision=(
+                    boundary.expected_revision_token if explicit_turn_revision else None
+                ),
             )
             self.jobs.succeed(
                 running.id,
@@ -5815,7 +6270,27 @@ class ChatService:
         if cancellation_token is not None:
             cancellation_token.on_cancel(cancel_search)
         try:
-            return await search_task
+            result = await search_task
+            continuity_degraded = bool(
+                self.repositories.list_post_turn_outbox_steps(
+                    save_id=save_id,
+                    statuses=("pending", "running", "failed"),
+                )
+            )
+            if not continuity_degraded:
+                return result
+            return replace(
+                result,
+                selected_state=(),
+                selected_state_changes=(),
+                selected_memories=(),
+                selected_observations=(),
+                retrieval_degraded=True,
+                retrieval_recovery=(
+                    "Continuity repair is pending; unresolved derived context was "
+                    "excluded and the recent chronicle remains authoritative."
+                ),
+            )
         except asyncio.CancelledError:
             if cancellation_token is not None and cancellation_token.cancelled:
                 raise ChatTurnCancelled(CHAT_TURN_CANCELLED_ERROR) from None
@@ -5843,6 +6318,34 @@ class ChatService:
             save_id=save_id,
             focus_message=focus_message,
         )
+        return cast(ContextSearchResult, result)
+
+    async def _refine_context_for_plan(
+        self,
+        *,
+        save_id: str,
+        player_message_id: str,
+        request: EvidenceRefinementRequest,
+        prior_result: ContextSearchResult,
+    ) -> ContextSearchResult:
+        refine = getattr(self.context_search_service, "refine_for_plan", None)
+        if not callable(refine):
+            return prior_result
+        try:
+            result = await refine(
+                save_id=save_id,
+                player_message_id=player_message_id,
+                request=request,
+                prior_result=prior_result,
+            )
+        except Exception as exc:
+            log_error_event(
+                "chat.context_refinement_failed",
+                save_id=save_id,
+                player_message_id=player_message_id,
+                **exception_log_fields(exc),
+            )
+            return prior_result
         return cast(ContextSearchResult, result)
 
     async def _queue_look_around_update_suggestions(
@@ -11375,6 +11878,52 @@ def _budgeted_narrator_context(
         ),
         summary="\n".join(summaries) if summaries else None,
         context_breakdown=context_breakdown,
+    )
+
+
+def _request_with_budgeted_context(
+    request: ChatRequest,
+    context: _BudgetedNarratorContext,
+    *,
+    messages: tuple[ChatMessage, ...],
+) -> ChatRequest:
+    return replace(
+        request,
+        messages=messages,
+        scenario_instructions=context.scenario_instructions,
+        current_scene_recap=context.current_scene_recap,
+        character_voice_profiles=context.character_voice_profiles,
+        open_obligations=context.open_obligations,
+        pending_context_suggestions=context.pending_context_suggestions,
+        retrieved_scenario_sections=context.retrieved_scenario_sections,
+        retrieved_state=context.retrieved_state,
+        retrieved_state_changes=context.retrieved_state_changes,
+        retrieved_recent_messages=context.retrieved_recent_messages,
+        retrieved_media_assets=context.retrieved_media_assets,
+        retrieved_character_text_context=context.retrieved_character_text_context,
+        retrieved_memories=context.retrieved_memories,
+        retrieved_observations=context.retrieved_observations,
+        summary=context.summary,
+        context_breakdown=context.context_breakdown,
+    )
+
+
+def _context_result_selected_count(result: ContextSearchResult) -> int:
+    return sum(
+        len(items)
+        for items in (
+            result.selected_open_obligations,
+            result.selected_scenario_sections,
+            result.selected_state,
+            result.selected_state_changes,
+            result.selected_media_assets,
+            result.selected_character_text_context,
+            result.selected_memories,
+            result.selected_observations,
+            result.selected_character_voice,
+            result.selected_summaries,
+            result.selected_recent_messages,
+        )
     )
 
 

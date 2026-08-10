@@ -609,6 +609,46 @@ def test_export_import_preserves_pending_retry_budgets(
     assert imported_suggestion.max_retry_count == 2
 
 
+def test_export_import_preserves_incomplete_post_turn_outbox(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.ensure_post_turn_outbox_steps(
+        save_id=save.id,
+        player_message_id=PLAYER_MESSAGE_ID,
+        narrator_message_id=NARRATOR_MESSAGE_ID,
+        turn_revision="revision-1",
+        steps=("context",),
+        payload={
+            "verified_plan_coverage": {
+                "source_message_ids": [PLAYER_MESSAGE_ID, NARRATOR_MESSAGE_ID]
+            }
+        },
+    )
+    bundle_path = tmp_path / "exports" / "pending-continuity.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+    imported_rows = repositories.list_post_turn_outbox_steps(
+        save_id=_imported_save_id(imported)
+    )
+
+    assert len(imported_rows) == 1
+    assert imported_rows[0].step == "context"
+    assert imported_rows[0].status == "pending"
+    assert imported_rows[0].player_message_id != PLAYER_MESSAGE_ID
+    assert imported_rows[0].narrator_message_id != NARRATOR_MESSAGE_ID
+    imported_coverage = imported_rows[0].payload["verified_plan_coverage"]
+    assert isinstance(imported_coverage, dict)
+    assert imported_coverage["source_message_ids"] == [
+        imported_rows[0].player_message_id,
+        imported_rows[0].narrator_message_id,
+    ]
+
+
 def test_export_rejects_snapshot_that_cannot_be_imported(
     repositories: PersistenceRepositories,
     tmp_path: Path,

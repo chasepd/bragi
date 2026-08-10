@@ -9264,19 +9264,21 @@ def test_slow_action_choices_do_not_delay_next_narrator_turn(tmp_path: Path) -> 
         assert runtime.action_choices_started.wait(timeout=2)
 
         for _ in range(50):
-            post_turn_jobs = [
+            active_jobs = client.get("/api/jobs?status=active").json()["jobs"]
+            action_choice_jobs = [
                 job
-                for job in client.get("/api/jobs?status=active").json()["jobs"]
-                if job["type"] == "post_turn_background"
+                for job in active_jobs
+                if job["type"] == "action_choice_generate"
             ]
-            if (
-                post_turn_jobs
-                and post_turn_jobs[0]["completion_level"] == "continuity_ready"
-            ):
+            post_turn_active = any(
+                job["type"] == "post_turn_background" for job in active_jobs
+            )
+            if action_choice_jobs and not post_turn_active:
                 break
             time.sleep(0.01)
         else:
-            raise AssertionError("post-turn continuity did not become ready")
+            raise AssertionError("independent action-choice job was not exposed")
+        assert not post_turn_active
 
         second = client.post(
             "/api/chat",
@@ -9292,15 +9294,13 @@ def test_slow_action_choices_do_not_delay_next_narrator_turn(tmp_path: Path) -> 
         assert second_finished["status"] == "succeeded"
 
         runtime.release_action_choices.set()
-        post_turn_finished = _wait_for_terminal_job(
+        action_choice_finished = _wait_for_terminal_job(
             client,
-            post_turn_jobs[0]["id"],
+            action_choice_jobs[0]["id"],
             save_id="save-1",
         )
 
-    assert post_turn_finished["completion_level"] == (
-        "optional_enrichments_complete"
-    )
+    assert action_choice_finished["status"] == "cancelled"
 
 
 def test_chat_turn_leaves_state_pruning_for_scheduler(tmp_path: Path) -> None:
@@ -14726,6 +14726,25 @@ class _RecordingCharacterTextProvider:
 def _allow_safety_response(
     request: StructuredOutputRequest,
 ) -> StructuredOutputResponse:
+    if request.schema_name == "content_safety_batch_review":
+        reviews_schema = request.schema["properties"]["reviews"]
+        count = int(reviews_schema["minItems"])
+        return StructuredOutputResponse(
+            data={
+                "reviews": [
+                    {
+                        "ordinal": ordinal,
+                        "action": "allow",
+                        "category": "none",
+                        "reason": "Test fixture content is within the ceiling.",
+                        "minimum_rating": "g",
+                    }
+                    for ordinal in range(1, count + 1)
+                ]
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
     if request.schema_name != "content_safety_review":
         raise AssertionError(f"unexpected structured schema: {request.schema_name}")
     return StructuredOutputResponse(

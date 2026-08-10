@@ -42,6 +42,7 @@ EXPECTED_TABLES = {
     "entity_links",
     "job_steps",
     "jobs",
+    "post_turn_outbox",
     "locations",
     "media_assets",
     "memories",
@@ -181,6 +182,19 @@ EXPECTED_COLUMNS = {
         "task",
         "metadata_json",
     },
+    "post_turn_outbox": {
+        "id",
+        "save_id",
+        "player_message_id",
+        "narrator_message_id",
+        "turn_revision",
+        "step",
+        "status",
+        "attempt_count",
+        "payload_json",
+        "result_json",
+        "last_error",
+    },
     "users": {
         "id",
         "username",
@@ -285,6 +299,7 @@ EXPECTED_INDEXES = {
     "idx_jobs_save_status_completed",
     "idx_jobs_status_type_save_completed",
     "idx_job_steps_provider_model_task_status_completed",
+    "idx_post_turn_outbox_save_status_updated",
     "idx_locations_save_active_name_created",
     "idx_media_assets_save_active_created",
     "idx_media_assets_save_source_type_active",
@@ -2089,6 +2104,58 @@ def test_migration_76_to_77_adds_turn_outcomes_schema(tmp_path: Path) -> None:
     with sqlite3.connect(database_path) as connection:
         columns = _column_names(connection, "turn_outcomes")
         assert {"id", "save_id", "message_id", "payload_json", "created_at"} <= columns
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_78_to_79_adds_action_choice_generation_claims(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE message_action_choice_generation_claims")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 79")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = _column_names(
+            connection,
+            "message_action_choice_generation_claims",
+        )
+        assert {
+            "message_id",
+            "save_id",
+            "narrator_updated_at",
+            "generation_token",
+            "created_at",
+            "updated_at",
+        } <= columns
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_79_to_80_adds_post_turn_outbox(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE post_turn_outbox")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 80")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = _column_names(connection, "post_turn_outbox")
+        assert {
+            "id",
+            "save_id",
+            "player_message_id",
+            "narrator_message_id",
+            "turn_revision",
+            "step",
+            "status",
+        } <= columns
         assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
 
 

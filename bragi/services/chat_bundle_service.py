@@ -378,6 +378,17 @@ class ChatBundleService:
                 """,
                 (save_id,),
             ),
+            "post_turn_outbox": self._rows(
+                """
+                SELECT player_message_id, narrator_message_id, turn_revision,
+                       step, payload_json, last_error, created_at, updated_at
+                FROM post_turn_outbox
+                WHERE save_id = ?
+                  AND status IN ('pending', 'running', 'failed')
+                ORDER BY created_at, rowid
+                """,
+                (save_id,),
+            ),
             "message_revisions": (
                 self._rows(
                     """
@@ -1312,6 +1323,54 @@ class ChatBundleService:
             "character_text_message": character_text_message_id_map,
             "character_text_messages": character_text_message_id_map,
         }
+        imported_revision_token = (
+            self.repositories.context_candidate_revision_token(save.id)
+        )
+        for row in _list_of_objects(
+            data.get("post_turn_outbox"),
+            "post_turn_outbox",
+        ):
+            original_player_id = _text(row, "player_message_id")
+            original_narrator_id = _text(row, "narrator_message_id")
+            if (
+                original_player_id not in message_id_map
+                or original_narrator_id not in message_id_map
+            ):
+                continue
+            payload = _json_object(row, "payload_json")
+            coverage = payload.get("verified_plan_coverage")
+            if isinstance(coverage, dict):
+                source_ids = coverage.get("source_message_ids")
+                if isinstance(source_ids, list):
+                    coverage["source_message_ids"] = [
+                        message_id_map[source_id]
+                        for source_id in source_ids
+                        if isinstance(source_id, str) and source_id in message_id_map
+                    ]
+            boundary = payload.get("turn_revision")
+            if isinstance(boundary, dict):
+                boundary["save_id"] = save.id
+                for field in (
+                    "player_message_id",
+                    "narrator_message_id",
+                    "expected_head_message_id",
+                ):
+                    original_message_id = boundary.get(field)
+                    if isinstance(original_message_id, str):
+                        boundary[field] = message_id_map.get(
+                            original_message_id,
+                            message_id_map[original_narrator_id],
+                        )
+                boundary["base_snapshot_id"] = None
+                boundary["expected_revision_token"] = imported_revision_token
+            self.repositories.ensure_post_turn_outbox_steps(
+                save_id=save.id,
+                player_message_id=message_id_map[original_player_id],
+                narrator_message_id=message_id_map[original_narrator_id],
+                turn_revision=imported_revision_token,
+                steps=(_text(row, "step"),),
+                payload=payload,
+            )
         message_action_choice_id_map: dict[str, str] = {}
         for row in _list_of_objects(
             data.get("message_action_choices"),
