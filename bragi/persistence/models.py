@@ -876,6 +876,19 @@ class JobRecord:
 
 
 @dataclass(frozen=True)
+class ChatTurnSubmissionRecord:
+    save_id: str
+    client_turn_id: str
+    operation: str
+    request_fingerprint: str
+    job: JobRecord
+    player_message_id: str | None = None
+    narrator_message_id: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(frozen=True)
 class ScheduledTaskRecord:
     id: str
     task_type: str

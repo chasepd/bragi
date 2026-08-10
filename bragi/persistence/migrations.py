@@ -22,7 +22,7 @@ from bragi.text_search import (
     unicode_word_terms,
 )
 
-CURRENT_SCHEMA_VERSION = 80
+CURRENT_SCHEMA_VERSION = 81
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
@@ -669,6 +669,22 @@ ON jobs(status, type, save_id, completed_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_save_status_completed
 ON jobs(save_id, status, completed_at);
 
+CREATE TABLE IF NOT EXISTS chat_turn_submissions (
+    save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+    client_turn_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+    player_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    narrator_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(save_id, client_turn_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_turn_submissions_job_id
+ON chat_turn_submissions(job_id);
+
 CREATE TABLE IF NOT EXISTS job_steps (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -756,7 +772,10 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 79:
+            if current == 80:
+                _migrate_schema_80_to_81(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 79:
                 _migrate_schema_79_to_80(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 78:
@@ -979,6 +998,8 @@ def migrate_database(database_path: Path | str) -> None:
             _migrate_schema_78_to_79(connection)
         if not _schema_migration_applied(connection, 80):
             _migrate_schema_79_to_80(connection)
+        if not _schema_migration_applied(connection, 81):
+            _migrate_schema_80_to_81(connection)
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
         _ensure_context_observation_curation_schema(connection)
@@ -1033,6 +1054,7 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         _ensure_character_text_message_revision_schema(connection)
         _ensure_character_text_message_attachment_schema(connection)
         _ensure_turn_snapshot_schema(connection)
+        _ensure_chat_turn_submission_schema(connection)
         _ensure_summary_pressure_state_schema(connection)
         _ensure_context_revision_schema(connection)
         _ensure_continuity_index_revision_schema(connection)
@@ -2368,6 +2390,34 @@ def _migrate_schema_79_to_80(connection: sqlite3.Connection) -> None:
     _ensure_post_turn_outbox_schema(connection)
     _ensure_message_action_choice_generation_claim_schema(connection)
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (80)")
+
+
+def _migrate_schema_80_to_81(connection: sqlite3.Connection) -> None:
+    _ensure_chat_turn_submission_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (81)")
+
+
+def _ensure_chat_turn_submission_schema(connection: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS chat_turn_submissions (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            client_turn_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
+            job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+            player_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+            narrator_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(save_id, client_turn_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_turn_submissions_job_id
+        ON chat_turn_submissions(job_id);
+        """,
+    )
 
 
 def _ensure_post_turn_outbox_schema(connection: sqlite3.Connection) -> None:

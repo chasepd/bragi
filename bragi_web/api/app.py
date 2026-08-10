@@ -10,11 +10,13 @@ import mimetypes
 import os
 import secrets
 import socket
+import sqlite3
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import perf_counter, time
@@ -32,7 +34,7 @@ from typing import (
     get_type_hints,
 )
 from urllib.parse import SplitResult, urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import (
     Depends,
@@ -379,6 +381,7 @@ class ChatRequest(BaseModel):
     body: str = Field(default="", max_length=MAX_CHAT_BODY_CHARS)
     speaker_name: str | None = None
     save_id: str | None = None
+    client_turn_id: UUID
 
 
 class LookAroundRequest(BaseModel):
@@ -433,6 +436,12 @@ class CharacterTextDeleteRequest(BaseModel):
 class TimeskipRequest(BaseModel):
     instruction: str = ""
     save_id: str | None = None
+    client_turn_id: UUID
+
+
+class ContinueStoryRequest(BaseModel):
+    save_id: str | None = None
+    client_turn_id: UUID
 
 
 class SaveScopedRequest(BaseModel):
@@ -3218,16 +3227,38 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 status_code=400,
                 detail="speaker_name is reserved for internal Storyteller turns",
             )
-        return await _submit_chat(payload, state)
+        return await _submit_chat(payload, state, operation="chat")
 
     async def _submit_chat(
         payload: ChatRequest,
         state: StateDep,
+        *,
+        operation: str,
     ) -> dict[str, Any]:
         async with state.lock.async_access():
             submitted_save_id = _require_save_id(payload.save_id)
             _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
             current_user_id = _owner_user_id_for_request(state)
+        request_fingerprint = _chat_turn_request_fingerprint(
+            operation,
+            {
+                "body": payload.body.strip(),
+                "speaker_name": (
+                    payload.speaker_name.strip()
+                    if payload.speaker_name and payload.speaker_name.strip()
+                    else None
+                ),
+            },
+        )
+        replay = _chat_turn_submission_replay(
+            state,
+            save_id=submitted_save_id,
+            client_turn_id=str(payload.client_turn_id),
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+        )
+        if replay is not None:
+            return replay
         status = _chat_submission_status(state, submitted_save_id)
         if not status["can_submit"]:
             if status["reason"] == "no_save":
@@ -3280,6 +3311,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             finally:
                 await flush_retry_progress()
                 await flush_turn_progress()
+            _link_chat_turn_submission_messages(state, handle, turn)
             _raise_for_initial_chat_turn_failure(
                 turn,
                 failure_message="Chat turn did not produce a narrator response",
@@ -3325,22 +3357,40 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 return _initial_chat_turn_result(turn)
             return _initial_chat_turn_result(turn)
 
-        return await _create_job_summary(
+        return await _create_idempotent_chat_job_summary(
             state,
-            "chat_turn",
             worker,
             save_id=submitted_save_id,
-            exclusive_key=_chat_turn_exclusive_key(submitted_save_id),
+            client_turn_id=str(payload.client_turn_id),
+            operation=operation,
+            request_fingerprint=request_fingerprint,
         )
 
     @app.post("/api/chat/continue")
     async def continue_story(
-        payload: SaveScopedRequest,
+        payload: ContinueStoryRequest,
         state: StateDep,
     ) -> dict[str, Any]:
         async with state.lock.async_access():
             submitted_save_id = _require_save_id(payload.save_id)
             _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
+        request_fingerprint = _chat_turn_request_fingerprint(
+            "continue",
+            {
+                "body": STORY_CONTINUATION_DIRECTION,
+                "speaker_name": STORY_CONTINUATION_SPEAKER_NAME,
+            },
+        )
+        replay = _chat_turn_submission_replay(
+            state,
+            save_id=submitted_save_id,
+            client_turn_id=str(payload.client_turn_id),
+            operation="continue",
+            request_fingerprint=request_fingerprint,
+        )
+        if replay is not None:
+            return replay
+        async with state.lock.async_access():
             save = state.repositories.get_save(submitted_save_id)
             if (
                 save is None
@@ -3357,8 +3407,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 body=STORY_CONTINUATION_DIRECTION,
                 speaker_name=STORY_CONTINUATION_SPEAKER_NAME,
                 save_id=submitted_save_id,
+                client_turn_id=payload.client_turn_id,
             ),
             state,
+            operation="continue",
         )
 
     @app.post("/api/chat/look-around")
@@ -3429,6 +3481,19 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             _raise_unless_save_action_allowed(state, submitted_save_id, "mutate")
             current_user_id = _owner_user_id_for_request(state)
         status = _chat_submission_status(state, submitted_save_id)
+        request_fingerprint = _chat_turn_request_fingerprint(
+            "timeskip",
+            {"instruction": instruction},
+        )
+        replay = _chat_turn_submission_replay(
+            state,
+            save_id=submitted_save_id,
+            client_turn_id=str(payload.client_turn_id),
+            operation="timeskip",
+            request_fingerprint=request_fingerprint,
+        )
+        if replay is not None:
+            return replay
         if not status["can_submit"]:
             if status["reason"] == "no_save":
                 raise HTTPException(status_code=400, detail="No save loaded")
@@ -3478,6 +3543,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             finally:
                 await flush_retry_progress()
                 await flush_turn_progress()
+            _link_chat_turn_submission_messages(state, handle, turn)
             _raise_for_initial_chat_turn_failure(
                 turn,
                 failure_message="Timeskip did not produce a narrator response",
@@ -3523,12 +3589,13 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 return _initial_chat_turn_result(turn)
             return _initial_chat_turn_result(turn)
 
-        return await _create_job_summary(
+        return await _create_idempotent_chat_job_summary(
             state,
-            "chat_turn",
             worker,
             save_id=submitted_save_id,
-            exclusive_key=_chat_turn_exclusive_key(submitted_save_id),
+            client_turn_id=str(payload.client_turn_id),
+            operation="timeskip",
+            request_fingerprint=request_fingerprint,
         )
 
     @app.post("/api/chat/cancel")
@@ -8971,6 +9038,168 @@ async def _create_job_summary(
                 detail=_CHAT_TURN_ACTIVE_DETAIL,
             ) from exc
         raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except JobRegistryFullError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+
+def _chat_turn_request_fingerprint(
+    operation: str,
+    normalized_payload: dict[str, object],
+) -> str:
+    encoded = json.dumps(
+        {"operation": operation, "payload": normalized_payload},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _chat_turn_submission_replay(
+    state: WebAppState,
+    *,
+    save_id: str,
+    client_turn_id: str,
+    operation: str,
+    request_fingerprint: str,
+) -> dict[str, Any] | None:
+    get_submission = getattr(
+        state.repositories,
+        "get_chat_turn_submission",
+        None,
+    )
+    if not callable(get_submission):
+        return None
+    submission = get_submission(
+        save_id=save_id,
+        client_turn_id=client_turn_id,
+    )
+    if submission is None:
+        return None
+    if (
+        submission.operation != operation
+        or submission.request_fingerprint != request_fingerprint
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "client_turn_id was already used for a different chat submission."
+            ),
+        )
+    live = state.jobs.get(submission.job.id)
+    if live is not None:
+        return _job_summary_for_request(state, live)
+    persisted = submission.job
+    result: object = persisted.result
+    if persisted.status == "succeeded":
+        result = {
+            "kind": "chat_turn_replay",
+            "save_id": save_id,
+            "player_message_id": submission.player_message_id,
+            "narrator_message_id": submission.narrator_message_id,
+            "requires_full_refresh": True,
+        }
+    return {
+        "id": persisted.id,
+        "type": persisted.type,
+        "save_id": persisted.save_id,
+        "status": persisted.status,
+        "completion_level": (
+            RESPONSE_COMMITTED if submission.narrator_message_id else None
+        ),
+        "result": result,
+        "error": persisted.error,
+        "latest_progress": None,
+    }
+
+
+def _link_chat_turn_submission_messages(
+    state: WebAppState,
+    handle: JobHandle,
+    turn: object,
+) -> None:
+    link_messages = getattr(
+        state.repositories,
+        "link_chat_turn_submission_messages",
+        None,
+    )
+    if callable(link_messages):
+        link_messages(
+            job_id=handle.record.id,
+            player_message_id=getattr(turn, "player_message_id", None),
+            narrator_message_id=getattr(turn, "narrator_message_id", None),
+        )
+
+
+async def _create_idempotent_chat_job_summary(
+    state: WebAppState,
+    worker: JobWorker,
+    *,
+    save_id: str,
+    client_turn_id: str,
+    operation: str,
+    request_fingerprint: str,
+) -> dict[str, Any]:
+    job_id = uuid4().hex
+    creator_user_id = _owner_user_id_for_request(state)
+    exclusive_key = _chat_turn_exclusive_key(save_id)
+
+    def persist(record: JobRecord) -> None:
+        create_submission = getattr(
+            state.repositories,
+            "create_chat_turn_submission_job",
+            None,
+        )
+        if not callable(create_submission):
+            return
+        create_submission(
+            save_id=save_id,
+            client_turn_id=client_turn_id,
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+            creator_user_id=creator_user_id,
+            job_id=record.id,
+            payload={
+                "source": "web",
+                "exclusive_key": exclusive_key or "",
+                "operation": operation,
+            },
+        )
+
+    try:
+        supports_durable_submission = callable(
+            getattr(
+                state.repositories,
+                "create_chat_turn_submission_job",
+                None,
+            )
+        )
+        record = await state.jobs.create(
+            "chat_turn",
+            worker,
+            save_id=save_id,
+            creator_user_id=creator_user_id,
+            exclusive_key=exclusive_key,
+            job_id=job_id,
+            persist_before_start=(persist if supports_durable_submission else None),
+        )
+        return _job_summary_for_request(state, record)
+    except (sqlite3.IntegrityError, JobRegistryExclusiveKeyError) as exc:
+        replay = _chat_turn_submission_replay(
+            state,
+            save_id=save_id,
+            client_turn_id=client_turn_id,
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+        )
+        if replay is not None:
+            return replay
+        if isinstance(exc, JobRegistryExclusiveKeyError):
+            raise HTTPException(
+                status_code=409,
+                detail=_CHAT_TURN_ACTIVE_DETAIL,
+            ) from exc
+        raise
     except JobRegistryFullError as exc:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
 

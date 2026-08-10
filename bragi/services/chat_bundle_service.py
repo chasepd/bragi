@@ -389,6 +389,21 @@ class ChatBundleService:
                 """,
                 (save_id,),
             ),
+            "chat_turn_submissions": self._rows(
+                """
+                SELECT submission.client_turn_id, submission.operation,
+                       submission.request_fingerprint,
+                       submission.player_message_id,
+                       submission.narrator_message_id,
+                       submission.created_at, submission.updated_at,
+                       job.status AS job_status, job.error AS job_error
+                FROM chat_turn_submissions AS submission
+                JOIN jobs AS job ON job.id = submission.job_id
+                WHERE submission.save_id = ?
+                ORDER BY submission.created_at, submission.rowid
+                """,
+                (save_id,),
+            ),
             "message_revisions": (
                 self._rows(
                     """
@@ -1326,6 +1341,52 @@ class ChatBundleService:
         imported_revision_token = (
             self.repositories.context_candidate_revision_token(save.id)
         )
+        for row in _list_of_objects(
+            data.get("chat_turn_submissions"),
+            "chat_turn_submissions",
+        ):
+            original_player_id = _optional_text(row, "player_message_id")
+            original_narrator_id = _optional_text(row, "narrator_message_id")
+            imported_job_id = uuid4().hex
+            submission = self.repositories.create_chat_turn_submission_job(
+                save_id=save.id,
+                client_turn_id=_text(row, "client_turn_id"),
+                operation=_text(row, "operation"),
+                request_fingerprint=_text(row, "request_fingerprint"),
+                creator_user_id=owner_user_id,
+                job_id=imported_job_id,
+                payload={"source": "save_import", "imported": True},
+            )
+            self.repositories.link_chat_turn_submission_messages(
+                job_id=submission.job.id,
+                player_message_id=(
+                    message_id_map.get(original_player_id)
+                    if original_player_id is not None
+                    else None
+                ),
+                narrator_message_id=(
+                    message_id_map.get(original_narrator_id)
+                    if original_narrator_id is not None
+                    else None
+                ),
+            )
+            source_status = _text(row, "job_status")
+            if source_status == "succeeded" and original_narrator_id in message_id_map:
+                self.repositories.start_job(imported_job_id)
+                self.repositories.update_job(
+                    imported_job_id,
+                    status="succeeded",
+                    result={"imported_replay": True},
+                )
+            else:
+                self.repositories.cancel_job(
+                    imported_job_id,
+                    error=(
+                        _optional_text(row, "job_error")
+                        or "Chat submission was interrupted during save import"
+                    ),
+                    result={"imported_replay": True},
+                )
         for row in _list_of_objects(
             data.get("post_turn_outbox"),
             "post_turn_outbox",

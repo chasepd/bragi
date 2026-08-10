@@ -36,6 +36,7 @@ from bragi.persistence.models import (
     CharacterTextProvenanceRecord,
     CharacterTextThreadParticipantRecord,
     CharacterTextThreadRecord,
+    ChatTurnSubmissionRecord,
     ContextObservationCurationHealthRecord,
     ContextObservationCurationStateRecord,
     ContextObservationRecord,
@@ -271,6 +272,10 @@ _JOB_COLUMNS = (
     "id, save_id, creator_user_id, type, status, payload_json, result_json, error, "
     "created_at, started_at, completed_at, duration_ms, diagnostics_json"
 )
+
+
+def _qualified_columns(columns: str, alias: str) -> str:
+    return ", ".join(f"{alias}.{column.strip()}" for column in columns.split(","))
 _DATING_ROUTE_STATE_COLUMNS = (
     "id, save_id, player_character_id, npc_character_id, stage, "
     "first_met_message_id, first_met_world_day_index, "
@@ -1103,6 +1108,7 @@ class PersistenceRepositories:
         try:
             for table_name in (
                 "media_assets",
+                "chat_turn_submissions",
                 "jobs",
                 "save_loss_outcomes",
                 "save_loss_condition_changes",
@@ -13929,6 +13935,125 @@ class PersistenceRepositories:
         )
         return _job_from_row(row) if row is not None else None
 
+    def get_chat_turn_submission(
+        self,
+        *,
+        save_id: str,
+        client_turn_id: str,
+    ) -> ChatTurnSubmissionRecord | None:
+        row = self._fetch_one(
+            f"""
+            SELECT submission.save_id, submission.client_turn_id,
+                   submission.operation, submission.request_fingerprint,
+                   submission.player_message_id, submission.narrator_message_id,
+                   submission.created_at AS submission_created_at,
+                   submission.updated_at AS submission_updated_at,
+                   {_qualified_columns(_JOB_COLUMNS, 'job')}
+            FROM chat_turn_submissions AS submission
+            JOIN jobs AS job ON job.id = submission.job_id
+            WHERE submission.save_id = ? AND submission.client_turn_id = ?
+            """,
+            (save_id, client_turn_id),
+        )
+        return _chat_turn_submission_from_row(row) if row is not None else None
+
+    def create_chat_turn_submission_job(
+        self,
+        *,
+        save_id: str,
+        client_turn_id: str,
+        operation: str,
+        request_fingerprint: str,
+        creator_user_id: str | None,
+        job_id: str,
+        payload: dict[str, object],
+    ) -> ChatTurnSubmissionRecord:
+        self.begin_immediate_transaction()
+        try:
+            self.create_job(
+                save_id=save_id,
+                creator_user_id=creator_user_id,
+                type="chat_turn",
+                status="queued",
+                payload=payload,
+                job_id=job_id,
+            )
+            self.connection.execute(
+                """
+                INSERT INTO chat_turn_submissions(
+                    save_id, client_turn_id, operation, request_fingerprint, job_id
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (save_id, client_turn_id, operation, request_fingerprint, job_id),
+            )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        submission = self.get_chat_turn_submission(
+            save_id=save_id,
+            client_turn_id=client_turn_id,
+        )
+        if submission is None:
+            raise RuntimeError("Chat turn submission was not persisted")
+        return submission
+
+    def link_chat_turn_submission_messages(
+        self,
+        *,
+        job_id: str,
+        player_message_id: str | None,
+        narrator_message_id: str | None,
+    ) -> ChatTurnSubmissionRecord:
+        submission_row = self._fetch_one(
+            "SELECT save_id FROM chat_turn_submissions WHERE job_id = ?",
+            (job_id,),
+        )
+        if submission_row is None:
+            raise ValueError(f"Unknown chat turn submission job: {job_id}")
+        save_id = str(submission_row["save_id"])
+        if player_message_id is not None and self.get_message(
+            save_id=save_id,
+            message_id=player_message_id,
+            include_deleted=True,
+        ) is None:
+            player_message_id = None
+        if narrator_message_id is not None and self.get_message(
+            save_id=save_id,
+            message_id=narrator_message_id,
+            include_deleted=True,
+        ) is None:
+            narrator_message_id = None
+        self.connection.execute(
+            """
+            UPDATE chat_turn_submissions
+            SET player_message_id = COALESCE(?, player_message_id),
+                narrator_message_id = COALESCE(?, narrator_message_id),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE job_id = ?
+            """,
+            (player_message_id, narrator_message_id, job_id),
+        )
+        self.commit()
+        row = self._fetch_one(
+            f"""
+            SELECT submission.save_id, submission.client_turn_id,
+                   submission.operation, submission.request_fingerprint,
+                   submission.player_message_id, submission.narrator_message_id,
+                   submission.created_at AS submission_created_at,
+                   submission.updated_at AS submission_updated_at,
+                   {_qualified_columns(_JOB_COLUMNS, 'job')}
+            FROM chat_turn_submissions AS submission
+            JOIN jobs AS job ON job.id = submission.job_id
+            WHERE submission.job_id = ?
+            """,
+            (job_id,),
+        )
+        if row is None:
+            raise ValueError(f"Unknown chat turn submission job: {job_id}")
+        return _chat_turn_submission_from_row(row)
+
     def count_job_steps_by_job_id(
         self,
         job_ids: tuple[str, ...],
@@ -17201,6 +17326,30 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
             if diagnostics_json is not None
             else None
         ),
+    )
+
+
+def _chat_turn_submission_from_row(
+    row: sqlite3.Row,
+) -> ChatTurnSubmissionRecord:
+    return ChatTurnSubmissionRecord(
+        save_id=str(row["save_id"]),
+        client_turn_id=str(row["client_turn_id"]),
+        operation=str(row["operation"]),
+        request_fingerprint=str(row["request_fingerprint"]),
+        job=_job_from_row(row),
+        player_message_id=(
+            str(row["player_message_id"])
+            if row["player_message_id"] is not None
+            else None
+        ),
+        narrator_message_id=(
+            str(row["narrator_message_id"])
+            if row["narrator_message_id"] is not None
+            else None
+        ),
+        created_at=str(row["submission_created_at"]),
+        updated_at=str(row["submission_updated_at"]),
     )
 
 
