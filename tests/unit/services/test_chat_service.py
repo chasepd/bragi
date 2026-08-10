@@ -104,6 +104,10 @@ from bragi.services.content_rating import (
     CONTENT_FILTER_RATING_SETTING,
     FADE_TO_BLACK_ENABLED_SETTING,
 )
+from bragi.services.content_safety_service import (
+    ContentSafetyAction,
+    ContentSafetyResult,
+)
 from bragi.services.context_search_service import (
     ContextSearchResult,
     ContextSearchService,
@@ -1932,6 +1936,89 @@ class FailingSummaryService:
         raise self.error
 
 
+class ControlledContentSafetyService:
+    def __init__(
+        self,
+        *,
+        started: asyncio.Event,
+        release: asyncio.Event,
+        error: Exception | None = None,
+        cancelled: asyncio.Event | None = None,
+    ) -> None:
+        self.started = started
+        self.release = release
+        self.error = error
+        self.cancelled = cancelled
+        self.finished = asyncio.Event()
+
+    async def review_narration(self, **_kwargs: object) -> ContentSafetyResult:
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            if self.cancelled is not None:
+                self.cancelled.set()
+            raise
+        if self.error is not None:
+            raise self.error
+        self.finished.set()
+        return ContentSafetyResult(
+            body="submitted input",
+            action=ContentSafetyAction.ALLOW,
+            minimum_rating="pg",
+            agent_ran=True,
+        )
+
+
+class ControlledSummaryService:
+    def __init__(
+        self,
+        *,
+        repositories: PersistenceRepositories,
+        started: asyncio.Event,
+        release: asyncio.Event,
+        cancelled: asyncio.Event | None = None,
+    ) -> None:
+        self.repositories = repositories
+        self.started = started
+        self.release = release
+        self.cancelled = cancelled
+        self.finished = asyncio.Event()
+        self.pending_messages: list[PendingMessageEstimate | None] = []
+        self.message_bodies_at_start: list[list[str]] = []
+
+    async def summarize_if_needed(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
+        pending_message: PendingMessageEstimate | None = None,
+        current_user_id: str | None = None,
+    ) -> object:
+        self.pending_messages.append(pending_message)
+        self.message_bodies_at_start.append(
+            [message.body for message in self.repositories.list_messages(save_id)]
+        )
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            if self.cancelled is not None:
+                self.cancelled.set()
+            raise
+        self.finished.set()
+        return None
+
+    async def prepare_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
+        current_user_id: str | None = None,
+    ) -> object:
+        return None
+
+
 class RecordingMediaService:
     def __init__(
         self,
@@ -2840,7 +2927,8 @@ def test_submit_player_turn_reports_pre_narrator_progress_phases(
 
     status_texts = [event.status_text for event in progress_events]
     assert status_texts[0] == "Submitting turn"
-    assert "Checking history" in status_texts
+    assert "Checking submitted content" in status_texts
+    assert "Checking content and history" in status_texts
     assert "Saving player input" in status_texts
     assert "Dating route profile skipped" in status_texts
     assert "Selecting context" in status_texts
@@ -2854,6 +2942,7 @@ def test_submit_player_turn_reports_pre_narrator_progress_phases(
     }
     assert final_statuses == {
         "submission": "succeeded",
+        "classification": "succeeded",
         "history": "succeeded",
         "input": "succeeded",
         "dating_route_profile": "skipped",
@@ -2865,6 +2954,511 @@ def test_submit_player_turn_reports_pre_narrator_progress_phases(
         "save_narration": "succeeded",
         "action_choices": "skipped",
     }
+
+
+def test_submit_player_turn_overlaps_classification_and_history_before_persisting(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    older_player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I cross the ash bridge.",
+    )
+    older_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="A windless bell answers beneath the span.",
+        provider="fake",
+        model="fake-chat",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        summary_started = asyncio.Event()
+        summary_release = asyncio.Event()
+        content_safety = ControlledContentSafetyService(
+            started=classification_started,
+            release=classification_release,
+        )
+        summary = ControlledSummaryService(
+            repositories=repositories,
+            started=summary_started,
+            release=summary_release,
+        )
+        progress_events: list[Any] = []
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=summary,
+            content_safety_service=cast(Any, content_safety),
+        )
+
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+                turn_progress_callback=progress_events.append,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_started.wait(), timeout=1.0)
+
+        assert repositories.list_messages(save.id) == [older_player, older_narrator]
+        assert summary.message_bodies_at_start == [
+            [
+                "I cross the ash bridge.",
+                "A windless bell answers beneath the span.",
+            ]
+        ]
+        assert summary.pending_messages == [
+            PendingMessageEstimate(
+                body="I climb toward the beacon lens.",
+                role="player",
+            )
+        ]
+        assert any(
+            {
+                job.name: job.status
+                for job in event.jobs
+            }.get("classification")
+            == "running"
+            and {
+                job.name: job.status
+                for job in event.jobs
+            }.get("history")
+            == "running"
+            for event in progress_events
+        )
+
+        summary_release.set()
+        await asyncio.wait_for(summary.finished.wait(), timeout=1.0)
+        assert not task.done()
+        assert repositories.list_messages(save.id) == [older_player, older_narrator]
+
+        classification_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert result.player_message.content_rating == "pg"
+
+    asyncio.run(run())
+
+
+def test_submit_player_turn_cancels_history_when_classification_fails(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        summary_started = asyncio.Event()
+        summary_release = asyncio.Event()
+        summary_cancelled = asyncio.Event()
+        content_safety = ControlledContentSafetyService(
+            started=classification_started,
+            release=classification_release,
+            error=RuntimeError("classification unavailable"),
+        )
+        summary = ControlledSummaryService(
+            repositories=repositories,
+            started=summary_started,
+            release=summary_release,
+            cancelled=summary_cancelled,
+        )
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=summary,
+            content_safety_service=cast(Any, content_safety),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_started.wait(), timeout=1.0)
+        classification_release.set()
+
+        with pytest.raises(RuntimeError, match="classification unavailable"):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(summary_cancelled.wait(), timeout=1.0)
+        assert repositories.list_messages(save.id) == []
+
+    asyncio.run(run())
+
+
+def test_submit_player_turn_no_summary_fast_path_waits_only_for_classification(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        history_finished = asyncio.Event()
+
+        def record_progress(progress: object) -> None:
+            jobs = getattr(progress, "jobs", ())
+            if any(
+                getattr(job, "name", None) == "history"
+                and getattr(job, "status", None) == "succeeded"
+                for job in jobs
+            ):
+                history_finished.set()
+
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+                turn_progress_callback=record_progress,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(history_finished.wait(), timeout=1.0)
+        assert not task.done()
+        assert repositories.list_messages(save.id) == []
+
+        classification_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert result.player_message.content_rating == "pg"
+
+    asyncio.run(run())
+
+
+def test_submit_player_turn_reports_summary_failure_but_waits_for_classification(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        history_failed = asyncio.Event()
+        progress_events: list[Any] = []
+
+        def record_progress(progress: object) -> None:
+            progress_events.append(progress)
+            jobs = getattr(progress, "jobs", ())
+            if any(
+                getattr(job, "name", None) == "history"
+                and getattr(job, "status", None) == "failed"
+                for job in jobs
+            ):
+                history_failed.set()
+
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=FailingSummaryService(
+                events=[],
+                error=RuntimeError("summary backend is down"),
+            ),
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+                turn_progress_callback=record_progress,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(history_failed.wait(), timeout=1.0)
+        assert not task.done()
+        assert repositories.list_messages(save.id) == []
+
+        classification_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert result.player_message.content_rating == "pg"
+        final_statuses = {
+            job.name: job.status
+            for job in getattr(progress_events[-1], "jobs", ())
+        }
+        assert final_statuses["history"] == "failed"
+
+    asyncio.run(run())
+
+
+def test_submit_player_turn_cancels_both_pre_input_branches(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        classification_cancelled = asyncio.Event()
+        summary_started = asyncio.Event()
+        summary_release = asyncio.Event()
+        summary_cancelled = asyncio.Event()
+        token = CancellationToken()
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=ControlledSummaryService(
+                repositories=repositories,
+                started=summary_started,
+                release=summary_release,
+                cancelled=summary_cancelled,
+            ),
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                    cancelled=classification_cancelled,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+                cancellation_token=token,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_started.wait(), timeout=1.0)
+        assert token.cancel() is True
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(classification_cancelled.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_cancelled.wait(), timeout=1.0)
+        assert repositories.list_messages(save.id) == []
+
+    asyncio.run(run())
+
+
+def test_submit_player_turn_task_cancellation_cleans_up_pre_input_branches(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        classification_cancelled = asyncio.Event()
+        summary_started = asyncio.Event()
+        summary_release = asyncio.Event()
+        summary_cancelled = asyncio.Event()
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=ControlledSummaryService(
+                repositories=repositories,
+                started=summary_started,
+                release=summary_release,
+                cancelled=summary_cancelled,
+            ),
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                    cancelled=classification_cancelled,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_started.wait(), timeout=1.0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(classification_cancelled.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_cancelled.wait(), timeout=1.0)
+        assert repositories.list_messages(save.id) == []
+
+    asyncio.run(run())
+
+
+def test_submit_timeskip_turn_overlaps_pre_input_checks(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        summary_started = asyncio.Event()
+        summary_release = asyncio.Event()
+        summary = ControlledSummaryService(
+            repositories=repositories,
+            started=summary_started,
+            release=summary_release,
+        )
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=summary,
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_timeskip_turn(
+                save_id=save.id,
+                instruction="Skip to dawn at the city gates.",
+                run_post_turn_jobs=False,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_started.wait(), timeout=1.0)
+        assert repositories.list_messages(save.id) == []
+        assert summary.pending_messages == [
+            PendingMessageEstimate(
+                body="Timeskip request: Skip to dawn at the city gates.",
+                role="system",
+            )
+        ]
+
+        summary_release.set()
+        await asyncio.wait_for(summary.finished.wait(), timeout=1.0)
+        assert not task.done()
+        assert repositories.list_messages(save.id) == []
+
+        classification_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert result.player_message.role == "system"
+        assert result.player_message.content_rating == "pg"
+
+    asyncio.run(run())
 
 
 def test_submit_player_turn_enters_post_input_context_after_input_saved(

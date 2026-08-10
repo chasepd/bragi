@@ -6549,6 +6549,7 @@ describe("frontend helpers", () => {
             progress: "Selecting context",
             phases: [
               { name: "submission", status: "succeeded" },
+              { name: "classification", status: "succeeded" },
               { name: "history", status: "succeeded" },
               { name: "input", status: "succeeded" },
               { name: "character_planning", status: "skipped" },
@@ -6567,6 +6568,7 @@ describe("frontend helpers", () => {
 
     expect(screen.getByText("Selecting context")).toBeInTheDocument();
     expect(screen.getByText("Submitting")).toBeInTheDocument();
+    expect(screen.getByText("Content classification")).toBeInTheDocument();
     expect(screen.getByText("History check")).toBeInTheDocument();
     expect(screen.getByText("Saving input")).toBeInTheDocument();
     expect(screen.getByText("Character planning")).toBeInTheDocument();

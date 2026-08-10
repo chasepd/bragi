@@ -9294,6 +9294,7 @@ function visiblePostTurnPhases(phases: TrackedJobPhase[] | undefined, includeFul
 function postTurnPhaseLabel(name: string): string {
   const labels: Record<string, string> = {
     submission: "Submitting",
+    classification: "Content classification",
     history: "History check",
     input: "Saving input",
     character_planning: "Character planning",
