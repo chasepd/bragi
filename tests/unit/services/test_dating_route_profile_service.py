@@ -185,6 +185,65 @@ def test_profile_service_discards_stale_result_after_route_edit(
     assert repositories.list_context_update_audit(save_id) == []
 
 
+def test_profile_service_discards_entire_batch_after_other_route_edit(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_id, first_npc_id = _dating_route_save(repositories)
+    first_route = repositories.list_dating_route_states(save_id)[0]
+    second_npc = repositories.add_character(save_id=save_id, name="Yui Sato")
+    second_route = repositories.upsert_dating_route_state(
+        save_id=save_id,
+        player_character_id=player_id,
+        npc_character_id=second_npc.id,
+        stage="introduced",
+    )
+
+    class MutatingOtherRouteProvider(ProfileProvider):
+        async def generate_structured_output(
+            self,
+            request: StructuredOutputRequest,
+        ) -> StructuredOutputResponse:
+            repositories.upsert_dating_route_state(
+                save_id=save_id,
+                player_character_id=second_route.player_character_id,
+                npc_character_id=second_route.npc_character_id,
+                comfort_with_intimacy="explicitly edited while generation ran",
+                pacing_preference="deliberate and user-authored",
+            )
+            return await super().generate_structured_output(request)
+
+    provider = MutatingOtherRouteProvider(
+        {
+            "profiles": [
+                _generated_profile_item(first_npc_id),
+                _generated_profile_item(second_npc.id),
+            ]
+        }
+    )
+    _configure_profile_model(repositories)
+
+    result = asyncio.run(
+        DatingRouteProfileService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).ensure_profiles_for_save(save_id=save_id)
+    )
+
+    first_updated = repositories.get_dating_route_state(first_route.id)
+    second_updated = repositories.get_dating_route_state(second_route.id)
+    assert first_updated is not None
+    assert second_updated is not None
+    assert result.updated_count == 0
+    assert result.stale_count == 2
+    assert first_updated.comfort_with_intimacy == ""
+    assert first_updated.pacing_preference == ""
+    assert second_updated.comfort_with_intimacy == (
+        "explicitly edited while generation ran"
+    )
+    assert second_updated.pacing_preference == "deliberate and user-authored"
+    assert repositories.list_context_update_audit(save_id) == []
+
+
 def test_profile_service_preserves_explicit_route_profile_fields(
     repositories: PersistenceRepositories,
 ) -> None:

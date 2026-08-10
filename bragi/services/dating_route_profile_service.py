@@ -160,7 +160,7 @@ class DatingRouteProfileService:
                 skipped_reason=skipped_reason,
             )
         characters = self.repositories.list_characters(save_id)
-        input_fingerprints = _profile_input_fingerprints(
+        input_fingerprint = _profile_input_fingerprint(
             scenario=details.scenario,
             characters=characters,
             routes=routes,
@@ -198,7 +198,7 @@ class DatingRouteProfileService:
             save_id=save_id,
             routes=routes,
             profiles_by_npc_id=profiles_by_npc_id,
-            input_fingerprints=input_fingerprints,
+            input_fingerprint=input_fingerprint,
             source_message_id=source_message_id,
         )
         return DatingRouteProfileResult(
@@ -235,7 +235,7 @@ class DatingRouteProfileService:
         save_id: str,
         routes: tuple[DatingRouteStateRecord, ...],
         profiles_by_npc_id: Mapping[str, Mapping[str, object]],
-        input_fingerprints: Mapping[str, str],
+        input_fingerprint: str,
         source_message_id: str | None,
     ) -> tuple[int, int]:
         updated_count = 0
@@ -244,27 +244,25 @@ class DatingRouteProfileService:
         try:
             details = self.repositories.load_save_details(save_id)
             characters = self.repositories.list_characters(save_id)
-            characters_by_id = {
-                character.id: character for character in characters
-            }
+            current_routes: list[DatingRouteStateRecord] = []
+            batch_stale = details is None
             for route in routes:
                 current = self.repositories.get_dating_route_state(route.id)
-                if (
-                    current is None
-                    or details is None
-                    or not _route_needs_profile(current)
-                ):
-                    stale_count += 1
-                    continue
+                if current is None or not _route_needs_profile(current):
+                    batch_stale = True
+                    break
+                current_routes.append(current)
+            if not batch_stale and details is not None:
                 current_fingerprint = _profile_input_fingerprint(
                     scenario=details.scenario,
-                    characters_by_id=characters_by_id,
-                    route=current,
+                    characters=characters,
+                    routes=tuple(current_routes),
                 )
-                if current_fingerprint != input_fingerprints.get(route.id):
-                    stale_count += 1
-                    continue
-                item = profiles_by_npc_id[route.npc_character_id]
+                batch_stale = current_fingerprint != input_fingerprint
+            if batch_stale:
+                stale_count = len(routes)
+            for current in () if batch_stale else current_routes:
+                item = profiles_by_npc_id[current.npc_character_id]
                 before = _route_profile_audit_value(current)
                 updated = self.repositories.upsert_dating_route_state(
                     save_id=save_id,
@@ -337,38 +335,16 @@ def _route_needs_profile(route: DatingRouteStateRecord) -> bool:
     )
 
 
-def _profile_input_fingerprints(
+def _profile_input_fingerprint(
     *,
     scenario: ScenarioRecord,
     characters: list[CharacterRecord],
     routes: tuple[DatingRouteStateRecord, ...],
-) -> dict[str, str]:
-    characters_by_id = {character.id: character for character in characters}
-    return {
-        route.id: _profile_input_fingerprint(
-            scenario=scenario,
-            characters_by_id=characters_by_id,
-            route=route,
-        )
-        for route in routes
-    }
-
-
-def _profile_input_fingerprint(
-    *,
-    scenario: ScenarioRecord,
-    characters_by_id: Mapping[str, CharacterRecord],
-    route: DatingRouteStateRecord,
 ) -> str:
-    relevant_characters = [
-        character
-        for character_id in (route.player_character_id, route.npc_character_id)
-        if (character := characters_by_id.get(character_id)) is not None
-    ]
     messages = _dating_route_profile_messages(
         scenario=scenario,
-        characters=relevant_characters,
-        routes=(route,),
+        characters=characters,
+        routes=routes,
     )
     rendered = json.dumps(
         [(message.role, message.body) for message in messages],
