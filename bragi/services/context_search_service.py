@@ -1583,6 +1583,17 @@ def _context_candidate_set(
             and character.is_player_character
         )
     )
+    known_by_character_identifiers = frozenset(
+        identifier.casefold()
+        for character_id in turn_scope.reference_character_ids
+        for character in [characters_by_id.get(character_id)]
+        for identifier in (
+            character_id,
+            *(character.aliases if character is not None else ()),
+            *((character.name,) if character is not None else ()),
+        )
+        if identifier
+    )
     message_candidates = _message_candidates(
         recent_messages,
         player_message_id,
@@ -1613,6 +1624,7 @@ def _context_candidate_set(
         world_state=world_state,
         scoped_targets=scoped_targets,
         reference_character_ids=audience_reference_character_ids,
+        known_by_character_identifiers=known_by_character_identifiers,
         accepted_observation_ids=accepted_observation_ids,
         present_character_ids=turn_scope.present_character_ids,
         message_visibility=message_visibility or [],
@@ -3340,6 +3352,7 @@ def _indexed_context_candidates(
     world_state: list[WorldStateRecord],
     scoped_targets: ScopedTargets,
     reference_character_ids: frozenset[str],
+    known_by_character_identifiers: frozenset[str] = frozenset(),
     accepted_observation_ids: frozenset[str],
     present_character_ids: frozenset[str],
     message_visibility: list[MessageVisibilityRecord],
@@ -3364,7 +3377,11 @@ def _indexed_context_candidates(
             continue
         if (
             record.metadata.get("reveal_policy") != "narrator_only"
-            and _known_by_candidate_blocked(record, scoped_targets)
+            and _known_by_candidate_blocked(
+                record,
+                scoped_targets,
+                character_identifiers=known_by_character_identifiers,
+            )
         ):
             continue
         source_text = _indexed_context_candidate_text(record, source_type=source_type)
@@ -3678,6 +3695,8 @@ def _bounded_structured_identifiers(text: str) -> tuple[str, ...]:
 def _known_by_candidate_blocked(
     record: ContextSourceRecord,
     scoped_targets: ScopedTargets,
+    *,
+    character_identifiers: frozenset[str] = frozenset(),
 ) -> bool:
     audience_character_ids = record.metadata.get("audience_character_ids")
     if isinstance(audience_character_ids, list) and audience_character_ids:
@@ -3693,7 +3712,7 @@ def _known_by_candidate_blocked(
     allowed_identifiers = {
         str(target_id).casefold()
         for _target_type, target_id in scoped_targets.allowed
-    } | allowed_owners
+    } | allowed_owners | set(character_identifiers)
     normalized_known_by = {str(item).casefold() for item in known_by}
     anchors = record.metadata.get("entity_anchors")
     known_identifiers = set(normalized_known_by)

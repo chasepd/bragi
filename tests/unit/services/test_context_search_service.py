@@ -3277,6 +3277,11 @@ def test_restricted_claim_matches_anchor_key_or_display_name_to_scope(
         claim,
         ScopedTargets(allowed={}, blocked=set()),
     )
+    assert not context_search_module._known_by_candidate_blocked(
+        claim,
+        ScopedTargets(allowed={}, blocked=set()),
+        character_identifiers=frozenset({"mira-id", "mira"}),
+    )
 
 
 def test_scenario_supersession_key_boundaries_do_not_collide(
