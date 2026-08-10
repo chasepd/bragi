@@ -1246,6 +1246,85 @@ type SseParseContext = {
 
 type SseParseResult<T> = { ok: true; value: T } | { ok: false };
 
+type StreamFallbackPoll = (signal: AbortSignal) => Promise<void>;
+
+const STREAM_CONNECT_TIMEOUT_MS = 10_000;
+const STREAM_STALE_TIMEOUT_MS = 45_000;
+const STREAM_FALLBACK_BASE_MS = 1_000;
+const STREAM_FALLBACK_MAX_MS = 30_000;
+
+function createStreamFallbackController(fallbackPoll?: StreamFallbackPoll) {
+  let state = 0;
+  let attempt = 0;
+  let healthTimer: number | undefined;
+  let pollTimer: number | undefined;
+  let pollController: AbortController | undefined;
+
+  const canPoll = () => (
+    navigator.onLine && !document.hidden
+  );
+  const clearPoll = () => {
+    window.clearTimeout(pollTimer);
+    pollTimer = undefined;
+    pollController?.abort();
+    pollController = undefined;
+  };
+  const schedulePoll = (delay: number) => {
+    if (
+      state !== 1
+      || pollTimer !== undefined
+      || pollController !== undefined
+      || !canPoll()
+    ) return;
+    pollTimer = window.setTimeout(async () => {
+      pollTimer = undefined;
+      if (state !== 1 || !canPoll()) return;
+      const controller = new AbortController();
+      pollController = controller;
+      await fallbackPoll?.(controller.signal);
+      if (pollController === controller) pollController = undefined;
+      if (state !== 1) return;
+      const baseDelay = Math.min(
+        STREAM_FALLBACK_BASE_MS * (2 ** attempt++),
+        STREAM_FALLBACK_MAX_MS
+      );
+      schedulePoll(baseDelay * (0.8 + Math.random() * 0.4));
+    }, delay);
+  };
+  const pauseOrResume = () => {
+    if (state !== 1) return;
+    if (canPoll()) schedulePoll(0);
+    else clearPoll();
+  };
+  const contact = () => {
+    if (state === 2) return;
+    window.clearTimeout(healthTimer);
+    clearPoll();
+    attempt = 0;
+    state = 0;
+    healthTimer = window.setTimeout(fail, STREAM_STALE_TIMEOUT_MS);
+  };
+  const fail = () => {
+    if (state === 2) return;
+    window.clearTimeout(healthTimer);
+    state = 1;
+    schedulePoll(0);
+  };
+  const close = () => {
+    if (state === 2) return;
+    state = 2;
+    window.clearTimeout(healthTimer);
+    clearPoll();
+    window.removeEventListener("online", pauseOrResume);
+    document.removeEventListener("visibilitychange", pauseOrResume);
+  };
+
+  healthTimer = window.setTimeout(fail, STREAM_CONNECT_TIMEOUT_MS);
+  window.addEventListener("online", pauseOrResume);
+  document.addEventListener("visibilitychange", pauseOrResume);
+  return { close, contact, fail };
+}
+
 function parseSseJson<T>(event: MessageEvent, context: SseParseContext): SseParseResult<T> {
   try {
     return { ok: true, value: JSON.parse(event.data) as T };
@@ -1270,78 +1349,57 @@ export function watchJob(
   onEvent?: (name: string, data: unknown) => void,
   saveId?: string | null
 ) {
-  const events = new EventSource(jobApiPath(jobId, saveId, "/events"));
   let closed = false;
-  let fallbackStarted = false;
-  let fallback: number | undefined;
-  const closeWatcher = () => {
-    closed = true;
-    events.close();
-    if (fallback) window.clearTimeout(fallback);
-  };
-  const poll = async () => {
-    if (closed) return;
-    try {
-      const job = await api<Job>(jobApiPath(jobId, saveId));
-      if (["succeeded", "failed", "cancelled"].includes(job.status)) {
-        onUpdate(job);
-        if (job.status === "failed") {
-          logClientEvent("error", "client.job.failed", {
-            job_id: job.id,
-            job_type: job.type,
-            status: job.status,
-            error_present: Boolean(job.error)
-          });
+  let events: EventSource | undefined;
+  const fallbackController = createStreamFallbackController(
+    async (signal) => {
+      try {
+        const job = await api<Job>(jobApiPath(jobId, saveId), { signal });
+        if (signal.aborted) return;
+        if (["succeeded", "failed", "cancelled"].includes(job.status)) {
+          finish(job);
+          return;
         }
-        closeWatcher();
-        return;
-      }
-      if (job.latest_progress !== null && job.latest_progress !== undefined) {
-        onEvent?.("progress", job.latest_progress);
-      }
-      if (job.completion_level) {
-        onEvent?.("completion_level", { completion_level: job.completion_level });
-      }
-    } catch (failure) {
-      if (failure instanceof ApiError && failure.status === 404) {
-        logClientEvent("error", "client.job.stale", {
+        if (job.latest_progress !== null && job.latest_progress !== undefined) {
+          onEvent?.("progress", job.latest_progress);
+        }
+        if (job.completion_level) {
+          onEvent?.("completion_level", { completion_level: job.completion_level });
+        }
+      } catch (failure) {
+        if (closed || signal.aborted) return;
+        if (failure instanceof ApiError && failure.status === 404) {
+          logClientEvent("error", "client.job.stale", {
+            job_id: jobId,
+            save_id: saveId,
+            error_message: failure.message
+          });
+          finish({
+            id: jobId,
+            type: "unknown",
+            status: "cancelled",
+            result: null,
+            error: failure.message
+          });
+          return;
+        }
+        logClientEvent("error", "client.job.poll_failed", {
           job_id: jobId,
           save_id: saveId,
-          error_message: failure.message
+          error_name: failure instanceof Error ? failure.name : "Error",
+          error_message: failure instanceof Error ? failure.message : "Could not read job"
         });
-        onUpdate({
-          id: jobId,
-          type: "unknown",
-          status: "cancelled",
-          result: null,
-          error: failure.message
-        });
-        closeWatcher();
-        return;
       }
-      logClientEvent("error", "client.job.poll_failed", {
-        job_id: jobId,
-        save_id: saveId,
-        error_name: failure instanceof Error ? failure.name : "Error",
-        error_message: failure instanceof Error ? failure.message : "Could not read job"
-      });
     }
-    fallback = window.setTimeout(poll, 1000);
-  };
-  const startFallback = () => {
+  );
+  const closeWatcher = () => {
     if (closed) return;
-    events.close();
-    if (fallbackStarted) return;
-    fallbackStarted = true;
-    void poll();
+    closed = true;
+    events?.close();
+    fallbackController.close();
   };
-  events.addEventListener("done", (event) => {
-    const parsed = parseSseJson<Job>(event as MessageEvent, { stream: "job", eventName: "done", jobId, saveId });
-    if (!parsed.ok) {
-      startFallback();
-      return;
-    }
-    const job = parsed.value;
+  const finish = (job: Job) => {
+    if (closed) return;
     onUpdate(job);
     if (job.status === "failed") {
       logClientEvent("error", "client.job.failed", {
@@ -1352,14 +1410,31 @@ export function watchJob(
       });
     }
     closeWatcher();
+  };
+  if (typeof EventSource === "undefined") {
+    fallbackController.fail();
+    return closeWatcher;
+  }
+  events = new EventSource(jobApiPath(jobId, saveId, "/events"));
+  events.onopen = fallbackController.contact;
+  events.addEventListener("heartbeat", fallbackController.contact);
+  events.addEventListener("done", (event) => {
+    const parsed = parseSseJson<Job>(event as MessageEvent, { stream: "job", eventName: "done", jobId, saveId });
+    if (!parsed.ok) {
+      fallbackController.fail();
+      return;
+    }
+    fallbackController.contact();
+    finish(parsed.value);
   });
   for (const eventName of ["progress", "completion_level", "runtime", "chat_turn_delta"]) {
     events.addEventListener(eventName, (event) => {
       const parsed = parseSseJson<unknown>(event as MessageEvent, { stream: "job", eventName, jobId, saveId });
       if (!parsed.ok) {
-        startFallback();
+        fallbackController.fail();
         return;
       }
+      fallbackController.contact();
       onEvent?.(eventName, parsed.value);
     });
   }
@@ -1368,23 +1443,33 @@ export function watchJob(
     if (typeof data === "string" && data.length > 0) {
       const parsed = parseSseJson<unknown>(event as MessageEvent, { stream: "job", eventName: "error", jobId, saveId });
       if (!parsed.ok) {
-        startFallback();
+        fallbackController.fail();
         return;
       }
+      fallbackController.contact();
       onEvent?.("error", parsed.value);
     }
   });
-  events.onerror = () => {
+  events.onerror = (event) => {
+    const data = (event as MessageEvent | undefined)?.data;
+    if (typeof data === "string" && data.length > 0) return;
     logClientEvent("error", "client.job.sse_fallback", { job_id: jobId, save_id: saveId });
-    startFallback();
+    fallbackController.fail();
   };
-  return () => {
-    closeWatcher();
-  };
+  return closeWatcher;
 }
 
-export function watchSave(saveId: string, onEvent: (event: SaveEvent) => void, onRecover?: () => void) {
-  if (typeof EventSource === "undefined") return () => undefined;
+export function watchSave(
+  saveId: string,
+  onEvent: (event: SaveEvent) => void,
+  onRecover?: () => void,
+  fallbackPoll?: StreamFallbackPoll
+) {
+  const fallbackController = createStreamFallbackController(fallbackPoll);
+  if (typeof EventSource === "undefined") {
+    fallbackController.fail();
+    return fallbackController.close;
+  }
   const events = new EventSource(`/api/saves/${encodeURIComponent(saveId)}/events`);
   const eventNames = [
     "runtime_changed",
@@ -1399,9 +1484,11 @@ export function watchSave(saveId: string, onEvent: (event: SaveEvent) => void, o
   const handleEvent = (eventName: string) => (event: Event) => {
     const parsed = parseSseJson<SaveEvent>(event as MessageEvent, { stream: "save", eventName, saveId });
     if (!parsed.ok) {
+      fallbackController.fail();
       onRecover?.();
       return;
     }
+    fallbackController.contact();
     const payload = parsed.value;
     if (Number.isFinite(payload.event_id)) {
       if (payload.event_id <= latestEventId) return;
@@ -1412,10 +1499,16 @@ export function watchSave(saveId: string, onEvent: (event: SaveEvent) => void, o
   for (const name of eventNames) {
     events.addEventListener(name, handleEvent(name));
   }
+  events.onopen = fallbackController.contact;
+  events.addEventListener("heartbeat", fallbackController.contact);
   events.onerror = () => {
     logClientEvent("error", "client.save.sse_error", { save_id: saveId });
+    fallbackController.fail();
   };
-  return () => events.close();
+  return () => {
+    events.close();
+    fallbackController.close();
+  };
 }
 
 export function logClientEvent(level: "debug" | "info" | "error", event: string, fields: Record<string, unknown> = {}) {

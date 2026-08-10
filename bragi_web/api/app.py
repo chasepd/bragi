@@ -105,6 +105,8 @@ _ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _MEDIA_CACHE_CONTROL = "private, max-age=31536000, immutable"
 _STATIC_CACHE_CONTROL = "public, max-age=86400"
 _SPA_CACHE_CONTROL = "no-cache"
+_SSE_HEARTBEAT_SECONDS = 15.0
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 _COMPRESSIBLE_STATIC_SUFFIXES = frozenset({".css", ".js"})
 _DIAGNOSTIC_CATEGORIES = frozenset(
     {"signals", "jobs", "performance", "scheduler", "events", "save_health"}
@@ -2654,6 +2656,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 **_save_event_stream_auth_filter(state),
             ),
             media_type="text/event-stream",
+            headers=_SSE_HEADERS,
         )
 
     @app.get("/api/scenarios")
@@ -6150,6 +6153,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
     @app.get("/api/jobs/{job_id}/events")
     async def job_events(
         job_id: str,
+        request: Request,
         state: StateDep,
         save_id: str | None = None,
     ) -> StreamingResponse:
@@ -6164,10 +6168,15 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             _event_stream(
                 state,
                 job_id,
+                last_event_id=_save_event_cursor_from_header(
+                    request.headers.get("last-event-id"),
+                    latest_event_id=record.event_offset + len(record.events),
+                ),
                 current_user=_current_request_user(),
                 current_user_role=_current_request_role(state),
             ),
             media_type="text/event-stream",
+            headers=_SSE_HEADERS,
         )
 
     _mount_spa(app)
@@ -10687,11 +10696,12 @@ def _origin_port(parsed: SplitResult) -> int:
 async def _event_stream(
     state: WebAppState,
     job_id: str,
+    last_event_id: int = 0,
     *,
     current_user: UserRecord | None | object = _CURRENT_USER_SENTINEL,
     current_user_role: str | None = None,
 ) -> AsyncIterator[str]:
-    index = 0
+    index = last_event_id
     emitted = 0
     while True:
         record = state.jobs.get(job_id)
@@ -10718,7 +10728,11 @@ async def _event_stream(
                     current_user=current_user,
                     current_user_role=current_user_role,
                 )
-            yield f"event: {event['event']}\ndata: {json.dumps(payload)}\n\n"
+            yield (
+                f"id: {index}\n"
+                f"event: {event['event']}\n"
+                f"data: {json.dumps(payload)}\n\n"
+            )
         if record.status in {"succeeded", "failed", "cancelled"}:
             with _repository_scope_for_state(state):
                 summary = _job_summary_for_request(
@@ -10737,7 +10751,21 @@ async def _event_stream(
             )
             break
         try:
-            index = await state.jobs.wait_for_event(job_id, index)
+            index = await asyncio.wait_for(
+                state.jobs.wait_for_event(job_id, index),
+                timeout=_SSE_HEARTBEAT_SECONDS,
+            )
+            current = state.jobs.get(job_id)
+            if current is not None:
+                event_end = current.event_offset + len(current.events)
+                if index >= event_end and current.status not in {
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                }:
+                    yield "event: heartbeat\ndata: {}\n\n"
+        except TimeoutError:
+            yield "event: heartbeat\ndata: {}\n\n"
         except asyncio.CancelledError:
             record = state.jobs.get(job_id)
             observe(
@@ -10816,13 +10844,26 @@ async def _save_event_stream(
                 f"data: {json.dumps(payload)}\n\n"
             )
         try:
-            index = await state.save_events.wait_for_event(
+            index = await asyncio.wait_for(
+                state.save_events.wait_for_event(
+                    save_id,
+                    index,
+                    owner_user_id=owner_user_id,
+                    include_unowned_global=include_unowned_global,
+                    include_all_global=include_all_global,
+                ),
+                timeout=_SSE_HEARTBEAT_SECONDS,
+            )
+            if not state.save_events.events_after(
                 save_id,
                 index,
                 owner_user_id=owner_user_id,
                 include_unowned_global=include_unowned_global,
                 include_all_global=include_all_global,
-            )
+            ):
+                yield "event: heartbeat\ndata: {}\n\n"
+        except TimeoutError:
+            yield "event: heartbeat\ndata: {}\n\n"
         except asyncio.CancelledError:
             observe(
                 "web.save_sse.disconnected",
