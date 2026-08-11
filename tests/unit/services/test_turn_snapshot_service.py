@@ -3336,6 +3336,76 @@ def test_restore_snapshot_restores_scene_facts_and_provenance(
     assert restored.provenance[0].source_message_id == message.id
 
 
+def test_snapshot_backed_fork_preserves_distinct_scene_fact_conflict_keys(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The guide stands beside the arch and raises a hand.",
+    )
+    guide = repositories.add_character(
+        save_id=save.id,
+        name="Guide",
+        source_message_id=message.id,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The guide waits beside the arch.",
+        source_message_id=message.id,
+    )
+    repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="actor_position",
+        subject_type="character",
+        subject_id=guide.id,
+        subject_label=guide.name,
+        value="beside the arch",
+        source_message_id=message.id,
+        evidence_quote="stands beside the arch",
+    )
+    repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="actor_pose",
+        subject_type="character",
+        subject_id=guide.id,
+        subject_label=guide.name,
+        value="hand raised",
+        source_message_id=message.id,
+        evidence_quote="raises a hand",
+    )
+    TurnSnapshotService(repositories).capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+
+    fork = SaveForkService(repositories).fork_from_message(
+        save_id=save.id,
+        message_id=message.id,
+        media_dir=tmp_path / "media",
+    )
+
+    [forked_guide] = repositories.list_characters(fork.save.id)
+    forked_facts = repositories.list_scene_facts(fork.save.id)
+    assert [fact.fact_type for fact in forked_facts] == [
+        "actor_position",
+        "actor_pose",
+    ]
+    assert {fact.subject_id for fact in forked_facts} == {forked_guide.id}
+    assert {fact.conflict_key for fact in forked_facts} == {
+        f"actor_position:character:{forked_guide.id}",
+        f"actor_pose:character:{forked_guide.id}",
+    }
+    assert {
+        source.evidence_quote
+        for fact in forked_facts
+        for source in fact.provenance
+    } == {"stands beside the arch", "raises a hand"}
+
+
 def test_snapshot_backed_fork_consolidates_legacy_scene_fact_conflicts(
     repositories: PersistenceRepositories,
     tmp_path: Path,
