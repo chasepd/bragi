@@ -3336,6 +3336,103 @@ def test_restore_snapshot_restores_scene_facts_and_provenance(
     assert restored.provenance[0].source_message_id == message.id
 
 
+def test_snapshot_backed_fork_consolidates_legacy_scene_fact_conflicts(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The brass key is first on the table, then slips beneath it.",
+    )
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="A brass key lies beneath the table.",
+        source_message_id=message.id,
+    )
+    repositories.connection.executemany(
+        """
+        INSERT INTO scene_facts(
+            id, save_id, scene_snapshot_id, scene_generation, fact_type,
+            subject_type, subject_label, value, conflict_key, lifetime,
+            created_turn_number
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (
+                "legacy-key-location-1",
+                save.id,
+                scene.id,
+                scene.scene_generation,
+                "object_location",
+                "object",
+                "brass key",
+                "on the table",
+                "legacy:first-location-key",
+                "scene",
+                1,
+            ),
+            (
+                "legacy-key-location-2",
+                save.id,
+                scene.id,
+                scene.scene_generation,
+                "object_location",
+                "object",
+                "brass key",
+                "beneath the table",
+                "legacy:second-location-key",
+                "scene",
+                1,
+            ),
+        ),
+    )
+    repositories.connection.executemany(
+        """
+        INSERT INTO scene_fact_sources(
+            id, save_id, scene_fact_id, source_message_id, evidence_quote
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            (
+                "legacy-key-source-1",
+                save.id,
+                "legacy-key-location-1",
+                message.id,
+                "first on the table",
+            ),
+            (
+                "legacy-key-source-2",
+                save.id,
+                "legacy-key-location-2",
+                message.id,
+                "slips beneath it",
+            ),
+        ),
+    )
+    repositories.connection.commit()
+    TurnSnapshotService(repositories).capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+
+    fork = SaveForkService(repositories).fork_from_message(
+        save_id=save.id,
+        message_id=message.id,
+        media_dir=tmp_path / "media",
+    )
+
+    [fact] = repositories.list_scene_facts(fork.save.id)
+    assert fact.value == "beneath the table"
+    assert [source.evidence_quote for source in fact.provenance] == [
+        "slips beneath it"
+    ]
+
+
 def test_snapshot_backed_fork_remaps_character_text_reply_links(
     repositories: PersistenceRepositories,
     tmp_path: Path,
