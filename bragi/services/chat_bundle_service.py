@@ -26,10 +26,12 @@ from bragi.persistence.repositories import (
     MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_REBUILD,
     MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD,
     PersistenceRepositories,
+    _epistemic_claim_fingerprint,
     canonical_claim_fingerprint,
     validate_context_source_index_budget,
 )
 from bragi.private_files import write_private_bytes
+from bragi.scene_facts import scene_fact_conflict_key
 from bragi.services.action_choice_flags import normalize_legacy_action_choice_scenario
 from bragi.services.character_text_world_update_service import (
     character_text_source_ref,
@@ -70,6 +72,7 @@ from bragi.services.scenario_service import (
     scenario_record_is_retired,
     strip_deprecated_scenario_character_sections,
 )
+from bragi.services.turn_outcome import remap_turn_outcome_payload
 from bragi.services.turn_snapshot_service import (
     TurnSnapshotService,
     portable_context_observation_curation_state_row,
@@ -368,10 +371,37 @@ class ChatBundleService:
                 """
                 SELECT id, save_id, role, speaker_name, body, provider, model,
                        token_estimate, created_at, updated_at, deleted_at,
-                       safety_transition, content_rating
+                       safety_transition, content_rating, narration_status,
+                       narration_error
                 FROM messages
                 WHERE save_id = ? AND deleted_at IS NULL
                 ORDER BY created_at, rowid
+                """,
+                (save_id,),
+            ),
+            "post_turn_outbox": self._rows(
+                """
+                SELECT player_message_id, narrator_message_id, turn_revision,
+                       step, payload_json, last_error, created_at, updated_at
+                FROM post_turn_outbox
+                WHERE save_id = ?
+                  AND status IN ('pending', 'running', 'failed')
+                ORDER BY created_at, rowid
+                """,
+                (save_id,),
+            ),
+            "chat_turn_submissions": self._rows(
+                """
+                SELECT submission.client_turn_id, submission.operation,
+                       submission.request_fingerprint,
+                       submission.player_message_id,
+                       submission.narrator_message_id,
+                       submission.created_at, submission.updated_at,
+                       job.status AS job_status, job.error AS job_error
+                FROM chat_turn_submissions AS submission
+                JOIN jobs AS job ON job.id = submission.job_id
+                WHERE submission.save_id = ?
+                ORDER BY submission.created_at, submission.rowid
                 """,
                 (save_id,),
             ),
@@ -441,6 +471,8 @@ class ChatBundleService:
                 SELECT id, save_id, body, tags_json, importance,
                        source_message_id, source_message_ids_json,
                        claim_fingerprint, source_observation_ids_json,
+                       epistemic_status, epistemic_actor_id,
+                       epistemic_actor_name,
                        created_at, updated_at, archived_at
                 FROM memories
                 WHERE save_id = ? AND archived_at IS NULL
@@ -523,7 +555,9 @@ class ChatBundleService:
                 """
                 SELECT id, save_id, observation_type, claim, evidence_quote,
                        source_message_ids_json, scope, status, confidence,
-                       tags_json, metadata_json, created_at, updated_at,
+                       tags_json, metadata_json, epistemic_status,
+                       epistemic_actor_id, epistemic_actor_name,
+                       created_at, updated_at,
                        archived_at
                 FROM context_observations
                 WHERE save_id = ? AND archived_at IS NULL
@@ -563,6 +597,32 @@ class ChatBundleService:
                 FROM scene_snapshots
                 WHERE save_id = ?
                 ORDER BY rowid
+                """,
+                (save_id,),
+            ),
+            "scene_facts": self._rows(
+                """
+                SELECT id, save_id, scene_snapshot_id, scene_generation,
+                       fact_type, subject_type, subject_id, subject_label,
+                       target_type, target_id, target_label, aspect, value,
+                       conflict_key, lifetime, created_turn_number,
+                       expires_after_turn_number, archived_at, archive_reason,
+                       created_at, updated_at
+                FROM scene_facts
+                WHERE save_id = ? AND archived_at IS NULL
+                ORDER BY created_at, rowid
+                """,
+                (save_id,),
+            ),
+            "scene_fact_sources": self._rows(
+                """
+                SELECT sources.id, sources.save_id, sources.scene_fact_id,
+                       sources.source_message_id, sources.evidence_quote,
+                       sources.reason, sources.confidence, sources.created_at
+                FROM scene_fact_sources AS sources
+                JOIN scene_facts AS facts ON facts.id = sources.scene_fact_id
+                WHERE sources.save_id = ? AND facts.archived_at IS NULL
+                ORDER BY sources.created_at, sources.rowid
                 """,
                 (save_id,),
             ),
@@ -793,6 +853,15 @@ class ChatBundleService:
                 """,
                 (save_id,),
             ),
+            "turn_outcomes": self._rows(
+                """
+                SELECT id, save_id, message_id, payload_json, created_at
+                FROM turn_outcomes
+                WHERE save_id = ?
+                ORDER BY created_at, rowid
+                """,
+                (save_id,),
+            ),
             "save_app_settings": _save_app_setting_rows(
                 self.repositories,
                 save_id=save_id,
@@ -993,6 +1062,12 @@ class ChatBundleService:
             active_source_refs,
             "context_update_audit",
         )
+        data["turn_outcomes"] = [
+            row
+            for row in _list_of_objects(data["turn_outcomes"], "turn_outcomes")
+            if row.get("message_id") is None
+            or row.get("message_id") in active_message_ids
+        ]
         exported_target_ids = _exported_knowledge_target_ids(data)
         data["character_knowledge_edges"] = _filter_character_knowledge_edge_rows(
             data["character_knowledge_edges"],
@@ -1126,6 +1201,7 @@ class ChatBundleService:
                 ),
             )
             self.repositories.rebuild_context_source_search_terms(imported.save_id)
+            self.repositories.rebuild_summary_pressure_state(imported.save_id)
             self.repositories.commit_transaction()
         except Exception:
             self.repositories.rollback_transaction()
@@ -1223,11 +1299,27 @@ class ChatBundleService:
         for message_data in messages_data:
             original_id = _text(message_data, "id")
             role = _text(message_data, "role")
-            if role not in {"player", "narrator"}:
+            if role not in {"player", "narrator", "system"}:
                 raise ChatBundleError(
                     f"Unsupported message role in chat bundle: {role}"
                 )
             body = _text(message_data, "body")
+            if role == "system" and (
+                _optional_text(message_data, "speaker_name") != "Timeskip"
+                or not body.startswith("Timeskip request: ")
+            ):
+                raise ChatBundleError(
+                    "Unsupported system message in chat bundle"
+                )
+            narration_status = (
+                _optional_text(message_data, "narration_status") or "complete"
+            )
+            narration_error = _optional_text(message_data, "narration_error")
+            if narration_status in {"pending", "retrying"}:
+                narration_status = "cancelled"
+                narration_error = (
+                    "The response was interrupted before this save was exported."
+                )
             safety_transition = _optional_text(message_data, "safety_transition") or ""
             content_rating = "unclassified"
             message = self.repositories.append_message(
@@ -1242,6 +1334,8 @@ class ChatBundleService:
                 updated_at=_optional_text(message_data, "updated_at"),
                 safety_transition=safety_transition,
                 content_rating=content_rating,
+                narration_status=narration_status,
+                narration_error=narration_error,
                 touch_save_updated_at=False,
             )
             safety_transition = message.safety_transition
@@ -1263,6 +1357,100 @@ class ChatBundleService:
             "character_text_message": character_text_message_id_map,
             "character_text_messages": character_text_message_id_map,
         }
+        imported_revision_token = (
+            self.repositories.context_candidate_revision_token(save.id)
+        )
+        for row in _list_of_objects(
+            data.get("chat_turn_submissions"),
+            "chat_turn_submissions",
+        ):
+            original_player_id = _optional_text(row, "player_message_id")
+            original_narrator_id = _optional_text(row, "narrator_message_id")
+            imported_job_id = uuid4().hex
+            submission = self.repositories.create_chat_turn_submission_job(
+                save_id=save.id,
+                client_turn_id=_text(row, "client_turn_id"),
+                operation=_text(row, "operation"),
+                request_fingerprint=_text(row, "request_fingerprint"),
+                creator_user_id=owner_user_id,
+                job_id=imported_job_id,
+                payload={"source": "save_import", "imported": True},
+            )
+            self.repositories.link_chat_turn_submission_messages(
+                job_id=submission.job.id,
+                player_message_id=(
+                    message_id_map.get(original_player_id)
+                    if original_player_id is not None
+                    else None
+                ),
+                narrator_message_id=(
+                    message_id_map.get(original_narrator_id)
+                    if original_narrator_id is not None
+                    else None
+                ),
+            )
+            source_status = _text(row, "job_status")
+            if source_status == "succeeded" and original_narrator_id in message_id_map:
+                self.repositories.start_job(imported_job_id)
+                self.repositories.update_job(
+                    imported_job_id,
+                    status="succeeded",
+                    result={"imported_replay": True},
+                )
+            else:
+                self.repositories.cancel_job(
+                    imported_job_id,
+                    error=(
+                        _optional_text(row, "job_error")
+                        or "Chat submission was interrupted during save import"
+                    ),
+                    result={"imported_replay": True},
+                )
+        for row in _list_of_objects(
+            data.get("post_turn_outbox"),
+            "post_turn_outbox",
+        ):
+            original_player_id = _text(row, "player_message_id")
+            original_narrator_id = _text(row, "narrator_message_id")
+            if (
+                original_player_id not in message_id_map
+                or original_narrator_id not in message_id_map
+            ):
+                continue
+            payload = _json_object(row, "payload_json")
+            coverage = payload.get("verified_plan_coverage")
+            if isinstance(coverage, dict):
+                source_ids = coverage.get("source_message_ids")
+                if isinstance(source_ids, list):
+                    coverage["source_message_ids"] = [
+                        message_id_map[source_id]
+                        for source_id in source_ids
+                        if isinstance(source_id, str) and source_id in message_id_map
+                    ]
+            boundary = payload.get("turn_revision")
+            if isinstance(boundary, dict):
+                boundary["save_id"] = save.id
+                for field in (
+                    "player_message_id",
+                    "narrator_message_id",
+                    "expected_head_message_id",
+                ):
+                    original_message_id = boundary.get(field)
+                    if isinstance(original_message_id, str):
+                        boundary[field] = message_id_map.get(
+                            original_message_id,
+                            message_id_map[original_narrator_id],
+                        )
+                boundary["base_snapshot_id"] = None
+                boundary["expected_revision_token"] = imported_revision_token
+            self.repositories.ensure_post_turn_outbox_steps(
+                save_id=save.id,
+                player_message_id=message_id_map[original_player_id],
+                narrator_message_id=message_id_map[original_narrator_id],
+                turn_revision=imported_revision_token,
+                steps=(_text(row, "step"),),
+                payload=payload,
+            )
         message_action_choice_id_map: dict[str, str] = {}
         for row in _list_of_objects(
             data.get("message_action_choices"),
@@ -1356,6 +1544,8 @@ class ChatBundleService:
         imported_id_maps["world_state"] = world_state_id_map
         imported_id_maps["world_state_key"] = world_state_key_map
 
+        pending_epistemic_actor_refs: list[tuple[str, str, str]] = []
+        pending_memory_actor_details: dict[str, tuple[str, str, str]] = {}
         memory_id_map: dict[str, str] = {}
         for row in _list_of_objects(data.get("memories"), "memories"):
             original_id = _text(row, "id")
@@ -1364,6 +1554,18 @@ class ChatBundleService:
                 transitioned_original_message_ids,
             ):
                 continue
+            actor_id = _optional_text(row, "epistemic_actor_id")
+            actor_name = _optional_text(row, "epistemic_actor_name") or ""
+            epistemic_status = (
+                _text(row, "epistemic_status")
+                if "epistemic_status" in row
+                else "legacy_unclassified"
+            )
+            temporary_actor_name = (
+                f"bundle-import-actor:{actor_id}"
+                if actor_id is not None
+                else actor_name
+            )
             memory = self.repositories.add_memory(
                 save_id=save.id,
                 body=_text(row, "body"),
@@ -1383,8 +1585,18 @@ class ChatBundleService:
                     repair_tracker=repair_tracker,
                 ),
                 claim_fingerprint=canonical_claim_fingerprint(_text(row, "body")),
+                epistemic_status=epistemic_status,
+                epistemic_actor_id=None,
+                epistemic_actor_name=temporary_actor_name,
             )
             memory_id_map[original_id] = memory.id
+            if actor_id is not None:
+                pending_epistemic_actor_refs.append(("memories", memory.id, actor_id))
+                pending_memory_actor_details[memory.id] = (
+                    memory.body,
+                    epistemic_status,
+                    actor_name,
+                )
         imported_id_maps["memory"] = memory_id_map
         imported_id_maps["memories"] = memory_id_map
 
@@ -1461,6 +1673,45 @@ class ChatBundleService:
         imported_id_maps["state_change"] = state_change_id_map
         imported_id_maps["state_changes"] = state_change_id_map
 
+        turn_outcome_id_map: dict[str, str] = {}
+        for row in _list_of_objects(data.get("turn_outcomes"), "turn_outcomes"):
+            original_id = _text(row, "id")
+            if _bundle_row_references_messages(
+                row,
+                transitioned_original_message_ids,
+            ):
+                continue
+            original_message_id = _optional_text(row, "message_id")
+            if original_message_id:
+                message_id = _mapped_optional_required(
+                    message_id_map=message_id_map,
+                    original_id=original_message_id,
+                    field_name="turn_outcomes.message_id",
+                    repair_tracker=repair_tracker,
+                )
+                if message_id is None:
+                    continue
+            else:
+                message_id = None
+            payload = _optional_json_object(row, "payload_json") or {}
+            if _bundle_payload_references_messages(
+                payload,
+                transitioned_original_message_ids,
+            ):
+                continue
+            outcome_record = self.repositories.add_turn_outcome(
+                save_id=save.id,
+                message_id=message_id,
+                payload=remap_turn_outcome_payload(
+                    payload,
+                    message_id_map=message_id_map,
+                    save_id=save.id,
+                ),
+            )
+            turn_outcome_id_map[original_id] = outcome_record.id
+        imported_id_maps["turn_outcome"] = turn_outcome_id_map
+        imported_id_maps["turn_outcomes"] = turn_outcome_id_map
+
         observation_id_map: dict[str, str] = {}
         for row in _list_of_objects(
             data.get("context_observations"),
@@ -1489,8 +1740,19 @@ class ChatBundleService:
                 confidence=_float(row, "confidence"),
                 tags=_json_string_list(row, "tags_json"),
                 metadata=_optional_json_object(row, "metadata_json") or {},
+                epistemic_status=(
+                    _text(row, "epistemic_status")
+                    if "epistemic_status" in row
+                    else "legacy_unclassified"
+                ),
+                epistemic_actor_id=None,
+                epistemic_actor_name=_optional_text(row, "epistemic_actor_name") or "",
             )
             observation_id_map[original_id] = observation.id
+            if actor_id := _optional_text(row, "epistemic_actor_id"):
+                pending_epistemic_actor_refs.append(
+                    ("context_observations", observation.id, actor_id)
+                )
         imported_id_maps["observation"] = observation_id_map
         imported_id_maps["context_observations"] = observation_id_map
         imported_memories = {
@@ -1848,6 +2110,40 @@ class ChatBundleService:
             live_media_asset_id_map=live_media_asset_id_map,
             repair_tracker=repair_tracker,
         )
+        imported_character_ids = imported_id_maps.get("characters", {})
+        for table_name, record_id, original_actor_id in pending_epistemic_actor_refs:
+            mapped_actor_id = imported_character_ids.get(original_actor_id)
+            if mapped_actor_id is None:
+                continue
+            if table_name == "memories":
+                body, epistemic_status, actor_name = pending_memory_actor_details[
+                    record_id
+                ]
+                self.repositories.connection.execute(
+                    """
+                    UPDATE memories
+                    SET epistemic_actor_id = ?, epistemic_actor_name = ?,
+                        claim_fingerprint = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        mapped_actor_id,
+                        actor_name,
+                        _epistemic_claim_fingerprint(
+                            body,
+                            epistemic_status=epistemic_status,
+                            epistemic_actor_id=mapped_actor_id,
+                            epistemic_actor_name=actor_name,
+                        ),
+                        record_id,
+                    ),
+                )
+            else:
+                self.repositories.connection.execute(
+                    f"UPDATE {table_name} SET epistemic_actor_id = ? WHERE id = ?",
+                    (mapped_actor_id, record_id),
+                )
+        self.repositories.commit()
         try:
             imported_snapshot_count = TurnSnapshotService(
                 self.repositories
@@ -1953,6 +2249,17 @@ class ChatBundleService:
             _text(row, "id"): uuid4().hex
             for row in _list_of_objects(data.get("scene_snapshots"), "scene_snapshots")
         }
+        scene_fact_id_map = {
+            _text(row, "id"): uuid4().hex
+            for row in _list_of_objects(data.get("scene_facts"), "scene_facts")
+        }
+        scene_fact_source_id_map = {
+            _text(row, "id"): uuid4().hex
+            for row in _list_of_objects(
+                data.get("scene_fact_sources"),
+                "scene_fact_sources",
+            )
+        }
         dating_route_state_id_map = {
             _text(row, "id"): uuid4().hex
             for row in _list_of_objects(
@@ -2027,6 +2334,10 @@ class ChatBundleService:
         imported_id_maps["context_update_audit"] = context_update_audit_id_map
         imported_id_maps["scene_snapshot"] = scene_snapshot_id_map
         imported_id_maps["scene_snapshots"] = scene_snapshot_id_map
+        imported_id_maps["scene_fact"] = scene_fact_id_map
+        imported_id_maps["scene_facts"] = scene_fact_id_map
+        imported_id_maps["scene_fact_source"] = scene_fact_source_id_map
+        imported_id_maps["scene_fact_sources"] = scene_fact_source_id_map
         imported_id_maps["dating_route_state"] = dating_route_state_id_map
         imported_id_maps["dating_route_states"] = dating_route_state_id_map
         imported_id_maps["character_text_thread"] = character_text_thread_id_map
@@ -2073,6 +2384,7 @@ class ChatBundleService:
             "character_text_thread": character_text_thread_id_map,
             "character_text_message": character_text_message_id_map,
             "scene_snapshot": scene_snapshot_id_map,
+            "scene_fact": scene_fact_id_map,
             "dating_route_state": dating_route_state_id_map,
         }
         _remap_imported_media_reference_metadata(
@@ -2172,6 +2484,74 @@ class ChatBundleService:
             scene_snapshots.append(copied)
         _insert_rows(connection, "scene_snapshots", scene_snapshots)
         _backfill_imported_scene_world_time(connection, save_id)
+
+        scene_facts: list[dict[str, object]] = []
+        for row in _list_of_objects(data.get("scene_facts"), "scene_facts"):
+            original_id = _text(row, "id")
+            copied = _copy_row_for_save(
+                row,
+                save_id,
+                new_id=scene_fact_id_map[original_id],
+            )
+            copied["scene_snapshot_id"] = _mapped_optional_value(
+                scene_snapshot_id_map,
+                _optional_text(row, "scene_snapshot_id"),
+                field_name="scene_facts.scene_snapshot_id",
+                repair_tracker=repair_tracker,
+            )
+            for prefix in ("subject", "target"):
+                reference_type = _optional_text(row, f"{prefix}_type") or ""
+                original_reference_id = _optional_text(row, f"{prefix}_id")
+                reference_map = (
+                    character_id_map
+                    if reference_type == "character"
+                    else location_id_map
+                    if reference_type == "location"
+                    else {}
+                )
+                copied[f"{prefix}_id"] = _mapped_optional_value(
+                    reference_map,
+                    original_reference_id,
+                    field_name=f"scene_facts.{prefix}_id",
+                    repair_tracker=repair_tracker,
+                )
+            copied["conflict_key"] = scene_fact_conflict_key(
+                fact_type=_text(copied, "fact_type"),
+                subject_type=_text(copied, "subject_type"),
+                subject_id=_optional_text(copied, "subject_id"),
+                subject_label=_text(copied, "subject_label"),
+                target_type=_optional_text(copied, "target_type") or "",
+                target_id=_optional_text(copied, "target_id"),
+                target_label=_optional_text(copied, "target_label") or "",
+                aspect=_optional_text(copied, "aspect") or "",
+            )
+            scene_facts.append(copied)
+        _insert_rows(connection, "scene_facts", scene_facts)
+
+        scene_fact_sources: list[dict[str, object]] = []
+        for row in _list_of_objects(
+            data.get("scene_fact_sources"),
+            "scene_fact_sources",
+        ):
+            original_fact_id = _text(row, "scene_fact_id")
+            mapped_fact_id = scene_fact_id_map.get(original_fact_id)
+            mapped_message_id = _mapped_optional_required(
+                message_id_map=message_id_map,
+                original_id=_optional_text(row, "source_message_id"),
+                field_name="scene_fact_sources.source_message_id",
+                repair_tracker=repair_tracker,
+            )
+            if mapped_fact_id is None or mapped_message_id is None:
+                continue
+            copied = _copy_row_for_save(
+                row,
+                save_id,
+                new_id=scene_fact_source_id_map[_text(row, "id")],
+            )
+            copied["scene_fact_id"] = mapped_fact_id
+            copied["source_message_id"] = mapped_message_id
+            scene_fact_sources.append(copied)
+        _insert_rows(connection, "scene_fact_sources", scene_fact_sources)
 
         context_sources: list[dict[str, object]] = []
         for row in _list_of_objects(data.get("context_sources"), "context_sources"):
@@ -5585,6 +5965,25 @@ def _remapped_context_update_suggestion_proposed_value_json(
                 repair_tracker=repair_tracker,
             )
         )
+    if "epistemic_actor_id" in remapped:
+        actor_id = remapped["epistemic_actor_id"]
+        if actor_id is None or actor_id == "":
+            remapped["epistemic_actor_id"] = None
+        elif not isinstance(actor_id, str):
+            raise ChatBundleError(
+                "Bundle context_update_suggestions.proposed_value_json."
+                "epistemic_actor_id must be a character id"
+            )
+        else:
+            remapped["epistemic_actor_id"] = _mapped_optional_id(
+                entity_id_maps.get("character", {}),
+                actor_id,
+                field_name=(
+                    "context_update_suggestions.proposed_value_json."
+                    "epistemic_actor_id"
+                ),
+                repair_tracker=repair_tracker,
+            )
     if "location_id" in remapped:
         location_id = remapped["location_id"]
         if location_id is None or location_id == "":
@@ -5855,6 +6254,40 @@ def _bundle_row_references_messages(
     return bool(message_ids.intersection(source_ids))
 
 
+def _bundle_payload_references_messages(
+    payload: dict[str, object],
+    message_ids: set[str],
+) -> bool:
+    if not message_ids:
+        return False
+
+    def references_refs(refs: object) -> bool:
+        if not isinstance(refs, list):
+            return False
+        return any(
+            isinstance(item, str)
+            and (
+                item.startswith("message:")
+                and item.removeprefix("message:") in message_ids
+                or item in message_ids
+            )
+            for item in refs
+        )
+
+    if references_refs(payload.get("source_message_ids")):
+        return True
+    if references_refs(payload.get("attempt_evidence_source_ids")):
+        return True
+    raw_effects = payload.get("effects")
+    if isinstance(raw_effects, list):
+        for item in raw_effects:
+            if isinstance(item, dict) and references_refs(
+                item.get("evidence_source_ids")
+            ):
+                return True
+    return False
+
+
 def _bundle_summary_covers_transition(
     row: dict[str, object],
     *,
@@ -5909,6 +6342,7 @@ def _remove_imported_safety_transition_records(
         "save_loss_conditions",
         "save_loss_outcomes",
         "state_changes",
+        "turn_outcomes",
         "world_state",
     )
     for table_name in table_names:
@@ -5940,6 +6374,7 @@ def _remove_imported_safety_transition_records(
             "proposed_value_json",
             "before_json",
             "after_json",
+            "payload_json",
         ):
             if column in columns:
                 for message_id in transition_message_ids:

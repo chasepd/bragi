@@ -11,6 +11,11 @@ import pytest
 from bragi.interaction_mode import InteractionMode
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.providers.contracts import (
+    ProviderClient,
+    StructuredOutputRequest,
+    StructuredOutputResponse,
+)
 from bragi.providers.fake import FakeProviderClient
 from bragi.safety import CONTENT_FILTER_TRANSITION
 from bragi.services.action_choice_service import (
@@ -30,15 +35,23 @@ from bragi.services.content_safety_service import (
 class BlockingContentSafetyService:
     def __init__(self) -> None:
         self.fade_settings: list[bool] = []
+        self.reviewed_batches: list[tuple[str, ...]] = []
 
-    async def review_narration(self, **kwargs: object) -> ContentSafetyResult:
+    async def review_narrations(
+        self, **kwargs: object
+    ) -> tuple[ContentSafetyResult, ...]:
         self.fade_settings.append(bool(kwargs["fade_to_black_enabled"]))
-        return ContentSafetyResult(
-            body=CONTENT_FILTER_TRANSITION,
-            action=ContentSafetyAction.BLOCK,
-            minimum_rating="r",
-            transition_applied=True,
-            agent_ran=True,
+        bodies = tuple(cast(tuple[str, ...], kwargs["bodies"]))
+        self.reviewed_batches.append(bodies)
+        return tuple(
+            ContentSafetyResult(
+                body=CONTENT_FILTER_TRANSITION,
+                action=ContentSafetyAction.BLOCK,
+                minimum_rating="r",
+                transition_applied=True,
+                agent_ran=True,
+            )
+            for _body in bodies
         )
 
 
@@ -260,7 +273,90 @@ def test_action_choice_service_safety_reviews_and_rates_generated_choices(
 
     assert [record.body for record in records] == [CONTENT_FILTER_TRANSITION] * 4
     assert [record.content_rating for record in records] == ["g"] * 4
-    assert safety.fade_settings == [False] * 4
+    assert safety.fade_settings == [False]
+    assert safety.reviewed_batches == [
+        ("Choice one.", "Choice two.", "Choice three.", "Choice four.")
+    ]
+
+
+def test_newer_generation_token_wins_when_older_provider_finishes_late(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, narrator_id = _create_cyoa_save(repositories)
+    _save_model(
+        repositories,
+        model_id="fake-chat",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task=ACTION_CHOICE_GENERATION_TASK,
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run_race() -> tuple[list[str], list[str]]:
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        class RacingChoiceProvider:
+            provider_name = "fake"
+
+            def __init__(self) -> None:
+                self.call_count = 0
+
+            async def generate_structured_output(
+                self,
+                request: StructuredOutputRequest,
+            ) -> StructuredOutputResponse:
+                self.call_count += 1
+                call_number = self.call_count
+                if call_number == 1:
+                    first_started.set()
+                    await release_first.wait()
+                prefix = "Old" if call_number == 1 else "New"
+                return StructuredOutputResponse(
+                    data={
+                        "choices": [
+                            {"body": f"{prefix} choice {ordinal}."}
+                            for ordinal in range(1, 5)
+                        ]
+                    },
+                    provider=request.provider,
+                    model_id=request.model_id,
+                )
+
+        provider = RacingChoiceProvider()
+        service = ActionChoiceService(
+            repositories=repositories,
+            providers={"fake": cast(ProviderClient, provider)},
+        )
+        older = service.prepare_for_message(
+            save_id=save_id,
+            narrator_message_id=narrator_id,
+        )
+        newer = service.prepare_for_message(
+            save_id=save_id,
+            narrator_message_id=narrator_id,
+        )
+        assert older is not None
+        assert newer is not None
+        older_task = asyncio.create_task(service.generate_prepared(older))
+        await first_started.wait()
+        newer_records = await service.generate_prepared(newer)
+        release_first.set()
+        older_records = await older_task
+        return (
+            [record.body for record in older_records],
+            [record.body for record in newer_records],
+        )
+
+    older_bodies, newer_bodies = asyncio.run(run_race())
+
+    assert older_bodies == []
+    assert newer_bodies == [f"New choice {ordinal}." for ordinal in range(1, 5)]
+    assert [
+        record.body for record in repositories.latest_message_action_choices(save_id)
+    ] == newer_bodies
 
 
 def test_action_choice_service_uses_roleplay_specific_action_choice_model_preference(
@@ -525,6 +621,52 @@ def test_action_choice_service_rechecks_prepared_model_capability(
         asyncio.run(service.generate_prepared(prepared))
 
     assert provider.structured_output_requests == []
+    assert repositories.list_message_action_choices(save_id) == []
+
+
+def test_action_choice_service_discards_prepared_choices_after_head_advances(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, narrator_id = _create_cyoa_save(repositories)
+    _save_model(
+        repositories,
+        model_id="fake-chat",
+        capabilities=["structured_output"],
+    )
+    provider = FakeProviderClient(
+        structured_output={
+            "choices": [
+                {"body": "Open the brass atlas."},
+                {"body": "Question the librarian."},
+                {"body": "Hide the index under your coat."},
+                {"body": "Step through the blue shelf-door."},
+            ]
+        }
+    )
+    repositories.set_model_preference(
+        task=CHARACTER_ACTION_PLANNING_TASK,
+        provider="fake",
+        model_id="fake-chat",
+    )
+    service = ActionChoiceService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+    prepared = service.prepare_for_message(
+        save_id=save_id,
+        narrator_message_id=narrator_id,
+    )
+    assert prepared is not None
+    repositories.append_message(
+        save_id=save_id,
+        role="player",
+        speaker_name="Ily",
+        body="I choose my own path.",
+    )
+
+    records = asyncio.run(service.generate_prepared(prepared))
+
+    assert records == []
     assert repositories.list_message_action_choices(save_id) == []
 
 

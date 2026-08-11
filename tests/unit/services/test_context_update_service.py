@@ -1517,6 +1517,8 @@ def test_tool_calling_context_update_applies_valid_tool_calls(
         "upsert_active_thread",
         "link_entities",
         "record_phone_number_exchange",
+        "upsert_scene_fact",
+        "retire_scene_fact",
     ]
 
 
@@ -1767,6 +1769,78 @@ def test_structured_context_update_drops_items_with_ungrounded_evidence(
 
     assert extraction.scene is None
     assert [location.name for location in extraction.locations] == ["Beacon Gallery"]
+
+
+def test_structured_context_update_drops_invalid_scene_local_id_without_batch_loss(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    provider = SequenceStructuredProvider(
+        [
+            {
+                "scene": {},
+                "locations": [
+                    {
+                        "name": "Beacon Gallery",
+                        "source_message_id": narrator_message.id,
+                        "evidence_quote": "beacon gallery",
+                    }
+                ],
+                "characters": [],
+                "active_threads": [],
+                "entity_links": [],
+                "phone_number_exchanges": [],
+                "scene_fact_upserts": [
+                    {
+                        "fact_type": "object_location",
+                        "subject_type": "object",
+                        "subject_id": "provider-generated-object-id",
+                        "subject_label": "beacon lens",
+                        "target_type": "",
+                        "target_id": "",
+                        "target_label": "",
+                        "aspect": "",
+                        "value": "inside the beacon gallery",
+                        "source_message_id": narrator_message.id,
+                        "evidence_quote": "beacon gallery",
+                        "reason": "Track its position.",
+                        "confidence": 0.9,
+                    }
+                ],
+                "scene_fact_retirements": [],
+            }
+        ]
+    )
+    updater = module.StructuredProviderContextUpdater(
+        provider=provider,
+        provider_name="fake",
+        model_id="fake-structured",
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(player_message, narrator_message),
+        scene_snapshot=None,
+        locations=(),
+        characters=(),
+        active_threads=(),
+        entity_links=(),
+    )
+    extraction = asyncio.run(updater.extract(request))
+    service = module.ContextUpdateService(
+        repositories=repositories,
+        extractor=RecordingContextUpdateExtractor(module.ContextUpdateExtraction()),
+    )
+
+    result = service.apply_extraction(
+        save_id=save.id,
+        extraction=extraction,
+        allowed_source_message_ids=(player_message.id, narrator_message.id),
+        completed_messages=(player_message, narrator_message),
+    )
+
+    assert [location.name for location in result.locations] == ["Beacon Gallery"]
+    assert repositories.list_scene_facts(save.id) == []
 
 
 def test_apply_extraction_drops_items_with_ungrounded_completed_message_evidence(
@@ -3080,7 +3154,7 @@ def test_update_after_turn_preserves_plan_owned_mood_but_applies_other_domains(
             source_message_ids=(player_message.id, narrator_message.id),
             verified_coverage=VerifiedPostTurnCoverage(
                 scene_snapshot_fields=frozenset({"mood"}),
-                applied_domains=frozenset({"scene_snapshot"}),
+                applied_domains=frozenset({"scene"}),
                 committed_count=1,
             ),
         )
@@ -8392,6 +8466,163 @@ def _tool_call_user_body(request: ToolCallRequest) -> str:
     )
 
 
+def test_apply_extraction_moves_actor_and_retires_interrupted_action(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="North Hall",
+        premise="A runner crosses a guarded hall.",
+        player_role="Runner",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Crossing")
+    actor = repositories.add_character(save_id=save.id, name="Mara")
+    source = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara reaches the window and stops running.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[actor.id],
+        source_message_id=source.id,
+    )
+    old_position, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="actor_position",
+        subject_type="character",
+        subject_id=actor.id,
+        subject_label="Mara",
+        value="beside the north door",
+        source_message_id=source.id,
+        evidence_quote="Mara reaches the window",
+    )
+    action, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="ongoing_action",
+        subject_type="character",
+        subject_id=actor.id,
+        subject_label="Mara",
+        value="running across the hall",
+        source_message_id=source.id,
+        evidence_quote="stops running",
+    )
+    service = module.ContextUpdateService(
+        repositories=repositories,
+        extractor=RecordingContextUpdateExtractor(module.ContextUpdateExtraction()),
+    )
+    extraction = module.ContextUpdateExtraction(
+        scene_fact_upserts=(
+            module.ExtractedSceneFactUpsert(
+                fact_type="actor_position",
+                subject_type="character",
+                subject_id=actor.id,
+                subject_label="Mara",
+                value="beside the window",
+                source_message_id=source.id,
+                evidence_quote="Mara reaches the window",
+            ),
+        ),
+        scene_fact_retirements=(
+            module.ExtractedSceneFactRetirement(
+                fact_id=action.id,
+                source_message_id=source.id,
+                evidence_quote="stops running",
+            ),
+        ),
+    )
+
+    result = service.apply_extraction(
+        save_id=save.id,
+        extraction=extraction,
+        allowed_source_message_ids=(source.id,),
+        completed_messages=(source,),
+    )
+
+    current = repositories.list_scene_facts(save.id)
+    assert len(current) == 1
+    assert current[0].fact_type == "actor_position"
+    assert current[0].value == "beside the window"
+    archived_position = repositories.get_scene_fact(old_position.id)
+    archived_action = repositories.get_scene_fact(action.id)
+    assert archived_position is not None
+    assert archived_action is not None
+    assert archived_position.archive_reason == "superseded"
+    assert archived_action.archive_reason == "explicit_retirement"
+    assert {entry.operation for entry in result.audit_entries} == {
+        "retired",
+        "superseded",
+    }
+
+
+def test_apply_extraction_keeps_corroborating_scene_fact_provenance(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="North Hall",
+        premise="A runner crosses a guarded hall.",
+        player_role="Runner",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Crossing")
+    actor = repositories.add_character(save_id=save.id, name="Mara")
+    first = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I stop beside the window.",
+    )
+    second = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara now stands beside the window.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[actor.id],
+        source_message_id=second.id,
+    )
+    upserts = tuple(
+        module.ExtractedSceneFactUpsert(
+            fact_type="actor_position",
+            subject_type="character",
+            subject_id=actor.id,
+            subject_label="Mara",
+            value="beside the window",
+            source_message_id=message.id,
+            evidence_quote=evidence,
+        )
+        for message, evidence in (
+            (first, "stop beside the window"),
+            (second, "stands beside the window"),
+        )
+    )
+    service = module.ContextUpdateService(
+        repositories=repositories,
+        extractor=RecordingContextUpdateExtractor(module.ContextUpdateExtraction()),
+    )
+
+    result = service.apply_extraction(
+        save_id=save.id,
+        extraction=module.ContextUpdateExtraction(scene_fact_upserts=upserts),
+        allowed_source_message_ids=(first.id, second.id),
+        completed_messages=(first, second),
+    )
+
+    [fact] = repositories.list_scene_facts(save.id)
+    assert [source.source_message_id for source in fact.provenance] == [
+        first.id,
+        second.id,
+    ]
+    assert [entry.operation for entry in result.audit_entries] == [
+        "created",
+        "refreshed",
+    ]
+
+
 def _save_with_completed_turn(
     repositories: PersistenceRepositories,
 ) -> tuple[SaveRecord, MessageRecord, MessageRecord]:
@@ -8474,3 +8705,370 @@ def _count(result: object, name: str) -> int:
     if isinstance(counts, dict) and name in counts:
         return int(counts[name])
     raise AssertionError(f"Missing count for {name!r} in {result!r}")
+
+
+def test_filter_extraction_for_verified_coverage_suppresses_covered_domains(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        source_message_id=player_message.id,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The old scene.",
+        present_character_ids=[],
+    )
+    extraction = module.ContextUpdateExtraction(
+        scene=module.ExtractedSceneSnapshot(
+            source_message_id=narrator_message.id,
+            current_location_name="Beacon Gallery",
+            situation="Ilyra braces the failing lens.",
+            mood="uneasy",
+            present_character_names=("Captain Ilyra",),
+            reason="The narrator established the new scene.",
+        ),
+        characters=(
+            module.ExtractedCharacter(
+                name="Captain Ilyra",
+                source_message_id=narrator_message.id,
+                appearance="weathered leather coat",
+                current_clothing="soaked through",
+                status="injured arm",
+                personality="stubborn but fair",
+                evidence_quote="weathered leather",
+                reason="The narrator described her.",
+            ),
+        ),
+        active_threads=(
+            module.ExtractedActiveThread(
+                title="Stabilize the beacon",
+                source_message_id=narrator_message.id,
+                description="The lens may crack.",
+                status="active",
+                reason="The failing lens remains unresolved.",
+            ),
+        ),
+        entity_links=(
+            module.ExtractedEntityLink(
+                entity_type="character",
+                target_type="memory",
+                source_message_id=narrator_message.id,
+                entity_name="Ilyra",
+                target_name="the beacon secret",
+                relation="knows",
+                reason="The narrator linked Ilyra to the secret.",
+            ),
+        ),
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(player_message, narrator_message),
+        scene_snapshot=repositories.get_scene_snapshot(save.id),
+        locations=tuple(repositories.list_locations(save.id)),
+        characters=tuple(repositories.list_characters(save.id)),
+        active_threads=tuple(repositories.list_active_threads(save.id)),
+        entity_links=tuple(repositories.list_entity_links(save.id)),
+        memories=tuple(repositories.list_memories(save.id)),
+        world_state=tuple(repositories.list_world_state(save.id)),
+        summaries=tuple(repositories.list_summaries(save.id)),
+        prior_context=(),
+    )
+    from bragi.services.post_turn_inference import (
+        POST_TURN_DOMAIN_KNOWLEDGE,
+        POST_TURN_DOMAIN_PHYSICAL,
+        POST_TURN_DOMAIN_THREAD_CLOCK,
+        VerifiedPostTurnCoverage,
+    )
+
+    filtered = module._filter_extraction_for_verified_coverage(
+        extraction,
+        coverage=VerifiedPostTurnCoverage(
+            applied_domains=frozenset(
+                {
+                    POST_TURN_DOMAIN_PHYSICAL,
+                    POST_TURN_DOMAIN_THREAD_CLOCK,
+                    POST_TURN_DOMAIN_KNOWLEDGE,
+                }
+            ),
+            state_keys=frozenset(
+                {"character.captain_ilyra.physical_state"}
+            ),
+            committed_count=3,
+        ),
+        request=request,
+    )
+
+    assert filtered.active_threads == ()
+    assert filtered.entity_links == ()
+    assert len(filtered.characters) == 1
+    filtered_character = filtered.characters[0]
+    assert filtered_character.appearance == ""
+    assert filtered_character.current_clothing == ""
+    assert filtered_character.status == ""
+    assert filtered_character.personality == "stubborn but fair"
+    assert filtered.scene is not None
+    assert filtered.scene.mood == "uneasy"
+    assert filtered.scene.situation == "Ilyra braces the failing lens."
+
+
+def test_filter_extraction_for_verified_coverage_keeps_uncovered_character_fields(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        source_message_id=player_message.id,
+    )
+    extraction = module.ContextUpdateExtraction(
+        characters=(
+            module.ExtractedCharacter(
+                name="Captain Ilyra",
+                source_message_id=narrator_message.id,
+                appearance="weathered leather coat",
+                status="injured arm",
+                evidence_quote="weathered leather",
+                reason="The narrator described her.",
+            ),
+        ),
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(player_message, narrator_message),
+        scene_snapshot=repositories.get_scene_snapshot(save.id),
+        locations=tuple(repositories.list_locations(save.id)),
+        characters=tuple(repositories.list_characters(save.id)),
+        active_threads=tuple(repositories.list_active_threads(save.id)),
+        entity_links=tuple(repositories.list_entity_links(save.id)),
+        memories=tuple(repositories.list_memories(save.id)),
+        world_state=tuple(repositories.list_world_state(save.id)),
+        summaries=tuple(repositories.list_summaries(save.id)),
+        prior_context=(),
+    )
+    from bragi.services.post_turn_inference import (
+        POST_TURN_DOMAIN_SCENE,
+        VerifiedPostTurnCoverage,
+    )
+
+    filtered = module._filter_extraction_for_verified_coverage(
+        extraction,
+        coverage=VerifiedPostTurnCoverage(
+            applied_domains=frozenset({POST_TURN_DOMAIN_SCENE}),
+            committed_count=1,
+        ),
+        request=request,
+    )
+
+    assert len(filtered.characters) == 1
+    assert filtered.characters[0].appearance == "weathered leather coat"
+    assert filtered.characters[0].status == "injured arm"
+
+
+def test_filter_focused_maintenance_for_verified_coverage_drops_covered_domains(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        source_message_id=player_message.id,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The old scene.",
+        present_character_ids=[character.id],
+    )
+    from bragi.services.post_turn_inference import (
+        POST_TURN_DOMAIN_EMOTIONAL,
+        POST_TURN_DOMAIN_RELATIONSHIP,
+        POST_TURN_DOMAIN_THREAD_CLOCK,
+        VerifiedPostTurnCoverage,
+    )
+
+    maintenance = module.FocusedSceneMaintenance(
+        scene_updates=(
+            module.ExtractedSceneSnapshot(
+                source_message_id=narrator_message.id,
+                current_location_name="Beacon Gallery",
+                mood="legacy mood",
+                situation="Ilyra braces the failing lens.",
+                reason="The narrator moved the scene.",
+            ),
+        ),
+        active_thread_updates=(
+            module.ExtractedFocusedActiveThreadStatus(
+                active_thread_id="thread-1",
+                status="resolved",
+                source_message_id=narrator_message.id,
+                reason="The lens was fixed.",
+            ),
+        ),
+        character_relationships=(
+            module.ExtractedFocusedCharacterRelationship(
+                character_id=character.id,
+                target_name="Mara",
+                posture="trusting",
+                source_message_id=narrator_message.id,
+                reason="Ilyra warms to Mara.",
+            ),
+        ),
+        character_emotions=(
+            module.ExtractedFocusedCharacterEmotion(
+                character_id=character.id,
+                emotional_state="calm",
+                source_message_id=narrator_message.id,
+                reason="The crisis passes.",
+            ),
+        ),
+    )
+    filtered = module._filter_focused_maintenance_for_verified_coverage(
+        maintenance,
+        coverage=VerifiedPostTurnCoverage(
+            applied_domains=frozenset(
+                {
+                    POST_TURN_DOMAIN_THREAD_CLOCK,
+                    POST_TURN_DOMAIN_RELATIONSHIP,
+                    POST_TURN_DOMAIN_EMOTIONAL,
+                }
+            ),
+            state_keys=frozenset(
+                {
+                    "character.captain_ilyra.relationships",
+                    "character.captain_ilyra.current_emotional_state",
+                }
+            ),
+            committed_count=3,
+        ),
+        current_snapshot=repositories.get_scene_snapshot(save.id),
+        characters=tuple(repositories.list_characters(save.id)),
+    )
+
+    assert filtered.active_thread_updates == ()
+    assert filtered.character_relationships == ()
+    assert filtered.character_emotions == ()
+    assert len(filtered.scene_updates) == 1
+    assert filtered.scene_updates[0].mood == "legacy mood"
+
+
+def test_filter_focused_maintenance_keeps_uncovered_domains(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        source_message_id=player_message.id,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The old scene.",
+        present_character_ids=[character.id],
+    )
+    from bragi.services.post_turn_inference import (
+        POST_TURN_DOMAIN_SCENE,
+        VerifiedPostTurnCoverage,
+    )
+
+    maintenance = module.FocusedSceneMaintenance(
+        character_emotions=(
+            module.ExtractedFocusedCharacterEmotion(
+                character_id=character.id,
+                emotional_state="calm",
+                source_message_id=narrator_message.id,
+                reason="The crisis passes.",
+            ),
+        ),
+    )
+    filtered = module._filter_focused_maintenance_for_verified_coverage(
+        maintenance,
+        coverage=VerifiedPostTurnCoverage(
+            applied_domains=frozenset({POST_TURN_DOMAIN_SCENE}),
+            committed_count=1,
+        ),
+        current_snapshot=repositories.get_scene_snapshot(save.id),
+        characters=tuple(repositories.list_characters(save.id)),
+    )
+
+    assert len(filtered.character_emotions) == 1
+
+
+def test_filter_extraction_preserves_uncovered_characters_in_covered_domain(
+    repositories: PersistenceRepositories,
+) -> None:
+    module = _context_update_module()
+    save, player_message, narrator_message = _save_with_completed_turn(repositories)
+    mara = repositories.add_character(
+        save_id=save.id,
+        name="Mara",
+        source_message_id=player_message.id,
+    )
+    repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        source_message_id=player_message.id,
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="The old scene.",
+        present_character_ids=[mara.id],
+    )
+    extraction = module.ContextUpdateExtraction(
+        characters=(
+            module.ExtractedCharacter(
+                name="Mara",
+                source_message_id=narrator_message.id,
+                appearance="bruised",
+                current_clothing="torn cloak",
+                evidence_quote="bruised",
+                reason="The narrator described her.",
+            ),
+            module.ExtractedCharacter(
+                name="Captain Ilyra",
+                source_message_id=narrator_message.id,
+                appearance="weathered leather coat",
+                status="unharmed",
+                evidence_quote="weathered leather",
+                reason="The narrator described her.",
+            ),
+        ),
+    )
+    request = module.ContextUpdateRequest(
+        save_id=save.id,
+        messages=(player_message, narrator_message),
+        scene_snapshot=repositories.get_scene_snapshot(save.id),
+        locations=tuple(repositories.list_locations(save.id)),
+        characters=tuple(repositories.list_characters(save.id)),
+        active_threads=tuple(repositories.list_active_threads(save.id)),
+        entity_links=tuple(repositories.list_entity_links(save.id)),
+        memories=tuple(repositories.list_memories(save.id)),
+        world_state=tuple(repositories.list_world_state(save.id)),
+        summaries=tuple(repositories.list_summaries(save.id)),
+        prior_context=(),
+    )
+    from bragi.services.post_turn_inference import (
+        POST_TURN_DOMAIN_PHYSICAL,
+        VerifiedPostTurnCoverage,
+    )
+
+    filtered = module._filter_extraction_for_verified_coverage(
+        extraction,
+        coverage=VerifiedPostTurnCoverage(
+            applied_domains=frozenset({POST_TURN_DOMAIN_PHYSICAL}),
+            state_keys=frozenset({"character.mara.physical_state"}),
+            committed_count=1,
+        ),
+        request=request,
+    )
+
+    by_name = {character.name: character for character in filtered.characters}
+    assert by_name["Mara"].appearance == ""
+    assert by_name["Mara"].current_clothing == ""
+    assert by_name["Captain Ilyra"].appearance == "weathered leather coat"
+    assert by_name["Captain Ilyra"].status == "unharmed"

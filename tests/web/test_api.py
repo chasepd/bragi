@@ -8,11 +8,12 @@ import json
 import sqlite3
 import threading
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NoReturn, cast
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient as FastAPITestClient
@@ -158,6 +159,189 @@ def test_async_api_routes_do_not_use_blocking_state_lock() -> None:
                 offenders.append(f"{node.name}:{child.lineno}")
 
     assert offenders == []
+
+
+@pytest.mark.parametrize(
+    ("status", "status_text", "continuity_degraded", "retry_pending"),
+    [
+        ("waiting", "Waiting for prior turn continuity", False, False),
+        ("succeeded", "Prior turn continuity is ready", False, False),
+        (
+            "failed",
+            "Prior turn continuity catch-up failed; repair will retry",
+            True,
+            True,
+        ),
+        (
+            "retry_pending",
+            "Prior turn continuity is still catching up; retry pending",
+            True,
+            True,
+        ),
+        ("cancelled", "Prior turn continuity catch-up cancelled", False, False),
+    ],
+)
+def test_post_turn_catchup_progress_contract(
+    status: str,
+    status_text: str,
+    continuity_degraded: bool,
+    retry_pending: bool,
+) -> None:
+    assert api_app._post_turn_catchup_progress(  # pyright: ignore[reportPrivateUsage]
+        status,
+        job_ids=["prior-job"],
+    ) == {
+        "kind": "post_turn_catchup",
+        "status": status,
+        "status_text": status_text,
+        "continuity_degraded": continuity_degraded,
+        "retry_pending": retry_pending,
+        "job_ids": ["prior-job"],
+        "jobs": [
+            {
+                "name": "post_turn_catchup",
+                "status": status,
+                "category": "continuity",
+            }
+        ],
+    }
+
+
+def test_post_turn_catchup_emits_retry_pending_from_recovery() -> None:
+    class CatchupHandle:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        async def event(self, event: str, payload: object = None) -> None:
+            self.events.append((event, payload))
+
+    class CatchupRuntime:
+        async def run_post_turn_outbox_recovery(
+            self,
+            *,
+            active_save_id: str,
+        ) -> SimpleNamespace:
+            assert active_save_id == "save-1"
+            return SimpleNamespace(continuity_degraded=True)
+
+    handle = CatchupHandle()
+    state = SimpleNamespace(
+        jobs=SimpleNamespace(list_active=lambda **_kwargs: []),
+        repositories=SimpleNamespace(
+            list_post_turn_outbox_steps=lambda **_kwargs: [object()]
+        ),
+        runtime=CatchupRuntime(),
+    )
+
+    asyncio.run(
+        api_app._wait_for_background_post_turn_catchup(
+            cast(WebAppState, state),
+            cast(Any, handle),
+            save_id="save-1",
+        )
+    )
+
+    assert [
+        cast(dict[str, object], payload)["status"]
+        for event, payload in handle.events
+        if event == "progress"
+    ] == ["waiting", "retry_pending"]
+
+
+def test_post_turn_catchup_emits_safe_failure_progress() -> None:
+    class CatchupHandle:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        async def event(self, event: str, payload: object = None) -> None:
+            self.events.append((event, payload))
+
+    class CatchupRuntime:
+        async def run_post_turn_outbox_recovery(
+            self,
+            *,
+            active_save_id: str,
+        ) -> NoReturn:
+            assert active_save_id == "save-1"
+            raise RuntimeError("provider leaked api_key=live-secret")
+
+    handle = CatchupHandle()
+    state = SimpleNamespace(
+        jobs=SimpleNamespace(list_active=lambda **_kwargs: []),
+        repositories=SimpleNamespace(
+            list_post_turn_outbox_steps=lambda **_kwargs: [object()]
+        ),
+        runtime=CatchupRuntime(),
+    )
+
+    asyncio.run(
+        api_app._wait_for_background_post_turn_catchup(
+            cast(WebAppState, state),
+            cast(Any, handle),
+            save_id="save-1",
+        )
+    )
+
+    payloads = [payload for event, payload in handle.events if event == "progress"]
+    assert [cast(dict[str, object], payload)["status"] for payload in payloads] == [
+        "waiting",
+        "failed",
+    ]
+    assert "live-secret" not in json.dumps(payloads)
+    assert "api_key" not in json.dumps(payloads)
+
+
+def test_post_turn_catchup_emits_cancelled_before_propagating_cancellation() -> None:
+    async def run_test() -> list[tuple[str, object]]:
+        class CatchupHandle:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, object]] = []
+
+            async def event(self, event: str, payload: object = None) -> None:
+                self.events.append((event, payload))
+
+        class CatchupRuntime:
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+
+            async def run_post_turn_outbox_recovery(
+                self,
+                *,
+                active_save_id: str,
+            ) -> None:
+                assert active_save_id == "save-1"
+                self.started.set()
+                await asyncio.Event().wait()
+
+        runtime = CatchupRuntime()
+        handle = CatchupHandle()
+        state = SimpleNamespace(
+            jobs=SimpleNamespace(list_active=lambda **_kwargs: []),
+            repositories=SimpleNamespace(
+                list_post_turn_outbox_steps=lambda **_kwargs: [object()]
+            ),
+            runtime=runtime,
+        )
+        task = asyncio.create_task(
+            api_app._wait_for_background_post_turn_catchup(
+                cast(WebAppState, state),
+                cast(Any, handle),
+                save_id="save-1",
+            )
+        )
+        await runtime.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return handle.events
+
+    events = asyncio.run(run_test())
+
+    assert [
+        cast(dict[str, object], payload)["status"]
+        for event, payload in events
+        if event == "progress"
+    ] == ["waiting", "cancelled"]
 
 
 def test_async_api_routes_wait_for_runtime_lock_contention(tmp_path: Path) -> None:
@@ -1431,7 +1615,11 @@ def test_child_role_can_read_chat_and_generate_media_but_cannot_mutate_save(
         )
         submitted = client.post(
             "/api/chat",
-            json={"body": "I check the beacon.", "save_id": assigned_save.id},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "I check the beacon.",
+                "save_id": assigned_save.id,
+            },
         )
         assert submitted.status_code == 200
         chat_job = _wait_for_terminal_job(
@@ -2977,11 +3165,16 @@ def test_child_role_blocks_unsafe_direct_routes_but_hides_unrelated_saves(
 
         unrelated_chat = client.post(
             "/api/chat",
-            json={"body": "I peek.", "save_id": unrelated_save.id},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "I peek.",
+                "save_id": unrelated_save.id,
+            },
         )
         timeskip = client.post(
             "/api/chat/timeskip",
             json={
+                "client_turn_id": str(uuid4()),
                 "instruction": "Skip to dawn.",
                 "save_id": assigned_save.id,
             },
@@ -3234,7 +3427,11 @@ def test_job_runtime_results_and_events_scrub_debug_details_for_non_admin(
         ).status_code == 200
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon.", "save_id": save.id},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon.",
+                "save_id": save.id,
+            },
         )
         assert created.status_code == 200
         job_id = created.json()["id"]
@@ -3693,7 +3890,11 @@ def test_retired_character_interaction_records_are_recovery_only(
             ),
             client.post(
                 "/api/chat",
-                json={"save_id": save.id, "body": "Continue."},
+                json={
+                    "client_turn_id": str(uuid4()),
+                    "save_id": save.id,
+                    "body": "Continue.",
+                },
             ),
             client.post(
                 "/api/scenarios/continuation-draft",
@@ -5154,7 +5355,10 @@ def test_save_scoped_write_rejects_missing_save_id_after_presentation_load(
 
     with TestClient(create_app(cast(WebAppState, state))) as client:
         loaded = client.post("/api/saves/save-2/load")
-        chat = client.post("/api/chat", json={"body": "Light the beacon"})
+        chat = client.post(
+            "/api/chat",
+            json={"client_turn_id": str(uuid4()), "body": "Light the beacon"},
+        )
         cleanup = client.post("/api/world-data/context-cleanup", json={})
 
     assert loaded.status_code == 200
@@ -6692,6 +6896,65 @@ def test_job_sse_summarizes_failed_job_error_events(tmp_path: Path) -> None:
     asyncio.run(run_test())
 
 
+def test_job_event_stream_resumes_after_last_event_id(tmp_path: Path) -> None:
+    async def run_test() -> None:
+        state = _state_double(tmp_path)
+        succeeded = JobRecord(
+            id="job-resume",
+            type="chat_turn",
+            status="succeeded",
+            events=[
+                {"event": "progress", "payload": {"step": 1}},
+                {"event": "progress", "payload": {"step": 2}},
+            ],
+        )
+        state.jobs._jobs = {  # noqa: SLF001 - controlled fixture
+            succeeded.id: succeeded
+        }
+
+        chunks = [
+            chunk
+            async for chunk in api_app._event_stream(  # noqa: SLF001
+                cast(WebAppState, state),
+                succeeded.id,
+                last_event_id=1,
+            )
+        ]
+
+        assert any("id: 2" in chunk and '"step": 2' in chunk for chunk in chunks)
+        assert '"step": 1' not in repr(chunks)
+        assert any("event: done" in chunk for chunk in chunks)
+
+    asyncio.run(run_test())
+
+
+def test_job_event_stream_emits_heartbeat_while_idle(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def run_test() -> None:
+        state = _state_double(tmp_path)
+        running = JobRecord(id="job-idle", type="chat_turn", status="running")
+        state.jobs._jobs = {running.id: running}  # noqa: SLF001 - controlled fixture
+
+        async def wait_for_event(_job_id: str, last_index: int) -> int:
+            return last_index
+
+        monkeypatch.setattr(state.jobs, "wait_for_event", wait_for_event)
+        stream = cast(
+            AsyncGenerator[str, None],
+            api_app._event_stream(cast(WebAppState, state), running.id),  # noqa: SLF001
+        )
+        try:
+            chunk = await anext(stream)
+        finally:
+            await stream.aclose()
+
+        assert chunk == "event: heartbeat\ndata: {}\n\n"
+
+    asyncio.run(run_test())
+
+
 def test_job_runtime_payloads_use_fresh_visible_save_list(tmp_path: Path) -> None:
     async def collect_events(state: WebAppState, job_id: str) -> list[str]:
         return [
@@ -6923,6 +7186,38 @@ def test_save_event_stream_resumes_after_last_event_id(tmp_path: Path) -> None:
     asyncio.run(run_test())
 
 
+def test_save_event_stream_emits_heartbeat_while_idle(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def run_test() -> None:
+        state = _state_double(tmp_path)
+
+        async def wait_for_event(
+            _save_id: str,
+            last_event_id: int,
+            **_kwargs: object,
+        ) -> int:
+            return last_event_id
+
+        monkeypatch.setattr(state.save_events, "wait_for_event", wait_for_event)
+        stream = cast(
+            AsyncGenerator[str, None],
+            api_app._save_event_stream(  # noqa: SLF001
+                cast(WebAppState, state),
+                "save-1",
+            ),
+        )
+        try:
+            chunk = await anext(stream)
+        finally:
+            await stream.aclose()
+
+        assert chunk == "event: heartbeat\ndata: {}\n\n"
+
+    asyncio.run(run_test())
+
+
 def test_save_event_stream_replays_retained_events_after_overflow(
     tmp_path: Path,
 ) -> None:
@@ -7025,6 +7320,58 @@ def test_save_events_route_reads_last_event_id_header(
     assert seen == [(state, "save-1", 1)]
 
 
+def test_event_stream_routes_disable_buffering_and_job_route_resumes(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = _state_double(tmp_path)
+    succeeded = JobRecord(
+        id="job-1",
+        type="chat_turn",
+        status="succeeded",
+        events=[
+            {"event": "progress", "payload": {"step": step}}
+            for step in range(3)
+        ],
+    )
+    state.jobs._jobs = {succeeded.id: succeeded}  # noqa: SLF001 - controlled fixture
+    seen: list[int] = []
+
+    async def stream_double(
+        _stream_state: WebAppState,
+        _job_id: str,
+        last_event_id: int = 0,
+        **_kwargs: object,
+    ) -> AsyncGenerator[str, None]:
+        seen.append(last_event_id)
+        yield "event: done\ndata: {}\n\n"
+
+    monkeypatch.setattr(api_app, "_event_stream", stream_double)
+
+    async def save_stream_double(
+        _stream_state: WebAppState,
+        _save_id: str,
+        _last_event_id: int = 0,
+        **_kwargs: object,
+    ) -> AsyncGenerator[str, None]:
+        yield "event: heartbeat\ndata: {}\n\n"
+
+    monkeypatch.setattr(api_app, "_save_event_stream", save_stream_double)
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        job_response = client.get(
+            "/api/jobs/job-1/events",
+            headers={"Last-Event-ID": "3"},
+        )
+        save_response = client.get("/api/saves/save-1/events")
+
+    assert seen == [3]
+    for response in (job_response, save_response):
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-cache"
+        assert response.headers["x-accel-buffering"] == "no"
+
+
 def test_save_event_last_event_id_header_parser_falls_back_safely() -> None:
     cursor_from_header = api_app._save_event_cursor_from_header  # noqa: SLF001
 
@@ -7116,6 +7463,7 @@ def test_chat_submission_status_blocks_same_save_active_chat_turn(
         "reason": "chat_turn_active",
         "blocking_job_id": "chat-1",
         "blocking_job_status": "running",
+        "blocking_message_id": None,
     }
     assert allowed.status_code == 200
     assert allowed.json() == {
@@ -7124,6 +7472,7 @@ def test_chat_submission_status_blocks_same_save_active_chat_turn(
         "reason": None,
         "blocking_job_id": None,
         "blocking_job_status": None,
+        "blocking_message_id": None,
     }
     assert jobs.list_active_save_ids == ["save-1", "save-3"]
 
@@ -7145,6 +7494,7 @@ def test_chat_submission_status_blocks_when_no_save_is_available(
         "reason": "no_save",
         "blocking_job_id": None,
         "blocking_job_status": None,
+        "blocking_message_id": None,
     }
 
 
@@ -7184,7 +7534,11 @@ def test_chat_post_rejects_same_save_active_chat_turn(tmp_path: Path) -> None:
     with TestClient(create_app(cast(WebAppState, state))) as client:
         response = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
 
     assert response.status_code == 409
@@ -7192,6 +7546,73 @@ def test_chat_post_rejects_same_save_active_chat_turn(tmp_path: Path) -> None:
         "detail": "A chat turn is already being processed for this save."
     }
     assert runtime.submissions == []
+
+
+def test_concurrent_duplicate_chat_posts_return_one_job(tmp_path: Path) -> None:
+    class BlockingRuntime(_RuntimeDouble):
+        def __init__(self, save_id: str) -> None:
+            super().__init__()
+            self.active_save_id = save_id
+            self.calls = 0
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        async def submit_player_message_for_initial_render(
+            self,
+            *,
+            body: str,
+            speaker_name: str | None,
+            active_save_id: object,
+        ) -> object:
+            self.calls += 1
+            self.entered.set()
+            await asyncio.to_thread(self.release.wait)
+            return SimpleNamespace(
+                model=_chat_model("The bell answers."),
+                has_post_turn_jobs=False,
+                save_id=active_save_id,
+                player_message_id="player-1",
+                narrator_message_id="narrator-1",
+            )
+
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(
+        sqlite3.connect(database_path, check_same_thread=False)
+    )
+    save = _create_auth_save(repositories, title="Lantern Save", owner_user_id=None)
+    runtime = BlockingRuntime(save.id)
+    state = _state_double(tmp_path, runtime)
+    state.repositories = repositories
+    state.jobs._repositories = repositories  # noqa: SLF001 - production wiring
+    barrier = threading.Barrier(2)
+    responses: list[object] = []
+    payload = {
+        "body": "Light the beacon",
+        "save_id": save.id,
+        "client_turn_id": "11111111-1111-4111-8111-111111111111",
+    }
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        def post_duplicate() -> None:
+            barrier.wait(timeout=2.0)
+            responses.append(client.post("/api/chat", json=payload))
+
+        threads = [threading.Thread(target=post_duplicate) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2.0)
+        runtime.release.set()
+
+    assert len(responses) == 2
+    assert {cast(Any, response).status_code for response in responses} == {200}
+    assert len({cast(Any, response).json()["id"] for response in responses}) == 1
+    assert runtime.calls == 1
+    assert repositories.connection.execute(
+        "SELECT COUNT(*) FROM chat_turn_submissions WHERE save_id = ?",
+        (save.id,),
+    ).fetchone()[0] == 1
 
 
 def test_chat_regenerate_rejects_same_save_active_chat_turn(tmp_path: Path) -> None:
@@ -7510,11 +7931,80 @@ def test_chat_post_records_save_id_on_created_job(tmp_path: Path) -> None:
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
 
     assert created.status_code == 200
     assert created.json()["save_id"] == "save-1"
+
+
+def test_retry_interrupted_chat_queues_source_scoped_turn_without_new_input(
+    tmp_path: Path,
+) -> None:
+    class RetryRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.retry_calls: list[tuple[str, object]] = []
+
+        async def retry_interrupted_turn_for_initial_render(
+            self,
+            *,
+            message_id: str,
+            active_save_id: object,
+            **_kwargs: object,
+        ) -> object:
+            self.retry_calls.append((message_id, active_save_id))
+            return SimpleNamespace(
+                model=_chat_model("The observatory door opens."),
+                has_post_turn_jobs=False,
+                save_id="save-1",
+                player_message_id=message_id,
+                narrator_message_id="narrator-1",
+            )
+
+    runtime = RetryRuntime()
+    state = _state_double(tmp_path, runtime)
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(
+        sqlite3.connect(database_path, check_same_thread=False)
+    )
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Observatory",
+        premise="A sealed observatory waits above the city.",
+        player_role="Keeper",
+        content={},
+    )
+    repositories.create_save(
+        save_id="save-1",
+        scenario_id=scenario.id,
+        title="Observatory",
+    )
+    source = repositories.append_message(
+        save_id="save-1",
+        role="player",
+        speaker_name="Mara",
+        body="I open the observatory door.",
+        narration_status="failed",
+        narration_error="Bragi could not finish the narrator response.",
+    )
+    state.repositories = repositories
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        created = client.post(
+            "/api/chat/retry",
+            json={"message_id": source.id, "save_id": "save-1"},
+        )
+        job = _wait_for_terminal_job(client, created.json()["id"], save_id="save-1")
+
+    assert created.status_code == 200
+    assert job["status"] == "succeeded"
+    assert runtime.retry_calls == [(source.id, "save-1")]
 
 
 def test_chat_post_rejects_internal_story_continuation_speaker(
@@ -7526,6 +8016,7 @@ def test_chat_post_rejects_internal_story_continuation_speaker(
         response = client.post(
             "/api/chat",
             json={
+                "client_turn_id": str(uuid4()),
                 "save_id": "save-1",
                 "body": "Hide this user-authored message.",
                 "speaker_name": "Bragi Story Continuation",
@@ -7571,7 +8062,7 @@ def test_continue_story_submits_server_owned_storyteller_direction(
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat/continue",
-            json={"save_id": "save-1"},
+            json={"client_turn_id": str(uuid4()), "save_id": "save-1"},
         )
         assert created.status_code == 200
         job = _wait_for_terminal_job(
@@ -7601,13 +8092,52 @@ def test_continue_story_rejects_roleplay_save(tmp_path: Path) -> None:
     with TestClient(create_app(cast(WebAppState, state))) as client:
         response = client.post(
             "/api/chat/continue",
-            json={"save_id": "save-1"},
+            json={"client_turn_id": str(uuid4()), "save_id": "save-1"},
         )
 
     assert response.status_code == 409
     assert response.json()["detail"] == (
         "Continue story is only available in Storyteller mode."
     )
+
+
+def test_continue_story_replays_before_current_mode_check(tmp_path: Path) -> None:
+    client_turn_id = "11111111-1111-4111-8111-111111111111"
+    job = JobRecord(
+        id="continue-1",
+        type="chat_turn",
+        status="succeeded",
+        save_id="save-1",
+    )
+    state = _state_double(tmp_path)
+    state.jobs._jobs = {job.id: job}  # noqa: SLF001 - replay fixture
+    state.repositories = SimpleNamespace(
+        get_chat_turn_submission=lambda *, save_id, client_turn_id: SimpleNamespace(
+            operation="continue",
+            request_fingerprint=api_app._chat_turn_request_fingerprint(
+                "continue",
+                {
+                    "body": api_app.STORY_CONTINUATION_DIRECTION,
+                    "speaker_name": api_app.STORY_CONTINUATION_SPEAKER_NAME,
+                },
+            ),
+            job=job,
+            player_message_id=None,
+            narrator_message_id=None,
+        ),
+        get_save=lambda _save_id: SimpleNamespace(
+            interaction_mode=InteractionMode.ROLEPLAY
+        ),
+    )
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.post(
+            "/api/chat/continue",
+            json={"client_turn_id": client_turn_id, "save_id": "save-1"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == job.id
 
 
 def test_timeskip_post_records_save_id_on_created_job(tmp_path: Path) -> None:
@@ -7621,7 +8151,9 @@ def test_timeskip_post_records_save_id_on_created_job(tmp_path: Path) -> None:
             *,
             instruction: str,
             active_save_id: object,
+            narrator_stream_callback: Callable[[str], None] | None = None,
         ) -> object:
+            assert narrator_stream_callback is None
             self.submissions.append((instruction, active_save_id))
             return SimpleNamespace(
                 model=_chat_model("Dawn catches on the city gates."),
@@ -7638,6 +8170,7 @@ def test_timeskip_post_records_save_id_on_created_job(tmp_path: Path) -> None:
         created = client.post(
             "/api/chat/timeskip",
             json={
+                "client_turn_id": str(uuid4()),
                 "instruction": "Skip to dawn at the city gates.",
                 "save_id": "save-1",
             },
@@ -7653,11 +8186,14 @@ def test_timeskip_post_turn_jobs_preserve_request_actor(
     tmp_path: Path,
     max_active_jobs: int | None,
 ) -> None:
+    prepared_choices = object()
+
     class RuntimeWithTimeskipPostTurn(_RuntimeDouble):
         def __init__(self) -> None:
             super().__init__()
             self.submission_user_ids: list[str | None] = []
             self.post_turn_user_ids: list[str | None] = []
+            self.choice_user_ids: list[str | None] = []
             self.post_turn_finished = threading.Event()
 
         async def submit_timeskip_for_initial_render(
@@ -7675,7 +8211,18 @@ def test_timeskip_post_turn_jobs_preserve_request_actor(
                 save_id=cast(str, active_save_id),
                 player_message_id="timeskip-1",
                 narrator_message_id="narrator-1",
+                prepared_action_choices=prepared_choices,
             )
+
+        async def run_prepared_action_choices(
+            self,
+            *,
+            prepared_action_choices: object,
+            current_user_id: str | None = None,
+        ) -> str:
+            assert prepared_action_choices is prepared_choices
+            self.choice_user_ids.append(current_user_id)
+            return "succeeded"
 
         async def run_post_turn_jobs(
             self,
@@ -7719,6 +8266,7 @@ def test_timeskip_post_turn_jobs_preserve_request_actor(
         created = client.post(
             "/api/chat/timeskip",
             json={
+                "client_turn_id": str(uuid4()),
                 "instruction": "Skip to dawn at the city gates.",
                 "save_id": save.id,
             },
@@ -7730,6 +8278,11 @@ def test_timeskip_post_turn_jobs_preserve_request_actor(
     assert job["status"] == "succeeded"
     assert runtime.submission_user_ids == [user.id]
     assert runtime.post_turn_user_ids == [user.id]
+    if max_active_jobs is None:
+        assert runtime.choice_user_ids == [user.id]
+    else:
+        assert runtime.choice_user_ids == []
+        assert job["completion_level"] == "optional_enrichments_complete"
 
 
 def test_look_around_post_records_save_id_and_returns_answer_job(
@@ -7792,7 +8345,11 @@ def test_chat_and_look_around_reject_oversized_text_inputs(tmp_path: Path) -> No
     with TestClient(create_app(cast(WebAppState, state))) as client:
         chat_response = client.post(
             "/api/chat",
-            json={"body": oversized_chat, "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": oversized_chat,
+                "save_id": "save-1",
+            },
         )
         look_response = client.post(
             "/api/chat/look-around",
@@ -8102,7 +8659,11 @@ def test_chat_turn_exposes_initial_pre_narrator_phase_progress(
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert created.status_code == 200
         job_id = created.json()["id"]
@@ -8140,7 +8701,7 @@ def test_chat_turn_uses_runtime_pre_narrator_phase_progress(
             turn_progress_callback(
                 _expected_chat_turn_progress(
                     "Selecting context",
-                    succeeded=("submission", "history", "input"),
+                    succeeded=("submission", "classification", "history", "input"),
                     running="context_selection",
                 )
             )
@@ -8160,7 +8721,11 @@ def test_chat_turn_uses_runtime_pre_narrator_phase_progress(
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert created.status_code == 200
         job_id = created.json()["id"]
@@ -8178,7 +8743,7 @@ def test_chat_turn_uses_runtime_pre_narrator_phase_progress(
     assert job["status"] == "running"
     assert job["latest_progress"] == _expected_chat_turn_progress(
         "Selecting context",
-        succeeded=("submission", "history", "input"),
+        succeeded=("submission", "classification", "history", "input"),
         running="context_selection",
     )
 
@@ -8216,6 +8781,7 @@ def test_timeskip_exposes_initial_pre_narrator_phase_progress(
         created = client.post(
             "/api/chat/timeskip",
             json={
+                "client_turn_id": str(uuid4()),
                 "instruction": "Skip to dawn at the city gates.",
                 "save_id": "save-1",
             },
@@ -8262,7 +8828,11 @@ def test_timeskip_post_rejects_blank_instruction(tmp_path: Path) -> None:
     with TestClient(create_app(cast(WebAppState, state))) as client:
         response = client.post(
             "/api/chat/timeskip",
-            json={"instruction": "   ", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "instruction": "   ",
+                "save_id": "save-1",
+            },
         )
 
     assert response.status_code == 400
@@ -8306,6 +8876,7 @@ def test_timeskip_post_rejects_same_save_active_chat_turn(tmp_path: Path) -> Non
         response = client.post(
             "/api/chat/timeskip",
             json={
+                "client_turn_id": str(uuid4()),
                 "instruction": "Skip to dawn at the city gates.",
                 "save_id": "save-1",
             },
@@ -8483,7 +9054,11 @@ def test_chat_cancel_is_not_blocked_by_runtime_access_lock(tmp_path: Path) -> No
     with TestClient(create_app(cast(WebAppState, state))) as client:
         chat = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert chat.status_code == 200
         job_id = chat.json()["id"]
@@ -8579,7 +9154,11 @@ def test_generic_chat_job_cancel_records_cancelled_status(tmp_path: Path) -> Non
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert created.status_code == 200
         job_id = created.json()["id"]
@@ -8601,8 +9180,12 @@ def test_generic_chat_job_cancel_records_cancelled_status(tmp_path: Path) -> Non
                 break
             time.sleep(0.01)
 
+        repeated = client.post(_job_cancel_url(job_id, "save-1"))
+
     assert job["status"] == "cancelled"
     assert job["error"] == "Cancelled"
+    assert repeated.status_code == 200
+    assert repeated.json() == {"cancelled": False}
 
 
 def test_chat_turn_completes_after_initial_render_and_queues_post_turn_job(
@@ -8663,7 +9246,11 @@ def test_chat_turn_completes_after_initial_render_and_queues_post_turn_job(
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert created.status_code == 200
         job_id = created.json()["id"]
@@ -8736,6 +9323,10 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
             super().__init__()
             self.deferred_calls: list[dict[str, object]] = []
             self._payloads: dict[tuple[str, str], dict[str, object]] = {}
+            self.submit_count = 0
+            self.image_started = threading.Event()
+            self.release_image = threading.Event()
+            self.second_turn_started = threading.Event()
 
         async def submit_player_message_for_initial_render(
             self,
@@ -8744,6 +9335,16 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
             speaker_name: str | None,
             active_save_id: object,
         ) -> SimpleNamespace:
+            self.submit_count += 1
+            if self.submit_count > 1:
+                self.second_turn_started.set()
+                return SimpleNamespace(
+                    model=_chat_model("The lens keeps humming."),
+                    has_post_turn_jobs=False,
+                    save_id="save-1",
+                    player_message_id="player-2",
+                    narrator_message_id="narrator-2",
+                )
             return SimpleNamespace(
                 model=_chat_model("The bell answers."),
                 has_post_turn_jobs=True,
@@ -8780,6 +9381,8 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
             current_user_id: str | None = None,
         ) -> str:
             self.deferred_calls.append(prepared_automatic_image)
+            self.image_started.set()
+            await asyncio.to_thread(self.release_image.wait)
             return "succeeded"
 
     runtime = DeferredImageRuntime()
@@ -8787,15 +9390,57 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert created.status_code == 200
+        _wait_for_terminal_job(client, created.json()["id"], save_id="save-1")
+        assert runtime.image_started.wait(timeout=2)
         for _ in range(100):
-            if runtime.deferred_calls:
+            post_turn_jobs = [
+                job
+                for job in client.get("/api/jobs?status=active").json()["jobs"]
+                if job["type"] == "post_turn_background"
+            ]
+            if (
+                post_turn_jobs
+                and post_turn_jobs[0]["completion_level"] == "continuity_ready"
+            ):
                 break
             time.sleep(0.01)
+        else:
+            raise AssertionError("post-turn continuity did not become ready")
+
+        second = client.post(
+            "/api/chat",
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Inspect the lens",
+                "save_id": "save-1",
+            },
+        )
+        assert second.status_code == 200
+        assert runtime.second_turn_started.wait(timeout=2)
+        second_finished = _wait_for_terminal_job(
+            client,
+            second.json()["id"],
+            save_id="save-1",
+        )
+        assert second_finished["status"] == "succeeded"
+        runtime.release_image.set()
+        post_turn_finished = _wait_for_terminal_job(
+            client,
+            post_turn_jobs[0]["id"],
+            save_id="save-1",
+        )
 
     assert runtime.deferred_calls == [prepared_payload]
+    assert post_turn_finished["completion_level"] == (
+        "optional_enrichments_complete"
+    )
 
 
 def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
@@ -8865,12 +9510,18 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
     )
     state = _state_double(tmp_path, runtime)
     state.repositories = repositories
+    state.jobs._repositories = repositories  # noqa: SLF001 - production wiring
     state.providers = runtime.providers
 
     with TestClient(create_app(cast(WebAppState, state))) as client:
+        client_turn_id = "11111111-1111-4111-8111-111111111111"
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": save.id},
+            json={
+                "body": "Light the beacon",
+                "save_id": save.id,
+                "client_turn_id": client_turn_id,
+            },
         )
         assert created.status_code == 200
         job_id = created.json()["id"]
@@ -8885,9 +9536,36 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
             time.sleep(0.01)
         else:
             raise AssertionError("chat turn job did not finish")
+        state.jobs._jobs.clear()  # noqa: SLF001 - simulate registry loss after commit
+        replay = client.post(
+            "/api/chat",
+            json={
+                "body": " Light the beacon ",
+                "save_id": save.id,
+                "client_turn_id": client_turn_id,
+            },
+        )
+        conflict = client.post(
+            "/api/chat",
+            json={
+                "body": "Ring the bell",
+                "save_id": save.id,
+                "client_turn_id": client_turn_id,
+            },
+        )
 
     assert job_record is not None
     assert job_record.status == "succeeded"
+    assert replay.status_code == 200
+    assert replay.json()["id"] == job_id
+    assert replay.json()["status"] == "succeeded"
+    assert conflict.status_code == 409
+    assert conflict.json() == {
+        "detail": (
+            "client_turn_id was already used for a different chat submission."
+        )
+    }
+    assert len(repositories.list_messages(save.id)) == 2
     result = cast(dict[str, Any], job_record.result)
     assert result["kind"] == "chat_turn_delta"
     assert result["version"] == 1
@@ -8949,7 +9627,11 @@ def test_post_turn_jobs_expose_initial_phase_progress_before_runtime_callback(
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert created.status_code == 200
 
@@ -8978,18 +9660,40 @@ def test_post_turn_jobs_expose_initial_phase_progress_before_runtime_callback(
     assert job["latest_progress"] == {
         "status_text": "Updating world state",
         "jobs": [
-            {"name": "state", "status": "pending"},
-            {"name": "context", "status": "pending"},
-            {"name": "proactive_text", "status": "pending"},
-            {"name": "director", "status": "pending"},
-            {"name": "scenario", "status": "pending"},
-            {"name": "image", "status": "pending"},
+            {"name": "summary", "status": "pending", "category": "continuity"},
+            {"name": "state", "status": "pending", "category": "continuity"},
+            {
+                "name": "context",
+                "status": "pending",
+                "category": "continuity",
+            },
+            {
+                "name": "time_reconciliation",
+                "status": "pending",
+                "category": "continuity",
+            },
+            {
+                "name": "proactive_text",
+                "status": "pending",
+                "category": "continuity",
+            },
+            {
+                "name": "director",
+                "status": "pending",
+                "category": "continuity",
+            },
+            {
+                "name": "scenario",
+                "status": "pending",
+                "category": "continuity",
+            },
+            {"name": "image", "status": "pending", "category": "optional"},
         ],
     }
     assert finished["status"] == "succeeded"
 
 
-def test_chat_turn_waits_for_background_post_turn_after_input_progress(
+def test_chat_turn_waits_for_background_continuity_before_persisting_input(
     tmp_path: Path,
 ) -> None:
     class PostTurnCatchupRuntime(_RuntimeDouble):
@@ -8998,8 +9702,7 @@ def test_chat_turn_waits_for_background_post_turn_after_input_progress(
             self.submit_count = 0
             self.post_turn_started = threading.Event()
             self.release_post_turn = threading.Event()
-            self.second_input_saved = threading.Event()
-            self.second_catchup_done = threading.Event()
+            self.second_submit_started = threading.Event()
 
         async def submit_player_message_for_initial_render(
             self,
@@ -9008,7 +9711,6 @@ def test_chat_turn_waits_for_background_post_turn_after_input_progress(
             speaker_name: str | None,
             active_save_id: object,
             turn_progress_callback: Callable[[object], None] | None = None,
-            post_input_catchup: Callable[[], Awaitable[Any]] | None = None,
         ) -> SimpleNamespace:
             del speaker_name
             self.submit_count += 1
@@ -9024,16 +9726,13 @@ def test_chat_turn_waits_for_background_post_turn_after_input_progress(
             assert active_save_id == "save-1"
             assert body == "I check the lens while the world settles."
             assert turn_progress_callback is not None
-            assert post_input_catchup is not None
+            self.second_submit_started.set()
             turn_progress_callback(
                 _expected_chat_turn_progress(
                     "Player input saved",
-                    succeeded=("submission", "history", "input"),
+                    succeeded=("submission", "classification", "history", "input"),
                 )
             )
-            self.second_input_saved.set()
-            await post_input_catchup()
-            self.second_catchup_done.set()
             return SimpleNamespace(
                 model=_chat_model("The lens keeps humming."),
                 has_post_turn_jobs=False,
@@ -9060,7 +9759,11 @@ def test_chat_turn_waits_for_background_post_turn_after_input_progress(
     with TestClient(create_app(cast(WebAppState, state))) as client:
         first = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert first.status_code == 200
         assert runtime.post_turn_started.wait(timeout=2)
@@ -9072,37 +9775,176 @@ def test_chat_turn_waits_for_background_post_turn_after_input_progress(
 
         second = client.post(
             "/api/chat",
-            json={
+            json={"client_turn_id": str(uuid4()),
                 "body": "I check the lens while the world settles.",
                 "save_id": "save-1",
             },
         )
         assert second.status_code == 200
         second_job_id = second.json()["id"]
-        assert runtime.second_input_saved.wait(timeout=2)
-        assert not runtime.second_catchup_done.is_set()
         for _ in range(50):
             second_running = client.get(_job_url(second_job_id, "save-1")).json()
-            if second_running.get("latest_progress", {}).get("status_text") == (
-                "Player input saved"
-            ):
+            if second_running.get("latest_progress", {}).get("status") == "waiting":
                 break
             time.sleep(0.01)
+        assert not runtime.second_submit_started.is_set()
         runtime.release_post_turn.set()
+        assert runtime.second_submit_started.wait(timeout=2)
         second_finished = _wait_for_terminal_job(
             client,
             second_job_id,
             save_id="save-1",
         )
+        second_record = state.jobs.get(second_job_id)
 
     assert first_job["status"] == "succeeded"
     assert second_running["status"] == "running"
-    assert second_running["latest_progress"] == _expected_chat_turn_progress(
-        "Player input saved",
-        succeeded=("submission", "history", "input"),
-    )
-    assert runtime.second_catchup_done.is_set()
+    catchup_job_ids = second_running["latest_progress"]["job_ids"]
+    assert len(catchup_job_ids) == 1
+    assert second_running["latest_progress"] == {
+        "kind": "post_turn_catchup",
+        "status": "waiting",
+        "status_text": "Waiting for prior turn continuity",
+        "continuity_degraded": False,
+        "retry_pending": False,
+        "job_ids": catchup_job_ids,
+        "jobs": [
+            {
+                "name": "post_turn_catchup",
+                "status": "waiting",
+                "category": "continuity",
+            }
+        ],
+    }
     assert second_finished["status"] == "succeeded"
+    assert second_finished["latest_progress"]["status_text"] == "Player input saved"
+    assert second_record is not None
+    assert [
+        event["payload"]["status"]
+        for event in second_record.events
+        if event["event"] == "progress"
+        and event["payload"].get("kind") == "post_turn_catchup"
+    ] == ["waiting", "succeeded"]
+
+
+def test_slow_action_choices_do_not_delay_next_narrator_turn(tmp_path: Path) -> None:
+    prepared_choices = object()
+
+    class OptionalActionRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.submit_count = 0
+            self.action_choices_started = threading.Event()
+            self.release_action_choices = threading.Event()
+            self.second_turn_started = threading.Event()
+
+        async def submit_player_message_for_initial_render(
+            self,
+            *,
+            body: str,
+            speaker_name: str | None,
+            active_save_id: object,
+        ) -> SimpleNamespace:
+            del body, speaker_name, active_save_id
+            self.submit_count += 1
+            if self.submit_count == 1:
+                return SimpleNamespace(
+                    model=_chat_model("The bell answers."),
+                    has_post_turn_jobs=True,
+                    save_id="save-1",
+                    player_message_id="player-1",
+                    narrator_message_id="narrator-1",
+                    prepared_action_choices=prepared_choices,
+                )
+            self.second_turn_started.set()
+            return SimpleNamespace(
+                model=_chat_model("The lens keeps humming."),
+                has_post_turn_jobs=False,
+                save_id="save-1",
+                player_message_id="player-2",
+                narrator_message_id="narrator-2",
+            )
+
+        async def run_post_turn_jobs(
+            self,
+            *,
+            save_id: str,
+            player_message_id: str,
+            narrator_message_id: str,
+            progress_callback: object | None = None,
+        ) -> dict[str, object]:
+            del save_id, player_message_id, narrator_message_id, progress_callback
+            return _chat_model("Continuity ready.")
+
+        async def run_prepared_action_choices(
+            self,
+            *,
+            prepared_action_choices: object,
+            current_user_id: str | None = None,
+        ) -> str:
+            del current_user_id
+            assert prepared_action_choices is prepared_choices
+            self.action_choices_started.set()
+            await asyncio.to_thread(self.release_action_choices.wait)
+            return "succeeded"
+
+    runtime = OptionalActionRuntime()
+    state = _state_double(tmp_path, runtime)
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        first = client.post(
+            "/api/chat",
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
+        )
+        assert first.status_code == 200
+        _wait_for_terminal_job(client, first.json()["id"], save_id="save-1")
+        assert runtime.action_choices_started.wait(timeout=2)
+
+        for _ in range(50):
+            active_jobs = client.get("/api/jobs?status=active").json()["jobs"]
+            action_choice_jobs = [
+                job
+                for job in active_jobs
+                if job["type"] == "action_choice_generate"
+            ]
+            post_turn_active = any(
+                job["type"] == "post_turn_background" for job in active_jobs
+            )
+            if action_choice_jobs and not post_turn_active:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("independent action-choice job was not exposed")
+        assert not post_turn_active
+
+        second = client.post(
+            "/api/chat",
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "I inspect the lens",
+                "save_id": "save-1",
+            },
+        )
+        assert second.status_code == 200
+        assert runtime.second_turn_started.wait(timeout=2)
+        second_finished = _wait_for_terminal_job(
+            client,
+            second.json()["id"],
+            save_id="save-1",
+        )
+        assert second_finished["status"] == "succeeded"
+
+        runtime.release_action_choices.set()
+        action_choice_finished = _wait_for_terminal_job(
+            client,
+            action_choice_jobs[0]["id"],
+            save_id="save-1",
+        )
+
+    assert action_choice_finished["status"] == "cancelled"
 
 
 def test_chat_turn_leaves_state_pruning_for_scheduler(tmp_path: Path) -> None:
@@ -9151,7 +9993,11 @@ def test_chat_turn_leaves_state_pruning_for_scheduler(tmp_path: Path) -> None:
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert created.status_code == 200
         chat_job_id = created.json()["id"]
@@ -9221,7 +10067,11 @@ def test_chat_turn_skips_duplicate_active_state_pruning_job(tmp_path: Path) -> N
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert created.status_code == 200
         chat_job_id = created.json()["id"]
@@ -9271,7 +10121,11 @@ def test_provider_retry_progress_events_are_sent_before_sse_done(
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert created.status_code == 200
         job_id = created.json()["id"]
@@ -9293,7 +10147,10 @@ def test_provider_retry_progress_events_are_sent_before_sse_done(
         ]
 
     chunks = asyncio.run(collect_events())
-    event_names = [chunk.split("\n", 1)[0] for chunk in chunks]
+    event_names = [
+        next(line for line in chunk.splitlines() if line.startswith("event: "))
+        for chunk in chunks
+    ]
     retry_index = next(
         index
         for index, chunk in enumerate(chunks)
@@ -9304,8 +10161,8 @@ def test_provider_retry_progress_events_are_sent_before_sse_done(
     assert retry_index < event_names.index("event: done")
 
 
-def test_chat_turn_emits_narrator_draft_before_runtime(tmp_path: Path) -> None:
-    class StreamingRuntime(_RuntimeDouble):
+def test_chat_turn_uses_final_only_narrator_delivery(tmp_path: Path) -> None:
+    class FinalOnlyRuntime(_RuntimeDouble):
         async def submit_player_message_for_initial_render(
             self,
             *,
@@ -9315,9 +10172,7 @@ def test_chat_turn_emits_narrator_draft_before_runtime(tmp_path: Path) -> None:
             narrator_stream_callback: Callable[[str], None] | None = None,
         ) -> SimpleNamespace:
             assert body == "Light the beacon"
-            if narrator_stream_callback is not None:
-                narrator_stream_callback("The bell")
-                narrator_stream_callback("The bell answers.")
+            assert narrator_stream_callback is None
             return SimpleNamespace(
                 model=_chat_model("The bell answers."),
                 has_post_turn_jobs=False,
@@ -9326,11 +10181,15 @@ def test_chat_turn_emits_narrator_draft_before_runtime(tmp_path: Path) -> None:
                 narrator_message_id="narrator-1",
             )
 
-    state = _state_double(tmp_path, StreamingRuntime())
+    state = _state_double(tmp_path, FinalOnlyRuntime())
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
-            json={"body": "Light the beacon", "save_id": "save-1"},
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
         )
         assert created.status_code == 200
         job_id = created.json()["id"]
@@ -9344,13 +10203,8 @@ def test_chat_turn_emits_narrator_draft_before_runtime(tmp_path: Path) -> None:
     snapshot = state.jobs.get(job_id)
     assert snapshot is not None
     event_names = [event["event"] for event in snapshot.events]
-    drafts = [
-        event["payload"]["message"]["body"]
-        for event in snapshot.events
-        if event["event"] == "narrator_draft"
-    ]
-    assert drafts == ["The bell", "The bell answers."]
-    assert event_names.index("narrator_draft") < event_names.index("runtime")
+    assert "narrator_draft" not in event_names
+    assert event_names.index("progress") < event_names.index("runtime")
 
 
 def test_client_log_endpoint_sanitizes_sensitive_metadata(
@@ -10281,6 +11135,37 @@ def test_terminal_chat_like_job_cancel_does_not_request_runtime_cancellation(
     assert cancelled.status_code == 200
     assert cancelled.json() == {"cancelled": False}
     assert runtime.cancel_calls == []
+
+
+def test_active_chat_like_job_cancel_reports_when_cancellation_cannot_be_requested(
+    tmp_path: Path,
+) -> None:
+    class RejectingCancelRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_calls: list[str | None] = []
+
+        def cancel_active_submit(self, *, save_id: str | None = None) -> bool:
+            self.cancel_calls.append(save_id)
+            return False
+
+    runtime = RejectingCancelRuntime()
+    state = _state_double(tmp_path, runtime)
+    state.jobs._jobs = {  # noqa: SLF001 - controlled registry fixture
+        "chat-turn-running": JobRecord(
+            id="chat-turn-running",
+            type="chat_turn",
+            save_id="save-1",
+            status="running",
+        )
+    }
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        cancelled = client.post(_job_cancel_url("chat-turn-running", "save-1"))
+
+    assert cancelled.status_code == 409
+    assert cancelled.json()["detail"] == "Job cancellation could not be requested"
+    assert runtime.cancel_calls == ["save-1"]
 
 
 def test_chat_regenerate_passes_feedback_to_runtime(tmp_path: Path) -> None:
@@ -14396,6 +15281,7 @@ def _chat_model(body: str) -> dict[str, object]:
 
 _EXPECTED_CHAT_TURN_PHASES = (
     "submission",
+    "classification",
     "history",
     "input",
     "character_planning",
@@ -14535,6 +15421,25 @@ class _RecordingCharacterTextProvider:
 def _allow_safety_response(
     request: StructuredOutputRequest,
 ) -> StructuredOutputResponse:
+    if request.schema_name == "content_safety_batch_review":
+        reviews_schema = request.schema["properties"]["reviews"]
+        count = int(reviews_schema["minItems"])
+        return StructuredOutputResponse(
+            data={
+                "reviews": [
+                    {
+                        "ordinal": ordinal,
+                        "action": "allow",
+                        "category": "none",
+                        "reason": "Test fixture content is within the ceiling.",
+                        "minimum_rating": "g",
+                    }
+                    for ordinal in range(1, count + 1)
+                ]
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
     if request.schema_name != "content_safety_review":
         raise AssertionError(f"unexpected structured schema: {request.schema_name}")
     return StructuredOutputResponse(
@@ -14660,11 +15565,16 @@ def _submit_chat_and_wait(
 ) -> dict[str, Any]:
     submitted = client.post(
         "/api/chat",
-        json={"body": body, "speaker_name": "Mara", "save_id": save_id},
+        json={
+            "client_turn_id": str(uuid4()),
+            "body": body,
+            "speaker_name": "Mara",
+            "save_id": save_id,
+        },
     )
     assert submitted.status_code == 200
     job = _wait_for_terminal_job(client, submitted.json()["id"], save_id=save_id)
-    assert job["status"] == "succeeded"
+    assert job["status"] == "succeeded", job
     assert job["error"] is None
     assert isinstance(job["result"], dict)
     assert job["result"]["error"] is None
@@ -16251,6 +17161,7 @@ def _state_double(tmp_path: Path, runtime: object | None = None) -> SimpleNamesp
         repositories=SimpleNamespace(
             list_saves=lambda: [],
             list_media_assets=lambda _save_id: [],
+            get_active_interrupted_message_narration=lambda _save_id: None,
         ),
         settings_service=lambda: SimpleNamespace(secret_storage_warning=lambda: None),
         secret_store=SimpleNamespace(),

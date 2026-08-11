@@ -1128,6 +1128,24 @@ h1 {
   margin-bottom: 10px;
 }
 
+.interrupted-turn {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid rgba(224, 157, 91, 0.38);
+  border-radius: 7px;
+  background: rgba(105, 60, 31, 0.22);
+}
+
+.interrupted-turn-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
 .prose {
   white-space: pre-wrap;
   line-height: 1.62;
@@ -1380,6 +1398,13 @@ h1 {
 .cyoa-custom-toggle[aria-expanded="true"] {
   color: #15130e;
   background: linear-gradient(180deg, #ead894, #d7a84f);
+}
+
+.cyoa-generation-status {
+  display: block;
+  padding: 0 14px 10px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .cyoa-regenerate-button {

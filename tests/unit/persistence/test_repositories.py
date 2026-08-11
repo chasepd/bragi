@@ -97,6 +97,88 @@ def test_message_safety_transition_round_trips_and_edits_clear_it(
     assert edited.safety_transition == ""
     assert edited.content_rating == "g"
 
+
+def test_message_narration_state_round_trips_and_recovers_interrupted_work(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Interrupted Turn Test",
+        premise="A neutral test scenario.",
+        player_role="Traveler",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Test Save")
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="Open the sealed gate.",
+        narration_status="pending",
+    )
+
+    state = repositories.get_message_narration_state(
+        save_id=save.id,
+        message_id=player.id,
+    )
+    assert state is not None
+    assert state.status == "pending"
+    assert state.error is None
+
+    repositories.set_message_narration_state(
+        save_id=save.id,
+        message_id=player.id,
+        status="retrying",
+    )
+    recovered = repositories.recover_interrupted_message_narrations(
+        error="The turn was interrupted before a narrator response was saved.",
+    )
+
+    assert recovered == [player.id]
+    state = repositories.get_message_narration_state(
+        save_id=save.id,
+        message_id=player.id,
+    )
+    assert state is not None
+    assert state.status == "cancelled"
+    assert state.error == (
+        "The turn was interrupted before a narrator response was saved."
+    )
+
+
+def test_active_interrupted_message_narration_uses_latest_visible_head(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Interrupted Turn Test",
+        premise="A neutral test scenario.",
+        player_role="Traveler",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Test Save")
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="Open the sealed gate.",
+        narration_status="failed",
+        narration_error="Bragi could not finish the narrator response.",
+    )
+
+    state = repositories.get_active_interrupted_message_narration(save.id)
+
+    assert state is not None
+    assert state.message_id == player.id
+    assert state.status == "failed"
+    assert state.source_kind == "player"
+
+    repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The gate opens.",
+    )
+
+    assert repositories.get_active_interrupted_message_narration(save.id) is None
+
     raw_body = "He thrust into her before the scene changed."
     raw = repositories.append_message(
         save_id=save.id,
@@ -653,6 +735,237 @@ def test_repositories_round_trip_scene_snapshot_world_time(
     assert snapshot.world_time_source_message_id is None
     assert snapshot.world_time_confidence == 0.92
     assert snapshot.locked_fields == ["time_of_day"]
+
+
+def test_repositories_scene_facts_replace_shared_object_placement_slot(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Room",
+        premise="Two travelers search a locked room.",
+        player_role="Traveler",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="The Search")
+    player = repositories.add_character(
+        save_id=save.id,
+        name="Rowan",
+        is_player_character=True,
+    )
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Rowan drops the brass key beside the north door.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[player.id],
+        source_message_id=narrator.id,
+    )
+
+    held, replaced, refreshed = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="object_possession",
+        subject_type="object",
+        subject_id=None,
+        subject_label="Brass Key",
+        target_type="character",
+        target_id=player.id,
+        value="held in Rowan's right hand",
+        source_message_id=narrator.id,
+        evidence_quote="Rowan drops the brass key",
+    )
+    dropped, replaced, refreshed = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="brass   key",
+        target_type="environment",
+        target_label="north door",
+        value="on the floor beside the north door",
+        source_message_id=narrator.id,
+        evidence_quote="brass key beside the north door",
+    )
+
+    assert replaced is not None
+    assert replaced.id == held.id
+    assert refreshed is False
+    assert repositories.get_scene_fact(held.id).archive_reason == "superseded"  # type: ignore[union-attr]
+    assert repositories.list_scene_facts(save.id) == [dropped]
+
+
+def test_repositories_scene_fact_refreshes_turn_ttl_and_provenance(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Gatehouse",
+        premise="A guard braces the gate.",
+        player_role="Scout",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="At the Gate")
+    guard = repositories.add_character(save_id=save.id, name="Mara")
+    first = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara keeps hauling the gate chain.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[guard.id],
+        source_message_id=first.id,
+    )
+    fact, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="ongoing_action",
+        subject_type="character",
+        subject_id=guard.id,
+        subject_label="Mara",
+        value="hauling the gate chain",
+        source_message_id=first.id,
+        evidence_quote="Mara keeps hauling the gate chain",
+    )
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I brace the mechanism.",
+    )
+    second = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara is still hauling the gate chain.",
+    )
+
+    assert repositories.list_scene_facts(save.id) == []
+    refreshed, replaced, was_refreshed = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="ongoing_action",
+        subject_type="character",
+        subject_id=guard.id,
+        subject_label="Mara",
+        value="hauling the gate chain",
+        source_message_id=second.id,
+        evidence_quote="still hauling the gate chain",
+    )
+
+    assert player.role == "player"
+    assert refreshed.id != fact.id
+    assert replaced is None
+    assert was_refreshed is False
+    assert refreshed.expires_after_turn_number == 3
+    assert [item.source_message_id for item in refreshed.provenance] == [second.id]
+
+
+def test_scene_fact_source_removal_is_audited_and_archives_last_source(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, first_message_id = _persist_repository_save(repositories)
+    repositories.upsert_scene_snapshot(
+        save_id=save_id,
+        source_message_id=first_message_id,
+    )
+    fact, _, _ = repositories.upsert_scene_fact(
+        save_id=save_id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="brass key",
+        value="on the table",
+        source_message_id=first_message_id,
+        evidence_quote="Ash scratches the glass",
+    )
+    second = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        body="The brass key remains on the table.",
+    )
+    refreshed, _, was_refreshed = repositories.upsert_scene_fact(
+        save_id=save_id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="brass key",
+        value="on the table",
+        source_message_id=second.id,
+        evidence_quote="remains on the table",
+    )
+    assert refreshed.id == fact.id
+    assert was_refreshed is True
+
+    repositories.remove_scene_fact_provenance_for_messages(
+        save_id=save_id,
+        message_ids={first_message_id},
+    )
+    still_active = repositories.get_scene_fact(fact.id)
+    assert still_active is not None
+    assert still_active.archived_at is None
+    assert [source.source_message_id for source in still_active.provenance] == [
+        second.id
+    ]
+
+    repositories.remove_scene_fact_provenance_for_messages(
+        save_id=save_id,
+        message_ids={second.id},
+    )
+    archived = repositories.get_scene_fact(fact.id)
+    assert archived is not None
+    assert archived.archive_reason == "source_removed"
+    audits = [
+        audit
+        for audit in repositories.list_context_update_audit(save_id)
+        if audit.entity_id == fact.id
+    ]
+    assert [audit.operation for audit in audits] == [
+        "provenance_removed",
+        "source_removed",
+    ]
+
+
+def test_repositories_scene_transition_archives_current_facts(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Vault",
+        premise="A sealed vault opens into a tunnel.",
+        player_role="Delver",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Below")
+    actor = repositories.add_character(save_id=save.id, name="Ilya")
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Ilya crouches behind the stone plinth.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[actor.id],
+        source_message_id=message.id,
+    )
+    fact, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="actor_pose",
+        subject_type="character",
+        subject_id=actor.id,
+        subject_label="Ilya",
+        value="crouched behind the stone plinth",
+        source_message_id=message.id,
+        evidence_quote="Ilya crouches behind the stone plinth",
+    )
+
+    repositories.advance_scene_generation(
+        save_id=save.id,
+        source_message_id=message.id,
+    )
+
+    assert repositories.list_scene_facts(save.id) == []
+    archived = repositories.get_scene_fact(fact.id)
+    assert archived is not None
+    assert archived.archive_reason == "scene_transition"
 
 
 def test_repositories_preserve_canonical_world_time_on_unrelated_snapshot_update(
@@ -1858,6 +2171,102 @@ def test_repositories_store_latest_active_message_action_choices(
     assert [
         choice.body for choice in repositories.list_message_action_choices(save.id)
     ] == ["Wait", "Run", "Ask", "Touch", "Climb", "Read", "Listen", "Knock"]
+
+
+def test_action_choice_write_requires_current_revision_and_generation_claim(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Library of Falling Doors",
+        premise="Every shelf is a door.",
+        player_role="Courier",
+        content={"action_choices_enabled": True},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Library")
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The first shelf opens.",
+    )
+    assert narrator.updated_at is not None
+    narrator_updated_at = narrator.updated_at
+    assert repositories.claim_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        narrator_updated_at=narrator_updated_at,
+        generation_token="older-token",
+    )
+    assert repositories.claim_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        narrator_updated_at=narrator_updated_at,
+        generation_token="newer-token",
+    )
+
+    stale = repositories.replace_message_action_choices(
+        save_id=save.id,
+        message_id=narrator.id,
+        choices=("Old one", "Old two", "Old three", "Old four"),
+        expected_head_message_id=narrator.id,
+        expected_narrator_updated_at=narrator_updated_at,
+        generation_token="older-token",
+    )
+    current = repositories.replace_message_action_choices(
+        save_id=save.id,
+        message_id=narrator.id,
+        choices=("New one", "New two", "New three", "New four"),
+        expected_head_message_id=narrator.id,
+        expected_narrator_updated_at=narrator_updated_at,
+        generation_token="newer-token",
+    )
+
+    assert stale == []
+    assert [choice.body for choice in current] == [
+        "New one",
+        "New two",
+        "New three",
+        "New four",
+    ]
+    assert not repositories.release_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        generation_token="newer-token",
+    )
+
+
+def test_action_choice_claim_rejects_edited_narrator_revision(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Library of Falling Doors",
+        premise="Every shelf is a door.",
+        player_role="Courier",
+        content={"action_choices_enabled": True},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Library")
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The first shelf opens.",
+    )
+    assert narrator.updated_at is not None
+    narrator_updated_at = narrator.updated_at
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=narrator.id,
+        body="The corrected shelf opens.",
+    )
+
+    assert not repositories.claim_message_action_choice_generation(
+        save_id=save.id,
+        message_id=narrator.id,
+        narrator_updated_at=narrator_updated_at,
+        generation_token="stale-revision",
+    )
 
 
 def test_repositories_find_active_message_after_marker(
@@ -3246,6 +3655,88 @@ def test_update_memory_atomically_merges_canonical_collision(
     assert repositories.list_memories(save_id) == [merged]
 
 
+def test_epistemic_memory_update_preserves_status_actor_and_distinct_fingerprint(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    actor = repositories.add_character(save_id=save_id, name="Courier")
+    legacy = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate is unguarded.",
+        tags=["fact"],
+    )
+    hearsay = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate is unguarded.",
+        tags=["hearsay"],
+        epistemic_status="reported_speech",
+        epistemic_actor_id=actor.id,
+        epistemic_actor_name=actor.name,
+    )
+
+    updated = repositories.update_memory(
+        memory_id=hearsay.id,
+        body="The north gate may be unguarded.",
+        tags=["hearsay", "gate"],
+        importance=0.8,
+    )
+    duplicate = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate may be unguarded.",
+        tags=["report"],
+        importance=0.9,
+        epistemic_status="reported_speech",
+        epistemic_actor_id=actor.id,
+        epistemic_actor_name=actor.name,
+    )
+
+    assert legacy.id != hearsay.id
+    assert updated.epistemic_status == "reported_speech"
+    assert updated.epistemic_actor_id == actor.id
+    assert duplicate.id == hearsay.id
+    assert duplicate.epistemic_status == "reported_speech"
+    assert set(duplicate.tags) == {"hearsay", "gate", "report"}
+
+
+def test_add_memory_repairs_mismatched_epistemic_identity(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    actor = repositories.add_character(save_id=save_id, name="Courier")
+    memory = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate is open.",
+        tags=["legacy"],
+        epistemic_status="reported_speech",
+        epistemic_actor_id=actor.id,
+        epistemic_actor_name=actor.name,
+    )
+    repositories.connection.execute(
+        """
+        UPDATE memories
+        SET epistemic_status = 'legacy_unclassified',
+            epistemic_actor_id = NULL,
+            epistemic_actor_name = ''
+        WHERE id = ?
+        """,
+        (memory.id,),
+    )
+    repositories.commit()
+
+    repaired = repositories.add_memory(
+        save_id=save_id,
+        body=memory.body,
+        tags=["hearsay"],
+        epistemic_status="reported_speech",
+        epistemic_actor_id=actor.id,
+        epistemic_actor_name=actor.name,
+    )
+
+    assert repaired.id == memory.id
+    assert repaired.epistemic_status == "reported_speech"
+    assert repaired.epistemic_actor_id == actor.id
+
+
 def test_repositories_consolidate_duplicates_without_losing_active_references(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3492,6 +3983,36 @@ def test_restore_memories_merges_active_fingerprint_collision(
     assert trigger.trigger_key == f"memory:{archived.id}"
     assert trigger.source_id == archived.id
     assert trigger.reason == "Replacement preference"
+
+
+def test_restore_memory_preserves_epistemic_fingerprint_identity(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _ = _persist_repository_save(repositories)
+    actor = repositories.add_character(save_id=save_id, name="Courier")
+    objective = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate is open.",
+        tags=["fact"],
+        epistemic_status="objective_outcome",
+    )
+    report = repositories.add_memory(
+        save_id=save_id,
+        body="The north gate is open.",
+        tags=["hearsay"],
+        epistemic_status="reported_speech",
+        epistemic_actor_id=actor.id,
+        epistemic_actor_name=actor.name,
+    )
+    repositories.archive_memory(report.id)
+
+    repositories.restore_memories(frozenset({report.id}))
+
+    restored = repositories.get_memory(save_id, report.id)
+    assert restored is not None
+    assert restored.id != objective.id
+    assert restored.epistemic_status == "reported_speech"
+    assert restored.epistemic_actor_id == actor.id
 
 
 def test_repositories_check_unprotected_character_existence(
@@ -8063,6 +8584,66 @@ def test_repository_rejects_invalid_job_statuses(
         )
 
 
+def test_repository_claims_and_links_idempotent_chat_submission(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_message_id = _persist_repository_save(repositories)
+
+    claimed = repositories.create_chat_turn_submission_job(
+        save_id=save_id,
+        client_turn_id="11111111-1111-4111-8111-111111111111",
+        operation="chat",
+        request_fingerprint="fingerprint-1",
+        creator_user_id=None,
+        job_id="chat-job-1",
+        payload={"source": "web"},
+    )
+
+    assert claimed.job.id == "chat-job-1"
+    assert claimed.job.status == "queued"
+    assert claimed.client_turn_id == "11111111-1111-4111-8111-111111111111"
+    assert repositories.get_chat_turn_submission(
+        save_id=save_id,
+        client_turn_id=claimed.client_turn_id,
+    ) == claimed
+
+    narrator = repositories.append_message(
+        save_id=save_id,
+        role="narrator",
+        body="The beacon answers.",
+    )
+    linked = repositories.link_chat_turn_submission_messages(
+        job_id=claimed.job.id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator.id,
+    )
+
+    assert linked.player_message_id == player_message_id
+    assert linked.narrator_message_id == narrator.id
+
+    repositories.start_job(claimed.job.id)
+    repositories.update_job(claimed.job.id, status="succeeded")
+    replay = repositories.get_chat_turn_submission(
+        save_id=save_id,
+        client_turn_id=claimed.client_turn_id,
+    )
+    assert replay is not None
+    assert replay.job.status == "succeeded"
+
+    with pytest.raises(sqlite3.IntegrityError):
+        repositories.create_chat_turn_submission_job(
+            save_id=save_id,
+            client_turn_id=claimed.client_turn_id,
+            operation="chat",
+            request_fingerprint="fingerprint-2",
+            creator_user_id=None,
+            job_id="chat-job-2",
+            payload={"source": "web"},
+        )
+
+    assert repositories.get_persisted_job("chat-job-2") is None
+
+
 def test_repository_rejects_mutating_terminal_jobs(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -8172,6 +8753,69 @@ def test_repository_records_job_steps_with_safe_metadata_and_redacted_errors(
     }
     assert "private phrase" not in repr(step.metadata)
     assert repositories.list_job_steps(job.id) == [step]
+
+
+def test_repository_claims_and_recovers_post_turn_outbox_steps(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower above the ash.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I light the beacon.",
+    )
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The lens answers with red fire.",
+    )
+
+    created = repositories.ensure_post_turn_outbox_steps(
+        save_id=save.id,
+        player_message_id=player.id,
+        narrator_message_id=narrator.id,
+        turn_revision="revision-1",
+        steps=("state", "context"),
+        payload={"turn_revision": {"expected_head_message_id": narrator.id}},
+    )
+    duplicate = repositories.ensure_post_turn_outbox_steps(
+        save_id=save.id,
+        player_message_id=player.id,
+        narrator_message_id=narrator.id,
+        turn_revision="revision-1",
+        steps=("state", "context"),
+        payload={},
+    )
+
+    assert [step.step for step in created] == ["state", "context"]
+    assert [step.id for step in duplicate] == [step.id for step in created]
+    claimed = repositories.claim_post_turn_outbox_step(created[0].id)
+    assert claimed is not None
+    assert claimed.status == "running"
+    assert claimed.attempt_count == 1
+    assert repositories.claim_post_turn_outbox_step(created[0].id) is None
+
+    recovered = repositories.requeue_running_post_turn_outbox_steps()
+    assert [step.id for step in recovered] == [created[0].id]
+    assert recovered[0].status == "pending"
+    reclaimed = repositories.claim_post_turn_outbox_step(created[0].id)
+    assert reclaimed is not None
+    completed = repositories.complete_post_turn_outbox_step(
+        created[0].id,
+        status="succeeded",
+        result={"applied": True},
+    )
+    assert completed.status == "succeeded"
+    assert completed.result == {"applied": True}
 
 
 def test_repository_runtime_performance_aggregates_success_durations_only(
@@ -9149,3 +9793,66 @@ def _load_content(content_json: str) -> dict[str, object]:
     loaded = json.loads(content_json)
     assert isinstance(loaded, dict)
     return cast(dict[str, object], loaded)
+
+
+def test_turn_outcomes_round_trip_and_list_by_save(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Evening comes.",
+    )
+    other_save = repositories.create_save(scenario_id=scenario.id, title="Other")
+
+    added = repositories.add_turn_outcome(
+        save_id=save.id,
+        message_id=message.id,
+        payload={
+            "save_id": save.id,
+            "message_id": message.id,
+            "attempt_resolution": "succeeded",
+            "effects": [],
+        },
+    )
+    assert added.payload["attempt_resolution"] == "succeeded"
+
+    fetched = repositories.get_turn_outcome_for_message(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    assert fetched is not None
+    assert fetched.payload["message_id"] == message.id
+    assert fetched.save_id == save.id
+
+    assert [row.id for row in repositories.list_turn_outcomes(save.id)] == [added.id]
+    assert repositories.list_turn_outcomes(other_save.id) == []
+
+
+def test_turn_outcome_lookup_returns_none_for_unknown_message(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    assert (
+        repositories.get_turn_outcome_for_message(
+            save_id=save.id,
+            message_id="missing",
+        )
+        is None
+    )

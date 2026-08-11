@@ -82,6 +82,7 @@ import {
   Job,
   JobStepsModel,
   JobStepSummary,
+  isPostTurnCatchupProgress,
   logClientEvent,
   MarkdownBlock,
   MediaAsset,
@@ -1443,8 +1444,6 @@ const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
   "opening_message"
 ]);
 const HIDDEN_WORLD_FIELDS = new Set(["original_key", "source_message_ids", "consolidated"]);
-const ACTIVE_CHAT_RUNTIME_REFETCH_MS = 1000;
-const CHAT_SUBMISSION_STATUS_REFETCH_MS = 1000;
 const VIRTUAL_LIST_INITIAL_RECT = { width: 390, height: 520 };
 const CHRONICLE_ESTIMATED_ROW_HEIGHT = 156;
 const CHRONICLE_ROW_GAP = 16;
@@ -1835,8 +1834,8 @@ const TASK_MODEL_TOOLTIPS: Record<string, string> = {
   context_update: "Sets the model Bragi uses to propose world and memory updates.",
   character_enhancement: "Sets the model Bragi uses when auto-enhancing character profile fields.",
   action_choice_generation: "Sets the structured-output model Bragi uses to suggest player action choices after narrator turns.",
-  character_presence_assessment: "Sets the structured-output model Bragi uses to decide NPC scene presence before narrator turns.",
-  character_intent_planning: "Sets the structured-output model Bragi uses to plan visible NPC intent and next actions.",
+  character_presence_assessment: "Sets the structured-output model Bragi uses to assess ambiguous NPC scene entry/exit before narrator turns.",
+  character_intent_planning: "Sets the structured-output model Bragi uses for dating-route intent profiling fallbacks. NPC intents are planned by the narrator planner.",
   context_cleanup_scan: "Sets the model Bragi uses to scan transcript chunks for possible stale-context cleanup notes.",
   context_cleanup_actions: "Sets the model Bragi uses to propose automatic cleanup actions for stale context records.",
   guided_context_cleanup: "Sets the model Bragi uses for user-directed cleanup action proposals.",
@@ -2822,23 +2821,21 @@ function Workbench({
   const runtimeFreshUntilRef = useRef(0);
   const runtimeFreshSaveIdRef = useRef<string | null>(null);
   const activeSaveIdRef = useRef<string | null>(null);
+  const hasTrackedChatJobRef = useRef(false);
   const currentUserId = currentUser?.id ?? null;
   const [selectedSaveId, setSelectedSaveId] = useState<string | null>(() => loadSelectedSaveId(currentUserId));
-  const [runtimeFreshUntil, setRuntimeFreshUntil] = useState(0);
   const [paintedRuntimeSaveKey, setPaintedRuntimeSaveKey] = useState<string | null>(null);
   const [seenTextMessageIdsByThread, setSeenTextMessageIdsByThread] = useState<Record<string, string>>({});
   const [pendingSaveId, setPendingSaveId] = useState<string | null>(null);
   const [saveSelectionError, setSaveSelectionError] = useState("");
   const [pendingMessage, setPendingMessage] = useState<PendingChronicleMessage | null>(null);
-  const [pendingNarratorMessage, setPendingNarratorMessage] = useState<PendingChronicleMessage | null>(null);
   const [layout, setLayout] = useState<WorkbenchLayout>(loadWorkbenchLayout);
   const [resizingSide, setResizingSide] = useState<ResizeSide | null>(null);
   const layoutDrag = useRef<{ side: ResizeSide; startX: number; startLayout: WorkbenchLayout } | null>(null);
   const isStackedWorkbench = useMediaQuery(WORKBENCH_STACKED_QUERY);
   const isMobileWorkbench = useMediaQuery(WORKBENCH_MOBILE_QUERY);
   const hasTrackedChatJob = Object.values(trackedJobs).some(({ job }) => isChatJobType(job.type));
-  const liveUpdatesAvailable = typeof EventSource !== "undefined";
-  const runtimePollingSuppressed = runtimeFreshUntil > Date.now();
+  hasTrackedChatJobRef.current = hasTrackedChatJob;
   const runtime = useQuery({
     queryKey: runtimeQueryKey(selectedSaveId),
     queryFn: async ({ signal }) => {
@@ -2856,8 +2853,7 @@ function Workbench({
     placeholderData: keepPreviousData,
     retry: (failureCount, failure) => (
       !(failure instanceof ApiError && failure.status < 500) && failureCount < 3
-    ),
-    refetchInterval: hasTrackedChatJob && !runtimePollingSuppressed ? ACTIVE_CHAT_RUNTIME_REFETCH_MS : false
+    )
   });
   const model = runtime.data;
   const runtimeLoadError = runtime.error instanceof Error ? runtime.error.message : "";
@@ -2881,14 +2877,12 @@ function Workbench({
     queryKey: ["jobs", "active", activeSaveId],
     queryFn: ({ signal }) => apiRead<{ jobs: Job[] }>(activeJobsPath(activeSaveId), signal),
     enabled: Boolean(model),
-    refetchInterval: hasTrackedChatJob || !liveUpdatesAvailable ? 2000 : false,
     retry: false
   });
   const chatSubmissionStatus = useQuery({
     queryKey: ["chat", "submission-status", activeSaveId],
     queryFn: ({ signal }) => apiRead<ChatSubmissionStatus>(chatSubmissionStatusPath(activeSaveId), signal),
     enabled: Boolean(model),
-    refetchInterval: hasTrackedChatJob || !liveUpdatesAvailable ? CHAT_SUBMISSION_STATUS_REFETCH_MS : false,
     retry: false
   });
   const characterTextsSummary = useQuery({
@@ -2997,12 +2991,10 @@ function Workbench({
     const freshUntil = Date.now() + RUNTIME_FRESH_SUPPRESS_MS;
     runtimeFreshSaveIdRef.current = saveId;
     runtimeFreshUntilRef.current = freshUntil;
-    setRuntimeFreshUntil(freshUntil);
     runtimeFreshTimerRef.current = window.setTimeout(() => {
       runtimeFreshTimerRef.current = null;
       runtimeFreshSaveIdRef.current = null;
       runtimeFreshUntilRef.current = 0;
-      setRuntimeFreshUntil(0);
     }, RUNTIME_FRESH_SUPPRESS_MS);
   }, []);
 
@@ -3064,12 +3056,38 @@ function Workbench({
     if (!activeSaveId) return undefined;
     return watchSave(activeSaveId, refreshForSaveEvent, () => {
       refreshWorkbench(activeSaveId);
+    }, async (signal) => {
+      async function refreshFallback<T>(queryKey: readonly unknown[], path: string) {
+        const value = await apiRead<T>(path, signal);
+        if (!signal.aborted && activeSaveIdRef.current === activeSaveId) {
+          client.setQueryData(queryKey, value);
+        }
+      }
+      const refreshes: Promise<unknown>[] = [
+        refreshFallback<{ jobs: Job[] }>(
+          ["jobs", "active", activeSaveId],
+          activeJobsPath(activeSaveId)
+        ),
+        refreshFallback<ChatSubmissionStatus>(
+          ["chat", "submission-status", activeSaveId],
+          chatSubmissionStatusPath(activeSaveId)
+        )
+      ];
+      if (
+        hasTrackedChatJobRef.current
+        && runtimeFreshUntilRef.current <= Date.now()
+      ) {
+        refreshes.push(refreshFallback<RuntimeModel>(
+          runtimeQueryKey(activeSaveId),
+          runtimePath(activeSaveId)
+        ));
+      }
+      await Promise.allSettled(refreshes);
     });
-  }, [activeSaveId, refreshForSaveEvent, refreshWorkbench]);
+  }, [activeSaveId, client, refreshForSaveEvent, refreshWorkbench]);
 
   useEffect(() => {
     setPendingMessage((current) => pendingMessageForActiveSave(current, activeSaveId));
-    setPendingNarratorMessage((current) => pendingMessageForActiveSave(current, activeSaveId));
     setLookAroundAnswer(null);
   }, [activeSaveId]);
 
@@ -3187,6 +3205,18 @@ function Workbench({
 
   const runJob = useCallback<RunJob>((created, options = { applyResult: true }) => {
     if (!jobBelongsToActiveSave(created, activeSaveIdRef.current)) return () => undefined;
+    if (jobWatchers.current[created.id]) return jobWatchers.current[created.id];
+    if (created.status !== "queued" && created.status !== "running") {
+      if (created.status === "succeeded") {
+        options.onSucceeded?.(created.result);
+      }
+      if (created.status === "failed") {
+        options.onFailed?.(created.error || "Background job failed.", created);
+      }
+      if (options.clearPendingMessages !== false) setPendingMessage(null);
+      refreshWorkbench(activeSaveIdRef.current, ALL_WORKBENCH_REFRESH_TARGETS);
+      return () => undefined;
+    }
     setTrackedJobs((current) => {
       const existing = current[created.id];
       return {
@@ -3194,7 +3224,6 @@ function Workbench({
         [created.id]: trackedActiveJob(created, existing)
       };
     });
-    if (jobWatchers.current[created.id]) return jobWatchers.current[created.id];
     const stop = watchJob(
       created.id,
       (done) => {
@@ -3218,34 +3247,45 @@ function Workbench({
           applyCharacterTextJobResult(client, done.result, done.save_id ?? activeSaveIdRef.current);
         }
         if (appliesToCurrentSave && done.status === "succeeded") options.onSucceeded?.(done.result);
+        const isActionChoiceJob = (
+          done.type === "action_choice_generate"
+          || done.type === "action_choice_regenerate"
+        );
+        if (
+          appliesToCurrentSave
+          && isActionChoiceJob
+          && (done.status === "failed" || done.status === "cancelled")
+        ) {
+          const error = done.status === "failed" ? done.error || "Background job failed." : null;
+          appliedRuntimeResult = true;
+          client.setQueryData<RuntimeModel>(
+            runtimeQueryKey(done.save_id ?? activeSaveIdRef.current),
+            (current) => current?.action_choices
+              && (
+                !current.action_choices.generation_job
+                || current.action_choices.generation_job.id === done.id
+              )
+              ? {
+                ...current,
+                action_choices: {
+                  ...current.action_choices,
+                  generation_job: null,
+                  generation_error: error
+                }
+              }
+              : current
+          );
+        }
         if (appliesToCurrentSave && done.status === "failed") {
           const error = done.error || "Background job failed.";
-          if (done.type === "action_choice_generate") {
+          if (isActionChoiceJob) {
             appliedRuntimeResult = true;
-            client.setQueryData<RuntimeModel>(
-              runtimeQueryKey(done.save_id ?? activeSaveIdRef.current),
-              (current) => current?.action_choices
-                && (
-                  !current.action_choices.generation_job
-                  || current.action_choices.generation_job.id === done.id
-                )
-                ? {
-                  ...current,
-                  action_choices: {
-                    ...current.action_choices,
-                    generation_job: null,
-                    generation_error: error
-                  }
-                }
-                : current
-            );
           }
           options.onFailed?.(error, done);
         }
         if (appliesToCurrentSave) {
           if (options.clearPendingMessages !== false) {
             setPendingMessage(null);
-            setPendingNarratorMessage(null);
           }
           refreshWorkbench(
             activeSaveIdRef.current,
@@ -3257,35 +3297,44 @@ function Workbench({
       (name, data) => {
         if (name === "runtime" && isRuntimeModel(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
           setPendingMessage(null);
-          setPendingNarratorMessage(null);
           applyRuntimeModel(data);
           client.invalidateQueries({ queryKey: ["chat", "submission-status", data.active_save_id ?? activeSaveIdRef.current] });
         }
         if (name === "chat_turn_delta" && isChatTurnDelta(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
           setPendingMessage(null);
-          setPendingNarratorMessage(null);
           if (!applyChatTurnDelta(data)) {
             refreshWorkbench(data.save_id, ALL_WORKBENCH_REFRESH_TARGETS);
           }
           client.invalidateQueries({ queryKey: ["chat", "submission-status", data.save_id] });
-        }
-        if (name === "narrator_draft" && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
-          const message = narratorDraftMessage(data);
-          if (message) {
-            setPendingNarratorMessage({
-              ...message,
-              pending_save_id: created.save_id ?? activeSaveIdRef.current
-            });
-          }
         }
         if (name === "progress") {
           const phases = postTurnProgressPhases(data);
           setTrackedJobs((current) => {
             const tracked = current[created.id];
             if (!tracked) return current;
+            const replacesCatchup = isPostTurnCatchupProgress(data)
+              || isPostTurnCatchupProgress(tracked.job.latest_progress);
             return {
               ...current,
-              [created.id]: { ...tracked, progress: progressLabel(data), phases: phases ?? tracked.phases }
+              [created.id]: {
+                ...tracked,
+                job: { ...tracked.job, latest_progress: data },
+                progress: progressLabel(data),
+                phases: phases ?? (replacesCatchup ? undefined : tracked.phases)
+              }
+            };
+          });
+        }
+        if (name === "completion_level" && isCompletionLevelEvent(data)) {
+          setTrackedJobs((current) => {
+            const tracked = current[created.id];
+            if (!tracked) return current;
+            return {
+              ...current,
+              [created.id]: {
+                ...tracked,
+                job: { ...tracked.job, completion_level: data.completion_level }
+              }
             };
           });
         }
@@ -3385,9 +3434,6 @@ function Workbench({
       const jobSaveId = tracked.job.save_id ?? null;
       const saveQuery = jobSaveId ? `?save_id=${encodeURIComponent(jobSaveId)}` : "";
       await postJson(`/api/jobs/${encodeURIComponent(tracked.job.id)}/cancel${saveQuery}`, {});
-      if (tracked.job.type === "chat_turn") {
-        await postJson("/api/chat/cancel", { save_id: jobSaveId ?? model?.active_save_id ?? null });
-      }
     } catch (failure) {
       setTrackedJobs((current) => ({
         ...current,
@@ -3457,8 +3503,7 @@ function Workbench({
   const persistedChronicleMessages = model?.chronicle?.messages ?? [];
   const pendingAfterMessageId = persistedChronicleMessages[persistedChronicleMessages.length - 1]?.message_id ?? null;
   const activePendingMessage = pendingMessageForActiveSave(pendingMessage, activeSaveId);
-  const activePendingNarratorMessage = pendingMessageForActiveSave(pendingNarratorMessage, activeSaveId);
-  const activePendingMessages = [activePendingMessage, activePendingNarratorMessage].filter((message): message is PendingChronicleMessage => Boolean(message));
+  const activePendingMessages = [activePendingMessage].filter((message): message is PendingChronicleMessage => Boolean(message));
   const chatInputDisabled = !activeSaveSupported || !model?.composer_enabled || Boolean(activePendingMessage) || hasActiveSaveChatBlocker || !chatCanSubmit;
 
   return (
@@ -3577,6 +3622,11 @@ function Workbench({
         {!activeSaveSupported ? (
           <InlineNotice>{activeSave?.unsupported_reason || "This save is no longer supported. Export or delete it from the library."}</InlineNotice>
         ) : null}
+        {model?.continuity_degraded ? (
+          <InlineNotice polite>
+            Continuity updates are still catching up. Bragi is using the recent chronicle as the source of truth until repair completes.
+          </InlineNotice>
+        ) : null}
         <Chronicle
           model={model}
           runJob={runJob}
@@ -3606,7 +3656,11 @@ function Workbench({
             runJob={runJob}
             activeSaveId={activeSaveId}
             actionChoices={model?.action_choices ?? null}
-            generationActive={pendingJobs.some(({ job }) => job.type === "action_choice_generate")}
+            generationActive={pendingJobs.some(({ job }) => (
+              job.type === "action_choice_generate"
+              || job.type === "action_choice_regenerate"
+            ))}
+            generationRecoveryPending={activeJobs.isPending}
             pendingAfterMessageId={pendingAfterMessageId}
             onPendingMessage={setPendingMessage}
           />
@@ -4960,6 +5014,13 @@ function chronicleJobActionRequest(
       fallbackError: "Could not regenerate message"
     };
   }
+  if (actionId === "retry-interrupted-turn") {
+    return {
+      path: "/api/chat/retry",
+      body: { message_id: messageId, save_id: activeSaveId },
+      fallbackError: "Could not retry response"
+    };
+  }
   if (actionId === "generate-scene-image") {
     return {
       path: "/api/media/generate",
@@ -5002,7 +5063,13 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
         <span>{isDirection ? "Direction" : message.speaker_name || message.role}</span>
         {message.revision_count ? <small className="message-edited">Edited</small> : null}
         <div className="message-actions">
-          {message.actions.map((action) => {
+          {message.actions
+            .filter((action) => !message.interrupted_turn || ![
+              "retry-interrupted-turn",
+              "edit-and-resubmit-message",
+              "delete-messages-from-here"
+            ].includes(action.action_id))
+            .map((action) => {
             const actionKey = chronicleJobActionKey(message.message_id, action.action_id);
             const jobRequest = chronicleJobActionRequest(action.action_id, message.message_id, activeSaveId);
             const actionPending = Boolean(jobRequest && pendingJobActionKeys.has(actionKey));
@@ -5015,7 +5082,6 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
                 aria-label={action.label}
                 disabled={
                   message.message_id === "pending-player-message"
-                  || message.message_id === "pending-narrator-message"
                   || actionPending
                   || mutationsDisabled
                 }
@@ -5034,6 +5100,49 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
         error ? <InlineNotice key={key} className="message-action-error">{error}</InlineNotice> : null
       ))}
       <MarkdownView message={message} />
+      {message.interrupted_turn ? (
+        <div className="interrupted-turn" role="alert">
+          <div>
+            <strong>
+              {message.interrupted_turn.status === "cancelled"
+                ? "Turn cancelled"
+                : "Turn interrupted"}
+            </strong>
+            <p>{message.interrupted_turn.reason}</p>
+          </div>
+          <div className="interrupted-turn-actions">
+            {message.actions
+              .filter((action) => [
+                "retry-interrupted-turn",
+                "edit-and-resubmit-message",
+                "delete-messages-from-here"
+              ].includes(action.action_id))
+              .map((action) => {
+                const actionKey = chronicleJobActionKey(
+                  message.message_id,
+                  action.action_id
+                );
+                const actionPending = pendingJobActionKeys.has(actionKey);
+                return (
+                  <button
+                    key={action.action_id}
+                    type="button"
+                    className={touchActionClassName(
+                      action.action_id === "delete-messages-from-here"
+                        && "destructive-action"
+                    )}
+                    disabled={actionPending || mutationsDisabled}
+                    title={action.label}
+                    aria-label={action.label}
+                    onClick={() => onAction(action.action_id, message)}
+                  >
+                    {actionPending ? "Working…" : action.label}
+                  </button>
+                );
+              })}
+          </div>
+        </div>
+      ) : null}
     </article>
   );
 });
@@ -5432,11 +5541,13 @@ function trackedActiveJob(created: Job, existing?: TrackedJob): TrackedJob {
   const progressFromJob = latestProgress === null ? null : progressLabel(latestProgress);
   const phasesFromJob = postTurnProgressPhases(latestProgress);
   const preservedProgress = existing?.progress && !["Queued", "Running"].includes(existing.progress) ? existing.progress : null;
-  const nextProgress = phasesFromJob ? progressFromJob : null;
+  const replacesCatchup = isPostTurnCatchupProgress(latestProgress)
+    || isPostTurnCatchupProgress(existing?.job.latest_progress);
+  const nextProgress = phasesFromJob || replacesCatchup ? progressFromJob : null;
   return {
     job: created,
     progress: nextProgress ?? preservedProgress ?? progressFromJob ?? firstProgress,
-    phases: phasesFromJob ?? existing?.phases
+    phases: phasesFromJob ?? (replacesCatchup ? undefined : existing?.phases)
   };
 }
 
@@ -5453,8 +5564,8 @@ function PendingJobsCompactSummary({
   onCancel: (job: TrackedJob) => void;
   onToggleDetails?: () => void;
 }) {
-  const groups = compactJobGroups(jobs);
-  const summary = groups.map((group) => group.count > 1 ? `${group.label} x${group.count}` : group.label).join("; ");
+  const summary = (jobs.length === 1 && postTurnCompletionLabel(jobs[0].job))
+    || compactJobGroups(jobs).map((group) => group.count > 1 ? `${group.label} x${group.count}` : group.label).join("; ");
   return (
     <div className="pending-job-row compact-summary">
       <Loader2 className="spin" size={15} />
@@ -5501,7 +5612,8 @@ function PendingJobRow({
   expandedFull?: boolean;
 }) {
   const label = jobTypeLabel(tracked.job.type);
-  const progress = tracked.progress || labelize(tracked.job.status);
+  const progress = postTurnCompletionLabel(tracked.job)
+    ?? (tracked.progress || labelize(tracked.job.status));
   const visiblePhases = expanded ? visiblePostTurnPhases(tracked.phases, expandedFull) : [];
   const longRunningHint = useLongRunningJobHint(tracked);
   return (
@@ -5787,14 +5899,18 @@ function EditMessageModal({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const titleId = React.useId();
-  const isNarratorEdit = message.role !== "player";
+  const isNarratorEdit = message.role === "narrator";
+  const isSystemEdit = message.role === "system";
   const unchanged = body.trim() === message.body.trim();
   const submitEdit = async (mode: "save" | "resubmit") => {
     setBusy(true);
     setError("");
     try {
       if (mode === "resubmit") {
-        runJob(await postJson<Job>("/api/chat/edit", { message_id: message.message_id, body, save_id: activeSaveId }));
+        runJob(await postJson<Job>(
+          message.role === "system" ? "/api/chat/retry" : "/api/chat/edit",
+          { message_id: message.message_id, body, save_id: activeSaveId }
+        ));
       } else if (isNarratorEdit) {
         runJob(await postJson<Job>("/api/chat/narrator-edit", {
           message_id: message.message_id,
@@ -5844,9 +5960,11 @@ function EditMessageModal({
             </button>
           ) : (
             <>
-              <button type="button" className="primary-command compact" disabled={busy || !body.trim() || unchanged} onClick={() => submitEdit("save")}>
-                <Save size={15} /> Edit without Resubmit
-              </button>
+              {!isSystemEdit ? (
+                <button type="button" className="primary-command compact" disabled={busy || !body.trim() || unchanged} onClick={() => submitEdit("save")}>
+                  <Save size={15} /> Edit without Resubmit
+                </button>
+              ) : null}
               <button type="submit" className="primary-command compact" disabled={busy || !body.trim()}>
                 <RefreshCw size={15} /> Resubmit
               </button>
@@ -6035,6 +6153,7 @@ function splitInspectionText(text: string): { sources: string; raw: string | nul
 }
 
 function actionIcon(actionId: string) {
+  if (actionId === "retry-interrupted-turn") return <RefreshCw size={14} />;
   if (actionId === "edit-and-resubmit-message") return <Edit3 size={14} />;
   if (actionId === "edit-text-message") return <Edit3 size={14} />;
   if (actionId === "correct-character-text-message") return <Edit3 size={14} />;
@@ -6196,7 +6315,29 @@ function lookAroundAnswerFromResult(
 type ChatSubmitVariables = {
   body: string;
   saveId: string | null;
+  key: string;
 };
+
+function clientTurnId(): string {
+  return crypto.randomUUID?.() ?? "10000000-1000-4000-8000-100000000000".replace(
+    /[018]/g,
+    (digit) => (
+      Number(digit)
+      ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (Number(digit) / 4)))
+    ).toString(16)
+  );
+}
+
+function chatSubmitVariables(
+  body: string,
+  saveId: string | null,
+  previous: ChatSubmitVariables | null
+): ChatSubmitVariables {
+  if (previous && previous.saveId === saveId && previous.body.trim() === body.trim()) {
+    return previous;
+  }
+  return { body, saveId, key: clientTurnId() };
+}
 
 function pendingPlayerChronicleMessage(
   body: string,
@@ -6475,14 +6616,19 @@ function Composer({
   const continuingSaveIdRef = useRef<string | null | undefined>(undefined);
   const [continuingSaveId, setContinuingSaveId] = useState<string | null | undefined>(undefined);
   const timeskipSubmittingRef = useRef(false);
+  const failedSubmitRef = useRef<ChatSubmitVariables | null>(null);
+  const failedContinueRef = useRef<{ saveId: string | null; key: string } | null>(null);
+  const failedTimeskipRef = useRef<{ instruction: string; saveId: string | null; key: string } | null>(null);
   const submit = useMutation({
-    mutationFn: (submitted: ChatSubmitVariables) => postJson<Job>("/api/chat", { body: submitted.body, speaker_name: null, save_id: submitted.saveId }),
+    mutationFn: (submitted: ChatSubmitVariables) => postJson<Job>("/api/chat", { body: submitted.body, speaker_name: null, save_id: submitted.saveId, client_turn_id: submitted.key }),
     onSuccess: (job, submitted) => {
+      failedSubmitRef.current = null;
       if (submitted.saveId !== activeSaveIdRef.current) return;
       setSubmitError("");
       runJob(job);
     },
     onError: (error, submitted) => {
+      failedSubmitRef.current = submitted;
       if (submitted.saveId !== activeSaveIdRef.current) return;
       setBody((currentBody) => currentBody ? currentBody : submitted.body);
       onPendingMessage(null);
@@ -6496,27 +6642,36 @@ function Composer({
     }
   });
   const timeskip = useMutation({
-    mutationFn: (instruction: string) => postJson<Job>("/api/chat/timeskip", { instruction, save_id: activeSaveId }),
+    mutationFn: (submitted: { instruction: string; saveId: string | null; key: string }) => postJson<Job>("/api/chat/timeskip", { instruction: submitted.instruction, save_id: submitted.saveId, client_turn_id: submitted.key }),
     onSuccess: (job) => {
+      failedTimeskipRef.current = null;
       runJob(job);
       setTimeskipOpen(false);
+    },
+    onError: (_error, submitted) => {
+      failedTimeskipRef.current = submitted;
     },
     onSettled: () => {
       timeskipSubmittingRef.current = false;
     }
   });
   const continueStory = useMutation({
-    mutationFn: (saveId: string | null) => postJson<Job>("/api/chat/continue", { save_id: saveId }),
-    onSuccess: (job, submittedSaveId) => {
+    mutationFn: (submitted: { saveId: string | null; key: string }) => postJson<Job>("/api/chat/continue", { save_id: submitted.saveId, client_turn_id: submitted.key }),
+    onSuccess: (job, submitted) => {
+      failedContinueRef.current = null;
+      const submittedSaveId = submitted.saveId;
       if (submittedSaveId !== activeSaveIdRef.current) return;
       setSubmitError("");
       runJob(job);
     },
-    onError: (error, submittedSaveId) => {
+    onError: (error, submitted) => {
+      failedContinueRef.current = submitted;
+      const submittedSaveId = submitted.saveId;
       if (submittedSaveId !== activeSaveIdRef.current) return;
       setSubmitError(error instanceof Error ? error.message : "Could not continue story");
     },
-    onSettled: (_data, _error, submittedSaveId) => {
+    onSettled: (_data, _error, submitted) => {
+      const submittedSaveId = submitted.saveId;
       if (continuingSaveIdRef.current === submittedSaveId) {
         continuingSaveIdRef.current = undefined;
         setContinuingSaveId(undefined);
@@ -6526,6 +6681,9 @@ function Composer({
   useEffect(() => {
     setSubmitError("");
     setTimeskipOpen(false);
+    failedSubmitRef.current = null;
+    failedContinueRef.current = null;
+    failedTimeskipRef.current = null;
   }, [activeSaveId]);
   useEffect(() => {
     if (disabled) setTimeskipOpen(false);
@@ -6567,7 +6725,7 @@ function Composer({
             setSubmitError("");
             setBody("");
             onPendingMessage(pendingPlayerChronicleMessage(submittedBody, submittedSaveId, pendingAfterMessageId));
-            submit.mutate({ body: submittedBody, saveId: submittedSaveId });
+            submit.mutate(chatSubmitVariables(submittedBody, submittedSaveId, failedSubmitRef.current));
           }
         }}
       >
@@ -6600,7 +6758,12 @@ function Composer({
                   continuingSaveIdRef.current = activeSaveId;
                   setContinuingSaveId(activeSaveId);
                   setSubmitError("");
-                  continueStory.mutate(activeSaveId);
+                  const previous = failedContinueRef.current;
+                  continueStory.mutate(
+                    previous?.saveId === activeSaveId
+                      ? previous
+                      : { saveId: activeSaveId, key: clientTurnId() }
+                  );
                 }}
               >
                 {continueBusy ? (
@@ -6651,7 +6814,17 @@ function Composer({
           onSubmit={(instruction) => {
             if (timeskipDisabled || !instruction.trim()) return;
             timeskipSubmittingRef.current = true;
-            timeskip.mutate(instruction);
+            const previous = failedTimeskipRef.current;
+            const submitted = (
+              previous
+              && previous.saveId === activeSaveId
+              && previous.instruction.trim() === instruction.trim()
+            ) ? { ...previous, instruction } : {
+              instruction,
+              saveId: activeSaveId,
+              key: clientTurnId()
+            };
+            timeskip.mutate(submitted);
           }}
         />
       ) : null}
@@ -6665,6 +6838,7 @@ function CyoaActionPicker({
   activeSaveId,
   actionChoices,
   generationActive = false,
+  generationRecoveryPending = false,
   pendingAfterMessageId = null,
   onPendingMessage
 }: {
@@ -6673,6 +6847,7 @@ function CyoaActionPicker({
   activeSaveId: string | null;
   actionChoices: RuntimeModel["action_choices"];
   generationActive?: boolean;
+  generationRecoveryPending?: boolean;
   pendingAfterMessageId?: string | null;
   onPendingMessage: (message: PendingChronicleMessage | null) => void;
 }) {
@@ -6683,15 +6858,18 @@ function CyoaActionPicker({
   activeSaveIdRef.current = activeSaveId;
   const submittingSaveIdRef = useRef<string | null | undefined>(undefined);
   const [submittingSaveId, setSubmittingSaveId] = useState<string | null | undefined>(undefined);
+  const failedSubmitRef = useRef<ChatSubmitVariables | null>(null);
   const submit = useMutation({
-    mutationFn: (submitted: ChatSubmitVariables) => postJson<Job>("/api/chat", { body: submitted.body, speaker_name: null, save_id: submitted.saveId }),
+    mutationFn: (submitted: ChatSubmitVariables) => postJson<Job>("/api/chat", { body: submitted.body, speaker_name: null, save_id: submitted.saveId, client_turn_id: submitted.key }),
     onSuccess: (job, submitted) => {
+      failedSubmitRef.current = null;
       if (submitted.saveId !== activeSaveIdRef.current) return;
       setSubmitError("");
       setManualBody("");
       runJob(job);
     },
     onError: (error, submitted) => {
+      failedSubmitRef.current = submitted;
       if (submitted.saveId !== activeSaveIdRef.current) return;
       setManualBody((currentBody) => currentBody ? currentBody : submitted.body);
       onPendingMessage(null);
@@ -6723,24 +6901,28 @@ function CyoaActionPicker({
     setManualOpen(false);
     setManualBody("");
     setSubmitError("");
+    failedSubmitRef.current = null;
   }, [activeSaveId, actionChoices?.narrator_message_id]);
 
   const choices = [...(actionChoices?.choices ?? [])].sort((left, right) => left.ordinal - right.ordinal);
-  const choicesGenerating = generationActive || Boolean(actionChoices?.generation_job);
-  const customActionLabel = choicesGenerating ? "Generating choices..." : "Write your own";
   const submitBusy = submittingSaveId === activeSaveId || submittingSaveIdRef.current === activeSaveId;
   const regenerateBusy = regenerate.isPending;
-  const canSubmit = !disabled && !submitBusy && !choicesGenerating;
+  const choicesGenerating = generationActive
+    || generationRecoveryPending
+    || Boolean(actionChoices?.generation_job)
+    || regenerateBusy;
+  const canSubmit = !disabled && !submitBusy;
+  const canSubmitChoice = canSubmit && !choicesGenerating;
   const canRegenerate = !disabled && !submitBusy && !regenerateBusy && !choicesGenerating && Boolean(activeSaveId && actionChoices?.narrator_message_id);
-  const submitBody = (body: string) => {
+  const submitBody = (body: string, allowed = canSubmit) => {
     const submittedBody = body.trim();
-    if (!canSubmit || !submittedBody) return;
+    if (!allowed || !submittedBody) return;
     const submittedSaveId = activeSaveId;
     submittingSaveIdRef.current = submittedSaveId;
     setSubmittingSaveId(submittedSaveId);
     setSubmitError("");
     onPendingMessage(pendingPlayerChronicleMessage(submittedBody, submittedSaveId, pendingAfterMessageId));
-    submit.mutate({ body: submittedBody, saveId: submittedSaveId });
+    submit.mutate(chatSubmitVariables(submittedBody, submittedSaveId, failedSubmitRef.current));
   };
   const regenerateOptions = () => {
     if (!canRegenerate || !actionChoices?.narrator_message_id) return;
@@ -6759,8 +6941,8 @@ function CyoaActionPicker({
             <button
               type="button"
               className="cyoa-choice-button"
-              disabled={!canSubmit}
-              onClick={() => submitBody(choice.body)}
+              disabled={!canSubmitChoice}
+              onClick={() => submitBody(choice.body, canSubmitChoice)}
             >
               <span className="cyoa-choice-ordinal" aria-hidden="true">{index + 1}</span>
               <span className="cyoa-choice-body">{choice.body}</span>
@@ -6773,15 +6955,17 @@ function CyoaActionPicker({
           <button
             type="button"
             className="cyoa-custom-toggle"
-            disabled={disabled || submitBusy || choicesGenerating}
-            aria-label={customActionLabel}
-            aria-live="polite"
+            disabled={disabled || submitBusy}
+            aria-label="Write your own"
             aria-expanded={manualOpen}
             onClick={() => setManualOpen((current) => !current)}
           >
             <Edit3 size={17} aria-hidden="true" />
-            <span>{customActionLabel}</span>
+            <span>Write your own</span>
           </button>
+          {choicesGenerating ? (
+            <span className="cyoa-generation-status" role="status">Generating choices...</span>
+          ) : null}
           {manualOpen ? (
             <form
               className="cyoa-manual-form"
@@ -9261,6 +9445,7 @@ function visiblePostTurnPhases(phases: TrackedJobPhase[] | undefined, includeFul
 function postTurnPhaseLabel(name: string): string {
   const labels: Record<string, string> = {
     submission: "Submitting",
+    classification: "Content classification",
     history: "History check",
     input: "Saving input",
     character_planning: "Character planning",
@@ -9270,13 +9455,15 @@ function postTurnPhaseLabel(name: string): string {
     response_checks: "Response checks",
     save_narration: "Saving narration",
     action_choices: "Action choices",
+    summary: "History summary",
     state: "World state",
     context: "Context update",
     proactive_text: "Proactive text",
     director: "Director pressure",
     scenario: "Scenario evolution",
     characters: "Character cleanup",
-    image: "Automatic image"
+    image: "Automatic image",
+    post_turn_catchup: "Prior turn continuity"
   };
   return labels[name] ?? labelize(name);
 }
@@ -9341,12 +9528,27 @@ function jobTypeLabel(type: string) {
   return labels[type] ?? labelize(type);
 }
 
+const POST_TURN_COMPLETION_LABELS = {
+  response_committed: "Response ready",
+  continuity_ready: "Continuity ready",
+  optional_enrichments_complete: "Optional complete"
+} as const;
+
+function postTurnCompletionLabel(job: Job): string | null {
+  if (job.type !== "post_turn_background" || !job.completion_level) return null;
+  return POST_TURN_COMPLETION_LABELS[job.completion_level];
+}
+
+function isCompletionLevelEvent(data: unknown): data is { completion_level: NonNullable<Job["completion_level"]> } {
+  if (!data || typeof data !== "object") return false;
+  const level = (data as { completion_level?: unknown }).completion_level;
+  return typeof level === "string" && level in POST_TURN_COMPLETION_LABELS;
+}
+
 function isChatJobType(type: string) {
   return type === "chat_turn"
     || type === "look_around"
     || type === "chat_regenerate"
-    || type === "action_choice_generate"
-    || type === "action_choice_regenerate"
     || type === "chat_edit"
     || type === "message_edit"
     || type === "narrator_edit"
@@ -9520,7 +9722,9 @@ export function applyChatTurnDeltaToRuntimeModel(model: RuntimeModel, delta: Cha
     action_choices: delta.action_choices,
     saves,
     status: delta.status,
-    error: delta.error
+    error: delta.error,
+    continuity_degraded: delta.continuity_degraded ?? model.continuity_degraded,
+    retry_pending: delta.retry_pending ?? model.retry_pending
   };
 }
 
@@ -9572,25 +9776,6 @@ function characterTextsModelWithUpdatedThread(model: CharacterTextsModel, thread
 
 function isCharacterRegistryModel(value: unknown): value is CharacterRegistryModel {
   return Boolean(value && typeof value === "object" && "active_save_id" in value && "characters" in value);
-}
-
-function narratorDraftMessage(value: unknown): PendingChronicleMessage | null {
-  if (!value || typeof value !== "object" || !("message" in value)) return null;
-  const message = (value as { message?: unknown }).message;
-  if (!message || typeof message !== "object") return null;
-  const candidate = message as Partial<ChronicleMessage>;
-  if (candidate.message_id !== "pending-narrator-message") return null;
-  if (candidate.role !== "narrator" || typeof candidate.body !== "string") return null;
-  return {
-    message_id: "pending-narrator-message",
-    role: "narrator",
-    speaker_name: typeof candidate.speaker_name === "string" ? candidate.speaker_name : "Narrator",
-    body: candidate.body,
-    actions: [],
-    markdown_blocks: Array.isArray(candidate.markdown_blocks)
-      ? candidate.markdown_blocks
-      : [{ kind: "paragraph", spans: [{ kind: "text", text: candidate.body }] }]
-  };
 }
 
 function scenarioFlow(model: RuntimeModel | undefined, scenarioType: string): ScenarioWizardFlow | undefined {

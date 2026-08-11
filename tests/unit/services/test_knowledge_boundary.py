@@ -10,6 +10,7 @@ from bragi.persistence.models import (
 from bragi.services.knowledge_boundary import (
     allowed_character_scoped_targets,
     character_scope_for_turn,
+    message_visible_to_character,
     message_visible_to_present_characters,
 )
 
@@ -245,6 +246,56 @@ def test_absent_mentions_do_not_hide_messages_from_present_scene() -> None:
         present_character_ids=frozenset({absent.id}),
         message_visibility=[hidden_from_absent],
     )
+
+
+def test_visibility_is_projected_per_character_in_mixed_knowledge_scene() -> None:
+    secret = "message-secret"
+    informed = _character("character-informed", name="Informed")
+    uninformed = _character("character-uninformed", name="Uninformed")
+    visibility = [
+        _message_visibility(message_id=secret, character_id=uninformed.id),
+    ]
+
+    assert message_visible_to_character(
+        message_id=secret,
+        character_id=informed.id,
+        message_visibility=visibility,
+    )
+    assert not message_visible_to_character(
+        message_id=secret,
+        character_id=uninformed.id,
+        message_visibility=visibility,
+    )
+
+
+def test_informed_present_character_unlocks_fact_hidden_from_companion() -> None:
+    secret = "message-secret"
+    informed = _character("character-informed", name="Informed")
+    uninformed = _character("character-uninformed", name="Uninformed")
+
+    targets = allowed_character_scoped_targets(
+        scene_snapshot=_scene_snapshot(
+            present_character_ids=[informed.id, uninformed.id]
+        ),
+        characters=[informed, uninformed],
+        character_knowledge_edges=[
+            _knowledge_edge(
+                character_id=informed.id,
+                target_type="memory",
+                target_id="memory-secret",
+                source_message_id=secret,
+            )
+        ],
+        entity_links=[],
+        latest_player_message="I wait for an answer.",
+        message_visibility=[
+            _message_visibility(message_id=secret, character_id=uninformed.id)
+        ],
+    )
+
+    assert targets.allowed == {
+        ("memory", "memory-secret"): ("Informed knows",),
+    }
 
 
 def _character(

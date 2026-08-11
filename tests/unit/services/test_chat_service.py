@@ -63,9 +63,11 @@ from bragi.services.agentic_context import (
     RESPONSE_VERIFICATION_MODE_SETTING,
     CurationResult,
     DatingRouteStageViolation,
+    EvidenceRefinementRequest,
     NarrativeBeat,
     NarratorCommitDecision,
     NarratorMessageSpec,
+    NarratorQualityFinding,
     NarratorVerificationResult,
     NpcIntent,
     ObservationResult,
@@ -96,10 +98,15 @@ from bragi.services.chat_service import (
     CancellationToken,
     ChatService,
     _selected_context_sources,
+    _verified_post_turn_coverage_for_turn,
 )
 from bragi.services.content_rating import (
     CONTENT_FILTER_RATING_SETTING,
     FADE_TO_BLACK_ENABLED_SETTING,
+)
+from bragi.services.content_safety_service import (
+    ContentSafetyAction,
+    ContentSafetyResult,
 )
 from bragi.services.context_search_service import (
     ContextSearchResult,
@@ -114,7 +121,6 @@ from bragi.services.context_update_service import (
 )
 from bragi.services.dating_route_profile_service import (
     DATING_ROUTE_PROFILE_TASK,
-    DatingRouteProfileResult,
 )
 from bragi.services.director_pressure_service import (
     DIRECTOR_PRESSURE_ENABLED_SETTING,
@@ -202,6 +208,26 @@ class RecordingChatProvider:
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        if request.schema_name == "content_safety_batch_review":
+            count = int(request.schema["properties"]["reviews"]["minItems"])
+            return StructuredOutputResponse(
+                data={
+                    "reviews": [
+                        {
+                            "ordinal": ordinal,
+                            "action": "allow",
+                            "category": "none",
+                            "reason": (
+                                "The narration stays within the content ceiling."
+                            ),
+                            "minimum_rating": "g",
+                        }
+                        for ordinal in range(1, count + 1)
+                    ]
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
         return StructuredOutputResponse(
             data={
                 "action": "allow",
@@ -503,7 +529,10 @@ class RecordingCyoaChatProvider(RecordingChatProvider):
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
-        if request.schema_name == "content_safety_review":
+        if request.schema_name in {
+            "content_safety_review",
+            "content_safety_batch_review",
+        }:
             return await RecordingChatProvider.generate_structured_output(
                 self,
                 request,
@@ -550,6 +579,20 @@ class RecordingCharacterActionChatProvider(RecordingChatProvider):
             )
         self.events.append(request.schema_name)
         self.structured_output_requests.append(request)
+        if "assessments" in request.schema.get("properties", {}):
+            body = request.messages[-1].body
+            items: list[dict[str, object]] = []
+            for name, character_id in _requested_batch_character_ids(body).items():
+                data = dict(self.decisions_by_name[name])
+                data = _with_allowed_character_action_evidence_ids(data, request)
+                data["character_id"] = character_id
+                items.append(data)
+            return StructuredOutputResponse(
+                data={"assessments": items},
+                provider=request.provider,
+                model_id=request.model_id,
+                token_usage={"total": 13},
+            )
         name = _requested_character_name(request.messages[-1].body)
         data = dict(self.decisions_by_name[name])
         data = _with_allowed_character_action_evidence_ids(data, request)
@@ -682,6 +725,18 @@ class SequenceChatProvider(RecordingChatProvider):
             model_id=request.model_id,
             token_usage={"prompt": 11, "completion": 23, "total": 34},
         )
+
+
+class SequenceTransportChatProvider(SequenceChatProvider):
+    """Streaming-capable provider whose test responses use final-only chat."""
+
+    def __init__(self, provider_name: str, response_bodies: tuple[str, ...]) -> None:
+        super().__init__(provider_name, response_bodies)
+        self.stream_requests: list[ChatRequest] = []
+
+    def stream_chat(self, request: ChatRequest) -> Any:
+        self.stream_requests.append(request)
+        raise AssertionError("final-only delivery must not request transport streaming")
 
 
 class StreamingChatProvider(RecordingChatProvider):
@@ -1328,6 +1383,28 @@ class ScriptedContextSearch:
         return self.result
 
 
+class RefiningScriptedContextSearch(ScriptedContextSearch):
+    def __init__(
+        self,
+        result: ContextSearchResult,
+        refined_result: ContextSearchResult,
+    ) -> None:
+        super().__init__(result)
+        self.refined_result = refined_result
+        self.refinement_calls: list[EvidenceRefinementRequest] = []
+
+    async def refine_for_plan(
+        self,
+        *,
+        save_id: str,
+        player_message_id: str,
+        request: EvidenceRefinementRequest,
+        prior_result: ContextSearchResult,
+    ) -> ContextSearchResult:
+        self.refinement_calls.append(request)
+        return self.refined_result
+
+
 class ScriptedWorldTimeRunner:
     def __init__(
         self,
@@ -1426,6 +1503,21 @@ class ScriptedNarratorPlanner:
     ) -> NarratorMessageSpec:
         self.calls.append((save_id, request))
         return self.spec
+
+
+class SequenceNarratorPlanner(ScriptedNarratorPlanner):
+    def __init__(self, specs: tuple[NarratorMessageSpec, ...]) -> None:
+        super().__init__(specs[-1])
+        self.specs = list(specs)
+
+    async def plan(
+        self,
+        *,
+        save_id: str,
+        request: ChatRequest,
+    ) -> NarratorMessageSpec:
+        self.calls.append((save_id, request))
+        return self.specs.pop(0)
 
 
 class FailingNarratorPlanner:
@@ -1803,6 +1895,15 @@ class RecordingSummaryService:
         self.summary_id = summary.id
         return summary
 
+    async def prepare_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
+        current_user_id: str | None = None,
+    ) -> object:
+        return None
+
 
 class FailingSummaryService:
     def __init__(self, *, events: list[str], error: Exception) -> None:
@@ -1823,6 +1924,98 @@ class FailingSummaryService:
         self.calls.append((save_id, model_context_window))
         self.pending_messages.append(pending_message)
         raise self.error
+
+    async def prepare_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
+        current_user_id: str | None = None,
+    ) -> object:
+        raise self.error
+
+
+class ControlledContentSafetyService:
+    def __init__(
+        self,
+        *,
+        started: asyncio.Event,
+        release: asyncio.Event,
+        error: Exception | None = None,
+        cancelled: asyncio.Event | None = None,
+    ) -> None:
+        self.started = started
+        self.release = release
+        self.error = error
+        self.cancelled = cancelled
+        self.finished = asyncio.Event()
+
+    async def review_narration(self, **_kwargs: object) -> ContentSafetyResult:
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            if self.cancelled is not None:
+                self.cancelled.set()
+            raise
+        if self.error is not None:
+            raise self.error
+        self.finished.set()
+        return ContentSafetyResult(
+            body="submitted input",
+            action=ContentSafetyAction.ALLOW,
+            minimum_rating="pg",
+            agent_ran=True,
+        )
+
+
+class ControlledSummaryService:
+    def __init__(
+        self,
+        *,
+        repositories: PersistenceRepositories,
+        started: asyncio.Event,
+        release: asyncio.Event,
+        cancelled: asyncio.Event | None = None,
+    ) -> None:
+        self.repositories = repositories
+        self.started = started
+        self.release = release
+        self.cancelled = cancelled
+        self.finished = asyncio.Event()
+        self.pending_messages: list[PendingMessageEstimate | None] = []
+        self.message_bodies_at_start: list[list[str]] = []
+
+    async def summarize_if_needed(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
+        pending_message: PendingMessageEstimate | None = None,
+        current_user_id: str | None = None,
+    ) -> object:
+        self.pending_messages.append(pending_message)
+        self.message_bodies_at_start.append(
+            [message.body for message in self.repositories.list_messages(save_id)]
+        )
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            if self.cancelled is not None:
+                self.cancelled.set()
+            raise
+        self.finished.set()
+        return None
+
+    async def prepare_for_next_turn(
+        self,
+        *,
+        save_id: str,
+        model_context_window: int | None,
+        current_user_id: str | None = None,
+    ) -> object:
+        return None
 
 
 class RecordingMediaService:
@@ -2642,7 +2835,7 @@ def test_submit_player_turn_final_guard_rejects_phrase_from_verifier_retry(
     assert [message.role for message in persisted] == ["player"]
 
 
-def test_submit_player_turn_buffers_streamed_narrator_until_script_guard_passes(
+def test_submit_player_turn_uses_final_only_transport_until_script_guard_passes(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -2662,19 +2855,11 @@ def test_submit_player_turn_buffers_streamed_narrator_until_script_guard_passes(
         provider="openrouter",
         model_id="anthropic/claude-3.5-sonnet",
     )
-    provider = SequenceStreamingChatProvider(
+    provider = SequenceTransportChatProvider(
         "openrouter",
         (
-            (
-                ChatStreamChunk(delta="玩家喜欢"),
-                ChatStreamChunk(delta="简洁叙事。", token_usage={"total": 12}),
-                ChatStreamChunk(token_usage={"total": 12}, done=True),
-            ),
-            (
-                ChatStreamChunk(delta="The lantern"),
-                ChatStreamChunk(delta=" holds.", token_usage={"total": 12}),
-                ChatStreamChunk(token_usage={"total": 12}, done=True),
-            ),
+            "玩家喜欢简洁叙事。",
+            "The lantern holds.",
         ),
     )
     service = ChatService(
@@ -2682,24 +2867,20 @@ def test_submit_player_turn_buffers_streamed_narrator_until_script_guard_passes(
         providers={"openrouter": provider},
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
-    drafts: list[str] = []
-
     result = asyncio.run(
         service.submit_player_turn(
             save_id=save.id,
             body="I climb toward the beacon lens.",
             speaker_name="Mara",
             run_post_turn_jobs=False,
-            narrator_stream_callback=drafts.append,
         )
     )
 
-    assert drafts == ["The lantern holds."]
-    assert len(provider.stream_requests) == 2
-    assert provider.chat_requests == []
+    assert provider.stream_requests == []
+    assert len(provider.chat_requests) == 2
     assert (
         "unsupported writing script"
-        in provider.stream_requests[1].regeneration_feedback
+        in provider.chat_requests[1].regeneration_feedback
     )
     assert result.narrator_message.body == "The lantern holds."
     persisted = repositories.list_messages(save.id)
@@ -2745,9 +2926,9 @@ def test_submit_player_turn_reports_pre_narrator_progress_phases(
 
     status_texts = [event.status_text for event in progress_events]
     assert status_texts[0] == "Submitting turn"
-    assert "Checking history" in status_texts
+    assert "Checking submitted content" in status_texts
+    assert "Checking content and history" in status_texts
     assert "Saving player input" in status_texts
-    assert "Dating route profile skipped" in status_texts
     assert "Selecting context" in status_texts
     assert "Preparing narrator prompt" in status_texts
     assert "Writing narrator response" in status_texts
@@ -2759,9 +2940,9 @@ def test_submit_player_turn_reports_pre_narrator_progress_phases(
     }
     assert final_statuses == {
         "submission": "succeeded",
+        "classification": "succeeded",
         "history": "succeeded",
         "input": "succeeded",
-        "dating_route_profile": "skipped",
         "character_planning": "skipped",
         "context_selection": "succeeded",
         "prompt": "succeeded",
@@ -2770,6 +2951,511 @@ def test_submit_player_turn_reports_pre_narrator_progress_phases(
         "save_narration": "succeeded",
         "action_choices": "skipped",
     }
+
+
+def test_submit_player_turn_overlaps_classification_and_history_before_persisting(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    older_player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I cross the ash bridge.",
+    )
+    older_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="A windless bell answers beneath the span.",
+        provider="fake",
+        model="fake-chat",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        summary_started = asyncio.Event()
+        summary_release = asyncio.Event()
+        content_safety = ControlledContentSafetyService(
+            started=classification_started,
+            release=classification_release,
+        )
+        summary = ControlledSummaryService(
+            repositories=repositories,
+            started=summary_started,
+            release=summary_release,
+        )
+        progress_events: list[Any] = []
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=summary,
+            content_safety_service=cast(Any, content_safety),
+        )
+
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+                turn_progress_callback=progress_events.append,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_started.wait(), timeout=1.0)
+
+        assert repositories.list_messages(save.id) == [older_player, older_narrator]
+        assert summary.message_bodies_at_start == [
+            [
+                "I cross the ash bridge.",
+                "A windless bell answers beneath the span.",
+            ]
+        ]
+        assert summary.pending_messages == [
+            PendingMessageEstimate(
+                body="I climb toward the beacon lens.",
+                role="player",
+            )
+        ]
+        assert any(
+            {
+                job.name: job.status
+                for job in event.jobs
+            }.get("classification")
+            == "running"
+            and {
+                job.name: job.status
+                for job in event.jobs
+            }.get("history")
+            == "running"
+            for event in progress_events
+        )
+
+        summary_release.set()
+        await asyncio.wait_for(summary.finished.wait(), timeout=1.0)
+        assert not task.done()
+        assert repositories.list_messages(save.id) == [older_player, older_narrator]
+
+        classification_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert result.player_message.content_rating == "pg"
+
+    asyncio.run(run())
+
+
+def test_submit_player_turn_cancels_history_when_classification_fails(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        summary_started = asyncio.Event()
+        summary_release = asyncio.Event()
+        summary_cancelled = asyncio.Event()
+        content_safety = ControlledContentSafetyService(
+            started=classification_started,
+            release=classification_release,
+            error=RuntimeError("classification unavailable"),
+        )
+        summary = ControlledSummaryService(
+            repositories=repositories,
+            started=summary_started,
+            release=summary_release,
+            cancelled=summary_cancelled,
+        )
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=summary,
+            content_safety_service=cast(Any, content_safety),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_started.wait(), timeout=1.0)
+        classification_release.set()
+
+        with pytest.raises(RuntimeError, match="classification unavailable"):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(summary_cancelled.wait(), timeout=1.0)
+        assert repositories.list_messages(save.id) == []
+
+    asyncio.run(run())
+
+
+def test_submit_player_turn_no_summary_fast_path_waits_only_for_classification(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        history_finished = asyncio.Event()
+
+        def record_progress(progress: object) -> None:
+            jobs = getattr(progress, "jobs", ())
+            if any(
+                getattr(job, "name", None) == "history"
+                and getattr(job, "status", None) == "succeeded"
+                for job in jobs
+            ):
+                history_finished.set()
+
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+                turn_progress_callback=record_progress,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(history_finished.wait(), timeout=1.0)
+        assert not task.done()
+        assert repositories.list_messages(save.id) == []
+
+        classification_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert result.player_message.content_rating == "pg"
+
+    asyncio.run(run())
+
+
+def test_submit_player_turn_reports_summary_failure_but_waits_for_classification(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        history_failed = asyncio.Event()
+        progress_events: list[Any] = []
+
+        def record_progress(progress: object) -> None:
+            progress_events.append(progress)
+            jobs = getattr(progress, "jobs", ())
+            if any(
+                getattr(job, "name", None) == "history"
+                and getattr(job, "status", None) == "failed"
+                for job in jobs
+            ):
+                history_failed.set()
+
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=FailingSummaryService(
+                events=[],
+                error=RuntimeError("summary backend is down"),
+            ),
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+                turn_progress_callback=record_progress,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(history_failed.wait(), timeout=1.0)
+        assert not task.done()
+        assert repositories.list_messages(save.id) == []
+
+        classification_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert result.player_message.content_rating == "pg"
+        final_statuses = {
+            job.name: job.status
+            for job in getattr(progress_events[-1], "jobs", ())
+        }
+        assert final_statuses["history"] == "failed"
+
+    asyncio.run(run())
+
+
+def test_submit_player_turn_cancels_both_pre_input_branches(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        classification_cancelled = asyncio.Event()
+        summary_started = asyncio.Event()
+        summary_release = asyncio.Event()
+        summary_cancelled = asyncio.Event()
+        token = CancellationToken()
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=ControlledSummaryService(
+                repositories=repositories,
+                started=summary_started,
+                release=summary_release,
+                cancelled=summary_cancelled,
+            ),
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                    cancelled=classification_cancelled,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+                cancellation_token=token,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_started.wait(), timeout=1.0)
+        assert token.cancel() is True
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(classification_cancelled.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_cancelled.wait(), timeout=1.0)
+        assert repositories.list_messages(save.id) == []
+
+    asyncio.run(run())
+
+
+def test_submit_player_turn_task_cancellation_cleans_up_pre_input_branches(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        classification_cancelled = asyncio.Event()
+        summary_started = asyncio.Event()
+        summary_release = asyncio.Event()
+        summary_cancelled = asyncio.Event()
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=ControlledSummaryService(
+                repositories=repositories,
+                started=summary_started,
+                release=summary_release,
+                cancelled=summary_cancelled,
+            ),
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                    cancelled=classification_cancelled,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_started.wait(), timeout=1.0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        await asyncio.wait_for(classification_cancelled.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_cancelled.wait(), timeout=1.0)
+        assert repositories.list_messages(save.id) == []
+
+    asyncio.run(run())
+
+
+def test_submit_timeskip_turn_overlaps_pre_input_checks(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    async def run() -> None:
+        classification_started = asyncio.Event()
+        classification_release = asyncio.Event()
+        summary_started = asyncio.Event()
+        summary_release = asyncio.Event()
+        summary = ControlledSummaryService(
+            repositories=repositories,
+            started=summary_started,
+            release=summary_release,
+        )
+        service = ChatService(
+            repositories=repositories,
+            providers={"fake": RecordingChatProvider("fake")},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            summary_service=summary,
+            content_safety_service=cast(
+                Any,
+                ControlledContentSafetyService(
+                    started=classification_started,
+                    release=classification_release,
+                ),
+            ),
+        )
+        task = asyncio.create_task(
+            service.submit_timeskip_turn(
+                save_id=save.id,
+                instruction="Skip to dawn at the city gates.",
+                run_post_turn_jobs=False,
+            )
+        )
+        await asyncio.wait_for(classification_started.wait(), timeout=1.0)
+        await asyncio.wait_for(summary_started.wait(), timeout=1.0)
+        assert repositories.list_messages(save.id) == []
+        assert summary.pending_messages == [
+            PendingMessageEstimate(
+                body="Timeskip request: Skip to dawn at the city gates.",
+                role="system",
+            )
+        ]
+
+        summary_release.set()
+        await asyncio.wait_for(summary.finished.wait(), timeout=1.0)
+        assert not task.done()
+        assert repositories.list_messages(save.id) == []
+
+        classification_release.set()
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert result.player_message.role == "system"
+        assert result.player_message.content_rating == "pg"
+
+    asyncio.run(run())
 
 
 def test_submit_player_turn_enters_post_input_context_after_input_saved(
@@ -3287,6 +3973,80 @@ def test_submit_player_turn_uses_rich_request_when_plan_first_plan_is_empty(
     assert job["result"]["narrator_mode_reason"] == "invalid_turn_plan"
 
 
+def test_submit_player_turn_replans_once_after_authoritative_context_refinement(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(PLAN_FIRST_NARRATOR_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    first_spec = NarratorMessageSpec(
+        intent="Resolve the player's indirect reference.",
+        thesis="Find the missing remedy evidence.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=("Which remedy the player means.",),
+        evidence_source_ids=(),
+        evidence_refinement=EvidenceRefinementRequest(
+            terms=("physician", "antivenom"),
+            reason="The pronouns are ambiguous.",
+        ),
+    )
+    final_spec = replace(
+        first_spec,
+        thesis="The physician stored the antivenom in the western archive.",
+        uncertainties=(),
+        evidence_refinement=None,
+    )
+    context_search = RefiningScriptedContextSearch(
+        ContextSearchResult(),
+        ContextSearchResult(
+            selected_memories=(
+                SelectedContextItem(
+                    source_type="memory",
+                    source_id="memory-antivenom",
+                    text="The physician stored antivenom in the western archive.",
+                    relevance_note="The refinement resolved the reference.",
+                ),
+            ),
+            retrieval_round_used=True,
+        ),
+    )
+    planner = SequenceNarratorPlanner((first_spec, final_spec))
+    provider = RecordingChatProvider("fake")
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={"fake": provider},
+            context_search_service=context_search,
+            narrator_planner=planner,
+        ).submit_player_turn(
+            save_id=save.id,
+            body="Where did she store it?",
+            speaker_name="Mara",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    assert len(context_search.refinement_calls) == 1
+    assert len(planner.calls) == 2
+    assert planner.calls[1][1].retrieved_memories
+    assert provider.chat_requests[0].retrieved_memories
+    assert "western archive" in provider.chat_requests[0].narration_brief
+
+
 def test_submit_player_turn_uses_response_planning_model_preference(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3471,6 +4231,133 @@ def test_submit_player_turn_uses_seven_attempts_after_narrator_verifier_failure(
     assert "The lens burns red." in retry_request.narration_brief
     assert retry_request.narration_evidence == ("observation:warning",)
     assert result.narrator_message.body == "The lens burns red above the stair."
+
+
+def test_submit_player_turn_retries_typed_narrator_quality_finding(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting(
+        RESPONSE_VERIFICATION_MODE_SETTING,
+        RESPONSE_VERIFICATION_MODE_RETRY_ONCE,
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = SequenceChatProvider(
+        "fake",
+        (
+            "Mara steps through the sealed gate.",
+            "The sealed gate stops Mara at the threshold.",
+        ),
+    )
+    spec = NarratorMessageSpec(
+        intent="Resolve Mara's attempt to cross the gate.",
+        thesis="The sealed gate blocks the crossing.",
+        must_say=(),
+        avoid=(),
+        tone="tense and grounded",
+        uncertainties=(),
+        evidence_source_ids=("scene:gate",),
+    )
+    finding = NarratorQualityFinding(
+        category="spatial_continuity",
+        reason="The supplied scene says the gate is sealed.",
+        narrator_quote="Mara steps through the sealed gate.",
+        context_quote="The gate remains sealed.",
+    )
+    verifier = ScriptedNarratorVerifier(
+        NarratorVerificationResult(
+            passed=True,
+            retry_feedback="Keep the gate consistent.",
+            confidence=0.94,
+            quality_findings=(finding,),
+        )
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+        narrator_planner=ScriptedNarratorPlanner(spec),
+        narrator_verifier=verifier,
+    )
+
+    result = asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I try to walk through the sealed gate.",
+            speaker_name="Mara",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    assert len(provider.chat_requests) == 7
+    feedback = provider.chat_requests[1].regeneration_feedback
+    assert "Keep the gate consistent." in feedback
+    assert "Spatial continuity" in feedback
+    assert "Mara steps through the sealed gate." in feedback
+    assert "The gate remains sealed." in feedback
+    assert "The supplied scene says the gate is sealed." in feedback
+    assert result.narrator_message.body == (
+        "The sealed gate stops Mara at the threshold."
+    )
+    job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
+    assert job_result["narrator_verifier"]["quality_finding_count"] == 1
+    assert job_result["narrator_verifier"]["quality_findings"] == [
+        {
+            "category": "spatial_continuity",
+            "reason": "The supplied scene says the gate is sealed.",
+            "narrator_quote": "Mara steps through the sealed gate.",
+            "context_quote": "The gate remains sealed.",
+        }
+    ]
+
+
+def test_narrator_quality_retry_feedback_includes_every_typed_finding() -> None:
+    findings = tuple(
+        NarratorQualityFinding(
+            category=category,
+            reason=f"Reason {index}.",
+            narrator_quote=f"Draft quote {index}.",
+            context_quote=f"Context quote {index}.",
+        )
+        for index, category in enumerate(
+            (
+                "spatial_continuity",
+                "possession_continuity",
+                "injury_resource_continuity",
+                "action_feasibility",
+                "causality",
+                "elapsed_time",
+                "character_voice",
+                "semantic_repetition",
+                "forward_movement",
+            ),
+            start=1,
+        )
+    )
+
+    feedback = chat_service_module._verification_retry_feedback(
+        NarratorVerificationResult(
+            passed=False,
+            quality_findings=findings,
+        )
+    )
+
+    for index in range(1, 10):
+        assert f"Reason {index}." in feedback
+        assert f"Draft quote {index}." in feedback
+        assert f"Context quote {index}." in feedback
 
 
 def test_submit_player_turn_uses_seven_attempts_after_narrator_passivity_issue(
@@ -4106,7 +4993,7 @@ def test_submit_player_turn_allows_later_stage_commitment_language(
     )
 
 
-def test_submit_player_turn_profiles_dating_route_before_narrator_prompt(
+def test_submit_player_turn_uses_dating_route_fallback_without_profiling(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, _player_id, npc_id = _create_dating_chat_save(
@@ -4152,17 +5039,15 @@ def test_submit_player_turn_profiles_dating_route_before_narrator_prompt(
     )
 
     route = repositories.list_dating_route_states(save_id)[0]
-    assert provider.events[:2] == ["dating_route_profile", "chat"]
-    assert route.comfort_with_intimacy.startswith("open to physical intimacy")
-    assert route.pacing_preference == "direct and chemistry-led"
+    assert provider.events == ["chat"]
+    assert route.comfort_with_intimacy == ""
+    assert route.pacing_preference == ""
     request = provider.chat_requests[0]
     route_context = "\n".join(request.current_scene_recap)
-    assert "comfort with intimacy: open to physical intimacy" in route_context
-    assert "pacing: direct and chemistry-led" in route_context
-    assert "sexual escalation" not in route_context
+    assert "no route-specific intimacy profile is established yet" in route_context
 
 
-def test_submit_player_turn_captures_profiled_route_state_in_player_snapshot(
+def test_submit_player_turn_does_not_capture_profile_snapshot_when_routes_exist(
     repositories: PersistenceRepositories,
 ) -> None:
     save_id, _player_id, _npc_id = _create_dating_chat_save(
@@ -4181,35 +5066,10 @@ def test_submit_player_turn_captures_profiled_route_state_in_player_snapshot(
         model_id="fake-chat",
     )
 
-    class MutatingProfileRunner:
-        async def ensure_profiles_for_save(
-            self,
-            *,
-            save_id: str,
-            source_message_id: str | None = None,
-        ) -> DatingRouteProfileResult:
-            route = repositories.list_dating_route_states(save_id)[0]
-            repositories.upsert_dating_route_state(
-                save_id=save_id,
-                player_character_id=route.player_character_id,
-                npc_character_id=route.npc_character_id,
-                stage=route.stage,
-                comfort_with_intimacy="profiled before narrator prompt",
-                pacing_preference="profiled pacing",
-                source_message_id=source_message_id,
-                route_id=route.id,
-            )
-            return DatingRouteProfileResult(
-                status="succeeded",
-                updated_count=1,
-                requested_count=1,
-            )
-
     service = ChatService(
         repositories=repositories,
         providers={"fake": RecordingChatProvider("fake")},
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
-        dating_route_profile_service=MutatingProfileRunner(),
     )
 
     result = asyncio.run(
@@ -4225,11 +5085,67 @@ def test_submit_player_turn_captures_profiled_route_state_in_player_snapshot(
         save_id=save_id,
         message_id=result.player_message.id,
     )
-    route = repositories.list_dating_route_states(save_id)[0]
     assert snapshot is not None
-    assert snapshot.reason == "pre_turn_dating_route_profile"
-    assert route.comfort_with_intimacy == "profiled before narrator prompt"
-    assert route.pacing_preference == "profiled pacing"
+    assert snapshot.reason != "pre_turn_dating_route_profile"
+
+
+def test_submit_player_turn_skips_snapshot_check_when_route_profile_is_unchanged(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_id, _player_id, _npc_id = _create_dating_chat_save(
+        repositories,
+        stage="introduced",
+    )
+    route = repositories.list_dating_route_states(save_id)[0]
+    repositories.upsert_dating_route_state(
+        save_id=save_id,
+        player_character_id=route.player_character_id,
+        npc_character_id=route.npc_character_id,
+        stage=route.stage,
+        comfort_with_intimacy="already profiled",
+        pacing_preference="already paced",
+        route_id=route.id,
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-chat",
+        display_name="Fake Chat",
+        capabilities=[ProviderCapability.CHAT.value],
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    def fail_dirty_capture(
+        self: TurnSnapshotService,
+        save_id: str,
+        *,
+        reason: str = "dirty_head",
+    ) -> object:
+        raise AssertionError(f"unexpected dirty snapshot capture: {save_id} {reason}")
+
+    monkeypatch.setattr(
+        TurnSnapshotService,
+        "capture_current_head_if_dirty",
+        fail_dirty_capture,
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": RecordingChatProvider("fake")},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    asyncio.run(
+        service.submit_player_turn(
+            save_id=save_id,
+            body="I ask Mika about the gate.",
+            speaker_name="Lio",
+            run_post_turn_jobs=False,
+        )
+    )
 
 
 def test_submit_player_turn_keeps_dating_route_anchor_after_setup_ages_out(
@@ -4238,10 +5154,7 @@ def test_submit_player_turn_keeps_dating_route_anchor_after_setup_ages_out(
     scenario = repositories.create_scenario(
         type="dating_sim",
         title="Last Summer",
-        premise=(
-            "A long initial dating-sim setup with romance options and dorm "
-            "politics that should age out of the normal scenario header."
-        ),
+        premise="A transfer student navigates romance options and dorm politics.",
         player_role="Transfer student",
         content={
             "player_character_name": "Lio Takahashi",
@@ -4352,7 +5265,10 @@ def test_submit_player_turn_keeps_dating_route_anchor_after_setup_ages_out(
         assert "trust: guarded" in route_context
         assert "comfort with intimacy: none yet" in route_context
         assert "premature now: exclusivity or commitment language" in route_context
-    assert "Premise/setup:" not in request.scenario_instructions
+    assert (
+        "Premise: A transfer student navigates romance options and dorm politics."
+        in request.scenario_instructions
+    )
     assert "Opening romance-option setup that has aged out." not in [
         message.body for message in request.messages
     ]
@@ -4575,7 +5491,7 @@ def test_submit_player_turn_commits_rendered_planned_scene_presence(
     result = asyncio.run(
         service.submit_player_turn(
             save_id=save.id,
-            body="I ask who should fetch the map.",
+            body="I ask whether Lio should fetch the map.",
             speaker_name="Ily",
             run_post_turn_jobs=False,
         )
@@ -4651,7 +5567,7 @@ def test_submit_player_turn_skips_scene_presence_with_ungrounded_evidence(
             ),
         ).submit_player_turn(
             save_id=save.id,
-            body="I ask who should fetch the map.",
+            body="I ask whether Lio should leave.",
             speaker_name="Ily",
             run_post_turn_jobs=False,
         )
@@ -4822,7 +5738,7 @@ def test_submit_player_turn_commits_plan_grounded_in_assembled_context(
         "planned_commits"
     ]
     assert planned["committed_count"] == 1
-    assert planned["by_domain"]["scene_snapshot"]["committed"] == 1
+    assert planned["by_domain"]["scene"]["committed"] == 1
     assert planned["rejected_count"] == 0
 
 
@@ -5461,8 +6377,6 @@ def test_character_assessment_scene_presence_candidate_uses_presence_evidence(
                     character_name="Mara",
                     present=True,
                     enters_scene=True,
-                    action="Mara checks the corridor.",
-                    intent="inspect the corridor",
                     reason="Mara enters only if presence evidence is grounded.",
                     confidence=0.84,
                     evidence_source_ids=("message:intent",),
@@ -5479,6 +6393,305 @@ def test_character_assessment_scene_presence_candidate_uses_presence_evidence(
     assert candidates[0].evidence_source_ids == ("message:presence",)
     assert candidates[0].evidence_quote == "presence quote"
     assert candidates[0].value["evidence_quote"] == "presence quote"
+
+
+def test_narrator_spec_commit_candidates_prefer_assessment_candidates() -> None:
+    assessment_candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={
+            "action": "leave",
+            "character_name": "Mara",
+            "evidence_quote": "presence quote",
+        },
+        reason="Mara may leave.",
+        confidence=0.9,
+        evidence_source_ids=("message:presence",),
+        evidence_quote="presence quote",
+        candidate_id="scene_presence:mara:leave",
+        candidate_type="scene_presence",
+        character_id="mara",
+    )
+    model_duplicate = replace(
+        assessment_candidate,
+        value={"action": "leave"},
+        reason="Model-authored duplicate candidate.",
+    )
+    model_conflicting = replace(
+        assessment_candidate,
+        candidate_id="scene_presence:mara:enter",
+        value={"action": "enter"},
+        reason="Model-authored conflicting candidate.",
+    )
+    model_other_character = replace(
+        assessment_candidate,
+        character_id="lio",
+        candidate_id="scene_presence:lio:enter",
+        value={"action": "enter"},
+        reason="Model-authored candidate for a different character.",
+    )
+    model_deterministic_present = replace(
+        assessment_candidate,
+        character_id="ren",
+        candidate_id="scene_presence:ren:leave",
+        value={"action": "leave"},
+        reason=(
+            "Model-authored candidate for an assessed character "
+            "without a candidate."
+        ),
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Mara leaves if rendered.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(
+            model_duplicate,
+            model_conflicting,
+            model_other_character,
+            model_deterministic_present,
+        ),
+    )
+
+    merged = chat_service_module._narrator_spec_with_commit_candidates(
+        spec,
+        (assessment_candidate,),
+    )
+
+    assert merged is not None
+    assert merged.state_commit_candidates == (
+        model_other_character,
+        model_deterministic_present,
+        assessment_candidate,
+    )
+    assert {
+        (rejection.candidate_id, rejection.reason)
+        for rejection in merged.planner_rejections
+    } == {
+        ("scene_presence:mara:leave", "superseded_by_assessment"),
+        ("scene_presence:mara:enter", "superseded_by_assessment"),
+    }
+
+
+def test_narrator_spec_keeps_model_candidate_for_character_without_candidate(
+    repositories: PersistenceRepositories,
+) -> None:
+    model_candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={"action": "leave", "character_name": "Ren"},
+        reason="Model candidate for an assessed character without a candidate.",
+        confidence=0.9,
+        evidence_source_ids=("message:source",),
+        evidence_quote="Ren leaves.",
+        candidate_id="scene_presence:ren:leave",
+        candidate_type="scene_presence",
+        character_id="ren",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Ren stays present.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(model_candidate,),
+    )
+
+    merged = chat_service_module._narrator_spec_with_commit_candidates(
+        spec,
+        (),
+    )
+
+    assert merged is not None
+    assert merged.state_commit_candidates == (model_candidate,)
+    assert merged.planner_rejections == ()
+
+
+def test_narrator_spec_keeps_model_candidate_for_ungrounded_assessment(
+    repositories: PersistenceRepositories,
+) -> None:
+    assessment_candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={
+            "action": "leave",
+            "character_name": "Mara",
+            "evidence_quote": "presence quote",
+        },
+        reason="Mara may leave.",
+        confidence=0.9,
+        evidence_source_ids=("message:presence",),
+        evidence_quote="presence quote",
+        candidate_id="scene_presence:mara:leave",
+        candidate_type="scene_presence",
+        character_id="mara",
+    )
+    model_candidate = replace(
+        assessment_candidate,
+        character_id="ren",
+        candidate_id="scene_presence:ren:leave",
+        value={"action": "leave"},
+        reason="Model candidate for an ungrounded assessment character.",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Ren leaves if rendered.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(model_candidate,),
+    )
+
+    merged = chat_service_module._narrator_spec_with_commit_candidates(
+        spec,
+        (assessment_candidate,),
+    )
+
+    assert merged is not None
+    assert merged.state_commit_candidates == (
+        model_candidate,
+        assessment_candidate,
+    )
+    assert merged.planner_rejections == ()
+
+
+def test_planned_learned_memory_candidate_skips_invalid_knowledge_metadata(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    candidate = StateCommitCandidate(
+        operation="create",
+        state_key="character.learned_memory",
+        value={
+            "body": "Mara learned the lens phrase.",
+            "knowledge_state": "observed",
+        },
+        reason="The planner offered a bad knowledge state.",
+        confidence=0.9,
+        evidence_source_ids=("message:source",),
+        evidence_quote="the lens phrase",
+        candidate_id="memory:mara:0",
+        candidate_type="character_learned_memory",
+        character_id=mara.id,
+    )
+
+    status, reason, changed = (
+        chat_service_module._apply_character_learned_memory_candidate(
+            repositories=repositories,
+            save_id=save.id,
+            player_message_id="message:player",
+            narrator_message_id="message:narrator",
+            candidate=candidate,
+            evidence_source_text_by_id={"message:source": "the lens phrase"},
+        )
+    )
+
+    assert status == "skipped"
+    assert reason == "unknown_knowledge_state"
+    assert changed is False
+    assert repositories.list_memories(save.id) == []
+
+
+def test_planned_commit_grounding_accepts_planning_scene_text(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    snapshot = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara waits by the beacon controls.",
+        present_character_ids=[mara.id],
+    )
+    assert snapshot is not None
+    candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene.presence",
+        field_path="present_character_ids",
+        value={
+            "action": "leave",
+            "character_name": "Mara",
+            "evidence_quote": mara.id,
+        },
+        reason="Mara may leave.",
+        confidence=0.9,
+        evidence_source_ids=(f"scene_snapshot:{snapshot.id}",),
+        evidence_quote=mara.id,
+        candidate_id="scene_presence:mara:leave",
+        candidate_type="scene_presence",
+        character_id=mara.id,
+    )
+
+    situation_quote_candidate = replace(
+        candidate,
+        evidence_source_ids=(f"scene_snapshot:{snapshot.id}",),
+        evidence_quote="Mara waits by the beacon controls.",
+    )
+    grounded_via_inventory = chat_service_module._planned_commit_evidence_is_grounded(
+        repositories=repositories,
+        save_id=save.id,
+        player_message_id="message:player",
+        narrator_message_id="message:narrator",
+        candidate=situation_quote_candidate,
+        evidence_source_text_by_id={
+            f"scene_snapshot:{snapshot.id}": (
+                "Scene snapshot: situation: Mara waits by the beacon controls."
+            )
+        },
+    )
+    assert grounded_via_inventory is True
+
+    grounded_via_ids_line_fallback = (
+        chat_service_module._planned_commit_evidence_is_grounded(
+            repositories=repositories,
+            save_id=save.id,
+            player_message_id="message:player",
+            narrator_message_id="message:narrator",
+            candidate=candidate,
+            evidence_source_text_by_id={
+                f"scene_snapshot:{snapshot.id}": (
+                    "Scene snapshot: situation: Mara waits by the beacon controls."
+                )
+            },
+        )
+    )
+    assert grounded_via_ids_line_fallback is True
+
+    grounded_without_inventory_key = (
+        chat_service_module._planned_commit_evidence_is_grounded(
+            repositories=repositories,
+            save_id=save.id,
+            player_message_id="message:player",
+            narrator_message_id="message:narrator",
+            candidate=candidate,
+            evidence_source_text_by_id={},
+        )
+    )
+    assert grounded_without_inventory_key is True
 
 
 def test_submit_player_turn_queues_verified_learned_memory_when_confirmation_enabled(
@@ -5562,9 +6775,9 @@ def test_submit_player_turn_queues_verified_learned_memory_when_confirmation_ena
     ]
     assert planned["confirmation_queued_count"] == 1
     assert planned["committed_count"] == 0
-    assert planned["coverage"]["memory_count"] == 0
+    assert planned["coverage"]["memory_count"] == 1
     assert planned["coverage"]["applied_domains"] == []
-    assert planned["coverage"]["queued_domains"] == ["memories"]
+    assert planned["coverage"]["queued_domains"] == ["knowledge"]
 
 
 def test_submit_player_turn_skips_learned_memory_with_ungrounded_evidence(
@@ -5653,7 +6866,7 @@ def test_submit_player_turn_skips_learned_memory_with_ungrounded_evidence(
     } == {"ungrounded_evidence_metadata"}
     assert planned["rejected_count"] == 2
     assert planned["by_reason"]["ungrounded_evidence_metadata"] == 2
-    assert planned["by_domain"]["memories"]["rejected"] == 2
+    assert planned["by_domain"]["knowledge"]["rejected"] == 2
 
 
 def test_hybrid_post_turn_mode_does_not_duplicate_verified_planned_memory(
@@ -5758,7 +6971,7 @@ def test_hybrid_post_turn_mode_does_not_duplicate_verified_planned_memory(
     assert state_result["verified_plan_coverage"]["memory_count"] == 1
 
 
-def test_plan_owned_post_turn_mode_keeps_hybrid_fallback_for_partial_coverage(
+def test_plan_owned_post_turn_mode_stays_strong_with_committed_candidate_coverage(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -5874,23 +7087,937 @@ def test_plan_owned_post_turn_mode_keeps_hybrid_fallback_for_partial_coverage(
         )
     )
 
-    assert "state_memory_extraction" in events
-    assert "context_update" in events
+    assert "state_memory_extraction" not in events
+    assert "context_update" not in events
     assert "scenario_evolution" in events
     assert "automatic_media" in events
-    assert [state.key for state in repositories.list_world_state(save.id)] == [
-        "legacy.should_not_run"
-    ]
+    assert repositories.list_world_state(save.id) == []
     coordinator = _post_turn_jobs(repositories, save.id)[-1]
     assert coordinator["payload"]["post_turn_inference_mode"] == "plan_owned"
-    assert coordinator["payload"]["effective_post_turn_inference_mode"] == "hybrid"
+    assert coordinator["payload"]["effective_post_turn_inference_mode"] == "plan_owned"
     assert coordinator["result"]["post_turn_inference_mode_reason"] == (
-        "plan_owned_partial_domain_fallback"
+        "plan_owned_coverage_strong"
     )
     coverage = coordinator["result"]["verified_plan_coverage"]
-    assert coverage["applied_domains"] == ["scene_snapshot"]
-    assert _post_turn_child_status(coordinator, "state") == "succeeded"
+    assert coverage["applied_domains"] == ["scene"]
+    assert _post_turn_child_status(coordinator, "state") == "skipped"
+    assert _post_turn_child_status(coordinator, "context") == "skipped"
+
+
+def test_plan_owned_accepted_turn_does_not_trigger_duplicate_inference(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara watches the beacon lens.",
+        present_character_ids=[mara.id],
+    )
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=POST_TURN_INFERENCE_MODE_SETTING,
+        value="plan_owned",
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=DIRECTOR_PRESSURE_ENABLED_SETTING,
+        value=False,
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=CHARACTER_ACTION_PLANNING_ENABLED_SETTING,
+        value=False,
+    )
+    for task, model_id in (
+        ("chat", "fake-chat"),
+        ("state_memory", "fake-state-memory"),
+        ("context_update", "fake-context-update"),
+        ("scenario_evolution", "fake-scenario-evolution"),
+    ):
+        repositories.save_provider_model(
+            provider="fake",
+            model_id=model_id,
+            display_name=model_id,
+            capabilities=["chat"] if task == "chat" else ["structured_output"],
+            context_window=32768,
+        )
+        repositories.set_model_preference(
+            task=task,
+            provider="fake",
+            model_id=model_id,
+        )
+    narrator_body = (
+        "Mara settles into uneasy quiet as evening falls over the keep and "
+        "ember dawn wakes the beacon."
+    )
+    mood_candidate = _scene_snapshot_field_candidate(
+        field_path="mood",
+        value="uneasy",
+        candidate_id="scene_snapshot:mood",
+        evidence_quote="uneasy quiet",
+    )
+    emotion_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="",
+        value={
+            "mood": "uneasy",
+            "character_id": mara.id,
+            "evidence_quote": "Mara settles into uneasy quiet",
+        },
+        reason="Mara is uneasy after the turn.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="Mara settles into uneasy quiet",
+        candidate_id="emotional_change:mara:uneasy",
+        candidate_type="emotional_change",
+        character_id=mara.id,
+    )
+    time_candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene_snapshot.in_world_time",
+        value={
+            "time_of_day": "evening",
+            "evidence_quote": "evening falls over the keep",
+        },
+        reason="Evening falls over the keep.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="evening falls over the keep",
+        candidate_id="world_time_change:evening",
+        candidate_type="world_time_change",
+    )
+    memory_candidate = _learned_memory_candidate(
+        mara.id,
+        body="Mara learned that ember dawn wakes the beacon.",
+        candidate_id="character_learned_memory:mara:beacon",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="The turn changes mood, time, and knowledge.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(
+            mood_candidate,
+            emotion_candidate,
+            time_candidate,
+            memory_candidate,
+        ),
+        attempted_action="I ask Mara what ember dawn means.",
+        attempt_feasibility=("Mara is present",),
+        attempt_evidence_source_ids=("message:latest",),
+        attempt_evidence_quote="ember dawn",
+    )
+    events: list[str] = []
+    provider = ScriptedPostTurnStructuredProvider(
+        "fake",
+        response_bodies=(narrator_body,),
+        events=events,
+        state_data={
+            "state_changes": [
+                {
+                    "operation": "upsert",
+                    "key": "legacy.should_not_run",
+                    "value": {"status": "bad"},
+                    "category": "debug",
+                    "confidence": 0.8,
+                    "evidence_quote": "uneasy quiet",
+                }
+            ],
+            "memories": [
+                {
+                    "body": "Mara learned that ember dawn wakes the beacon.",
+                    "tags": ["mara", "beacon"],
+                    "importance": 0.86,
+                    "evidence_quote": "ember dawn wakes the beacon",
+                }
+            ],
+        },
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={"fake": provider},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                NarratorVerificationResult(
+                    passed=True,
+                    issues=(),
+                    retry_feedback="",
+                    confidence=0.92,
+                    post_turn_update_needed=False,
+                    attempt_resolution="succeeded",
+                    attempt_evidence_source_ids=("message:latest",),
+                    attempt_evidence_quote="ember dawn",
+                    commit_decisions=(
+                        _commit_decision(mood_candidate),
+                        _commit_decision(emotion_candidate),
+                        _commit_decision(time_candidate),
+                        _commit_decision(memory_candidate),
+                    ),
+                )
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I ask Mara what ember dawn means.",
+            speaker_name="Ily",
+        )
+    )
+
+    assert "state_memory_extraction" not in events
+    assert "context_update" not in events
+    assert "context_observation_extraction" not in events
+    assert "world_time_reconciliation" not in events
+    assert [state.key for state in repositories.list_world_state(save.id)] == [
+        "character.mara.current_emotional_state"
+    ]
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert snapshot is not None
+    assert snapshot.mood == "uneasy"
+    assert snapshot.time_of_day == "evening"
+    assert [memory.body for memory in repositories.list_memories(save.id)] == [
+        "Mara learned that ember dawn wakes the beacon."
+    ]
+    coordinator = _post_turn_jobs(repositories, save.id)[-1]
+    assert coordinator["payload"]["effective_post_turn_inference_mode"] == "plan_owned"
+    assert coordinator["result"]["post_turn_inference_mode_reason"] == (
+        "plan_owned_coverage_strong"
+    )
+    assert _post_turn_child_status(coordinator, "state") == "skipped"
+    assert _post_turn_child_status(coordinator, "context") == "skipped"
+    assert _post_turn_child_status(coordinator, "time_reconciliation") == "skipped"
+    outcome = repositories.get_turn_outcome_for_message(
+        save_id=save.id,
+        message_id=_chat_completion_jobs(repositories, save.id)[-1]["result"][
+            "narrator_message_id"
+        ],
+    )
+    assert outcome is not None
+    assert outcome.payload["attempted_action"] == "I ask Mara what ember dawn means."
+    assert outcome.payload["attempt_resolution"] == "succeeded"
+    assert outcome.payload["post_turn_update_needed"] is False
+    raw_effects = outcome.payload["effects"]
+    assert isinstance(raw_effects, list)
+    assert len(raw_effects) == 4
+    raw_domains = outcome.payload["applied_domains"]
+    assert isinstance(raw_domains, list)
+    assert set(raw_domains) == {
+        "scene",
+        "emotional",
+        "time",
+        "knowledge",
+    }
+
+
+def test_hybrid_state_and_knowledge_covered_skips_state_job(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=POST_TURN_INFERENCE_MODE_SETTING,
+        value="plan_owned",
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=DIRECTOR_PRESSURE_ENABLED_SETTING,
+        value=False,
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=CHARACTER_ACTION_PLANNING_ENABLED_SETTING,
+        value=False,
+    )
+    for task, model_id in (
+        ("chat", "fake-chat"),
+        ("state_memory", "fake-state-memory"),
+        ("context_update", "fake-context-update"),
+        ("scenario_evolution", "fake-scenario-evolution"),
+    ):
+        repositories.save_provider_model(
+            provider="fake",
+            model_id=model_id,
+            display_name=model_id,
+            capabilities=["chat"] if task == "chat" else ["structured_output"],
+            context_window=32768,
+        )
+        repositories.set_model_preference(
+            task=task,
+            provider="fake",
+            model_id=model_id,
+        )
+    state_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="keep.beacon",
+        value={
+            "value": {"status": "lit"},
+            "evidence_quote": "ember dawn wakes the beacon",
+        },
+        reason="The beacon is lit.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="ember dawn wakes the beacon",
+        candidate_id="world_state_change:keep.beacon",
+        candidate_type="world_state_change",
+    )
+    memory_candidate = _learned_memory_candidate(
+        mara.id,
+        body="Mara learned that ember dawn wakes the beacon.",
+        candidate_id="character_learned_memory:mara:beacon",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="The beacon is lit and Mara learns the phrase.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(state_candidate, memory_candidate),
+    )
+    events: list[str] = []
+    provider = ScriptedPostTurnStructuredProvider(
+        "fake",
+        response_bodies=(
+            "ember dawn wakes the beacon and Mara repeats the phrase.",
+        ),
+        events=events,
+        state_data={
+            "state_changes": [
+                {
+                    "operation": "upsert",
+                    "key": "legacy.should_not_run",
+                    "value": {"status": "bad"},
+                    "category": "debug",
+                    "confidence": 0.8,
+                    "evidence_quote": "ember dawn wakes the beacon",
+                }
+            ],
+            "memories": [],
+        },
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={"fake": provider},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                NarratorVerificationResult(
+                    passed=True,
+                    issues=(),
+                    retry_feedback="",
+                    confidence=0.92,
+                    post_turn_update_needed=True,
+                    commit_decisions=(
+                        _commit_decision(state_candidate),
+                        _commit_decision(memory_candidate),
+                    ),
+                )
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I check the beacon.",
+            speaker_name="Ily",
+        )
+    )
+
+    assert "state_memory_extraction" not in events
+    assert "context_update" in events
+    assert [state.key for state in repositories.list_world_state(save.id)] == [
+        "keep.beacon"
+    ]
+    coordinator = _post_turn_jobs(repositories, save.id)[-1]
+    assert coordinator["payload"]["effective_post_turn_inference_mode"] == "hybrid"
+    state_result = _post_turn_child_result(coordinator, "state")
+    assert state_result["skipped_reason"] == "post_turn_state_and_knowledge_covered"
+    assert _post_turn_child_status(coordinator, "state") == "skipped"
     assert _post_turn_child_status(coordinator, "context") == "succeeded"
+
+
+def test_submit_player_turn_applies_planned_character_world_state_effects(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    physical_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="",
+        value={
+            "appearance": "bruised",
+            "character_id": mara.id,
+            "evidence_quote": "bruised",
+        },
+        reason="Mara is bruised after the turn.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="bruised",
+        candidate_id="physical_change:mara:bruised",
+        candidate_type="physical_change",
+        character_id=mara.id,
+    )
+    relationship_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="",
+        value={
+            "target_name": "Ily",
+            "posture": "wary",
+            "character_id": mara.id,
+            "evidence_quote": "wary",
+        },
+        reason="Mara is wary of Ily after the turn.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="wary",
+        candidate_id="relationship_change:mara:ily",
+        candidate_type="relationship_change",
+        character_id=mara.id,
+    )
+    emotional_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="",
+        value={"mood": "tense", "character_id": mara.id, "evidence_quote": "tense"},
+        reason="Mara is tense after the turn.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="tense",
+        candidate_id="emotional_change:mara:tense",
+        candidate_type="emotional_change",
+        character_id=mara.id,
+    )
+    resource_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="keep.supplies",
+        value={"value": {"arrows": 3}, "evidence_quote": "three arrows"},
+        reason="Three arrows remain.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="three arrows",
+        candidate_id="resource_change:keep.supplies",
+        candidate_type="resource_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="The turn changes Mara and the supplies.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(
+            physical_candidate,
+            relationship_candidate,
+            emotional_candidate,
+            resource_candidate,
+        ),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    (
+                        "Mara looks bruised and tense, wary of Ily; three "
+                        "arrows remain.",
+                    ),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(
+                    _commit_decision(physical_candidate),
+                    _commit_decision(relationship_candidate),
+                    _commit_decision(emotional_candidate),
+                    _commit_decision(resource_candidate),
+                )
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I check on Mara and the stores.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    state_by_key = {
+        state.key: state.value for state in repositories.list_world_state(save.id)
+    }
+    assert state_by_key["character.mara.physical_state"] == {
+        "appearance": "bruised"
+    }
+    assert state_by_key["character.mara.relationships"] == {"Ily": "wary"}
+    assert state_by_key["character.mara.current_emotional_state"] == {
+        "mood": "tense"
+    }
+    assert state_by_key["keep.supplies"] == {"arrows": 3}
+    narrator_message_id = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "narrator_message_id"
+    ]
+    for state in repositories.list_world_state(save.id):
+        assert state.source_message_id == narrator_message_id
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["committed_count"] == 4
+    assert planned["by_domain"]["physical"]["committed"] == 1
+    assert planned["by_domain"]["relationship"]["committed"] == 1
+    assert planned["by_domain"]["emotional"]["committed"] == 1
+    assert planned["by_domain"]["resource"]["committed"] == 1
+    coverage = planned["coverage"]
+    assert set(coverage["applied_domains"]) == {
+        "physical",
+        "relationship",
+        "emotional",
+        "resource",
+    }
+    assert "character.mara.physical_state" in coverage["state_keys"]
+    reloaded_coverage = _verified_post_turn_coverage_for_turn(
+        repositories=repositories,
+        save_id=save.id,
+        player_message_id=_chat_completion_jobs(repositories, save.id)[-1]["result"][
+            "player_message_id"
+        ],
+        narrator_message_id=narrator_message_id,
+    )
+    assert "character.mara.physical_state" in reloaded_coverage.state_keys
+    assert "character.mara.relationships" in reloaded_coverage.state_keys
+    assert "character.mara.current_emotional_state" in reloaded_coverage.state_keys
+    assert reloaded_coverage.applied_domains == frozenset(
+        coverage["applied_domains"]
+    )
+
+
+def test_submit_player_turn_applies_planned_world_state_change(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="keep.beacon",
+        value={"value": {"status": "lit"}, "evidence_quote": "beacon lights"},
+        reason="The beacon lights.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="beacon lights",
+        candidate_id="world_state_change:keep.beacon",
+        candidate_type="world_state_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="The beacon lights.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(candidate,),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("The beacon lights in a steady pulse.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(_commit_decision(candidate))
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I fire the beacon.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    state_by_key = {
+        state.key: state.value for state in repositories.list_world_state(save.id)
+    }
+    assert state_by_key["keep.beacon"] == {"status": "lit"}
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["committed_count"] == 1
+    assert planned["by_domain"]["state"]["committed"] == 1
+
+
+def test_submit_player_turn_applies_planned_active_thread_change(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    create_candidate = StateCommitCandidate(
+        operation="create",
+        state_key="",
+        value={
+            "title": "Riders in the ash",
+            "status": "active",
+            "description": "Riders close in.",
+            "evidence_quote": "riders close in",
+        },
+        reason="A clock for the riders starts.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="riders close in",
+        candidate_id="active_thread_change:riders",
+        candidate_type="active_thread_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="A rider clock starts.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(create_candidate,),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("Horns sound as riders close in on the ash road.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(_commit_decision(create_candidate))
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I listen for movement.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    threads = repositories.list_active_threads(save.id)
+    assert [thread.title for thread in threads] == ["Riders in the ash"]
+    assert threads[0].status == "active"
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["committed_count"] == 1
+    assert planned["by_domain"]["thread_clock"]["committed"] == 1
+
+
+def test_submit_player_turn_applies_planned_world_time_change(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara watches the beacon lens.",
+        in_world_time="morning",
+        time_of_day="morning",
+    )
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene_snapshot.in_world_time",
+        value={"time_of_day": "evening", "evidence_quote": "evening comes"},
+        reason="Evening comes to the keep.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="evening comes",
+        candidate_id="world_time_change:evening",
+        candidate_type="world_time_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Evening comes.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(candidate,),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("evening comes to the ash-darkened keep.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(_commit_decision(candidate))
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I wait through the day.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert snapshot is not None
+    assert snapshot.time_of_day == "evening"
+    assert snapshot.world_time_source_message_id is not None
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["committed_count"] == 1
+    assert planned["by_domain"]["time"]["committed"] == 1
+    assert set(planned["coverage"]["scene_snapshot_fields"]) >= {
+        "in_world_time",
+        "time_of_day",
+        "day_of_week",
+    }
+
+
+def test_submit_player_turn_skips_planned_world_time_change_for_locked_field(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara watches the beacon lens.",
+        in_world_time="morning",
+        time_of_day="morning",
+        locked_fields=["time_of_day"],
+    )
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene_snapshot.in_world_time",
+        value={"time_of_day": "evening", "evidence_quote": "evening comes"},
+        reason="Evening comes to the keep.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="evening comes",
+        candidate_id="world_time_change:evening",
+        candidate_type="world_time_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Evening comes.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(candidate,),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("evening comes to the ash-darkened keep.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(_commit_decision(candidate))
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I wait through the day.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert snapshot is not None
+    assert snapshot.time_of_day == "morning"
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["committed_count"] == 0
+    assert {
+        decision["reason"] for decision in planned["decisions"]
+    } == {"locked_world_time_field"}
+
+
+def test_submit_player_turn_planned_world_time_change_is_noop_when_unchanged(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara watches the beacon lens.",
+        in_world_time="evening",
+        time_of_day="evening",
+    )
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    candidate = StateCommitCandidate(
+        operation="update",
+        state_key="scene_snapshot.in_world_time",
+        value={"time_of_day": "evening", "evidence_quote": "evening holds"},
+        reason="Evening holds.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="evening holds",
+        candidate_id="world_time_change:evening",
+        candidate_type="world_time_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Evening holds.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(candidate,),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("evening holds over the ash-darkened keep.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(_commit_decision(candidate))
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I watch the evening.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert snapshot is not None
+    assert snapshot.time_of_day == "evening"
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["committed_count"] == 1
+    assert planned["decisions"][0]["changed"] is False
 
 
 def test_plan_owned_post_turn_mode_falls_back_when_commits_still_need_updates(
@@ -7162,7 +9289,7 @@ def test_submit_player_turn_falls_back_to_legacy_npc_audit_when_verifier_unavail
     )
 
 
-def test_submit_player_turn_includes_pending_context_suggestions_without_applying(
+def test_submit_player_turn_omits_pending_context_suggestions_without_applying(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -7213,23 +9340,13 @@ def test_submit_player_turn_includes_pending_context_suggestions_without_applyin
     )
 
     request = provider.chat_requests[0]
-    assert request.pending_context_suggestions == (
-        "Pending review (not canon yet): update world_state/state-storm-mood "
-        'storm.mood -> {"mood": "wary"}; confidence=91%',
-    )
-    assert source_message.id not in "\n".join(request.pending_context_suggestions)
-    assert "The narrator described the storm as wary" not in "\n".join(
-        request.pending_context_suggestions
-    )
+    assert request.pending_context_suggestions == ()
     assert repositories.list_world_state(save.id) == []
     assert repositories.list_context_update_suggestions(save.id, status="pending") == [
         suggestion
     ]
-    assert any(
-        source["tier"] == "pending_context_suggestions"
-        and source["source_type"] == "context_update_suggestion"
-        and source["source_id"] == suggestion.id
-        and source["included"] is True
+    assert all(
+        source["tier"] != "pending_context_suggestions"
         for source in request.context_breakdown["sources"]
     )
 
@@ -7393,7 +9510,7 @@ def test_submit_player_turn_streams_narrator_drafts_and_persists_final_body(
     assert persisted_messages[1].token_estimate == 5
 
 
-def test_rated_streaming_never_publishes_draft_rejected_by_safety_agent(
+def test_rated_final_only_delivery_never_streams_body_rejected_by_safety_agent(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -7427,6 +9544,7 @@ def test_rated_streaming_never_publishes_draft_rejected_by_safety_agent(
             ),
             ChatStreamChunk(token_usage={"total": 12}, done=True),
         ),
+        fallback_body=rejected_draft,
     )
     service = ChatService(
         repositories=repositories,
@@ -7436,19 +9554,16 @@ def test_rated_streaming_never_publishes_draft_rejected_by_safety_agent(
         },
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
-    drafts: list[str] = []
-
     result = asyncio.run(
         service.submit_player_turn(
             save_id=save.id,
             body="I close the tower door.",
             run_post_turn_jobs=False,
-            narrator_stream_callback=drafts.append,
         )
     )
 
-    assert drafts == [CONTENT_FILTER_TRANSITION]
-    assert rejected_draft not in repr(drafts)
+    assert narrator_provider.stream_requests == []
+    assert len(narrator_provider.chat_requests) == 1
     assert result.narrator_message.body == CONTENT_FILTER_TRANSITION
     assert result.narrator_message.content_rating == "g"
 
@@ -9857,8 +11972,12 @@ def test_submit_player_turn_persists_chat_transport_diagnostics(
     assert len(jobs) == 2
     assert jobs[0]["result"]["transport_mode"] == "non_streaming"
     assert jobs[0]["result"]["streaming_used"] is False
+    assert jobs[0]["result"]["delivery_mode"] == "final_only"
+    assert jobs[0]["result"]["incremental_delivery_used"] is False
     assert jobs[1]["result"]["transport_mode"] == "streaming"
     assert jobs[1]["result"]["streaming_used"] is True
+    assert jobs[1]["result"]["delivery_mode"] == "final_only"
+    assert jobs[1]["result"]["incremental_delivery_used"] is False
     assert jobs[1]["result"]["context_search_failed"] is False
     assert jobs[1]["result"]["context_search_selected_counts"] == {
         "character_text_context": 0,
@@ -10058,10 +12177,7 @@ def test_submit_player_turn_cancels_running_context_search_child_task(
         title="Ashfall Keep",
         premise="A border keep is cut off by ash storms.",
         player_role="Signal warden",
-        content={
-            "starting_scene": "The beacon gutters in the tower.",
-            "lore": "The buried lens code hums under the ash.",
-        },
+        content={"starting_scene": "The beacon gutters in the tower."},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
     repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
@@ -10163,10 +12279,7 @@ def test_submit_player_turn_cancels_context_search_from_another_thread(
         title="Ashfall Keep",
         premise="A border keep is cut off by ash storms.",
         player_role="Signal warden",
-        content={
-            "starting_scene": "The beacon gutters in the tower.",
-            "lore": "The buried lens code hums under the ash.",
-        },
+        content={"starting_scene": "The beacon gutters in the tower."},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
     repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
@@ -11534,6 +13647,64 @@ def test_run_post_turn_jobs_skips_context_update_with_missing_catalog_row(
     assert "state" in provider.structured_output_requests[0].schema_name.casefold()
 
 
+def test_run_post_turn_jobs_waits_for_summary_preparation_barrier(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I tend the beacon.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The flame steadies.",
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prepare(**_kwargs: object) -> str:
+        started.set()
+        await release.wait()
+        return "succeeded"
+
+    monkeypatch.setattr(service, "_prepare_summary_for_next_turn", prepare)
+
+    async def run() -> dict[str, object]:
+        task = asyncio.create_task(
+            service.run_post_turn_jobs(
+                save_id=save.id,
+                player_message_id=player_message.id,
+                narrator_message_id=narrator_message.id,
+            )
+        )
+        await started.wait()
+        assert task.done() is False
+        release.set()
+        return await task
+
+    result = asyncio.run(run())
+
+    result_jobs = result["jobs"]
+    assert isinstance(result_jobs, list)
+    statuses = {str(job["name"]): str(job["status"]) for job in result_jobs}
+    assert statuses["summary"] == "succeeded"
+
+
 def test_run_post_turn_jobs_leaves_character_maintenance_for_scheduler(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -11594,12 +13765,14 @@ def test_run_post_turn_jobs_leaves_character_maintenance_for_scheduler(
     jobs = _post_turn_jobs(repositories, save.id)
     assert len(jobs) == 1
     assert [job["name"] for job in jobs[0]["result"]["jobs"]] == [
+        "summary",
         "state",
         "context",
         "time_reconciliation",
         "proactive_text",
         "director",
         "scenario",
+        "context_precompute",
         "image",
     ]
 
@@ -11648,6 +13821,47 @@ def test_run_post_turn_jobs_does_not_review_outcomes(
     assert len(jobs) == 1
     child_names = [child["name"] for child in jobs[0]["result"]["jobs"]]
     assert "outcome" not in child_names
+
+
+def test_run_post_turn_jobs_precomputes_next_turn_context(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message_id, narrator_message_id = _append_completed_turns(
+        repositories,
+        save_id=save.id,
+        count=1,
+    )
+
+    class PrecomputingContextSearch(ScriptedContextSearch):
+        def __init__(self) -> None:
+            super().__init__(ContextSearchResult())
+            self.precomputed_save_ids: list[str] = []
+
+        def precompute_next_turn(self, save_id: str) -> None:
+            self.precomputed_save_ids.append(save_id)
+
+    context_search = PrecomputingContextSearch()
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={},
+            context_search_service=context_search,
+        ).run_post_turn_jobs(
+            save_id=save.id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+        )
+    )
+
+    assert context_search.precomputed_save_ids == [save.id]
 
 
 def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
@@ -11723,32 +13937,35 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
         )
     )
 
-    final_statuses = {
-        job.name: job.status for job in progress_updates[-1].jobs
-    }
+    final_statuses = {job.name: job.status for job in progress_updates[-1].jobs}
     assert final_statuses == {
+        "summary": "skipped",
         "state": "succeeded",
         "context": "failed",
         "time_reconciliation": "blocked_dependency",
         "proactive_text": "blocked_dependency",
         "director": "blocked_dependency",
         "scenario": "skipped",
+        "context_precompute": "blocked_dependency",
         "image": "failed",
     }
     assert progress_updates[-1].status_text == (
-        "Post-turn: state succeeded, context failed, "
+        "Post-turn: summary skipped, state succeeded, context failed, "
         "time_reconciliation blocked_dependency, proactive_text blocked_dependency, "
-        "director blocked_dependency, scenario skipped, image failed"
+        "director blocked_dependency, scenario skipped, "
+        "context_precompute blocked_dependency, image failed"
     )
     assert all(
         [job.name for job in progress.jobs]
         == [
+            "summary",
             "state",
             "context",
             "time_reconciliation",
             "proactive_text",
             "director",
             "scenario",
+            "context_precompute",
             "image",
         ]
         for progress in progress_updates
@@ -11767,14 +13984,25 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
 
     jobs = _post_turn_jobs(repositories, save.id)
     assert len(jobs) == 1
-    assert jobs[0]["status"] == "succeeded"
+    assert jobs[0]["status"] == "failed"
+    assert jobs[0]["result"]["continuity_degraded"] is True
+    assert jobs[0]["result"]["retry_pending"] is True
     expected_dependencies = {
+        "summary": [],
         "state": [],
         "context": ["state"],
         "time_reconciliation": ["context"],
         "proactive_text": ["time_reconciliation"],
         "director": ["time_reconciliation"],
         "scenario": [],
+        "context_precompute": [
+            "summary",
+            "context",
+            "time_reconciliation",
+            "proactive_text",
+            "director",
+            "scenario",
+        ],
         "image": [],
     }
     assert jobs[0]["payload"]["dependencies"] == expected_dependencies
@@ -11783,33 +14011,58 @@ def test_run_post_turn_jobs_records_coordinator_dependencies_and_child_statuses(
     assert jobs[0]["result"]["image_context_semantics"] == "pre_post_turn_updates"
     result_jobs = jobs[0]["result"]["jobs"]
     assert [(job["name"], job["status"]) for job in result_jobs] == [
+        ("summary", "skipped"),
         ("state", "succeeded"),
         ("context", "failed"),
         ("time_reconciliation", "blocked_dependency"),
         ("proactive_text", "blocked_dependency"),
         ("director", "blocked_dependency"),
         ("scenario", "skipped"),
+        ("context_precompute", "blocked_dependency"),
         ("image", "failed"),
     ]
-    assert result_jobs[2]["result"]["blocked_by"] == "context"
-    assert result_jobs[3]["result"]["blocked_by"] == "time_reconciliation"
+    assert result_jobs[3]["result"]["blocked_by"] == "context"
+    assert result_jobs[4]["result"]["blocked_by"] == "time_reconciliation"
     steps = repositories.list_job_steps(jobs[0]["id"])
     step_by_name = {step.name: step for step in steps}
     assert {
         name: (step.status, step.task)
         for name, step in step_by_name.items()
     } == {
+        "summary": ("skipped", "summarization"),
         "state": ("succeeded", "state_memory"),
         "context": ("failed", "context_update"),
         "time_reconciliation": ("blocked_dependency", "context_update"),
         "proactive_text": ("blocked_dependency", "chat"),
         "director": ("blocked_dependency", "director_pressure"),
         "scenario": ("skipped", "scenario_evolution"),
+        "context_precompute": ("blocked_dependency", "context_precompute"),
         "image": ("failed", "image_generation"),
     }
     assert all(step.duration_ms is not None for step in steps)
     assert step_by_name["context"].error == "context updater unavailable"
     assert step_by_name["image"].error == "image provider unavailable"
+
+    async def repaired_context_step(**_kwargs: object) -> str:
+        return "succeeded"
+
+    monkeypatch.setattr(
+        service,
+        "_update_context_if_configured",
+        repaired_context_step,
+    )
+    assert asyncio.run(
+        service.run_post_turn_outbox_recovery(save_id=save.id)
+    ) == 1
+    recovered = repositories.list_post_turn_outbox_steps(save_id=save.id)
+    assert {row.step: row.status for row in recovered} == {
+        "state": "succeeded",
+        "context": "succeeded",
+        "time_reconciliation": "skipped",
+        "proactive_text": "skipped",
+        "director": "skipped",
+    }
+    assert next(row for row in recovered if row.step == "state").attempt_count == 1
 
 
 def test_run_post_turn_jobs_records_world_time_reconciliation_metadata(
@@ -12304,12 +14557,14 @@ def test_run_post_turn_jobs_leaves_world_context_retention_for_scheduler(
     assert retention.calls == []
     coordinator = _post_turn_jobs(repositories, save.id)[0]
     assert [job["name"] for job in coordinator["result"]["jobs"]] == [
+        "summary",
         "state",
         "context",
         "time_reconciliation",
         "proactive_text",
         "director",
         "scenario",
+        "context_precompute",
         "image",
     ]
 
@@ -14608,7 +16863,8 @@ def test_narrator_messages_reuses_snapshot_records_without_requery(
     )
 
     assert counting.read_counts == baseline_counts
-    assert [message.role for message in transcript] == ["player"]
+    assert [message.role for message in transcript] == ["narrator", "player"]
+    assert transcript[0].body == "Ilyra studies the gate from the rampart."
     assert transcript[-1].body == "We approach the gatehouse."
 
 
@@ -15991,29 +18247,30 @@ def test_submit_player_turn_continues_when_optional_context_search_fails(
     assert persisted_messages[1] == result.narrator_message
 
 
-def test_submit_player_turn_omits_initial_setup_after_opening_leaves_recent_window(
+def test_submit_player_turn_keeps_contract_after_opening_leaves_prompt_windows(
     repositories: PersistenceRepositories,
 ) -> None:
     long_premise = (
-        "A long initial setup about lantern ferries, archive districts, and "
-        "the discovery of a disputed star map."
+        "An archive courier must recover a disputed star map before rival "
+        "factions turn the city against itself."
     )
     long_tone = (
-        "Warm archival mystery with a lengthy initial tone brief full of "
-        "ferry bells, catalog disputes, and understated romance."
+        "Warm archival mystery told in close third person with understated romance."
     )
     long_player_role = (
-        "The player is Avery Quill, a fictional archive courier with an "
-        "initial biography that should not ride along forever after setup."
+        "Avery Quill, an archive courier trusted by neither faction."
     )
     scenario = repositories.create_scenario(
-        type="full_roleplay",
+        type="fantasy_roleplay",
         title="Lantern Archive Arrival",
         premise=long_premise,
         player_role=long_player_role,
         content={
             "player_character_name": "Avery Quill",
             "tone_genre": long_tone,
+            "magic_system": "Reading a star map consumes one treasured memory.",
+            "realms_and_places": "The opening ferry crosses seven archive districts.",
+            "starting_scene": "Avery steps off the lantern ferry at dawn.",
             "current_scene": (
                 "Avery is reviewing a map with Nira in the archive atrium."
             ),
@@ -16029,29 +18286,55 @@ def test_submit_player_turn_omits_initial_setup_after_opening_leaves_recent_wind
         speaker_name="Narrator",
         body="Opening setup chronicle that has now aged out.",
     )
-    repositories.append_message(
-        save_id=save.id,
-        role="player",
-        speaker_name="Avery",
-        body="I ask Nira what the map's missing mark means.",
-    )
-    recent_narrator = repositories.append_message(
-        save_id=save.id,
-        role="narrator",
-        speaker_name="Narrator",
-        body="Nira sets the brass compass on the archive table.",
-    )
+    for index in range(3):
+        repositories.append_message(
+            save_id=save.id,
+            role="player",
+            speaker_name="Avery",
+            body=f"I ask Nira about map mark {index}.",
+        )
+        repositories.append_message(
+            save_id=save.id,
+            role="narrator",
+            speaker_name="Narrator",
+            body=f"Nira moves brass compass {index} across the archive table.",
+        )
+    repositories.set_app_setting(RECENT_PLAYER_MESSAGE_WINDOW_SETTING, 1)
     repositories.set_app_setting(RECENT_NARRATOR_MESSAGE_WINDOW_SETTING, 1)
+    repositories.set_app_setting(
+        NARRATOR_PLANNER_RECENT_PLAYER_MESSAGE_WINDOW_SETTING,
+        2,
+    )
+    repositories.set_app_setting(
+        NARRATOR_PLANNER_RECENT_NARRATOR_MESSAGE_WINDOW_SETTING,
+        2,
+    )
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting(PLAN_FIRST_NARRATOR_SETTING, True)
+    repositories.set_app_setting("context_budget_mode", "fixed_chars")
+    repositories.set_app_setting("context_budget_fixed_total_chars", 1)
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
         model_id="anthropic/claude-3.5-sonnet",
     )
     provider = RecordingChatProvider("openrouter")
+    planner = ScriptedNarratorPlanner(
+        NarratorMessageSpec(
+            intent="Answer Avery without losing the scenario contract.",
+            thesis="The disputed map remains central.",
+            must_say=(),
+            avoid=(),
+            tone="warm archival mystery",
+            uncertainties=(),
+            evidence_source_ids=(),
+        )
+    )
     service = ChatService(
         repositories=repositories,
         providers={"openrouter": provider},
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
+        narrator_planner=planner,
     )
 
     asyncio.run(
@@ -16059,25 +18342,44 @@ def test_submit_player_turn_omits_initial_setup_after_opening_leaves_recent_wind
             save_id=save.id,
             body="I answer Nira honestly.",
             speaker_name="Avery",
+            run_post_turn_jobs=False,
         )
     )
 
+    planner_request = planner.calls[0][1]
     request = provider.chat_requests[0]
-    assert "Title: Lantern Archive Arrival" in request.scenario_instructions
-    assert "Player character name: Avery Quill" in request.scenario_instructions
-    assert (
-        "Current scene: Avery is reviewing a map with Nira in the archive atrium."
-        in request.scenario_instructions
-    )
-    assert "Premise/setup:" not in request.scenario_instructions
-    assert "Tone/style:" not in request.scenario_instructions
-    assert "Player role:" not in request.scenario_instructions
-    assert long_premise not in request.scenario_instructions
-    assert long_tone not in request.scenario_instructions
-    assert long_player_role not in request.scenario_instructions
-    assert [
-        message.body for message in request.messages if message.role == "narrator"
-    ] == [recent_narrator.body]
+    for seen_request in (planner_request, request):
+        assert "Title: Lantern Archive Arrival" in seen_request.scenario_instructions
+        assert (
+            "Player character name: Avery Quill"
+            in seen_request.scenario_instructions
+        )
+        assert f"Premise: {long_premise}" in seen_request.scenario_instructions
+        assert f"Tone/style: {long_tone}" in seen_request.scenario_instructions
+        assert f"Player role: {long_player_role}" in seen_request.scenario_instructions
+        assert (
+            "Magic constraints: Reading a star map consumes one treasured memory."
+            not in seen_request.scenario_instructions
+        )
+        assert "The opening ferry crosses seven archive districts." not in (
+            seen_request.scenario_instructions
+        )
+        assert "Avery steps off the lantern ferry at dawn." not in (
+            seen_request.scenario_instructions
+        )
+        scenario_source = next(
+            source
+            for source in seen_request.context_breakdown["sources"]
+            if source["tier"] == "scenario_header"
+        )
+        assert scenario_source["included"] is True
+        assert scenario_source["reason"] == "durable scenario contract"
+    assert len(
+        [message for message in planner_request.messages if message.role == "narrator"]
+    ) == 2
+    assert len(
+        [message for message in request.messages if message.role == "narrator"]
+    ) == 1
 
 
 def test_submit_player_turn_continues_when_context_search_is_rate_limited(
@@ -16657,6 +18959,15 @@ def test_submit_player_turn_injects_selected_old_messages_as_retrieved_chronicle
         speaker_name="Mara",
         body="I check the cold storeroom.",
     )
+    for index in range(18):
+        repositories.append_message(
+            save_id=save.id,
+            role="narrator" if index % 2 else "player",
+            speaker_name="Narrator" if index % 2 else "Mara",
+            body=f"Later chronicle bridge event {index}.",
+            provider="openrouter" if index % 2 else None,
+            model="anthropic/claude-3.5-sonnet" if index % 2 else None,
+        )
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
@@ -16823,7 +19134,10 @@ def test_submit_player_turn_includes_active_linked_facts_in_narrator_recap(
     )
 
     request = provider.chat_requests[0]
-    assert f"Linked memory: {linked_fact}" in "\n".join(request.current_scene_recap)
+    assert (
+        "Linked memory: [epistemic status: legacy_unclassified] " + linked_fact
+        in "\n".join(request.current_scene_recap)
+    )
     assert request.retrieved_memories == ()
     linked_fact_breakdown = next(
         source
@@ -16988,7 +19302,7 @@ def test_submit_player_turn_runs_character_action_planning_before_prompt(
                 "intent": "",
                 "reason": "Lio is not in the gallery.",
                 "confidence": 0.8,
-                "evidence_source_ids": ["character:lio"],
+                "evidence_source_ids": ["scene_snapshot:snapshot-1"],
             },
         },
     )
@@ -17024,15 +19338,16 @@ def test_submit_player_turn_runs_character_action_planning_before_prompt(
     request = provider.chat_requests[0]
     assert provider.events == [
         "character_presence_assessment",
-        "character_presence_assessment",
-        "character_intent_plan",
         "chat",
     ]
     assert request.character_action_plans == (
         "[character_action:"
-        f"{mara.id}] Mara | intent: protect the lens crew | next action: "
-        "Mara lowers the lantern and listens for the reply. | reason: Mara is "
-        "in the current scene by the controls. | confidence: 90% | evidence: "
+        f"{lio.id}] Archivist Lio | present: no | reason: Lio is not in the "
+        "gallery. | confidence: 80% | evidence: "
+        f"scene_snapshot:{original_snapshot.id}",
+        "[character_action:"
+        f"{mara.id}] Mara | present: yes | reason: Mara is in the current "
+        "scene by the controls. | confidence: 90% | evidence: "
         f"scene_snapshot:{original_snapshot.id}",
     )
     current_snapshot = repositories.get_scene_snapshot(save.id)
@@ -17186,6 +19501,7 @@ def test_submit_player_turn_overlaps_plan_first_character_planning_and_context(
             save_id: str,
             player_message_id: str,
             apply_presence_updates: bool = True,
+            intents_absorbed: bool = True,
         ) -> CharacterActionPlanningResult:
             self.apply_presence_updates.append(apply_presence_updates)
             planning_started.set()
@@ -17266,6 +19582,7 @@ def test_storyteller_character_planning_never_applies_direction_presence(
             save_id: str,
             player_message_id: str,
             apply_presence_updates: bool = True,
+            intents_absorbed: bool = True,
         ) -> CharacterActionPlanningResult:
             self.apply_presence_updates.append(apply_presence_updates)
             return CharacterActionPlanningResult(skipped_reason="test")
@@ -17287,7 +19604,7 @@ def test_storyteller_character_planning_never_applies_direction_presence(
     assert planner.apply_presence_updates == [False]
 
 
-def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
+def test_submit_player_turn_feeds_presence_assessments_to_planner(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -17315,12 +19632,6 @@ def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
         situation="Mara waits beside the beacon controls.",
         present_character_ids=[mara.id],
     )
-    memory = repositories.add_memory(
-        save_id=save.id,
-        body="The beacon lens answers to ember dawn.",
-        tags=["beacon"],
-        memory_id="memory-beacon-key",
-    )
     repositories.set_app_setting(CHARACTER_ACTION_PLANNING_ENABLED_SETTING, True)
     repositories.set_model_preference(
         task="chat",
@@ -17343,38 +19654,11 @@ def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
         {
             "Mara": {
                 "present": True,
-                "action": "Mara pockets the phrase and watches the lens.",
-                "intent": "remember the beacon phrase",
-                "reason": "The player directly tells Mara the phrase.",
+                "enters_scene": False,
+                "leaves_scene": False,
+                "reason": "The player directly addresses Mara.",
                 "confidence": 0.89,
                 "evidence_source_ids": ["message:latest"],
-                "learned_memory_candidates": [
-                    {
-                        "body": "Mara learned that ember dawn wakes the beacon lens.",
-                        "tags": ["mara", "beacon"],
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "The player told Mara directly.",
-                        "confidence": 0.87,
-                        "evidence_source_ids": ["message:latest"],
-                        "evidence_quote": "ember dawn wakes the beacon lens",
-                    }
-                ],
-                "knowledge_edge_candidates": [
-                    {
-                        "target_type": "memory",
-                        "target_id": memory.id,
-                        "knowledge_state": "knows",
-                        "acquisition_method": "told",
-                        "reason": "The source message teaches this memory.",
-                        "confidence": 0.84,
-                        "evidence_source_ids": ["message:latest"],
-                        "evidence_quote": "ember dawn",
-                    }
-                ],
-                "needs_review_notes": [
-                    "Review before making Mara's learned phrase durable."
-                ],
             }
         },
     )
@@ -17406,20 +19690,9 @@ def test_submit_player_turn_feeds_richer_character_assessments_to_planner(
 
     assert len(planner.calls) == 1
     assessment_text = "\n".join(planner.calls[0][1].character_action_plans)
-    assert "Mara pockets the phrase and watches the lens." in assessment_text
-    assert "learned memory candidate (do not persist automatically)" in (
-        assessment_text
-    )
-    assert "Mara learned that ember dawn wakes the beacon lens." in assessment_text
-    assert "knowledge edge candidate (do not persist automatically)" in (
-        assessment_text
-    )
-    assert "target: memory:memory-beacon-key" in assessment_text
-    assert "Review before making Mara's learned phrase durable." in assessment_text
-    assert [record.id for record in repositories.list_memories(save.id)] == [
-        memory.id
-    ]
-    assert repositories.list_character_knowledge_edges(save.id) == []
+    assert "present: yes" in assessment_text
+    assert "reason: The player directly addresses Mara." in assessment_text
+    assert "The player directly addresses Mara." in assessment_text
 
 
 def test_submit_player_turn_does_not_run_director_pressure_before_prompt(
@@ -17599,6 +19872,10 @@ def test_submit_player_turn_skips_character_action_planning_when_disabled(
         "prompt_guidance_count": 0,
         "skipped_reason": "disabled",
         "applied_presence_update": False,
+        "model_calls_avoided": 0,
+        "presence_calls_made": 0,
+        "deterministic_presence_count": 0,
+        "intents_absorbed": False,
     }
 
 
@@ -17670,15 +19947,13 @@ def test_submit_timeskip_turn_runs_character_action_planning(
 
     assert provider.events == [
         "character_presence_assessment",
-        "character_intent_plan",
         "chat",
     ]
     request = provider.chat_requests[0]
     assert len(request.character_action_plans) == 1
     assert request.character_action_plans[0].startswith(
         "[character_action:"
-        f"{mara.id}] Mara | intent: protect the signal | next action: "
-        "Mara shields the lantern as dawn breaks. | reason: The timeskip "
+        f"{mara.id}] Mara | present: yes | reason: The timeskip "
         "keeps Mara at the beacon. | confidence: 85% | evidence: message:"
     )
     snapshot = repositories.get_scene_snapshot(save.id)
@@ -17927,7 +20202,149 @@ def test_current_scene_recap_preserves_long_narrator_message_edges() -> None:
     assert "..." in recap_line
 
 
-def test_submit_player_turn_keeps_recent_transcript_out_of_current_scene_recap(
+@pytest.mark.parametrize(
+    ("prior_entries", "current_body", "expected_fragments"),
+    (
+        (
+            (("narrator", "Ilyra", "Who sent you to the tower?"),),
+            "Wait—the west door just opened.",
+            ("Who sent you to the tower?", "west door just opened"),
+        ),
+        (
+            (
+                ("player", "Mara", "I sprint across the failing bridge."),
+                (
+                    "narrator",
+                    "Narrator",
+                    "Mara reaches the midpoint before the bridge drops again.",
+                ),
+            ),
+            "I grab the remaining cable.",
+            ("sprint across", "reaches the midpoint", "remaining cable"),
+        ),
+        (
+            (
+                ("player", "Mara", "I hand Ilyra the brass key."),
+                (
+                    "narrator",
+                    "Narrator",
+                    "Ilyra holds out her palm but has not taken the key.",
+                ),
+            ),
+            "I wait for her answer.",
+            ("hand Ilyra", "has not taken the key", "wait for her answer"),
+        ),
+        (
+            (
+                ("player", "Mara", "I lunge at the ash guard."),
+                (
+                    "narrator",
+                    "Narrator",
+                    "The guard catches Mara's wrist; neither has yielded.",
+                ),
+            ),
+            "I twist toward the open stairwell.",
+            ("lunge", "catches Mara's wrist", "neither has yielded"),
+        ),
+        (
+            (
+                (
+                    "narrator",
+                    "Narrator",
+                    "The lens keeps humming; no one changes position.",
+                ),
+            ),
+            "I stay still and listen.",
+            ("no one changes position", "stay still and listen"),
+        ),
+    ),
+)
+def test_current_scene_recap_preserves_immediate_causal_bridge(
+    prior_entries: tuple[tuple[str, str, str], ...],
+    current_body: str,
+    expected_fragments: tuple[str, ...],
+) -> None:
+    messages = [
+        MessageRecord(
+            id=f"prior-{index}",
+            save_id="save-1",
+            role=role,
+            speaker_name=speaker,
+            body=body,
+            provider="fake" if role == "narrator" else None,
+            model="fake-chat" if role == "narrator" else None,
+            token_estimate=None,
+        )
+        for index, (role, speaker, body) in enumerate(prior_entries)
+    ]
+    player_message = MessageRecord(
+        id="current-player",
+        save_id="save-1",
+        role="player",
+        speaker_name="Mara",
+        body=current_body,
+        provider=None,
+        model=None,
+        token_estimate=None,
+    )
+
+    recap = "\n".join(
+        chat_service_module._current_scene_recap(
+            messages=[*messages, player_message],
+            player_message=player_message,
+        )
+    )
+
+    assert "player input; outcome unconfirmed" in recap
+    assert "narrator chronicle; accepted evidence" in recap or not any(
+        role == "narrator" for role, _speaker, _body in prior_entries
+    )
+    for fragment in expected_fragments:
+        assert fragment in recap
+
+
+def test_current_scene_recap_excludes_hidden_messages_and_bounds_window() -> None:
+    prior_messages = [
+        MessageRecord(
+            id=f"message-{index}",
+            save_id="save-1",
+            role="narrator" if index % 2 == 0 else "player",
+            speaker_name="Narrator" if index % 2 == 0 else "Mara",
+            body=f"Chronicle event {index}",
+            provider="fake" if index % 2 == 0 else None,
+            model="fake-chat" if index % 2 == 0 else None,
+            token_estimate=None,
+        )
+        for index in range(25)
+    ]
+    player_message = MessageRecord(
+        id="current-player",
+        save_id="save-1",
+        role="player",
+        speaker_name="Mara",
+        body="I answer the latest event.",
+        provider=None,
+        model=None,
+        token_estimate=None,
+    )
+
+    sources = chat_service_module._current_scene_recap_sources(
+        messages=[*prior_messages, player_message],
+        player_message=player_message,
+        hidden_message_ids=frozenset({"message-24"}),
+    )
+
+    message_sources = [source for source in sources if source.source_type == "message"]
+    assert (
+        len(message_sources)
+        == chat_service_module.CURRENT_SCENE_RECAP_MESSAGE_WINDOW
+    )
+    assert message_sources[0].source_id == "message-5"
+    assert message_sources[-1].source_id == player_message.id
+    assert "message-24" not in {source.source_id for source in message_sources}
+
+
+def test_submit_player_turn_bridges_bounded_history_through_current_scene_recap(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -17942,7 +20359,19 @@ def test_submit_player_turn_keeps_recent_transcript_out_of_current_scene_recap(
         save_id=save.id,
         role="narrator",
         speaker_name="Narrator",
-        body="The exact brass lens transcript should only appear as chat history.",
+        body="Ilyra asks who loosened the brass lens while keeping hold of it.",
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=RECENT_PLAYER_MESSAGE_WINDOW_SETTING,
+        value=0,
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=RECENT_NARRATOR_MESSAGE_WINDOW_SETTING,
+        value=0,
     )
     repositories.set_model_preference(
         task="chat",
@@ -17956,20 +20385,50 @@ def test_submit_player_turn_keeps_recent_transcript_out_of_current_scene_recap(
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
 
-    asyncio.run(
+    submitted = asyncio.run(
         service.submit_player_turn(
             save_id=save.id,
-            body="I inspect the lens housing.",
+            body="I reach for the lens housing.",
             speaker_name="Mara",
+            run_post_turn_jobs=False,
         )
     )
 
     request = provider.chat_requests[0]
-    assert prior_message.body in [message.body for message in request.messages]
+    assert prior_message.body not in [message.body for message in request.messages]
     recap_text = "\n".join(request.current_scene_recap)
-    assert "Recent chronicle:" not in recap_text
-    assert prior_message.body not in recap_text
+    assert prior_message.body in recap_text
+    assert "Mara (player input; outcome unconfirmed)" in recap_text
+    assert "I reach for the lens housing." in recap_text
     assert "Deterministic current-scene context" in recap_text
+    recap_sources = [
+        source
+        for source in request.context_breakdown["sources"]
+        if source["tier"] == "current_scene_recap"
+    ]
+    assert [
+        source["source_id"]
+        for source in recap_sources
+        if source["source_type"] == "message"
+    ] == [
+        prior_message.id,
+        submitted.player_message.id,
+    ]
+    diagnostics = chat_service_module._chat_prompt_context_diagnostics(
+        request,
+        context_search_failed=False,
+        context_search_degraded=False,
+        context_search_recovery=None,
+    )
+    assert diagnostics["current_scene_recap_chars"] == sum(
+        len(line) for line in request.current_scene_recap
+    )
+    assert diagnostics["current_scene_recap_source_ids"] == [
+        "current_scene_recap:authority",
+        f"message:{prior_message.id}",
+        f"message:{submitted.player_message.id}",
+        "rules:current_scene_authority",
+    ]
 
 
 def test_submit_player_turn_budgets_retrieved_context_and_reports_breakdown(
@@ -18702,7 +21161,7 @@ def test_submit_player_turn_reuses_narration_snapshot_for_prompt_building(
     assert counting.read_counts.get("message_visibility", 0) <= 4
 
 
-def test_submit_player_turn_final_prompt_budget_trims_baseline_before_retrieval(
+def test_submit_player_turn_final_prompt_budget_trims_recap_and_baseline(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -18781,6 +21240,7 @@ def test_submit_player_turn_final_prompt_budget_trims_baseline_before_retrieval(
     trimmed_sections = [
         item["section"] for item in budget["trimmed_sections"] if isinstance(item, dict)
     ]
+    assert "current_scene_recap" in trimmed_sections
     assert "messages" in trimmed_sections
     assert "retrieved_state" not in trimmed_sections
     job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
@@ -18794,9 +21254,15 @@ def test_submit_player_turn_final_prompt_budget_trims_baseline_before_retrieval(
     )
     assert prompt_diagnostics["retrieved_counts"]["state"] == 1
     assert prompt_diagnostics["final_prompt_budget"]["trimmed"] is True
+    assert prompt_diagnostics["current_scene_recap_source_count"] == len(
+        request.current_scene_recap
+    )
+    assert f"message:{submitted.player_message.id}" in prompt_diagnostics[
+        "current_scene_recap_source_ids"
+    ]
 
 
-def test_final_prompt_budget_trims_pending_suggestions_before_messages() -> None:
+def test_final_prompt_budget_discards_pending_suggestions_before_messages() -> None:
     request = chat_service_module._apply_final_prompt_budget(
         ChatRequest(
             provider="fake",
@@ -18820,8 +21286,45 @@ def test_final_prompt_budget_trims_pending_suggestions_before_messages() -> None
         "Brief prior beat.",
         "I wait for the signal.",
     ]
-    assert trimmed_sections[0] == "pending_context_suggestions"
+    assert "pending_context_suggestions" not in trimmed_sections
     assert "messages" not in trimmed_sections
+
+
+def test_final_prompt_recap_trim_candidates_use_message_provenance() -> None:
+    deceptive_state = (
+        "Scene snapshot: a placard reads "
+        "(player input; outcome unconfirmed): but remains accepted state."
+    )
+    request = ChatRequest(
+        provider="fake",
+        model_id="fake-chat",
+        messages=(ChatMessage(role="player", body="I wait."),),
+        current_scene_recap=(
+            chat_service_module.CURRENT_SCENE_RECAP_AUTHORITY,
+            'Narrator (narrator chronicle; accepted evidence): "Earlier beat."',
+            'Mara (player input; outcome unconfirmed): "I wait."',
+            deceptive_state,
+        ),
+        context_breakdown={
+            "current_scene_recap_source_ids": [
+                "current_scene_recap:authority",
+                "message:earlier-narrator",
+                "message:current-player",
+                "scene_snapshot:current-scene",
+            ]
+        },
+    )
+
+    candidates = [
+        candidate
+        for candidate in chat_service_module._final_prompt_trim_candidates(request)
+        if candidate.section == "current_scene_recap"
+    ]
+
+    assert [
+        (candidate.index, candidate.source_type, candidate.source_id)
+        for candidate in candidates
+    ] == [(1, "message", "earlier-narrator")]
 
 
 def test_final_prompt_budget_can_trim_phone_context() -> None:
@@ -19039,10 +21542,10 @@ def test_submit_player_turn_keeps_recent_baseline_and_retrieves_selected_prior_m
             provider=None if index % 2 == 0 else "openrouter",
             model=None if index % 2 == 0 else "anthropic/claude-3.5-sonnet",
         )
-        for index in range(16)
+        for index in range(25)
     ]
     selected_older_message = prior_messages[0]
-    selected_newer_message = prior_messages[14]
+    selected_newer_message = prior_messages[23]
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
@@ -19082,16 +21585,16 @@ def test_submit_player_turn_keeps_recent_baseline_and_retrieves_selected_prior_m
 
     request = provider.chat_requests[0]
     assert [message.body for message in request.messages] == [
-        prior_messages[6].body,
-        prior_messages[7].body,
-        prior_messages[8].body,
-        prior_messages[9].body,
-        prior_messages[10].body,
-        prior_messages[11].body,
-        prior_messages[12].body,
-        prior_messages[13].body,
-        selected_newer_message.body,
         prior_messages[15].body,
+        prior_messages[16].body,
+        prior_messages[17].body,
+        prior_messages[18].body,
+        prior_messages[19].body,
+        prior_messages[20].body,
+        prior_messages[21].body,
+        prior_messages[22].body,
+        selected_newer_message.body,
+        prior_messages[24].body,
         "I raise the storm lantern again.",
     ]
     assert {
@@ -19099,11 +21602,11 @@ def test_submit_player_turn_keeps_recent_baseline_and_retrieves_selected_prior_m
         for message in request.messages
         if message.role == "player"
     } == {
-        prior_messages[6].body,
-        prior_messages[8].body,
-        prior_messages[10].body,
-        prior_messages[12].body,
-        selected_newer_message.body,
+        prior_messages[16].body,
+        prior_messages[18].body,
+        prior_messages[20].body,
+        prior_messages[22].body,
+        prior_messages[24].body,
         "I raise the storm lantern again.",
     }
     assert {
@@ -19111,11 +21614,11 @@ def test_submit_player_turn_keeps_recent_baseline_and_retrieves_selected_prior_m
         for message in request.messages
         if message.role == "narrator"
     } == {
-        prior_messages[7].body,
-        prior_messages[9].body,
-        prior_messages[11].body,
-        prior_messages[13].body,
         prior_messages[15].body,
+        prior_messages[17].body,
+        prior_messages[19].body,
+        prior_messages[21].body,
+        selected_newer_message.body,
     }
     assert selected_older_message.body not in [
         message.body for message in request.messages
@@ -19124,11 +21627,11 @@ def test_submit_player_turn_keeps_recent_baseline_and_retrieves_selected_prior_m
         selected_newer_message.body
     ) == 1
     assert request.retrieved_recent_messages == (
-        "[message:"
-        f"{selected_newer_message.id}] {selected_newer_message.body}",
-        "[message:"
-        f"{selected_older_message.id}] {selected_older_message.body}",
+        f"[message:{selected_older_message.id}] {selected_older_message.body}",
     )
+    assert request.context_breakdown["suppressed_duplicate_retrieval_keys"] == [
+        f"message:{selected_newer_message.id}"
+    ]
     assert all(
         message.body not in {chat_message.body for chat_message in request.messages}
         for message in (prior_messages[1], prior_messages[2], prior_messages[3])
@@ -19425,7 +21928,7 @@ def test_submit_player_turn_includes_latest_summary_when_search_selects_none(
     )
 
 
-def test_submit_player_turn_excludes_summary_covering_hidden_message(
+def test_submit_player_turn_keeps_hidden_character_fact_in_omniscient_context(
     repositories: PersistenceRepositories,
 ) -> None:
     scenario = repositories.create_scenario(
@@ -19543,8 +22046,7 @@ def test_submit_player_turn_excludes_summary_covering_hidden_message(
     )
 
     request = provider.chat_requests[0]
-    assert request.summary is None
-    assert summary.body not in request.scenario_instructions
+    assert summary.body in (request.summary or "")
     assert hidden_memory.body not in request.scenario_instructions
     assert hidden_state.key not in request.scenario_instructions
     assert request.pending_context_suggestions == ()
@@ -20387,6 +22889,62 @@ def test_scenario_evolution_not_due_records_configured_interval_skip_job(
     assert len(provider.structured_output_requests) == 1
 
 
+def test_scenario_evolution_interval_anchors_player_only_tone_update(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"tone_genre": "Tense frontier fantasy."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    source_player = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I turn the grim watch into an irreverent adventure.",
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The first watch ends in laughter.",
+    )
+    repositories.record_save_scenario_evolution(
+        save_id=save.id,
+        title=scenario.title,
+        premise=scenario.premise,
+        player_role=scenario.player_role,
+        content={"tone_genre": "Irreverent frontier fantasy."},
+        reason="tone_genre: The player redirected the tone.",
+        provider="fake",
+        model="fake-scenario-evolution",
+        source_message_id=source_player.id,
+        source_message_ids=(source_player.id,),
+    )
+    repositories.append_message(
+        save_id=save.id,
+        role="player",
+        body="I crack another joke during the watch.",
+    )
+    next_narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The guards struggle not to laugh.",
+    )
+
+    due = chat_service_module._scenario_evolution_due(
+        repositories=repositories,
+        save_id=save.id,
+        narrator_message_id=next_narrator.id,
+        turn_interval=2,
+    )
+
+    assert due.due is False
+    assert due.narrator_turns_since_update == 1
+    assert due.skip_reason == "not_due"
+
+
 def test_retired_character_interaction_state_extraction_has_no_special_guidance(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -20861,6 +23419,18 @@ def _requested_character_name(body: str) -> str:
     raise AssertionError("request did not include a Character line")
 
 
+def _requested_batch_character_ids(body: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    current_name: str | None = None
+    for line in body.splitlines():
+        if line.startswith("Character: "):
+            current_name = line.removeprefix("Character: ").strip()
+        elif line.startswith("character_id: ") and current_name is not None:
+            pairs[current_name] = line.removeprefix("character_id: ").strip()
+            current_name = None
+    return pairs
+
+
 def _database_text(repositories: PersistenceRepositories) -> str:
     return "\n".join(repositories.connection.iterdump())
 
@@ -21228,3 +23798,326 @@ def test_look_around_derives_markdown_blocks_from_answer(
     assert code_texts == ["silver key"]
     [observation] = repositories.list_context_observations(save.id)
     assert observation.claim == answer_body
+
+def test_hybrid_queued_knowledge_still_runs_state_job_without_duplicate_memory(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting("manual_confirmation_memories_enabled", True)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=POST_TURN_INFERENCE_MODE_SETTING,
+        value="plan_owned",
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=DIRECTOR_PRESSURE_ENABLED_SETTING,
+        value=False,
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=CHARACTER_ACTION_PLANNING_ENABLED_SETTING,
+        value=False,
+    )
+    for task, model_id in (
+        ("chat", "fake-chat"),
+        ("state_memory", "fake-state-memory"),
+        ("context_update", "fake-context-update"),
+        ("scenario_evolution", "fake-scenario-evolution"),
+    ):
+        repositories.save_provider_model(
+            provider="fake",
+            model_id=model_id,
+            display_name=model_id,
+            capabilities=["chat"] if task == "chat" else ["structured_output"],
+            context_window=32768,
+        )
+        repositories.set_model_preference(
+            task=task,
+            provider="fake",
+            model_id=model_id,
+        )
+    memory_body = "Mara learned that ember dawn wakes the beacon."
+    memory_candidate = _learned_memory_candidate(
+        mara.id,
+        body=memory_body,
+        candidate_id="character_learned_memory:mara:beacon",
+    )
+    state_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="keep.beacon",
+        value={
+            "value": {"status": "lit"},
+            "evidence_quote": "ember dawn wakes the beacon",
+        },
+        reason="The beacon is lit.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="ember dawn wakes the beacon",
+        candidate_id="world_state_change:keep.beacon",
+        candidate_type="world_state_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="The beacon is lit and Mara learns the phrase.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(state_candidate, memory_candidate),
+    )
+    events: list[str] = []
+    provider = ScriptedPostTurnStructuredProvider(
+        "fake",
+        response_bodies=(
+            "ember dawn wakes the beacon and Mara repeats the phrase.",
+        ),
+        events=events,
+        state_data={
+            "state_changes": [],
+            "memories": [
+                {
+                    "body": memory_body,
+                    "tags": ["mara", "beacon"],
+                    "importance": 0.86,
+                    "evidence_quote": "ember dawn wakes the beacon",
+                }
+            ],
+        },
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={"fake": provider},
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                NarratorVerificationResult(
+                    passed=True,
+                    issues=(),
+                    retry_feedback="",
+                    confidence=0.92,
+                    post_turn_update_needed=True,
+                    commit_decisions=(
+                        _commit_decision(state_candidate),
+                        _commit_decision(memory_candidate),
+                    ),
+                )
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I check the beacon.",
+            speaker_name="Ily",
+        )
+    )
+
+    assert "state_memory_extraction" in events
+    assert repositories.list_memories(save.id) == []
+    pending = [
+        suggestion
+        for suggestion in repositories.list_context_update_suggestions(save.id)
+        if suggestion.status == "pending"
+    ]
+    assert len(pending) == 1
+    coordinator = _post_turn_jobs(repositories, save.id)[-1]
+    assert coordinator["payload"]["effective_post_turn_inference_mode"] == "hybrid"
+    state_result = _post_turn_child_result(coordinator, "state")
+    assert state_result["suppressed_memory_count"] == 1
+    assert _post_turn_child_status(coordinator, "state") == "narrowed"
+
+
+def test_submit_player_turn_merges_multiple_planned_relationship_changes(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    mara = repositories.add_character(save_id=save.id, name="Mara", met=True)
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    ily_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="",
+        value={
+            "target_name": "Ily",
+            "posture": "wary",
+            "character_id": mara.id,
+            "evidence_quote": "wary of Ily",
+        },
+        reason="Mara is wary of Ily.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="wary of Ily",
+        candidate_id="relationship_change:mara:ily",
+        candidate_type="relationship_change",
+        character_id=mara.id,
+    )
+    bo_candidate = StateCommitCandidate(
+        operation="upsert",
+        state_key="",
+        value={
+            "target_name": "Bo",
+            "posture": "trusting",
+            "character_id": mara.id,
+            "evidence_quote": "trusting Bo",
+        },
+        reason="Mara trusts Bo.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="trusting Bo",
+        candidate_id="relationship_change:mara:bo",
+        candidate_type="relationship_change",
+        character_id=mara.id,
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="Mara's ties shift.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(ily_candidate, bo_candidate),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("Mara grows wary of Ily while trusting Bo.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(
+                    _commit_decision(ily_candidate),
+                    _commit_decision(bo_candidate),
+                )
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I ask who Mara trusts.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    state_by_key = {
+        state.key: state.value for state in repositories.list_world_state(save.id)
+    }
+    assert state_by_key["character.mara.relationships"] == {
+        "Ily": "wary",
+        "Bo": "trusting",
+    }
+
+
+def test_submit_player_turn_skips_planned_active_thread_change_for_locked_field(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "Mara watches the beacon lens."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.add_active_thread(
+        save_id=save.id,
+        title="Riders in the ash",
+        description="Riders close in.",
+        status="active",
+        priority=1,
+        locked_fields=["priority"],
+    )
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    candidate = StateCommitCandidate(
+        operation="update",
+        state_key="",
+        value={
+            "title": "Riders in the ash",
+            "status": "active",
+            "priority": 5,
+            "evidence_quote": "riders close in",
+        },
+        reason="The riders grow urgent.",
+        confidence=0.9,
+        evidence_source_ids=("message:latest",),
+        evidence_quote="riders close in",
+        candidate_id="active_thread_change:riders:priority",
+        candidate_type="active_thread_change",
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="The rider clock advances.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        state_commit_candidates=(candidate,),
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={
+                "fake": SequenceChatProvider(
+                    "fake",
+                    ("Horns sound as riders close in on the ash road.",),
+                )
+            },
+            context_search_service=ScriptedContextSearch(ContextSearchResult()),
+            narrator_planner=ScriptedNarratorPlanner(spec),
+            narrator_verifier=ScriptedNarratorVerifier(
+                _passing_verification(_commit_decision(candidate))
+            ),
+        ).submit_player_turn(
+            save_id=save.id,
+            body="I listen for movement.",
+            speaker_name="Ily",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    threads = repositories.list_active_threads(save.id)
+    assert [thread.title for thread in threads] == ["Riders in the ash"]
+    assert threads[0].priority == 1
+    planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][
+        "planned_commits"
+    ]
+    assert planned["committed_count"] == 0
+    assert {
+        decision["reason"] for decision in planned["decisions"]
+    } == {"locked_active_thread_field"}

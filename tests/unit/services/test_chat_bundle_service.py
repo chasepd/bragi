@@ -428,6 +428,17 @@ def test_chat_bundle_round_trips_storyteller_mode_and_defaults_legacy_mode(
     imported_save = repositories.get_save(_imported_save_id(imported))
     assert imported_save is not None
     assert imported_save.interaction_mode is InteractionMode.STORYTELLER
+    source_pressure = repositories.get_summary_pressure_state(save.id)
+    imported_pressure = repositories.get_summary_pressure_state(imported_save.id)
+    assert imported_pressure.unsummarized_message_count == (
+        source_pressure.unsummarized_message_count
+    )
+    assert imported_pressure.unsummarized_token_estimate == (
+        source_pressure.unsummarized_token_estimate
+    )
+    assert imported_pressure.active_summary_count == (
+        source_pressure.active_summary_count
+    )
 
     del data["scenario"]["interaction_mode"]
     del data["save"]["interaction_mode"]
@@ -451,6 +462,69 @@ def test_chat_bundle_round_trips_storyteller_mode_and_defaults_legacy_mode(
     legacy_save = repositories.get_save(_imported_save_id(legacy_import))
     assert legacy_save is not None
     assert legacy_save.interaction_mode is InteractionMode.ROLEPLAY
+
+
+def test_chat_bundle_preserves_interrupted_turn_recovery_state(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    interrupted_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I open the observatory door.",
+        narration_status="pending",
+    )
+    repositories.set_message_narration_state(
+        message_id=interrupted_message.id,
+        save_id=save.id,
+        status="failed",
+        error="The response could not be completed. Retry or edit this turn.",
+    )
+    bundle_path = tmp_path / "interrupted-turn.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+    imported = service.import_save(bundle_path)
+
+    interruption = repositories.get_active_interrupted_message_narration(
+        _imported_save_id(imported)
+    )
+    assert interruption is not None
+    assert interruption.status == "failed"
+    assert interruption.error == (
+        "The response could not be completed. Retry or edit this turn."
+    )
+
+
+def test_chat_bundle_preserves_interrupted_timeskip_recovery_state(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.append_message(
+        save_id=save.id,
+        role="system",
+        speaker_name="Timeskip",
+        body="Timeskip request: Advance the world by 2 hours.",
+        narration_status="failed",
+        narration_error="The response could not be completed. Retry or edit this turn.",
+    )
+    bundle_path = tmp_path / "interrupted-timeskip.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+    imported = service.import_save(bundle_path)
+
+    interruption = repositories.get_active_interrupted_message_narration(
+        _imported_save_id(imported)
+    )
+    assert interruption is not None
+    assert interruption.status == "failed"
+    assert interruption.source_kind == "timeskip"
 
 
 def test_export_save_writes_manifest_data_and_referenced_media(
@@ -596,6 +670,88 @@ def test_export_import_preserves_pending_retry_budgets(
         if item.field_path == suggestion.field_path
     )
     assert imported_suggestion.max_retry_count == 2
+
+
+def test_export_import_preserves_incomplete_post_turn_outbox(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.ensure_post_turn_outbox_steps(
+        save_id=save.id,
+        player_message_id=PLAYER_MESSAGE_ID,
+        narrator_message_id=NARRATOR_MESSAGE_ID,
+        turn_revision="revision-1",
+        steps=("context",),
+        payload={
+            "verified_plan_coverage": {
+                "source_message_ids": [PLAYER_MESSAGE_ID, NARRATOR_MESSAGE_ID]
+            }
+        },
+    )
+    bundle_path = tmp_path / "exports" / "pending-continuity.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+    imported_rows = repositories.list_post_turn_outbox_steps(
+        save_id=_imported_save_id(imported)
+    )
+
+    assert len(imported_rows) == 1
+    assert imported_rows[0].step == "context"
+    assert imported_rows[0].status == "pending"
+    assert imported_rows[0].player_message_id != PLAYER_MESSAGE_ID
+    assert imported_rows[0].narrator_message_id != NARRATOR_MESSAGE_ID
+    imported_coverage = imported_rows[0].payload["verified_plan_coverage"]
+    assert isinstance(imported_coverage, dict)
+    assert imported_coverage["source_message_ids"] == [
+        imported_rows[0].player_message_id,
+        imported_rows[0].narrator_message_id,
+    ]
+
+
+def test_export_import_preserves_chat_turn_idempotency_ledger(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    client_turn_id = "11111111-1111-4111-8111-111111111111"
+    submission = repositories.create_chat_turn_submission_job(
+        save_id=save.id,
+        client_turn_id=client_turn_id,
+        operation="chat",
+        request_fingerprint="fingerprint-1",
+        creator_user_id=None,
+        job_id="chat-job-export",
+        payload={"source": "web"},
+    )
+    repositories.link_chat_turn_submission_messages(
+        job_id=submission.job.id,
+        player_message_id=PLAYER_MESSAGE_ID,
+        narrator_message_id=NARRATOR_MESSAGE_ID,
+    )
+    repositories.start_job(submission.job.id)
+    repositories.update_job(submission.job.id, status="succeeded")
+    bundle_path = tmp_path / "exports" / "idempotency.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+    imported = service.import_save(bundle_path)
+    imported_submission = repositories.get_chat_turn_submission(
+        save_id=_imported_save_id(imported),
+        client_turn_id=client_turn_id,
+    )
+
+    assert imported_submission is not None
+    assert imported_submission.operation == "chat"
+    assert imported_submission.request_fingerprint == "fingerprint-1"
+    assert imported_submission.job.id != submission.job.id
+    assert imported_submission.job.status == "succeeded"
+    assert imported_submission.player_message_id != PLAYER_MESSAGE_ID
+    assert imported_submission.narrator_message_id != NARRATOR_MESSAGE_ID
 
 
 def test_export_rejects_snapshot_that_cannot_be_imported(
@@ -2699,6 +2855,80 @@ def test_import_save_preserves_memory_and_scene_scratch_provenance(
     assert imported_scratch.expires_after_turn_number == 13
 
 
+def test_export_import_preserves_epistemic_fields_and_remaps_actor(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    courier = repositories.add_character(save_id=save.id, name="Courier")
+    second_courier = repositories.add_character(save_id=save.id, name="Courier")
+    repositories.add_memory(
+        save_id=save.id,
+        body="The courier reports that the north gate is unguarded.",
+        tags=["hearsay"],
+        source_message_id=PLAYER_MESSAGE_ID,
+        epistemic_status="reported_speech",
+        epistemic_actor_id=courier.id,
+        epistemic_actor_name=courier.name,
+    )
+    repositories.add_memory(
+        save_id=save.id,
+        body="The courier reports that the north gate is unguarded.",
+        tags=["hearsay"],
+        source_message_id=PLAYER_MESSAGE_ID,
+        epistemic_status="reported_speech",
+        epistemic_actor_id=second_courier.id,
+        epistemic_actor_name=second_courier.name,
+    )
+    repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="character_fact",
+        claim="The courier intends to leave before dawn.",
+        evidence_quote="I climb toward the beacon lens.",
+        source_message_ids=[PLAYER_MESSAGE_ID],
+        epistemic_status="intention",
+        epistemic_actor_id=courier.id,
+        epistemic_actor_name=courier.name,
+    )
+    bundle_path = tmp_path / "exports" / "epistemic-round-trip.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+    imported_save_id = _imported_save_id(imported)
+    imported_couriers = [
+        character
+        for character in repositories.list_characters(imported_save_id)
+        if character.name == "Courier"
+    ]
+    imported_memories = [
+        memory
+        for memory in repositories.list_memories(imported_save_id)
+        if "north gate" in memory.body
+    ]
+    imported_observation = next(
+        observation
+        for observation in repositories.list_context_observations(imported_save_id)
+        if "before dawn" in observation.claim
+    )
+
+    assert len(imported_couriers) == 2
+    assert len(imported_memories) == 2
+    assert {memory.epistemic_actor_id for memory in imported_memories} == {
+        character.id for character in imported_couriers
+    }
+    assert all(
+        memory.epistemic_status == "reported_speech"
+        and memory.epistemic_actor_name == "Courier"
+        for memory in imported_memories
+    )
+    assert imported_observation.epistemic_status == "intention"
+    assert imported_observation.epistemic_actor_id in {
+        character.id for character in imported_couriers
+    }
+
+
 def test_import_save_accepts_legacy_memories_without_observation_provenance(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -3023,6 +3253,7 @@ def test_import_save_remaps_colliding_ids_and_preserves_bundle_data(
     base_scenario = repositories.get_scenario(imported_save.scenario_id)
     assert base_scenario is not None
     assert base_scenario.title == "Ashfall Keep"
+    assert json.loads(base_scenario.content_json)["_canon_claims"]["version"] == 1
     loaded = repositories.load_save_details(imported_save_id)
     assert loaded is not None
     assert loaded.scenario.id == imported_save.scenario_id
@@ -5372,7 +5603,7 @@ def test_import_save_rejects_unsupported_message_role_without_new_save(
     )
     save_ids = [save.id for save in repositories.list_saves()]
 
-    with pytest.raises(module.ChatBundleError, match="Unsupported message role"):
+    with pytest.raises(module.ChatBundleError, match="Unsupported"):
         service.import_save(broken_bundle_path)
 
     assert [save.id for save in repositories.list_saves()] == save_ids
@@ -6323,6 +6554,11 @@ def _seed_bundle_save(
         content={
             "opening_message": "The tower bell cracks once.",
             "starting_scene": "The beacon gutters in the tower.",
+            "_canon_claims": {
+                "version": 1,
+                "source_digest": "derived-content-is-rebuilt-on-import",
+                "claims": [],
+            },
         },
     )
     save = repositories.create_save(
@@ -6453,6 +6689,52 @@ def _seed_bundle_save(
         media_path.parent.mkdir(parents=True)
         media_path.write_bytes(MEDIA_BYTES)
     return save
+
+
+def test_export_import_round_trips_active_scene_facts(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    media_dir.mkdir()
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="Mara stands beside the red beacon lens.",
+        source_message_id=NARRATOR_MESSAGE_ID,
+    )
+    fact, _, _ = repositories.upsert_scene_fact(
+        fact_id="scene-fact-beacon-lens",
+        save_id=save.id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="beacon lens",
+        value="mounted above the tower stair",
+        source_message_id=NARRATOR_MESSAGE_ID,
+        evidence_quote="The lens flashes red",
+    )
+    bundle_path = tmp_path / "scene-facts.bragi-chat"
+
+    chat_bundle_module.ChatBundleService(
+        repositories=repositories,
+        media_dir=media_dir,
+    ).export_save(save.id, bundle_path)
+    imported = chat_bundle_module.ChatBundleService(
+        repositories=repositories,
+        media_dir=media_dir,
+    ).import_save(bundle_path)
+
+    [imported_fact] = repositories.list_scene_facts(imported.save_id)
+    imported_messages = repositories.list_messages(imported.save_id)
+    imported_narrator = next(
+        message for message in imported_messages if message.role == "narrator"
+    )
+    assert imported_fact.id != fact.id
+    assert imported_fact.subject_label == "beacon lens"
+    assert imported_fact.value == "mounted above the tower stair"
+    assert imported_fact.scene_snapshot_id != fact.scene_snapshot_id
+    assert imported_fact.provenance[0].source_message_id == imported_narrator.id
 
 
 def _replace_seed_scenario_update_content(
@@ -7163,3 +7445,98 @@ def _write_bundle_member_bytes(
         bundle.writestr("manifest.json", manifest_payload)
         bundle.writestr("data.json", data_payload)
         bundle.writestr(bundle_name, payload)
+
+
+def test_chat_bundle_round_trips_turn_outcomes_with_remapped_message_refs(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.add_turn_outcome(
+        save_id=save.id,
+        message_id=NARRATOR_MESSAGE_ID,
+        payload={
+            "save_id": save.id,
+            "message_id": NARRATOR_MESSAGE_ID,
+            "source_message_ids": [PLAYER_MESSAGE_ID, NARRATOR_MESSAGE_ID],
+            "attempted_action": "I climb toward the beacon lens.",
+            "attempt_resolution": "succeeded",
+            "attempt_evidence_source_ids": [f"message:{PLAYER_MESSAGE_ID}"],
+            "effects": [
+                {
+                    "candidate_id": "scene:mood",
+                    "candidate_type": "scene_snapshot_field",
+                    "domain": "scene",
+                    "operation": "update",
+                    "state_key": "scene_snapshot.mood",
+                    "field_path": "mood",
+                    "character_id": "",
+                    "target_type": "",
+                    "target_id": "",
+                    "value": {"mood": "uneasy"},
+                    "confidence": 0.9,
+                    "evidence_source_ids": [f"message:{NARRATOR_MESSAGE_ID}"],
+                    "evidence_quote": "lens flashes red",
+                    "verifier_status": "rendered",
+                    "safe_to_commit": True,
+                    "application_status": "committed",
+                    "reason": "rendered",
+                    "changed": True,
+                }
+            ],
+            "applied_domains": ["scene"],
+            "queued_domains": [],
+            "verification_passed": True,
+            "verifier_available": True,
+            "post_turn_update_needed": False,
+            "committed_count": 1,
+            "confirmation_queued_count": 0,
+        },
+    )
+    bundle_path = tmp_path / "outcomes.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+
+    with zipfile.ZipFile(bundle_path) as bundle:
+        data = json.loads(bundle.read("data.json"))
+    assert [row["message_id"] for row in data["turn_outcomes"]] == [
+        NARRATOR_MESSAGE_ID
+    ]
+
+    imported = service.import_save(bundle_path)
+    imported_save = repositories.get_save(_imported_save_id(imported))
+    assert imported_save is not None
+    imported_messages = [
+        message
+        for message in repositories.list_messages(imported_save.id)
+        if message.role == "narrator"
+    ]
+    assert len(imported_messages) == 1
+    imported_narrator_id = imported_messages[0].id
+    imported_player_id = next(
+        message.id
+        for message in repositories.list_messages(imported_save.id)
+        if message.role == "player"
+    )
+    outcome = repositories.get_turn_outcome_for_message(
+        save_id=imported_save.id,
+        message_id=imported_narrator_id,
+    )
+    assert outcome is not None
+    assert outcome.payload["save_id"] == imported_save.id
+    assert outcome.payload["attempt_resolution"] == "succeeded"
+    assert outcome.payload["source_message_ids"] == [
+        imported_player_id,
+        imported_narrator_id,
+    ]
+    assert outcome.payload["attempt_evidence_source_ids"] == [
+        f"message:{imported_player_id}"
+    ]
+    raw_effects = outcome.payload["effects"]
+    assert isinstance(raw_effects, list)
+    effect = raw_effects[0]
+    assert isinstance(effect, dict)
+    assert effect["evidence_source_ids"] == [f"message:{imported_narrator_id}"]
+    assert effect["domain"] == "scene"

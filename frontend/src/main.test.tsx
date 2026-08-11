@@ -33,12 +33,14 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 type EventSourceDoubleInstance = {
   url: string;
   closed: boolean;
   closeCalls: number;
+  dispatchOpen: () => void;
   dispatch: (name: string, data: unknown) => void;
   dispatchRaw: (name: string, data: string) => void;
   dispatchNativeError: () => void;
@@ -52,6 +54,7 @@ function installEventSourceDouble(): EventSourceDoubleInstance[] {
     closed = false;
     closeCalls = 0;
     listeners: Record<string, ((event: Event) => void)[]> = {};
+    onopen: ((event: Event) => void) | null = null;
     onerror: ((event: Event) => void) | null = null;
 
     constructor(url: string) {
@@ -68,14 +71,20 @@ function installEventSourceDouble(): EventSourceDoubleInstance[] {
       this.closeCalls += 1;
     }
 
+    dispatchOpen() {
+      this.onopen?.(new Event("open"));
+    }
+
     dispatch(name: string, data: unknown) {
       this.dispatchRaw(name, JSON.stringify(data));
     }
 
     dispatchRaw(name: string, data: string) {
+      const event = { data } as MessageEvent;
       for (const listener of this.listeners[name] ?? []) {
-        listener({ data } as MessageEvent);
+        listener(event);
       }
+      if (name === "error") this.onerror?.(event);
     }
 
     dispatchNativeError() {
@@ -1381,13 +1390,90 @@ describe("frontend helpers", () => {
         scenario_title: "Lantern Keep"
       },
       fallback_used: false,
-      context_trimmed: false
+      context_trimmed: false,
+      continuity_degraded: true,
+      retry_pending: true
     };
 
     sources[0].dispatch("chat_turn_delta", delta);
     stop();
 
     expect(events).toHaveBeenCalledWith("chat_turn_delta", delta);
+  });
+
+  it("does not expose provisional narrator draft job events", async () => {
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const events = vi.fn();
+    const stop = watchJob("job-1", vi.fn(), events, "save-1");
+
+    sources[0].dispatch("narrator_draft", {
+      message: { body: "Unchecked narrator text." }
+    });
+    stop();
+
+    expect(events).not.toHaveBeenCalled();
+  });
+
+  it("delivers job completion level events", async () => {
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const events = vi.fn();
+    const stop = watchJob("job-1", vi.fn(), events, "save-1");
+
+    sources[0].dispatchRaw(
+      "completion_level",
+      JSON.stringify({ completion_level: "continuity_ready" })
+    );
+
+    expect(events).toHaveBeenCalledWith(
+      "completion_level",
+      { completion_level: "continuity_ready" }
+    );
+    stop();
+  });
+
+  it("reconstructs active job progress during SSE fallback polling", async () => {
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const progress = {
+      kind: "post_turn_catchup",
+      status: "waiting",
+      status_text: "Waiting for prior turn continuity",
+      continuity_degraded: false,
+      retry_pending: false,
+      job_ids: ["prior-job"],
+      jobs: [{ name: "post_turn_catchup", status: "waiting", category: "continuity" }]
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve(
+      path === "/api/log/client"
+        ? { ok: true, json: async () => ({ ok: true }) }
+        : {
+            ok: true,
+            json: async () => ({
+              id: "job-1",
+              type: "chat_turn",
+              save_id: "save-1",
+              status: "running",
+              completion_level: "response_committed",
+              latest_progress: progress,
+              result: null,
+              error: null
+            })
+          }
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    const events = vi.fn();
+
+    const stop = watchJob("job-1", vi.fn(), events, "save-1");
+    sources[0].dispatchNativeError();
+
+    await waitFor(() => expect(events).toHaveBeenCalledWith("progress", progress));
+    expect(events).toHaveBeenCalledWith(
+      "completion_level",
+      { completion_level: "response_committed" }
+    );
+    stop();
   });
 
   it("scopes job event streams and fallback polling to a save", async () => {
@@ -1500,7 +1586,6 @@ describe("frontend helpers", () => {
   it("stops fallback polling when a job is no longer known", async () => {
     const { watchJob } = await import("./api");
     const sources = installEventSourceDouble();
-    const setTimeoutSpy = vi.spyOn(window, "setTimeout");
     const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve(
       path === "/api/log/client"
         ? { ok: true, json: async () => ({ ok: true }) }
@@ -1510,60 +1595,218 @@ describe("frontend helpers", () => {
 
     const updates = vi.fn();
     watchJob("job-1", updates);
-    await act(async () => {
-      sources[0].dispatchNativeError();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    sources[0].dispatchNativeError();
 
-    expect(updates).toHaveBeenCalledWith(expect.objectContaining({
+    await waitFor(() => expect(updates).toHaveBeenCalledWith(expect.objectContaining({
       id: "job-1",
       status: "cancelled",
       error: "Unknown job"
-    }));
+    })));
     expect(fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1")).toHaveLength(1);
-    expect(setTimeoutSpy).not.toHaveBeenCalled();
     expect(fetchMock.mock.calls.some(([path, init]) => path === "/api/log/client" && String(init.body).includes("client.job.stale"))).toBe(true);
-    setTimeoutSpy.mockRestore();
   });
 
   it("keeps retrying fallback polling after transient job read failures", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
     const { watchJob } = await import("./api");
     const sources = installEventSourceDouble();
-    let retryPoll: (() => void) | undefined;
-    const setTimeoutSpy = vi.spyOn(window, "setTimeout").mockImplementation((callback: TimerHandler) => {
-      retryPoll = callback as () => void;
-      return 1;
+    let jobReads = 0;
+    const fetchMock = vi.fn().mockImplementation((path: string) => {
+      if (path === "/api/log/client") {
+        return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+      }
+      jobReads += 1;
+      if (jobReads === 1) return Promise.reject(new TypeError("network down"));
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({ id: "job-1", type: "chat_turn", status: "succeeded", result: null, error: null })
+      });
     });
-    const fetchMock = vi.fn()
-      .mockImplementationOnce((path: string) => Promise.resolve(path === "/api/log/client" ? { ok: true, json: async () => ({ ok: true }) } : { ok: true, json: async () => ({ ok: true }) }))
-      .mockRejectedValueOnce(new TypeError("network down"))
-      .mockImplementation((path: string) => Promise.resolve(
-        path === "/api/log/client"
-          ? { ok: true, json: async () => ({ ok: true }) }
-          : { ok: true, json: async () => ({ id: "job-1", type: "chat_turn", status: "succeeded", result: null, error: null }) }
-      ));
     vi.stubGlobal("fetch", fetchMock);
 
     const updates = vi.fn();
     watchJob("job-1", updates);
-    await act(async () => {
-      sources[0].dispatchNativeError();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    sources[0].dispatchNativeError();
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(fetchMock).toHaveBeenCalledWith("/api/jobs/job-1", expect.anything());
-    expect(retryPoll).toBeDefined();
-    await act(async () => {
-      retryPoll?.();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    await vi.advanceTimersByTimeAsync(1_000);
 
     expect(updates).toHaveBeenCalledWith(expect.objectContaining({ id: "job-1", status: "succeeded" }));
-    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1").length).toBeGreaterThanOrEqual(2);
-    setTimeoutSpy.mockRestore();
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1")).toHaveLength(2);
+    vi.useRealTimers();
+  });
+
+  it("treats data-bearing job error events as healthy SSE messages", async () => {
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "job-1", type: "chat_turn", status: "running", result: null, error: null })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const events = vi.fn();
+
+    const stop = watchJob("job-1", vi.fn(), events);
+    sources[0].dispatch("error", { error: "Job failed safely" });
+
+    expect(events).toHaveBeenCalledWith("error", { error: "Job failed safely" });
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1")).toHaveLength(0);
+    expect(sources[0].closed).toBe(false);
+    stop();
+  });
+
+  it("coalesces fallback polls and ignores a late response after SSE recovery", async () => {
+    vi.useFakeTimers();
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const response = deferred<{ ok: boolean; json: () => Promise<Job> }>();
+    const fetchMock = vi.fn().mockImplementation((path: string) => (
+      path === "/api/log/client"
+        ? Promise.resolve({ ok: true, json: async () => ({ ok: true }) })
+        : response.promise
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    const updates = vi.fn();
+
+    const stop = watchJob("job-1", updates);
+    sources[0].dispatchNativeError();
+    await vi.advanceTimersByTimeAsync(0);
+    sources[0].dispatchNativeError();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1")).toHaveLength(1);
+
+    sources[0].dispatchOpen();
+    response.resolve({
+      ok: true,
+      json: async () => ({ id: "job-1", type: "chat_turn", status: "succeeded", result: null, error: null })
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(updates).not.toHaveBeenCalled();
+    expect(sources[0].closed).toBe(false);
+    stop();
+    vi.useRealTimers();
+  });
+
+  it("backs off job polling and stops it when SSE recovers", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve(
+      path === "/api/log/client"
+        ? { ok: true, json: async () => ({ ok: true }) }
+        : { ok: true, json: async () => ({ id: "job-1", type: "chat_turn", status: "running", result: null, error: null }) }
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const stop = watchJob("job-1", vi.fn());
+    sources[0].dispatchOpen();
+    sources[0].dispatchNativeError();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const jobCalls = () => fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1").length;
+    expect(jobCalls()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(jobCalls()).toBe(2);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(jobCalls()).toBe(3);
+    await vi.advanceTimersByTimeAsync(4_000);
+    await vi.advanceTimersByTimeAsync(8_000);
+    await vi.advanceTimersByTimeAsync(16_000);
+    expect(jobCalls()).toBe(6);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(jobCalls()).toBe(6);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(jobCalls()).toBe(7);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(jobCalls()).toBe(8);
+
+    sources[0].dispatchOpen();
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(jobCalls()).toBe(8);
+    expect(sources[0].closed).toBe(false);
+
+    stop();
+    vi.useRealTimers();
+  });
+
+  it("uses heartbeats to detect stale save streams and stop fallback polling", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { watchSave } = await import("./api");
+    const sources = installEventSourceDouble();
+    const fallbackPoll = vi.fn().mockResolvedValue(undefined);
+
+    const stop = watchSave("save-1", vi.fn(), undefined, fallbackPoll);
+    sources[0].dispatchOpen();
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(fallbackPoll).not.toHaveBeenCalled();
+
+    sources[0].dispatch("heartbeat", {});
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(fallbackPoll).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_001);
+    expect(fallbackPoll).toHaveBeenCalledTimes(1);
+
+    sources[0].dispatch("heartbeat", {});
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(fallbackPoll).toHaveBeenCalledTimes(1);
+
+    stop();
+    vi.useRealTimers();
+  });
+
+  it("pauses save fallback polling while offline or hidden", async () => {
+    vi.useFakeTimers();
+    const { watchSave } = await import("./api");
+    const sources = installEventSourceDouble();
+    const fallbackPoll = vi.fn().mockResolvedValue(undefined);
+    let online = false;
+    let hidden = false;
+    vi.spyOn(navigator, "onLine", "get").mockImplementation(() => online);
+    vi.spyOn(document, "hidden", "get").mockImplementation(() => hidden);
+
+    const stop = watchSave("save-1", vi.fn(), undefined, fallbackPoll);
+    sources[0].dispatchNativeError();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fallbackPoll).not.toHaveBeenCalled();
+
+    online = true;
+    window.dispatchEvent(new Event("online"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fallbackPoll).toHaveBeenCalledTimes(1);
+
+    hidden = true;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fallbackPoll).toHaveBeenCalledTimes(1);
+
+    hidden = false;
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fallbackPoll).toHaveBeenCalledTimes(2);
+
+    stop();
+    vi.useRealTimers();
+  });
+
+  it("delivers a terminal job only once across fallback and SSE", async () => {
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const terminal = { id: "job-1", type: "chat_turn", status: "succeeded", result: null, error: null };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => terminal }));
+    const updates = vi.fn();
+
+    watchJob("job-1", updates);
+    sources[0].dispatch("done", terminal);
+    sources[0].dispatch("done", terminal);
+
+    expect(updates).toHaveBeenCalledTimes(1);
   });
 
   it("does not mount the workbench as an import side effect in tests", async () => {
@@ -1614,7 +1857,9 @@ describe("frontend helpers", () => {
         scenario_title: "Lantern Keep"
       },
       fallback_used: false,
-      context_trimmed: false
+      context_trimmed: false,
+      continuity_degraded: true,
+      retry_pending: true
     };
 
     const once = applyChatTurnDeltaToRuntimeModel(model, delta);
@@ -1630,6 +1875,16 @@ describe("frontend helpers", () => {
     expect(twice.saves[0].title).toBe("Lantern Keep Updated");
     expect(twice.status).toBe("Turn complete");
     expect(twice.error).toBeNull();
+    expect(twice.continuity_degraded).toBe(true);
+    expect(twice.retry_pending).toBe(true);
+
+    const repaired = applyChatTurnDeltaToRuntimeModel(twice, {
+      ...delta,
+      continuity_degraded: false,
+      retry_pending: false
+    });
+    expect(repaired.continuity_degraded).toBe(false);
+    expect(repaired.retry_pending).toBe(false);
   });
 
   it("hides pending character text rows even after reply text exists", async () => {
@@ -1856,6 +2111,194 @@ describe("frontend helpers", () => {
     });
   });
 
+  it.each(["failed", "cancelled"] as const)(
+    "restores a %s committed turn and retries without duplicating it",
+    async (status) => {
+      const retryJob = {
+        id: "job-retry-1",
+        type: "chat_turn",
+        status: "queued",
+        result: null,
+        error: null
+      };
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => retryJob
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const runJob = vi.fn();
+      const { Chronicle } = await import("./main");
+      const model = runtimeModel({
+        composer_enabled: false,
+        chronicle: {
+          messages: [
+            {
+              message_id: "player-interrupted-1",
+              role: "player",
+              speaker_name: "Mara",
+              body: "I open the observatory door.",
+              interrupted_turn: {
+                status,
+                reason: status === "cancelled"
+                  ? "The response was cancelled. Retry or edit this turn."
+                  : "The response could not be completed. Retry or edit this turn.",
+                source_kind: "player"
+              },
+              actions: [
+                { action_id: "retry-interrupted-turn", label: "Retry response" },
+                { action_id: "edit-and-resubmit-message", label: "Edit and resubmit" },
+                { action_id: "delete-messages-from-here", label: "Delete from here" }
+              ]
+            }
+          ]
+        }
+      });
+
+      render(<Chronicle model={model} runJob={runJob} pendingMessage={null} />);
+
+      expect(screen.getAllByText("I open the observatory door.")).toHaveLength(1);
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        status === "cancelled" ? "Turn cancelled" : "Turn interrupted"
+      );
+      const retryButtons = screen.getAllByRole("button", { name: "Retry response" });
+      await userEvent.click(retryButtons[retryButtons.length - 1]);
+
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        "/api/chat/retry",
+        expect.anything()
+      ));
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1].body))).toEqual({
+        message_id: "player-interrupted-1",
+        save_id: "save-1"
+      });
+      expect(runJob).toHaveBeenCalledWith(retryJob);
+    }
+  );
+
+  it("edits an interrupted timeskip through the retry endpoint", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        id: "job-timeskip-edit",
+        type: "chat_turn",
+        status: "queued",
+        result: null,
+        error: null
+      })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Chronicle } = await import("./main");
+    render(<Chronicle model={runtimeModel({
+      chronicle: { messages: [{
+        message_id: "timeskip-1",
+        role: "system",
+        speaker_name: "Timeskip",
+        body: "Timeskip request: Skip to dawn.",
+        interrupted_turn: {
+          status: "failed",
+          reason: "The response was interrupted.",
+          source_kind: "timeskip"
+        },
+        actions: [
+          { action_id: "retry-interrupted-turn", label: "Retry response" },
+          { action_id: "edit-and-resubmit-message", label: "Edit this message" },
+          { action_id: "delete-messages-from-here", label: "Delete from here" }
+        ]
+      }] }
+    })} runJob={vi.fn()} pendingMessage={null} />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit this message" }));
+    expect(screen.queryByRole("button", { name: "Edit without Resubmit" })).not.toBeInTheDocument();
+    const editor = screen.getByLabelText("Message");
+    await userEvent.clear(editor);
+    await userEvent.type(editor, "Timeskip request: Skip to midnight.");
+    await userEvent.click(screen.getByRole("button", { name: "Resubmit" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/chat/retry",
+      expect.anything()
+    ));
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1].body))).toMatchObject({
+      message_id: "timeskip-1",
+      body: "Timeskip request: Skip to midnight."
+    });
+  });
+
+  it.each(["failed", "cancelled"] as const)(
+    "refreshes the committed turn after a chat job reports %s",
+    async (status) => {
+      const sources = installEventSourceDouble();
+      const chatJob = {
+        id: `job-chat-${status}`,
+        type: "chat_turn",
+        save_id: "save-1",
+        status: "running",
+        result: null,
+        error: null
+      } satisfies Job;
+      let currentModel = runtimeModel();
+      const fallbackFetch = workbenchFetch([chatJob], currentModel);
+      vi.stubGlobal("fetch", vi.fn().mockImplementation(
+        (path: string, init?: RequestInit) => path.startsWith("/api/runtime")
+          ? Promise.resolve({ ok: true, json: async () => currentModel })
+          : fallbackFetch(path, init)
+      ));
+      const { Workbench } = await import("./main");
+
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <Workbench />
+        </QueryClientProvider>
+      );
+
+      const jobSource = await waitFor(() => {
+        const source = sources.find((candidate) => candidate.url.includes(chatJob.id));
+        if (!source) throw new Error("chat job watcher was not created");
+        return source;
+      });
+      currentModel = runtimeModel({
+        composer_enabled: false,
+        chronicle: {
+          messages: [
+            {
+              message_id: "player-committed-1",
+              role: "player",
+              speaker_name: "Mara",
+              body: "I open the observatory door.",
+              interrupted_turn: {
+                status,
+                reason: "The response was interrupted. Retry or edit this turn.",
+                source_kind: "player"
+              },
+              actions: [
+                { action_id: "retry-interrupted-turn", label: "Retry response" },
+                { action_id: "edit-and-resubmit-message", label: "Edit and resubmit" },
+                { action_id: "delete-messages-from-here", label: "Delete from here" }
+              ]
+            }
+          ]
+        }
+      });
+
+      act(() => {
+        jobSource.dispatch("done", {
+          ...chatJob,
+          status,
+          error: status === "failed" ? "Background job failed." : null
+        });
+      });
+
+      const interruptionTitle = await screen.findByText(
+        status === "cancelled" ? "Turn cancelled" : "Turn interrupted"
+      );
+      expect(interruptionTitle.closest('[role="alert"]')).toHaveTextContent(
+        "The response was interrupted."
+      );
+      expect(screen.getAllByText("I open the observatory door.")).toHaveLength(1);
+      expect(screen.getAllByRole("button", { name: "Retry response" })).toHaveLength(1);
+    }
+  );
+
   it("renders storyteller human messages as directions with guiding composer copy", async () => {
     const { Chronicle, Composer } = await import("./main");
     const model = runtimeModel({
@@ -1897,6 +2340,8 @@ describe("frontend helpers", () => {
   });
 
   it("continues a storyteller chronicle without clearing drafted guidance", async () => {
+    const getRandomValues = globalThis.crypto.getRandomValues.bind(globalThis.crypto);
+    vi.stubGlobal("crypto", { getRandomValues });
     const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
       ok: true,
       json: async () => path === "/api/chat/continue"
@@ -1940,10 +2385,16 @@ describe("frontend helpers", () => {
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
       "/api/chat/continue",
       expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({ save_id: "save-1" })
+        method: "POST"
       })
     ));
+    const continueCall = fetchMock.mock.calls.find(([path]) => path === "/api/chat/continue");
+    expect(JSON.parse(String(continueCall?.[1].body))).toMatchObject({
+      client_turn_id: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      ),
+      save_id: "save-1"
+    });
     expect(textarea).toHaveValue("Bring the rival back in the following scene.");
     expect(onPendingMessage).not.toHaveBeenCalled();
     expect(runJob).toHaveBeenCalledWith(expect.objectContaining({
@@ -6298,6 +6749,23 @@ describe("frontend helpers", () => {
     );
   });
 
+  it.each([
+    ["waiting", "Waiting for prior turn continuity"],
+    ["succeeded", "Prior turn continuity is ready"],
+    ["failed", "Prior turn continuity catch-up failed; repair will retry"],
+    ["retry_pending", "Prior turn continuity is still catching up; retry pending"],
+    ["cancelled", "Prior turn continuity catch-up cancelled"]
+  ])("formats %s post-turn catch-up progress", async (status, statusText) => {
+    const { progressLabel } = await import("./main");
+
+    expect(progressLabel({
+      kind: "post_turn_catchup",
+      status,
+      status_text: statusText,
+      jobs: [{ name: "post_turn_catchup", status, category: "continuity" }]
+    })).toBe(statusText);
+  });
+
   it("renders compact pending jobs as grouped summaries", async () => {
     const { PendingJobsTray } = await import("./main");
     const onCancel = vi.fn();
@@ -6370,6 +6838,67 @@ describe("frontend helpers", () => {
     expect(screen.getByText("Generating image")).toBeInTheDocument();
   });
 
+  it("distinguishes continuity work from optional post-turn enrichments", async () => {
+    const { PendingJobsTray } = await import("./main");
+
+    render(
+      <PendingJobsTray
+        mode="expanded"
+        jobs={[
+          {
+            job: {
+              id: "job-continuity",
+              type: "post_turn_background",
+              status: "running",
+              completion_level: "response_committed",
+              result: null,
+              error: null
+            },
+            progress: "World state running"
+          },
+          {
+            job: {
+              id: "job-optional",
+              type: "post_turn_background",
+              status: "running",
+              completion_level: "continuity_ready",
+              result: null,
+              error: null
+            },
+            progress: "Action choices running"
+          }
+        ]}
+        onCancel={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("Response ready")).toBeInTheDocument();
+    expect(screen.getByText("Continuity ready")).toBeInTheDocument();
+  });
+
+  it("shows post-turn completion in the default compact tray", async () => {
+    const { PendingJobsTray } = await import("./main");
+
+    render(
+      <PendingJobsTray
+        jobs={[{
+          job: {
+            id: "job-optional-complete",
+            type: "post_turn_background",
+            status: "running",
+            completion_level: "optional_enrichments_complete",
+            result: null,
+            error: null
+          },
+          progress: "Scenario evolution complete"
+        }]}
+        onCancel={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("Optional complete")).toBeInTheDocument();
+  });
+
   it("renders expanded pending jobs with pre-narrator phase detail", async () => {
     const { PendingJobsTray } = await import("./main");
 
@@ -6382,6 +6911,7 @@ describe("frontend helpers", () => {
             progress: "Selecting context",
             phases: [
               { name: "submission", status: "succeeded" },
+              { name: "classification", status: "succeeded" },
               { name: "history", status: "succeeded" },
               { name: "input", status: "succeeded" },
               { name: "character_planning", status: "skipped" },
@@ -6400,6 +6930,7 @@ describe("frontend helpers", () => {
 
     expect(screen.getByText("Selecting context")).toBeInTheDocument();
     expect(screen.getByText("Submitting")).toBeInTheDocument();
+    expect(screen.getByText("Content classification")).toBeInTheDocument();
     expect(screen.getByText("History check")).toBeInTheDocument();
     expect(screen.getByText("Saving input")).toBeInTheDocument();
     expect(screen.getByText("Character planning")).toBeInTheDocument();
@@ -6526,6 +7057,45 @@ describe("frontend helpers", () => {
         { name: "context", status: "running" },
         { name: "characters", status: "pending" }
       ]
+    });
+  });
+
+  it("hydrates and then replaces post-turn catch-up progress", async () => {
+    const { trackedActiveJob } = await import("./main");
+    const catchupProgress = {
+      kind: "post_turn_catchup" as const,
+      status: "waiting" as const,
+      status_text: "Waiting for prior turn continuity",
+      continuity_degraded: false,
+      retry_pending: false,
+      job_ids: ["prior-job"],
+      jobs: [{ name: "post_turn_catchup", status: "waiting", category: "continuity" }]
+    };
+    const waitingJob = {
+      id: "job-1",
+      type: "chat_turn",
+      status: "running",
+      result: null,
+      error: null,
+      latest_progress: catchupProgress
+    } satisfies Job;
+    const waiting = trackedActiveJob(waitingJob);
+
+    expect(waiting).toEqual({
+      job: waitingJob,
+      progress: "Waiting for prior turn continuity",
+      phases: [{ name: "post_turn_catchup", status: "waiting" }]
+    });
+
+    const narratingJob = {
+      ...waitingJob,
+      updated_at: 2,
+      latest_progress: { label: "Selecting context" }
+    } satisfies Job;
+    expect(trackedActiveJob(narratingJob, waiting)).toEqual({
+      job: narratingJob,
+      progress: "Selecting context",
+      phases: undefined
     });
   });
 
@@ -7261,6 +7831,27 @@ describe("frontend helpers", () => {
     expect(screen.queryByRole("button", { name: "Generate opening image" })).not.toBeInTheDocument();
   });
 
+  it("warns when durable continuity repair is pending", async () => {
+    installEventSourceDouble();
+    const fetchMock = workbenchFetch(
+      [],
+      runtimeModel({ continuity_degraded: true, retry_pending: true }),
+      [],
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(
+      await screen.findByText(/Continuity updates are still catching up/),
+    ).toBeInTheDocument();
+  });
+
   it("shows a retryable composer notice when chat submission status fails and recovers", async () => {
     installEventSourceDouble();
     let statusRequests = 0;
@@ -7463,25 +8054,11 @@ describe("frontend helpers", () => {
 
     const jobSource = sources.find((source) => source.url.startsWith("/api/jobs/"));
     expect(jobSource).toBeTruthy();
-    act(() => {
-      jobSource?.dispatch("narrator_draft", {
-        message: {
-          message_id: "pending-narrator-message",
-          role: "narrator",
-          speaker_name: "Narrator",
-          body: "Save A draft in progress.",
-          markdown_blocks: [{ kind: "paragraph", spans: [{ kind: "text", text: "Save A draft in progress." }] }],
-          actions: []
-        }
-      });
-    });
-    expect(await screen.findByText("Save A draft in progress.")).toBeInTheDocument();
 
     await userEvent.click(await screen.findByRole("button", { name: "Load Signal Tower" }));
 
     await waitFor(() => expect(screen.getByText("Save B text.")).toBeInTheDocument());
     await waitFor(() => expect(screen.queryByLabelText("Pending jobs")).not.toBeInTheDocument());
-    expect(screen.queryByText("Save A draft in progress.")).not.toBeInTheDocument();
 
     act(() => {
       jobSource?.dispatch("runtime", runtimeModel({
@@ -8155,8 +8732,8 @@ describe("frontend helpers", () => {
     expect(scenarioCalls).toBe(countsBeforeEvent.scenarioCalls);
   });
 
-  it("polls the runtime while a chat job is active so missed SSE updates still show the narrator response", async () => {
-    installEventSourceDouble();
+  it("polls the runtime after save SSE fails so missed updates still show the narrator response", async () => {
+    const sources = installEventSourceDouble();
     const initialModel = runtimeModel({
       chronicle: {
         messages: [
@@ -8203,8 +8780,108 @@ describe("frontend helpers", () => {
 
     await waitFor(() => expect(screen.getByText("The beacon waits.")).toBeInTheDocument());
     await screen.findByLabelText("Pending jobs");
+    await waitFor(() => expect(sources.some((source) => source.url === "/api/saves/save-1/events")).toBe(true));
+
+    act(() => {
+      sources.find((source) => source.url === "/api/saves/save-1/events")?.dispatchNativeError();
+    });
 
     await waitFor(() => expect(screen.getByText("The bell answers.")).toBeInTheDocument(), { timeout: 2500 });
+  });
+
+  it("ignores a late save fallback runtime response after SSE recovers", async () => {
+    const sources = installEventSourceDouble();
+    const initialModel = runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "m1", role: "narrator", speaker_name: null, body: "The beacon waits.", actions: [] }
+        ]
+      }
+    });
+    const updatedModel = runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "m1", role: "narrator", speaker_name: null, body: "The beacon waits.", actions: [] },
+          { message_id: "m2", role: "narrator", speaker_name: null, body: "The stale bell answers.", actions: [] }
+        ]
+      }
+    });
+    const fallbackRuntime = deferred<{ ok: boolean; json: () => Promise<RuntimeModel> }>();
+    let deferRuntime = false;
+    let fallbackSignal: AbortSignal | undefined;
+    let runtimeCalls = 0;
+    const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path.startsWith("/api/runtime")) {
+        runtimeCalls += 1;
+        if (deferRuntime) {
+          fallbackSignal = init?.signal ?? undefined;
+          return fallbackRuntime.promise;
+        }
+        return Promise.resolve({ ok: true, json: async () => initialModel });
+      }
+      if (path === "/api/scenarios") {
+        return Promise.resolve({ ok: true, json: async () => ({ scenarios: [] }) });
+      }
+      if (path.startsWith("/api/jobs?status=active")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            jobs: [
+              { id: "job-1", type: "chat_turn", save_id: "save-1", status: "running", result: null, error: null, created_at: 1 }
+            ]
+          })
+        });
+      }
+      if (path.startsWith("/api/chat/submission-status")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            save_id: "save-1",
+            can_submit: false,
+            reason: "chat_turn_active",
+            blocking_job_id: "job-1",
+            blocking_job_status: "running"
+          })
+        });
+      }
+      if (path === "/api/settings/shell") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ pending_jobs_display_mode: modelSettingsPayload().pending_jobs_display_mode })
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await screen.findByText("The beacon waits.");
+    await screen.findByLabelText("Pending jobs");
+    await waitFor(() => expect(sources.some((source) => source.url === "/api/saves/save-1/events")).toBe(true));
+    deferRuntime = true;
+    act(() => {
+      sources.find((source) => source.url === "/api/saves/save-1/events")?.dispatchNativeError();
+    });
+    await waitFor(() => expect(runtimeCalls).toBeGreaterThan(1));
+
+    act(() => {
+      sources.find((source) => source.url === "/api/saves/save-1/events")?.dispatchOpen();
+    });
+    expect(fallbackSignal?.aborted).toBe(true);
+    await act(async () => {
+      fallbackRuntime.resolve({ ok: true, json: async () => updatedModel });
+      await fallbackRuntime.promise;
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("The stale bell answers.")).not.toBeInTheDocument();
+    expect(screen.getByText("The beacon waits.")).toBeInTheDocument();
   });
 
   it("uses a mobile app shell without desktop resize handles", async () => {
@@ -11574,7 +12251,7 @@ describe("frontend helpers", () => {
     expect(shell.style.getPropertyValue("--right-panel-width")).toBe("370px");
   });
 
-  it("cancels chat jobs through the job and runtime cancel endpoints", async () => {
+  it("cancels tracked chat jobs through one job cancellation request", async () => {
     installEventSourceDouble();
     const fetchMock = workbenchFetch([
       { id: "job-1", type: "chat_turn", save_id: "save-1", status: "running", result: null, error: null, created_at: 1 }
@@ -11592,9 +12269,42 @@ describe("frontend helpers", () => {
     await userEvent.click(cancelButtons[cancelButtons.length - 1]);
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/jobs/job-1/cancel?save_id=save-1", expect.objectContaining({ method: "POST" })));
-    const chatCancel = fetchMock.mock.calls.find(([path]) => path === "/api/chat/cancel");
-    expect(chatCancel).toBeTruthy();
-    expect(JSON.parse(String(chatCancel?.[1].body))).toEqual({ save_id: "save-1" });
+    const cancellationCalls = fetchMock.mock.calls.filter(([path]) => String(path).includes("/cancel"));
+    expect(cancellationCalls).toHaveLength(1);
+    expect(fetchMock.mock.calls.some(([path]) => path === "/api/chat/cancel")).toBe(false);
+  });
+
+  it("surfaces a tracked job cancellation failure", async () => {
+    installEventSourceDouble();
+    const activeJobs = [
+      { id: "job-1", type: "chat_turn", save_id: "save-1", status: "running", result: null, error: null, created_at: 1 } satisfies Job
+    ];
+    const baseFetch = workbenchFetch(activeJobs);
+    const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/api/jobs/job-1/cancel?save_id=save-1") {
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          statusText: "Conflict",
+          json: async () => ({ detail: "Job cancellation could not be requested" })
+        });
+      }
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    const cancelButtons = await screen.findAllByRole("button", { name: "Cancel Chat turn" });
+    await userEvent.click(cancelButtons[cancelButtons.length - 1]);
+
+    expect(await screen.findByText("Job cancellation could not be requested")).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([path]) => path === "/api/chat/cancel")).toBe(false);
   });
 
   it("cancels non-chat jobs without runtime chat cancellation", async () => {
@@ -11744,7 +12454,84 @@ describe("frontend helpers", () => {
     expect(within(tray).getByText("Character cleanup")).toBeInTheDocument();
   });
 
-  it("renders narrator draft job events as a transient chronicle message", async () => {
+  it("does not let stale active-job hydration restore catch-up after live narration progress", async () => {
+    const sources = installEventSourceDouble();
+    const catchupProgress = {
+      kind: "post_turn_catchup" as const,
+      status: "waiting" as const,
+      status_text: "Waiting for prior turn continuity",
+      continuity_degraded: false,
+      retry_pending: false,
+      job_ids: ["prior-job"],
+      jobs: [{ name: "post_turn_catchup", status: "waiting", category: "continuity" }]
+    };
+    const activeJobs: Job[] = [{
+      id: "job-1",
+      type: "chat_turn",
+      save_id: "save-1",
+      status: "running",
+      result: null,
+      error: null,
+      latest_progress: catchupProgress
+    } satisfies Job];
+    const baseFetch = workbenchFetch(activeJobs, runtimeModel());
+    const staleActiveResponse = deferred<{
+      ok: boolean;
+      json: () => Promise<{ jobs: Job[] }>;
+    }>();
+    let activeJobRequests = 0;
+    const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path.startsWith("/api/jobs?status=active")) {
+        activeJobRequests += 1;
+        if (activeJobRequests === 2) return staleActiveResponse.promise;
+      }
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByText("Waiting for prior turn continuity")).toBeInTheDocument();
+    const jobSource = sources.find((source) => source.url.startsWith("/api/jobs/job-1/events"));
+    const saveSource = sources.find((source) => source.url === "/api/saves/save-1/events");
+    expect(jobSource).toBeDefined();
+    expect(saveSource).toBeDefined();
+
+    act(() => {
+      saveSource?.dispatch("job_changed", {
+        event_id: 1,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: { job: activeJobs[0] }
+      });
+    });
+    await waitFor(() => expect(activeJobRequests).toBe(2));
+
+    act(() => {
+      jobSource?.dispatch("progress", { label: "Selecting context" });
+    });
+    expect(await screen.findByText("Selecting context")).toBeInTheDocument();
+
+    await act(async () => {
+      staleActiveResponse.resolve({
+        ok: true,
+        json: async () => ({ jobs: [{ ...activeJobs[0], updated_at: 2 }] })
+      });
+      await staleActiveResponse.promise;
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Selecting context")).toBeInTheDocument();
+      expect(screen.queryByText("Waiting for prior turn continuity")).not.toBeInTheDocument();
+    });
+  });
+
+  it("does not render narrator output before the final job result", async () => {
     const sources = installEventSourceDouble();
     const activeJobs = [{ id: "job-1", type: "chat_turn", status: "running", result: null, error: null, created_at: 1 } satisfies Job];
     const model = runtimeModel();
@@ -11759,32 +12546,14 @@ describe("frontend helpers", () => {
 
     expect((await screen.findAllByText("Active jobs")).length).toBeGreaterThan(0);
     const jobSources = () => sources.filter((source) => source.url.startsWith("/api/jobs/"));
-    const dispatchDraft = (body: string) => {
+
+    act(() => {
       for (const source of jobSources()) {
-        source.dispatch("narrator_draft", {
-          message: {
-            message_id: "pending-narrator-message",
-            role: "narrator",
-            speaker_name: "Narrator",
-            body,
-            markdown_blocks: [{ kind: "paragraph", spans: [{ kind: "text", text: body }] }],
-            actions: []
-          }
-        });
+        source.dispatch("progress", { label: "Checking response" });
       }
-    };
-
-    act(() => {
-      dispatchDraft("The bell");
     });
 
-    expect(await screen.findByText("The bell")).toBeInTheDocument();
-
-    act(() => {
-      dispatchDraft("The bell answers.");
-    });
-
-    expect(await screen.findByText("The bell answers.")).toBeInTheDocument();
+    expect(screen.queryByText("The bell answers.")).not.toBeInTheDocument();
 
     act(() => {
       activeJobs.splice(0);
@@ -14850,6 +15619,7 @@ describe("frontend helpers", () => {
     const chatCall = fetchMock.mock.calls.find(([path]) => path === "/api/chat");
     expect(JSON.parse(String(chatCall?.[1].body))).toMatchObject({
       body: "Light the beacon",
+      client_turn_id: expect.any(String),
       save_id: "save-1",
       speaker_name: null
     });
@@ -14894,7 +15664,11 @@ describe("frontend helpers", () => {
 
   it("shows opening action choice generation before choices are ready", async () => {
     const { CyoaActionPicker } = await import("./main");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }));
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "chat-job", type: "chat_turn", status: "queued" })
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
     render(
       <QueryClientProvider client={new QueryClient()}>
@@ -14919,8 +15693,19 @@ describe("frontend helpers", () => {
       </QueryClientProvider>
     );
 
-    expect(screen.getByRole("button", { name: "Generating choices..." })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Generating choices...");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: "Write your own" }));
+    await userEvent.type(screen.getByRole("textbox", { name: "Custom action" }), "Take another path");
+    await userEvent.click(screen.getByTitle("Send"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+      "/api/chat",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringContaining('"client_turn_id"')
+      })
+    ));
   });
 
   it("keeps empty opening choices retryable after generation fails", async () => {
@@ -15097,7 +15882,8 @@ describe("frontend helpers", () => {
         } : current
       );
     });
-    expect(screen.getByRole("button", { name: "Generating choices..." })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Generating choices...");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
     act(() => {
       jobSource.dispatch("done", {
         ...generationJob,
@@ -15151,10 +15937,21 @@ describe("frontend helpers", () => {
       result: null,
       error: null
     };
-    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
-      ok: true,
-      json: async () => path === "/api/action-choices/regenerate" ? job : {}
-    }));
+    let resolveRegeneration!: (response: {
+      ok: boolean;
+      json: () => Promise<typeof job>;
+    }) => void;
+    const regenerationResponse = new Promise<{
+      ok: boolean;
+      json: () => Promise<typeof job>;
+    }>((resolve) => {
+      resolveRegeneration = resolve;
+    });
+    const fetchMock = vi.fn().mockImplementation((path: string) => (
+      path === "/api/action-choices/regenerate"
+        ? regenerationResponse
+        : Promise.resolve({ ok: true, json: async () => ({}) })
+    ));
     const runJob = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
@@ -15183,7 +15980,147 @@ describe("frontend helpers", () => {
         })
       })
     ));
-    expect(runJob).toHaveBeenCalledWith(job);
+    expect(screen.getByRole("status")).toHaveTextContent("Generating choices...");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Open the brass door" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+    expect(runJob).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveRegeneration({ ok: true, json: async () => job });
+      await regenerationResponse;
+    });
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(job));
+  });
+
+  it("guards generated choices while a tracked regeneration job remains active", async () => {
+    const sources = installEventSourceDouble();
+    const regenerationJob = {
+      id: "job-choice-regeneration",
+      type: "action_choice_regenerate",
+      save_id: "save-1",
+      status: "running",
+      result: null,
+      error: null
+    } satisfies Job;
+    const model = runtimeModel({
+      action_choices_enabled: true,
+      action_choices: cyoaActionChoices()
+    });
+    vi.stubGlobal("fetch", workbenchFetch([regenerationJob], model));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Generating choices..."
+    );
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Open the brass door" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+    const jobSource = sources.find(
+      (source) => source.url === "/api/jobs/job-choice-regeneration/events?save_id=save-1"
+    );
+    if (!jobSource) throw new Error("regeneration job watcher was not created");
+    act(() => {
+      jobSource.dispatch("done", {
+        ...regenerationJob,
+        status: "failed",
+        error: "Action choices could not be regenerated."
+      });
+    });
+    expect(
+      await screen.findByText("Action choices could not be regenerated.")
+    ).toBeInTheDocument();
+  });
+
+  it("guards generated choices while active action choice jobs are being recovered", async () => {
+    const model = runtimeModel({
+      action_choices_enabled: true,
+      action_choices: cyoaActionChoices()
+    });
+    let resolveActiveJobs!: (response: {
+      ok: boolean;
+      json: () => Promise<{ jobs: Job[] }>;
+    }) => void;
+    const activeJobsResponse = new Promise<{
+      ok: boolean;
+      json: () => Promise<{ jobs: Job[] }>;
+    }>((resolve) => {
+      resolveActiveJobs = resolve;
+    });
+    const fallbackFetch = workbenchFetch([], model);
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string, init?: RequestInit) => (
+      path.startsWith("/api/jobs?status=active")
+        ? activeJobsResponse
+        : fallbackFetch(path, init)
+    )));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Generating choices...");
+    expect(screen.getByRole("button", { name: "Write your own" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Open the brass door" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeDisabled();
+
+    await act(async () => {
+      resolveActiveJobs({ ok: true, json: async () => ({ jobs: [] }) });
+      await activeJobsResponse;
+    });
+
+    await waitFor(() => expect(
+      screen.getByRole("button", { name: "Open the brass door" })
+    ).toBeEnabled());
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeEnabled();
+  });
+
+  it("clears an embedded opening generation marker when its job is cancelled", async () => {
+    const sources = installEventSourceDouble();
+    const generationJob = {
+      id: "job-opening-choices-cancelled",
+      type: "action_choice_generate",
+      save_id: "save-1",
+      status: "running",
+      result: null,
+      error: null
+    } satisfies Job;
+    const model = runtimeModel({
+      action_choices_enabled: true,
+      action_choices: cyoaActionChoices({ generation_job: generationJob })
+    });
+    vi.stubGlobal("fetch", workbenchFetch([], model));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Generating choices...");
+    const jobSource = await waitFor(() => {
+      const source = sources.find(
+        (candidate) => candidate.url === "/api/jobs/job-opening-choices-cancelled/events?save_id=save-1"
+      );
+      if (!source) throw new Error("opening action choice watcher was not created");
+      return source;
+    });
+    act(() => {
+      jobSource.dispatch("done", { ...generationJob, status: "cancelled" });
+    });
+
+    await waitFor(() => expect(screen.queryByRole("status")).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Open the brass door" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Regenerate options" })).toBeEnabled();
   });
 
   it("submits a selected CYOA action as a normal chat message", async () => {
@@ -15631,6 +16568,13 @@ describe("frontend helpers", () => {
 
     fireEvent.submit(form);
     await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+
+    const chatBodies = fetchMock.mock.calls
+      .filter(([path]) => path === "/api/chat")
+      .map(([, init]) => JSON.parse(String(init?.body)) as Record<string, string>);
+    expect(chatBodies).toHaveLength(2);
+    expect(chatBodies[0].client_turn_id).toBeTruthy();
+    expect(chatBodies[1].client_turn_id).toBe(chatBodies[0].client_turn_id);
 
     resolveSecondChat({
       ok: true,

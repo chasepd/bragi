@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
+from bragi.epistemics import format_epistemic_fact
 from bragi.persistence.models import (
     ActiveThreadRecord,
     CharacterKnowledgeEdgeRecord,
@@ -21,11 +22,13 @@ from bragi.persistence.models import (
     MessageVisibilityRecord,
     SaveDetailsRecord,
     ScenarioRecord,
+    SceneFactRecord,
     SceneSnapshotRecord,
     SummaryRecord,
     WorldStateRecord,
 )
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.scene_facts import MAX_SCENE_FACT_CONTEXT
 from bragi.services.action_choice_flags import scenario_action_choices_enabled
 from bragi.services.active_thread_lifecycle import (
     active_thread_is_prompt_visible,
@@ -39,10 +42,15 @@ from bragi.services.dating_route_policy import (
 from bragi.services.knowledge_boundary import (
     character_scope_for_turn,
     knowledge_edge_has_character_text_source,
+    message_visible_to_character,
     message_visible_to_present_characters,
 )
 from bragi.services.mention_matching import character_name_is_mentioned
 from bragi.services.open_threads import is_open_threads_aggregate_key
+from bragi.services.scenario_canon import (
+    scenario_canon_claims,
+    scenario_canon_is_current,
+)
 from bragi.services.summary_safety import validate_summary_output
 from bragi.world_time_model import format_world_time_from_snapshot
 
@@ -76,10 +84,12 @@ SCENARIO_CORE_CONTENT_KEYS = frozenset(
         "player_role",
         "tone_genre",
         "starting_scene",
+        "opening_message",
         "current_scene",
         "relationship_seed",
-        "case_facts",
-        "case_status",
+        "character_starters",
+        "action_choices_enabled",
+        "choice_style",
     )
 )
 _MISSING = object()
@@ -208,6 +218,7 @@ class ContextAssemblyService:
                     reason="selected scenario section",
                 )
                 for index, section in enumerate(selected_scenario_sections)
+                if _image_safe_scenario_section(section)
             ),
             *deterministic_context_sources(
                 repositories=self.repositories,
@@ -253,6 +264,11 @@ class ContextAssemblyService:
             "\n".join(source.text for source in selected_sources if source.text),
             breakdown,
         )
+
+
+def _image_safe_scenario_section(value: str) -> bool:
+    lowered = value.casefold()
+    return "| narrator_only]" not in lowered and "| restricted]" not in lowered
 
 
 def context_budget_settings(
@@ -454,97 +470,12 @@ def compact_scenario_instructions(
     *,
     include_setup: bool = True,
 ) -> str:
-    dating_sim_identity_parts = _dating_sim_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    fantasy_identity_parts = _fantasy_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    science_fiction_identity_parts = _science_fiction_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    first_contact_identity_parts = _first_contact_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    survival_expedition_identity_parts = _survival_expedition_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    time_loop_identity_parts = _time_loop_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    mystery_identity_parts = _investigation_mystery_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    heist_identity_parts = _heist_infiltration_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    intrigue_identity_parts = _political_intrigue_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    settlement_identity_parts = _settlement_builder_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    hunt_identity_parts = _monster_hunt_bounty_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    journey_identity_parts = _road_trip_pilgrimage_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    trade_identity_parts = _merchant_trade_route_identity_lines(
-        scenario,
-        include_setup=include_setup,
-    )
-    cyoa_identity_parts = _choose_your_own_adventure_identity_lines(scenario)
-    full_setup_parts = (
-        f"Premise/setup: {scenario.premise}",
+    scenario_contract_parts = (
+        f"Premise: {scenario.premise}",
         _player_character_name_line(scenario),
-        *fantasy_identity_parts,
-        *science_fiction_identity_parts,
-        *first_contact_identity_parts,
-        *survival_expedition_identity_parts,
-        *time_loop_identity_parts,
-        *mystery_identity_parts,
-        *heist_identity_parts,
-        *intrigue_identity_parts,
-        *settlement_identity_parts,
-        *hunt_identity_parts,
-        *journey_identity_parts,
-        *trade_identity_parts,
-        *dating_sim_identity_parts,
-        *cyoa_identity_parts,
         _scenario_content_line(scenario, "tone_genre", "Tone/style"),
         _scenario_content_line(scenario, "current_scene", "Current scene"),
         f"Player role: {scenario.player_role}",
-    )
-    lean_identity_parts = (
-        _player_character_name_line(scenario),
-        _scenario_content_line(scenario, "current_scene", "Current scene"),
-        *fantasy_identity_parts,
-        *science_fiction_identity_parts,
-        *first_contact_identity_parts,
-        *survival_expedition_identity_parts,
-        *time_loop_identity_parts,
-        *mystery_identity_parts,
-        *heist_identity_parts,
-        *intrigue_identity_parts,
-        *settlement_identity_parts,
-        *hunt_identity_parts,
-        *journey_identity_parts,
-        *trade_identity_parts,
-        *dating_sim_identity_parts,
-        *cyoa_identity_parts,
     )
     header = (
         (
@@ -554,10 +485,10 @@ def compact_scenario_instructions(
         )
         if include_setup
         else (
-            "Scenario header. Treat this as durable identity only; initial "
-            "setup is omitted because the opening is no longer in the recent "
-            "chronicle window. Current scene context, selected retrieval, and "
-            "chronicle messages are authoritative when they diverge."
+            "Scenario header. Treat this as the durable creative contract; "
+            "initial setup details are omitted because the opening is no longer "
+            "in the recent chronicle window. Current scene context, selected "
+            "retrieval, and chronicle messages are authoritative when they diverge."
         )
     )
     return "\n".join(
@@ -604,7 +535,7 @@ def compact_scenario_instructions(
                 else ""
             ),
             f"Title: {scenario.title}",
-            *(full_setup_parts if include_setup else lean_identity_parts),
+            *scenario_contract_parts,
         )
         if part
     )
@@ -1149,6 +1080,60 @@ def scenario_section_candidates(
     return tuple(candidates)
 
 
+def scenario_claim_candidates(
+    scenario: ScenarioRecord | None,
+) -> tuple[tuple[str, str, str, dict[str, object]], ...]:
+    """Return compiled atomic claims with deterministic prompt boundaries."""
+
+    if scenario is None:
+        return ()
+    try:
+        loaded = json.loads(scenario.content_json)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(loaded, dict):
+        return ()
+    if not scenario_canon_is_current(loaded):
+        return ()
+    candidates: list[tuple[str, str, str, dict[str, object]]] = []
+    for claim in scenario_canon_claims(loaded):
+        if not claim.claim_key or not claim.claim:
+            continue
+        text = (
+            f"[{claim.authority} | {claim.temporal_status} | "
+            f"{claim.reveal_policy}] {claim.claim}"
+        )
+        if claim.reveal_policy == "narrator_only":
+            text += " [Narrator-only: do not reveal without accepted reveal evidence.]"
+        elif claim.reveal_policy == "restricted":
+            text += " [Restricted knowledge: preserve the stated audience boundary.]"
+        if claim.temporal_status == "current_at_scenario_start":
+            text += " [Scenario-start state; newer accepted state supersedes it.]"
+        candidates.append(
+            (
+                f"scenario:{scenario.id}:claim:{claim.claim_key}",
+                claim.source_section,
+                text,
+                {
+                    "scenario_id": scenario.id,
+                    "claim_key": claim.claim_key,
+                    "source_section": claim.source_section,
+                    "source_sha256": claim.source_sha256,
+                    "evidence_quote": claim.evidence_quote,
+                    "entity_anchors": list(claim.entity_anchors),
+                    "fact_type": claim.fact_type,
+                    "fact_key": claim.fact_key,
+                    "authority": claim.authority,
+                    "temporal_status": claim.temporal_status,
+                    "reveal_policy": claim.reveal_policy,
+                    "known_by": list(claim.known_by),
+                    "importance": claim.importance,
+                },
+            )
+        )
+    return tuple(candidates)
+
+
 def deterministic_context_sources(
     *,
     repositories: PersistenceRepositories,
@@ -1307,6 +1292,18 @@ def deterministic_context_sources(
         sources.extend(
             _scene_snapshot_sources(snapshot, location_map, character_map, mode)
         )
+        if mode == "narrator":
+            sources.extend(
+                _scene_fact_sources(
+                    repositories.list_scene_facts(
+                        save_id,
+                        scene_snapshot_id=snapshot.id,
+                        scene_generation=snapshot.scene_generation,
+                    ),
+                    locations=location_map,
+                    characters=character_map,
+                )
+            )
         sources.extend(
             _dating_route_context_sources(
                 repositories=repositories,
@@ -1646,9 +1643,15 @@ def _dedupe_context_sources(
     sources: tuple[ContextSource, ...],
 ) -> tuple[ContextSource, ...]:
     deduped: list[ContextSource] = []
-    seen: dict[tuple[str, str], int] = {}
+    seen: dict[tuple[str, str, str], int] = {}
     for source in sources:
-        key = (source.source_type, source.source_id)
+        actor_scope = ""
+        if (
+            source.tier == "active_linked_facts"
+            and source.text.startswith("Character-scoped knowledge (")
+        ):
+            actor_scope = source.text.partition(" linked ")[0]
+        key = (source.source_type, source.source_id, actor_scope)
         if key in seen:
             existing_index = seen[key]
             if source.always_include and not deduped[existing_index].always_include:
@@ -1953,7 +1956,6 @@ def _active_linked_fact_sources(
         )
         if _knowledge_edge_source_visible_to_active_characters(
             edge,
-            active_character_ids=active_character_ids,
             message_visibility=visibility_records,
         )
     )
@@ -2023,37 +2025,61 @@ def _active_linked_fact_sources(
             message_positions=message_positions,
         )
     }
-    scenario_candidates = scenario_section_candidates(scenario)
-    scenario_sections = {
-        source_id: (section_id, text)
-        for source_id, section_id, text in scenario_candidates
+    knowledge_memory_by_id = {
+        memory.id: memory
+        for memory in memory_records
+        if _record_is_at_or_before(
+            memory,
+            source_message_id=source_message_id,
+            message_positions=message_positions,
+        )
     }
-    scenario_sections_by_key = {
-        section_id: (source_id, text)
-        for source_id, section_id, text in scenario_candidates
+    knowledge_state_by_id = {
+        state.id: state
+        for state in world_state_records
+        if not (
+            active_thread_records_exist and is_open_threads_aggregate_key(state.key)
+        )
+        if _record_is_at_or_before(
+            state,
+            source_message_id=source_message_id,
+            message_positions=message_positions,
+        )
+    }
+    knowledge_summary_by_id = {
+        summary.id: summary
+        for summary in summary_records
+        if validate_summary_output(summary.body).accepted
+        if _summary_is_at_or_before(
+            summary,
+            source_message_id=source_message_id,
+            message_positions=message_positions,
+        )
     }
     character_names = {
         character.id: character.name
         for character in character_records
     }
     sources: list[ContextSource] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     knowledge_edge_targets: set[tuple[str, str, str]] = set()
     for edge in knowledge_edges:
         target_type = _normalized_link_type(edge.target_type)
         knowledge_edge_targets.add((edge.character_id, target_type, edge.target_id))
         source = _knowledge_edge_source(
             edge=edge,
-            memory_by_id=memory_by_id,
-            state_by_id=state_by_id,
-            summary_by_id=summary_by_id,
-            scenario_sections=scenario_sections,
-            scenario_sections_by_key=scenario_sections_by_key,
+            memory_by_id=knowledge_memory_by_id,
+            state_by_id=knowledge_state_by_id,
+            summary_by_id=knowledge_summary_by_id,
             character_names=character_names,
         )
         if source is None:
             continue
-        key = (source.source_type, source.source_id)
+        key = (
+            source.source_type,
+            source.source_id,
+            f"knowledge:{edge.character_id}:{edge.knowledge_state}",
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -2079,13 +2105,11 @@ def _active_linked_fact_sources(
             memory_by_id=memory_by_id,
             state_by_id=state_by_id,
             summary_by_id=summary_by_id,
-            scenario_sections=scenario_sections,
-            scenario_sections_by_key=scenario_sections_by_key,
             character_names=character_names,
         )
         if source is None:
             continue
-        key = (source.source_type, source.source_id)
+        key = (source.source_type, source.source_id, "entity_link")
         if key in seen:
             continue
         seen.add(key)
@@ -2118,8 +2142,6 @@ def _linked_fact_source(
     memory_by_id: dict[str, MemoryRecord],
     state_by_id: dict[str, WorldStateRecord],
     summary_by_id: dict[str, SummaryRecord],
-    scenario_sections: dict[str, tuple[str, str]],
-    scenario_sections_by_key: dict[str, tuple[str, str]],
     character_names: dict[str, str],
 ) -> ContextSource | None:
     target_type = _normalized_link_type(link.target_type)
@@ -2132,7 +2154,7 @@ def _linked_fact_source(
             tier="active_linked_facts",
             source_type="memory",
             source_id=memory.id,
-            text=f"{prefix}memory: {memory.body}",
+            text=f"{prefix}memory: {_epistemic_memory_text(memory)}",
             reason=_link_reason(link),
         )
     if target_type == "world_state":
@@ -2160,25 +2182,16 @@ def _linked_fact_source(
             text=f"{prefix}summary: {summary.body}",
             reason=_link_reason(link),
         )
-    if target_type == "scenario_section":
-        section = scenario_sections.get(link.target_id)
-        source_id = link.target_id
-        if section is None:
-            by_key = scenario_sections_by_key.get(link.target_id)
-            if by_key is None:
-                return None
-            source_id, text = by_key
-            section_id = link.target_id
-        else:
-            section_id, text = section
-        return ContextSource(
-            tier="active_linked_facts",
-            source_type="scenario_section",
-            source_id=source_id,
-            text=f"{prefix}scenario section ({section_id}): {text}",
-            reason=_link_reason(link),
-        )
     return None
+
+
+def _epistemic_memory_text(memory: MemoryRecord) -> str:
+    return format_epistemic_fact(
+        memory.body,
+        status=memory.epistemic_status,
+        actor_id=memory.epistemic_actor_id,
+        actor_name=memory.epistemic_actor_name,
+    )
 
 
 def _knowledge_edge_source(
@@ -2187,8 +2200,6 @@ def _knowledge_edge_source(
     memory_by_id: dict[str, MemoryRecord],
     state_by_id: dict[str, WorldStateRecord],
     summary_by_id: dict[str, SummaryRecord],
-    scenario_sections: dict[str, tuple[str, str]],
-    scenario_sections_by_key: dict[str, tuple[str, str]],
     character_names: dict[str, str],
 ) -> ContextSource | None:
     if not _knowledge_edge_allows_prompt_use(edge):
@@ -2204,7 +2215,7 @@ def _knowledge_edge_source(
             tier="active_linked_facts",
             source_type="memory",
             source_id=memory.id,
-            text=f"{prefix}memory: {memory.body}",
+            text=f"{prefix}memory: {_epistemic_memory_text(memory)}",
             reason=reason,
         )
     if target_type == "world_state":
@@ -2230,24 +2241,6 @@ def _knowledge_edge_source(
             source_type="summary",
             source_id=summary.id,
             text=f"{prefix}summary: {summary.body}",
-            reason=reason,
-        )
-    if target_type == "scenario_section":
-        section = scenario_sections.get(edge.target_id)
-        source_id = edge.target_id
-        if section is None:
-            by_key = scenario_sections_by_key.get(edge.target_id)
-            if by_key is None:
-                return None
-            source_id, text = by_key
-            section_id = edge.target_id
-        else:
-            section_id, text = section
-        return ContextSource(
-            tier="active_linked_facts",
-            source_type="scenario_section",
-            source_id=source_id,
-            text=f"{prefix}scenario section ({section_id}): {text}",
             reason=reason,
         )
     return None
@@ -2304,16 +2297,18 @@ def _normalized_link_type(value: str) -> str:
 def _knowledge_edge_source_visible_to_active_characters(
     edge: CharacterKnowledgeEdgeRecord,
     *,
-    active_character_ids: set[str],
     message_visibility: tuple[MessageVisibilityRecord, ...],
 ) -> bool:
-    return _source_message_ids_visible_to_active_characters(
-        (
+    return all(
+        message_visible_to_character(
+            message_id=source_id,
+            character_id=edge.character_id,
+            message_visibility=list(message_visibility),
+        )
+        for source_id in (
             *edge.source_message_ids,
             *([edge.source_message_id] if edge.source_message_id else []),
-        ),
-        active_character_ids=active_character_ids,
-        message_visibility=message_visibility,
+        )
     )
 
 
@@ -2448,6 +2443,91 @@ def _scene_snapshot_sources(
             )
         )
     return tuple(sources)
+
+
+_SCENE_FACT_CONTEXT_PRIORITY = {
+    "pending_reaction": 0,
+    "ongoing_action": 1,
+    "physical_constraint": 2,
+    "line_of_sight": 3,
+    "actor_position": 4,
+    "actor_pose": 5,
+    "object_possession": 6,
+    "object_location": 6,
+    "environment_state": 7,
+}
+
+
+def _scene_fact_sources(
+    facts: list[SceneFactRecord],
+    *,
+    locations: dict[str, LocationRecord],
+    characters: dict[str, CharacterRecord],
+) -> tuple[ContextSource, ...]:
+    ordered = sorted(
+        facts,
+        key=lambda fact: (
+            _SCENE_FACT_CONTEXT_PRIORITY.get(fact.fact_type, 99),
+            _scene_fact_reference_text(
+                fact.subject_type,
+                fact.subject_id,
+                fact.subject_label,
+                locations=locations,
+                characters=characters,
+            ).casefold(),
+            fact.conflict_key,
+            fact.id,
+        ),
+    )[:MAX_SCENE_FACT_CONTEXT]
+    if not ordered:
+        return ()
+    lines = ["Volatile current-scene facts (not durable lore):"]
+    for fact in ordered:
+        subject = _scene_fact_reference_text(
+            fact.subject_type,
+            fact.subject_id,
+            fact.subject_label,
+            locations=locations,
+            characters=characters,
+        )
+        target = _scene_fact_reference_text(
+            fact.target_type,
+            fact.target_id,
+            fact.target_label,
+            locations=locations,
+            characters=characters,
+        )
+        aspect = f" [{fact.aspect}]" if fact.aspect else ""
+        target_text = f" -> {target}" if target else ""
+        lines.append(
+            f"- {fact.fact_type.replace('_', ' ')}: "
+            f"{subject}{target_text}{aspect}: {fact.value}"
+        )
+    return (
+        ContextSource(
+            tier="current_scene",
+            source_type="scene_fact",
+            source_id=",".join(fact.id for fact in ordered),
+            text="\n".join(lines),
+            reason="typed volatile scene facts",
+            always_include=True,
+        ),
+    )
+
+
+def _scene_fact_reference_text(
+    reference_type: str,
+    reference_id: str | None,
+    label: str,
+    *,
+    locations: dict[str, LocationRecord],
+    characters: dict[str, CharacterRecord],
+) -> str:
+    if reference_type == "character" and reference_id in characters:
+        return characters[reference_id].name
+    if reference_type == "location" and reference_id in locations:
+        return locations[reference_id].name
+    return label
 
 
 def _dating_route_context_sources(

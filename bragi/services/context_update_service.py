@@ -24,6 +24,7 @@ from bragi.persistence.models import (
     LocationRecord,
     MemoryRecord,
     MessageRecord,
+    SceneFactRecord,
     SceneSnapshotRecord,
     StateChangeRecord,
     SummaryRecord,
@@ -49,6 +50,14 @@ from bragi.providers.errors import (
 from bragi.providers.structured_schema import normalize_strict_json_schema
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
+from bragi.scene_facts import (
+    MAX_SCENE_FACT_MUTATIONS_PER_TURN,
+    SCENE_FACT_SUBJECT_TYPES,
+    SCENE_FACT_TARGET_TYPES,
+    SCENE_FACT_TYPES,
+    scene_fact_conflict_key,
+    validate_scene_fact_shape,
+)
 from bragi.services.active_thread_lifecycle import (
     ACTIVE_THREAD_STATUSES,
     ACTIVE_THREAD_VISIBILITIES,
@@ -88,7 +97,14 @@ from bragi.services.phone_number_exchange import (
 from bragi.services.phone_number_exchange import (
     infer_phone_number_exchanges as infer_phone_number_exchange_records,
 )
-from bragi.services.post_turn_inference import VerifiedPostTurnCoverage
+from bragi.services.post_turn_inference import (
+    POST_TURN_DOMAIN_EMOTIONAL,
+    POST_TURN_DOMAIN_KNOWLEDGE,
+    POST_TURN_DOMAIN_PHYSICAL,
+    POST_TURN_DOMAIN_RELATIONSHIP,
+    POST_TURN_DOMAIN_THREAD_CLOCK,
+    VerifiedPostTurnCoverage,
+)
 from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.provider_fallbacks import (
     provider_error_with_fallback_attempted,
@@ -241,6 +257,32 @@ class ExtractedSceneSnapshot:
 
 
 @dataclass(frozen=True)
+class ExtractedSceneFactUpsert:
+    fact_type: str
+    subject_type: str
+    subject_id: str | None
+    subject_label: str
+    value: str
+    source_message_id: str
+    evidence_quote: str
+    target_type: str = ""
+    target_id: str | None = None
+    target_label: str = ""
+    aspect: str = ""
+    reason: str = ""
+    confidence: float = 1.0
+
+
+@dataclass(frozen=True)
+class ExtractedSceneFactRetirement:
+    fact_id: str
+    source_message_id: str
+    evidence_quote: str
+    reason: str = ""
+    confidence: float = 1.0
+
+
+@dataclass(frozen=True)
 class ExtractedLocation:
     name: str
     source_message_id: str
@@ -332,6 +374,8 @@ class ContextUpdateExtraction:
     active_threads: tuple[ExtractedActiveThread, ...] = ()
     entity_links: tuple[ExtractedEntityLink, ...] = ()
     phone_number_exchanges: tuple[ExtractedPhoneNumberExchange, ...] = ()
+    scene_fact_upserts: tuple[ExtractedSceneFactUpsert, ...] = ()
+    scene_fact_retirements: tuple[ExtractedSceneFactRetirement, ...] = ()
     tool_diagnostics: dict[str, object] = field(
         default_factory=dict,
         compare=False,
@@ -396,16 +440,173 @@ def _filter_extraction_for_verified_coverage(
     coverage: VerifiedPostTurnCoverage | None,
     request: ContextUpdateRequest,
 ) -> ContextUpdateExtraction:
-    if coverage is None or coverage.empty or extraction.scene is None:
+    if coverage is None or coverage.empty:
         return extraction
-    return replace(
-        extraction,
-        scene=_filter_scene_for_verified_coverage(
+    scene = (
+        _filter_scene_for_verified_coverage(
             extraction.scene,
             coverage=coverage,
             current_snapshot=request.scene_snapshot,
             characters=request.characters,
-        ),
+        )
+        if extraction.scene is not None
+        else None
+    )
+    characters = extraction.characters
+    if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_PHYSICAL):
+        covered_physical_names = _coverage_character_names(
+            coverage,
+            "physical_state",
+            characters=request.characters,
+        )
+        if covered_physical_names:
+            characters = tuple(
+                _filter_character_physical_for_verified_coverage(character)
+                if character.name.strip().casefold() in covered_physical_names
+                else character
+                for character in characters
+            )
+    active_threads = extraction.active_threads
+    if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_THREAD_CLOCK):
+        active_threads = ()
+    entity_links = extraction.entity_links
+    if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_KNOWLEDGE):
+        entity_links = ()
+    return replace(
+        extraction,
+        scene=scene,
+        characters=characters,
+        active_threads=active_threads,
+        entity_links=entity_links,
+    )
+
+
+def _coverage_character_ids(
+    coverage: VerifiedPostTurnCoverage,
+    key_suffix: str,
+) -> frozenset[str]:
+    prefix = "character."
+    suffix = f".{key_suffix}"
+    return frozenset(
+        key[len(prefix) : -len(suffix)]
+        for key in coverage.state_keys
+        if key.startswith(prefix) and key.endswith(suffix)
+    )
+
+
+def _coverage_character_names(
+    coverage: VerifiedPostTurnCoverage,
+    key_suffix: str,
+    *,
+    characters: tuple[CharacterRecord, ...],
+) -> frozenset[str]:
+    covered_slugs = _coverage_character_ids(coverage, key_suffix)
+    if not covered_slugs:
+        return frozenset()
+    return frozenset(
+        character.name.strip().casefold()
+        for character in characters
+        if _continuity_key_slug(character.name) in covered_slugs
+        and character.name.strip()
+    )
+
+
+def _coverage_character_records(
+    coverage: VerifiedPostTurnCoverage,
+    key_suffix: str,
+    *,
+    characters: tuple[CharacterRecord, ...],
+) -> frozenset[str]:
+    covered_slugs = _coverage_character_ids(coverage, key_suffix)
+    if not covered_slugs:
+        return frozenset()
+    return frozenset(
+        character.id
+        for character in characters
+        if _continuity_key_slug(character.name) in covered_slugs
+    )
+
+
+def _filter_character_physical_for_verified_coverage(
+    character: ExtractedCharacter,
+) -> ExtractedCharacter:
+    return replace(
+        character,
+        appearance="",
+        visual_notes="",
+        current_clothing="",
+        status="",
+    )
+
+
+def _coverage_covers_domain(
+    coverage: VerifiedPostTurnCoverage,
+    domain: str,
+) -> bool:
+    # Only applied domains count as established; confirmation-queued effects
+    # are pending manual approval and legacy inference fills their domains.
+    return domain in coverage.applied_domains
+
+
+def _filter_focused_maintenance_for_verified_coverage(
+    maintenance: FocusedSceneMaintenance,
+    *,
+    coverage: VerifiedPostTurnCoverage,
+    current_snapshot: SceneSnapshotRecord | None,
+    characters: tuple[CharacterRecord, ...],
+) -> FocusedSceneMaintenance:
+    scene_updates = tuple(
+        _filter_scene_for_verified_coverage(
+            update,
+            coverage=coverage,
+            current_snapshot=current_snapshot,
+            characters=characters,
+        )
+        for update in maintenance.scene_updates
+    )
+    active_thread_updates = (
+        ()
+        if _coverage_covers_domain(coverage, POST_TURN_DOMAIN_THREAD_CLOCK)
+        else maintenance.active_thread_updates
+    )
+    covered_relationship_ids = _coverage_character_records(
+        coverage,
+        "relationships",
+        characters=characters,
+    )
+    if (
+        _coverage_covers_domain(coverage, POST_TURN_DOMAIN_RELATIONSHIP)
+        and covered_relationship_ids
+    ):
+        character_relationships = tuple(
+            relationship
+            for relationship in maintenance.character_relationships
+            if relationship.character_id not in covered_relationship_ids
+        )
+    else:
+        character_relationships = maintenance.character_relationships
+    covered_emotion_ids = _coverage_character_records(
+        coverage,
+        "current_emotional_state",
+        characters=characters,
+    )
+    if (
+        _coverage_covers_domain(coverage, POST_TURN_DOMAIN_EMOTIONAL)
+        and covered_emotion_ids
+    ):
+        character_emotions = tuple(
+            emotion
+            for emotion in maintenance.character_emotions
+            if emotion.character_id not in covered_emotion_ids
+        )
+    else:
+        character_emotions = maintenance.character_emotions
+    return replace(
+        maintenance,
+        scene_updates=scene_updates,
+        active_thread_updates=active_thread_updates,
+        character_relationships=character_relationships,
+        character_emotions=character_emotions,
     )
 
 
@@ -448,6 +649,7 @@ class ContextUpdateRequest:
     characters: tuple[CharacterRecord, ...]
     active_threads: tuple[ActiveThreadRecord, ...]
     entity_links: tuple[EntityLinkRecord, ...]
+    scene_facts: tuple[SceneFactRecord, ...] = ()
     memories: tuple[MemoryRecord, ...] = ()
     world_state: tuple[WorldStateRecord, ...] = ()
     summaries: tuple[SummaryRecord, ...] = ()
@@ -464,6 +666,7 @@ class _ContextUpdateReadSnapshot:
     characters: tuple[CharacterRecord, ...]
     active_threads: tuple[ActiveThreadRecord, ...]
     entity_links: tuple[EntityLinkRecord, ...]
+    scene_facts: tuple[SceneFactRecord, ...]
     memories: tuple[MemoryRecord, ...]
     world_state: tuple[WorldStateRecord, ...]
     summaries: tuple[SummaryRecord, ...]
@@ -594,10 +797,11 @@ def _load_context_update_read_snapshot(
 ) -> _ContextUpdateReadSnapshot:
     source_ids = set(source_message_ids)
     all_messages = tuple(repositories.list_messages(save_id))
+    scene_snapshot = repositories.get_scene_snapshot(save_id)
     return _ContextUpdateReadSnapshot(
         all_messages=all_messages,
         messages=tuple(message for message in all_messages if message.id in source_ids),
-        scene_snapshot=repositories.get_scene_snapshot(save_id),
+        scene_snapshot=scene_snapshot,
         locations=tuple(repositories.list_locations(save_id)),
         characters=tuple(repositories.list_characters(save_id)),
         active_threads=tuple(
@@ -606,6 +810,15 @@ def _load_context_update_read_snapshot(
             if active_thread_is_prompt_visible(thread)
         ),
         entity_links=tuple(repositories.list_entity_links(save_id)),
+        scene_facts=tuple(
+            repositories.list_scene_facts(
+                save_id,
+                scene_snapshot_id=(scene_snapshot.id if scene_snapshot else None),
+                scene_generation=(
+                    scene_snapshot.scene_generation if scene_snapshot else None
+                ),
+            )
+        ),
         memories=tuple(repositories.list_memories(save_id)),
         world_state=tuple(repositories.list_world_state(save_id)),
         summaries=tuple(repositories.list_summaries(save_id)),
@@ -742,7 +955,7 @@ class StructuredProviderContextUpdater:
                 provider=self.provider_name,
                 model_id=self.model_id,
                 schema_name="context_update_extraction",
-                schema=_context_update_schema(request.messages),
+                schema=_context_update_schema(request),
                 messages=_context_update_messages(request),
                 temperature=0.0,
             ),
@@ -925,7 +1138,7 @@ class ToolCallingProviderContextUpdater:
                 provider=self.provider_name,
                 model_id=self.model_id,
                 messages=_context_update_tool_messages(request),
-                tools=_context_update_tool_definitions(request.messages),
+                tools=_context_update_tool_definitions(request),
                 temperature=0.0,
             ),
             task="context_update",
@@ -1424,6 +1637,8 @@ class ToolCallingProviderContextUpdater:
         active_threads: list[ExtractedActiveThread] = []
         entity_links: list[ExtractedEntityLink] = []
         phone_number_exchanges: list[ExtractedPhoneNumberExchange] = []
+        scene_fact_upserts: list[ExtractedSceneFactUpsert] = []
+        scene_fact_retirements: list[ExtractedSceneFactRetirement] = []
         tool_schemas = {tool.name: tool.parameters for tool in request.tools}
         source_messages_by_id = {message.id: message for message in source_messages}
         last_errors: list[str] = []
@@ -1471,6 +1686,10 @@ class ToolCallingProviderContextUpdater:
                             entity_links.append(extracted)
                         elif isinstance(extracted, ExtractedPhoneNumberExchange):
                             phone_number_exchanges.append(extracted)
+                        elif isinstance(extracted, ExtractedSceneFactUpsert):
+                            scene_fact_upserts.append(extracted)
+                        elif isinstance(extracted, ExtractedSceneFactRetirement):
+                            scene_fact_retirements.append(extracted)
                         _append_tool_diagnostic_call(
                             diagnostics,
                             "accepted_calls",
@@ -1517,6 +1736,8 @@ class ToolCallingProviderContextUpdater:
                     active_threads=tuple(active_threads),
                     entity_links=tuple(entity_links),
                     phone_number_exchanges=tuple(phone_number_exchanges),
+                    scene_fact_upserts=tuple(scene_fact_upserts),
+                    scene_fact_retirements=tuple(scene_fact_retirements),
                     tool_diagnostics=_final_tool_diagnostics(diagnostics),
                 )
 
@@ -2641,9 +2862,25 @@ def _validate_context_update_tool_call(
     )
     if error is not None:
         return _invalid_tool_call(error)
+    extracted = _tool_call_extraction(call.name, arguments)
+    if isinstance(extracted, ExtractedSceneFactUpsert):
+        try:
+            validate_scene_fact_shape(
+                fact_type=extracted.fact_type,
+                subject_type=extracted.subject_type,
+                subject_id=extracted.subject_id,
+                subject_label=extracted.subject_label,
+                target_type=extracted.target_type,
+                target_id=extracted.target_id,
+                target_label=extracted.target_label,
+                aspect=extracted.aspect,
+                value=extracted.value,
+            )
+        except ValueError as exc:
+            return _invalid_tool_call(str(exc))
     return True, _accepted_tool_result(), _ValidatedContextToolCall(
         arguments=arguments,
-        extraction=_tool_call_extraction(call.name, arguments),
+        extraction=extracted,
     )
 
 
@@ -2825,6 +3062,10 @@ def _tool_call_extraction(tool_name: str, arguments: dict[str, object]) -> objec
         return _entity_link_from_data(arguments)
     if tool_name == "record_phone_number_exchange":
         return _phone_number_exchange_from_data(arguments)
+    if tool_name == "upsert_scene_fact":
+        return _scene_fact_upsert_from_data(arguments)
+    if tool_name == "retire_scene_fact":
+        return _scene_fact_retirement_from_data(arguments)
     raise ValueError(f"Unsupported context update tool: {tool_name}")
 
 
@@ -3068,6 +3309,7 @@ class ContextUpdateService:
                 characters=snapshot.characters,
                 active_threads=snapshot.active_threads,
                 entity_links=snapshot.entity_links,
+                scene_facts=snapshot.scene_facts,
                 memories=snapshot.memories,
                 world_state=snapshot.world_state,
                 summaries=snapshot.summaries,
@@ -3263,6 +3505,7 @@ class ContextUpdateService:
             characters=characters,
             active_threads=active_threads,
             entity_links=entity_links,
+            scene_facts=tuple(self.repositories.list_scene_facts(save_id)),
             memories=memories,
             world_state=world_state,
             summaries=summaries,
@@ -3309,6 +3552,10 @@ class ContextUpdateService:
             message_ids=message_ids,
         )
         self.repositories.archive_context_observations_for_deleted_messages(
+            save_id=save_id,
+            message_ids=message_ids,
+        )
+        self.repositories.remove_scene_fact_provenance_for_messages(
             save_id=save_id,
             message_ids=message_ids,
         )
@@ -3494,17 +3741,11 @@ class ContextUpdateService:
         try:
             maintenance = await self.focused_scene_maintainer.maintain(request)
             if verified_coverage is not None and not verified_coverage.empty:
-                maintenance = replace(
+                maintenance = _filter_focused_maintenance_for_verified_coverage(
                     maintenance,
-                    scene_updates=tuple(
-                        _filter_scene_for_verified_coverage(
-                            update,
-                            coverage=verified_coverage,
-                            current_snapshot=request.scene_snapshot,
-                            characters=request.characters,
-                        )
-                        for update in maintenance.scene_updates
-                    ),
+                    coverage=verified_coverage,
+                    current_snapshot=request.scene_snapshot,
+                    characters=request.characters,
                 )
             self.repositories.begin_transaction()
             applied = self.apply_focused_scene_maintenance(
@@ -3736,6 +3977,10 @@ def _drop_safety_transition_extraction_sources(
         entity_links=tuple(filter(keep, extraction.entity_links)),
         phone_number_exchanges=tuple(
             filter(keep, extraction.phone_number_exchanges)
+        ),
+        scene_fact_upserts=tuple(filter(keep, extraction.scene_fact_upserts)),
+        scene_fact_retirements=tuple(
+            filter(keep, extraction.scene_fact_retirements)
         ),
     )
 
@@ -4494,11 +4739,121 @@ class _ContextUpdateApplier:
             self.snapshot.refresh_world_state()
         if extraction.scene is not None:
             self._apply_scene(extraction.scene)
+        self._apply_scene_fact_mutations(
+            upserts=extraction.scene_fact_upserts,
+            retirements=extraction.scene_fact_retirements,
+        )
         for link in extraction.entity_links:
             self._apply_entity_link(link)
         if not self.storyteller_mode:
             for exchange in extraction.phone_number_exchanges:
                 self._apply_phone_number_exchange(exchange)
+
+    def _apply_scene_fact_mutations(
+        self,
+        *,
+        upserts: tuple[ExtractedSceneFactUpsert, ...],
+        retirements: tuple[ExtractedSceneFactRetirement, ...],
+    ) -> None:
+        for retirement in retirements:
+            retired = self.repositories.retire_scene_fact(
+                save_id=self.save_id,
+                fact_id=retirement.fact_id,
+                reason="explicit_retirement",
+            )
+            if retired is None:
+                continue
+            self._record_applied(
+                operation="retired",
+                entity_type="scene_fact",
+                entity_id=retired.id,
+                field_path=retired.conflict_key,
+                before=_scene_fact_audit_value(retired),
+                after=None,
+                reason=retirement.reason,
+                confidence=retirement.confidence,
+                source_message_ids=[retirement.source_message_id],
+            )
+
+        grouped: dict[str, list[ExtractedSceneFactUpsert]] = {}
+        conflicts: set[str] = set()
+        for upsert in upserts:
+            conflict_key = scene_fact_conflict_key(
+                fact_type=upsert.fact_type,
+                subject_type=upsert.subject_type,
+                subject_id=upsert.subject_id,
+                subject_label=upsert.subject_label,
+                target_type=upsert.target_type,
+                target_id=upsert.target_id,
+                target_label=upsert.target_label,
+                aspect=upsert.aspect,
+            )
+            existing = grouped.get(conflict_key, [])
+            if existing and any(
+                _extracted_scene_fact_audit_value(item)
+                != _extracted_scene_fact_audit_value(upsert)
+                for item in existing
+            ):
+                conflicts.add(conflict_key)
+                continue
+            existing.append(upsert)
+            grouped[conflict_key] = existing
+        for conflict_key in sorted(conflicts):
+            rejected = grouped.pop(conflict_key)[0]
+            self.audit_entries.append(
+                self.repositories.add_context_update_audit(
+                    save_id=self.save_id,
+                    operation="conflict_rejected",
+                    entity_type="scene_fact",
+                    entity_id=None,
+                    field_path=conflict_key,
+                    before=None,
+                    after=_extracted_scene_fact_audit_value(rejected),
+                    reason="Conflicting scene fact updates in one extraction batch.",
+                    confidence=rejected.confidence,
+                    source_message_ids=[rejected.source_message_id],
+                )
+            )
+        for conflict_key, fact_upserts in grouped.items():
+            for upsert in fact_upserts:
+                saved, replaced, refreshed = self.repositories.upsert_scene_fact(
+                    save_id=self.save_id,
+                    fact_type=upsert.fact_type,
+                    subject_type=upsert.subject_type,
+                    subject_id=upsert.subject_id,
+                    subject_label=upsert.subject_label,
+                    target_type=upsert.target_type,
+                    target_id=upsert.target_id,
+                    target_label=upsert.target_label,
+                    aspect=upsert.aspect,
+                    value=upsert.value,
+                    source_message_id=upsert.source_message_id,
+                    evidence_quote=upsert.evidence_quote,
+                    reason=upsert.reason,
+                    confidence=upsert.confidence,
+                )
+                operation = (
+                    "refreshed"
+                    if refreshed
+                    else "superseded"
+                    if replaced
+                    else "created"
+                )
+                self._record_applied(
+                    operation=operation,
+                    entity_type="scene_fact",
+                    entity_id=saved.id,
+                    field_path=conflict_key,
+                    before=(
+                        _scene_fact_audit_value(replaced)
+                        if replaced is not None
+                        else _scene_fact_audit_value(saved) if refreshed else None
+                    ),
+                    after=_scene_fact_audit_value(saved),
+                    reason=upsert.reason,
+                    confidence=upsert.confidence,
+                    source_message_ids=[upsert.source_message_id],
+                )
 
     def apply_world_data_enrichment(self, enrichment: WorldDataEnrichment) -> None:
         for location in enrichment.locations:
@@ -5884,6 +6239,14 @@ def context_update_extraction_from_structured_data(
             _phone_number_exchange_from_data(item)
             for item in _object_list(data.get("phone_number_exchanges"))
         ),
+        scene_fact_upserts=tuple(
+            _scene_fact_upsert_from_data(item)
+            for item in _object_list(data.get("scene_fact_upserts"))
+        ),
+        scene_fact_retirements=tuple(
+            _scene_fact_retirement_from_data(item)
+            for item in _object_list(data.get("scene_fact_retirements"))
+        ),
     )
 
 
@@ -5986,6 +6349,38 @@ def _scene_from_data(value: dict[str, object]) -> ExtractedSceneSnapshot:
             else None
         ),
         scene_transition=value.get("scene_transition") is True,
+        reason=_string(value.get("reason")),
+        confidence=_confidence(value.get("confidence")),
+    )
+
+
+def _scene_fact_upsert_from_data(
+    value: dict[str, object],
+) -> ExtractedSceneFactUpsert:
+    return ExtractedSceneFactUpsert(
+        fact_type=_string(value.get("fact_type")),
+        subject_type=_string(value.get("subject_type")),
+        subject_id=_string(value.get("subject_id")) or None,
+        subject_label=_string(value.get("subject_label")),
+        target_type=_string(value.get("target_type")),
+        target_id=_string(value.get("target_id")) or None,
+        target_label=_string(value.get("target_label")),
+        aspect=_string(value.get("aspect")),
+        value=_string(value.get("value")),
+        source_message_id=_string(value.get("source_message_id")),
+        evidence_quote=_string(value.get("evidence_quote")),
+        reason=_string(value.get("reason")),
+        confidence=_confidence(value.get("confidence")),
+    )
+
+
+def _scene_fact_retirement_from_data(
+    value: dict[str, object],
+) -> ExtractedSceneFactRetirement:
+    return ExtractedSceneFactRetirement(
+        fact_id=_string(value.get("fact_id")),
+        source_message_id=_string(value.get("source_message_id")),
+        evidence_quote=_string(value.get("evidence_quote")),
         reason=_string(value.get("reason")),
         confidence=_confidence(value.get("confidence")),
     )
@@ -6195,6 +6590,19 @@ def _filter_structured_extraction_evidence(
             for exchange in extraction.phone_number_exchanges
             if valid_evidence(exchange.source_message_id, exchange.evidence_quote)
         ),
+        scene_fact_upserts=tuple(
+            fact
+            for fact in extraction.scene_fact_upserts
+            if valid_evidence(fact.source_message_id, fact.evidence_quote)
+        ),
+        scene_fact_retirements=tuple(
+            retirement
+            for retirement in extraction.scene_fact_retirements
+            if valid_evidence(
+                retirement.source_message_id,
+                retirement.evidence_quote,
+            )
+        ),
         tool_diagnostics=extraction.tool_diagnostics,
     )
 
@@ -6303,6 +6711,37 @@ def _validate_extraction(
             exchange.evidence_quote,
             "phone number exchange",
         )
+    if (
+        len(extraction.scene_fact_upserts)
+        + len(extraction.scene_fact_retirements)
+        > MAX_SCENE_FACT_MUTATIONS_PER_TURN
+    ):
+        raise ValueError("Too many scene fact mutations in one turn")
+    for fact in extraction.scene_fact_upserts:
+        validate_scene_fact_shape(
+            fact_type=fact.fact_type,
+            subject_type=fact.subject_type,
+            subject_id=fact.subject_id,
+            subject_label=fact.subject_label,
+            target_type=fact.target_type,
+            target_id=fact.target_id,
+            target_label=fact.target_label,
+            aspect=fact.aspect,
+            value=fact.value,
+        )
+        validate_evidence(
+            fact.source_message_id,
+            fact.evidence_quote,
+            "scene fact",
+        )
+    for retirement in extraction.scene_fact_retirements:
+        if not retirement.fact_id.strip():
+            raise ValueError("Scene fact retirement fact_id is required")
+        validate_evidence(
+            retirement.source_message_id,
+            retirement.evidence_quote,
+            "scene fact retirement",
+        )
 
 
 def _validate_world_data_enrichment(
@@ -6393,6 +6832,16 @@ def _drop_unknown_extraction_sources(
             for exchange in extraction.phone_number_exchanges
             if exchange.source_message_id in allowed
         ),
+        scene_fact_upserts=tuple(
+            fact
+            for fact in extraction.scene_fact_upserts
+            if fact.source_message_id in allowed
+        ),
+        scene_fact_retirements=tuple(
+            retirement
+            for retirement in extraction.scene_fact_retirements
+            if retirement.source_message_id in allowed
+        ),
         tool_diagnostics=extraction.tool_diagnostics,
     )
 
@@ -6419,8 +6868,32 @@ def _drop_invalid_extracted_entities(
             for exchange in extraction.phone_number_exchanges
             if exchange.character_id.strip()
         ),
+        scene_fact_upserts=tuple(
+            fact
+            for fact in extraction.scene_fact_upserts
+            if _scene_fact_shape_is_valid(fact)
+        ),
+        scene_fact_retirements=extraction.scene_fact_retirements,
         tool_diagnostics=extraction.tool_diagnostics,
     )
+
+
+def _scene_fact_shape_is_valid(fact: ExtractedSceneFactUpsert) -> bool:
+    try:
+        validate_scene_fact_shape(
+            fact_type=fact.fact_type,
+            subject_type=fact.subject_type,
+            subject_id=fact.subject_id,
+            subject_label=fact.subject_label,
+            target_type=fact.target_type,
+            target_id=fact.target_id,
+            target_label=fact.target_label,
+            aspect=fact.aspect,
+            value=fact.value,
+        )
+    except ValueError:
+        return False
+    return True
 
 
 def _selector_from_extractor(
@@ -7083,7 +7556,35 @@ def _current_scene_string_array_schema(label: str) -> dict[str, object]:
     }
 
 
-def _context_update_schema(messages: tuple[MessageRecord, ...]) -> dict[str, object]:
+def _scene_fact_upsert_schema_properties() -> dict[str, object]:
+    return {
+        "fact_type": {"type": "string", "enum": sorted(SCENE_FACT_TYPES)},
+        "subject_type": {
+            "type": "string",
+            "enum": sorted(SCENE_FACT_SUBJECT_TYPES),
+        },
+        "subject_id": {"type": "string"},
+        "subject_label": {"type": "string"},
+        "target_type": {
+            "type": "string",
+            "enum": sorted(SCENE_FACT_TARGET_TYPES),
+        },
+        "target_id": {"type": "string"},
+        "target_label": {"type": "string"},
+        "aspect": {"type": "string"},
+        "value": {"type": "string"},
+    }
+
+
+def _context_update_schema(
+    request: ContextUpdateRequest | tuple[MessageRecord, ...],
+) -> dict[str, object]:
+    messages = (
+        request.messages if isinstance(request, ContextUpdateRequest) else request
+    )
+    scene_facts = (
+        request.scene_facts if isinstance(request, ContextUpdateRequest) else ()
+    )
     source_schema: dict[str, object] = {"type": "string"}
     message_ids = [message.id for message in messages]
     if message_ids:
@@ -7278,6 +7779,45 @@ def _context_update_schema(messages: tuple[MessageRecord, ...]) -> dict[str, obj
                     ],
                 },
             },
+            "scene_fact_upserts": {
+                "type": "array",
+                "maxItems": MAX_SCENE_FACT_MUTATIONS_PER_TURN,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        **base_properties,
+                        **_scene_fact_upsert_schema_properties(),
+                    },
+                    "required": [
+                        "fact_type",
+                        "subject_type",
+                        "value",
+                        "source_message_id",
+                        "evidence_quote",
+                    ],
+                },
+            },
+            "scene_fact_retirements": {
+                "type": "array",
+                "maxItems": MAX_SCENE_FACT_MUTATIONS_PER_TURN,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        **base_properties,
+                        "fact_id": {
+                            "type": "string",
+                            "enum": [fact.id for fact in scene_facts],
+                        },
+                    },
+                    "required": [
+                        "fact_id",
+                        "source_message_id",
+                        "evidence_quote",
+                    ],
+                },
+            },
         },
         "required": [
             "locations",
@@ -7285,6 +7825,8 @@ def _context_update_schema(messages: tuple[MessageRecord, ...]) -> dict[str, obj
             "active_threads",
             "entity_links",
             "phone_number_exchanges",
+            "scene_fact_upserts",
+            "scene_fact_retirements",
         ],
     })
 
@@ -7340,7 +7882,12 @@ def _context_update_messages(request: ContextUpdateRequest) -> tuple[ChatMessage
                 "and scene.hazards, emit complete current lists when the turn "
                 "clearly establishes them, emit an empty list only when the "
                 "turn clearly establishes none remain, and omit or use null "
-                "when unchanged or unclear. Treat fields listed as "
+                "when unchanged or unclear. Emit scene_fact_upserts only for "
+                "the final current physical or causal state at the end of the "
+                "completed turn. Retire a listed scene fact only when the turn "
+                "directly establishes that it stopped being true. Keep these "
+                "facts volatile; do not turn them into durable lore. Treat "
+                "fields listed as "
                 "locked(read-only) in the registry as player-locked read-only "
                 "facts."
             ),
@@ -7387,7 +7934,11 @@ def _context_update_tool_messages(
                 "presence is clear; use an empty list only when no named "
                 "characters are present. For nearby_objects and hazards, "
                 "provide complete current lists only when clear; use an empty "
-                "list only when none remain; otherwise omit or use null."
+                "list only when none remain; otherwise omit or use null. Use "
+                "upsert_scene_fact for final current positions, poses, object "
+                "placement, actions, constraints, environmental state, sight "
+                "lines, and pending reactions. Use retire_scene_fact only for "
+                "a listed current fact directly contradicted or completed."
             ),
         )
         tool_messages.append(
@@ -7401,9 +7952,9 @@ def _context_update_tool_messages(
 
 
 def _context_update_tool_definitions(
-    messages: tuple[MessageRecord, ...],
+    request: ContextUpdateRequest,
 ) -> tuple[ToolDefinition, ...]:
-    schemas = _context_update_tool_schemas(messages)
+    schemas = _context_update_tool_schemas(request)
     descriptions = {
         "update_scene_snapshot": "Propose current scene snapshot fields.",
         "upsert_location": "Propose a location create or update.",
@@ -7414,6 +7965,8 @@ def _context_update_tool_definitions(
             "Record an explicit phone number or contact-info exchange between "
             "the player and one existing NPC."
         ),
+        "upsert_scene_fact": "Create or refresh one current typed scene fact.",
+        "retire_scene_fact": "Retire one current scene fact that is no longer true.",
     }
     return tuple(
         ToolDefinition(
@@ -7426,10 +7979,10 @@ def _context_update_tool_definitions(
 
 
 def _context_update_tool_schemas(
-    messages: tuple[MessageRecord, ...],
+    request: ContextUpdateRequest,
 ) -> dict[str, dict[str, object]]:
     source_schema: dict[str, object] = {"type": "string"}
-    message_ids = [message.id for message in messages]
+    message_ids = [message.id for message in request.messages]
     if message_ids:
         source_schema["enum"] = message_ids
     base_properties: dict[str, object] = {
@@ -7584,6 +8137,29 @@ def _context_update_tool_schemas(
                         "character_has_player_number",
                         "both",
                     ],
+                },
+            },
+        ),
+        "upsert_scene_fact": _tool_schema(
+            required=[
+                "fact_type",
+                "subject_type",
+                "value",
+                "source_message_id",
+                "evidence_quote",
+            ],
+            properties={
+                **base_properties,
+                **_scene_fact_upsert_schema_properties(),
+            },
+        ),
+        "retire_scene_fact": _tool_schema(
+            required=["fact_id", "source_message_id", "evidence_quote"],
+            properties={
+                **base_properties,
+                "fact_id": {
+                    "type": "string",
+                    "enum": [fact.id for fact in request.scene_facts],
                 },
             },
         ),
@@ -7878,6 +8454,17 @@ def _registry_text(request: ContextUpdateRequest) -> str:
             f"time={world_time}; weather={snapshot.weather}; "
             f"mood={snapshot.mood}; "
             f"locked(read-only)={','.join(snapshot.locked_fields)}"
+        )
+    for fact in request.scene_facts:
+        lines.append(
+            "- scene_fact "
+            f"{fact.id}: type={fact.fact_type}; "
+            f"subject={fact.subject_type}:"
+            f"{fact.subject_id or fact.subject_label}; "
+            f"target={fact.target_type}:"
+            f"{fact.target_id or fact.target_label}; "
+            f"aspect={fact.aspect}; value={fact.value}; "
+            f"lifetime={fact.lifetime}"
         )
     locations, omitted = _limited_items(
         request.locations,
@@ -8787,6 +9374,39 @@ def _scene_audit_value(snapshot: SceneSnapshotRecord) -> dict[str, object]:
         "nearby_objects": snapshot.nearby_objects,
         "hazards": snapshot.hazards,
         "present_character_ids": snapshot.present_character_ids,
+    }
+
+
+def _scene_fact_audit_value(fact: SceneFactRecord) -> dict[str, object]:
+    return {
+        "fact_type": fact.fact_type,
+        "subject_type": fact.subject_type,
+        "subject_id": fact.subject_id,
+        "subject_label": fact.subject_label,
+        "target_type": fact.target_type,
+        "target_id": fact.target_id,
+        "target_label": fact.target_label,
+        "aspect": fact.aspect,
+        "value": fact.value,
+        "lifetime": fact.lifetime,
+        "scene_generation": fact.scene_generation,
+        "expires_after_turn_number": fact.expires_after_turn_number,
+    }
+
+
+def _extracted_scene_fact_audit_value(
+    fact: ExtractedSceneFactUpsert,
+) -> dict[str, object]:
+    return {
+        "fact_type": fact.fact_type,
+        "subject_type": fact.subject_type,
+        "subject_id": fact.subject_id,
+        "subject_label": fact.subject_label,
+        "target_type": fact.target_type,
+        "target_id": fact.target_id,
+        "target_label": fact.target_label,
+        "aspect": fact.aspect,
+        "value": fact.value,
     }
 
 

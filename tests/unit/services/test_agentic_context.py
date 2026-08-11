@@ -12,7 +12,7 @@ from bragi.persistence.migrations import migrate_database
 from bragi.persistence.models import ContextObservationRecord, SaveRecord
 from bragi.persistence.repositories import (
     PersistenceRepositories,
-    canonical_claim_fingerprint,
+    _epistemic_claim_fingerprint,
 )
 from bragi.providers.contracts import (
     ChatMessage,
@@ -38,6 +38,7 @@ from bragi.services.agentic_context import (
     NarrativeBeat,
     NarratorCommitDecision,
     NarratorMessageSpec,
+    NarratorQualityFinding,
     NpcIntent,
     ObservationService,
     PlayerAgencyConstraint,
@@ -260,6 +261,76 @@ def test_observation_extractor_returns_evidence_backed_candidates(
     assert provider.structured_output_requests[0].schema_name == (
         "context_observation_extraction"
     )
+    observation_schema = provider.structured_output_requests[0].schema["properties"][
+        "observations"
+    ]["items"]
+    assert {
+        "epistemic_status",
+        "epistemic_actor_id",
+        "epistemic_actor_name",
+    } <= set(observation_schema["required"])
+
+
+def test_observation_service_preserves_actor_distinct_matching_claims(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    messages = tuple(repositories.list_messages(save.id))
+    base = {
+        "observation_type": "character_fact",
+        "claim": "Keep it grounded.",
+        "evidence_quote": "Keep it grounded",
+        "source_message_ids": [messages[0].id],
+        "scope": "save",
+        "confidence": 0.7,
+        "tags": ["report"],
+        "epistemic_status": "claim",
+    }
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        **base,
+                        "epistemic_actor_id": "actor-one",
+                        "epistemic_actor_name": "First Courier",
+                    },
+                    {
+                        **base,
+                        "epistemic_actor_id": "actor-two",
+                        "epistemic_actor_name": "Second Courier",
+                        "epistemic_status": "reported_speech",
+                    },
+                    {
+                        **base,
+                        "epistemic_actor_id": "actor-one",
+                        "epistemic_actor_name": "First Courier",
+                        "epistemic_status": "objective_outcome",
+                    },
+                ]
+            }
+        }
+    )
+
+    result = asyncio.run(
+        ObservationService(
+            repositories=repositories,
+            extractor=StructuredProviderObservationExtractor(
+                provider=provider,
+                provider_name=provider.provider_name,
+                model_id="observer",
+            ),
+        ).observe_turn(
+            save_id=save.id,
+            source_message_ids=tuple(message.id for message in messages),
+        )
+    )
+
+    assert result.observed_count == 2
+    assert {item.epistemic_actor_name for item in result.observations} == {
+        "First Courier",
+        "Second Courier",
+    }
 
 
 def test_observation_extractor_normalizes_type_confidence_and_candidate_limit(
@@ -354,6 +425,47 @@ def test_observation_service_drops_ungrounded_evidence_quotes(
     )
 
     assert result.observed_count == 1
+
+
+def test_observation_service_downgrades_mixed_source_player_lie(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player, narrator = repositories.list_messages(save.id)
+    provider = RecordingStructuredProvider(
+        {
+            "context_observation_extraction": {
+                "observations": [
+                    {
+                        "observation_type": "player_preference",
+                        "claim": "Keep it grounded.",
+                        "evidence_quote": "Keep it grounded",
+                        "source_message_ids": [player.id, narrator.id],
+                        "scope": "durable",
+                        "confidence": 0.9,
+                        "tags": ["ownership"],
+                        "epistemic_status": "objective_outcome",
+                    }
+                ]
+            }
+        }
+    )
+
+    result = asyncio.run(
+        ObservationService(
+            repositories=repositories,
+            extractor=StructuredProviderObservationExtractor(
+                provider=provider,
+                provider_name=provider.provider_name,
+                model_id="observer",
+            ),
+        ).observe_turn(
+            save_id=save.id,
+            source_message_ids=(player.id, narrator.id),
+        )
+    )
+
+    assert result.observations[0].epistemic_status == "claim"
     assert result.observations[0].claim == "Keep it grounded."
 
 
@@ -2100,6 +2212,8 @@ def test_context_curation_queues_durable_memory_when_confirmation_enabled(
         scope="durable",
         confidence=0.9,
         tags=["tone"],
+        epistemic_status="claim",
+        epistemic_actor_name="Mara",
     )
     provider = RecordingStructuredProvider(
         {
@@ -2145,9 +2259,15 @@ def test_context_curation_queues_durable_memory_when_confirmation_enabled(
         "source_message_ids": [player.id],
         "source_observation_id": observation.id,
         "source_observation_ids": [observation.id],
-        "claim_fingerprint": canonical_claim_fingerprint(
-            "Keep it grounded."
+        "claim_fingerprint": _epistemic_claim_fingerprint(
+            "Keep it grounded.",
+            epistemic_status="claim",
+            epistemic_actor_id=None,
+            epistemic_actor_name="Mara",
         ),
+        "epistemic_status": "claim",
+        "epistemic_actor_id": None,
+        "epistemic_actor_name": "Mara",
     }
     updated_observation = repositories.get_context_observation(observation.id)
     assert updated_observation is not None
@@ -2497,6 +2617,252 @@ def test_narrator_planner_returns_message_spec_from_structured_output() -> None:
     assert "Mara shows the brass warrant." in brief
     assert "State commit candidates (do not persist automatically):" in brief
     assert "candidate only" in brief
+
+
+def test_planner_prompt_instructs_batched_intents_and_knowledge_candidates() -> None:
+    request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(ChatMessage(role="player", body="What do I see?"),),
+    )
+
+    messages = agentic_context_module._planner_messages(request)
+
+    system_body = messages[0].body
+    assert "npc_intents is the single batched intent artifact" in system_body
+    assert "present or entering non-player character" in system_body
+    assert "scene_presence state commit candidate" in system_body
+    assert "value.action" in system_body
+    assert "character_learned_memory or character_knowledge_edge" in system_body
+    assert "uncommitted until verified" in system_body
+    assert "never invent target ids" in system_body
+
+
+def test_narrator_planner_rejects_malformed_candidate_value_shapes(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player_message = repositories.list_messages(save.id)[0]
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="Keep it grounded while I climb toward the beacon lens.",
+    )
+    lio = repositories.add_character(save_id=save.id, name="Lio", met=True)
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_plan": {
+                "intent": "Answer the player move.",
+                "thesis": "The scene settles.",
+                "narrative_beats": [],
+                "required_facts": [],
+                "must_say": [],
+                "avoid": [],
+                "agency_constraints": [],
+                "tone": "grounded",
+                "uncertainties": [],
+                "evidence_source_ids": [f"message:{player_message.id}"],
+                "npc_intents": [],
+                "state_commit_candidates": [
+                    {
+                        "candidate_id": "presence:bad-action",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "teleport"},
+                        "character_id": lio.id,
+                        "reason": "Bad action.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "memory:no-body",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "value": {},
+                        "character_id": lio.id,
+                        "reason": "No body.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "memory:bad-knowledge-state",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "value": {
+                            "body": "Lio observed the lens.",
+                            "knowledge_state": "observed",
+                        },
+                        "character_id": lio.id,
+                        "reason": "Bad knowledge state.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "memory:bad-acquisition",
+                        "candidate_type": "character_learned_memory",
+                        "operation": "create",
+                        "state_key": "character.learned_memory",
+                        "value": {
+                            "body": "Lio learned the plan.",
+                            "acquisition_method": "guessed",
+                        },
+                        "character_id": lio.id,
+                        "reason": "Bad acquisition method.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "presence:stay-without-present",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "stay"},
+                        "character_id": lio.id,
+                        "reason": "Stay needs a present flag.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": f"scene_presence:{lio.id}:leave",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "enter"},
+                        "character_id": lio.id,
+                        "reason": "The id suffix contradicts the action.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "presence:no-character",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "enter"},
+                        "character_id": "",
+                        "reason": "Missing character id.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "knowledge:missing-target-id",
+                        "candidate_type": "character_knowledge_edge",
+                        "operation": "upsert",
+                        "state_key": "character.knowledge_edge",
+                        "value": {"target_type": "memory"},
+                        "character_id": lio.id,
+                        "reason": "Missing target id.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "knowledge:bad-acquisition",
+                        "candidate_type": "character_knowledge_edge",
+                        "operation": "upsert",
+                        "state_key": "character.knowledge_edge",
+                        "value": {
+                            "target_type": "memory",
+                            "target_id": "memory:any",
+                            "acquisition_method": "guessed",
+                        },
+                        "character_id": lio.id,
+                        "reason": "Bad acquisition method.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                    {
+                        "candidate_id": "presence:valid",
+                        "candidate_type": "scene_presence",
+                        "operation": "update",
+                        "state_key": "scene.presence",
+                        "value": {"action": "enter"},
+                        "character_id": lio.id,
+                        "reason": "Lio enters.",
+                        "confidence": 0.8,
+                        "evidence_source_ids": [f"message:{player_message.id}"],
+                        "evidence_quote": (
+                            "Keep it grounded while I climb toward the beacon lens."
+                        ),
+                    },
+                ],
+            }
+        }
+    )
+    planner = StructuredProviderNarratorPlanner(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="planner",
+        repositories=repositories,
+    )
+    request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(ChatMessage(role="player", body=player_message.body),),
+        context_breakdown={
+            "sources": [
+                {
+                    "source_type": "message",
+                    "source_id": player_message.id,
+                    "included": True,
+                },
+                {
+                    "source_type": "character",
+                    "source_id": lio.id,
+                    "included": True,
+                },
+            ]
+        },
+    )
+
+    spec = asyncio.run(planner.plan(save_id=save.id, request=request))
+
+    assert {
+        (rejection.candidate_id, rejection.reason)
+        for rejection in spec.planner_rejections
+    } == {
+        ("presence:bad-action", "unsupported_scene_presence_action"),
+        ("memory:no-body", "missing_memory_body"),
+        ("memory:bad-knowledge-state", "unknown_knowledge_state"),
+        ("memory:bad-acquisition", "unknown_acquisition_method"),
+        ("presence:stay-without-present", "missing_scene_presence_present"),
+        (f"scene_presence:{lio.id}:leave", "scene_presence_id_action_mismatch"),
+        ("presence:no-character", "missing_character_id"),
+        ("knowledge:missing-target-id", "missing_knowledge_edge_target"),
+        ("knowledge:bad-acquisition", "unknown_acquisition_method"),
+    }
+    assert [candidate.candidate_id for candidate in spec.state_commit_candidates] == [
+        "presence:valid"
+    ]
 
 
 def test_narrator_planner_constrains_canonical_ids_and_reports_typed_rejections(
@@ -2891,6 +3257,31 @@ def test_narrator_planner_defaults_missing_new_plan_fields() -> None:
     assert "unreasonable" in prompt_text
 
 
+def test_narrator_planner_returns_typed_evidence_refinement_request() -> None:
+    data: dict[str, object] = {
+        "intent": "Resolve the indirect reference.",
+        "thesis": "Find the healer's stored remedy.",
+        "must_say": [],
+        "avoid": [],
+        "tone": "grounded",
+        "uncertainties": ["Which remedy the player means."],
+        "evidence_source_ids": [],
+        "evidence_refinement": {
+            "terms": ["physician", "antivenom"],
+            "phrases": ["western archive"],
+            "entity_ids": [],
+            "source_ids": [],
+            "reason": "The pronouns are ambiguous.",
+        },
+    }
+
+    spec = agentic_context_module._narrator_message_spec_from_data(data)
+
+    assert spec.evidence_refinement is not None
+    assert spec.evidence_refinement.terms == ("physician", "antivenom")
+    assert spec.evidence_refinement.phrases == ("western archive",)
+
+
 def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
     provider = RecordingStructuredProvider(
         {
@@ -3008,6 +3399,360 @@ def test_narrator_verifier_reports_failed_contract_and_agency_issues() -> None:
     assert "hostile" in prompt_text
     assert "unreasonable" in prompt_text
     assert "Ilyra" in prompt_text
+
+
+@pytest.mark.parametrize(
+    "category",
+    (
+        "spatial_continuity",
+        "possession_continuity",
+        "injury_resource_continuity",
+        "action_feasibility",
+        "causality",
+        "elapsed_time",
+        "character_voice",
+        "semantic_repetition",
+        "forward_movement",
+    ),
+)
+def test_narrator_verifier_reports_typed_quality_findings(category: str) -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "Revise the contradiction.",
+                "confidence": 0.91,
+                "quality_findings": [
+                    {
+                        "category": category,
+                        "reason": "The draft contradicts supplied context.",
+                        "narrator_quote": "Mara crosses the sealed gate.",
+                        "context_quote": "The gate remains sealed.",
+                    }
+                ],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    source_request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(
+            ChatMessage(role="player", body="I test the gate."),
+            *(
+                (ChatMessage(role="narrator", body="The gate remains sealed."),)
+                if category == "semantic_repetition"
+                else ()
+            ),
+        ),
+        current_scene_recap=("The gate remains sealed.",),
+        character_voice_profiles=(
+            ("The gate remains sealed.",) if category == "character_voice" else ()
+        ),
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=source_request,
+            spec=NarratorMessageSpec(
+                intent="Resolve the attempted crossing.",
+                thesis="Keep the sealed gate physically consistent.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=("scene:gate",),
+            ),
+            narrator_body="Mara crosses the sealed gate.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.quality_findings == (
+        NarratorQualityFinding(
+            category=category,
+            reason="The draft contradicts supplied context.",
+            narrator_quote="Mara crosses the sealed gate.",
+            context_quote="The gate remains sealed.",
+        ),
+    )
+    quality_schema = provider.structured_output_requests[0].schema["properties"][
+        "quality_findings"
+    ]
+    assert quality_schema["maxItems"] == 9
+    assert quality_schema["items"]["properties"]["category"]["enum"] == [
+        "spatial_continuity",
+        "possession_continuity",
+        "injury_resource_continuity",
+        "action_feasibility",
+        "causality",
+        "elapsed_time",
+        "character_voice",
+        "semantic_repetition",
+        "forward_movement",
+    ]
+    for field_name in ("reason", "narrator_quote", "context_quote"):
+        assert quality_schema["items"]["properties"][field_name]["minLength"] == 1
+
+
+def test_narrator_verifier_clean_response_has_no_quality_findings() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.96,
+                "quality_findings": [],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I wait."),),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Advance the scene.",
+                thesis="The watch changes.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=(),
+            ),
+            narrator_body="The watch bell rings and fresh guards enter.",
+        )
+    )
+
+    assert result.passed is True
+    assert result.quality_findings == ()
+
+
+@pytest.mark.parametrize(
+    ("narrator_quote", "context_quote"),
+    (
+        ("A quote absent from the draft.", "The gate remains sealed."),
+        ("Mara crosses the sealed gate.", "A quote absent from supplied context."),
+        ("`Mara crosses the sealed gate.`", "The gate remains sealed."),
+        ("Mara crosses the sealed gate.", "The gate   remains sealed."),
+    ),
+)
+def test_narrator_verifier_fails_closed_for_ungrounded_quality_finding(
+    narrator_quote: str,
+    context_quote: str,
+) -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.9,
+                "quality_findings": [
+                    {
+                        "category": "spatial_continuity",
+                        "reason": "The draft contradicts the sealed gate.",
+                        "narrator_quote": narrator_quote,
+                        "context_quote": context_quote,
+                    }
+                ],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I test the gate."),),
+                current_scene_recap=("The gate remains sealed.",),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Resolve the attempted crossing.",
+                thesis="Keep the sealed gate physically consistent.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=("scene:gate",),
+            ),
+            narrator_body="Mara crosses the sealed gate.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.quality_findings == ()
+    assert result.issues == (
+        "Narrator quality finding contained evidence not present in the "
+        "supplied draft or context.",
+    )
+
+
+@pytest.mark.parametrize(
+    ("category", "source_request"),
+    (
+        (
+            "character_voice",
+            ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I address Ilyra."),),
+                current_scene_recap=("Ilyra is standing beside the sealed gate.",),
+            ),
+        ),
+        (
+            "semantic_repetition",
+            ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I test the gate."),),
+                retrieved_recent_messages=(
+                    "Ilyra is standing beside the sealed gate.",
+                ),
+            ),
+        ),
+    ),
+)
+def test_narrator_verifier_rejects_wrong_domain_quality_evidence(
+    category: str,
+    source_request: ChatRequest,
+) -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.88,
+                "quality_findings": [
+                    {
+                        "category": category,
+                        "reason": "The draft conflicts with specialized evidence.",
+                        "narrator_quote": "Ilyra speaks in a warm drawl.",
+                        "context_quote": (
+                            "Ilyra is standing beside the sealed gate."
+                        ),
+                    }
+                ],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=source_request,
+            spec=NarratorMessageSpec(
+                intent="Let Ilyra react.",
+                thesis="Ilyra challenges Mara.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=(),
+            ),
+            narrator_body="Ilyra speaks in a warm drawl.",
+        )
+    )
+
+    assert result.passed is False
+    assert result.quality_findings == ()
+    assert result.issues == (
+        "Narrator quality finding contained evidence not present in the "
+        "supplied draft or context.",
+    )
+
+
+def test_narrator_verifier_labels_bounded_narrator_repetition_evidence() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.95,
+                "quality_findings": [],
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+
+    asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(
+                    ChatMessage(role="narrator", body="Ash whispers at the glass."),
+                    ChatMessage(role="player", body="I shield the lantern."),
+                    ChatMessage(role="narrator", body="The red lens pulses once."),
+                    ChatMessage(role="player", body="I approach Ilyra."),
+                ),
+                character_voice_profiles=(
+                    "Ilyra voice profile; voice: clipped and precise",
+                ),
+                retrieved_recent_messages=(
+                    "An older narrator turn uses the phrase iron silence.",
+                ),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Let Ilyra react.",
+                thesis="Ilyra challenges Mara.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=("character_voice:ilyra",),
+            ),
+            narrator_body="Ilyra asks for Mara's authority in clipped terms.",
+        )
+    )
+
+    prompt_text = "\n".join(
+        message.body for message in provider.structured_output_requests[0].messages
+    )
+    baseline = prompt_text.split("Recent narrator prose baseline:\n", 1)[1].split(
+        "\n\nSource request:", 1
+    )[0]
+    assert baseline == "1. Ash whispers at the glass.\n2. The red lens pulses once."
+    assert "I shield the lantern." not in baseline
+    assert "An older narrator turn" not in baseline
+    assert "use only supplied voice profiles and established dialogue" in prompt_text
+    assert "never stereotypes" in prompt_text
 
 
 def test_narrator_verifier_reports_commit_decisions() -> None:
@@ -3843,3 +4588,229 @@ def test_context_curation_rejects_unsupported_short_name_change(
     assert result.accepted_count == 0
     assert result.confirmation_count == 1
     assert repositories.list_memories(save.id) == []
+
+
+def test_narrator_planner_parses_attempt_and_new_effect_types() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_plan": {
+                "intent": "Answer the player move.",
+                "thesis": "Evening falls and Mara changes.",
+                "narrative_beats": [],
+                "required_facts": [],
+                "must_say": [],
+                "avoid": [],
+                "agency_constraints": [],
+                "tone": "grounded",
+                "uncertainties": [],
+                "evidence_source_ids": ["message:player-1"],
+                "npc_intents": [],
+                "state_commit_candidates": [
+                    {
+                        "candidate_id": "emotional:mara",
+                        "candidate_type": "emotional_change",
+                        "operation": "upsert",
+                        "state_key": "",
+                        "field_path": "",
+                        "character_id": "mara",
+                        "target_type": "",
+                        "target_id": "",
+                        "value": {"mood": "uneasy"},
+                        "safe_without_narration_allowed": False,
+                        "reason": "Mara becomes uneasy.",
+                        "confidence": 0.9,
+                        "evidence_source_ids": ["message:player-1"],
+                        "evidence_quote": "uneasy",
+                    },
+                    {
+                        "candidate_id": "time:evening",
+                        "candidate_type": "world_time_change",
+                        "operation": "update",
+                        "state_key": "scene_snapshot.in_world_time",
+                        "field_path": "",
+                        "character_id": "",
+                        "target_type": "",
+                        "target_id": "",
+                        "value": {"time_of_day": "evening"},
+                        "safe_without_narration_allowed": False,
+                        "reason": "Evening comes.",
+                        "confidence": 0.9,
+                        "evidence_source_ids": ["message:player-1"],
+                        "evidence_quote": "evening",
+                    },
+                ],
+                "attempted_action": "I ask Mara what she knows.",
+                "attempt_feasibility": ["Mara is present."],
+                "attempt_evidence_source_ids": ["message:player-1"],
+                "attempt_evidence_quote": "I ask Mara",
+            }
+        }
+    )
+    planner = StructuredProviderNarratorPlanner(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="planner",
+    )
+    spec = asyncio.run(
+        planner.plan(
+            save_id="save-1",
+            request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I ask Mara."),),
+            ),
+        )
+    )
+
+    assert spec.attempted_action == "I ask Mara what she knows."
+    assert spec.attempt_feasibility == ("Mara is present.",)
+    assert spec.attempt_evidence_source_ids == ("message:player-1",)
+    assert spec.attempt_evidence_quote == "I ask Mara"
+    assert [candidate.candidate_type for candidate in spec.state_commit_candidates] == [
+        "emotional_change",
+        "world_time_change",
+    ]
+    schema = provider.structured_output_requests[0].schema
+    candidate_types = schema["properties"]["state_commit_candidates"]["items"][
+        "properties"
+    ]["candidate_type"]["enum"]
+    assert "physical_change" in candidate_types
+    assert "relationship_change" in candidate_types
+    assert "emotional_change" in candidate_types
+    assert "active_thread_change" in candidate_types
+    assert "resource_change" in candidate_types
+    assert "world_state_change" in candidate_types
+    assert "world_time_change" in candidate_types
+    assert "attempted_action" in schema["properties"]
+    assert "attempt_feasibility" in schema["properties"]
+    assert "attempt_evidence_source_ids" in schema["properties"]
+    assert "attempted_action" in schema["required"]
+
+
+def test_narrator_planner_rejects_ungrounded_attempt_evidence(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    player_message = repositories.list_messages(save.id)[0]
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=player_message.id,
+        body="Keep it grounded while I climb toward the beacon lens.",
+    )
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_plan": {
+                "intent": "Answer the player move.",
+                "thesis": "Mara reacts.",
+                "narrative_beats": [],
+                "required_facts": [],
+                "must_say": [],
+                "avoid": [],
+                "agency_constraints": [],
+                "tone": "grounded",
+                "uncertainties": [],
+                "evidence_source_ids": [f"message:{player_message.id}"],
+                "npc_intents": [],
+                "state_commit_candidates": [],
+                "attempted_action": "I climb toward the beacon lens.",
+                "attempt_feasibility": ["A clear route."],
+                "attempt_evidence_source_ids": ["message:missing"],
+                "attempt_evidence_quote": "no such phrase",
+            }
+        }
+    )
+    planner = StructuredProviderNarratorPlanner(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="planner",
+        repositories=repositories,
+    )
+    spec = asyncio.run(
+        planner.plan(
+            save_id=save.id,
+            request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I climb."),),
+            ),
+        )
+    )
+
+    assert spec.attempted_action == "I climb toward the beacon lens."
+    assert spec.attempt_evidence_source_ids == ()
+    assert spec.attempt_evidence_quote == ""
+    assert any(
+        rejection.candidate_id == "attempted_action"
+        and rejection.reason == "unknown_evidence_source_id"
+        for rejection in spec.planner_rejections
+    )
+    assert any(
+        rejection.candidate_id == "attempted_action"
+        and rejection.reason == "evidence_quote_not_found"
+        for rejection in spec.planner_rejections
+    )
+
+
+def test_narrator_verifier_parses_attempt_resolution() -> None:
+    provider = RecordingStructuredProvider(
+        {
+            "narrator_message_verification": {
+                "passed": True,
+                "issues": [],
+                "retry_feedback": "",
+                "confidence": 0.92,
+                "npc_agency_issues": [],
+                "npc_passivity_issues": [],
+                "player_choice_violations": [],
+                "npc_knowledge_leaks": [],
+                "commit_decisions": [],
+                "dating_route_stage_violations": [],
+                "attempt_resolution": "succeeded",
+                "attempt_evidence_source_ids": ["message:player-1"],
+                "attempt_evidence_quote": "Mara opens the gate",
+            }
+        }
+    )
+    verifier = StructuredProviderNarratorVerifier(
+        provider=provider,
+        provider_name=provider.provider_name,
+        model_id="verifier",
+    )
+    result = asyncio.run(
+        verifier.verify(
+            save_id="save-1",
+            source_request=ChatRequest(
+                provider="fake-chat",
+                model_id="narrator",
+                messages=(ChatMessage(role="player", body="I open the gate."),),
+            ),
+            spec=NarratorMessageSpec(
+                intent="Answer the player move.",
+                thesis="The gate opens.",
+                must_say=(),
+                avoid=(),
+                tone="grounded",
+                uncertainties=(),
+                evidence_source_ids=(),
+                attempted_action="I open the gate.",
+            ),
+            narrator_body="Mara opens the gate.",
+        )
+    )
+
+    assert result.attempt_resolution == "succeeded"
+    assert result.attempt_evidence_source_ids == ("message:player-1",)
+    assert result.attempt_evidence_quote == "Mara opens the gate"
+    schema = provider.structured_output_requests[0].schema
+    assert "attempt_resolution" in schema["properties"]
+    assert "attempt_resolution" in schema["required"]
+    assert set(schema["properties"]["attempt_resolution"]["enum"]) == {
+        "succeeded",
+        "partially_succeeded",
+        "failed",
+        "uncertain",
+    }
+    commit_enum = schema["properties"]["commit_decisions"]["items"]["properties"][
+        "candidate_type"
+    ]["enum"]
+    assert "emotional_change" in commit_enum

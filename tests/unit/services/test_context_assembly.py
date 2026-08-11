@@ -47,7 +47,7 @@ def test_compact_scenario_instructions_keeps_setup_compact() -> None:
     instructions = compact_scenario_instructions(scenario)
 
     assert "Title: Ashfall Keep" in instructions
-    assert "Premise/setup: A border keep is cut off by ash storms." in instructions
+    assert "Premise: A border keep is cut off by ash storms." in instructions
     assert "Player role: Signal warden" in instructions
     assert "Narrator control rule" in instructions
     assert (
@@ -109,10 +109,10 @@ def test_compact_scenario_instructions_keeps_mystery_truth_retrieval_only() -> N
     instructions = compact_scenario_instructions(scenario)
 
     assert "Player character name: Inspector Mara Voss" in instructions
-    assert "Case facts: Curator Elian Vale vanished from a sealed gallery." in (
+    assert "Case facts: Curator Elian Vale vanished from a sealed gallery." not in (
         instructions
     )
-    assert "Case status: Unresolved; only public facts are known." in instructions
+    assert "Case status: Unresolved; only public facts are known." not in instructions
     assert "Current scene: Mara stands outside the east gallery." in instructions
     assert "Watch log gap" not in instructions
     assert "smuggling ledger" not in instructions
@@ -136,7 +136,7 @@ def test_compact_scenario_instructions_guides_cyoa_changed_situations() -> None:
     assert "ends at a decision point" not in instructions
     assert "Do not include numbered options" in instructions
     assert "Bragi generates those separately" in instructions
-    assert "Choice style: Four terse choices" in instructions
+    assert "Choice style: Four terse choices" not in instructions
 
 
 def test_compact_scenario_instructions_includes_survival_expedition_setup() -> None:
@@ -155,16 +155,16 @@ def test_compact_scenario_instructions_includes_survival_expedition_setup() -> N
 
     instructions = compact_scenario_instructions(scenario)
 
-    assert "Expedition goal: Reach Northwatch" in instructions
-    assert "Route options: Cliff road" in instructions
-    assert "Resource inventory: Food: 9 days" in instructions
-    assert "Environmental conditions: Late winter" in instructions
-    assert "Hazards/events: Avalanches" in instructions
-    assert "Camp status: Two canvas tents" in instructions
-    assert "Travel progress: 0 of 80 miles" in instructions
+    assert "Expedition goal: Reach Northwatch" not in instructions
+    assert "Route options: Cliff road" not in instructions
+    assert "Resource inventory: Food: 9 days" not in instructions
+    assert "Environmental conditions: Late winter" not in instructions
+    assert "Hazards/events: Avalanches" not in instructions
+    assert "Camp status: Two canvas tents" not in instructions
+    assert "Travel progress: 0 of 80 miles" not in instructions
 
 
-def test_compact_scenario_instructions_includes_time_loop_boundaries() -> None:
+def test_compact_scenario_instructions_excludes_time_loop_canon() -> None:
     scenario = _scenario(
         scenario_type="time_loop",
         content={
@@ -185,12 +185,12 @@ def test_compact_scenario_instructions_includes_time_loop_boundaries() -> None:
 
     instructions = compact_scenario_instructions(scenario)
 
-    assert "Loop premise: The festival day repeats" in instructions
-    assert "Reset trigger: The drowned bell" in instructions
-    assert "Loop duration: Twenty-four hours" in instructions
-    assert "Reset baseline: The harbor resets" in instructions
-    assert "Persistent player/meta knowledge: Tower code" in instructions
-    assert "NPC memory rules: NPCs reset" in instructions
+    assert "Loop premise: The festival day repeats" not in instructions
+    assert "Reset trigger: The drowned bell" not in instructions
+    assert "Loop duration: Twenty-four hours" not in instructions
+    assert "Reset baseline: The harbor resets" not in instructions
+    assert "Persistent player/meta knowledge: Tower code" not in instructions
+    assert "NPC memory rules: NPCs reset" not in instructions
     assert "Current loop state: Loop 1" not in instructions
 
 
@@ -215,40 +215,32 @@ def test_compact_scenario_instructions_includes_political_intrigue_setup() -> No
 
     instructions = compact_scenario_instructions(scenario)
 
-    assert "Political arena: The harbor council" in instructions
-    assert "Political factions: Guilds" in instructions
-    assert "Central conflict: A midnight no-confidence vote" in instructions
-    assert "Secrets/leverage: Only Mara knows Orro moved" in instructions
-    assert "Reputation/standing: Mara is trusted" in instructions
-    assert "Obligations/favors: Orro owes Mara" in instructions
-    assert "Alliances/rivalries: Reformers court Mara" in instructions
-    assert "Event calendar: Dawn hearing" in instructions
-    assert "Political pressure: The midnight vote proceeds" in instructions
-    assert "Public/private knowledge: The public knows the vote is close" in (
+    assert "Political arena: The harbor council" not in instructions
+    assert "Political factions: Guilds" not in instructions
+    assert "Central conflict: A midnight no-confidence vote" not in instructions
+    assert "Secrets/leverage: Only Mara knows Orro moved" not in instructions
+    assert "Reputation/standing: Mara is trusted" not in instructions
+    assert "Obligations/favors: Orro owes Mara" not in instructions
+    assert "Alliances/rivalries: Reformers court Mara" not in instructions
+    assert "Event calendar: Dawn hearing" not in instructions
+    assert "Political pressure: The midnight vote proceeds" not in instructions
+    assert "Public/private knowledge: The public knows the vote is close" not in (
         instructions
     )
 
 
-def test_compact_scenario_instructions_can_omit_aged_setup_fields() -> None:
+def test_compact_scenario_instructions_keeps_contract_when_setup_ages_out() -> None:
     scenario = ScenarioRecord(
         id="scenario-aged",
         type="full_roleplay",
         title="Lantern Archive Arrival",
-        premise=(
-            "A sprawling initial setup about lantern ferries, archive districts, "
-            "and a disputed star map."
-        ),
-        player_role=(
-            "The player is Avery Quill, a fictional archive courier whose initial "
-            "biography should not ride along after setup is no longer recent."
-        ),
+        premise="A courier must recover a disputed star map before the archive war.",
+        player_role="Avery Quill, an archive courier trusted by neither faction.",
         content_json=json.dumps(
             {
                 "player_character_name": "Avery Quill",
-                "tone_genre": (
-                    "Warm archival mystery with a long initial style brief "
-                    "that belongs near setup, not every late narrator prompt."
-                ),
+                "tone_genre": "Warm archival mystery with understated romance.",
+                "starting_scene": "Avery steps off the lantern ferry at dawn.",
                 "current_scene": (
                     "Avery is reviewing a map with Nira in the archive atrium."
                 ),
@@ -265,12 +257,44 @@ def test_compact_scenario_instructions_can_omit_aged_setup_fields() -> None:
         in instructions
     )
     assert "Narrator control rule" in instructions
-    assert "Premise/setup:" not in instructions
-    assert "Tone/style:" not in instructions
-    assert "Player role:" not in instructions
-    assert "disputed star map" not in instructions
-    assert "long initial style brief" not in instructions
-    assert "long initial biography" not in instructions
+    assert (
+        "Premise: A courier must recover a disputed star map before the archive war."
+        in instructions
+    )
+    assert "Tone/style: Warm archival mystery with understated romance." in instructions
+    assert (
+        "Player role: Avery Quill, an archive courier trusted by neither faction."
+        in instructions
+    )
+    assert "Avery steps off the lantern ferry at dawn." not in instructions
+
+
+def test_compact_scenario_instructions_keeps_specialized_durable_contract() -> None:
+    scenario = _scenario(
+        scenario_type="fantasy_roleplay",
+        content={
+            "magic_system": "Every spell consumes a treasured memory.",
+            "realms_and_places": "The opening road crosses seven named kingdoms.",
+            "factions_and_orders": "The opening court hosts five rival orders.",
+            "tone_genre": "Mythic tragedy told through close third-person prose.",
+            "current_scene": "Mara waits beneath the broken moon gate.",
+        },
+    )
+
+    instructions = compact_scenario_instructions(scenario, include_setup=False)
+
+    assert "Premise: A border keep is cut off by ash storms." in instructions
+    assert "Player role: Signal warden" in instructions
+    assert (
+        "Tone/style: Mythic tragedy told through close third-person prose."
+        in instructions
+    )
+    assert (
+        "Magic constraints: Every spell consumes a treasured memory."
+        not in instructions
+    )
+    assert "The opening road crosses seven named kingdoms." not in instructions
+    assert "The opening court hosts five rival orders." not in instructions
 
 
 def test_scenario_section_candidates_exclude_core_content_fields() -> None:
@@ -319,6 +343,16 @@ def test_scenario_section_candidates_include_mystery_hidden_truth() -> None:
     candidates = scenario_section_candidates(scenario)
 
     assert candidates == (
+        (
+            "scenario:scenario-1:section:case_facts",
+            "case_facts",
+            "Curator Elian Vale vanished from a sealed gallery.",
+        ),
+        (
+            "scenario:scenario-1:section:case_status",
+            "case_status",
+            "Unresolved.",
+        ),
         (
             "scenario:scenario-1:section:hidden_truth",
             "hidden_truth",
@@ -471,6 +505,34 @@ def test_image_scene_context_excludes_pending_review_suggestions(
         source.tier != "pending_context_suggestions"
         for source in image_breakdown.sources
     )
+
+
+def test_image_scene_context_excludes_secret_compiled_claims(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, _current_location = _create_context_save(
+        repositories,
+        scenario_id="scenario-secret-image-context",
+        save_id="save-secret-image-context",
+    )
+
+    image_context, breakdown = ContextAssemblyService(
+        repositories
+    ).build_image_scene_context(
+        save_id=save.id,
+        selected_scenario_sections=(
+            "[canonical | durable | open] The tower lens is red.",
+            "[canonical | durable | narrator_only] The lens contains a ghost.",
+            "[canonical | durable | restricted] The keeper knows its true name.",
+        ),
+    )
+
+    assert "The tower lens is red." in image_context
+    assert "contains a ghost" not in image_context
+    assert "true name" not in image_context
+    assert len(
+        [source for source in breakdown.sources if source.tier == "scenario_section"]
+    ) == 1
 
 
 def test_pending_context_suggestion_sources_group_and_cap_rows(
@@ -759,6 +821,14 @@ def test_deterministic_context_sources_include_active_linked_facts(
                 target_type=target_type,
                 target_id=target_id,
             )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=present_character.id,
+        target_type="scenario_section",
+        target_id=active_scenario_target,
+        knowledge_state="knows",
+        acquisition_method="witnessed",
+    )
     for entity_type, entity_id in (
         ("location", inactive_location.id),
         ("character", non_present_character.id),
@@ -787,13 +857,13 @@ def test_deterministic_context_sources_include_active_linked_facts(
         active_memory_text,
         active_world_state_text,
         active_summary_text,
-        active_scenario_text,
     ):
         assert expected in active_linked_text
     for excluded in (
         inactive_memory_text,
         inactive_world_state_key,
         inactive_summary_text,
+        active_scenario_text,
         inactive_scenario_text,
     ):
         assert excluded not in active_linked_text
@@ -978,6 +1048,7 @@ def test_character_knows_linked_facts_are_attributed_as_character_scoped(
     )
     assert (
         "Character-scoped knowledge (Captain Ilyra knows) linked memory: "
+        "[epistemic status: legacy_unclassified] "
         "The lens-key phrase is ember dawn."
     ) in linked_text
     assert (
@@ -1006,6 +1077,14 @@ def test_character_knowledge_edges_are_attributed_as_character_scoped(
         met=True,
         character_id="character-knowledge-nira",
     )
+    also_present = repositories.add_character(
+        save_id=save.id,
+        name="Bram",
+        role="Archive guard",
+        location_id=current_location.id,
+        met=True,
+        character_id="character-knowledge-bram",
+    )
     absent = repositories.add_character(
         save_id=save.id,
         name="Tarin",
@@ -1017,7 +1096,7 @@ def test_character_knowledge_edges_are_attributed_as_character_scoped(
         save_id=save.id,
         current_location_id=current_location.id,
         situation="Nira has just arrived.",
-        present_character_ids=[present.id],
+        present_character_ids=[present.id, also_present.id],
         snapshot_id="snapshot-character-knowledge",
     )
     first_message = repositories.append_message(
@@ -1068,6 +1147,14 @@ def test_character_knowledge_edges_are_attributed_as_character_scoped(
         )
     repositories.add_character_knowledge_edge(
         save_id=save.id,
+        character_id=also_present.id,
+        target_type="memory",
+        target_id=visible_memory.id,
+        knowledge_state="may_know",
+        acquisition_method="witnessed",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
         character_id=absent.id,
         target_type="memory",
         target_id=hidden_memory.id,
@@ -1082,6 +1169,12 @@ def test_character_knowledge_edges_are_attributed_as_character_scoped(
     )
     assert (
         "Character-scoped knowledge (Nira knows) linked memory: "
+        "[epistemic status: legacy_unclassified] "
+        "Nira knows Avery invited her into the chart room."
+    ) in linked_text
+    assert (
+        "Character-scoped knowledge (Bram may know) linked memory: "
+        "[epistemic status: legacy_unclassified] "
         "Nira knows Avery invited her into the chart room."
     ) in linked_text
     assert (
@@ -1154,6 +1247,75 @@ def test_character_knowledge_edges_hidden_from_present_scene_are_not_linked_fact
         source.text for source in sources if source.tier == "active_linked_facts"
     )
     assert "Tarin knows the moonstone opens the cobalt ledger" not in linked_text
+
+
+def test_character_knowledge_edge_target_is_not_intersection_filtered(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, current_location = _create_context_save(
+        repositories,
+        scenario_id="scenario-mixed-present-knowledge",
+        save_id="save-mixed-present-knowledge",
+    )
+    owner = repositories.add_character(
+        save_id=save.id,
+        name="Nira",
+        role="Archive guide",
+        location_id=current_location.id,
+        met=True,
+        character_id="character-mixed-nira",
+    )
+    other = repositories.add_character(
+        save_id=save.id,
+        name="Bram",
+        role="Guard",
+        location_id=current_location.id,
+        met=True,
+        character_id="character-mixed-bram",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=current_location.id,
+        situation="Nira and Bram compare notes.",
+        present_character_ids=[owner.id, other.id],
+        snapshot_id="snapshot-mixed-present-knowledge",
+    )
+    secret_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Nira alone learned that the moonstone opens the cobalt ledger.",
+        message_id="message-mixed-present-secret",
+    )
+    secret = repositories.add_memory(
+        save_id=save.id,
+        body="The moonstone opens the cobalt ledger.",
+        tags=["secret"],
+        source_message_id=secret_message.id,
+        memory_id="memory-mixed-present-secret",
+    )
+    repositories.add_message_visibility(
+        save_id=save.id,
+        message_id=secret_message.id,
+        character_id=other.id,
+        visibility="not_visible",
+        source="scene_presence",
+    )
+    repositories.add_character_knowledge_edge(
+        save_id=save.id,
+        character_id=owner.id,
+        target_type="memory",
+        target_id=secret.id,
+        knowledge_state="knows",
+        acquisition_method="witnessed",
+    )
+
+    sources = deterministic_context_sources(repositories=repositories, save_id=save.id)
+
+    linked_text = "\n".join(
+        source.text for source in sources if source.tier == "active_linked_facts"
+    )
+    assert "Character-scoped knowledge (Nira knows)" in linked_text
+    assert "The moonstone opens the cobalt ledger." in linked_text
 
 
 def test_source_less_character_link_does_not_hydrate_hidden_source_memory(
@@ -2040,6 +2202,55 @@ def test_deterministic_context_sources_include_political_intrigue_state(
     assert "intrigue.obligations: summary: Orro owes Mara" in source_text
     assert "faction.harbor_guild.standing: toward_mara: ally" in source_text
     assert "memory.unrelated" not in source_text
+
+
+def test_current_scene_facts_are_narrator_only_volatile_context(
+    repositories: PersistenceRepositories,
+) -> None:
+    _scenario, save, location = _create_context_save(
+        repositories,
+        scenario_id="scenario-scene-facts",
+        save_id="save-scene-facts",
+    )
+    character = repositories.add_character(save_id=save.id, name="Mara")
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="Mara crouches behind the brass console.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        current_location_id=location.id,
+        present_character_ids=[character.id],
+        source_message_id=message.id,
+    )
+    fact, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="actor_pose",
+        subject_type="character",
+        subject_id=character.id,
+        subject_label="Mara",
+        value="crouched behind the brass console",
+        source_message_id=message.id,
+        evidence_quote="Mara crouches behind the brass console",
+    )
+
+    narrator_sources = deterministic_context_sources(
+        repositories=repositories,
+        save_id=save.id,
+        mode="narrator",
+    )
+    image_sources = deterministic_context_sources(
+        repositories=repositories,
+        save_id=save.id,
+        mode="image",
+    )
+
+    source = next(item for item in narrator_sources if item.source_type == "scene_fact")
+    assert source.source_id == fact.id
+    assert "Volatile current-scene facts (not durable lore)" in source.text
+    assert "actor pose: Mara: crouched behind the brass console" in source.text
+    assert all(item.source_type != "scene_fact" for item in image_sources)
 
 
 def _create_context_save(

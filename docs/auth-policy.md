@@ -130,6 +130,7 @@ or per user/session before using a save ID.
 | `/api/scenarios/draft/character-starters/generate` | Authenticated | Generate draft character starters for the current user; child blocked. |
 | `/api/scenarios/draft/section` | Authenticated | Regenerate draft sections for the current user. |
 | `/api/chat` | Save-scoped | Submit chat only to an accessible save; child allowed for owned or assigned saves. |
+| `/api/chat/retry` | Save-scoped | Retry an interrupted player turn for an accessible save, or an interrupted timeskip when role policy allows save mutation. |
 | `/api/chat/continue` | Save-scoped | Continue narration only for an accessible Storyteller-mode save when role policy allows chat. |
 | `/api/chat/look-around` | Save-scoped | Ask side-channel scene questions only for an accessible save; child allowed for owned or assigned saves. |
 | `/api/character-texts/send` | Save-scoped | Send side-channel character texts only to an accessible save when texts are enabled; child allowed for owned or assigned saves. |
@@ -139,7 +140,7 @@ or per user/session before using a save ID.
 | `/api/character-texts/delete-from-here` | Save-scoped | Delete character text conversation suffixes only in an accessible save; child blocked. |
 | `/api/character-texts/edit` | Save-scoped | Edit and replay player character texts only in an accessible save; child blocked. |
 | `/api/chat/timeskip` | Save-scoped | Timeskip only when role can write to the save. |
-| `/api/chat/cancel` | Save-scoped | Cancel only the current user's accessible save job; child cannot cancel another user's active chat job. |
+| `/api/chat/cancel` | Save-scoped | Compatibility fallback for callers without a tracked job ID; cancel only the current user's accessible save job, and prefer `/api/jobs/{job_id}/cancel` when a job ID is available. Child cannot cancel another user's active chat job. |
 | `/api/action-choices/regenerate` | Save-scoped | Regenerate generated action choices only for an accessible save; child allowed as normal chat participation. |
 | `/api/chat/regenerate` | Save-scoped | Regenerate only messages in an accessible save. |
 | `/api/runtime/custom-instructions` | Save-scoped | Update only accessible save instructions; child blocked. |

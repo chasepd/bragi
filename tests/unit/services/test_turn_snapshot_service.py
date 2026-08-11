@@ -77,6 +77,29 @@ def test_snapshot_import_coalesces_many_to_one_memory_remaps() -> None:
     ]
 
 
+def test_snapshot_reference_filter_converges_beyond_eight_hops() -> None:
+    summaries = tuple(
+        {
+            "id": f"summary-{index}",
+            "save_id": "save-one",
+            "source_message_ids_json": "[]",
+            "source_summary_ids_json": json.dumps(
+                ["missing-summary" if index == 0 else f"summary-{index - 1}"]
+            ),
+        }
+        for index in range(12)
+    )
+
+    rows = _sanitize_snapshot_rows_for_safety(
+        {
+            "messages": (),
+            "summaries": summaries,
+        }
+    )
+
+    assert rows["summaries"] == ()
+
+
 def test_snapshot_object_decode_rejects_declared_size_bomb() -> None:
     payload = json.dumps("x" * (1024 * 1024)).encode("utf-8")
 
@@ -136,6 +159,94 @@ def test_snapshot_object_decode_rejects_json_node_bomb(
                 ).decode("ascii"),
                 "uncompressed_size": len(payload),
             }
+        )
+
+
+def test_local_snapshot_object_rejects_oversized_declared_payload(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    snapshot = service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        """
+        UPDATE save_snapshot_objects
+        SET uncompressed_size = ?
+        WHERE object_hash = ?
+        """,
+        (
+            turn_snapshot_module._MAX_SNAPSHOT_OBJECT_UNCOMPRESSED_BYTES + 1,
+            snapshot.root_manifest_hash,
+        ),
+    )
+    repositories.commit()
+
+    with pytest.raises(ValueError, match="too large"):
+        service._snapshot_manifest(snapshot)
+
+
+def test_local_snapshot_tree_rejects_duplicate_node_reference(
+    repositories: PersistenceRepositories,
+) -> None:
+    service = TurnSnapshotService(repositories)
+    row_hash = service._store_object(
+        kind="row:messages",
+        value={"id": "message-one"},
+    )
+    child_hash = service._store_tree_node(
+        table_name="messages",
+        order_key="child",
+        row_key="message-one",
+        row_hash=row_hash,
+        priority=2,
+        left_hash=None,
+        right_hash=None,
+    )
+    root_hash = service._store_tree_node(
+        table_name="messages",
+        order_key="root",
+        row_key="message-root",
+        row_hash=row_hash,
+        priority=1,
+        left_hash=child_hash,
+        right_hash=child_hash,
+    )
+
+    with pytest.raises(ValueError, match="cycle"):
+        service._tree_entries(table_name="messages", root_hash=root_hash)
+
+
+def test_incremental_tree_mutation_rejects_excessive_depth(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = TurnSnapshotService(repositories)
+    row_hash = service._store_object(
+        kind="row:messages",
+        value={"id": "message-one", "save_id": "save-one"},
+    )
+    root_hash: str | None = None
+    for index, order_key in enumerate(("a", "b", "c")):
+        root_hash = service._store_tree_node(
+            table_name="messages",
+            order_key=order_key,
+            row_key=f"message-{order_key}",
+            row_hash=row_hash,
+            priority=index,
+            left_hash=root_hash,
+            right_hash=None,
+        )
+    monkeypatch.setattr(
+        turn_snapshot_module,
+        "_MAX_SNAPSHOT_TREE_MUTATION_DEPTH",
+        1,
+    )
+
+    with pytest.raises(ValueError, match="too deep"):
+        service._tree_delete(
+            table_name="messages",
+            root_hash=root_hash,
+            order_key="0",
         )
 
 
@@ -765,6 +876,45 @@ def test_legacy_memory_normalization_preserves_other_id_namespaces() -> None:
     [trigger] = rows["character_text_proactive_triggers"]
     assert trigger["trigger_key"] == "character_intent:memory-duplicate:basis"
     assert trigger["source_id"] == "memory-duplicate"
+
+
+def test_snapshot_memory_normalization_preserves_epistemic_identity() -> None:
+    rows = turn_snapshot_module._normalize_legacy_snapshot_memories(
+        {
+            "memories": (
+                {
+                    "id": "memory-first",
+                    "body": "The north gate is unguarded.",
+                    "tags_json": "[]",
+                    "importance": 0.8,
+                    "source_message_ids_json": "[]",
+                    "source_observation_ids_json": "[]",
+                    "epistemic_status": "reported_speech",
+                    "epistemic_actor_id": "character-first",
+                    "epistemic_actor_name": "Courier",
+                    "archived_at": None,
+                },
+                {
+                    "id": "memory-second",
+                    "body": "The north gate is unguarded.",
+                    "tags_json": "[]",
+                    "importance": 0.8,
+                    "source_message_ids_json": "[]",
+                    "source_observation_ids_json": "[]",
+                    "epistemic_status": "reported_speech",
+                    "epistemic_actor_id": "character-second",
+                    "epistemic_actor_name": "Courier",
+                    "archived_at": None,
+                },
+            )
+        }
+    )
+
+    assert [row["id"] for row in rows["memories"]] == [
+        "memory-first",
+        "memory-second",
+    ]
+    assert len({row["claim_fingerprint"] for row in rows["memories"]}) == 2
 
 
 def test_legacy_memory_normalization_bounds_merged_provenance() -> None:
@@ -1455,6 +1605,67 @@ def test_snapshot_restores_curation_progress_without_reviving_worker_lease(
     assert state.lease_until is None
     assert state.last_error is None
     assert state.terminal_outcome is None
+
+
+def test_snapshot_rechecks_curation_lease_after_time_passes_without_table_write(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The beacon was relit.",
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="event",
+        claim="The beacon was relit.",
+        evidence_quote="The beacon was relit.",
+        source_message_ids=[message.id],
+        scope="durable",
+        confidence=0.9,
+    )
+    repositories.claim_context_observations(
+        (observation.id,),
+        lease_token="snapshot-worker-secret",
+        lease_seconds=600,
+    )
+    service = TurnSnapshotService(repositories)
+    original = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    repositories.connection.execute(
+        "DROP TRIGGER dirty_snapshot_context_observation_curation_state_after_update"
+    )
+    repositories.connection.execute(
+        """
+        UPDATE context_observation_curation_state
+        SET lease_until = '2000-01-01 00:00:00'
+        WHERE observation_id = ?
+        """,
+        (observation.id,),
+    )
+    repositories.connection.execute(
+        """
+        UPDATE save_snapshot_row_state
+        SET recheck_at = '2000-01-01 00:00:00'
+        WHERE save_id = ?
+          AND table_name = 'context_observation_curation_state'
+          AND row_key = ?
+        """,
+        (save.id, observation.id),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+
+    assert changed.id != original.id
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+    [state] = rows["context_observation_curation_state"]
+    assert state["attempt_count"] == 1
+    assert state["lease_token"] is None
+    assert state["lease_until"] is None
 
 
 def test_imported_snapshot_rows_clear_curation_worker_lease() -> None:
@@ -3075,6 +3286,153 @@ def test_restore_snapshot_replaces_scene_scratch_before_its_scene(
     assert fork_scratch.source_id == fork_observation.id
 
 
+def test_restore_snapshot_restores_scene_facts_and_provenance(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The brass key rests on the table.",
+    )
+    repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="A brass key rests within reach.",
+        source_message_id=message.id,
+    )
+    original, _, _ = repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="brass key",
+        value="on the table",
+        source_message_id=message.id,
+        evidence_quote="rests on the table",
+    )
+    service = TurnSnapshotService(repositories)
+    snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    repositories.upsert_scene_fact(
+        save_id=save.id,
+        fact_type="object_location",
+        subject_type="object",
+        subject_id=None,
+        subject_label="brass key",
+        value="under the table",
+        source_message_id=message.id,
+        evidence_quote="brass key",
+    )
+
+    service.restore_save_to_snapshot(save_id=save.id, snapshot_id=snapshot.id)
+
+    [restored] = repositories.list_scene_facts(save.id)
+    assert restored.id == original.id
+    assert restored.fact_type == "object_location"
+    assert restored.value == "on the table"
+    assert restored.provenance[0].source_message_id == message.id
+
+
+def test_snapshot_backed_fork_consolidates_legacy_scene_fact_conflicts(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The brass key is first on the table, then slips beneath it.",
+    )
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        situation="A brass key lies beneath the table.",
+        source_message_id=message.id,
+    )
+    repositories.connection.executemany(
+        """
+        INSERT INTO scene_facts(
+            id, save_id, scene_snapshot_id, scene_generation, fact_type,
+            subject_type, subject_label, value, conflict_key, lifetime,
+            created_turn_number
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (
+                "legacy-key-location-1",
+                save.id,
+                scene.id,
+                scene.scene_generation,
+                "object_location",
+                "object",
+                "brass key",
+                "on the table",
+                "legacy:first-location-key",
+                "scene",
+                1,
+            ),
+            (
+                "legacy-key-location-2",
+                save.id,
+                scene.id,
+                scene.scene_generation,
+                "object_location",
+                "object",
+                "brass key",
+                "beneath the table",
+                "legacy:second-location-key",
+                "scene",
+                1,
+            ),
+        ),
+    )
+    repositories.connection.executemany(
+        """
+        INSERT INTO scene_fact_sources(
+            id, save_id, scene_fact_id, source_message_id, evidence_quote
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            (
+                "legacy-key-source-1",
+                save.id,
+                "legacy-key-location-1",
+                message.id,
+                "first on the table",
+            ),
+            (
+                "legacy-key-source-2",
+                save.id,
+                "legacy-key-location-2",
+                message.id,
+                "slips beneath it",
+            ),
+        ),
+    )
+    repositories.connection.commit()
+    TurnSnapshotService(repositories).capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+
+    fork = SaveForkService(repositories).fork_from_message(
+        save_id=save.id,
+        message_id=message.id,
+        media_dir=tmp_path / "media",
+    )
+
+    [fact] = repositories.list_scene_facts(fork.save.id)
+    assert fact.value == "beneath the table"
+    assert [source.evidence_quote for source in fact.provenance] == [
+        "slips beneath it"
+    ]
+
+
 def test_snapshot_backed_fork_remaps_character_text_reply_links(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -3276,6 +3634,908 @@ def test_dirty_head_capture_tracks_message_body_edits_without_context_change(
     assert repositories.list_messages(save.id)[0].body == "I polish the lens."
 
 
+def test_clean_head_capture_does_not_prepare_active_snapshot_rows(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    baseline = service.capture_baseline_snapshot(save.id)
+
+    def fail_active_scan(_save_id: str) -> object:
+        raise AssertionError("clean snapshot capture scanned active tables")
+
+    monkeypatch.setattr(service, "_active_rows_by_table", fail_active_scan)
+
+    captured = service.capture_current_head_if_dirty(save.id)
+
+    assert captured.id == baseline.id
+
+
+def test_snapshot_v2_manifest_reuses_unchanged_table_roots(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    baseline = service.capture_baseline_snapshot(save.id)
+    baseline_manifest = service._snapshot_manifest(baseline)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I check the lens.",
+    )
+
+    changed = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    changed_manifest = service._snapshot_manifest(changed)
+
+    assert baseline_manifest["format"] == "bragi-turn-snapshot-v2"
+    assert changed_manifest["format"] == "bragi-turn-snapshot-v2"
+    baseline_tables = baseline_manifest["table_roots"]
+    changed_tables = changed_manifest["table_roots"]
+    assert isinstance(baseline_tables, dict)
+    assert isinstance(changed_tables, dict)
+    assert changed_tables["messages"] != baseline_tables["messages"]
+    assert changed_tables["world_state"] == baseline_tables["world_state"]
+
+
+def test_dirty_row_capture_updates_tree_without_full_active_scan(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I check the lens.",
+    )
+    state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens",
+        value={"color": "red"},
+        source_message_id=message.id,
+    )
+    service = TurnSnapshotService(repositories)
+    original = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    original_manifest = service._snapshot_manifest(original)
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens",
+        value={"color": "blue"},
+        source_message_id=message.id,
+    )
+
+    def fail_active_scan(_save_id: str) -> object:
+        raise AssertionError("incremental snapshot capture scanned active tables")
+
+    monkeypatch.setattr(service, "_active_rows_by_table", fail_active_scan)
+
+    changed = service.capture_current_head_if_dirty(save.id)
+
+    changed_manifest = service._snapshot_manifest(changed)
+    original_roots = original_manifest["table_roots"]
+    changed_roots = changed_manifest["table_roots"]
+    assert isinstance(original_roots, dict)
+    assert isinstance(changed_roots, dict)
+    assert changed_roots["world_state"] != original_roots["world_state"]
+    assert changed_roots["messages"] == original_roots["messages"]
+    rows = service._rows_from_manifest(changed_manifest)
+    [captured_state] = rows["world_state"]
+    assert captured_state["id"] == state.id
+    assert json.loads(str(captured_state["value_json"])) == {"color": "blue"}
+
+
+def test_deleted_row_capture_updates_cached_graph_without_full_active_scan(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens",
+        value={"color": "red"},
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute("DELETE FROM world_state WHERE id = ?", (state.id,))
+    repositories.commit()
+
+    def fail_active_scan(_save_id: str) -> object:
+        raise AssertionError("incremental deletion scanned active tables")
+
+    monkeypatch.setattr(service, "_active_rows_by_table", fail_active_scan)
+
+    changed = service.capture_current_head_if_dirty(save.id)
+
+    assert service._rows_from_manifest(service._snapshot_manifest(changed))[
+        "world_state"
+    ] == ()
+
+
+def test_primary_key_update_removes_old_snapshot_identity(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    state = repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens",
+        value={"color": "red"},
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE world_state SET id = ? WHERE id = ?",
+        ("replacement-state", state.id),
+    )
+    repositories.commit()
+
+    def fail_active_scan(_save_id: str) -> object:
+        raise AssertionError("primary-key update scanned active tables")
+
+    monkeypatch.setattr(service, "_active_rows_by_table", fail_active_scan)
+    changed = service.capture_current_head_if_dirty(save.id)
+
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+    assert [row["id"] for row in rows["world_state"]] == ["replacement-state"]
+
+
+def test_incremental_reference_validation_is_scoped_to_save(
+    repositories: PersistenceRepositories,
+) -> None:
+    first = _create_save(repositories)
+    second = _create_save(repositories)
+    own_message = repositories.append_message(
+        save_id=first.id,
+        role="player",
+        body="I inspect the lens.",
+    )
+    foreign_message = repositories.append_message(
+        save_id=second.id,
+        role="player",
+        body="I inspect another lens.",
+    )
+    state = repositories.upsert_world_state(
+        save_id=first.id,
+        key="lens",
+        value={"color": "red"},
+        source_message_id=own_message.id,
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=first.id, message_id=own_message.id)
+    repositories.connection.execute(
+        "UPDATE world_state SET source_message_id = ? WHERE id = ?",
+        (foreign_message.id, state.id),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(first.id)
+
+    [captured] = service._rows_from_manifest(service._snapshot_manifest(changed))[
+        "world_state"
+    ]
+    assert captured["source_message_id"] is None
+
+
+def test_incremental_reference_is_restored_when_target_reactivates(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    repositories.add_location(
+        save_id=save.id,
+        location_id="tower",
+        name="Beacon Tower",
+    )
+    repositories.add_character(
+        save_id=save.id,
+        character_id="mara",
+        name="Mara",
+        location_id="tower",
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE locations SET archived_at = CURRENT_TIMESTAMP WHERE id = 'tower'"
+    )
+    repositories.commit()
+
+    archived = service.capture_current_head_if_dirty(save.id)
+    [archived_character] = service._rows_from_manifest(
+        service._snapshot_manifest(archived)
+    )["characters"]
+    assert archived_character["location_id"] is None
+
+    repositories.connection.execute(
+        "UPDATE locations SET archived_at = NULL WHERE id = 'tower'"
+    )
+    repositories.commit()
+    restored = service.capture_current_head_if_dirty(save.id)
+
+    [restored_character] = service._rows_from_manifest(
+        service._snapshot_manifest(restored)
+    )["characters"]
+    assert restored_character["location_id"] == "tower"
+
+
+def test_incremental_reference_filtering_reaches_fixed_point(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    repositories.add_character(
+        save_id=save.id,
+        character_id="mara",
+        name="Mara",
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="belief",
+        claim="Mara believes the beacon is lit.",
+        epistemic_actor_id="mara",
+        status="pending",
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE context_observations SET claim = claim || ' Still.' WHERE id = ?",
+        (observation.id,),
+    )
+    repositories.connection.execute(
+        "UPDATE characters SET archived_at = CURRENT_TIMESTAMP WHERE id = 'mara'"
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+
+    assert rows["context_observations"] == ()
+    assert all(
+        row["observation_id"] != observation.id
+        for row in rows["context_observation_curation_state"]
+    )
+
+
+def test_dirty_source_does_not_resurrect_persistently_excluded_target(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    repositories.add_character(
+        save_id=save.id,
+        character_id="mara",
+        name="Mara",
+    )
+    observation = repositories.add_context_observation(
+        save_id=save.id,
+        observation_type="belief",
+        claim="Mara believes the beacon is lit.",
+        epistemic_actor_id="mara",
+        status="pending",
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE characters SET archived_at = CURRENT_TIMESTAMP WHERE id = 'mara'"
+    )
+    repositories.commit()
+    service.capture_current_head_if_dirty(save.id)
+    repositories.connection.execute(
+        """
+        UPDATE context_observation_curation_state
+        SET attempt_count = attempt_count + 1
+        WHERE observation_id = ?
+        """,
+        (observation.id,),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+
+    assert rows["context_observation_curation_state"] == ()
+
+
+def test_incremental_missing_target_edge_survives_delete_and_recreate(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    repositories.add_location(
+        save_id=save.id,
+        location_id="tower",
+        name="Beacon Tower",
+        connections=["gate"],
+    )
+    repositories.add_location(
+        save_id=save.id,
+        location_id="gate",
+        name="South Gate",
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute("DELETE FROM locations WHERE id = 'gate'")
+    repositories.commit()
+
+    deleted = service.capture_current_head_if_dirty(save.id)
+    deleted_rows = service._rows_from_manifest(service._snapshot_manifest(deleted))
+    tower = next(row for row in deleted_rows["locations"] if row["id"] == "tower")
+    assert json.loads(str(tower["connections_json"])) == []
+
+    repositories.add_location(
+        save_id=save.id,
+        location_id="gate",
+        name="South Gate",
+    )
+    restored = service.capture_current_head_if_dirty(save.id)
+    restored_rows = service._rows_from_manifest(service._snapshot_manifest(restored))
+    tower = next(row for row in restored_rows["locations"] if row["id"] == "tower")
+    assert json.loads(str(tower["connections_json"])) == ["gate"]
+
+
+def test_initially_missing_target_creation_rechecks_declared_edge(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    repositories.add_location(
+        save_id=save.id,
+        location_id="tower",
+        name="Beacon Tower",
+        connections=["future-gate"],
+    )
+    service = TurnSnapshotService(repositories)
+    baseline = service.capture_baseline_snapshot(save.id)
+    [tower] = service._rows_from_manifest(service._snapshot_manifest(baseline))[
+        "locations"
+    ]
+    assert json.loads(str(tower["connections_json"])) == []
+
+    repositories.add_location(
+        save_id=save.id,
+        location_id="future-gate",
+        name="Future Gate",
+    )
+    changed = service.capture_current_head_if_dirty(save.id)
+    locations = service._rows_from_manifest(service._snapshot_manifest(changed))[
+        "locations"
+    ]
+    tower = next(row for row in locations if row["id"] == "tower")
+    assert json.loads(str(tower["connections_json"])) == ["future-gate"]
+
+
+def test_target_creation_restores_persisted_excluded_reference_cycle(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The archive opens.",
+    )
+    repositories.connection.executemany(
+        """
+        INSERT INTO summaries(
+            id, save_id, covers_message_start_id, covers_message_end_id,
+            body, provider, model, source_message_ids_json,
+            source_summary_ids_json
+        ) VALUES (?, ?, ?, ?, ?, 'fake', 'fake', ?, ?)
+        """,
+        (
+            (
+                "summary-a",
+                save.id,
+                message.id,
+                message.id,
+                "A",
+                json.dumps([message.id]),
+                json.dumps(["summary-b", "summary-c"]),
+            ),
+            (
+                "summary-b",
+                save.id,
+                message.id,
+                message.id,
+                "B",
+                json.dumps([message.id]),
+                json.dumps(["summary-a"]),
+            ),
+        ),
+    )
+    repositories.commit()
+    service = TurnSnapshotService(repositories)
+    baseline = service.capture_message_snapshot(save_id=save.id, message_id=message.id)
+    assert service._rows_from_manifest(service._snapshot_manifest(baseline))[
+        "summaries"
+    ] == ()
+    repositories.connection.execute(
+        """
+        INSERT INTO summaries(
+            id, save_id, covers_message_start_id, covers_message_end_id,
+            body, provider, model, source_message_ids_json,
+            source_summary_ids_json
+        ) VALUES ('summary-c', ?, ?, ?, 'C', 'fake', 'fake', ?, '[]')
+        """,
+        (save.id, message.id, message.id, json.dumps([message.id])),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    summaries = service._rows_from_manifest(service._snapshot_manifest(changed))[
+        "summaries"
+    ]
+
+    assert {str(row["id"]) for row in summaries} == {
+        "summary-a",
+        "summary-b",
+        "summary-c",
+    }
+
+
+def test_group_thread_participant_removal_rechecks_thread_inclusion(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    for character_id in ("mara", "rowan"):
+        repositories.add_character(
+            save_id=save.id,
+            character_id=character_id,
+            name=character_id.title(),
+        )
+    thread = repositories.create_character_text_group_thread(
+        save_id=save.id,
+        title="Beacon Crew",
+        character_ids=("mara", "rowan"),
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    participant = repositories.connection.execute(
+        """
+        SELECT id FROM character_text_thread_participants
+        WHERE save_id = ? AND thread_id = ? AND character_id = 'rowan'
+        """,
+        (save.id, thread.id),
+    ).fetchone()
+    assert participant is not None
+    repositories.connection.execute(
+        "DELETE FROM character_text_thread_participants WHERE id = ?",
+        (participant["id"],),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+
+    assert all(row["id"] != thread.id for row in rows["character_text_threads"])
+
+
+def test_character_exclusion_rechecks_group_participant_aggregate(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    for character_id in ("mara", "rowan"):
+        repositories.add_character(
+            save_id=save.id,
+            character_id=character_id,
+            name=character_id.title(),
+        )
+    thread = repositories.create_character_text_group_thread(
+        save_id=save.id,
+        title="Beacon Crew",
+        character_ids=("mara", "rowan"),
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE characters SET archived_at = CURRENT_TIMESTAMP WHERE id = 'rowan'"
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+
+    assert all(row["id"] != thread.id for row in rows["character_text_threads"])
+
+
+def test_group_reference_cycle_revives_after_character_is_unarchived(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    for character_id in ("mara", "rowan"):
+        repositories.add_character(
+            save_id=save.id,
+            character_id=character_id,
+            name=character_id.title(),
+        )
+    thread = repositories.create_character_text_group_thread(
+        save_id=save.id,
+        title="Beacon Crew",
+        character_ids=("mara", "rowan"),
+    )
+    participant_ids = {
+        str(row["id"])
+        for row in repositories.connection.execute(
+            """
+            SELECT id FROM character_text_thread_participants
+            WHERE save_id = ? AND thread_id = ?
+            """,
+            (save.id, thread.id),
+        )
+    }
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    repositories.connection.execute(
+        "UPDATE characters SET archived_at = CURRENT_TIMESTAMP "
+        "WHERE id = 'mara'"
+    )
+    repositories.commit()
+    excluded = service.capture_current_head_if_dirty(save.id)
+    excluded_rows = service._rows_from_manifest(
+        service._snapshot_manifest(excluded)
+    )
+    assert all(
+        row["id"] != thread.id
+        for row in excluded_rows["character_text_threads"]
+    )
+
+    repositories.connection.execute(
+        "UPDATE characters SET archived_at = NULL "
+        "WHERE id = 'mara'"
+    )
+    repositories.commit()
+    revived = service.capture_current_head_if_dirty(save.id)
+    revived_rows = service._rows_from_manifest(service._snapshot_manifest(revived))
+
+    assert thread.id in {
+        row["id"] for row in revived_rows["character_text_threads"]
+    }
+    assert participant_ids <= {
+        row["id"]
+        for row in revived_rows["character_text_thread_participants"]
+    }
+
+
+def test_participant_move_rechecks_old_and_new_group_threads(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    for character_id in ("mara", "rowan", "inez", "tomas"):
+        repositories.add_character(
+            save_id=save.id,
+            character_id=character_id,
+            name=character_id.title(),
+        )
+    old_thread = repositories.create_character_text_group_thread(
+        save_id=save.id,
+        title="Old Crew",
+        character_ids=("mara", "rowan"),
+    )
+    new_thread = repositories.create_character_text_group_thread(
+        save_id=save.id,
+        title="New Crew",
+        character_ids=("inez", "tomas"),
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_baseline_snapshot(save.id)
+    participant = repositories.connection.execute(
+        """
+        SELECT id FROM character_text_thread_participants
+        WHERE save_id = ? AND thread_id = ? AND character_id = 'rowan'
+        """,
+        (save.id, old_thread.id),
+    ).fetchone()
+    assert participant is not None
+    repositories.connection.execute(
+        """
+        UPDATE character_text_thread_participants
+        SET thread_id = ? WHERE id = ?
+        """,
+        (new_thread.id, participant["id"]),
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+    thread_ids = {str(row["id"]) for row in rows["character_text_threads"]}
+
+    assert old_thread.id not in thread_ids
+    assert new_thread.id in thread_ids
+
+
+def test_activity_removal_rechecks_narrator_cursor_aggregate(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The phone display dims.",
+    )
+    character = repositories.add_character(
+        save_id=save.id,
+        character_id="rowan",
+        name="Rowan",
+    )
+    thread = repositories.get_or_create_character_text_thread(
+        save_id=save.id,
+        character_id=character.id,
+        title="Rowan",
+    )
+    repositories.connection.execute(
+        """
+        INSERT INTO character_text_activity_events(
+            id, save_id, ordinal, thread_id, activity_type
+        ) VALUES ('activity-1', ?, 5, ?, 'message_sent')
+        """,
+        (save.id, thread.id),
+    )
+    repositories.connection.execute(
+        """
+        INSERT INTO narrator_phone_activity_cursors(
+            narrator_message_id, save_id, last_activity_ordinal
+        ) VALUES (?, ?, 5)
+        """,
+        (narrator.id, save.id),
+    )
+    repositories.commit()
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=save.id, message_id=narrator.id)
+    repositories.connection.execute(
+        "DELETE FROM character_text_activity_events WHERE id = 'activity-1'"
+    )
+    repositories.commit()
+
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))
+
+    [cursor] = rows["narrator_phone_activity_cursors"]
+    assert cursor["last_activity_ordinal"] == 0
+
+
+def test_low_ordinal_activity_change_does_not_rewrite_cursors(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The phone display dims.",
+    )
+    character = repositories.add_character(
+        save_id=save.id,
+        character_id="rowan",
+        name="Rowan",
+    )
+    thread = repositories.get_or_create_character_text_thread(
+        save_id=save.id,
+        character_id=character.id,
+        title="Rowan",
+    )
+    repositories.connection.executemany(
+        """
+        INSERT INTO character_text_activity_events(
+            id, save_id, ordinal, thread_id, activity_type
+        ) VALUES (?, ?, ?, ?, 'message_sent')
+        """,
+        (
+            ("activity-low", save.id, 5, thread.id),
+            ("activity-high", save.id, 10, thread.id),
+        ),
+    )
+    repositories.connection.execute(
+        """
+        INSERT INTO narrator_phone_activity_cursors(
+            narrator_message_id, save_id, last_activity_ordinal
+        ) VALUES (?, ?, 10)
+        """,
+        (narrator.id, save.id),
+    )
+    repositories.commit()
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=save.id, message_id=narrator.id)
+    repositories.connection.execute(
+        "UPDATE character_text_activity_events SET read_count = 1 "
+        "WHERE id = 'activity-low'"
+    )
+    repositories.commit()
+    stored_row_kinds: list[str] = []
+    original_store = service._store_object
+
+    def record_store(*, kind: str, value: object) -> str:
+        if kind.startswith("row:"):
+            stored_row_kinds.append(kind)
+        return original_store(kind=kind, value=value)
+
+    monkeypatch.setattr(service, "_store_object", record_store)
+
+    service.capture_current_head_if_dirty(save.id)
+
+    assert stored_row_kinds == ["row:character_text_activity_events"]
+
+
+def test_incremental_fade_transition_removes_dependents(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="The beacon is lit.",
+    )
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="beacon",
+        value={"lit": True},
+        source_message_id=message.id,
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=save.id, message_id=message.id)
+    repositories.connection.execute(
+        """
+        UPDATE messages
+        SET body = ?, safety_transition = 'fade_to_black'
+        WHERE id = ?
+        """,
+        ("The scene moves forward.", message.id),
+    )
+    repositories.commit()
+
+    faded = service.capture_current_head_if_dirty(save.id)
+    faded_rows = service._rows_from_manifest(service._snapshot_manifest(faded))
+    assert faded_rows["messages"] == ()
+    assert faded_rows["world_state"] == ()
+
+
+def test_dirty_row_capture_serializes_only_changed_row(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I inventory the lenses.",
+    )
+    for index in range(32):
+        repositories.upsert_world_state(
+            save_id=save.id,
+            key=f"lens.{index:02d}",
+            value={"color": "red"},
+            source_message_id=message.id,
+        )
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=save.id, message_id=message.id)
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens.17",
+        value={"color": "blue"},
+        source_message_id=message.id,
+    )
+    stored_row_kinds: list[str] = []
+    original_store_object = service._store_object
+
+    def record_store(*, kind: str, value: object) -> str:
+        if kind.startswith("row:"):
+            stored_row_kinds.append(kind)
+        return original_store_object(kind=kind, value=value)
+
+    monkeypatch.setattr(service, "_store_object", record_store)
+
+    service.capture_current_head_if_dirty(save.id)
+
+    assert stored_row_kinds == ["row:world_state"]
+
+
+def test_character_text_edit_serializes_only_changed_row(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save = _create_save(repositories)
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        body="A message arrives.",
+    )
+    character = repositories.add_character(
+        character_id="rowan",
+        save_id=save.id,
+        name="Rowan",
+        source_message_id=narrator.id,
+    )
+    thread = repositories.get_or_create_character_text_thread(
+        save_id=save.id,
+        character_id=character.id,
+        title="Rowan",
+    )
+    text_message = repositories.append_character_text_message(
+        message_id="text-one",
+        save_id=save.id,
+        thread_id=thread.id,
+        character_id=character.id,
+        sender="character",
+        body="Meet me by the south gate.",
+        in_world_sent_at="Friday evening",
+        delivered_at="2026-07-01T12:05:00+00:00",
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=save.id, message_id=narrator.id)
+    repositories.update_character_text_message_body(
+        save_id=save.id,
+        message_id=text_message.id,
+        body="Meet me by the north gate.",
+    )
+    stored_row_kinds: list[str] = []
+    original_store_object = service._store_object
+
+    def record_store(*, kind: str, value: object) -> str:
+        if kind.startswith("row:"):
+            stored_row_kinds.append(kind)
+        return original_store_object(kind=kind, value=value)
+
+    def fail_active_scan(_save_id: str) -> object:
+        raise AssertionError("character-text edit scanned active tables")
+
+    monkeypatch.setattr(service, "_store_object", record_store)
+    monkeypatch.setattr(service, "_active_rows_by_table", fail_active_scan)
+
+    service.capture_current_head_if_dirty(save.id)
+
+    assert stored_row_kinds == ["row:character_text_messages"]
+
+
+def test_snapshot_manifest_cannot_be_repointed_across_saves(
+    repositories: PersistenceRepositories,
+) -> None:
+    first = _create_save(repositories)
+    second = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    first_snapshot = service.capture_baseline_snapshot(first.id)
+    second_snapshot = service.capture_baseline_snapshot(second.id)
+    repositories.connection.execute(
+        "UPDATE save_turn_snapshots SET root_manifest_hash = ? WHERE id = ?",
+        (second_snapshot.root_manifest_hash, first_snapshot.id),
+    )
+    repositories.commit()
+
+    with pytest.raises(ValueError, match="wrong save id"):
+        service.restore_save_to_snapshot(
+            save_id=first.id,
+            snapshot_id=first_snapshot.id,
+        )
+
+
+def test_rolled_back_row_change_does_not_dirty_materialized_snapshot(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I inspect the lens.",
+    )
+    service = TurnSnapshotService(repositories)
+    original = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    repositories.begin_transaction()
+    repositories.update_message_body(
+        save_id=save.id,
+        message_id=message.id,
+        body="This edit is rolled back.",
+    )
+    repositories.rollback_transaction()
+
+    clean = service.capture_current_head_if_dirty(save.id)
+
+    assert clean.id == original.id
+
+
 def test_restore_snapshot_strips_deprecated_scenario_update_sections(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -3300,25 +4560,38 @@ def test_restore_snapshot_strips_deprecated_scenario_update_sections(
     service = TurnSnapshotService(repositories)
     snapshot = service.capture_baseline_snapshot(save.id)
     manifest = service._snapshot_manifest(snapshot)  # noqa: SLF001 - legacy fixture
-    tables = manifest["tables"]
-    assert isinstance(tables, dict)
-    update_entries = tables["save_scenario_updates"]
-    assert isinstance(update_entries, list)
-    [update_entry] = update_entries
-    assert isinstance(update_entry, dict)
+    rows_by_table = service._rows_from_manifest(manifest)  # noqa: SLF001
     row = repositories.connection.execute(
         "SELECT * FROM save_scenario_updates WHERE id = ?",
         (update.id,),
     ).fetchone()
     legacy_row = dict(row)
     legacy_row["content_json"] = json.dumps(legacy_content, sort_keys=True)
-    update_entry["object_hash"] = service._store_object(  # noqa: SLF001 - fixture
-        kind="row:save_scenario_updates",
-        value=legacy_row,
-    )
+    tables: dict[str, list[dict[str, str]]] = {}
+    for table_name, table_rows in rows_by_table.items():
+        entries: list[dict[str, str]] = []
+        for table_row in table_rows:
+            value = legacy_row if table_name == "save_scenario_updates" else table_row
+            entries.append(
+                {
+                    "id": str(value.get("id", "")),
+                    "object_hash": service._store_object(  # noqa: SLF001
+                        kind=f"row:{table_name}",
+                        value=value,
+                    ),
+                }
+            )
+        tables[table_name] = entries
     legacy_manifest_hash = service._store_object(  # noqa: SLF001 - fixture
         kind="snapshot_manifest",
-        value=manifest,
+        value={
+            "format": "bragi-turn-snapshot-v1",
+            "save_id": save.id,
+            "message_id": None,
+            "active_message_ids": [],
+            "context_revision": snapshot.context_revision,
+            "tables": tables,
+        },
     )
     repositories.connection.execute(
         "UPDATE save_turn_snapshots SET root_manifest_hash = ? WHERE id = ?",
@@ -3754,43 +5027,13 @@ def _snapshot_rows_by_table(
     repositories: PersistenceRepositories,
     snapshot_id: str,
 ) -> dict[str, list[dict[str, object]]]:
-    snapshot_row = repositories.connection.execute(
-        """
-        SELECT root_manifest_hash
-        FROM save_turn_snapshots
-        WHERE id = ?
-        """,
-        (snapshot_id,),
-    ).fetchone()
-    assert snapshot_row is not None
-    manifest_payload = repositories.connection.execute(
-        """
-        SELECT payload
-        FROM save_snapshot_objects
-        WHERE object_hash = ?
-        """,
-        (str(snapshot_row["root_manifest_hash"]),),
-    ).fetchone()
-    assert manifest_payload is not None
-    manifest = json.loads(zlib.decompress(bytes(manifest_payload["payload"])))
-    rows_by_table: dict[str, list[dict[str, object]]] = {}
-    for table_name, entries in manifest["tables"].items():
-        table_rows: list[dict[str, object]] = []
-        for entry in entries:
-            payload = repositories.connection.execute(
-                """
-                SELECT payload
-                FROM save_snapshot_objects
-                WHERE object_hash = ?
-                """,
-                (entry["object_hash"],),
-            ).fetchone()
-            assert payload is not None
-            decoded = json.loads(zlib.decompress(bytes(payload["payload"])))
-            assert isinstance(decoded, dict)
-            table_rows.append(decoded)
-        rows_by_table[str(table_name)] = table_rows
-    return rows_by_table
+    service = TurnSnapshotService(repositories)
+    snapshot = service._get_snapshot(snapshot_id)  # noqa: SLF001
+    manifest = service._snapshot_manifest(snapshot)  # noqa: SLF001
+    return {
+        table_name: list(rows)
+        for table_name, rows in service._rows_from_manifest(manifest).items()  # noqa: SLF001
+    }
 
 
 def _assert_snapshot_objects_do_not_store_media_bytes(
@@ -3804,3 +5047,75 @@ def _assert_snapshot_objects_do_not_store_media_bytes(
     ).fetchall()
     payloads = b"\n".join(zlib.decompress(bytes(row["payload"])) for row in rows)
     assert b"image bytes stay on disk" not in payloads
+
+
+def test_snapshot_captures_and_restores_turn_outcomes(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    narrator = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Evening comes.",
+    )
+    repositories.add_turn_outcome(
+        save_id=save.id,
+        message_id=narrator.id,
+        payload={
+            "save_id": save.id,
+            "message_id": narrator.id,
+            "attempt_resolution": "succeeded",
+            "effects": [
+                {
+                    "candidate_id": "time:1",
+                    "candidate_type": "world_time_change",
+                    "domain": "time",
+                    "operation": "update",
+                    "state_key": "scene_snapshot.in_world_time",
+                    "field_path": "",
+                    "character_id": "",
+                    "target_type": "",
+                    "target_id": "",
+                    "value": {"time_of_day": "evening"},
+                    "confidence": 0.9,
+                    "evidence_source_ids": [f"message:{narrator.id}"],
+                    "evidence_quote": "Evening comes",
+                    "verifier_status": "rendered",
+                    "safe_to_commit": True,
+                    "application_status": "committed",
+                    "reason": "rendered",
+                    "changed": True,
+                }
+            ],
+            "applied_domains": ["time"],
+            "queued_domains": [],
+            "verification_passed": True,
+            "verifier_available": True,
+            "post_turn_update_needed": False,
+            "committed_count": 1,
+            "confirmation_queued_count": 0,
+        },
+    )
+    service = TurnSnapshotService(repositories)
+    snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=narrator.id,
+    )
+    repositories.add_turn_outcome(
+        save_id=save.id,
+        message_id=narrator.id,
+        payload={"save_id": save.id, "message_id": narrator.id, "effects": []},
+    )
+
+    service.restore_save_to_snapshot(save_id=save.id, snapshot_id=snapshot.id)
+
+    outcomes = repositories.list_turn_outcomes(save.id)
+    assert len(outcomes) == 1
+    assert outcomes[0].payload["attempt_resolution"] == "succeeded"
+    assert outcomes[0].payload["applied_domains"] == ["time"]
+    raw_effects = outcomes[0].payload["effects"]
+    assert isinstance(raw_effects, list)
+    effect = raw_effects[0]
+    assert isinstance(effect, dict)
+    assert effect["evidence_source_ids"] == [f"message:{narrator.id}"]

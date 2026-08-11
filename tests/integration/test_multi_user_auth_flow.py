@@ -141,7 +141,11 @@ def test_multi_user_auth_flow_scopes_saves_and_child_access(
         child_denied = child_client.get(f"/api/runtime?save_id={rook_save.id}")
         child_chat = child_client.post(
             "/api/chat",
-            json={"save_id": mira_save.id, "body": "I tend the lamp."},
+            json={
+                "client_turn_id": "11111111-1111-4111-8111-111111111111",
+                "save_id": mira_save.id,
+                "body": "I tend the lamp.",
+            },
         )
         chat_job = _wait_for_terminal_job(
             child_client,

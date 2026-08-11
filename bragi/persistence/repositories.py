@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, cast
 from uuid import uuid4
 
+from bragi.epistemics import normalize_epistemic_status
 from bragi.interaction_mode import InteractionMode, normalize_interaction_mode
 from bragi.observation_types import normalize_observation_type
 from bragi.persistence.context_provenance import merge_context_source_metadata
@@ -35,6 +36,7 @@ from bragi.persistence.models import (
     CharacterTextProvenanceRecord,
     CharacterTextThreadParticipantRecord,
     CharacterTextThreadRecord,
+    ChatTurnSubmissionRecord,
     ContextObservationCurationHealthRecord,
     ContextObservationCurationStateRecord,
     ContextObservationRecord,
@@ -53,6 +55,7 @@ from bragi.persistence.models import (
     MediaAssetRecord,
     MemoryRecord,
     MessageActionChoiceRecord,
+    MessageNarrationStateRecord,
     MessagePageRecord,
     MessageRecord,
     MessageRevisionMetadataRecord,
@@ -60,6 +63,7 @@ from bragi.persistence.models import (
     MessageScenePresenceRecord,
     MessageVisibilityRecord,
     ModelPreferenceRecord,
+    PostTurnOutboxRecord,
     ProviderCatalogEntryRecord,
     ProviderConfigRecord,
     ProviderModelRecord,
@@ -69,11 +73,15 @@ from bragi.persistence.models import (
     SaveRecord,
     SaveScenarioUpdateRecord,
     ScenarioRecord,
+    SceneFactProvenanceRecord,
+    SceneFactRecord,
     SceneSnapshotRecord,
     ScheduledTaskRecord,
     ScopedSettingRecord,
     StateChangeRecord,
+    SummaryPressureStateRecord,
     SummaryRecord,
+    TurnOutcomeRecord,
     UserRecord,
     UserSessionRecord,
     WorldStateRecord,
@@ -84,6 +92,12 @@ from bragi.retry_policy import (
     configured_retry_count,
 )
 from bragi.safety import normalize_message_safety
+from bragi.scene_facts import (
+    MAX_ACTIVE_SCENE_FACTS,
+    scene_fact_conflict_key,
+    scene_fact_lifetime,
+    validate_scene_fact_shape,
+)
 from bragi.text_search import (
     MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS,
     cjk_lexical_anchors,
@@ -127,6 +141,9 @@ MAX_CONTEXT_SOURCE_NORMALIZED_BYTES_PER_RECORD = 4 * 1024 * 1024
 SCOPED_MAY_KNOW_CONFIDENCE_THRESHOLD = 0.7
 MAX_NARRATION_GRAPH_CHARACTER_IDS = 64
 JOB_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "cancelled"})
+POST_TURN_OUTBOX_STATUSES = frozenset(
+    {"pending", "running", "succeeded", "skipped", "failed", "superseded"}
+)
 _CJK_SUBSTRING_OPTIONAL_QUERY_TERMS = frozenset(
     {
         "a",
@@ -182,6 +199,9 @@ JOB_STEP_STATUSES = frozenset(
 _JOB_INITIAL_STATUSES = frozenset({"queued", "running"})
 _JOB_TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 _JOB_UPDATE_STATUSES = frozenset({"succeeded", "failed"})
+_MESSAGE_NARRATION_STATUSES = frozenset(
+    {"complete", "pending", "retrying", "failed", "cancelled"}
+)
 _SAFE_TEXT_METADATA_KEYS = frozenset(
     {
         "evidence_quote",
@@ -256,6 +276,10 @@ _JOB_COLUMNS = (
     "id, save_id, creator_user_id, type, status, payload_json, result_json, error, "
     "created_at, started_at, completed_at, duration_ms, diagnostics_json"
 )
+
+
+def _qualified_columns(columns: str, alias: str) -> str:
+    return ", ".join(f"{alias}.{column.strip()}" for column in columns.split(","))
 _DATING_ROUTE_STATE_COLUMNS = (
     "id, save_id, player_character_id, npc_character_id, stage, "
     "first_met_message_id, first_met_world_day_index, "
@@ -1088,6 +1112,7 @@ class PersistenceRepositories:
         try:
             for table_name in (
                 "media_assets",
+                "chat_turn_submissions",
                 "jobs",
                 "save_loss_outcomes",
                 "save_loss_condition_changes",
@@ -1498,6 +1523,29 @@ class PersistenceRepositories:
             (save_id,),
         )
         return SaveScenarioUpdateRecord(**dict(row)) if row else None
+
+    def update_active_save_scenario_content(
+        self,
+        *,
+        save_id: str,
+        content: dict[str, object],
+    ) -> SaveScenarioUpdateRecord:
+        update = self.get_active_save_scenario_update(save_id)
+        if update is None:
+            raise ValueError(f"Save has no active scenario update: {save_id}")
+        self.connection.execute(
+            """
+            UPDATE save_scenario_updates
+            SET content_json = ?
+            WHERE id = ? AND archived_at IS NULL
+            """,
+            (_dump_json(content), update.id),
+        )
+        self.commit()
+        refreshed = self.get_active_save_scenario_update(save_id)
+        if refreshed is None:
+            raise ValueError(f"Save has no active scenario update: {save_id}")
+        return refreshed
 
     def list_save_scenario_updates(
         self,
@@ -2378,8 +2426,11 @@ class PersistenceRepositories:
         updated_at: str | None = None,
         safety_transition: str = "",
         content_rating: str = "unclassified",
+        narration_status: str = "complete",
+        narration_error: str | None = None,
         touch_save_updated_at: bool = True,
     ) -> MessageRecord:
+        _validate_message_narration_status(narration_status)
         body, safety_transition = normalize_message_safety(
             body=body,
             role=role,
@@ -2403,13 +2454,13 @@ class PersistenceRepositories:
             INSERT INTO messages(
                 id, save_id, role, speaker_name, body, provider, model,
                 token_estimate, created_at, updated_at, safety_transition,
-                content_rating
+                content_rating, narration_status, narration_error
             )
             VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?,
                 COALESCE(?, CURRENT_TIMESTAMP),
                 COALESCE(?, strftime('%Y-%m-%d %H:%M:%f', 'now')),
-                ?, ?
+                ?, ?, ?, ?
             )
             """,
             (
@@ -2425,6 +2476,8 @@ class PersistenceRepositories:
                 updated_at,
                 record.safety_transition,
                 record.content_rating,
+                narration_status,
+                redact_text(narration_error),
             ),
         )
         if touch_save_updated_at:
@@ -2464,6 +2517,8 @@ class PersistenceRepositories:
                     roles=("narrator",),
                 )["narrator"],
             )
+            self.archive_stale_scene_facts(save_id=save_id)
+        self._advance_summary_pressure_state_for_message(record)
         self.commit()
         row = self._fetch_one(
             """
@@ -2496,6 +2551,120 @@ class PersistenceRepositories:
             (save_id, message_id),
         )
         return MessageRecord(**dict(row)) if row else None
+
+    def get_message_narration_state(
+        self,
+        *,
+        save_id: str,
+        message_id: str,
+    ) -> MessageNarrationStateRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, role, narration_status, narration_error
+            FROM messages
+            WHERE save_id = ? AND id = ? AND deleted_at IS NULL
+            """,
+            (save_id, message_id),
+        )
+        return _message_narration_state_from_row(row) if row is not None else None
+
+    def get_active_interrupted_message_narration(
+        self,
+        save_id: str,
+    ) -> MessageNarrationStateRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, role, speaker_name, body,
+                   narration_status, narration_error
+            FROM messages
+            WHERE save_id = ? AND deleted_at IS NULL
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (save_id,),
+        )
+        if row is None or row["narration_status"] not in {"failed", "cancelled"}:
+            return None
+        if (
+            row["role"] == "player"
+            and row["speaker_name"] == STORY_CONTINUATION_SPEAKER_NAME
+            and row["body"] == STORY_CONTINUATION_DIRECTION
+        ):
+            return None
+        if row["role"] not in {"player", "system"}:
+            return None
+        return _message_narration_state_from_row(row)
+
+    def set_message_narration_state(
+        self,
+        *,
+        save_id: str,
+        message_id: str,
+        status: str,
+        error: str | None = None,
+        expected_statuses: tuple[str, ...] = (),
+    ) -> MessageNarrationStateRecord:
+        _validate_message_narration_status(status)
+        for expected_status in expected_statuses:
+            _validate_message_narration_status(expected_status)
+        expected_clause = ""
+        params: list[object] = [status, redact_text(error), save_id, message_id]
+        if expected_statuses:
+            expected_clause = (
+                f"AND narration_status IN ({_placeholders(len(expected_statuses))})"
+            )
+            params.extend(expected_statuses)
+        cursor = self.connection.execute(
+            f"""
+            UPDATE messages
+            SET narration_status = ?, narration_error = ?
+            WHERE save_id = ? AND id = ? AND deleted_at IS NULL
+              {expected_clause}
+            """,
+            tuple(params),
+        )
+        self.commit()
+        if cursor.rowcount != 1:
+            raise ValueError(
+                f"Message narration state did not transition: {message_id}"
+            )
+        state = self.get_message_narration_state(
+            save_id=save_id,
+            message_id=message_id,
+        )
+        if state is None:
+            raise ValueError(f"Unknown active message id: {message_id}")
+        return state
+
+    def recover_interrupted_message_narrations(
+        self,
+        *,
+        error: str,
+    ) -> list[str]:
+        rows = self._fetch_all(
+            """
+            SELECT id
+            FROM messages
+            WHERE deleted_at IS NULL
+              AND narration_status IN ('pending', 'retrying')
+            ORDER BY rowid
+            """,
+            (),
+        )
+        message_ids = [str(row["id"]) for row in rows]
+        if not message_ids:
+            return []
+        self.connection.execute(
+            """
+            UPDATE messages
+            SET narration_status = 'cancelled', narration_error = ?
+            WHERE deleted_at IS NULL
+              AND narration_status IN ('pending', 'retrying')
+            """,
+            (redact_text(error),),
+        )
+        self.commit()
+        return message_ids
 
     def list_messages(
         self,
@@ -2899,6 +3068,7 @@ class PersistenceRepositories:
             """,
             (body, safety_transition, content_rating, save_id, message_id),
         )
+        self.rebuild_summary_pressure_state(save_id)
         self.commit()
         row = self._fetch_one(
             """
@@ -3120,6 +3290,7 @@ class PersistenceRepositories:
                 save_id=str(row["save_id"]),
                 message_ids={message_id},
             )
+            self.rebuild_summary_pressure_state(str(row["save_id"]))
         self.commit()
 
     def archive_messages_from(
@@ -3166,12 +3337,18 @@ class PersistenceRepositories:
             save_id=save_id,
             message_ids={record.id for record in records},
         )
+        self.rebuild_summary_pressure_state(save_id)
         self.commit()
         return records
 
     def restore_messages(self, message_ids: set[str] | frozenset[str]) -> None:
         if not message_ids:
             return
+        save_rows = self._fetch_all(
+            f"SELECT DISTINCT save_id FROM messages "
+            f"WHERE id IN ({_placeholders(len(message_ids))})",
+            tuple(message_ids),
+        )
         self.connection.execute(
             f"""
             UPDATE messages
@@ -3180,6 +3357,8 @@ class PersistenceRepositories:
             """,
             tuple(message_ids),
         )
+        for row in save_rows:
+            self.rebuild_summary_pressure_state(str(row["save_id"]))
         self.commit()
 
     def upsert_world_state(
@@ -4769,7 +4948,14 @@ class PersistenceRepositories:
         tags: list[str] | tuple[str, ...] | None = None,
         metadata: dict[str, object] | None = None,
         observation_id: str | None = None,
+        epistemic_status: str = "legacy_unclassified",
+        epistemic_actor_id: str | None = None,
+        epistemic_actor_name: str = "",
     ) -> ContextObservationRecord:
+        epistemic_actor_id = self._validated_epistemic_actor_id(
+            save_id=save_id,
+            actor_id=epistemic_actor_id,
+        )
         original_observation_type = observation_type.strip()
         normalized_observation_type = normalize_observation_type(
             original_observation_type
@@ -4792,15 +4978,19 @@ class PersistenceRepositories:
             confidence=confidence,
             tags=_unique_strings(tags or ()),
             metadata=normalized_metadata,
+            epistemic_status=normalize_epistemic_status(epistemic_status),
+            epistemic_actor_id=epistemic_actor_id,
+            epistemic_actor_name=epistemic_actor_name.strip()[:200],
         )
         self.connection.execute(
             """
             INSERT INTO context_observations(
                 id, save_id, observation_type, claim, evidence_quote,
                 source_message_ids_json, scope, status, confidence, tags_json,
-                metadata_json
+                metadata_json, epistemic_status, epistemic_actor_id,
+                epistemic_actor_name
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -4814,6 +5004,9 @@ class PersistenceRepositories:
                 record.confidence,
                 _dump_json(record.tags),
                 _dump_json(record.metadata),
+                record.epistemic_status,
+                record.epistemic_actor_id,
+                record.epistemic_actor_name,
             ),
         )
         self.connection.execute(
@@ -4848,7 +5041,8 @@ class PersistenceRepositories:
             """
             SELECT id, save_id, observation_type, claim, evidence_quote,
                    source_message_ids_json, scope, status, confidence, tags_json,
-                   metadata_json, created_at, updated_at, archived_at
+                   metadata_json, created_at, updated_at, archived_at,
+                   epistemic_status, epistemic_actor_id, epistemic_actor_name
             FROM context_observations
             WHERE id = ? AND archived_at IS NULL
             """,
@@ -4886,7 +5080,8 @@ class PersistenceRepositories:
             f"""
             SELECT id, save_id, observation_type, claim, evidence_quote,
                    source_message_ids_json, scope, status, confidence, tags_json,
-                   metadata_json, created_at, updated_at, archived_at
+                   metadata_json, created_at, updated_at, archived_at,
+                   epistemic_status, epistemic_actor_id, epistemic_actor_name
             FROM context_observations
             WHERE {' AND '.join(filters)}
             {order_sql}
@@ -4946,7 +5141,9 @@ class PersistenceRepositories:
                    observation.status, observation.confidence,
                    observation.tags_json, observation.metadata_json,
                    observation.created_at, observation.updated_at,
-                   observation.archived_at
+                   observation.archived_at, observation.epistemic_status,
+                   observation.epistemic_actor_id,
+                   observation.epistemic_actor_name
             FROM context_observations observation
             JOIN context_observation_curation_state curation
               ON curation.observation_id = observation.id
@@ -5186,7 +5383,8 @@ class PersistenceRepositories:
                 f"""
                 SELECT id, save_id, observation_type, claim, evidence_quote,
                        source_message_ids_json, scope, status, confidence,
-                       tags_json, metadata_json, created_at, updated_at, archived_at
+                       tags_json, metadata_json, created_at, updated_at, archived_at,
+                       epistemic_status, epistemic_actor_id, epistemic_actor_name
                 FROM context_observations
                 WHERE id IN (
                     SELECT observation_id
@@ -5645,7 +5843,503 @@ class PersistenceRepositories:
         saved = self.get_scene_snapshot(save_id)
         if saved is None:
             raise ValueError(f"Unknown scene snapshot for save id: {save_id}")
+        self.archive_stale_scene_facts(save_id=save_id)
         return saved
+
+    def list_scene_facts(
+        self,
+        save_id: str,
+        *,
+        include_archived: bool = False,
+        current_only: bool = True,
+        scene_snapshot_id: str | None = None,
+        scene_generation: int | None = None,
+    ) -> list[SceneFactRecord]:
+        if current_only and (scene_snapshot_id is None or scene_generation is None):
+            scene = self.get_scene_snapshot(save_id)
+            if scene is None:
+                return []
+            scene_snapshot_id = scene.id
+            scene_generation = scene.scene_generation
+        filters = ["facts.save_id = ?"]
+        params: list[object] = [save_id]
+        if not include_archived:
+            filters.append("facts.archived_at IS NULL")
+        if current_only:
+            current_turn = self.count_active_messages_by_role(
+                save_id,
+                roles=("narrator",),
+            )["narrator"]
+            filters.extend(
+                (
+                    "facts.scene_snapshot_id = ?",
+                    "facts.scene_generation = ?",
+                    "(facts.lifetime != 'turn' OR "
+                    "facts.expires_after_turn_number > ?)",
+                )
+            )
+            params.extend((scene_snapshot_id, scene_generation, current_turn))
+        rows = self._fetch_all(
+            f"""
+            SELECT facts.id, facts.save_id, facts.scene_snapshot_id,
+                   facts.scene_generation, facts.fact_type, facts.subject_type,
+                   facts.subject_id, facts.subject_label, facts.target_type,
+                   facts.target_id, facts.target_label, facts.aspect, facts.value,
+                   facts.conflict_key, facts.lifetime,
+                   facts.created_turn_number, facts.expires_after_turn_number,
+                   facts.archived_at, facts.archive_reason,
+                   facts.created_at, facts.updated_at
+            FROM scene_facts AS facts
+            WHERE {' AND '.join(filters)}
+            ORDER BY facts.created_at, facts.rowid
+            """,
+            tuple(params),
+        )
+        return [self._scene_fact_from_row(row) for row in rows]
+
+    def get_scene_fact(self, fact_id: str) -> SceneFactRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, scene_snapshot_id, scene_generation, fact_type,
+                   subject_type, subject_id, subject_label, target_type,
+                   target_id, target_label, aspect, value, conflict_key,
+                   lifetime, created_turn_number, expires_after_turn_number,
+                   archived_at, archive_reason, created_at, updated_at
+            FROM scene_facts
+            WHERE id = ?
+            """,
+            (fact_id,),
+        )
+        return self._scene_fact_from_row(row) if row is not None else None
+
+    def upsert_scene_fact(
+        self,
+        *,
+        save_id: str,
+        fact_type: str,
+        subject_type: str,
+        subject_id: str | None,
+        subject_label: str,
+        value: str,
+        source_message_id: str,
+        evidence_quote: str,
+        target_type: str = "",
+        target_id: str | None = None,
+        target_label: str = "",
+        aspect: str = "",
+        reason: str = "",
+        confidence: float = 1.0,
+        fact_id: str | None = None,
+    ) -> tuple[SceneFactRecord, SceneFactRecord | None, bool]:
+        scene = self.get_scene_snapshot(save_id)
+        if scene is None:
+            raise ValueError(f"Unknown scene snapshot for save id: {save_id}")
+        validate_scene_fact_shape(
+            fact_type=fact_type,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            subject_label=subject_label,
+            target_type=target_type,
+            target_id=target_id,
+            target_label=target_label,
+            aspect=aspect,
+            value=value,
+        )
+        self._validate_scene_fact_reference(
+            save_id=save_id,
+            reference_type=subject_type,
+            reference_id=subject_id,
+            field_name="subject_id",
+        )
+        self._validate_scene_fact_reference(
+            save_id=save_id,
+            reference_type=target_type,
+            reference_id=target_id,
+            field_name="target_id",
+        )
+        message = self.get_message(save_id=save_id, message_id=source_message_id)
+        if message is None:
+            raise ValueError(f"Unknown scene fact source message: {source_message_id}")
+        if not evidence_quote.strip():
+            raise ValueError("Scene fact evidence_quote is required")
+
+        self.archive_stale_scene_facts(save_id=save_id)
+        conflict_key = scene_fact_conflict_key(
+            fact_type=fact_type,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            subject_label=subject_label,
+            target_type=target_type,
+            target_id=target_id,
+            target_label=target_label,
+            aspect=aspect,
+        )
+        existing_row = self._fetch_one(
+            """
+            SELECT id
+            FROM scene_facts
+            WHERE save_id = ? AND scene_snapshot_id = ?
+              AND scene_generation = ? AND conflict_key = ?
+              AND archived_at IS NULL
+            """,
+            (save_id, scene.id, scene.scene_generation, conflict_key),
+        )
+        existing = (
+            self.get_scene_fact(str(existing_row["id"]))
+            if existing_row is not None
+            else None
+        )
+        lifetime = scene_fact_lifetime(fact_type)
+        turn_number = self.count_active_messages_by_role(
+            save_id,
+            roles=("narrator",),
+        )["narrator"]
+        expires_after = turn_number + 1 if lifetime == "turn" else None
+        values = (
+            fact_type,
+            subject_type,
+            subject_id,
+            subject_label.strip(),
+            target_type,
+            target_id,
+            target_label.strip(),
+            aspect.strip(),
+            value.strip(),
+        )
+        refreshed = existing is not None and values == (
+            existing.fact_type,
+            existing.subject_type,
+            existing.subject_id,
+            existing.subject_label,
+            existing.target_type,
+            existing.target_id,
+            existing.target_label,
+            existing.aspect,
+            existing.value,
+        )
+        replaced = None if refreshed else existing
+        if refreshed and existing is not None:
+            self.connection.execute(
+                """
+                UPDATE scene_facts
+                SET expires_after_turn_number = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (expires_after, existing.id),
+            )
+            saved_id = existing.id
+        else:
+            if existing is not None:
+                self.connection.execute(
+                    """
+                    UPDATE scene_facts
+                    SET archived_at = CURRENT_TIMESTAMP,
+                        archive_reason = 'superseded',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (existing.id,),
+                )
+            active_count = len(self.list_scene_facts(save_id))
+            if active_count >= MAX_ACTIVE_SCENE_FACTS:
+                raise ValueError("Current scene fact limit reached")
+            saved_id = fact_id or _new_id()
+            self.connection.execute(
+                """
+                INSERT INTO scene_facts(
+                    id, save_id, scene_snapshot_id, scene_generation, fact_type,
+                    subject_type, subject_id, subject_label, target_type,
+                    target_id, target_label, aspect, value, conflict_key,
+                    lifetime, created_turn_number, expires_after_turn_number
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    saved_id,
+                    save_id,
+                    scene.id,
+                    scene.scene_generation,
+                    *values,
+                    conflict_key,
+                    lifetime,
+                    turn_number,
+                    expires_after,
+                ),
+            )
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO scene_fact_sources(
+                id, save_id, scene_fact_id, source_message_id, evidence_quote,
+                reason, confidence
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _new_id(),
+                save_id,
+                saved_id,
+                source_message_id,
+                evidence_quote.strip(),
+                reason.strip(),
+                max(0.0, min(1.0, confidence)),
+            ),
+        )
+        self.commit()
+        saved = self.get_scene_fact(saved_id)
+        if saved is None:
+            raise ValueError(f"Unknown scene fact id: {saved_id}")
+        return saved, replaced, refreshed
+
+    def retire_scene_fact(
+        self,
+        *,
+        save_id: str,
+        fact_id: str,
+        reason: str = "retired",
+    ) -> SceneFactRecord | None:
+        existing = self.get_scene_fact(fact_id)
+        if existing is None or existing.save_id != save_id or existing.archived_at:
+            return None
+        self.connection.execute(
+            """
+            UPDATE scene_facts
+            SET archived_at = CURRENT_TIMESTAMP, archive_reason = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (reason, fact_id),
+        )
+        self.commit()
+        return existing
+
+    def archive_stale_scene_facts(self, *, save_id: str) -> tuple[str, ...]:
+        scene = self.get_scene_snapshot(save_id)
+        if scene is None:
+            return ()
+        current_turn = self.count_active_messages_by_role(
+            save_id,
+            roles=("narrator",),
+        )["narrator"]
+        rows = self._fetch_all(
+            """
+            SELECT id,
+                   CASE
+                       WHEN scene_snapshot_id != ? OR scene_generation != ?
+                           THEN 'scene_transition'
+                       ELSE 'ttl_expired'
+                   END AS archive_reason
+            FROM scene_facts
+            WHERE save_id = ? AND archived_at IS NULL
+              AND (
+                    scene_snapshot_id != ? OR scene_generation != ?
+                    OR (lifetime = 'turn' AND expires_after_turn_number <= ?)
+              )
+            ORDER BY created_at, rowid
+            """,
+            (
+                scene.id,
+                scene.scene_generation,
+                save_id,
+                scene.id,
+                scene.scene_generation,
+                current_turn,
+            ),
+        )
+        for row in rows:
+            fact = self.get_scene_fact(str(row["id"]))
+            self.connection.execute(
+                """
+                UPDATE scene_facts
+                SET archived_at = CURRENT_TIMESTAMP, archive_reason = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (row["archive_reason"], row["id"]),
+            )
+            if fact is not None:
+                self.add_context_update_audit(
+                    save_id=save_id,
+                    operation=f"{row['archive_reason']}_expired",
+                    entity_type="scene_fact",
+                    entity_id=fact.id,
+                    field_path=fact.conflict_key,
+                    before=_scene_fact_audit_payload(fact),
+                    after=None,
+                    reason=str(row["archive_reason"]),
+                    confidence=max(
+                        (source.confidence for source in fact.provenance),
+                        default=1.0,
+                    ),
+                    source_message_ids=[
+                        source.source_message_id for source in fact.provenance
+                    ],
+                )
+        if rows:
+            self.commit()
+        return tuple(str(row["id"]) for row in rows)
+
+    def remove_scene_fact_provenance_for_messages(
+        self,
+        *,
+        save_id: str,
+        message_ids: set[str] | frozenset[str],
+    ) -> frozenset[str]:
+        if not message_ids:
+            return frozenset()
+        ordered_ids = tuple(sorted(message_ids))
+        placeholders = _placeholders(len(ordered_ids))
+        affected = frozenset(
+            str(row["scene_fact_id"])
+            for row in self._fetch_all(
+                f"""
+                SELECT DISTINCT scene_fact_id
+                FROM scene_fact_sources
+                WHERE save_id = ?
+                  AND source_message_id IN ({placeholders})
+                """,
+                (save_id, *ordered_ids),
+            )
+        )
+        before_by_id = {
+            fact_id: fact
+            for fact_id in sorted(affected)
+            if (fact := self.get_scene_fact(fact_id)) is not None
+        }
+        self.connection.execute(
+            f"""
+            DELETE FROM scene_fact_sources
+            WHERE save_id = ? AND source_message_id IN ({placeholders})
+            """,
+            (save_id, *ordered_ids),
+        )
+        for fact_id in sorted(affected):
+            remaining = self._fetch_one(
+                "SELECT 1 FROM scene_fact_sources WHERE scene_fact_id = ? LIMIT 1",
+                (fact_id,),
+            )
+            if remaining is None:
+                self.connection.execute(
+                    """
+                    UPDATE scene_facts
+                    SET archived_at = COALESCE(archived_at, CURRENT_TIMESTAMP),
+                        archive_reason = CASE
+                            WHEN archived_at IS NULL THEN 'source_removed'
+                            ELSE archive_reason
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (fact_id,),
+                )
+        self.commit()
+        for fact_id, before in before_by_id.items():
+            removed_sources = tuple(
+                source
+                for source in before.provenance
+                if source.source_message_id in message_ids
+            )
+            after = self.get_scene_fact(fact_id)
+            archived = after is None or after.archive_reason == "source_removed"
+            after_payload = (
+                None
+                if after is None or archived
+                else _scene_fact_audit_payload(after)
+            )
+            self.add_context_update_audit(
+                save_id=save_id,
+                operation="source_removed" if archived else "provenance_removed",
+                entity_type="scene_fact",
+                entity_id=fact_id,
+                field_path=before.conflict_key,
+                before=_scene_fact_audit_payload(before),
+                after=after_payload,
+                reason=(
+                    "The final supporting message was removed."
+                    if archived
+                    else "Supporting message provenance was removed."
+                ),
+                confidence=max(
+                    (source.confidence for source in removed_sources),
+                    default=1.0,
+                ),
+                source_message_ids=[
+                    source.source_message_id for source in removed_sources
+                ],
+            )
+        return affected
+
+    def _scene_fact_from_row(self, row: sqlite3.Row) -> SceneFactRecord:
+        source_rows = self._fetch_all(
+            """
+            SELECT id, save_id, scene_fact_id, source_message_id,
+                   evidence_quote, reason, confidence, created_at
+            FROM scene_fact_sources
+            WHERE scene_fact_id = ?
+            ORDER BY created_at, rowid
+            """,
+            (row["id"],),
+        )
+        return SceneFactRecord(
+            id=str(row["id"]),
+            save_id=str(row["save_id"]),
+            scene_snapshot_id=str(row["scene_snapshot_id"]),
+            scene_generation=int(row["scene_generation"]),
+            fact_type=str(row["fact_type"]),
+            subject_type=str(row["subject_type"]),
+            subject_id=cast(str | None, row["subject_id"]),
+            subject_label=str(row["subject_label"]),
+            target_type=str(row["target_type"]),
+            target_id=cast(str | None, row["target_id"]),
+            target_label=str(row["target_label"]),
+            aspect=str(row["aspect"]),
+            value=str(row["value"]),
+            conflict_key=str(row["conflict_key"]),
+            lifetime=str(row["lifetime"]),
+            created_turn_number=int(row["created_turn_number"]),
+            expires_after_turn_number=_optional_int(
+                row["expires_after_turn_number"]
+            ),
+            archived_at=cast(str | None, row["archived_at"]),
+            archive_reason=str(row["archive_reason"]),
+            created_at=cast(str | None, row["created_at"]),
+            updated_at=cast(str | None, row["updated_at"]),
+            provenance=tuple(
+                SceneFactProvenanceRecord(
+                    id=str(source["id"]),
+                    save_id=str(source["save_id"]),
+                    scene_fact_id=str(source["scene_fact_id"]),
+                    source_message_id=str(source["source_message_id"]),
+                    evidence_quote=str(source["evidence_quote"]),
+                    reason=str(source["reason"]),
+                    confidence=float(source["confidence"]),
+                    created_at=cast(str | None, source["created_at"]),
+                )
+                for source in source_rows
+            ),
+        )
+
+    def _validate_scene_fact_reference(
+        self,
+        *,
+        save_id: str,
+        reference_type: str,
+        reference_id: str | None,
+        field_name: str,
+    ) -> None:
+        if reference_type == "character":
+            if reference_id is None:
+                raise ValueError(f"{field_name} is required for a character")
+            self._validate_character_reference(
+                save_id=save_id,
+                character_id=reference_id,
+                field_name=field_name,
+            )
+        elif reference_type == "location":
+            self._validate_location_reference(
+                save_id=save_id,
+                location_id=reference_id,
+                field_name=field_name,
+            )
 
     def upsert_scene_snapshot(
         self,
@@ -9697,12 +10391,54 @@ class PersistenceRepositories:
         provider: str = "",
         model: str = "",
         content_ratings: list[str] | tuple[str, ...] | None = None,
+        expected_head_message_id: str | None = None,
+        expected_narrator_updated_at: str | None = None,
+        generation_token: str | None = None,
     ) -> list[MessageActionChoiceRecord]:
         normalized_choices = tuple(
             choice.strip() for choice in choices if choice.strip()
         )
-        self.begin_transaction()
+        self.begin_immediate_transaction()
         try:
+            if (
+                expected_head_message_id is not None
+                and self.latest_active_message_id(save_id)
+                != expected_head_message_id
+            ):
+                self.rollback_transaction()
+                return []
+            if expected_narrator_updated_at is not None:
+                narrator_row = self._fetch_one(
+                    """
+                    SELECT updated_at
+                    FROM messages
+                    WHERE save_id = ? AND id = ? AND role = 'narrator'
+                      AND deleted_at IS NULL
+                    """,
+                    (save_id, message_id),
+                )
+                if (
+                    narrator_row is None
+                    or str(narrator_row["updated_at"])
+                    != expected_narrator_updated_at
+                ):
+                    self.rollback_transaction()
+                    return []
+            if generation_token is not None:
+                claim_row = self._fetch_one(
+                    """
+                    SELECT generation_token
+                    FROM message_action_choice_generation_claims
+                    WHERE save_id = ? AND message_id = ?
+                    """,
+                    (save_id, message_id),
+                )
+                if (
+                    claim_row is None
+                    or str(claim_row["generation_token"]) != generation_token
+                ):
+                    self.rollback_transaction()
+                    return []
             self.connection.execute(
                 """
                 DELETE FROM message_action_choices
@@ -9739,11 +10475,95 @@ class PersistenceRepositories:
                         content_rating,
                     ),
                 )
+            if generation_token is not None:
+                self.connection.execute(
+                    """
+                    DELETE FROM message_action_choice_generation_claims
+                    WHERE save_id = ? AND message_id = ? AND generation_token = ?
+                    """,
+                    (save_id, message_id, generation_token),
+                )
             self.commit_transaction()
         except Exception:
             self.rollback_transaction()
             raise
         return self.list_message_action_choices(save_id, message_id=message_id)
+
+    def claim_message_action_choice_generation(
+        self,
+        *,
+        save_id: str,
+        message_id: str,
+        narrator_updated_at: str,
+        generation_token: str,
+    ) -> bool:
+        self.begin_immediate_transaction()
+        try:
+            head_id = self.latest_active_message_id(save_id)
+            narrator_row = self._fetch_one(
+                """
+                SELECT updated_at
+                FROM messages
+                WHERE save_id = ? AND id = ? AND role = 'narrator'
+                  AND deleted_at IS NULL
+                """,
+                (save_id, message_id),
+            )
+            if (
+                head_id != message_id
+                or narrator_row is None
+                or str(narrator_row["updated_at"]) != narrator_updated_at
+            ):
+                self.rollback_transaction()
+                return False
+            self.connection.execute(
+                """
+                INSERT INTO message_action_choice_generation_claims(
+                    save_id, message_id, narrator_updated_at, generation_token,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(message_id) DO UPDATE SET
+                    save_id = excluded.save_id,
+                    narrator_updated_at = excluded.narrator_updated_at,
+                    generation_token = excluded.generation_token,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (save_id, message_id, narrator_updated_at, generation_token),
+            )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        return True
+
+    def release_message_action_choice_generation(
+        self,
+        *,
+        save_id: str,
+        message_id: str,
+        generation_token: str,
+    ) -> bool:
+        cursor = self.connection.execute(
+            """
+            DELETE FROM message_action_choice_generation_claims
+            WHERE save_id = ? AND message_id = ? AND generation_token = ?
+            """,
+            (save_id, message_id, generation_token),
+        )
+        self.commit()
+        return cursor.rowcount > 0
+
+    def invalidate_message_action_choice_generations(self, save_id: str) -> int:
+        cursor = self.connection.execute(
+            """
+            DELETE FROM message_action_choice_generation_claims
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        )
+        self.commit()
+        return cursor.rowcount
 
     def list_message_action_choices(
         self,
@@ -10507,6 +11327,80 @@ class PersistenceRepositories:
         )
         return [_context_update_audit_from_row(row) for row in rows]
 
+    def add_turn_outcome(
+        self,
+        *,
+        save_id: str,
+        message_id: str | None,
+        payload: dict[str, object],
+        outcome_id: str | None = None,
+    ) -> TurnOutcomeRecord:
+        record = TurnOutcomeRecord(
+            id=outcome_id or _new_id(),
+            save_id=save_id,
+            message_id=message_id,
+            payload=dict(payload),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO turn_outcomes(id, save_id, message_id, payload_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                record.id,
+                record.save_id,
+                record.message_id,
+                _dump_json(record.payload),
+            ),
+        )
+        self.commit()
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, message_id, payload_json, created_at
+            FROM turn_outcomes
+            WHERE id = ?
+            """,
+            (record.id,),
+        )
+        if row is None:
+            raise ValueError(f"Unknown turn outcome id: {record.id}")
+        return _turn_outcome_from_row(row)
+
+    def get_turn_outcome_for_message(
+        self,
+        *,
+        save_id: str,
+        message_id: str,
+    ) -> TurnOutcomeRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, message_id, payload_json, created_at
+            FROM turn_outcomes
+            WHERE save_id = ? AND message_id = ?
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (save_id, message_id),
+        )
+        if row is None:
+            return None
+        return _turn_outcome_from_row(row)
+
+    def list_turn_outcomes(
+        self,
+        save_id: str,
+    ) -> list[TurnOutcomeRecord]:
+        rows = self._fetch_all(
+            """
+            SELECT id, save_id, message_id, payload_json, created_at
+            FROM turn_outcomes
+            WHERE save_id = ?
+            ORDER BY created_at, rowid
+            """,
+            (save_id,),
+        )
+        return [_turn_outcome_from_row(row) for row in rows]
+
     def add_memory(
         self,
         *,
@@ -10519,12 +11413,25 @@ class PersistenceRepositories:
         memory_id: str | None = None,
         claim_fingerprint: str | None = None,
         source_observation_ids: list[str] | tuple[str, ...] | None = None,
+        epistemic_status: str = "legacy_unclassified",
+        epistemic_actor_id: str | None = None,
+        epistemic_actor_name: str = "",
     ) -> MemoryRecord:
+        epistemic_actor_id = self._validated_epistemic_actor_id(
+            save_id=save_id,
+            actor_id=epistemic_actor_id,
+        )
         resolved_source_message_ids = _memory_source_message_ids(
             source_message_id=source_message_id,
             source_message_ids=source_message_ids,
         )
-        resolved_fingerprint = canonical_claim_fingerprint(body)
+        normalized_epistemic_status = normalize_epistemic_status(epistemic_status)
+        resolved_fingerprint = _epistemic_claim_fingerprint(
+            body,
+            epistemic_status=normalized_epistemic_status,
+            epistemic_actor_id=epistemic_actor_id,
+            epistemic_actor_name=epistemic_actor_name,
+        )
         self.begin_immediate_transaction()
         try:
             existing = self.get_memory_by_claim_fingerprint(
@@ -10532,6 +11439,69 @@ class PersistenceRepositories:
                 claim_fingerprint=resolved_fingerprint,
             )
             if existing is not None:
+                if (
+                    existing.epistemic_status != normalized_epistemic_status
+                    or existing.epistemic_actor_id != epistemic_actor_id
+                    or existing.epistemic_actor_name
+                    != epistemic_actor_name.strip()[:200]
+                ):
+                    self.connection.execute(
+                        """
+                        UPDATE memories
+                        SET epistemic_status = ?, epistemic_actor_id = ?,
+                            epistemic_actor_name = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (
+                            normalized_epistemic_status,
+                            epistemic_actor_id,
+                            epistemic_actor_name.strip()[:200],
+                            existing.id,
+                        ),
+                    )
+                    existing = replace(
+                        existing,
+                        epistemic_status=normalized_epistemic_status,
+                        epistemic_actor_id=epistemic_actor_id,
+                        epistemic_actor_name=epistemic_actor_name.strip()[:200],
+                    )
+                if existing.epistemic_status != "legacy_unclassified":
+                    merged_source_ids = list(
+                        dict.fromkeys(
+                            (*existing.source_message_ids, *resolved_source_message_ids)
+                        )
+                    )
+                    merged_observation_ids = list(
+                        dict.fromkeys(
+                            (
+                                *existing.source_observation_ids,
+                                *(source_observation_ids or ()),
+                            )
+                        )
+                    )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS]
+                    self.connection.execute(
+                        """
+                        UPDATE memories
+                        SET tags_json = ?, importance = ?,
+                            source_message_ids_json = ?,
+                            source_observation_ids_json = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                        """,
+                        (
+                            _dump_json(list(dict.fromkeys((*existing.tags, *tags)))),
+                            max(existing.importance, importance),
+                            _dump_json(merged_source_ids),
+                            _dump_json(merged_observation_ids),
+                            existing.id,
+                        ),
+                    )
+                    self.commit_transaction()
+                    return next(
+                        memory
+                        for memory in self.list_memories(save_id)
+                        if memory.id == existing.id
+                    )
                 record = self.update_memory(
                     memory_id=existing.id,
                     body=existing.body,
@@ -10569,15 +11539,19 @@ class PersistenceRepositories:
                 source_observation_ids=_unique_strings(
                     source_observation_ids or ()
                 )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS],
+                epistemic_status=normalized_epistemic_status,
+                epistemic_actor_id=epistemic_actor_id,
+                epistemic_actor_name=epistemic_actor_name.strip()[:200],
             )
             self.connection.execute(
                 """
                 INSERT INTO memories(
                     id, save_id, body, tags_json, importance, source_message_id,
                     source_message_ids_json, claim_fingerprint,
-                    source_observation_ids_json
+                    source_observation_ids_json, epistemic_status,
+                    epistemic_actor_id, epistemic_actor_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.id,
@@ -10589,6 +11563,9 @@ class PersistenceRepositories:
                     _dump_json(record.source_message_ids),
                     record.claim_fingerprint,
                     _dump_json(record.source_observation_ids),
+                    record.epistemic_status,
+                    record.epistemic_actor_id,
+                    record.epistemic_actor_name,
                 ),
             )
             self.commit_transaction()
@@ -10596,6 +11573,20 @@ class PersistenceRepositories:
         except BaseException:
             self.rollback_transaction()
             raise
+
+    def _validated_epistemic_actor_id(
+        self,
+        *,
+        save_id: str,
+        actor_id: str | None,
+    ) -> str | None:
+        if not actor_id:
+            return None
+        row = self._fetch_one(
+            "SELECT 1 FROM characters WHERE id = ? AND save_id = ?",
+            (actor_id, save_id),
+        )
+        return actor_id if row is not None else None
 
     def update_memory(
         self,
@@ -10642,7 +11633,8 @@ class PersistenceRepositories:
         current = self._fetch_one(
             """
             SELECT save_id, source_message_id, source_message_ids_json,
-                   source_observation_ids_json, claim_fingerprint, archived_at
+                   source_observation_ids_json, claim_fingerprint, archived_at,
+                   epistemic_status, epistemic_actor_id, epistemic_actor_name
             FROM memories
             WHERE id = ?
             """,
@@ -10674,7 +11666,12 @@ class PersistenceRepositories:
                 else source_observation_ids
             )[:MAX_MEMORY_SOURCE_OBSERVATION_IDS]
         )
-        resolved_fingerprint = canonical_claim_fingerprint(body)
+        resolved_fingerprint = _epistemic_claim_fingerprint(
+            body,
+            epistemic_status=str(current["epistemic_status"]),
+            epistemic_actor_id=current["epistemic_actor_id"],
+            epistemic_actor_name=str(current["epistemic_actor_name"]),
+        )
         save_id = str(current["save_id"])
         collision = self.get_memory_by_claim_fingerprint(
             save_id=save_id,
@@ -10717,7 +11714,8 @@ class PersistenceRepositories:
             """
             SELECT id, save_id, body, tags_json, importance, source_message_id,
                    source_message_ids_json, claim_fingerprint,
-                   source_observation_ids_json
+                   source_observation_ids_json, epistemic_status,
+                   epistemic_actor_id, epistemic_actor_name
             FROM memories
             WHERE id = ?
             """,
@@ -10738,6 +11736,9 @@ class PersistenceRepositories:
             ),
             claim_fingerprint=row["claim_fingerprint"],
             source_observation_ids=_load_list(row["source_observation_ids_json"]),
+            epistemic_status=row["epistemic_status"],
+            epistemic_actor_id=row["epistemic_actor_id"],
+            epistemic_actor_name=row["epistemic_actor_name"],
         )
 
     def _merge_colliding_memory_update(
@@ -10857,7 +11858,9 @@ class PersistenceRepositories:
                 f"""
                 SELECT id, save_id, body, tags_json, importance,
                        source_message_id, source_message_ids_json,
-                       source_observation_ids_json, archived_at
+                       source_observation_ids_json, archived_at,
+                       epistemic_status, epistemic_actor_id,
+                       epistemic_actor_name
                 FROM memories
                 WHERE id IN ({_placeholders(len(memory_ids))})
                 ORDER BY created_at, rowid
@@ -10869,7 +11872,12 @@ class PersistenceRepositories:
                     continue
                 memory_id = str(row["id"])
                 save_id = str(row["save_id"])
-                fingerprint = canonical_claim_fingerprint(row["body"])
+                fingerprint = _epistemic_claim_fingerprint(
+                    str(row["body"]),
+                    epistemic_status=str(row["epistemic_status"]),
+                    epistemic_actor_id=row["epistemic_actor_id"],
+                    epistemic_actor_name=str(row["epistemic_actor_name"]),
+                )
                 collision = self.get_memory_by_claim_fingerprint(
                     save_id=save_id,
                     claim_fingerprint=fingerprint,
@@ -10992,7 +12000,8 @@ class PersistenceRepositories:
             f"""
             SELECT id, save_id, body, tags_json, importance, source_message_id,
                    source_message_ids_json, claim_fingerprint,
-                   source_observation_ids_json
+                   source_observation_ids_json, epistemic_status,
+                   epistemic_actor_id, epistemic_actor_name
             FROM memories
             WHERE save_id = ? AND archived_at IS NULL
             {order_sql}
@@ -11018,6 +12027,9 @@ class PersistenceRepositories:
                 source_observation_ids=_load_list(
                     row["source_observation_ids_json"]
                 ),
+                epistemic_status=row["epistemic_status"],
+                epistemic_actor_id=row["epistemic_actor_id"],
+                epistemic_actor_name=row["epistemic_actor_name"],
             )
             for row in rows
         ]
@@ -11027,7 +12039,8 @@ class PersistenceRepositories:
             """
             SELECT id, save_id, body, tags_json, importance, source_message_id,
                    source_message_ids_json, claim_fingerprint,
-                   source_observation_ids_json
+                   source_observation_ids_json, epistemic_status,
+                   epistemic_actor_id, epistemic_actor_name
             FROM memories
             WHERE save_id = ? AND id = ? AND archived_at IS NULL
             """,
@@ -11050,6 +12063,9 @@ class PersistenceRepositories:
             source_observation_ids=_load_list(
                 row["source_observation_ids_json"]
             ),
+            epistemic_status=row["epistemic_status"],
+            epistemic_actor_id=row["epistemic_actor_id"],
+            epistemic_actor_name=row["epistemic_actor_name"],
         )
 
     def list_memories_for_continuity_index(
@@ -11186,7 +12202,8 @@ class PersistenceRepositories:
                 observations.status, observations.confidence,
                 observations.tags_json, observations.metadata_json,
                 observations.created_at, observations.updated_at,
-                observations.archived_at
+                observations.archived_at, observations.epistemic_status,
+                observations.epistemic_actor_id, observations.epistemic_actor_name
             FROM context_observations AS observations
             JOIN json_each(?) selected
               ON observations.id = CAST(selected.value AS TEXT)
@@ -11208,7 +12225,8 @@ class PersistenceRepositories:
             """
             SELECT id, save_id, body, tags_json, importance, source_message_id,
                    source_message_ids_json, claim_fingerprint,
-                   source_observation_ids_json
+                   source_observation_ids_json, epistemic_status,
+                   epistemic_actor_id, epistemic_actor_name
             FROM memories
             WHERE save_id = ?
               AND claim_fingerprint = ?
@@ -11235,6 +12253,9 @@ class PersistenceRepositories:
             source_observation_ids=_load_list(
                 row["source_observation_ids_json"]
             ),
+            epistemic_status=row["epistemic_status"],
+            epistemic_actor_id=row["epistemic_actor_id"],
+            epistemic_actor_name=row["epistemic_actor_name"],
         )
 
     def consolidate_active_memory_duplicates(
@@ -11702,6 +12723,7 @@ class PersistenceRepositories:
                 _dump_json(list(record.source_summary_ids)),
             ),
         )
+        self.rebuild_summary_pressure_state(save_id)
         self.commit()
         return record
 
@@ -11722,6 +12744,12 @@ class PersistenceRepositories:
             """,
             (body, content_rating, summary_id),
         )
+        save_row = self._fetch_one(
+            "SELECT save_id FROM summaries WHERE id = ?",
+            (summary_id,),
+        )
+        if save_row is not None:
+            self.rebuild_summary_pressure_state(str(save_row["save_id"]))
         self.commit()
         row = self._fetch_one(
             """
@@ -11738,6 +12766,10 @@ class PersistenceRepositories:
         return _summary_from_row(row)
 
     def archive_summary(self, summary_id: str) -> None:
+        save_row = self._fetch_one(
+            "SELECT save_id FROM summaries WHERE id = ?",
+            (summary_id,),
+        )
         self.connection.execute(
             """
             UPDATE summaries
@@ -11746,11 +12778,18 @@ class PersistenceRepositories:
             """,
             (summary_id,),
         )
+        if save_row is not None:
+            self.rebuild_summary_pressure_state(str(save_row["save_id"]))
         self.commit()
 
     def restore_summaries(self, summary_ids: set[str] | frozenset[str]) -> None:
         if not summary_ids:
             return
+        save_rows = self._fetch_all(
+            f"SELECT DISTINCT save_id FROM summaries "
+            f"WHERE id IN ({_placeholders(len(summary_ids))})",
+            tuple(summary_ids),
+        )
         self.connection.execute(
             f"""
             UPDATE summaries
@@ -11759,7 +12798,152 @@ class PersistenceRepositories:
             """,
             tuple(summary_ids),
         )
+        for row in save_rows:
+            self.rebuild_summary_pressure_state(str(row["save_id"]))
         self.commit()
+
+    def get_summary_pressure_state(
+        self,
+        save_id: str,
+    ) -> SummaryPressureStateRecord:
+        row = self._fetch_one(
+            """
+            SELECT save_id, history_revision, summarized_through_message_id,
+                   unsummarized_message_count, unsummarized_player_count,
+                   unsummarized_narrator_count, unsummarized_other_count,
+                   unsummarized_token_estimate, active_summary_count,
+                   active_summary_token_estimate
+            FROM summary_pressure_state
+            WHERE save_id = ?
+            """,
+            (save_id,),
+        )
+        if row is None:
+            return self.rebuild_summary_pressure_state(save_id)
+        return SummaryPressureStateRecord(**dict(row))
+
+    def rebuild_summary_pressure_state(
+        self,
+        save_id: str,
+    ) -> SummaryPressureStateRecord:
+        if self.get_save(save_id) is None:
+            raise ValueError(f"Unknown save id: {save_id}")
+        messages = self.list_messages(save_id)
+        summaries = self.list_summaries(save_id)
+        summarized_through = (
+            summaries[-1].covers_message_end_id if summaries else None
+        )
+        start_index = 0
+        if summarized_through is not None:
+            for index, message in enumerate(messages):
+                if message.id == summarized_through:
+                    start_index = index + 1
+                    break
+        unsummarized = messages[start_index:]
+        player_count = sum(
+            1 for message in unsummarized if message.role == "player"
+        )
+        narrator_count = sum(
+            1 for message in unsummarized if message.role == "narrator"
+        )
+        existing = self._fetch_one(
+            "SELECT history_revision FROM summary_pressure_state WHERE save_id = ?",
+            (save_id,),
+        )
+        revision = int(existing["history_revision"]) + 1 if existing else 1
+        values = (
+            save_id,
+            revision,
+            summarized_through,
+            len(unsummarized),
+            player_count,
+            narrator_count,
+            len(unsummarized) - player_count - narrator_count,
+            sum(_message_body_token_estimate(message) for message in unsummarized),
+            len(summaries),
+            sum(_estimated_text_tokens(summary.body) for summary in summaries),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO summary_pressure_state(
+                save_id, history_revision, summarized_through_message_id,
+                unsummarized_message_count, unsummarized_player_count,
+                unsummarized_narrator_count, unsummarized_other_count,
+                unsummarized_token_estimate, active_summary_count,
+                active_summary_token_estimate, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(save_id) DO UPDATE SET
+                history_revision = excluded.history_revision,
+                summarized_through_message_id = excluded.summarized_through_message_id,
+                unsummarized_message_count = excluded.unsummarized_message_count,
+                unsummarized_player_count = excluded.unsummarized_player_count,
+                unsummarized_narrator_count = excluded.unsummarized_narrator_count,
+                unsummarized_other_count = excluded.unsummarized_other_count,
+                unsummarized_token_estimate = excluded.unsummarized_token_estimate,
+                active_summary_count = excluded.active_summary_count,
+                active_summary_token_estimate = excluded.active_summary_token_estimate,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            values,
+        )
+        return SummaryPressureStateRecord(
+            save_id=save_id,
+            history_revision=revision,
+            summarized_through_message_id=summarized_through,
+            unsummarized_message_count=len(unsummarized),
+            unsummarized_player_count=player_count,
+            unsummarized_narrator_count=narrator_count,
+            unsummarized_other_count=(
+                len(unsummarized) - player_count - narrator_count
+            ),
+            unsummarized_token_estimate=sum(
+                _message_body_token_estimate(message) for message in unsummarized
+            ),
+            active_summary_count=len(summaries),
+            active_summary_token_estimate=sum(
+                _estimated_text_tokens(summary.body) for summary in summaries
+            ),
+        )
+
+    def _advance_summary_pressure_state_for_message(
+        self,
+        message: MessageRecord,
+    ) -> None:
+        player_increment = 1 if message.role == "player" else 0
+        narrator_increment = 1 if message.role == "narrator" else 0
+        other_increment = 1 - player_increment - narrator_increment
+        self.connection.execute(
+            """
+            INSERT INTO summary_pressure_state(
+                save_id, history_revision, unsummarized_message_count,
+                unsummarized_player_count, unsummarized_narrator_count,
+                unsummarized_other_count, unsummarized_token_estimate
+            ) VALUES (?, 1, 1, ?, ?, ?, ?)
+            ON CONFLICT(save_id) DO UPDATE SET
+                history_revision = history_revision + 1,
+                unsummarized_message_count = unsummarized_message_count + 1,
+                unsummarized_player_count =
+                    unsummarized_player_count
+                    + excluded.unsummarized_player_count,
+                unsummarized_narrator_count =
+                    unsummarized_narrator_count
+                    + excluded.unsummarized_narrator_count,
+                unsummarized_other_count =
+                    unsummarized_other_count
+                    + excluded.unsummarized_other_count,
+                unsummarized_token_estimate =
+                    unsummarized_token_estimate
+                    + excluded.unsummarized_token_estimate,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                message.save_id,
+                player_increment,
+                narrator_increment,
+                other_increment,
+                _message_body_token_estimate(message),
+            ),
+        )
 
     def list_summaries(
         self,
@@ -12874,6 +14058,125 @@ class PersistenceRepositories:
         )
         return _job_from_row(row) if row is not None else None
 
+    def get_chat_turn_submission(
+        self,
+        *,
+        save_id: str,
+        client_turn_id: str,
+    ) -> ChatTurnSubmissionRecord | None:
+        row = self._fetch_one(
+            f"""
+            SELECT submission.save_id, submission.client_turn_id,
+                   submission.operation, submission.request_fingerprint,
+                   submission.player_message_id, submission.narrator_message_id,
+                   submission.created_at AS submission_created_at,
+                   submission.updated_at AS submission_updated_at,
+                   {_qualified_columns(_JOB_COLUMNS, 'job')}
+            FROM chat_turn_submissions AS submission
+            JOIN jobs AS job ON job.id = submission.job_id
+            WHERE submission.save_id = ? AND submission.client_turn_id = ?
+            """,
+            (save_id, client_turn_id),
+        )
+        return _chat_turn_submission_from_row(row) if row is not None else None
+
+    def create_chat_turn_submission_job(
+        self,
+        *,
+        save_id: str,
+        client_turn_id: str,
+        operation: str,
+        request_fingerprint: str,
+        creator_user_id: str | None,
+        job_id: str,
+        payload: dict[str, object],
+    ) -> ChatTurnSubmissionRecord:
+        self.begin_immediate_transaction()
+        try:
+            self.create_job(
+                save_id=save_id,
+                creator_user_id=creator_user_id,
+                type="chat_turn",
+                status="queued",
+                payload=payload,
+                job_id=job_id,
+            )
+            self.connection.execute(
+                """
+                INSERT INTO chat_turn_submissions(
+                    save_id, client_turn_id, operation, request_fingerprint, job_id
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (save_id, client_turn_id, operation, request_fingerprint, job_id),
+            )
+            self.commit_transaction()
+        except Exception:
+            self.rollback_transaction()
+            raise
+        submission = self.get_chat_turn_submission(
+            save_id=save_id,
+            client_turn_id=client_turn_id,
+        )
+        if submission is None:
+            raise RuntimeError("Chat turn submission was not persisted")
+        return submission
+
+    def link_chat_turn_submission_messages(
+        self,
+        *,
+        job_id: str,
+        player_message_id: str | None,
+        narrator_message_id: str | None,
+    ) -> ChatTurnSubmissionRecord:
+        submission_row = self._fetch_one(
+            "SELECT save_id FROM chat_turn_submissions WHERE job_id = ?",
+            (job_id,),
+        )
+        if submission_row is None:
+            raise ValueError(f"Unknown chat turn submission job: {job_id}")
+        save_id = str(submission_row["save_id"])
+        if player_message_id is not None and self.get_message(
+            save_id=save_id,
+            message_id=player_message_id,
+            include_deleted=True,
+        ) is None:
+            player_message_id = None
+        if narrator_message_id is not None and self.get_message(
+            save_id=save_id,
+            message_id=narrator_message_id,
+            include_deleted=True,
+        ) is None:
+            narrator_message_id = None
+        self.connection.execute(
+            """
+            UPDATE chat_turn_submissions
+            SET player_message_id = COALESCE(?, player_message_id),
+                narrator_message_id = COALESCE(?, narrator_message_id),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE job_id = ?
+            """,
+            (player_message_id, narrator_message_id, job_id),
+        )
+        self.commit()
+        row = self._fetch_one(
+            f"""
+            SELECT submission.save_id, submission.client_turn_id,
+                   submission.operation, submission.request_fingerprint,
+                   submission.player_message_id, submission.narrator_message_id,
+                   submission.created_at AS submission_created_at,
+                   submission.updated_at AS submission_updated_at,
+                   {_qualified_columns(_JOB_COLUMNS, 'job')}
+            FROM chat_turn_submissions AS submission
+            JOIN jobs AS job ON job.id = submission.job_id
+            WHERE submission.job_id = ?
+            """,
+            (job_id,),
+        )
+        if row is None:
+            raise ValueError(f"Unknown chat turn submission job: {job_id}")
+        return _chat_turn_submission_from_row(row)
+
     def count_job_steps_by_job_id(
         self,
         job_ids: tuple[str, ...],
@@ -12983,6 +14286,228 @@ class PersistenceRepositories:
         )
         self.commit()
         return self._get_job(record.id)
+
+    def ensure_post_turn_outbox_steps(
+        self,
+        *,
+        save_id: str,
+        player_message_id: str,
+        narrator_message_id: str,
+        turn_revision: str,
+        steps: tuple[str, ...],
+        payload: dict[str, object],
+    ) -> list[PostTurnOutboxRecord]:
+        for step in steps:
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO post_turn_outbox(
+                    id, save_id, player_message_id, narrator_message_id,
+                    turn_revision, step, status, payload_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    _new_id(),
+                    save_id,
+                    player_message_id,
+                    narrator_message_id,
+                    turn_revision,
+                    step,
+                    _dump_json(payload),
+                ),
+            )
+        self.commit()
+        rows = self._fetch_all(
+            """
+            SELECT id, save_id, player_message_id, narrator_message_id,
+                   turn_revision, step, status, attempt_count, payload_json,
+                   result_json, last_error, created_at, updated_at, started_at,
+                   completed_at
+            FROM post_turn_outbox
+            WHERE save_id = ? AND player_message_id = ?
+              AND narrator_message_id = ? AND turn_revision = ?
+            ORDER BY rowid
+            """,
+            (save_id, player_message_id, narrator_message_id, turn_revision),
+        )
+        return [_post_turn_outbox_from_row(row) for row in rows]
+
+    def list_post_turn_outbox_steps(
+        self,
+        *,
+        save_id: str | None = None,
+        statuses: tuple[str, ...] = (),
+    ) -> list[PostTurnOutboxRecord]:
+        conditions: list[str] = []
+        params: list[object] = []
+        if save_id is not None:
+            conditions.append("save_id = ?")
+            params.append(save_id)
+        if statuses:
+            for status in statuses:
+                _validate_post_turn_outbox_status(status)
+            conditions.append(f"status IN ({_placeholders(len(statuses))})")
+            params.extend(statuses)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = self._fetch_all(
+            f"""
+            SELECT id, save_id, player_message_id, narrator_message_id,
+                   turn_revision, step, status, attempt_count, payload_json,
+                   result_json, last_error, created_at, updated_at, started_at,
+                   completed_at
+            FROM post_turn_outbox
+            {where}
+            ORDER BY created_at, rowid
+            """,
+            tuple(params),
+        )
+        return [_post_turn_outbox_from_row(row) for row in rows]
+
+    def claim_post_turn_outbox_step(
+        self,
+        step_id: str,
+    ) -> PostTurnOutboxRecord | None:
+        cursor = self.connection.execute(
+            """
+            UPDATE post_turn_outbox
+            SET status = 'running', attempt_count = attempt_count + 1,
+                started_at = CURRENT_TIMESTAMP, completed_at = NULL,
+                last_error = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status IN ('pending', 'failed')
+            """,
+            (step_id,),
+        )
+        self.commit()
+        if cursor.rowcount != 1:
+            return None
+        return self._get_post_turn_outbox_step(step_id)
+
+    def complete_post_turn_outbox_step(
+        self,
+        step_id: str,
+        *,
+        status: str,
+        result: dict[str, object] | None = None,
+        error: str | None = None,
+        expected_statuses: tuple[str, ...] = ("running",),
+    ) -> PostTurnOutboxRecord:
+        _validate_post_turn_outbox_status(status)
+        if status in {"pending", "running"}:
+            raise ValueError(f"Outbox completion status is not terminal: {status}")
+        self._get_post_turn_outbox_step(step_id)
+        for expected_status in expected_statuses:
+            _validate_post_turn_outbox_status(expected_status)
+        self.connection.execute(
+            f"""
+            UPDATE post_turn_outbox
+            SET status = ?, result_json = ?, last_error = ?,
+                completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status IN ({_placeholders(len(expected_statuses))})
+            """,
+            (
+                status,
+                _dump_json(result) if result is not None else None,
+                redact_text(error),
+                step_id,
+                *expected_statuses,
+            ),
+        )
+        self.commit()
+        return self._get_post_turn_outbox_step(step_id)
+
+    def requeue_post_turn_outbox_step(
+        self,
+        step_id: str,
+        *,
+        error: str | None = None,
+    ) -> PostTurnOutboxRecord:
+        self._get_post_turn_outbox_step(step_id)
+        self.connection.execute(
+            """
+            UPDATE post_turn_outbox
+            SET status = 'pending', last_error = ?, completed_at = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'running'
+            """,
+            (redact_text(error), step_id),
+        )
+        self.commit()
+        return self._get_post_turn_outbox_step(step_id)
+
+    def requeue_running_post_turn_outbox_steps(
+        self,
+    ) -> list[PostTurnOutboxRecord]:
+        rows = self.list_post_turn_outbox_steps(statuses=("running",))
+        for row in rows:
+            self.connection.execute(
+                """
+                UPDATE post_turn_outbox
+                SET status = 'pending', last_error = ?, completed_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'running'
+                """,
+                ("Interrupted before continuity completed", row.id),
+            )
+        self.commit()
+        return [self._get_post_turn_outbox_step(row.id) for row in rows]
+
+    def complete_post_turn_outbox_step_for_turn(
+        self,
+        *,
+        save_id: str,
+        source_message_ids: tuple[str, ...],
+        step: str,
+        result: dict[str, object] | None = None,
+        turn_revision: str | None = None,
+    ) -> PostTurnOutboxRecord | None:
+        if len(source_message_ids) < 2:
+            return None
+        row = self._fetch_one(
+            """
+            SELECT id
+            FROM post_turn_outbox
+            WHERE save_id = ? AND player_message_id = ?
+              AND narrator_message_id = ? AND step = ?
+              AND (? IS NULL OR turn_revision = ?)
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (
+                save_id,
+                source_message_ids[0],
+                source_message_ids[-1],
+                step,
+                turn_revision,
+                turn_revision,
+            ),
+        )
+        if row is None:
+            return None
+        return self.complete_post_turn_outbox_step(
+            str(row["id"]),
+            status="succeeded",
+            result=result,
+            expected_statuses=("pending", "running", "failed"),
+        )
+
+    def _get_post_turn_outbox_step(
+        self,
+        step_id: str,
+    ) -> PostTurnOutboxRecord:
+        row = self._fetch_one(
+            """
+            SELECT id, save_id, player_message_id, narrator_message_id,
+                   turn_revision, step, status, attempt_count, payload_json,
+                   result_json, last_error, created_at, updated_at, started_at,
+                   completed_at
+            FROM post_turn_outbox
+            WHERE id = ?
+            """,
+            (step_id,),
+        )
+        if row is None:
+            raise ValueError(f"Unknown post-turn outbox step: {step_id}")
+        return _post_turn_outbox_from_row(row)
 
     def start_job(self, job_id: str) -> JobRecord:
         existing = self._get_job(job_id)
@@ -14025,6 +15550,16 @@ def _new_id() -> str:
     return uuid4().hex
 
 
+def _estimated_text_tokens(text: str) -> int:
+    return max(1, (len(text) + 3) // 4)
+
+
+def _message_body_token_estimate(message: MessageRecord) -> int:
+    if message.token_estimate is not None:
+        return max(1, message.token_estimate)
+    return _estimated_text_tokens(message.body)
+
+
 def canonical_claim_fingerprint(value: object) -> str:
     text = unicodedata.normalize("NFKC", str(value)).casefold()
     canonical = "".join(
@@ -14033,6 +15568,20 @@ def canonical_claim_fingerprint(value: object) -> str:
     )
     canonical = " ".join(canonical.split())
     return sha256(canonical.encode("utf-8")).hexdigest() if canonical else ""
+
+
+def _epistemic_claim_fingerprint(
+    body: str,
+    *,
+    epistemic_status: str,
+    epistemic_actor_id: str | None,
+    epistemic_actor_name: str,
+) -> str:
+    fingerprint = canonical_claim_fingerprint(body)
+    if epistemic_status == "legacy_unclassified":
+        return fingerprint
+    actor_key = epistemic_actor_id or epistemic_actor_name.strip().casefold()
+    return f"{fingerprint}:{epistemic_status}:{actor_key}"
 
 
 def _transaction_savepoint_name(depth: int) -> str:
@@ -14502,8 +16051,13 @@ def _context_source_eligibility_sql(
         params.extend(visibility_ids)
         params.extend(visibility_ids)
         params.extend(visibility_ids)
-    if visibility_character_ids is not None:
-        scope_ids_json = _dump_json(sorted(visibility_character_ids))
+    scope_character_ids = (
+        reference_character_ids
+        if reference_character_ids is not None
+        else visibility_character_ids
+    )
+    if scope_character_ids is not None:
+        scope_ids_json = _dump_json(sorted(scope_character_ids))
         source_target_type_sql = (
             f"(CASE WHEN {alias}.source_type IN ('state', 'world_state') "
             "THEN 'world_state' "
@@ -14566,9 +16120,7 @@ def _context_source_eligibility_sql(
             "SELECT 1 FROM message_visibility hidden "
             f"WHERE hidden.save_id = {alias}.save_id "
             "AND hidden.visibility = 'not_visible' "
-            "AND hidden.character_id IN ("
-            "SELECT CAST(value AS TEXT) FROM json_each(?)"
-            ") "
+            "AND hidden.character_id = edge.character_id "
             "AND (hidden.message_id = edge.source_message_id OR "
             "hidden.message_id IN ("
             "SELECT CAST(value AS TEXT) "
@@ -14597,9 +16149,7 @@ def _context_source_eligibility_sql(
             "SELECT 1 FROM message_visibility hidden "
             f"WHERE hidden.save_id = {alias}.save_id "
             "AND hidden.visibility = 'not_visible' "
-            "AND hidden.character_id IN ("
-            "SELECT CAST(value AS TEXT) FROM json_each(?)"
-            ") "
+            "AND hidden.character_id = link.entity_id "
             "AND hidden.message_id = link.source_message_id"
             ")"
             ")"
@@ -14607,8 +16157,6 @@ def _context_source_eligibility_sql(
         )
         params.extend(
             (
-                scope_ids_json,
-                scope_ids_json,
                 scope_ids_json,
                 scope_ids_json,
             )
@@ -14708,6 +16256,11 @@ def _context_source_eligibility_sql(
 def _validate_job_status(status: str) -> None:
     if status not in JOB_STATUSES:
         raise ValueError(f"Unknown job status: {status}")
+
+
+def _validate_post_turn_outbox_status(status: str) -> None:
+    if status not in POST_TURN_OUTBOX_STATUSES:
+        raise ValueError(f"Unknown post-turn outbox status: {status}")
 
 
 def _validate_character_text_delivery_status(status: str) -> None:
@@ -15016,6 +16569,24 @@ def _setting_scope_id(scope: str, scope_id: str | None) -> str:
     return scope_id
 
 
+def _validate_message_narration_status(status: str) -> None:
+    if status not in _MESSAGE_NARRATION_STATUSES:
+        raise ValueError(f"Unsupported message narration status: {status}")
+
+
+def _message_narration_state_from_row(
+    row: sqlite3.Row,
+) -> MessageNarrationStateRecord:
+    role = str(row["role"])
+    return MessageNarrationStateRecord(
+        message_id=str(row["id"]),
+        save_id=str(row["save_id"]),
+        status=str(row["narration_status"]),
+        error=(str(row["narration_error"]) if row["narration_error"] else None),
+        source_kind="timeskip" if role == "system" else "player",
+    )
+
+
 def _scoped_setting_from_row(row: sqlite3.Row) -> ScopedSettingRecord:
     scope_id = row["scope_id"]
     return ScopedSettingRecord(
@@ -15148,6 +16719,23 @@ def _scene_snapshot_from_row(row: sqlite3.Row) -> SceneSnapshotRecord:
         last_updated_message_id=last_updated_message_id,
         scene_generation=int(row["scene_generation"]),
     )
+
+
+def _scene_fact_audit_payload(fact: SceneFactRecord) -> dict[str, object]:
+    return {
+        "fact_type": fact.fact_type,
+        "subject_type": fact.subject_type,
+        "subject_id": fact.subject_id,
+        "subject_label": fact.subject_label,
+        "target_type": fact.target_type,
+        "target_id": fact.target_id,
+        "target_label": fact.target_label,
+        "aspect": fact.aspect,
+        "value": fact.value,
+        "lifetime": fact.lifetime,
+        "scene_generation": fact.scene_generation,
+        "expires_after_turn_number": fact.expires_after_turn_number,
+    }
 
 
 def _location_params(record: LocationRecord) -> tuple[object, ...]:
@@ -15592,6 +17180,17 @@ def _context_update_audit_from_row(row: sqlite3.Row) -> ContextUpdateAuditRecord
     )
 
 
+def _turn_outcome_from_row(row: sqlite3.Row) -> TurnOutcomeRecord:
+    payload = _load_json(row["payload_json"]) if row["payload_json"] else {}
+    return TurnOutcomeRecord(
+        id=row["id"],
+        save_id=row["save_id"],
+        message_id=row["message_id"],
+        payload=dict(payload) if isinstance(payload, dict) else {},
+        created_at=row["created_at"],
+    )
+
+
 def _context_observation_from_row(row: sqlite3.Row) -> ContextObservationRecord:
     return ContextObservationRecord(
         id=row["id"],
@@ -15608,6 +17207,9 @@ def _context_observation_from_row(row: sqlite3.Row) -> ContextObservationRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         archived_at=row["archived_at"],
+        epistemic_status=row["epistemic_status"],
+        epistemic_actor_id=row["epistemic_actor_id"],
+        epistemic_actor_name=row["epistemic_actor_name"],
     )
 
 
@@ -15868,6 +17470,30 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
     )
 
 
+def _chat_turn_submission_from_row(
+    row: sqlite3.Row,
+) -> ChatTurnSubmissionRecord:
+    return ChatTurnSubmissionRecord(
+        save_id=str(row["save_id"]),
+        client_turn_id=str(row["client_turn_id"]),
+        operation=str(row["operation"]),
+        request_fingerprint=str(row["request_fingerprint"]),
+        job=_job_from_row(row),
+        player_message_id=(
+            str(row["player_message_id"])
+            if row["player_message_id"] is not None
+            else None
+        ),
+        narrator_message_id=(
+            str(row["narrator_message_id"])
+            if row["narrator_message_id"] is not None
+            else None
+        ),
+        created_at=str(row["submission_created_at"]),
+        updated_at=str(row["submission_updated_at"]),
+    )
+
+
 def _scheduled_task_from_row(row: sqlite3.Row) -> ScheduledTaskRecord:
     result_json = row["result_json"]
     return ScheduledTaskRecord(
@@ -15904,6 +17530,30 @@ def _job_step_from_row(row: sqlite3.Row) -> JobStepRecord:
         duration_ms=row["duration_ms"],
         error=row["error"],
         metadata=_load_object(row["metadata_json"]),
+    )
+
+
+def _post_turn_outbox_from_row(row: sqlite3.Row) -> PostTurnOutboxRecord:
+    return PostTurnOutboxRecord(
+        id=str(row["id"]),
+        save_id=str(row["save_id"]),
+        player_message_id=str(row["player_message_id"]),
+        narrator_message_id=str(row["narrator_message_id"]),
+        turn_revision=str(row["turn_revision"]),
+        step=str(row["step"]),
+        status=str(row["status"]),
+        attempt_count=int(row["attempt_count"]),
+        payload=_load_object(row["payload_json"]),
+        result=(
+            _load_object(row["result_json"])
+            if row["result_json"] is not None
+            else None
+        ),
+        last_error=_row_value(row, "last_error"),
+        created_at=_row_value(row, "created_at"),
+        updated_at=_row_value(row, "updated_at"),
+        started_at=_row_value(row, "started_at"),
+        completed_at=_row_value(row, "completed_at"),
     )
 
 

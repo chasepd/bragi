@@ -35,6 +35,7 @@ Every prompt source has a stable source type and ID:
 - `scenario:<scenario_id>`
 - `scenario:<scenario_id>:section:<section_key>`
 - `scene_snapshot:<snapshot_id>`
+- `scene_fact:<fact_id>[,<fact_id>...]`
 - `location:<location_id>`
 - `character:<character_id>`
 - `dating_route_state:<route_id>`
@@ -72,10 +73,17 @@ mentioned current scene objects or hazards.
 
 Hints are not persisted and do not update `world_state`, scene snapshots, audit
 rows, suggestions, exports, or imports. Scene maintenance still persists only
-after the narrator turn completes and validation accepts the update. Volatile
-scene facts continue to use existing scene snapshot and `world_state` records;
-a dedicated scene fact schema remains deferred until that storage shape becomes
-awkward in practice.
+after the narrator turn completes and validation accepts the update.
+
+After each narrator turn, provider-enforced structured context updates may also
+record typed volatile scene facts such as positions, poses, object placement,
+ongoing actions, physical constraints, environment state, line of sight, and
+pending reactions. Physical facts remain active for the current scene; actions,
+line of sight, and pending reactions expire after the following narrator turn.
+Conflicting facts replace the prior value deterministically, while evidence and
+source-message provenance remain auditable. Active scene facts are included only
+in narrator context, never image prompts, and are preserved by snapshots,
+forking, and chat bundle export/import.
 
 ## Dating Route Pacing
 

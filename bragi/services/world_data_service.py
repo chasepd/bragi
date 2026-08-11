@@ -34,7 +34,7 @@ from bragi.persistence.models import (
 )
 from bragi.persistence.repositories import (
     PersistenceRepositories,
-    canonical_claim_fingerprint,
+    _epistemic_claim_fingerprint,
 )
 from bragi.services.character_locks import merge_character_locked_fields
 from bragi.services.character_profile_completion import (
@@ -43,6 +43,7 @@ from bragi.services.character_profile_completion import (
     normalize_scenario_character_starters,
     scenario_character_starter_to_json,
 )
+from bragi.services.scenario_canon import CANON_CONTENT_KEY
 from bragi.services.scenario_content_rating import (
     metadata_with_scenario_content_ratings,
     scenario_content_rating,
@@ -1500,7 +1501,12 @@ _SCENARIO_CORE_CONTENT_KEYS = frozenset(
     )
 )
 _SCENARIO_NON_SECTION_CONTENT_KEYS = frozenset(
-    (*_SCENARIO_CORE_CONTENT_KEYS, CHARACTER_STARTERS_CONTENT_KEY, "_source")
+    (
+        *_SCENARIO_CORE_CONTENT_KEYS,
+        CHARACTER_STARTERS_CONTENT_KEY,
+        CANON_CONTENT_KEY,
+        "_source",
+    )
 )
 
 
@@ -1543,6 +1549,9 @@ def _content_with_preserved_metadata(
     if scenario is None:
         return normalized
     scenario_content = dict(_scenario_content(scenario.content_json))
+    compiled_canon = scenario_content.get(CANON_CONTENT_KEY)
+    if isinstance(compiled_canon, Mapping):
+        normalized[CANON_CONTENT_KEY] = dict(compiled_canon)
     source = scenario_content.get("_source")
     resolved_section_ratings = dict(section_ratings or {})
     if not resolved_section_ratings:
@@ -3228,7 +3237,17 @@ def _apply_suggestion_value(
             else None
         )
         tags = _string_list_value(value.get("tags", []), "Memory tags")
-        fingerprint = canonical_claim_fingerprint(body)
+        epistemic_status = str(value.get("epistemic_status", "legacy_unclassified"))
+        epistemic_actor_id = value.get("epistemic_actor_id")
+        if not isinstance(epistemic_actor_id, str):
+            epistemic_actor_id = None
+        epistemic_actor_name = str(value.get("epistemic_actor_name", ""))
+        fingerprint = _epistemic_claim_fingerprint(
+            body,
+            epistemic_status=epistemic_status,
+            epistemic_actor_id=epistemic_actor_id,
+            epistemic_actor_name=epistemic_actor_name,
+        )
         repositories.begin_immediate_transaction()
         try:
             existing = next(
@@ -3252,6 +3271,9 @@ def _apply_suggestion_value(
                     ),
                     source_message_ids=memory_source_message_ids,
                     source_observation_ids=memory_source_observation_ids,
+                    epistemic_status=epistemic_status,
+                    epistemic_actor_id=epistemic_actor_id,
+                    epistemic_actor_name=epistemic_actor_name,
                 )
             else:
                 repositories.update_memory(

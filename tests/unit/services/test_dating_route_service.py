@@ -9,6 +9,9 @@ import pytest
 from bragi.interaction_mode import InteractionMode
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.services.dating_route_profile_service import (
+    DATING_ROUTE_PROFILE_ENRICHMENT_TASK,
+)
 from bragi.services.dating_route_service import DatingRouteService
 
 
@@ -36,6 +39,12 @@ def test_seed_routes_for_dating_sim_existing_romance_characters(
     assert route.npc_character_id == npc_id
     assert route.stage == "introduced"
     assert route.completed_interactions == 0
+    task = repositories.get_scheduled_task(
+        task_type=DATING_ROUTE_PROFILE_ENRICHMENT_TASK,
+        save_id=save_id,
+    )
+    assert task is not None
+    assert task.next_run_at <= task.updated_at
     assert route.dates_completed == 0
     assert route.next_reasonable_step == "build early interest or exchange contact info"
 

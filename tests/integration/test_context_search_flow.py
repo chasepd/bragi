@@ -69,7 +69,8 @@ class ContextThenNarratorProvider:
         )
         assert request.retrieved_state == ()
         assert request.context_breakdown["suppressed_duplicate_retrieval_keys"] == [
-            "world_state:state-beacon"
+            "world_state:state-beacon",
+            "message:message-lens",
         ]
         assert request.retrieved_memories == (
             "[memory:memory-elian] Mara promised Elian the beacon would burn.",

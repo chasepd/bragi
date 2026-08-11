@@ -24,6 +24,7 @@ from bragi.services.dating_route_profile_service import (
     DATING_ROUTE_PROFILE_TASK,
     DatingRouteProfileService,
 )
+from bragi.services.turn_snapshot_service import TurnSnapshotService
 
 
 @pytest.fixture
@@ -108,7 +109,9 @@ def test_profile_service_applies_generated_character_route_profile(
     updated = repositories.get_dating_route_state(route.id)
     assert updated is not None
     assert result.status == "succeeded"
+    assert result.seeded_count == 0
     assert result.updated_count == 1
+    assert result.changed_count == 1
     assert updated.comfort_with_intimacy.startswith("open to physical")
     assert updated.pacing_preference == "direct and chemistry-led"
     assert updated.known_boundaries == [
@@ -125,6 +128,122 @@ def test_profile_service_applies_generated_character_route_profile(
     assert request.schema["properties"]["profiles"]["items"]["properties"][
         "npc_character_id"
     ]["enum"] == [npc_id]
+    audits = repositories.list_context_update_audit(save_id)
+    assert [audit.operation for audit in audits] == [
+        "dating_route_profile_enrichment"
+    ]
+    assert audits[0].entity_id == route.id
+    assert audits[0].field_path == "route_profile"
+    snapshot = TurnSnapshotService(repositories).latest_snapshot_for_message(
+        save_id=save_id,
+        message_id=None,
+    )
+    assert snapshot is not None
+    assert snapshot.reason == "dating_route_profile_enrichment"
+
+
+def test_profile_service_discards_stale_result_after_route_edit(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, _player_id, npc_id = _dating_route_save(repositories)
+    route = repositories.list_dating_route_states(save_id)[0]
+
+    class MutatingProfileProvider(ProfileProvider):
+        async def generate_structured_output(
+            self,
+            request: StructuredOutputRequest,
+        ) -> StructuredOutputResponse:
+            repositories.upsert_dating_route_state(
+                save_id=save_id,
+                player_character_id=route.player_character_id,
+                npc_character_id=route.npc_character_id,
+                comfort_with_intimacy="explicitly edited while generation ran",
+                pacing_preference="deliberate and user-authored",
+                known_boundaries=["no public pressure"],
+            )
+            return await super().generate_structured_output(request)
+
+    provider = MutatingProfileProvider(
+        {"profiles": [_generated_profile_item(npc_id)]}
+    )
+    _configure_profile_model(repositories)
+
+    result = asyncio.run(
+        DatingRouteProfileService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).ensure_profiles_for_save(save_id=save_id)
+    )
+
+    updated = repositories.get_dating_route_state(route.id)
+    assert updated is not None
+    assert result.updated_count == 0
+    assert result.stale_count == 1
+    assert updated.comfort_with_intimacy == (
+        "explicitly edited while generation ran"
+    )
+    assert updated.pacing_preference == "deliberate and user-authored"
+    assert updated.known_boundaries == ["no public pressure"]
+    assert repositories.list_context_update_audit(save_id) == []
+
+
+def test_profile_service_discards_entire_batch_after_other_route_edit(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id, player_id, first_npc_id = _dating_route_save(repositories)
+    first_route = repositories.list_dating_route_states(save_id)[0]
+    second_npc = repositories.add_character(save_id=save_id, name="Yui Sato")
+    second_route = repositories.upsert_dating_route_state(
+        save_id=save_id,
+        player_character_id=player_id,
+        npc_character_id=second_npc.id,
+        stage="introduced",
+    )
+
+    class MutatingOtherRouteProvider(ProfileProvider):
+        async def generate_structured_output(
+            self,
+            request: StructuredOutputRequest,
+        ) -> StructuredOutputResponse:
+            repositories.upsert_dating_route_state(
+                save_id=save_id,
+                player_character_id=second_route.player_character_id,
+                npc_character_id=second_route.npc_character_id,
+                comfort_with_intimacy="explicitly edited while generation ran",
+                pacing_preference="deliberate and user-authored",
+            )
+            return await super().generate_structured_output(request)
+
+    provider = MutatingOtherRouteProvider(
+        {
+            "profiles": [
+                _generated_profile_item(first_npc_id),
+                _generated_profile_item(second_npc.id),
+            ]
+        }
+    )
+    _configure_profile_model(repositories)
+
+    result = asyncio.run(
+        DatingRouteProfileService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).ensure_profiles_for_save(save_id=save_id)
+    )
+
+    first_updated = repositories.get_dating_route_state(first_route.id)
+    second_updated = repositories.get_dating_route_state(second_route.id)
+    assert first_updated is not None
+    assert second_updated is not None
+    assert result.updated_count == 0
+    assert result.stale_count == 2
+    assert first_updated.comfort_with_intimacy == ""
+    assert first_updated.pacing_preference == ""
+    assert second_updated.comfort_with_intimacy == (
+        "explicitly edited while generation ran"
+    )
+    assert second_updated.pacing_preference == "deliberate and user-authored"
+    assert repositories.list_context_update_audit(save_id) == []
 
 
 def test_profile_service_preserves_explicit_route_profile_fields(

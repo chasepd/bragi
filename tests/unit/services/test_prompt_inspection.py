@@ -70,8 +70,8 @@ def test_prompt_inspection_store_captures_prompt_and_provider_payload() -> None:
     assert "Source cards" in rendered
     assert "Narrator prompt" in rendered
     assert "Conversation" in rendered
-    assert "Pending context review" in rendered
-    assert "not canon yet" in rendered
+    assert "Pending context review" not in rendered
+    assert "not canon yet" not in rendered
     assert "Raw requests" in rendered
     assert '"model_id": "fake-chat"' in rendered
     assert json.loads(store.provider_payload_for_message("message-1") or "{}") == {

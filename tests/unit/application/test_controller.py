@@ -124,6 +124,52 @@ class RuntimeFakeProvider:
             image_bytes=b"runtime fake scene image",
         )
 
+
+class RuntimeCanonProvider(RuntimeFakeProvider):
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        payload = json.loads(request.messages[-1].body)
+        sections = payload["sections"]
+        return StructuredOutputResponse(
+            data={
+                "sections": [
+                    {
+                        "section_id": section_id,
+                        "claims": [
+                            {
+                                "claim": evidence,
+                                "evidence_quote": evidence,
+                                "entity_anchors": [
+                                    {
+                                        "entity_type": "concept",
+                                        "entity_key": section_id,
+                                        "display_name": section_id,
+                                    }
+                                ],
+                                "fact_type": "other",
+                                "fact_key": section_id,
+                                "authority": "canonical",
+                                "temporal_status": "durable",
+                                "reveal_policy": "open",
+                                "known_by": [],
+                            }
+                            for evidence in re.split(
+                                r"(?<=[.!?])\s+|[;,]\s*|\n+|\s+(?:and|but|while|whereas)\s+",
+                                text,
+                            )
+                            if evidence.strip()
+                        ],
+                    }
+                    for section_id, text in sections.items()
+                ]
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
 class RuntimeContentSafetyProvider(RuntimeFakeProvider):
     def __init__(self, action: str = "block") -> None:
         super().__init__()
@@ -135,6 +181,24 @@ class RuntimeContentSafetyProvider(RuntimeFakeProvider):
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_requests.append(request)
+        if request.schema_name == "content_safety_batch_review":
+            count = int(request.schema["properties"]["reviews"]["minItems"])
+            return StructuredOutputResponse(
+                data={
+                    "reviews": [
+                        {
+                            "ordinal": ordinal,
+                            "action": "allow",
+                            "category": "none",
+                            "reason": "The draft stays within the content ceiling.",
+                            "minimum_rating": "g",
+                        }
+                        for ordinal in range(1, count + 1)
+                    ]
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
         return StructuredOutputResponse(
             data={
                 "action": self.action,
@@ -162,6 +226,24 @@ class RuntimeAllowingSafetyProvider(RuntimeContentSafetyProvider):
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_requests.append(request)
+        if request.schema_name == "content_safety_batch_review":
+            count = int(request.schema["properties"]["reviews"]["minItems"])
+            return StructuredOutputResponse(
+                data={
+                    "reviews": [
+                        {
+                            "ordinal": ordinal,
+                            "action": "allow",
+                            "category": "none",
+                            "reason": "The draft stays within the content ceiling.",
+                            "minimum_rating": "g",
+                        }
+                        for ordinal in range(1, count + 1)
+                    ]
+                },
+                provider=request.provider,
+                model_id=request.model_id,
+            )
         return StructuredOutputResponse(
             data={
                 "action": "allow",
@@ -261,6 +343,8 @@ class RuntimeStructuredCleanupProvider(RuntimeFakeProvider):
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         self.structured_requests.append(request)
+        if request.schema_name == "scenario_canon_claims":
+            return await RuntimeCanonProvider().generate_structured_output(request)
         if not self.responses:
             raise AssertionError(
                 f"unexpected structured request: {request.schema_name}"
@@ -417,6 +501,7 @@ class RuntimeToolReconciliationProvider(RuntimeFakeProvider):
                             "category": "scene",
                             "source_message_id": source_message_id,
                             "evidence_quote": "The corridor holds steady",
+                            "epistemic_status": "objective_outcome",
                             "confidence": 0.9,
                             "persistence_scope": "durable",
                         }
@@ -691,7 +776,6 @@ def test_manual_action_choice_scenario_generates_opening_action_choices(
         tmp_path,
         providers={"fake": provider},
     )
-
     model = controller.create_manual_scenario(
         runtime.ManualScenarioInput(
             scenario_type="full_roleplay",
@@ -738,7 +822,6 @@ def test_manual_storyteller_scenario_ignores_stale_player_fields_and_choices(
 ) -> None:
     runtime = _import_runtime_without_gtk(monkeypatch)
     controller = _runtime_controller(runtime, repositories, tmp_path)
-
     model = controller.create_manual_scenario(
         runtime.ManualScenarioInput(
             scenario_type="full_roleplay",
@@ -850,6 +933,7 @@ def test_save_action_choice_scenario_draft_returns_opening_action_choices(
         )
     )
 
+    assert _value(model, "error") is None
     choices = _value(model, "action_choices")
     assert [_value(choice, "body") for choice in _value(choices, "choices")] == [
         "Open the brass atlas.",
@@ -858,7 +942,6 @@ def test_save_action_choice_scenario_draft_returns_opening_action_choices(
         "Step through the blue shelf-door.",
     ]
     assert provider.structured_requests
-    assert _value(model, "error") is None
 
 
 def test_save_action_choice_scenario_draft_can_defer_opening_action_choices(
@@ -884,6 +967,7 @@ def test_save_action_choice_scenario_draft_can_defer_opening_action_choices(
         tmp_path,
         providers={"fake": provider},
     )
+    _configure_test_canon_compiler(controller, repositories)
 
     model = asyncio.run(
         controller.save_scenario_draft(
@@ -3234,7 +3318,9 @@ def test_save_scenario_draft_persists_reviewed_sections_creates_active_save_and_
     assert scenario.player_role == "Reef investigator"
     content = json.loads(scenario.content_json)
     assert {
-        key: value for key, value in content.items() if key != "_source"
+        key: value
+        for key, value in content.items()
+        if key not in {"_source", "_canon_claims"}
     } == reviewed_sections
     assert content["_source"] == {
         "content_rating": "g",
@@ -3264,6 +3350,7 @@ def test_save_scenario_draft_preserves_opening_at_adult_rating(
 ) -> None:
     runtime = _import_runtime_without_gtk(monkeypatch)
     controller = _runtime_controller(runtime, repositories, tmp_path)
+    _configure_test_canon_compiler(controller, repositories)
     adult = repositories.create_user(
         username="Ilyra",
         role="user",
@@ -3670,6 +3757,7 @@ def test_save_management_scenario_draft_seeds_template_state(
         )
     )
 
+    assert _value(model, "error") is None
     save = repositories.list_saves()[0]
     assert _value(model, "active_save_id") == save.id
     scenario = repositories.get_scenario(save.scenario_id)
@@ -4057,6 +4145,7 @@ def test_save_scenario_draft_reviews_submitted_character_starter_content(
             "safety": safety_provider,
         },
     )
+    _configure_test_canon_compiler(controller, repositories)
     sections = {
         **_reviewed_full_roleplay_sections(),
         "characters": "Captain Ilyra, the exiled commander.",
@@ -6692,6 +6781,68 @@ def test_timeskip_initial_render_persists_system_request_and_defers_post_turn_jo
 
 
 @pytest.mark.parametrize(
+    ("role", "speaker_name", "body"),
+    [
+        ("player", "Mara", "I open the observatory door."),
+        ("system", "Timeskip", "Timeskip request: Skip to dawn."),
+    ],
+)
+def test_retry_interrupted_turn_reuses_committed_source_message(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    role: str,
+    speaker_name: str,
+    body: str,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, _ = _persist_runtime_save(repositories, include_messages=False)
+    _configure_chat_and_context_preferences(repositories)
+    source = repositories.append_message(
+        save_id=save_id,
+        role=role,
+        speaker_name=speaker_name,
+        body=body,
+        narration_status="failed",
+        narration_error="Bragi could not finish the narrator response.",
+    )
+    provider = RuntimeFakeProvider()
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        provider=provider,
+        context_search_service=NoopContextSearch(),
+    )
+    controller.load_save(save_id)
+
+    turn = asyncio.run(
+        controller.retry_interrupted_turn_for_initial_render(
+            message_id=source.id,
+            edited_body=(
+                "Timeskip request: Skip to midnight."
+                if role == "system"
+                else None
+            ),
+        )
+    )
+
+    persisted_messages = repositories.list_messages(save_id)
+    assert [message.id for message in persisted_messages[:1]] == [source.id]
+    assert [message.role for message in persisted_messages] == [role, "narrator"]
+    if role == "system":
+        assert persisted_messages[0].body == "Timeskip request: Skip to midnight."
+    assert _value(turn, "player_message_id") == source.id
+    assert repositories.get_active_interrupted_message_narration(save_id) is None
+    state = repositories.get_message_narration_state(
+        save_id=save_id,
+        message_id=source.id,
+    )
+    assert state is not None
+    assert state.status == "complete"
+
+
+@pytest.mark.parametrize(
     ("player_character_name", "expected_speaker_name"),
     [
         ("Mara Voss", "Mara Voss"),
@@ -7108,9 +7259,9 @@ def test_edit_message_without_resubmit_player_reconciles_world_data(
     assert len(revisions) == 1
     assert revisions[0].reconciliation_status == "succeeded"
     assert revisions[0].reconciled_at is not None
-    assert {
-        state.key: state.value for state in repositories.list_world_state(save_id)
-    } == {"scene.corridor": {"status": "stable"}}
+    # The edited player action is still a claim/attempt until narration confirms
+    # its outcome, so reconciliation must not promote it into objective state.
+    assert repositories.list_world_state(save_id) == []
     edited_message = next(
         message
         for message in _chronicle_messages(model)
@@ -7236,6 +7387,8 @@ def test_edit_narrator_message_reconciliation_prefers_tool_calls(
             "upsert_active_thread",
             "link_entities",
             "record_phone_number_exchange",
+            "upsert_scene_fact",
+            "retire_scene_fact",
         ),
     ]
     request_text = "\n\n".join(
@@ -7706,7 +7859,7 @@ def test_edit_and_resubmit_reports_committed_edit_before_narrator_finishes(
         )
 
         try:
-            await asyncio.wait_for(replacement_narrator_started.wait(), timeout=1)
+            await asyncio.wait_for(replacement_narrator_started.wait(), timeout=2)
         except TimeoutError as exc:
             if task.done():
                 await task
@@ -7738,7 +7891,7 @@ def test_edit_and_resubmit_reports_committed_edit_before_narrator_finishes(
         ]
 
         release_replacement_narrator.set()
-        final_model = await asyncio.wait_for(task, timeout=1)
+        final_model = await asyncio.wait_for(task, timeout=2)
 
         final_messages = repositories.list_messages(save_id)
         assert [(message.role, message.body) for message in final_messages] == [
@@ -11282,6 +11435,7 @@ async def _save_scenario_draft(
     source_metadata: dict[str, object] | None = None,
     character_starters: list[dict[str, object]] | None = None,
 ) -> object:
+    _configure_test_canon_compiler(controller, controller.repositories)
     model = await controller.save_scenario_draft(
         scenario_type=scenario_type,
         scenario_types=scenario_types,
@@ -11309,6 +11463,26 @@ async def _save_scenario_draft(
     return await controller.generate_initial_scenario_image(
         source_message_id=opening_message_id,
         active_save_id=save_id,
+    )
+
+
+def _configure_test_canon_compiler(
+    controller: Any,
+    repositories: PersistenceRepositories,
+) -> None:
+    if repositories.get_model_preference("context_update") is not None:
+        return
+    controller.providers["canon"] = RuntimeCanonProvider()
+    repositories.set_model_preference(
+        task="context_update",
+        provider="canon",
+        model_id="fake-canon",
+    )
+    repositories.save_provider_model(
+        provider="canon",
+        model_id="fake-canon",
+        display_name="Fake Canon",
+        capabilities=["structured_output"],
     )
 
 

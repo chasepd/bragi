@@ -61,6 +61,25 @@ class ScriptedSafetyProvider:
         )
 
 
+class ScriptedBatchSafetyProvider:
+    provider_name = "fake"
+
+    def __init__(self, reviews: list[dict[str, object]]) -> None:
+        self.reviews = reviews
+        self.structured_output_requests: list[StructuredOutputRequest] = []
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        self.structured_output_requests.append(request)
+        return StructuredOutputResponse(
+            data={"reviews": self.reviews},
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
 def test_agent_rating_comparison_fails_closed_for_unclassified_legacy_content() -> None:
     assert content_rating_exceeds(
         minimum_rating="unclassified",
@@ -293,6 +312,94 @@ def test_unrated_bypasses_safety_agent_and_never_fades(
     assert result.agent_ran is False
     assert result.transition_applied is False
     assert provider.structured_output_requests == []
+
+
+def test_batch_review_uses_one_bounded_request_and_preserves_ordinal_results(
+    repositories: PersistenceRepositories,
+) -> None:
+    _configure_safety_model(repositories)
+    provider = ScriptedBatchSafetyProvider(
+        [
+            {
+                "ordinal": 2,
+                "action": "block",
+                "category": "violence",
+                "reason": "Too violent.",
+                "minimum_rating": "r",
+            },
+            {
+                "ordinal": 1,
+                "action": "allow",
+                "category": "none",
+                "reason": "Suitable.",
+                "minimum_rating": "g",
+            },
+        ]
+    )
+    service = ContentSafetyService(
+        repositories=repositories,
+        providers={"fake": cast(ProviderClient, provider)},
+    )
+
+    results = asyncio.run(
+        service.review_narrations(
+            bodies=("Open the door.", "Strike the guard."),
+            content_rating="pg",
+            fade_to_black_enabled=False,
+        )
+    )
+
+    assert [result.body for result in results] == [
+        "Open the door.",
+        CONTENT_FILTER_TRANSITION,
+    ]
+    assert len(provider.structured_output_requests) == 1
+    request = provider.structured_output_requests[0]
+    assert request.schema_name == "content_safety_batch_review"
+    reviews_schema = request.schema["properties"]["reviews"]
+    assert reviews_schema["minItems"] == 2
+    assert reviews_schema["maxItems"] == 2
+    assert "Draft 1:\nOpen the door." in request.messages[-1].body
+    assert "Draft 2:\nStrike the guard." in request.messages[-1].body
+
+
+def test_batch_review_fails_closed_for_duplicate_ordinals(
+    repositories: PersistenceRepositories,
+) -> None:
+    _configure_safety_model(repositories)
+    provider = ScriptedBatchSafetyProvider(
+        [
+            {
+                "ordinal": 1,
+                "action": "allow",
+                "category": "none",
+                "reason": "Suitable.",
+                "minimum_rating": "g",
+            },
+            {
+                "ordinal": 1,
+                "action": "allow",
+                "category": "none",
+                "reason": "Suitable.",
+                "minimum_rating": "g",
+            },
+        ]
+    )
+    service = ContentSafetyService(
+        repositories=repositories,
+        providers={"fake": cast(ProviderClient, provider)},
+    )
+
+    results = asyncio.run(
+        service.review_narrations(
+            bodies=("First draft.", "Second draft."),
+            content_rating="pg",
+            fade_to_black_enabled=False,
+        )
+    )
+
+    assert [result.body for result in results] == [CONTENT_FILTER_TRANSITION] * 2
+    assert all(result.category == "safety_agent_error" for result in results)
 
 
 def test_rated_review_fails_closed_without_a_safety_model(

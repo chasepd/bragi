@@ -13,6 +13,7 @@ from pathlib import Path
 from bragi.model_tasks import is_retired_model_task
 from bragi.observation_types import normalize_observation_type
 from bragi.persistence.context_provenance import merge_context_source_metadata
+from bragi.persistence.snapshot_contract import SNAPSHOT_TABLES
 from bragi.private_files import ensure_private_file
 from bragi.text_search import (
     MAX_STRUCTURED_IDENTIFIER_EDGE_SAMPLE_CHARS,
@@ -22,7 +23,7 @@ from bragi.text_search import (
     unicode_word_terms,
 )
 
-CURRENT_SCHEMA_VERSION = 74
+CURRENT_SCHEMA_VERSION = 83
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
@@ -130,7 +131,9 @@ CREATE TABLE IF NOT EXISTS messages (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     deleted_at TEXT,
     safety_transition TEXT NOT NULL DEFAULT '',
-    content_rating TEXT NOT NULL DEFAULT 'unclassified'
+    content_rating TEXT NOT NULL DEFAULT 'unclassified',
+    narration_status TEXT NOT NULL DEFAULT 'complete',
+    narration_error TEXT
 );
 
 CREATE TABLE IF NOT EXISTS message_revisions (
@@ -193,6 +196,9 @@ CREATE TABLE IF NOT EXISTS context_observations (
     confidence REAL NOT NULL DEFAULT 0.0,
     tags_json TEXT NOT NULL DEFAULT '[]',
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    epistemic_status TEXT NOT NULL DEFAULT 'legacy_unclassified',
+    epistemic_actor_id TEXT REFERENCES characters(id) ON DELETE SET NULL,
+    epistemic_actor_name TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     archived_at TEXT
@@ -256,6 +262,52 @@ CREATE TABLE IF NOT EXISTS scene_snapshots (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(save_id, current_location_id) REFERENCES locations(save_id, id)
 );
+
+CREATE TABLE IF NOT EXISTS scene_facts (
+    id TEXT PRIMARY KEY,
+    save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+    scene_snapshot_id TEXT NOT NULL REFERENCES scene_snapshots(id) ON DELETE CASCADE,
+    scene_generation INTEGER NOT NULL,
+    fact_type TEXT NOT NULL,
+    subject_type TEXT NOT NULL,
+    subject_id TEXT,
+    subject_label TEXT NOT NULL DEFAULT '',
+    target_type TEXT NOT NULL DEFAULT '',
+    target_id TEXT,
+    target_label TEXT NOT NULL DEFAULT '',
+    aspect TEXT NOT NULL DEFAULT '',
+    value TEXT NOT NULL,
+    conflict_key TEXT NOT NULL,
+    lifetime TEXT NOT NULL,
+    created_turn_number INTEGER NOT NULL,
+    expires_after_turn_number INTEGER,
+    archived_at TEXT,
+    archive_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scene_facts_active_conflict
+ON scene_facts(save_id, scene_snapshot_id, scene_generation, conflict_key)
+WHERE archived_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_scene_facts_current
+ON scene_facts(save_id, scene_snapshot_id, scene_generation, archived_at);
+
+CREATE TABLE IF NOT EXISTS scene_fact_sources (
+    id TEXT PRIMARY KEY,
+    save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+    scene_fact_id TEXT NOT NULL REFERENCES scene_facts(id) ON DELETE CASCADE,
+    source_message_id TEXT NOT NULL REFERENCES messages(id),
+    evidence_quote TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(scene_fact_id, source_message_id, evidence_quote)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scene_fact_sources_fact
+ON scene_fact_sources(scene_fact_id, created_at, id);
 
 CREATE TABLE IF NOT EXISTS locations (
     id TEXT PRIMARY KEY,
@@ -422,6 +474,9 @@ CREATE TABLE IF NOT EXISTS memories (
     source_message_ids_json TEXT NOT NULL DEFAULT '[]',
     claim_fingerprint TEXT NOT NULL DEFAULT '',
     source_observation_ids_json TEXT NOT NULL DEFAULT '[]',
+    epistemic_status TEXT NOT NULL DEFAULT 'legacy_unclassified',
+    epistemic_actor_id TEXT REFERENCES characters(id) ON DELETE SET NULL,
+    epistemic_actor_name TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     archived_at TEXT
@@ -440,6 +495,20 @@ CREATE TABLE IF NOT EXISTS summaries (
     source_summary_ids_json TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     archived_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS summary_pressure_state (
+    save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+    history_revision INTEGER NOT NULL DEFAULT 0,
+    summarized_through_message_id TEXT,
+    unsummarized_message_count INTEGER NOT NULL DEFAULT 0,
+    unsummarized_player_count INTEGER NOT NULL DEFAULT 0,
+    unsummarized_narrator_count INTEGER NOT NULL DEFAULT 0,
+    unsummarized_other_count INTEGER NOT NULL DEFAULT 0,
+    unsummarized_token_estimate INTEGER NOT NULL DEFAULT 0,
+    active_summary_count INTEGER NOT NULL DEFAULT 0,
+    active_summary_token_estimate INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS save_scenario_updates (
@@ -603,6 +672,22 @@ ON jobs(status, type, save_id, completed_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_save_status_completed
 ON jobs(save_id, status, completed_at);
 
+CREATE TABLE IF NOT EXISTS chat_turn_submissions (
+    save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+    client_turn_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+    player_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    narrator_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(save_id, client_turn_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_turn_submissions_job_id
+ON chat_turn_submissions(job_id);
+
 CREATE TABLE IF NOT EXISTS job_steps (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -626,6 +711,28 @@ ON job_steps(name, status, completed_at);
 
 CREATE INDEX IF NOT EXISTS idx_job_steps_provider_model_task_status_completed
 ON job_steps(provider, model, task, status, completed_at);
+
+CREATE TABLE IF NOT EXISTS post_turn_outbox (
+    id TEXT PRIMARY KEY,
+    save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+    player_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    narrator_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    turn_revision TEXT NOT NULL,
+    step TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TEXT,
+    completed_at TEXT,
+    UNIQUE(save_id, player_message_id, narrator_message_id, turn_revision, step)
+);
+
+CREATE INDEX IF NOT EXISTS idx_post_turn_outbox_save_status_updated
+ON post_turn_outbox(save_id, status, updated_at);
 
 CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
@@ -668,23 +775,74 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 73:
+            if current == 82:
+                _migrate_schema_82_to_83(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 81:
+                _migrate_schema_81_to_82(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 80:
+                _migrate_schema_80_to_81(connection)
+                _migrate_schema_81_to_82(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 79:
+                _migrate_schema_79_to_80(connection)
+                _migrate_schema_80_to_81(connection)
+                _migrate_schema_81_to_82(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 78:
+                _migrate_schema_78_to_79(connection)
+                _migrate_schema_79_to_80(connection)
+                _migrate_schema_80_to_81(connection)
+                _migrate_schema_81_to_82(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 77:
+                _migrate_schema_77_to_78(connection)
+                _migrate_schema_78_to_79(connection)
+                _migrate_schema_79_to_80(connection)
+                _migrate_schema_80_to_81(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 76:
+                _migrate_schema_76_to_77(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 75:
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 74:
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 73:
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 72:
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 71:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 70:
                 _migrate_schema_70_to_71(connection)
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 69:
                 _migrate_schema_69_to_70(connection)
@@ -692,6 +850,9 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 68:
                 _migrate_schema_68_to_69(connection)
@@ -700,6 +861,9 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 67:
                 _migrate_schema_67_to_68(connection)
@@ -709,6 +873,9 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 66:
                 _migrate_schema_66_to_67(connection)
@@ -719,6 +886,9 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 65:
                 _migrate_schema_65_to_66(connection)
@@ -730,6 +900,9 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 64:
                 _migrate_schema_64_to_65(connection)
@@ -742,6 +915,9 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 63:
                 _migrate_schema_63_to_64(connection)
@@ -755,6 +931,9 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 62:
                 _migrate_schema_62_to_63(connection)
@@ -769,6 +948,9 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 61:
                 _migrate_schema_61_to_62(connection)
@@ -784,6 +966,9 @@ def migrate_database(database_path: Path | str) -> None:
                 _migrate_schema_71_to_72(connection)
                 _migrate_schema_72_to_73(connection)
                 _migrate_schema_73_to_74(connection)
+                _migrate_schema_74_to_75(connection)
+                _migrate_schema_75_to_76(connection)
+                _migrate_schema_76_to_77(connection)
                 current = CURRENT_SCHEMA_VERSION
             else:
                 raise RuntimeError(
@@ -817,6 +1002,23 @@ def migrate_database(database_path: Path | str) -> None:
             or not _schema_migration_applied(connection, 74)
         ):
             _migrate_schema_73_to_74(connection)
+        if not _schema_migration_applied(connection, 75):
+            _migrate_schema_74_to_75(connection)
+        _migrate_schema_75_to_76(connection)
+        if not _schema_migration_applied(connection, 77):
+            _migrate_schema_76_to_77(connection)
+        if not _schema_migration_applied(connection, 78):
+            _migrate_schema_77_to_78(connection)
+        if not _schema_migration_applied(connection, 79):
+            _migrate_schema_78_to_79(connection)
+        if not _schema_migration_applied(connection, 80):
+            _migrate_schema_79_to_80(connection)
+        if not _schema_migration_applied(connection, 81):
+            _migrate_schema_80_to_81(connection)
+        if not _schema_migration_applied(connection, 82):
+            _migrate_schema_81_to_82(connection)
+        if not _schema_migration_applied(connection, 83):
+            _migrate_schema_82_to_83(connection)
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
         _ensure_context_observation_curation_schema(connection)
@@ -824,6 +1026,7 @@ def migrate_database(database_path: Path | str) -> None:
         _ensure_character_text_schema(connection)
         _ensure_character_text_activity_schema(connection)
         _ensure_scene_world_time_schema(connection)
+        _ensure_scene_fact_schema(connection)
         _ensure_hot_narration_query_indexes(connection)
         _ensure_continuity_index_revision_schema(connection)
         _ensure_context_source_search_terms_schema(connection)
@@ -854,11 +1057,14 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         _ensure_context_source_fts_schema(connection)
         _ensure_context_source_search_terms_schema(connection)
         _ensure_message_scene_presence_schema(connection)
+        _ensure_turn_outcome_schema(connection)
         _ensure_message_action_choices_schema(connection)
+        _ensure_message_action_choice_generation_claim_schema(connection)
         _normalize_legacy_action_choice_scenarios(connection)
         _ensure_character_agency_schema(connection)
         _ensure_character_age_schema(connection)
         _ensure_scene_world_time_schema(connection)
+        _ensure_scene_fact_schema(connection)
         _ensure_dating_route_state_schema(connection)
         _ensure_character_text_schema(connection)
         _ensure_character_text_activity_schema(connection)
@@ -867,6 +1073,9 @@ def _initialize_baseline_schema(connection: sqlite3.Connection) -> None:
         _ensure_character_text_message_revision_schema(connection)
         _ensure_character_text_message_attachment_schema(connection)
         _ensure_turn_snapshot_schema(connection)
+        _ensure_chat_turn_submission_schema(connection)
+        _ensure_summary_pressure_state_schema(connection)
+        _ensure_incremental_turn_snapshot_schema(connection)
         _ensure_context_revision_schema(connection)
         _ensure_continuity_index_revision_schema(connection)
         _ensure_character_contact_name_schema(connection)
@@ -1030,6 +1239,185 @@ def _ensure_turn_snapshot_schema(connection: sqlite3.Connection) -> None:
         ON save_turn_snapshots(root_manifest_hash);
         """
     )
+
+
+def _ensure_incremental_turn_snapshot_schema(connection: sqlite3.Connection) -> None:
+    if not _table_exists(connection, "saves"):
+        return
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS save_snapshot_state (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            base_snapshot_id TEXT REFERENCES save_turn_snapshots(id)
+                ON DELETE SET NULL,
+            base_message_id TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS save_snapshot_table_state (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            table_name TEXT NOT NULL,
+            current_generation INTEGER NOT NULL DEFAULT 0,
+            captured_generation INTEGER NOT NULL DEFAULT 0,
+            root_hash TEXT,
+            next_ordinal INTEGER NOT NULL DEFAULT 0,
+            needs_rebuild INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(save_id, table_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS save_snapshot_dirty_rows (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            table_name TEXT NOT NULL,
+            row_key TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            PRIMARY KEY(save_id, table_name, row_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS save_snapshot_row_state (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            table_name TEXT NOT NULL,
+            row_key TEXT NOT NULL,
+            object_hash TEXT,
+            order_key TEXT,
+            ordinal INTEGER NOT NULL,
+            included INTEGER NOT NULL DEFAULT 1,
+            recheck_at TEXT,
+            PRIMARY KEY(save_id, table_name, row_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS save_snapshot_row_references (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            source_table TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            target_table TEXT NOT NULL,
+            target_key TEXT NOT NULL,
+            PRIMARY KEY(
+                save_id, source_table, source_key, target_table, target_key
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS save_snapshot_activity_state (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            max_ordinal INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS save_snapshot_included_activity_events (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            event_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY(save_id, event_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_snapshot_dirty_rows_generation
+        ON save_snapshot_dirty_rows(save_id, table_name, generation);
+
+        CREATE INDEX IF NOT EXISTS idx_snapshot_row_recheck_due
+        ON save_snapshot_row_state(save_id, recheck_at)
+        WHERE recheck_at IS NOT NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_snapshot_reference_target
+        ON save_snapshot_row_references(
+            save_id, target_table, target_key, source_table, source_key
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_snapshot_included_activity_max
+        ON save_snapshot_included_activity_events(save_id, ordinal DESC);
+        """,
+    )
+    for table in SNAPSHOT_TABLES:
+        if not _table_exists(connection, table.name):
+            continue
+        for event in ("INSERT", "UPDATE", "DELETE"):
+            row_ref = "OLD" if event == "DELETE" else "NEW"
+            trigger_name = f"dirty_snapshot_{table.name}_after_{event.lower()}"
+            _execute_schema_script(
+                connection,
+                f"""
+                CREATE TRIGGER IF NOT EXISTS {trigger_name}
+                AFTER {event} ON {table.name}
+                FOR EACH ROW
+                BEGIN
+                    INSERT INTO save_snapshot_table_state(
+                        save_id, table_name, current_generation,
+                        captured_generation, needs_rebuild
+                    )
+                    VALUES ({row_ref}.save_id, '{table.name}', 1, 0, 0)
+                    ON CONFLICT(save_id, table_name) DO UPDATE SET
+                        current_generation = current_generation + 1;
+
+                    INSERT INTO save_snapshot_dirty_rows(
+                        save_id, table_name, row_key, generation
+                    )
+                    VALUES (
+                        {row_ref}.save_id,
+                        '{table.name}',
+                        COALESCE(
+                            CAST({row_ref}.{table.primary_key} AS TEXT),
+                            printf('rowid:%d', {row_ref}.rowid)
+                        ),
+                        (
+                            SELECT current_generation
+                            FROM save_snapshot_table_state
+                            WHERE save_id = {row_ref}.save_id
+                              AND table_name = '{table.name}'
+                        )
+                    )
+                    ON CONFLICT(save_id, table_name, row_key) DO UPDATE SET
+                        generation = excluded.generation;
+                END;
+                """,
+            )
+        _execute_schema_script(
+            connection,
+            f"""
+            CREATE TRIGGER IF NOT EXISTS dirty_snapshot_{table.name}_after_update_old
+            AFTER UPDATE ON {table.name}
+            FOR EACH ROW
+            WHEN OLD.save_id IS NOT NEW.save_id
+              OR OLD.{table.primary_key} IS NOT NEW.{table.primary_key}
+            BEGIN
+                INSERT INTO save_snapshot_table_state(
+                    save_id, table_name, current_generation,
+                    captured_generation, needs_rebuild
+                )
+                VALUES (OLD.save_id, '{table.name}', 1, 0, 0)
+                ON CONFLICT(save_id, table_name) DO UPDATE SET
+                    current_generation = current_generation + 1;
+
+                INSERT INTO save_snapshot_dirty_rows(
+                    save_id, table_name, row_key, generation
+                )
+                VALUES (
+                    OLD.save_id,
+                    '{table.name}',
+                    COALESCE(
+                        CAST(OLD.{table.primary_key} AS TEXT),
+                        printf('rowid:%d', OLD.rowid)
+                    ),
+                    (
+                        SELECT current_generation
+                        FROM save_snapshot_table_state
+                        WHERE save_id = OLD.save_id
+                          AND table_name = '{table.name}'
+                    )
+                )
+                ON CONFLICT(save_id, table_name, row_key) DO UPDATE SET
+                    generation = excluded.generation;
+            END;
+            """,
+        )
+    for table in SNAPSHOT_TABLES:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO save_snapshot_table_state(
+                save_id, table_name, current_generation,
+                captured_generation, needs_rebuild
+            )
+            SELECT id, ?, 1, 0, 1 FROM saves
+            """,
+            (table.name,),
+        )
 
 
 def _ensure_context_observation_schema(connection: sqlite3.Connection) -> None:
@@ -2127,6 +2515,335 @@ def _migrate_schema_72_to_73(connection: sqlite3.Connection) -> None:
 def _migrate_schema_73_to_74(connection: sqlite3.Connection) -> None:
     _ensure_interaction_mode_schema(connection)
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (74)")
+
+
+def _migrate_schema_74_to_75(connection: sqlite3.Connection) -> None:
+    _ensure_scene_fact_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (75)")
+
+
+def _ensure_scene_fact_schema(connection: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS scene_facts (
+            id TEXT PRIMARY KEY,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            scene_snapshot_id TEXT NOT NULL
+                REFERENCES scene_snapshots(id) ON DELETE CASCADE,
+            scene_generation INTEGER NOT NULL,
+            fact_type TEXT NOT NULL,
+            subject_type TEXT NOT NULL,
+            subject_id TEXT,
+            subject_label TEXT NOT NULL DEFAULT '',
+            target_type TEXT NOT NULL DEFAULT '',
+            target_id TEXT,
+            target_label TEXT NOT NULL DEFAULT '',
+            aspect TEXT NOT NULL DEFAULT '',
+            value TEXT NOT NULL,
+            conflict_key TEXT NOT NULL,
+            lifetime TEXT NOT NULL,
+            created_turn_number INTEGER NOT NULL,
+            expires_after_turn_number INTEGER,
+            archived_at TEXT,
+            archive_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_scene_facts_active_conflict
+        ON scene_facts(save_id, scene_snapshot_id, scene_generation, conflict_key)
+        WHERE archived_at IS NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_scene_facts_current
+        ON scene_facts(save_id, scene_snapshot_id, scene_generation, archived_at);
+
+        CREATE TABLE IF NOT EXISTS scene_fact_sources (
+            id TEXT PRIMARY KEY,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            scene_fact_id TEXT NOT NULL
+                REFERENCES scene_facts(id) ON DELETE CASCADE,
+            source_message_id TEXT NOT NULL REFERENCES messages(id),
+            evidence_quote TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 1.0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(scene_fact_id, source_message_id, evidence_quote)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_scene_fact_sources_fact
+        ON scene_fact_sources(scene_fact_id, created_at, id);
+        """,
+    )
+
+
+def _migrate_schema_76_to_77(connection: sqlite3.Connection) -> None:
+    _ensure_turn_outcome_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (77)")
+    _migrate_schema_77_to_78(connection)
+    _migrate_schema_78_to_79(connection)
+    _migrate_schema_79_to_80(connection)
+    _migrate_schema_80_to_81(connection)
+
+
+def _migrate_schema_79_to_80(connection: sqlite3.Connection) -> None:
+    _ensure_post_turn_outbox_schema(connection)
+    _ensure_message_action_choice_generation_claim_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (80)")
+
+
+def _migrate_schema_80_to_81(connection: sqlite3.Connection) -> None:
+    _ensure_chat_turn_submission_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (81)")
+    _migrate_schema_81_to_82(connection)
+
+
+def _ensure_chat_turn_submission_schema(connection: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS chat_turn_submissions (
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            client_turn_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
+            job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+            player_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+            narrator_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(save_id, client_turn_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_chat_turn_submissions_job_id
+        ON chat_turn_submissions(job_id);
+        """,
+    )
+
+def _migrate_schema_82_to_83(connection: sqlite3.Connection) -> None:
+    _add_column_if_missing(
+        connection,
+        "messages",
+        "narration_status",
+        "TEXT NOT NULL DEFAULT 'complete'",
+    )
+    _add_column_if_missing(connection, "messages", "narration_error", "TEXT")
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (83)")
+
+
+def _ensure_post_turn_outbox_schema(connection: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS post_turn_outbox (
+            id TEXT PRIMARY KEY,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            player_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            narrator_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+            turn_revision TEXT NOT NULL,
+            step TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            result_json TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            started_at TEXT,
+            completed_at TEXT,
+            UNIQUE(
+                save_id,
+                player_message_id,
+                narrator_message_id,
+                turn_revision,
+                step
+            )
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_post_turn_outbox_save_status_updated
+        ON post_turn_outbox(save_id, status, updated_at);
+        """,
+    )
+def _migrate_schema_77_to_78(connection: sqlite3.Connection) -> None:
+    _ensure_summary_pressure_state_schema(connection)
+    _backfill_summary_pressure_state(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (78)")
+    _migrate_schema_78_to_79(connection)
+
+
+def _migrate_schema_81_to_82(connection: sqlite3.Connection) -> None:
+    _ensure_incremental_turn_snapshot_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (82)")
+    _migrate_schema_82_to_83(connection)
+
+
+def _ensure_summary_pressure_state_schema(connection: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS summary_pressure_state (
+            save_id TEXT PRIMARY KEY REFERENCES saves(id) ON DELETE CASCADE,
+            history_revision INTEGER NOT NULL DEFAULT 0,
+            summarized_through_message_id TEXT,
+            unsummarized_message_count INTEGER NOT NULL DEFAULT 0,
+            unsummarized_player_count INTEGER NOT NULL DEFAULT 0,
+            unsummarized_narrator_count INTEGER NOT NULL DEFAULT 0,
+            unsummarized_other_count INTEGER NOT NULL DEFAULT 0,
+            unsummarized_token_estimate INTEGER NOT NULL DEFAULT 0,
+            active_summary_count INTEGER NOT NULL DEFAULT 0,
+            active_summary_token_estimate INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TRIGGER IF NOT EXISTS init_summary_pressure_state_after_save_insert
+        AFTER INSERT ON saves
+        FOR EACH ROW
+        BEGIN
+            INSERT OR IGNORE INTO summary_pressure_state(save_id) VALUES (NEW.id);
+        END;
+        """,
+    )
+
+
+def _migrate_schema_78_to_79(connection: sqlite3.Connection) -> None:
+    _ensure_message_action_choice_generation_claim_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (79)")
+
+
+def _ensure_message_action_choice_generation_claim_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS message_action_choice_generation_claims (
+            message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            narrator_updated_at TEXT NOT NULL,
+            generation_token TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_action_choice_generation_claims_save
+        ON message_action_choice_generation_claims(save_id, updated_at);
+        """,
+    )
+
+
+def _backfill_summary_pressure_state(connection: sqlite3.Connection) -> None:
+    for (save_id,) in connection.execute("SELECT id FROM saves").fetchall():
+        messages = connection.execute(
+            """
+            SELECT id, role, body, token_estimate
+            FROM messages
+            WHERE save_id = ? AND deleted_at IS NULL
+            ORDER BY rowid
+            """,
+            (save_id,),
+        ).fetchall()
+        summaries = connection.execute(
+            """
+            SELECT covers_message_end_id, body
+            FROM summaries
+            WHERE save_id = ? AND archived_at IS NULL
+            ORDER BY created_at, rowid
+            """,
+            (save_id,),
+        ).fetchall()
+        summarized_through = summaries[-1][0] if summaries else None
+        start_index = 0
+        if summarized_through is not None:
+            for index, message in enumerate(messages):
+                if message[0] == summarized_through:
+                    start_index = index + 1
+                    break
+        unsummarized = messages[start_index:]
+        player_count = sum(1 for message in unsummarized if message[1] == "player")
+        narrator_count = sum(
+            1 for message in unsummarized if message[1] == "narrator"
+        )
+        token_estimate = sum(
+            int(message[3])
+            if message[3] is not None
+            else max(1, (len(str(message[2])) + 3) // 4)
+            for message in unsummarized
+        )
+        summary_tokens = sum(
+            max(1, (len(str(summary[1])) + 3) // 4) for summary in summaries
+        )
+        connection.execute(
+            """
+            INSERT INTO summary_pressure_state(
+                save_id, history_revision, summarized_through_message_id,
+                unsummarized_message_count, unsummarized_player_count,
+                unsummarized_narrator_count, unsummarized_other_count,
+                unsummarized_token_estimate, active_summary_count,
+                active_summary_token_estimate, updated_at
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(save_id) DO UPDATE SET
+                history_revision = summary_pressure_state.history_revision + 1,
+                summarized_through_message_id = excluded.summarized_through_message_id,
+                unsummarized_message_count = excluded.unsummarized_message_count,
+                unsummarized_player_count = excluded.unsummarized_player_count,
+                unsummarized_narrator_count = excluded.unsummarized_narrator_count,
+                unsummarized_other_count = excluded.unsummarized_other_count,
+                unsummarized_token_estimate = excluded.unsummarized_token_estimate,
+                active_summary_count = excluded.active_summary_count,
+                active_summary_token_estimate = excluded.active_summary_token_estimate,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                save_id,
+                summarized_through,
+                len(unsummarized),
+                player_count,
+                narrator_count,
+                len(unsummarized) - player_count - narrator_count,
+                token_estimate,
+                len(summaries),
+                summary_tokens,
+            ),
+        )
+def _ensure_turn_outcome_schema(connection: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS turn_outcomes (
+            id TEXT PRIMARY KEY,
+            save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+            message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_turn_outcomes_save_message
+        ON turn_outcomes(save_id, message_id);
+        """,
+    )
+
+
+def _migrate_schema_75_to_76(connection: sqlite3.Connection) -> None:
+    for table_name in ("memories", "context_observations"):
+        _add_column_if_missing(
+            connection,
+            table_name,
+            "epistemic_status",
+            "TEXT NOT NULL DEFAULT 'legacy_unclassified'",
+        )
+        _add_column_if_missing(
+            connection,
+            table_name,
+            "epistemic_actor_id",
+            "TEXT REFERENCES characters(id) ON DELETE SET NULL",
+        )
+        _add_column_if_missing(
+            connection,
+            table_name,
+            "epistemic_actor_name",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (76)")
 
 
 def _interaction_mode_schema_is_current(connection: sqlite3.Connection) -> bool:

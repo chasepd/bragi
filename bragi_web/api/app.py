@@ -10,11 +10,13 @@ import mimetypes
 import os
 import secrets
 import socket
+import sqlite3
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import perf_counter, time
@@ -32,7 +34,7 @@ from typing import (
     get_type_hints,
 )
 from urllib.parse import SplitResult, urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import (
     Depends,
@@ -63,7 +65,10 @@ from bragi_web.bragi_adapter import (
 )
 from bragi_web.jobs import (
     ACTIVE_JOB_STATUSES,
+    CONTINUITY_READY,
+    OPTIONAL_ENRICHMENTS_COMPLETE,
     PUBLIC_JOB_FAILURE_ERROR,
+    RESPONSE_COMMITTED,
     TERMINAL_JOB_STATUSES,
     JobHandle,
     JobRecord,
@@ -90,6 +95,7 @@ from bragi_web.scheduler import WebMaintenanceScheduler
 from bragi_web.serialization import to_jsonable
 
 _CHAT_TURN_ACTIVE_DETAIL = "A chat turn is already being processed for this save."
+_JOB_CANCELLATION_FAILED_DETAIL = "Job cancellation could not be requested"
 _SAVE_ID_REQUIRED_DETAIL = "save_id is required for this save-scoped operation"
 _RETIRED_SCENARIO_TYPE = "character_interaction"
 _RETIRED_SCENARIO_DETAIL = (
@@ -99,6 +105,8 @@ _ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _MEDIA_CACHE_CONTROL = "private, max-age=31536000, immutable"
 _STATIC_CACHE_CONTROL = "public, max-age=86400"
 _SPA_CACHE_CONTROL = "no-cache"
+_SSE_HEARTBEAT_SECONDS = 15.0
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 _COMPRESSIBLE_STATIC_SUFFIXES = frozenset({".css", ".js"})
 _DIAGNOSTIC_CATEGORIES = frozenset(
     {"signals", "jobs", "performance", "scheduler", "events", "save_health"}
@@ -219,8 +227,6 @@ _CHAT_JOB_TYPES = frozenset(
         "chat_turn",
         "look_around",
         "chat_regenerate",
-        "action_choice_generate",
-        "action_choice_regenerate",
         "chat_edit",
         "message_edit",
         "narrator_edit",
@@ -229,8 +235,10 @@ _CHAT_JOB_TYPES = frozenset(
     }
 )
 _POST_TURN_PROGRESS_JOB_ORDER = (
+    "summary",
     "state",
     "context",
+    "time_reconciliation",
     "proactive_text",
     "director",
     "scenario",
@@ -238,6 +246,7 @@ _POST_TURN_PROGRESS_JOB_ORDER = (
 )
 _CHAT_TURN_PROGRESS_JOB_ORDER = (
     "submission",
+    "classification",
     "history",
     "input",
     "character_planning",
@@ -374,6 +383,7 @@ class ChatRequest(BaseModel):
     body: str = Field(default="", max_length=MAX_CHAT_BODY_CHARS)
     speaker_name: str | None = None
     save_id: str | None = None
+    client_turn_id: UUID
 
 
 class LookAroundRequest(BaseModel):
@@ -428,6 +438,12 @@ class CharacterTextDeleteRequest(BaseModel):
 class TimeskipRequest(BaseModel):
     instruction: str = ""
     save_id: str | None = None
+    client_turn_id: UUID
+
+
+class ContinueStoryRequest(BaseModel):
+    save_id: str | None = None
+    client_turn_id: UUID
 
 
 class SaveScopedRequest(BaseModel):
@@ -2640,6 +2656,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 **_save_event_stream_auth_filter(state),
             ),
             media_type="text/event-stream",
+            headers=_SSE_HEADERS,
         )
 
     @app.get("/api/scenarios")
@@ -3213,24 +3230,40 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 status_code=400,
                 detail="speaker_name is reserved for internal Storyteller turns",
             )
-        return await _submit_chat(payload, state)
+        return await _submit_chat(payload, state, operation="chat")
 
-    async def _submit_chat(
-        payload: ChatRequest,
+    @app.post("/api/chat/retry")
+    async def retry_interrupted_chat(
+        payload: EditMessageRequest,
         state: StateDep,
     ) -> dict[str, Any]:
         async with state.lock.async_access():
             submitted_save_id = _require_save_id(payload.save_id)
-            _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
+            interrupted = (
+                state.repositories.get_active_interrupted_message_narration(
+                    submitted_save_id
+                )
+            )
+            if interrupted is None or interrupted.message_id != payload.message_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This turn is no longer interrupted.",
+                )
+            _raise_unless_save_action_allowed(
+                state,
+                submitted_save_id,
+                "mutate" if interrupted.source_kind == "timeskip" else "chat",
+            )
+            active = _active_chat_turn_for_save(
+                state.jobs.list_active(save_id=submitted_save_id),
+                submitted_save_id,
+            )
+            if active is not None:
+                raise HTTPException(status_code=409, detail=_CHAT_TURN_ACTIVE_DETAIL)
             current_user_id = _owner_user_id_for_request(state)
-        status = _chat_submission_status(state, submitted_save_id)
-        if not status["can_submit"]:
-            if status["reason"] == "no_save":
-                raise HTTPException(status_code=400, detail="No save loaded")
-            raise HTTPException(status_code=409, detail=_CHAT_TURN_ACTIVE_DETAIL)
 
         async def worker(handle: JobHandle) -> Any:
-            initial_progress = _initial_chat_turn_progress("Submitting turn")
+            initial_progress = _initial_chat_turn_progress("Retrying turn")
             await handle.event("progress", initial_progress)
             (
                 turn_progress_callback,
@@ -3241,64 +3274,29 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 handle,
                 task_label="chat",
             )
-            draft_callback, flush_draft_progress = _narrator_draft_callback(handle)
-            kwargs: dict[str, Any] = {
-                "body": payload.body,
-                "speaker_name": payload.speaker_name,
-                "active_save_id": submitted_save_id,
-            }
-            needs_post_input_catchup = bool(
-                _active_background_post_turn_jobs(
-                    state,
-                    save_id=submitted_save_id,
-                )
+            await _wait_for_background_post_turn_catchup(
+                state,
+                handle,
+                save_id=submitted_save_id,
             )
-
-            async def post_input_catchup() -> None:
-                await _wait_for_background_post_turn_catchup(
-                    state,
-                    handle,
-                    save_id=submitted_save_id,
-                )
-
-            if _call_accepts_keyword(
-                state.runtime.submit_player_message_for_initial_render,
-                "current_user_id",
-            ):
-                kwargs["current_user_id"] = current_user_id
-            if _call_accepts_keyword(
-                state.runtime.submit_player_message_for_initial_render,
-                "retry_progress_callback",
-            ):
-                kwargs["retry_progress_callback"] = retry_callback
-            if _call_accepts_keyword(
-                state.runtime.submit_player_message_for_initial_render,
-                "narrator_stream_callback",
-            ):
-                kwargs["narrator_stream_callback"] = draft_callback
-            if _call_accepts_keyword(
-                state.runtime.submit_player_message_for_initial_render,
-                "turn_progress_callback",
-            ):
-                kwargs["turn_progress_callback"] = turn_progress_callback
-            if _call_accepts_keyword(
-                state.runtime.submit_player_message_for_initial_render,
-                "post_input_catchup",
-            ) and needs_post_input_catchup:
-                kwargs["post_input_catchup"] = post_input_catchup
             try:
-                turn = await state.runtime.submit_player_message_for_initial_render(
-                    **kwargs
+                turn = await state.runtime.retry_interrupted_turn_for_initial_render(
+                    message_id=payload.message_id,
+                    edited_body=payload.body.strip() or None,
+                    active_save_id=submitted_save_id,
+                    current_user_id=current_user_id,
+                    retry_progress_callback=retry_callback,
+                    turn_progress_callback=turn_progress_callback,
                 )
             finally:
                 await flush_retry_progress()
-                await flush_draft_progress()
                 await flush_turn_progress()
             _raise_for_initial_chat_turn_failure(
                 turn,
-                failure_message="Chat turn did not produce a narrator response",
+                failure_message="Retry did not produce a narrator response",
             )
             await _emit_initial_chat_turn_event(handle, turn)
+            await handle.advance_completion_level(RESPONSE_COMMITTED)
             if turn.has_post_turn_jobs:
                 queued = await _queue_post_turn_jobs_background(
                     state,
@@ -3318,7 +3316,142 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     current_user_id=current_user_id,
                 )
                 if queued is None:
-                    return await _run_post_turn_jobs_with_ordered_progress(
+                    return await _run_post_turn_jobs_inline_fallback(
+                        state,
+                        handle,
+                        save_id=turn.save_id or "",
+                        player_message_id=turn.player_message_id or "",
+                        narrator_message_id=turn.narrator_message_id or "",
+                        turn_revision=getattr(turn, "turn_revision", None),
+                        prepared_action_choices=getattr(
+                            turn,
+                            "prepared_action_choices",
+                            None,
+                        ),
+                        prior_phase_jobs=_completed_chat_turn_phase_jobs(
+                            latest_turn_progress_jobs()
+                        ),
+                        current_user_id=current_user_id,
+                    )
+            return _initial_chat_turn_result(turn)
+
+        return await _create_job_summary(
+            state,
+            "chat_turn",
+            worker,
+            save_id=submitted_save_id,
+            exclusive_key=_chat_turn_exclusive_key(submitted_save_id),
+        )
+
+    async def _submit_chat(
+        payload: ChatRequest,
+        state: StateDep,
+        *,
+        operation: str,
+    ) -> dict[str, Any]:
+        async with state.lock.async_access():
+            submitted_save_id = _require_save_id(payload.save_id)
+            _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
+            current_user_id = _owner_user_id_for_request(state)
+        request_fingerprint = _chat_turn_request_fingerprint(
+            operation,
+            {
+                "body": payload.body.strip(),
+                "speaker_name": (
+                    payload.speaker_name.strip()
+                    if payload.speaker_name and payload.speaker_name.strip()
+                    else None
+                ),
+            },
+        )
+        replay = _chat_turn_submission_replay(
+            state,
+            save_id=submitted_save_id,
+            client_turn_id=str(payload.client_turn_id),
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+        )
+        if replay is not None:
+            return replay
+        status = _chat_submission_status(state, submitted_save_id)
+        if not status["can_submit"]:
+            if status["reason"] == "no_save":
+                raise HTTPException(status_code=400, detail="No save loaded")
+            raise HTTPException(status_code=409, detail=_CHAT_TURN_ACTIVE_DETAIL)
+        await _cancel_action_choice_jobs_for_save(state, submitted_save_id)
+
+        async def worker(handle: JobHandle) -> Any:
+            initial_progress = _initial_chat_turn_progress("Submitting turn")
+            await handle.event("progress", initial_progress)
+            (
+                turn_progress_callback,
+                flush_turn_progress,
+                latest_turn_progress_jobs,
+            ) = _turn_progress_callback(handle, initial_progress)
+            retry_callback, flush_retry_progress = _retry_progress_callback(
+                handle,
+                task_label="chat",
+            )
+            kwargs: dict[str, Any] = {
+                "body": payload.body,
+                "speaker_name": payload.speaker_name,
+                "active_save_id": submitted_save_id,
+            }
+            await _wait_for_background_post_turn_catchup(
+                state,
+                handle,
+                save_id=submitted_save_id,
+            )
+
+            if _call_accepts_keyword(
+                state.runtime.submit_player_message_for_initial_render,
+                "current_user_id",
+            ):
+                kwargs["current_user_id"] = current_user_id
+            if _call_accepts_keyword(
+                state.runtime.submit_player_message_for_initial_render,
+                "retry_progress_callback",
+            ):
+                kwargs["retry_progress_callback"] = retry_callback
+            if _call_accepts_keyword(
+                state.runtime.submit_player_message_for_initial_render,
+                "turn_progress_callback",
+            ):
+                kwargs["turn_progress_callback"] = turn_progress_callback
+            try:
+                turn = await state.runtime.submit_player_message_for_initial_render(
+                    **kwargs
+                )
+            finally:
+                await flush_retry_progress()
+                await flush_turn_progress()
+            _link_chat_turn_submission_messages(state, handle, turn)
+            _raise_for_initial_chat_turn_failure(
+                turn,
+                failure_message="Chat turn did not produce a narrator response",
+            )
+            await _emit_initial_chat_turn_event(handle, turn)
+            await handle.advance_completion_level(RESPONSE_COMMITTED)
+            if turn.has_post_turn_jobs:
+                queued = await _queue_post_turn_jobs_background(
+                    state,
+                    handle,
+                    save_id=turn.save_id or "",
+                    player_message_id=turn.player_message_id or "",
+                    narrator_message_id=turn.narrator_message_id or "",
+                    turn_revision=getattr(turn, "turn_revision", None),
+                    prepared_action_choices=getattr(
+                        turn,
+                        "prepared_action_choices",
+                        None,
+                    ),
+                    prior_phase_jobs=_completed_chat_turn_phase_jobs(
+                        latest_turn_progress_jobs()
+                    ),
+                    current_user_id=current_user_id,
+                )
+                if queued is None:
+                    return await _run_post_turn_jobs_inline_fallback(
                         state,
                         handle,
                         save_id=turn.save_id or "",
@@ -3338,22 +3471,40 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 return _initial_chat_turn_result(turn)
             return _initial_chat_turn_result(turn)
 
-        return await _create_job_summary(
+        return await _create_idempotent_chat_job_summary(
             state,
-            "chat_turn",
             worker,
             save_id=submitted_save_id,
-            exclusive_key=_chat_turn_exclusive_key(submitted_save_id),
+            client_turn_id=str(payload.client_turn_id),
+            operation=operation,
+            request_fingerprint=request_fingerprint,
         )
 
     @app.post("/api/chat/continue")
     async def continue_story(
-        payload: SaveScopedRequest,
+        payload: ContinueStoryRequest,
         state: StateDep,
     ) -> dict[str, Any]:
         async with state.lock.async_access():
             submitted_save_id = _require_save_id(payload.save_id)
             _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
+        request_fingerprint = _chat_turn_request_fingerprint(
+            "continue",
+            {
+                "body": STORY_CONTINUATION_DIRECTION,
+                "speaker_name": STORY_CONTINUATION_SPEAKER_NAME,
+            },
+        )
+        replay = _chat_turn_submission_replay(
+            state,
+            save_id=submitted_save_id,
+            client_turn_id=str(payload.client_turn_id),
+            operation="continue",
+            request_fingerprint=request_fingerprint,
+        )
+        if replay is not None:
+            return replay
+        async with state.lock.async_access():
             save = state.repositories.get_save(submitted_save_id)
             if (
                 save is None
@@ -3370,8 +3521,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 body=STORY_CONTINUATION_DIRECTION,
                 speaker_name=STORY_CONTINUATION_SPEAKER_NAME,
                 save_id=submitted_save_id,
+                client_turn_id=payload.client_turn_id,
             ),
             state,
+            operation="continue",
         )
 
     @app.post("/api/chat/look-around")
@@ -3442,6 +3595,19 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             _raise_unless_save_action_allowed(state, submitted_save_id, "mutate")
             current_user_id = _owner_user_id_for_request(state)
         status = _chat_submission_status(state, submitted_save_id)
+        request_fingerprint = _chat_turn_request_fingerprint(
+            "timeskip",
+            {"instruction": instruction},
+        )
+        replay = _chat_turn_submission_replay(
+            state,
+            save_id=submitted_save_id,
+            client_turn_id=str(payload.client_turn_id),
+            operation="timeskip",
+            request_fingerprint=request_fingerprint,
+        )
+        if replay is not None:
+            return replay
         if not status["can_submit"]:
             if status["reason"] == "no_save":
                 raise HTTPException(status_code=400, detail="No save loaded")
@@ -3459,24 +3625,15 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 handle,
                 task_label="chat",
             )
-            draft_callback, flush_draft_progress = _narrator_draft_callback(handle)
             kwargs: dict[str, Any] = {
                 "instruction": instruction,
                 "active_save_id": submitted_save_id,
             }
-            needs_post_input_catchup = bool(
-                _active_background_post_turn_jobs(
-                    state,
-                    save_id=submitted_save_id,
-                )
+            await _wait_for_background_post_turn_catchup(
+                state,
+                handle,
+                save_id=submitted_save_id,
             )
-
-            async def post_input_catchup() -> None:
-                await _wait_for_background_post_turn_catchup(
-                    state,
-                    handle,
-                    save_id=submitted_save_id,
-                )
 
             if _call_accepts_keyword(
                 state.runtime.submit_timeskip_for_initial_render,
@@ -3490,32 +3647,23 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 kwargs["retry_progress_callback"] = retry_callback
             if _call_accepts_keyword(
                 state.runtime.submit_timeskip_for_initial_render,
-                "narrator_stream_callback",
-            ):
-                kwargs["narrator_stream_callback"] = draft_callback
-            if _call_accepts_keyword(
-                state.runtime.submit_timeskip_for_initial_render,
                 "turn_progress_callback",
             ):
                 kwargs["turn_progress_callback"] = turn_progress_callback
-            if _call_accepts_keyword(
-                state.runtime.submit_timeskip_for_initial_render,
-                "post_input_catchup",
-            ) and needs_post_input_catchup:
-                kwargs["post_input_catchup"] = post_input_catchup
             try:
                 turn = await state.runtime.submit_timeskip_for_initial_render(
                     **kwargs
                 )
             finally:
                 await flush_retry_progress()
-                await flush_draft_progress()
                 await flush_turn_progress()
+            _link_chat_turn_submission_messages(state, handle, turn)
             _raise_for_initial_chat_turn_failure(
                 turn,
                 failure_message="Timeskip did not produce a narrator response",
             )
             await _emit_initial_chat_turn_event(handle, turn)
+            await handle.advance_completion_level(RESPONSE_COMMITTED)
             if turn.has_post_turn_jobs:
                 queued = await _queue_post_turn_jobs_background(
                     state,
@@ -3535,7 +3683,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     current_user_id=current_user_id,
                 )
                 if queued is None:
-                    return await _run_post_turn_jobs_with_ordered_progress(
+                    return await _run_post_turn_jobs_inline_fallback(
                         state,
                         handle,
                         save_id=turn.save_id or "",
@@ -3555,12 +3703,13 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 return _initial_chat_turn_result(turn)
             return _initial_chat_turn_result(turn)
 
-        return await _create_job_summary(
+        return await _create_idempotent_chat_job_summary(
             state,
-            "chat_turn",
             worker,
             save_id=submitted_save_id,
-            exclusive_key=_chat_turn_exclusive_key(submitted_save_id),
+            client_turn_id=str(payload.client_turn_id),
+            operation="timeskip",
+            request_fingerprint=request_fingerprint,
         )
 
     @app.post("/api/chat/cancel")
@@ -3584,6 +3733,12 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             status = _chat_submission_status(state, action_save_id)
             if not status["can_submit"]:
                 raise HTTPException(status_code=409, detail=_CHAT_TURN_ACTIVE_DETAIL)
+
+        await _cancel_action_choice_jobs_for_save(
+            state,
+            action_save_id,
+            narrator_message_id=payload.message_id,
+        )
 
         return await _create_action_choice_job_summary(
             state,
@@ -3639,8 +3794,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             job_type,
             worker,
             save_id=save_id,
-            exclusive_key=_chat_turn_exclusive_key(save_id),
-            operation_queue_key=save_id,
+            operation_queue_key=_action_choice_operation_queue_key(
+                save_id,
+                narrator_message_id,
+            ),
         )
 
     @app.get("/api/messages/{message_id}/scene-presence")
@@ -6094,11 +6251,20 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             if should_cancel_runtime_chat
             else False
         )
-        return {"cancelled": job_cancelled or runtime_cancelled}
+        if job_cancelled or runtime_cancelled:
+            return {"cancelled": True}
+        current = state.jobs.get(job_id)
+        if current is not None and current.status in TERMINAL_JOB_STATUSES:
+            return {"cancelled": False}
+        raise HTTPException(
+            status_code=409,
+            detail=_JOB_CANCELLATION_FAILED_DETAIL,
+        )
 
     @app.get("/api/jobs/{job_id}/events")
     async def job_events(
         job_id: str,
+        request: Request,
         state: StateDep,
         save_id: str | None = None,
     ) -> StreamingResponse:
@@ -6113,10 +6279,15 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             _event_stream(
                 state,
                 job_id,
+                last_event_id=_save_event_cursor_from_header(
+                    request.headers.get("last-event-id"),
+                    latest_event_id=record.event_offset + len(record.events),
+                ),
                 current_user=_current_request_user(),
                 current_user_role=_current_request_role(state),
             ),
             media_type="text/event-stream",
+            headers=_SSE_HEADERS,
         )
 
     _mount_spa(app)
@@ -8147,6 +8318,15 @@ def _scrub_message_payload_for_role(
     _scrub_latest_message_preview(payload, content_safety=content_safety)
     if _looks_like_chronicle_message(payload):
         blocked_action_ids = _blocked_chronicle_action_ids(current_user_role)
+        interrupted_turn = payload.get("interrupted_turn")
+        if (
+            current_user_role == "child"
+            and isinstance(interrupted_turn, dict)
+            and interrupted_turn.get("source_kind") == "timeskip"
+        ):
+            blocked_action_ids = blocked_action_ids | frozenset(
+                {"retry-interrupted-turn"}
+            )
         if current_user_role != "admin":
             payload.pop("debug_prompt", None)
             payload.pop("debug_provider_payload", None)
@@ -8833,6 +9013,7 @@ def _chat_submission_status(
             "reason": "no_save",
             "blocking_job_id": None,
             "blocking_job_status": None,
+            "blocking_message_id": None,
         }
     blocking = _active_chat_turn_for_save(
         state.jobs.list_active(save_id=save_id),
@@ -8845,6 +9026,17 @@ def _chat_submission_status(
             "reason": "chat_turn_active",
             "blocking_job_id": blocking.id,
             "blocking_job_status": blocking.status,
+            "blocking_message_id": None,
+        }
+    interrupted = state.repositories.get_active_interrupted_message_narration(save_id)
+    if interrupted is not None:
+        return {
+            "save_id": save_id,
+            "can_submit": False,
+            "reason": "interrupted_turn",
+            "blocking_job_id": None,
+            "blocking_job_status": None,
+            "blocking_message_id": interrupted.message_id,
         }
     return {
         "save_id": save_id,
@@ -8852,6 +9044,7 @@ def _chat_submission_status(
         "reason": None,
         "blocking_job_id": None,
         "blocking_job_status": None,
+        "blocking_message_id": None,
     }
 
 
@@ -8895,6 +9088,42 @@ def _cancel_runtime_chat_for_job(state: WebAppState, job: JobRecord) -> bool:
 
 def _chat_turn_exclusive_key(save_id: str | None) -> str | None:
     return f"chat_turn:{save_id}" if save_id is not None else None
+
+
+def _action_choice_operation_queue_key(
+    save_id: str,
+    narrator_message_id: str,
+) -> str:
+    return f"action_choices:{save_id}:{narrator_message_id}"
+
+
+async def _cancel_action_choice_jobs_for_save(
+    state: WebAppState,
+    save_id: str,
+    *,
+    narrator_message_id: str | None = None,
+) -> None:
+    expected_queue_key = (
+        _action_choice_operation_queue_key(save_id, narrator_message_id)
+        if narrator_message_id is not None
+        else None
+    )
+    for job in state.jobs.list_active(save_id=save_id):
+        if job.type not in {"action_choice_generate", "action_choice_regenerate"}:
+            continue
+        if (
+            expected_queue_key is not None
+            and job.operation_queue_key != expected_queue_key
+        ):
+            continue
+        await state.jobs.cancel(job.id)
+    invalidate = getattr(
+        state.repositories,
+        "invalidate_message_action_choice_generations",
+        None,
+    )
+    if callable(invalidate):
+        invalidate(save_id)
 
 
 def _character_text_thread_job_key(thread_id: str) -> str:
@@ -8955,6 +9184,168 @@ async def _create_job_summary(
         raise HTTPException(status_code=429, detail=str(exc)) from exc
 
 
+def _chat_turn_request_fingerprint(
+    operation: str,
+    normalized_payload: dict[str, object],
+) -> str:
+    encoded = json.dumps(
+        {"operation": operation, "payload": normalized_payload},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _chat_turn_submission_replay(
+    state: WebAppState,
+    *,
+    save_id: str,
+    client_turn_id: str,
+    operation: str,
+    request_fingerprint: str,
+) -> dict[str, Any] | None:
+    get_submission = getattr(
+        state.repositories,
+        "get_chat_turn_submission",
+        None,
+    )
+    if not callable(get_submission):
+        return None
+    submission = get_submission(
+        save_id=save_id,
+        client_turn_id=client_turn_id,
+    )
+    if submission is None:
+        return None
+    if (
+        submission.operation != operation
+        or submission.request_fingerprint != request_fingerprint
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "client_turn_id was already used for a different chat submission."
+            ),
+        )
+    live = state.jobs.get(submission.job.id)
+    if live is not None:
+        return _job_summary_for_request(state, live)
+    persisted = submission.job
+    result: object = persisted.result
+    if persisted.status == "succeeded":
+        result = {
+            "kind": "chat_turn_replay",
+            "save_id": save_id,
+            "player_message_id": submission.player_message_id,
+            "narrator_message_id": submission.narrator_message_id,
+            "requires_full_refresh": True,
+        }
+    return {
+        "id": persisted.id,
+        "type": persisted.type,
+        "save_id": persisted.save_id,
+        "status": persisted.status,
+        "completion_level": (
+            RESPONSE_COMMITTED if submission.narrator_message_id else None
+        ),
+        "result": result,
+        "error": persisted.error,
+        "latest_progress": None,
+    }
+
+
+def _link_chat_turn_submission_messages(
+    state: WebAppState,
+    handle: JobHandle,
+    turn: object,
+) -> None:
+    link_messages = getattr(
+        state.repositories,
+        "link_chat_turn_submission_messages",
+        None,
+    )
+    if callable(link_messages):
+        link_messages(
+            job_id=handle.record.id,
+            player_message_id=getattr(turn, "player_message_id", None),
+            narrator_message_id=getattr(turn, "narrator_message_id", None),
+        )
+
+
+async def _create_idempotent_chat_job_summary(
+    state: WebAppState,
+    worker: JobWorker,
+    *,
+    save_id: str,
+    client_turn_id: str,
+    operation: str,
+    request_fingerprint: str,
+) -> dict[str, Any]:
+    job_id = uuid4().hex
+    creator_user_id = _owner_user_id_for_request(state)
+    exclusive_key = _chat_turn_exclusive_key(save_id)
+
+    def persist(record: JobRecord) -> None:
+        create_submission = getattr(
+            state.repositories,
+            "create_chat_turn_submission_job",
+            None,
+        )
+        if not callable(create_submission):
+            return
+        create_submission(
+            save_id=save_id,
+            client_turn_id=client_turn_id,
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+            creator_user_id=creator_user_id,
+            job_id=record.id,
+            payload={
+                "source": "web",
+                "exclusive_key": exclusive_key or "",
+                "operation": operation,
+            },
+        )
+
+    try:
+        supports_durable_submission = callable(
+            getattr(
+                state.repositories,
+                "create_chat_turn_submission_job",
+                None,
+            )
+        )
+        record = await state.jobs.create(
+            "chat_turn",
+            worker,
+            save_id=save_id,
+            creator_user_id=creator_user_id,
+            exclusive_key=exclusive_key,
+            job_id=job_id,
+            persist_before_start=(persist if supports_durable_submission else None),
+        )
+        return _job_summary_for_request(state, record)
+    except (sqlite3.IntegrityError, JobRegistryExclusiveKeyError) as exc:
+        replay = _chat_turn_submission_replay(
+            state,
+            save_id=save_id,
+            client_turn_id=client_turn_id,
+            operation=operation,
+            request_fingerprint=request_fingerprint,
+        )
+        if replay is not None:
+            return replay
+        if isinstance(exc, JobRegistryExclusiveKeyError):
+            raise HTTPException(
+                status_code=409,
+                detail=_CHAT_TURN_ACTIVE_DETAIL,
+            ) from exc
+        raise
+    except JobRegistryFullError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+
 def _locked_job_worker(state: WebAppState, worker: JobWorker) -> JobWorker:
     async def locked(handle: JobHandle) -> Any:
         async with state.lock.async_access():
@@ -8963,8 +9354,8 @@ def _locked_job_worker(state: WebAppState, worker: JobWorker) -> JobWorker:
     return locked
 
 
-def _post_turn_operation_queue_key(save_id: str) -> str:
-    return f"post_turn:{save_id}"
+def _post_turn_operation_queue_key(save_id: str, narrator_message_id: str) -> str:
+    return f"post_turn:{save_id}:{narrator_message_id}"
 
 
 def _active_background_post_turn_jobs(
@@ -8972,12 +9363,48 @@ def _active_background_post_turn_jobs(
     *,
     save_id: str,
 ) -> list[JobRecord]:
-    queue_key = _post_turn_operation_queue_key(save_id)
     return [
         job
         for job in state.jobs.list_active(save_id=save_id)
-        if job.type == "post_turn_background" and job.operation_queue_key == queue_key
+        if job.type == "post_turn_background"
     ]
+
+
+_POST_TURN_CATCHUP_STATUS_TEXT = {
+    "waiting": "Waiting for prior turn continuity",
+    "succeeded": "Prior turn continuity is ready",
+    "failed": "Prior turn continuity catch-up failed; repair will retry",
+    "retry_pending": (
+        "Prior turn continuity is still catching up; retry pending"
+    ),
+    "cancelled": "Prior turn continuity catch-up cancelled",
+}
+
+
+def _post_turn_catchup_progress(
+    status: str,
+    *,
+    job_ids: list[str],
+) -> dict[str, object]:
+    status_text = _POST_TURN_CATCHUP_STATUS_TEXT.get(status)
+    if status_text is None:
+        raise ValueError(f"Unsupported post-turn catch-up status: {status}")
+    degraded = status in {"failed", "retry_pending"}
+    return {
+        "kind": "post_turn_catchup",
+        "status": status,
+        "status_text": status_text,
+        "continuity_degraded": degraded,
+        "retry_pending": degraded,
+        "job_ids": list(job_ids),
+        "jobs": [
+            {
+                "name": "post_turn_catchup",
+                "status": status,
+                "category": "continuity",
+            }
+        ],
+    }
 
 
 async def _wait_for_background_post_turn_catchup(
@@ -8987,35 +9414,78 @@ async def _wait_for_background_post_turn_catchup(
     save_id: str,
 ) -> None:
     active_jobs = _active_background_post_turn_jobs(state, save_id=save_id)
-    tasks = [job.task for job in active_jobs if job.task is not None]
-    if not tasks:
+    list_outbox_steps = getattr(
+        state.repositories,
+        "list_post_turn_outbox_steps",
+        None,
+    )
+    incomplete_outbox = (
+        list_outbox_steps(
+            save_id=save_id,
+            statuses=("pending", "running", "failed"),
+        )
+        if callable(list_outbox_steps)
+        else ()
+    )
+    if not active_jobs and not incomplete_outbox:
+        return
+    job_ids = [job.id for job in active_jobs]
+    await handle.event(
+        "progress",
+        _post_turn_catchup_progress("waiting", job_ids=job_ids),
+    )
+    try:
+        async with asyncio.timeout(10):
+            for job in active_jobs:
+                try:
+                    await asyncio.shield(
+                        state.jobs.wait_for_completion_level(
+                            job.id,
+                            CONTINUITY_READY,
+                        )
+                    )
+                except Exception:
+                    # A failed prior web job still leaves durable outbox work
+                    # eligible for repair within the same preflight budget.
+                    continue
+            recover = getattr(
+                state.runtime,
+                "run_post_turn_outbox_recovery",
+                None,
+            )
+            result = (
+                await recover(active_save_id=save_id)
+                if callable(recover)
+                else None
+            )
+    except asyncio.CancelledError:
+        await handle.event(
+            "progress",
+            _post_turn_catchup_progress("cancelled", job_ids=job_ids),
+        )
+        raise
+    except Exception as exc:
+        observe(
+            "web.post_turn_catchup_failed",
+            level="error",
+            save_id=save_id,
+            prior_job_ids=job_ids,
+            **error_fields(exc),
+        )
+        await handle.event(
+            "progress",
+            _post_turn_catchup_progress("failed", job_ids=job_ids),
+        )
+        return
+    if result is not None and result.continuity_degraded:
+        await handle.event(
+            "progress",
+            _post_turn_catchup_progress("retry_pending", job_ids=job_ids),
+        )
         return
     await handle.event(
-        "post_turn_catchup",
-        {
-            "status": "waiting",
-            "job_ids": [job.id for job in active_jobs],
-        },
-    )
-    for task in tasks:
-        try:
-            await asyncio.shield(task)
-        except Exception as exc:
-            await handle.event(
-                "post_turn_catchup",
-                {
-                    "status": "failed",
-                    "job_ids": [job.id for job in active_jobs],
-                    "error": str(exc) or exc.__class__.__name__,
-                },
-            )
-            return
-    await handle.event(
-        "post_turn_catchup",
-        {
-            "status": "succeeded",
-            "job_ids": [job.id for job in active_jobs],
-        },
+        "progress",
+        _post_turn_catchup_progress("succeeded", job_ids=job_ids),
     )
 
 
@@ -9032,17 +9502,38 @@ async def _queue_post_turn_jobs_background(
     current_user_id: str | None = None,
 ) -> JobRecord | None:
     async def worker(post_turn_handle: JobHandle) -> Any:
-        return await _run_post_turn_jobs_with_ordered_progress(
+        await post_turn_handle.advance_completion_level(RESPONSE_COMMITTED)
+        optional_jobs: list[JobRecord] = []
+        await _queue_prepared_action_choices_if_available(
+            state,
+            post_turn_handle,
+            save_id=save_id,
+            narrator_message_id=narrator_message_id,
+            prepared_action_choices=prepared_action_choices,
+            current_user_id=current_user_id,
+        )
+        result = await _run_post_turn_jobs_with_ordered_progress(
             state,
             post_turn_handle,
             save_id=save_id,
             player_message_id=player_message_id,
             narrator_message_id=narrator_message_id,
             turn_revision=turn_revision,
-            prepared_action_choices=prepared_action_choices,
             prior_phase_jobs=None,
             current_user_id=current_user_id,
+            optional_jobs=optional_jobs,
         )
+        if bool(getattr(result, "continuity_degraded", False)):
+            await post_turn_handle.event("runtime", to_jsonable(result))
+            raise RuntimeError("Post-turn continuity is degraded; retry pending")
+        await post_turn_handle.advance_completion_level(CONTINUITY_READY)
+        for optional_job in optional_jobs:
+            if optional_job.task is not None:
+                await asyncio.shield(optional_job.task)
+        await post_turn_handle.advance_completion_level(
+            OPTIONAL_ENRICHMENTS_COMPLETE
+        )
+        return result
 
     try:
         record = await state.jobs.create(
@@ -9050,7 +9541,10 @@ async def _queue_post_turn_jobs_background(
             worker,
             save_id=save_id,
             creator_user_id=_owner_user_id_for_request(state),
-            operation_queue_key=_post_turn_operation_queue_key(save_id),
+            operation_queue_key=_post_turn_operation_queue_key(
+                save_id,
+                narrator_message_id,
+            ),
         )
     except (JobRegistryExclusiveKeyError, JobRegistryFullError) as exc:
         await handle.event(
@@ -9081,9 +9575,9 @@ async def _run_post_turn_jobs_with_ordered_progress(
     player_message_id: str,
     narrator_message_id: str,
     turn_revision: object | None = None,
-    prepared_action_choices: object | None = None,
     prior_phase_jobs: list[dict[str, str]] | None = None,
     current_user_id: str | None = None,
+    optional_jobs: list[JobRecord] | None = None,
 ) -> Any:
     done = object()
     progress_queue: asyncio.Queue[object] = asyncio.Queue()
@@ -9116,14 +9610,6 @@ async def _run_post_turn_jobs_with_ordered_progress(
             "turn_revision",
         ):
             kwargs["turn_revision"] = turn_revision
-        if (
-            prepared_action_choices is not None
-            and _call_accepts_keyword(
-                state.runtime.run_post_turn_jobs,
-                "prepared_action_choices",
-            )
-        ):
-            kwargs["prepared_action_choices"] = prepared_action_choices
         if _call_accepts_keyword(
             state.runtime.run_post_turn_jobs,
             "current_user_id",
@@ -9135,16 +9621,127 @@ async def _run_post_turn_jobs_with_ordered_progress(
         ):
             kwargs["defer_image_generation"] = True
         result = await state.runtime.run_post_turn_jobs(**kwargs)
-        await _queue_deferred_automatic_image_if_prepared(
+        image_job = await _queue_deferred_automatic_image_if_prepared(
             state,
             save_id=save_id,
             narrator_message_id=narrator_message_id,
             current_user_id=current_user_id,
         )
+        if image_job is not None and optional_jobs is not None:
+            optional_jobs.append(image_job)
         return result
     finally:
         progress_queue.put_nowait(done)
         await pump_task
+
+
+async def _run_post_turn_jobs_inline_fallback(
+    state: WebAppState,
+    handle: JobHandle,
+    *,
+    save_id: str,
+    player_message_id: str,
+    narrator_message_id: str,
+    turn_revision: object | None = None,
+    prepared_action_choices: object | None = None,
+    prior_phase_jobs: list[dict[str, str]] | None = None,
+    current_user_id: str | None = None,
+) -> Any:
+    optional_jobs: list[JobRecord] = []
+    await _queue_prepared_action_choices_if_available(
+        state,
+        handle,
+        save_id=save_id,
+        narrator_message_id=narrator_message_id,
+        prepared_action_choices=prepared_action_choices,
+        current_user_id=current_user_id,
+    )
+    result = await _run_post_turn_jobs_with_ordered_progress(
+        state,
+        handle,
+        save_id=save_id,
+        player_message_id=player_message_id,
+        narrator_message_id=narrator_message_id,
+        turn_revision=turn_revision,
+        prior_phase_jobs=prior_phase_jobs,
+        current_user_id=current_user_id,
+        optional_jobs=optional_jobs,
+    )
+    if bool(getattr(result, "continuity_degraded", False)):
+        await handle.event("runtime", to_jsonable(result))
+        raise RuntimeError("Post-turn continuity is degraded; retry pending")
+    await handle.advance_completion_level(CONTINUITY_READY)
+
+    async def finish_optional_jobs() -> None:
+        for optional_job in optional_jobs:
+            if optional_job.task is not None:
+                await asyncio.shield(optional_job.task)
+        await handle.advance_completion_level(OPTIONAL_ENRICHMENTS_COMPLETE)
+
+    if optional_jobs:
+        finalizer = asyncio.create_task(finish_optional_jobs())
+        finalizer.add_done_callback(
+            lambda task: None if task.cancelled() else task.exception()
+        )
+    else:
+        await handle.advance_completion_level(OPTIONAL_ENRICHMENTS_COMPLETE)
+    return result
+
+
+async def _queue_prepared_action_choices_if_available(
+    state: WebAppState,
+    handle: JobHandle,
+    *,
+    save_id: str,
+    narrator_message_id: str,
+    prepared_action_choices: object | None,
+    current_user_id: str | None = None,
+) -> JobRecord | None:
+    if prepared_action_choices is None:
+        return None
+    run_prepared = getattr(state.runtime, "run_prepared_action_choices", None)
+    if not callable(run_prepared):
+        return None
+
+    async def worker(action_choice_handle: JobHandle) -> Any:
+        del action_choice_handle
+        kwargs: dict[str, object] = {
+            "prepared_action_choices": prepared_action_choices,
+        }
+        if _call_accepts_keyword(run_prepared, "current_user_id"):
+            kwargs["current_user_id"] = current_user_id
+        return await run_prepared(**kwargs)
+
+    try:
+        record = await state.jobs.create(
+            "action_choice_generate",
+            worker,
+            save_id=save_id,
+            creator_user_id=current_user_id,
+            operation_queue_key=_action_choice_operation_queue_key(
+                save_id,
+                narrator_message_id,
+            ),
+        )
+    except Exception as exc:
+        observe(
+            "web.optional_enrichment_queue_failed",
+            level="error",
+            save_id=save_id,
+            narrator_message_id=narrator_message_id,
+            enrichment="action_choices",
+            **error_fields(exc),
+        )
+        await handle.event(
+            "optional_enrichment",
+            {"name": "action_choices", "status": "queue_failed"},
+        )
+        return None
+    await handle.event(
+        "optional_enrichment",
+        {"name": "action_choices", "status": "queued", "job_id": record.id},
+    )
+    return record
 
 
 async def _queue_deferred_automatic_image_if_prepared(
@@ -9153,27 +9750,27 @@ async def _queue_deferred_automatic_image_if_prepared(
     save_id: str,
     narrator_message_id: str,
     current_user_id: str | None = None,
-) -> None:
+) -> JobRecord | None:
     consume = getattr(
         state.runtime,
         "consume_deferred_automatic_image",
         None,
     )
     if not callable(consume):
-        return
+        return None
     prepared_automatic_image = consume(
         save_id=save_id,
         narrator_message_id=narrator_message_id,
     )
     if prepared_automatic_image is None:
-        return
+        return None
     run_deferred = getattr(
         state.runtime,
         "run_deferred_automatic_image",
         None,
     )
     if not callable(run_deferred):
-        return
+        return None
 
     async def worker(post_turn_handle: JobHandle) -> Any:
         kwargs: dict[str, object] = {
@@ -9185,21 +9782,23 @@ async def _queue_deferred_automatic_image_if_prepared(
         return await run_deferred(**kwargs)
 
     try:
-        await state.jobs.create(
+        return await state.jobs.create(
             "automatic_image_generation",
             worker,
             save_id=save_id,
             creator_user_id=current_user_id,
             operation_queue_key=f"automatic_image:{save_id}",
         )
-    except Exception:
-        kwargs: dict[str, object] = {
-            "save_id": save_id,
-            "prepared_automatic_image": prepared_automatic_image,
-        }
-        if _call_accepts_keyword(run_deferred, "current_user_id"):
-            kwargs["current_user_id"] = current_user_id
-        await run_deferred(**kwargs)
+    except Exception as exc:
+        observe(
+            "web.optional_enrichment_queue_failed",
+            level="error",
+            save_id=save_id,
+            narrator_message_id=narrator_message_id,
+            enrichment="image",
+            **error_fields(exc),
+        )
+        return None
 
 
 def _initial_chat_turn_progress(status_text: str) -> dict[str, object]:
@@ -9265,7 +9864,11 @@ def _progress_jobs(progress: object) -> list[dict[str, str]]:
         name = job.get("name")
         status = job.get("status")
         if isinstance(name, str) and isinstance(status, str):
-            parsed.append({"name": name, "status": status})
+            parsed_job = {"name": name, "status": status}
+            category = job.get("category")
+            if isinstance(category, str):
+                parsed_job["category"] = category
+            parsed.append(parsed_job)
     return parsed
 
 
@@ -9293,7 +9896,11 @@ def _initial_post_turn_progress(
         "status_text": "Updating world state",
         "jobs": (prior_phase_jobs or [])
         + [
-            {"name": name, "status": "pending"}
+            {
+                "name": name,
+                "status": "pending",
+                "category": "optional" if name == "image" else "continuity",
+            }
             for name in _POST_TURN_PROGRESS_JOB_ORDER
         ],
     }
@@ -9336,44 +9943,6 @@ def _retry_progress_callback(
             await asyncio.gather(*tasks)
 
     return callback, flush
-
-
-def _narrator_draft_callback(handle: JobHandle) -> tuple[Any, Any]:
-    loop = asyncio.get_running_loop()
-    tasks: list[asyncio.Task[None]] = []
-    last_body = ""
-
-    def callback(body: str) -> None:
-        nonlocal last_body
-        if body == last_body:
-            return
-        last_body = body
-        payload = {"message": _pending_narrator_message(body)}
-
-        def schedule() -> None:
-            tasks.append(asyncio.create_task(handle.event("narrator_draft", payload)))
-
-        loop.call_soon_threadsafe(schedule)
-
-    async def flush() -> None:
-        await asyncio.sleep(0)
-        if tasks:
-            await asyncio.gather(*tasks)
-
-    return callback, flush
-
-
-def _pending_narrator_message(body: str) -> dict[str, Any]:
-    from bragi.application.chronicle import parse_message_markdown
-
-    return {
-        "message_id": "pending-narrator-message",
-        "role": "narrator",
-        "speaker_name": "Narrator",
-        "body": body,
-        "markdown_blocks": to_jsonable(parse_message_markdown(body)),
-        "actions": [],
-    }
 
 
 def _provider_retry_status_text(progress: object, task_label: str) -> str:
@@ -10260,11 +10829,12 @@ def _origin_port(parsed: SplitResult) -> int:
 async def _event_stream(
     state: WebAppState,
     job_id: str,
+    last_event_id: int = 0,
     *,
     current_user: UserRecord | None | object = _CURRENT_USER_SENTINEL,
     current_user_role: str | None = None,
 ) -> AsyncIterator[str]:
-    index = 0
+    index = last_event_id
     emitted = 0
     while True:
         record = state.jobs.get(job_id)
@@ -10291,7 +10861,11 @@ async def _event_stream(
                     current_user=current_user,
                     current_user_role=current_user_role,
                 )
-            yield f"event: {event['event']}\ndata: {json.dumps(payload)}\n\n"
+            yield (
+                f"id: {index}\n"
+                f"event: {event['event']}\n"
+                f"data: {json.dumps(payload)}\n\n"
+            )
         if record.status in {"succeeded", "failed", "cancelled"}:
             with _repository_scope_for_state(state):
                 summary = _job_summary_for_request(
@@ -10310,7 +10884,21 @@ async def _event_stream(
             )
             break
         try:
-            index = await state.jobs.wait_for_event(job_id, index)
+            index = await asyncio.wait_for(
+                state.jobs.wait_for_event(job_id, index),
+                timeout=_SSE_HEARTBEAT_SECONDS,
+            )
+            current = state.jobs.get(job_id)
+            if current is not None:
+                event_end = current.event_offset + len(current.events)
+                if index >= event_end and current.status not in {
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                }:
+                    yield "event: heartbeat\ndata: {}\n\n"
+        except TimeoutError:
+            yield "event: heartbeat\ndata: {}\n\n"
         except asyncio.CancelledError:
             record = state.jobs.get(job_id)
             observe(
@@ -10389,13 +10977,26 @@ async def _save_event_stream(
                 f"data: {json.dumps(payload)}\n\n"
             )
         try:
-            index = await state.save_events.wait_for_event(
+            index = await asyncio.wait_for(
+                state.save_events.wait_for_event(
+                    save_id,
+                    index,
+                    owner_user_id=owner_user_id,
+                    include_unowned_global=include_unowned_global,
+                    include_all_global=include_all_global,
+                ),
+                timeout=_SSE_HEARTBEAT_SECONDS,
+            )
+            if not state.save_events.events_after(
                 save_id,
                 index,
                 owner_user_id=owner_user_id,
                 include_unowned_global=include_unowned_global,
                 include_all_global=include_all_global,
-            )
+            ):
+                yield "event: heartbeat\ndata: {}\n\n"
+        except TimeoutError:
+            yield "event: heartbeat\ndata: {}\n\n"
         except asyncio.CancelledError:
             observe(
                 "web.save_sse.disconnected",

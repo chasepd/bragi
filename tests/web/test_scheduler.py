@@ -12,6 +12,10 @@ from bragi.persistence.repositories import PersistenceRepositories
 from bragi.services.character_registry_maintenance_service import (
     CHARACTER_MAINTENANCE_TURN_CADENCE,
 )
+from bragi.services.dating_route_profile_service import (
+    DATING_ROUTE_PROFILE_ENRICHMENT_TASK,
+)
+from bragi.services.dating_route_service import DatingRouteService
 from bragi.services.memory_consolidation_service import MEMORY_CONSOLIDATION_THRESHOLD
 from bragi.services.model_preferences import set_save_model_override_preference
 from bragi_web.jobs import JobRegistry
@@ -99,6 +103,62 @@ def test_scheduler_persists_compact_task_result(
         "error": None,
         "status": "reviewed",
     }
+
+
+def test_dating_route_profile_scheduler_does_not_join_foreground_queue(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    scenario = repositories.create_scenario(
+        type="dating_sim",
+        title="Summer Paths",
+        premise="A relationship-focused summer.",
+        player_role="New student",
+        content={"player_character_name": "Ren"},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Summer")
+    player = repositories.add_character(
+        save_id=save.id,
+        name="Ren",
+        is_player_character=True,
+    )
+    repositories.add_character(
+        save_id=save.id,
+        name="Mika",
+        relationships={player.name: "romance option for Ren"},
+        status="available romance option",
+    )
+    assert DatingRouteService(repositories).seed_routes_for_save(save.id) == 1
+    repositories.set_model_preference(
+        task="dating_route_profile",
+        provider="fake",
+        model_id="fake-profile",
+    )
+    other_save_id = _save(repositories, title="Active Elsewhere")
+    runtime = _ReviewRuntime(active_save_id=other_save_id)
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.dating_route_profile_calls == [save.id]
+    task = repositories.get_scheduled_task(
+        task_type=DATING_ROUTE_PROFILE_ENRICHMENT_TASK,
+        save_id=save.id,
+    )
+    assert task is not None
+    assert task.last_job_id is not None
+    job = state.jobs.get(task.last_job_id)
+    assert job is not None
+    assert job.operation_queue_key is None
 
 
 def test_scheduler_marks_web_job_failed_when_runtime_result_has_error(
@@ -1632,6 +1692,7 @@ class _ReviewRuntime:
         self.memory_consolidation_calls: list[str] = []
         self.character_maintenance_calls: list[str] = []
         self.world_context_retention_calls: list[str] = []
+        self.dating_route_profile_calls: list[str] = []
 
     async def run_world_suggestion_review(
         self,
@@ -1645,6 +1706,14 @@ class _ReviewRuntime:
     async def run_state_pruning(self, *, active_save_id: str) -> object:
         self.state_pruning_calls.append(active_save_id)
         return {"active_save_id": active_save_id, "status": "cleaned", "error": None}
+
+    async def run_dating_route_profile_enrichment(
+        self,
+        *,
+        active_save_id: str,
+    ) -> object:
+        self.dating_route_profile_calls.append(active_save_id)
+        return {"status": "succeeded", "updated_count": 1}
 
     async def run_context_update_retries(self, *, active_save_id: str) -> object:
         self.context_retry_calls.append(active_save_id)

@@ -469,6 +469,7 @@ def create_state() -> WebAppState:
         secret_store._use_keyring = False  # noqa: SLF001
     providers = _provider_clients(secret_store, repositories=repositories)
     with repositories.scope():
+        repositories.requeue_running_post_turn_outbox_steps()
         JobLifecycleService(
             repositories=cast(Any, repositories),
         ).recover_stale_jobs(
@@ -486,6 +487,18 @@ def create_state() -> WebAppState:
         if callable(recover_text_deliveries):
             recover_text_deliveries(
                 error="Text delivery was interrupted before completion",
+            )
+        recover_message_narrations = getattr(
+            repositories,
+            "recover_interrupted_message_narrations",
+            None,
+        )
+        if callable(recover_message_narrations):
+            recover_message_narrations(
+                error=(
+                    "This turn was interrupted before a narrator response was "
+                    "saved. Your input was saved."
+                ),
             )
         _seed_fake_models_if_requested(repositories, providers)
     providers = bindings.wrap_provider_clients_for_telemetry(

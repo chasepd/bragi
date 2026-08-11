@@ -217,6 +217,15 @@ class MessageRecord:
 
 
 @dataclass(frozen=True)
+class MessageNarrationStateRecord:
+    message_id: str
+    save_id: str
+    status: str
+    error: str | None
+    source_kind: str
+
+
+@dataclass(frozen=True)
 class MessagePageRecord:
     messages: list[MessageRecord]
     has_more_before: bool = False
@@ -319,6 +328,44 @@ class SceneSnapshotRecord:
     first_seen_message_id: str | None = None
     last_updated_message_id: str | None = None
     scene_generation: int = 1
+
+
+@dataclass(frozen=True)
+class SceneFactProvenanceRecord:
+    id: str
+    save_id: str
+    scene_fact_id: str
+    source_message_id: str
+    evidence_quote: str
+    reason: str
+    confidence: float
+    created_at: str | None = None
+
+
+@dataclass(frozen=True)
+class SceneFactRecord:
+    id: str
+    save_id: str
+    scene_snapshot_id: str
+    scene_generation: int
+    fact_type: str
+    subject_type: str
+    subject_id: str | None
+    subject_label: str
+    target_type: str
+    target_id: str | None
+    target_label: str
+    aspect: str
+    value: str
+    conflict_key: str
+    lifetime: str
+    created_turn_number: int
+    expires_after_turn_number: int | None
+    archived_at: str | None = None
+    archive_reason: str = ""
+    created_at: str | None = None
+    updated_at: str | None = None
+    provenance: tuple[SceneFactProvenanceRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -674,6 +721,15 @@ class StateChangeRecord:
 
 
 @dataclass(frozen=True)
+class TurnOutcomeRecord:
+    id: str
+    save_id: str
+    message_id: str | None
+    payload: dict[str, object]
+    created_at: str | None = None
+
+
+@dataclass(frozen=True)
 class MemoryRecord:
     id: str
     save_id: str
@@ -684,6 +740,9 @@ class MemoryRecord:
     source_message_ids: list[str] = field(default_factory=list)
     claim_fingerprint: str = ""
     source_observation_ids: list[str] = field(default_factory=list)
+    epistemic_status: str = "legacy_unclassified"
+    epistemic_actor_id: str | None = None
+    epistemic_actor_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -702,6 +761,9 @@ class ContextObservationRecord:
     created_at: str | None = None
     updated_at: str | None = None
     archived_at: str | None = None
+    epistemic_status: str = "legacy_unclassified"
+    epistemic_actor_id: str | None = None
+    epistemic_actor_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -743,6 +805,20 @@ class SummaryRecord:
     content_rating: str = "unclassified"
     source_message_ids: tuple[str, ...] = ()
     source_summary_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SummaryPressureStateRecord:
+    save_id: str
+    history_revision: int
+    summarized_through_message_id: str | None
+    unsummarized_message_count: int
+    unsummarized_player_count: int
+    unsummarized_narrator_count: int
+    unsummarized_other_count: int
+    unsummarized_token_estimate: int
+    active_summary_count: int
+    active_summary_token_estimate: int
 
 
 @dataclass(frozen=True)
@@ -809,6 +885,19 @@ class JobRecord:
 
 
 @dataclass(frozen=True)
+class ChatTurnSubmissionRecord:
+    save_id: str
+    client_turn_id: str
+    operation: str
+    request_fingerprint: str
+    job: JobRecord
+    player_message_id: str | None = None
+    narrator_message_id: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(frozen=True)
 class ScheduledTaskRecord:
     id: str
     task_type: str
@@ -842,6 +931,25 @@ class JobStepRecord:
     duration_ms: int | None
     error: str | None
     metadata: dict[str, object]
+
+
+@dataclass(frozen=True)
+class PostTurnOutboxRecord:
+    id: str
+    save_id: str
+    player_message_id: str
+    narrator_message_id: str
+    turn_revision: str
+    step: str
+    status: str
+    attempt_count: int
+    payload: dict[str, object]
+    result: dict[str, object] | None
+    last_error: str | None
+    created_at: str | None = None
+    updated_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
 
 
 @dataclass(frozen=True)

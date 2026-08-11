@@ -12,10 +12,15 @@ from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi_web.jobs import (
+    CONTINUITY_READY,
+    OPTIONAL_ENRICHMENTS_COMPLETE,
+    RESPONSE_COMMITTED,
     JobHandle,
+    JobRecord,
     JobRegistry,
     JobRegistryFullError,
     JobRegistryLimits,
+    job_summary,
 )
 
 
@@ -27,6 +32,67 @@ SAFE_JOB_ERROR = "Background job failed. Check diagnostics for details."
 SAFE_RATE_LIMIT_ERROR = (
     "Provider request failed (rate_limited, 429). Check diagnostics for details."
 )
+
+
+def test_completion_level_wait_releases_before_optional_work_finishes() -> None:
+    async def run_test() -> None:
+        continuity_started = asyncio.Event()
+        release_continuity = asyncio.Event()
+        release_optional = asyncio.Event()
+        registry = JobRegistry()
+
+        async def worker(handle: JobHandle) -> dict[str, bool]:
+            await handle.advance_completion_level(RESPONSE_COMMITTED)
+            continuity_started.set()
+            await release_continuity.wait()
+            await handle.advance_completion_level(CONTINUITY_READY)
+            await release_optional.wait()
+            await handle.advance_completion_level(OPTIONAL_ENRICHMENTS_COMPLETE)
+            return {"complete": True}
+
+        record = await registry.create("post_turn_background", worker)
+        await continuity_started.wait()
+        wait_task = asyncio.create_task(
+            registry.wait_for_completion_level(record.id, CONTINUITY_READY)
+        )
+        await asyncio.sleep(0)
+        assert not wait_task.done()
+
+        release_continuity.set()
+        reached = await asyncio.wait_for(wait_task, timeout=1.0)
+        assert reached is not None
+        assert reached.completion_level == CONTINUITY_READY
+        assert reached.status == "running"
+        assert job_summary(reached)["completion_level"] == CONTINUITY_READY
+
+        release_optional.set()
+        assert record.task is not None
+        await record.task
+        finished = registry.get(record.id)
+        assert finished is not None
+        assert finished.completion_level == OPTIONAL_ENRICHMENTS_COMPLETE
+
+    asyncio.run(run_test())
+
+
+def test_completion_level_wait_releases_when_job_fails_before_barrier() -> None:
+    async def run_test() -> None:
+        registry = JobRegistry()
+
+        async def worker(handle: JobHandle) -> None:
+            await handle.advance_completion_level(RESPONSE_COMMITTED)
+            raise RuntimeError("continuity failed")
+
+        record = await registry.create("post_turn_background", worker)
+        reached = await asyncio.wait_for(
+            registry.wait_for_completion_level(record.id, CONTINUITY_READY),
+            timeout=1.0,
+        )
+        assert reached is not None
+        assert reached.status == "failed"
+        assert reached.completion_level == RESPONSE_COMMITTED
+
+    asyncio.run(run_test())
 
 
 def test_active_job_cap_rejects_new_jobs_until_one_finishes() -> None:
@@ -106,6 +172,57 @@ def test_active_exclusive_job_rejects_same_key_until_terminal() -> None:
         )
         assert retry.task is not None
         await retry.task
+
+    asyncio.run(run_test())
+
+
+def test_pre_persisted_job_is_durable_before_worker_starts() -> None:
+    async def run_test() -> None:
+        registry = JobRegistry()
+        persisted: list[str] = []
+
+        async def worker(handle: JobHandle) -> dict[str, bool]:
+            assert persisted == [handle.record.id]
+            return {"ok": True}
+
+        record = await registry.create(
+            "chat_turn",
+            worker,
+            save_id="save-1",
+            job_id="durable-job",
+            persist_before_start=lambda queued: persisted.append(queued.id),
+        )
+
+        assert record.id == "durable-job"
+        assert record.task is not None
+        await record.task
+
+    asyncio.run(run_test())
+
+
+def test_pre_persisted_job_does_not_start_when_persistence_fails() -> None:
+    async def run_test() -> None:
+        registry = JobRegistry()
+        worker_started = False
+
+        async def worker(_handle: JobHandle) -> None:
+            nonlocal worker_started
+            worker_started = True
+
+        def fail_persistence(_record: JobRecord) -> None:
+            raise sqlite3.IntegrityError("duplicate client turn")
+
+        with pytest.raises(sqlite3.IntegrityError):
+            await registry.create(
+                "chat_turn",
+                worker,
+                save_id="save-1",
+                job_id="durable-job",
+                persist_before_start=fail_persistence,
+            )
+
+        assert registry.get("durable-job") is None
+        assert not worker_started
 
     asyncio.run(run_test())
 

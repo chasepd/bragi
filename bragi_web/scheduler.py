@@ -17,7 +17,9 @@ from bragi_web.observability import error_fields, observe
 from bragi_web.serialization import to_jsonable
 
 WORLD_SUGGESTION_REVIEW_TASK = "world_suggestion_review"
+DATING_ROUTE_PROFILE_ENRICHMENT_TASK = "dating_route_profile_enrichment"
 STATE_PRUNING_TASK = "state_pruning"
+POST_TURN_OUTBOX_RECOVERY_TASK = "post_turn_outbox_recovery"
 STATE_EXTRACTION_RETRY_DRAIN_TASK = "state_extraction_retry_drain"
 CONTEXT_UPDATE_RETRY_DRAIN_TASK = "context_update_retry_drain"
 OBSERVATION_CURATION_DRAIN_TASK = "observation_curation_drain"
@@ -44,7 +46,9 @@ _RETRY_DRAIN_JOB_TYPES = {
 }
 
 WORLD_SUGGESTION_REVIEW_INTERVAL_SECONDS = 60
+DATING_ROUTE_PROFILE_ENRICHMENT_INTERVAL_SECONDS = 60
 STATE_PRUNING_INTERVAL_SECONDS = 60
+POST_TURN_OUTBOX_RECOVERY_INTERVAL_SECONDS = 15
 STATE_EXTRACTION_RETRY_DRAIN_INTERVAL_SECONDS = 60
 CONTEXT_UPDATE_RETRY_DRAIN_INTERVAL_SECONDS = 60
 OBSERVATION_CURATION_DRAIN_INTERVAL_SECONDS = 60
@@ -71,6 +75,7 @@ class _MaintenanceTaskDefinition:
     lease_seconds: int = _SCHEDULER_DEFAULT_LEASE_SECONDS
     publish_save_event: bool = True
     cache_policy_checks: bool = False
+    serialize_with_save_operations: bool = True
 
 
 class ScheduledMaintenanceTaskError(RuntimeError):
@@ -377,7 +382,9 @@ class WebMaintenanceScheduler:
                 worker,
                 save_id=save_id,
                 exclusive_key=_task_exclusive_key(definition.task_type, save_id),
-                operation_queue_key=save_id,
+                operation_queue_key=(
+                    save_id if definition.serialize_with_save_operations else None
+                ),
             )
         except JobRegistryExclusiveKeyError as exc:
             self._state.repositories.complete_scheduled_task(
@@ -731,6 +738,21 @@ def _world_suggestion_review_due(repositories: Any, save_id: str) -> bool:
     )
 
 
+def _dating_route_profile_enrichment_due(
+    repositories: Any,
+    save_id: str,
+) -> bool:
+    from bragi.services.dating_route_profile_service import (
+        dating_route_profile_model_configured,
+        dating_route_profiles_pending,
+    )
+
+    return dating_route_profiles_pending(
+        repositories,
+        save_id,
+    ) and dating_route_profile_model_configured(repositories, save_id)
+
+
 def _state_pruning_due(repositories: Any, save_id: str) -> bool:
     from bragi.services.state_pruning_policy import state_pruning_schedule_decision
 
@@ -753,6 +775,15 @@ def _context_update_retry_drain_due(repositories: Any, save_id: str) -> bool:
     return any(
         job.type == "context_update_retry" and job.save_id == save_id
         for job in repositories.list_jobs_by_status(("queued",))
+    )
+
+
+def _post_turn_outbox_recovery_due(repositories: Any, save_id: str) -> bool:
+    return bool(
+        repositories.list_post_turn_outbox_steps(
+            save_id=save_id,
+            statuses=("pending", "failed"),
+        )
     )
 
 
@@ -1025,6 +1056,16 @@ def _scheduled_task_error(
 
 _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
     _MaintenanceTaskDefinition(
+        task_type=DATING_ROUTE_PROFILE_ENRICHMENT_TASK,
+        interval_seconds=DATING_ROUTE_PROFILE_ENRICHMENT_INTERVAL_SECONDS,
+        progress_label="Profiling dating-route pacing",
+        runtime_method="run_dating_route_profile_enrichment",
+        event_reason="dating_route_profile_enrichment",
+        should_schedule=_dating_route_profile_enrichment_due,
+        cache_policy_checks=True,
+        serialize_with_save_operations=False,
+    ),
+    _MaintenanceTaskDefinition(
         task_type=WORLD_SUGGESTION_REVIEW_TASK,
         interval_seconds=WORLD_SUGGESTION_REVIEW_INTERVAL_SECONDS,
         progress_label="Reviewing world suggestions",
@@ -1041,6 +1082,14 @@ _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
         should_schedule=_state_pruning_due,
         job_type=WEB_MAINTENANCE_STATE_PRUNING_JOB,
         cache_policy_checks=True,
+    ),
+    _MaintenanceTaskDefinition(
+        task_type=POST_TURN_OUTBOX_RECOVERY_TASK,
+        interval_seconds=POST_TURN_OUTBOX_RECOVERY_INTERVAL_SECONDS,
+        progress_label="Repairing turn continuity",
+        runtime_method="run_post_turn_outbox_recovery",
+        event_reason="post_turn_outbox_recovery",
+        should_schedule=_post_turn_outbox_recovery_due,
     ),
     _MaintenanceTaskDefinition(
         task_type=STATE_EXTRACTION_RETRY_DRAIN_TASK,

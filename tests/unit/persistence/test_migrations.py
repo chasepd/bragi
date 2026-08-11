@@ -31,6 +31,7 @@ EXPECTED_TABLES = {
     "character_text_proactive_triggers",
     "character_text_provenance",
     "character_text_threads",
+    "chat_turn_submissions",
     "characters",
     "context_observations",
     "context_observation_curation_state",
@@ -42,6 +43,7 @@ EXPECTED_TABLES = {
     "entity_links",
     "job_steps",
     "jobs",
+    "post_turn_outbox",
     "locations",
     "media_assets",
     "memories",
@@ -181,6 +183,30 @@ EXPECTED_COLUMNS = {
         "task",
         "metadata_json",
     },
+    "post_turn_outbox": {
+        "id",
+        "save_id",
+        "player_message_id",
+        "narrator_message_id",
+        "turn_revision",
+        "step",
+        "status",
+        "attempt_count",
+        "payload_json",
+        "result_json",
+        "last_error",
+    },
+    "chat_turn_submissions": {
+        "save_id",
+        "client_turn_id",
+        "operation",
+        "request_fingerprint",
+        "job_id",
+        "player_message_id",
+        "narrator_message_id",
+        "created_at",
+        "updated_at",
+    },
     "users": {
         "id",
         "username",
@@ -279,12 +305,14 @@ EXPECTED_INDEXES = {
     "idx_characters_save_active_name_created",
     "idx_characters_save_protected_active",
     "idx_characters_single_active_player_character",
+    "idx_chat_turn_submissions_job_id",
     "idx_context_observations_save_active_created",
     "idx_context_sources_save_active_type_title_created",
     "idx_dating_route_states_save_active",
     "idx_jobs_save_status_completed",
     "idx_jobs_status_type_save_completed",
     "idx_job_steps_provider_model_task_status_completed",
+    "idx_post_turn_outbox_save_status_updated",
     "idx_locations_save_active_name_created",
     "idx_media_assets_save_active_created",
     "idx_media_assets_save_source_type_active",
@@ -978,6 +1006,94 @@ def test_migration_73_to_74_adds_roleplay_interaction_mode_defaults(
         assert connection.execute(
             "SELECT interaction_mode FROM saves WHERE id = 'legacy-save'"
         ).fetchone() == ("roleplay",)
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_74_to_75_adds_scene_fact_tables(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE scene_fact_sources")
+        connection.execute("DROP TABLE scene_facts")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 75")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {"scene_facts", "scene_fact_sources"} <= tables
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_75_to_76_marks_existing_knowledge_legacy_unclassified(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        repositories = PersistenceRepositories(connection)
+        scenario = repositories.create_scenario(
+            type="full_roleplay",
+            title="Legacy",
+            premise="",
+            player_role="Warden",
+            content={},
+        )
+        save = repositories.create_save(scenario_id=scenario.id, title="Legacy")
+        repositories.add_memory(save_id=save.id, body="An old fact.", tags=[])
+        repositories.add_context_observation(
+            save_id=save.id,
+            observation_type="world_fact",
+            claim="An old observation.",
+        )
+        for table_name in ("memories", "context_observations"):
+            connection.execute(
+                f"ALTER TABLE {table_name} DROP COLUMN epistemic_actor_name"
+            )
+            connection.execute(
+                f"ALTER TABLE {table_name} DROP COLUMN epistemic_actor_id"
+            )
+            connection.execute(
+                f"ALTER TABLE {table_name} DROP COLUMN epistemic_status"
+            )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 76")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT epistemic_status FROM memories"
+        ).fetchone() == ("legacy_unclassified",)
+        assert connection.execute(
+            "SELECT epistemic_status FROM context_observations"
+        ).fetchone() == ("legacy_unclassified",)
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_current_schema_repairs_missing_epistemic_columns(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "ALTER TABLE context_observations DROP COLUMN epistemic_actor_name"
+        )
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(context_observations)")
+        }
+        assert "epistemic_actor_name" in columns
         assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
 
 
@@ -1986,3 +2102,271 @@ def _save_context_revision(connection: sqlite3.Connection) -> int:
             ("save-1",),
         ).fetchone()[0]
     )
+
+
+def test_migration_76_to_77_adds_turn_outcomes_schema(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE turn_outcomes")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 77")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = _column_names(connection, "turn_outcomes")
+        assert {"id", "save_id", "message_id", "payload_json", "created_at"} <= columns
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_78_to_79_adds_action_choice_generation_claims(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE message_action_choice_generation_claims")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 79")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = _column_names(
+            connection,
+            "message_action_choice_generation_claims",
+        )
+        assert {
+            "message_id",
+            "save_id",
+            "narrator_updated_at",
+            "generation_token",
+            "created_at",
+            "updated_at",
+        } <= columns
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_79_to_80_adds_post_turn_outbox(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DROP TABLE post_turn_outbox")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 80")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = _column_names(connection, "post_turn_outbox")
+        assert {
+            "id",
+            "save_id",
+            "player_message_id",
+            "narrator_message_id",
+            "turn_revision",
+            "step",
+            "status",
+        } <= columns
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_82_to_83_adds_message_narration_state(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("ALTER TABLE messages DROP COLUMN narration_error")
+        connection.execute("ALTER TABLE messages DROP COLUMN narration_status")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 83")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        columns = _column_names(connection, "messages")
+        assert {"narration_status", "narration_error"} <= columns
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_77_keeps_existing_turn_outcome_rows(tmp_path: Path) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO scenarios(id, type, title, content_json)
+            VALUES ('s', 'full_roleplay', 'Legacy', '{}')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO saves(id, scenario_id, title)
+            VALUES ('save-1', 's', 'Keep')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO messages(save_id, role, speaker_name, body)
+            VALUES ('save-1', 'narrator', 'Narrator', 'body')
+            """
+        )
+        message_id = connection.execute(
+            "SELECT id FROM messages WHERE save_id = 'save-1'"
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO turn_outcomes(id, save_id, message_id, payload_json)
+            VALUES ('o-1', 'save-1', ?, '{"save_id": "save-1", "message_id": "m"}')
+            """,
+            (message_id,),
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 77")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            "SELECT id, payload_json FROM turn_outcomes WHERE id = 'o-1'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "o-1"
+
+
+def test_migration_77_to_78_backfills_summary_pressure_state(tmp_path: Path) -> None:
+    database_path = tmp_path / "summary-pressure.db"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version = 78")
+        connection.execute("DROP TRIGGER init_summary_pressure_state_after_save_insert")
+        connection.execute("DROP TABLE summary_pressure_state")
+        connection.execute(
+            "INSERT INTO scenarios(id, type, title, content_json) VALUES (?, ?, ?, ?)",
+            ("scenario-1", "full_roleplay", "Bridge", "{}"),
+        )
+        connection.execute(
+            "INSERT INTO saves(id, scenario_id, title) VALUES (?, ?, ?)",
+            ("save-1", "scenario-1", "Crossing"),
+        )
+        connection.executemany(
+            """
+            INSERT INTO messages(
+                id, save_id, role, body, token_estimate, deleted_at
+            ) VALUES (?, 'save-1', ?, ?, ?, NULL)
+            """,
+            (
+                ("player-1", "player", "Old player input", 10),
+                ("narrator-1", "narrator", "Old narration", 20),
+                ("player-2", "player", "Fresh player input", None),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO summaries(
+                id, save_id, covers_message_start_id, covers_message_end_id,
+                body, provider, model
+            ) VALUES (?, 'save-1', ?, ?, ?, ?, ?)
+            """,
+            (
+                "summary-1",
+                "player-1",
+                "narrator-1",
+                "The bridge was crossed.",
+                "fake",
+                "fake-summary",
+            ),
+        )
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM summary_pressure_state WHERE save_id = 'save-1'"
+        ).fetchone()
+        assert row is not None
+        assert row["summarized_through_message_id"] == "narrator-1"
+        assert row["unsummarized_message_count"] == 1
+        assert row["unsummarized_player_count"] == 1
+        assert row["unsummarized_narrator_count"] == 0
+        assert row["unsummarized_other_count"] == 0
+        assert row["unsummarized_token_estimate"] == 5
+        assert row["active_summary_count"] == 1
+        assert row["active_summary_token_estimate"] == 6
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_81_to_82_backfills_incremental_snapshot_tracking(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "incremental-snapshots.db"
+    migrate_database(database_path)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO scenarios(id, type, title, content_json) VALUES (?, ?, ?, ?)",
+            ("scenario-1", "full_roleplay", "Bridge", "{}"),
+        )
+        connection.execute(
+            "INSERT INTO saves(id, scenario_id, title) VALUES (?, ?, ?)",
+            ("save-1", "scenario-1", "Crossing"),
+        )
+        trigger_names = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'trigger' AND name LIKE 'dirty_snapshot_%'
+            """
+        ).fetchall()
+        for (trigger_name,) in trigger_names:
+            connection.execute(f'DROP TRIGGER "{trigger_name}"')
+        for table_name in (
+            "save_snapshot_activity_state",
+            "save_snapshot_included_activity_events",
+            "save_snapshot_row_references",
+            "save_snapshot_row_state",
+            "save_snapshot_dirty_rows",
+            "save_snapshot_table_state",
+            "save_snapshot_state",
+        ):
+            connection.execute(f"DROP TABLE {table_name}")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 82")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        tables = _object_names(connection, "table")
+        assert {
+            "save_snapshot_state",
+            "save_snapshot_table_state",
+            "save_snapshot_dirty_rows",
+            "save_snapshot_row_state",
+            "save_snapshot_row_references",
+            "save_snapshot_activity_state",
+            "save_snapshot_included_activity_events",
+        } <= tables
+        indexes = _object_names(connection, "index")
+        assert {
+            "idx_snapshot_row_recheck_due",
+            "idx_snapshot_reference_target",
+        } <= indexes
+        trigger_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'trigger' AND name LIKE 'dirty_snapshot_%'
+            """
+        ).fetchone()[0]
+        assert trigger_count > 0
+        state = connection.execute(
+            """
+            SELECT COUNT(*), MIN(needs_rebuild)
+            FROM save_snapshot_table_state
+            WHERE save_id = ?
+            """,
+            ("save-1",),
+        ).fetchone()
+        assert state is not None
+        assert state[0] > 0
+        assert state[1] == 1
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
