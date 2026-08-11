@@ -527,6 +527,7 @@ class TurnSnapshotService:
             self._rows_from_manifest(manifest)
         )
         rows_by_table = _normalize_legacy_snapshot_memories(rows_by_table)
+        rows_by_table = _normalize_legacy_snapshot_scene_facts(rows_by_table)
         raw_active_message_ids = manifest.get("active_message_ids", [])
         if not isinstance(raw_active_message_ids, list):
             raw_active_message_ids = []
@@ -602,6 +603,7 @@ class TurnSnapshotService:
             self._rows_from_manifest(manifest)
         )
         rows_by_table = _normalize_legacy_snapshot_memories(rows_by_table)
+        rows_by_table = _normalize_legacy_snapshot_scene_facts(rows_by_table)
         trailing = tuple(trailing_messages)
         source_snapshot_message_ids = frozenset(
             _snapshot_message_ids_from_rows(rows_by_table)
@@ -6539,6 +6541,73 @@ def _normalize_legacy_snapshot_memories(
         table_name: tuple(table_rows)
         for table_name, table_rows in rows.items()
     }
+
+
+def _normalize_legacy_snapshot_scene_facts(
+    rows_by_table: Mapping[str, Iterable[Mapping[str, object]]],
+) -> dict[str, tuple[dict[str, object], ...]]:
+    rows = {
+        table_name: [dict(row) for row in table_rows]
+        for table_name, table_rows in rows_by_table.items()
+    }
+    facts = rows.get("scene_facts", [])
+    active_keys: set[tuple[object, ...]] = set()
+    duplicate_ids: set[str] = set()
+    normalized_reversed: list[dict[str, object]] = []
+    for row in reversed(facts):
+        canonical_key = scene_fact_conflict_key(
+            fact_type=str(row.get("fact_type", "")),
+            subject_type=str(row.get("subject_type", "")),
+            subject_id=_optional_snapshot_string(row.get("subject_id")),
+            subject_label=str(row.get("subject_label", "")),
+            target_type=str(row.get("target_type", "")),
+            target_id=_optional_snapshot_string(row.get("target_id")),
+            target_label=str(row.get("target_label", "")),
+            aspect=str(row.get("aspect", "")),
+        )
+        row["conflict_key"] = canonical_key
+        if row.get("archived_at") is not None:
+            normalized_reversed.append(row)
+            continue
+        fact_unique_key = (
+            row.get("save_id"),
+            row.get("scene_snapshot_id"),
+            row.get("scene_generation"),
+            canonical_key,
+        )
+        if fact_unique_key not in active_keys:
+            active_keys.add(fact_unique_key)
+            normalized_reversed.append(row)
+            continue
+        duplicate_id = row.get("id")
+        if isinstance(duplicate_id, str):
+            duplicate_ids.add(duplicate_id)
+    rows["scene_facts"] = list(reversed(normalized_reversed))
+
+    seen_sources: set[tuple[object, ...]] = set()
+    normalized_sources: list[dict[str, object]] = []
+    for row in rows.get("scene_fact_sources", []):
+        fact_id = row.get("scene_fact_id")
+        if isinstance(fact_id, str) and fact_id in duplicate_ids:
+            continue
+        source_unique_key = (
+            row.get("scene_fact_id"),
+            row.get("source_message_id"),
+            row.get("evidence_quote"),
+        )
+        if source_unique_key in seen_sources:
+            continue
+        seen_sources.add(source_unique_key)
+        normalized_sources.append(row)
+    rows["scene_fact_sources"] = normalized_sources
+    return {
+        table_name: tuple(table_rows)
+        for table_name, table_rows in rows.items()
+    }
+
+
+def _optional_snapshot_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def _remap_snapshot_memory_reference(
