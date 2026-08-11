@@ -3443,16 +3443,7 @@ class _SnapshotRemapper:
                     value,
                 )
             elif table_name == "scene_facts" and column == "conflict_key":
-                remapped[column] = scene_fact_conflict_key(
-                    fact_type=str(remapped.get("fact_type", "")),
-                    subject_type=str(remapped.get("subject_type", "")),
-                    subject_id=cast(str | None, remapped.get("subject_id")),
-                    subject_label=str(remapped.get("subject_label", "")),
-                    target_type=str(remapped.get("target_type", "")),
-                    target_id=cast(str | None, remapped.get("target_id")),
-                    target_label=str(remapped.get("target_label", "")),
-                    aspect=str(remapped.get("aspect", "")),
-                )
+                continue
             elif table_name == "context_sources" and column == "source_id":
                 remapped[column] = self._mapped_context_source_id(
                     cast(str | None, row.get("source_type")),
@@ -3506,6 +3497,17 @@ class _SnapshotRemapper:
                 )
             else:
                 remapped[column] = value
+        if table_name == "scene_facts":
+            remapped["conflict_key"] = scene_fact_conflict_key(
+                fact_type=str(remapped.get("fact_type", "")),
+                subject_type=str(remapped.get("subject_type", "")),
+                subject_id=cast(str | None, remapped.get("subject_id")),
+                subject_label=str(remapped.get("subject_label", "")),
+                target_type=str(remapped.get("target_type", "")),
+                target_id=cast(str | None, remapped.get("target_id")),
+                target_label=str(remapped.get("target_label", "")),
+                aspect=str(remapped.get("aspect", "")),
+            )
         if table_name == "memories" and "epistemic_status" in remapped:
             actor_id = remapped.get("epistemic_actor_id")
             remapped["claim_fingerprint"] = _epistemic_claim_fingerprint(
