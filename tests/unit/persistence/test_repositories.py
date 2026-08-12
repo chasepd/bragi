@@ -3071,6 +3071,12 @@ def test_repositories_copy_save_scoped_settings_between_saves(
         key="image_style_preset",
         value="watercolor",
     )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=source_save.id,
+        key="director_pressure_guidance",
+        value="Advance the eclipse clock.",
+    )
 
     repositories.copy_save_scoped_settings(
         source_save_id=source_save.id,
@@ -3085,6 +3091,7 @@ def test_repositories_copy_save_scoped_settings_between_saves(
         )
     }
     assert copied == {
+        "director_pressure_guidance": "Advance the eclipse clock.",
         "image_generation_frequency": 3,
         "image_style_preset": "watercolor",
     }

@@ -19091,6 +19091,7 @@ describe("frontend helpers", () => {
       agentic_context_pipeline: { setting_key: "agentic_context_pipeline_enabled", enabled: false },
       plan_first_narrator: { setting_key: "plan_first_narrator_enabled", enabled: true },
       director_pressure: { setting_key: "director_pressure_enabled", enabled: true },
+      director_pressure_guidance: { setting_key: "director_pressure_guidance", value: "Advance the rival clock." },
       character_action_planning: { setting_key: "character_action_planning_enabled", enabled: true },
       character_action_planning_max_concurrency: { setting_key: "character_action_planning_max_concurrency", value: 20, minimum: 1, maximum: 20, step: 1 },
       npc_knowledge_audit_mode: { setting_key: "npc_knowledge_audit_mode", selected: "soft_fail", options: ["soft_fail", "hard_fail"] },
@@ -19148,6 +19149,7 @@ describe("frontend helpers", () => {
     expect(screen.getByTitle("Store this provider key locally for future requests.")).toBeInTheDocument();
     expect(screen.getByTitle("Fetch the current model list for fake.")).toBeInTheDocument();
     await userEvent.click(await screen.findByRole("tab", { name: "Save" }));
+    expect(screen.getByRole("textbox", { name: "Director Pressure Guidance" })).toHaveValue("Advance the rival clock.");
     expect(screen.getByRole("tab", { name: "Save" })).toHaveAttribute("aria-selected", "true");
 
     expect(screen.getByText("Summarization")).toBeInTheDocument();

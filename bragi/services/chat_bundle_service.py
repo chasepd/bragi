@@ -46,7 +46,11 @@ from bragi.services.chat_history_settings import (
     RECENT_PLAYER_MESSAGE_WINDOW_SETTING,
     sanitize_recent_message_window,
 )
-from bragi.services.director_pressure_service import DIRECTOR_PRESSURE_STATE_KEY
+from bragi.services.director_pressure_service import (
+    DIRECTOR_PRESSURE_GUIDANCE_SETTING,
+    DIRECTOR_PRESSURE_STATE_KEY,
+    sanitize_director_pressure_guidance,
+)
 from bragi.services.generation_settings import (
     MODEL_THINKING_PREFERENCES_SETTING,
     sanitize_model_thinking_preferences,
@@ -3754,6 +3758,8 @@ def _apply_save_app_settings(
             value = sanitize_model_thinking_preferences(value)
         if key == POST_TURN_INFERENCE_MODE_SETTING and scope == "save":
             value = sanitize_post_turn_inference_mode(value)
+        if key == DIRECTOR_PRESSURE_GUIDANCE_SETTING and scope == "save":
+            value = sanitize_director_pressure_guidance(value)
         if scope == "save" and key in {
             RECENT_PLAYER_MESSAGE_WINDOW_SETTING,
             NARRATOR_PLANNER_RECENT_PLAYER_MESSAGE_WINDOW_SETTING,

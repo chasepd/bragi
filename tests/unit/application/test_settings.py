@@ -40,7 +40,10 @@ from bragi.services.chat_history_settings import (
     RECENT_NARRATOR_MESSAGE_WINDOW_SETTING,
     RECENT_PLAYER_MESSAGE_WINDOW_SETTING,
 )
-from bragi.services.director_pressure_service import DIRECTOR_PRESSURE_ENABLED_SETTING
+from bragi.services.director_pressure_service import (
+    DIRECTOR_PRESSURE_ENABLED_SETTING,
+    DIRECTOR_PRESSURE_GUIDANCE_SETTING,
+)
 from bragi.services.generation_settings import MODEL_THINKING_PREFERENCES_SETTING
 from bragi.services.image_style_settings import save_image_style_preset_setting_key
 from bragi.services.model_preferences import (
@@ -2402,6 +2405,12 @@ def test_settings_model_exposes_summarization_and_image_controls(
         DIRECTOR_PRESSURE_ENABLED_SETTING
     )
     assert _value(director_pressure, "enabled", "value") is True
+
+    director_pressure_guidance = _value(model, "director_pressure_guidance")
+    assert _value(director_pressure_guidance, "setting_key") == (
+        DIRECTOR_PRESSURE_GUIDANCE_SETTING
+    )
+    assert _value(director_pressure_guidance, "value") == ""
 
     character_action_planning = _value(model, "character_action_planning")
     assert _value(character_action_planning, "setting_key") == (

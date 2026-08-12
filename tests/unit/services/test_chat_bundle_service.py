@@ -693,7 +693,6 @@ def test_export_import_preserves_incomplete_post_turn_outbox(
     bundle_path = tmp_path / "exports" / "pending-continuity.bragi-chat"
     service = _chat_bundle_service(repositories, media_dir)
     service.export_save(save.id, bundle_path)
-
     imported = service.import_save(bundle_path)
     imported_rows = repositories.list_post_turn_outbox_steps(
         save_id=_imported_save_id(imported)
@@ -819,7 +818,6 @@ def test_import_preserves_exported_legacy_normalized_budget_allowance(
     bundle_path = tmp_path / "exports" / "legacy-budget.bragi-chat"
     service = _chat_bundle_service(repositories, media_dir)
     service.export_save(save.id, bundle_path)
-
     imported = service.import_save(bundle_path)
 
     imported_save_id = _imported_save_id(imported)
@@ -1387,6 +1385,40 @@ def test_export_and_import_save_remaps_director_pressure_state(
     )
     assert director_thread.source_message_id == message_id_map[NARRATOR_MESSAGE_ID]
     assert director_thread.related_entities == ["director_pressure"]
+
+
+def test_import_save_sanitizes_director_pressure_guidance(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key="director_pressure_guidance",
+        value="  Advance the eclipse clock.  ",
+    )
+    bundle_path = tmp_path / "director-guidance.zip"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(save.id, bundle_path)
+    _rewrite_bundle_data(
+        bundle_path,
+        lambda data: _replace_save_app_setting_value(
+            data,
+            scope="save",
+            key="director_pressure_guidance",
+            value={"instruction": "untrusted object"},
+        ),
+    )
+
+    imported = service.import_save(bundle_path)
+
+    assert repositories.get_scoped_setting(
+        scope="save",
+        scope_id=_imported_save_id(imported),
+        key="director_pressure_guidance",
+    ) == ""
 
 
 def test_export_import_preserves_political_intrigue_world_state(

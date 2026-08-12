@@ -2443,6 +2443,9 @@ function SaveSettingsControls({
           {settings.director_pressure ? (
             <ToggleSetting control={settings.director_pressure} disabled={saveDisabled} updateLocal={updateLocal} />
           ) : null}
+          {settings.director_pressure_guidance ? (
+            <TextSetting control={settings.director_pressure_guidance} disabled={saveDisabled} updateLocal={updateLocal} />
+          ) : null}
           {settings.character_action_planning ? (
             <ToggleSetting control={settings.character_action_planning} disabled={saveDisabled} updateLocal={updateLocal} />
           ) : null}

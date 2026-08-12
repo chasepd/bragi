@@ -85,6 +85,8 @@ from bragi.services.context_assembly import (
 from bragi.services.director_pressure_service import (
     DIRECTOR_PRESSURE_ENABLED_DEFAULT,
     DIRECTOR_PRESSURE_ENABLED_SETTING,
+    DIRECTOR_PRESSURE_GUIDANCE_SETTING,
+    sanitize_director_pressure_guidance,
 )
 from bragi.services.generation_settings import (
     CHAT_MAX_OUTPUT_TOKENS_SETTING,
@@ -744,6 +746,8 @@ class SettingsService:
             SAVE_GENERATED_PHRASE_DENYLIST_SETTING,
         }:
             value = sanitize_generated_phrase_denylist(value)
+        elif key == DIRECTOR_PRESSURE_GUIDANCE_SETTING:
+            value = sanitize_director_pressure_guidance(value)
         if policy.scope == "save" and save_id is not None:
             if self.repositories.get_save(save_id) is None:
                 raise ValueError(f"{key} requires a save")
@@ -1164,6 +1168,7 @@ def _default_local_setting(key: str) -> object | None:
         ),
         PLAN_FIRST_NARRATOR_SETTING: PLAN_FIRST_NARRATOR_DEFAULT,
         DIRECTOR_PRESSURE_ENABLED_SETTING: DIRECTOR_PRESSURE_ENABLED_DEFAULT,
+        DIRECTOR_PRESSURE_GUIDANCE_SETTING: "",
         CHARACTER_ACTION_PLANNING_ENABLED_SETTING: (
             CHARACTER_ACTION_PLANNING_ENABLED_DEFAULT
         ),
