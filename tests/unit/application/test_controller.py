@@ -10214,6 +10214,7 @@ def test_submit_player_message_exhausted_retry_error_mentions_attempts(
     error_text = _error_text(model)
     assert "after 3 attempts" in error_text
     assert "sk-live-secret" not in error_text
+    assert len(provider.chat_requests) == 2
 
 
 def test_initial_render_provider_failure_returns_committed_player_message(

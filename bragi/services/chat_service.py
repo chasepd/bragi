@@ -52,6 +52,7 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.http_client import SAFE_PROVIDER_RESPONSE_HEADERS
+from bragi.providers.retry import is_transient_provider_error
 from bragi.redaction import redact_text
 from bragi.retry_policy import (
     configured_max_attempts,
@@ -293,6 +294,9 @@ from bragi.world_time_model import (
     canonical_world_time_from_values,
     legacy_world_time_fields,
 )
+
+AUTOMATIC_TURN_RETRY_DELAY_SECONDS = 1.0
+AUTOMATIC_RATE_LIMIT_RETRY_DELAY_SECONDS = 5.0
 
 CURRENT_SCENE_RECAP_MESSAGE_WINDOW = 20
 CURRENT_SCENE_RECAP_MESSAGE_MAX_CHARS = 320
@@ -644,6 +648,68 @@ class _TurnProgressPublisher:
                 progress_status=status,
                 **exception_log_fields(exc),
             )
+
+    def reset_for_automatic_retry(self, status_text: str) -> None:
+        completed_input_stages = {
+            name: self.statuses[name]
+            for name in ("submission", "classification", "input")
+            if self.statuses[name] == "succeeded"
+        }
+        self.statuses = {
+            name: completed_input_stages.get(name, "pending")
+            for name in CHAT_TURN_PROGRESS_JOB_ORDER
+        }
+        self.publish("submission", "succeeded", status_text)
+
+
+def _automatic_turn_retry_delay(exc: ProviderError) -> float:
+    if exc.category is ProviderErrorCategory.RATE_LIMITED:
+        return AUTOMATIC_RATE_LIMIT_RETRY_DELAY_SECONDS
+    return AUTOMATIC_TURN_RETRY_DELAY_SECONDS
+
+
+def _narration_is_safe_to_replay(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    player_message_id: str,
+) -> bool:
+    state = repositories.get_message_narration_state(
+        save_id=save_id,
+        message_id=player_message_id,
+    )
+    return state is not None and state.status in {"pending", "retrying"}
+
+
+def _automatic_turn_retry_status(exc: ProviderError, delay: float) -> str:
+    normalized_delay = float(delay)
+    reason = (
+        "Provider rate-limited"
+        if exc.category is ProviderErrorCategory.RATE_LIMITED
+        else "Provider temporarily unavailable"
+    )
+    seconds = int(normalized_delay) if normalized_delay.is_integer() else delay
+    unit = "second" if normalized_delay == 1 else "seconds"
+    return f"{reason}; retrying turn automatically in {seconds} {unit}"
+
+
+async def _wait_for_automatic_turn_retry(
+    *,
+    delay: float,
+    cancellation_token: CancellationToken,
+    cancellation_requested: Callable[[], bool] | None,
+) -> None:
+    remaining = max(0.0, delay)
+    while remaining > 0:
+        cancellation_token.throw_if_cancelled()
+        if cancellation_requested is not None and cancellation_requested():
+            raise ChatTurnCancelled(CHAT_TURN_CANCELLED_ERROR)
+        interval = min(0.1, remaining)
+        await asyncio.sleep(interval)
+        remaining -= interval
+    cancellation_token.throw_if_cancelled()
+    if cancellation_requested is not None and cancellation_requested():
+        raise ChatTurnCancelled(CHAT_TURN_CANCELLED_ERROR)
 
 
 @dataclass(frozen=True)
@@ -1486,6 +1552,181 @@ class ChatService:
         turn_progress_callback: TurnProgressCallback | None = None,
         _turn_progress: _TurnProgressPublisher | None = None,
     ) -> SubmittedTurn:
+        started_at = turn_started or perf_counter()
+        token = cancellation_token or CancellationToken()
+        turn_progress = _turn_progress or _TurnProgressPublisher(
+            save_id=save_id,
+            callback=turn_progress_callback,
+        )
+        if _turn_progress is None:
+            turn_progress.publish("submission", "succeeded", "Turn input ready")
+            turn_progress.publish("input", "succeeded", "Turn input ready")
+
+        automatic_retry_category: str | None = None
+        automatic_retry_delay_ms: int | None = None
+        for attempt in (1, 2):
+            try:
+                result = await asyncio.create_task(
+                    self._submit_existing_player_turn_once(
+                        save_id=save_id,
+                        player_message_id=player_message_id,
+                        source_message_role=source_message_role,
+                        run_post_turn_jobs=run_post_turn_jobs,
+                        await_post_turn_jobs=await_post_turn_jobs,
+                        defer_action_choices=defer_action_choices,
+                        turn_started=started_at,
+                        log_turn_started=log_turn_started and attempt == 1,
+                        summarize_before_context=summarize_before_context,
+                        regeneration_feedback=regeneration_feedback,
+                        turn_directive=turn_directive,
+                        current_user_id=current_user_id,
+                        cancellation_token=token,
+                        cancellation_requested=cancellation_requested,
+                        retry_progress_callback=retry_progress_callback,
+                        narrator_stream_callback=narrator_stream_callback,
+                        turn_progress_callback=turn_progress_callback,
+                        _turn_progress=turn_progress,
+                        automatic_retry_attempt=attempt - 1,
+                        automatic_retry_category=automatic_retry_category,
+                        automatic_retry_delay_ms=automatic_retry_delay_ms,
+                    )
+                )
+                if attempt == 2:
+                    log_event(
+                        "chat.automatic_turn_retry_succeeded",
+                        save_id=save_id,
+                        player_message_id=player_message_id,
+                        automatic_retry_attempt=1,
+                        automatic_retry_category=automatic_retry_category,
+                        automatic_retry_delay_ms=automatic_retry_delay_ms,
+                        automatic_retry_outcome="succeeded",
+                    )
+                return result
+            except ProviderError as exc:
+                if attempt == 2:
+                    log_error_event(
+                        "chat.automatic_turn_retry_failed",
+                        save_id=save_id,
+                        player_message_id=player_message_id,
+                        automatic_retry_attempt=1,
+                        automatic_retry_category=automatic_retry_category,
+                        automatic_retry_delay_ms=automatic_retry_delay_ms,
+                        automatic_retry_outcome="failed",
+                        **exception_log_fields(exc),
+                    )
+                    raise
+                if not is_transient_provider_error(
+                    exc
+                ) or not _narration_is_safe_to_replay(
+                    self.repositories,
+                    save_id=save_id,
+                    player_message_id=player_message_id,
+                ):
+                    raise
+                delay = _automatic_turn_retry_delay(exc)
+                automatic_retry_category = exc.category.value
+                automatic_retry_delay_ms = int(delay * 1000)
+                status_text = _automatic_turn_retry_status(exc, delay)
+                turn_progress.reset_for_automatic_retry(status_text)
+                log_event(
+                    "chat.automatic_turn_retry_scheduled",
+                    save_id=save_id,
+                    player_message_id=player_message_id,
+                    error_category=exc.category.value,
+                    retry_delay_ms=int(delay * 1000),
+                    automatic_retry_attempt=1,
+                )
+                try:
+                    await _wait_for_automatic_turn_retry(
+                        delay=delay,
+                        cancellation_token=token,
+                        cancellation_requested=cancellation_requested,
+                    )
+                except (ChatTurnCancelled, asyncio.CancelledError):
+                    cancelled_retry = self.jobs.create_running(
+                        save_id=save_id,
+                        type="chat_completion",
+                        payload={
+                            "player_message_id": player_message_id,
+                            "automatic_retry_attempt": 1,
+                            "automatic_retry_category": automatic_retry_category,
+                            "automatic_retry_delay_ms": automatic_retry_delay_ms,
+                        },
+                    )
+                    self.jobs.cancel(
+                        cancelled_retry.id,
+                        error=CHAT_TURN_CANCELLED_ERROR,
+                        result={
+                            "player_message_id": player_message_id,
+                            "automatic_retry_attempt": 1,
+                            "automatic_retry_category": automatic_retry_category,
+                            "automatic_retry_delay_ms": automatic_retry_delay_ms,
+                            "automatic_retry_outcome": "cancelled",
+                        },
+                    )
+                    log_event(
+                        "chat.automatic_turn_retry_cancelled",
+                        save_id=save_id,
+                        player_message_id=player_message_id,
+                        automatic_retry_attempt=1,
+                        automatic_retry_category=automatic_retry_category,
+                        automatic_retry_delay_ms=automatic_retry_delay_ms,
+                        automatic_retry_outcome="cancelled",
+                    )
+                    raise
+            except (ChatTurnCancelled, asyncio.CancelledError):
+                if attempt == 2:
+                    log_event(
+                        "chat.automatic_turn_retry_cancelled",
+                        save_id=save_id,
+                        player_message_id=player_message_id,
+                        automatic_retry_attempt=1,
+                        automatic_retry_category=automatic_retry_category,
+                        automatic_retry_delay_ms=automatic_retry_delay_ms,
+                        automatic_retry_outcome="cancelled",
+                    )
+                raise
+            except Exception as exc:
+                if attempt == 2:
+                    log_error_event(
+                        "chat.automatic_turn_retry_failed",
+                        save_id=save_id,
+                        player_message_id=player_message_id,
+                        automatic_retry_attempt=1,
+                        automatic_retry_category=automatic_retry_category,
+                        automatic_retry_delay_ms=automatic_retry_delay_ms,
+                        automatic_retry_outcome="failed",
+                        **exception_log_fields(exc),
+                    )
+                raise
+
+        raise AssertionError("automatic turn retry loop exited unexpectedly")
+
+    async def _submit_existing_player_turn_once(
+        self,
+        *,
+        save_id: str,
+        player_message_id: str,
+        source_message_role: str = "player",
+        run_post_turn_jobs: bool = True,
+        await_post_turn_jobs: bool = True,
+        defer_action_choices: bool = False,
+        turn_started: float | None = None,
+        log_turn_started: bool = True,
+        summarize_before_context: bool = True,
+        regeneration_feedback: str = "",
+        turn_directive: str = "",
+        current_user_id: str | None = None,
+        cancellation_token: CancellationToken | None = None,
+        cancellation_requested: Callable[[], bool] | None = None,
+        retry_progress_callback: ProviderRetryProgressCallback | None = None,
+        narrator_stream_callback: NarratorStreamCallback | None = None,
+        turn_progress_callback: TurnProgressCallback | None = None,
+        _turn_progress: _TurnProgressPublisher | None = None,
+        automatic_retry_attempt: int = 0,
+        automatic_retry_category: str | None = None,
+        automatic_retry_delay_ms: int | None = None,
+    ) -> SubmittedTurn:
         turn_started = turn_started or perf_counter()
         preference = _chat_model_preference_for_save(
             repositories=self.repositories,
@@ -1577,16 +1818,40 @@ class ChatService:
                 "player_speaker_name": player_message.speaker_name,
                 "provider": preference.provider,
                 "model": preference.model_id,
+                "automatic_retry_attempt": automatic_retry_attempt,
+                **(
+                    {"automatic_retry_category": automatic_retry_category}
+                    if automatic_retry_category is not None
+                    else {}
+                ),
+                **(
+                    {"automatic_retry_delay_ms": automatic_retry_delay_ms}
+                    if automatic_retry_delay_ms is not None
+                    else {}
+                ),
             },
         )
         loop = asyncio.get_running_loop()
+
+        def automatic_retry_result(outcome: str) -> dict[str, object]:
+            if automatic_retry_attempt == 0:
+                return {}
+            return {
+                "automatic_retry_attempt": automatic_retry_attempt,
+                "automatic_retry_category": automatic_retry_category,
+                "automatic_retry_delay_ms": automatic_retry_delay_ms,
+                "automatic_retry_outcome": outcome,
+            }
 
         def cancel_job() -> None:
             try:
                 self.jobs.cancel(
                     job.id,
                     error=CHAT_TURN_CANCELLED_ERROR,
-                    result={"player_message_id": player_message.id},
+                    result={
+                        "player_message_id": player_message.id,
+                        **automatic_retry_result("cancelled"),
+                    },
                 )
             except ValueError:
                 pass
@@ -1596,7 +1861,10 @@ class ChatService:
             try:
                 self.jobs.fail(
                     job.id,
-                    result={"player_message_id": player_message.id},
+                    result={
+                        "player_message_id": player_message.id,
+                        **automatic_retry_result("failed"),
+                    },
                     error=error,
                 )
             except ValueError:
@@ -2372,11 +2640,14 @@ class ChatService:
             )
             self.jobs.fail(
                 job.id,
-                result=_failed_chat_result(
-                    provider=preference.provider,
-                    model_id=preference.model_id,
-                    exc=exc,
-                ),
+                result={
+                    **_failed_chat_result(
+                        provider=preference.provider,
+                        model_id=preference.model_id,
+                        exc=exc,
+                    ),
+                    **automatic_retry_result("failed"),
+                },
                 error=_safe_error_text(exc),
             )
             log_error_event(
@@ -2950,6 +3221,18 @@ class ChatService:
                     "player_message_id": player_message.id,
                     "narrator_message_id": narrator_message.id,
                     "narrator_speaker_name": narrator_message.speaker_name,
+                    "automatic_retry_attempt": automatic_retry_attempt,
+                    **automatic_retry_result("succeeded"),
+                    **(
+                        {"automatic_retry_category": automatic_retry_category}
+                        if automatic_retry_category is not None
+                        else {}
+                    ),
+                    **(
+                        {"automatic_retry_delay_ms": automatic_retry_delay_ms}
+                        if automatic_retry_delay_ms is not None
+                        else {}
+                    ),
                     "provider": response.provider,
                     "model": response.model_id,
                     "token_usage": response.token_usage,
