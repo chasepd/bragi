@@ -5947,6 +5947,14 @@ def test_settings_expose_and_persist_save_scoped_context_automation_toggles(
                 "save_id": first_save_id,
             },
         )
+        saved_director_guidance = client.post(
+            "/api/settings/scoped",
+            json={
+                "key": "director_pressure_guidance",
+                "value": "  Advance the eclipse clock every turn.  ",
+                "save_id": first_save_id,
+            },
+        )
         saved_character_actions = client.post(
             "/api/settings/scoped",
             json={
@@ -5974,6 +5982,15 @@ def test_settings_expose_and_persist_save_scoped_context_automation_toggles(
         second_updated = client.get(f"/api/settings?save_id={second_save_id}")
 
     assert settings.status_code == 200
+    assert saved_director_guidance.status_code == 200
+    assert first_updated.json()["director_pressure_guidance"] == {
+        "setting_key": "director_pressure_guidance",
+        "value": "Advance the eclipse clock every turn.",
+    }
+    assert second_updated.json()["director_pressure_guidance"] == {
+        "setting_key": "director_pressure_guidance",
+        "value": "",
+    }
     assert settings.json()["agentic_context_pipeline"] == {
         "setting_key": AGENTIC_CONTEXT_PIPELINE_SETTING,
         "enabled": True,

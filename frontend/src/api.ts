@@ -444,6 +444,7 @@ export type SettingsModel = {
   agentic_context_pipeline?: ToggleControl;
   plan_first_narrator?: ToggleControl;
   director_pressure?: ToggleControl;
+  director_pressure_guidance?: TextControl;
   character_action_planning?: ToggleControl;
   character_action_planning_max_concurrency?: NumberControl;
   character_texts?: ToggleControl;

@@ -80,6 +80,8 @@ from bragi.services.diagnostics_service import redact_diagnostic_text
 from bragi.services.director_pressure_service import (
     DIRECTOR_PRESSURE_ENABLED_DEFAULT,
     DIRECTOR_PRESSURE_ENABLED_SETTING,
+    DIRECTOR_PRESSURE_GUIDANCE_SETTING,
+    director_pressure_guidance,
 )
 from bragi.services.generation_settings import (
     CHAT_MAX_OUTPUT_TOKENS_ENABLED_SETTING,
@@ -559,6 +561,7 @@ class SettingsModel:
     agentic_context_pipeline: ToggleControl | None
     plan_first_narrator: ToggleControl | None
     director_pressure: ToggleControl | None
+    director_pressure_guidance: TextControl | None
     character_action_planning: ToggleControl | None
     character_action_planning_max_concurrency: NumberControl | None
     character_texts: ToggleControl | None
@@ -865,6 +868,15 @@ def build_settings_model(
                     current_user_id=current_user_id,
                 ),
                 default=DIRECTOR_PRESSURE_ENABLED_DEFAULT,
+            ),
+        )
+        if save_controls_visible
+        else None,
+        director_pressure_guidance=TextControl(
+            setting_key=DIRECTOR_PRESSURE_GUIDANCE_SETTING,
+            value=director_pressure_guidance(
+                repositories,
+                save_id=active_save_id,
             ),
         )
         if save_controls_visible
