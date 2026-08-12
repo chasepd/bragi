@@ -4685,6 +4685,61 @@ def test_delete_save_removes_character_text_revisions_and_media_records(
     )
 
 
+def test_delete_save_removes_incremental_snapshot_tracking_rows(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep.",
+        player_role="Signal warden",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Evening comes.",
+    )
+    outcome = repositories.add_turn_outcome(
+        save_id=save.id,
+        message_id=message.id,
+        payload={"attempt_resolution": "succeeded", "effects": []},
+    )
+    repositories.connection.execute(
+        "DELETE FROM turn_outcomes WHERE id = ?",
+        (outcome.id,),
+    )
+    repositories.commit()
+    assert repositories.connection.execute(
+        """
+        SELECT COUNT(*) FROM save_snapshot_dirty_rows
+        WHERE save_id = ? AND table_name = 'turn_outcomes'
+        """,
+        (save.id,),
+    ).fetchone()[0] == 1
+    repositories.add_turn_outcome(
+        save_id=save.id,
+        message_id=message.id,
+        payload={"attempt_resolution": "succeeded", "effects": []},
+    )
+
+    assert repositories.delete_save(save.id) is True
+
+    assert repositories.get_save(save.id) is None
+    assert repositories.list_turn_outcomes(save.id) == []
+    for table_name in (
+        "save_snapshot_dirty_rows",
+        "save_snapshot_table_state",
+    ):
+        assert repositories.connection.execute(
+            f"SELECT COUNT(*) FROM {table_name} WHERE save_id = ?",
+            (save.id,),
+        ).fetchone()[0] == 0
+    assert repositories.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_repositories_persist_mvp_save_records(
     repositories: PersistenceRepositories,
 ) -> None:

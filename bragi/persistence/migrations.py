@@ -23,7 +23,7 @@ from bragi.text_search import (
     unicode_word_terms,
 )
 
-CURRENT_SCHEMA_VERSION = 83
+CURRENT_SCHEMA_VERSION = 84
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
@@ -775,7 +775,10 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 82:
+            if current == 83:
+                _migrate_schema_83_to_84(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 82:
                 _migrate_schema_82_to_83(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 81:
@@ -1331,12 +1334,20 @@ def _ensure_incremental_turn_snapshot_schema(connection: sqlite3.Connection) -> 
         for event in ("INSERT", "UPDATE", "DELETE"):
             row_ref = "OLD" if event == "DELETE" else "NEW"
             trigger_name = f"dirty_snapshot_{table.name}_after_{event.lower()}"
+            if event == "DELETE":
+                connection.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+            delete_guard = (
+                "WHEN EXISTS (SELECT 1 FROM saves WHERE id = OLD.save_id)"
+                if event == "DELETE"
+                else ""
+            )
             _execute_schema_script(
                 connection,
                 f"""
                 CREATE TRIGGER IF NOT EXISTS {trigger_name}
                 AFTER {event} ON {table.name}
                 FOR EACH ROW
+                {delete_guard}
                 BEGIN
                     INSERT INTO save_snapshot_table_state(
                         save_id, table_name, current_generation,
@@ -2629,6 +2640,12 @@ def _migrate_schema_82_to_83(connection: sqlite3.Connection) -> None:
     )
     _add_column_if_missing(connection, "messages", "narration_error", "TEXT")
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (83)")
+    _migrate_schema_83_to_84(connection)
+
+
+def _migrate_schema_83_to_84(connection: sqlite3.Connection) -> None:
+    _ensure_incremental_turn_snapshot_schema(connection)
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (84)")
 
 
 def _ensure_post_turn_outbox_schema(connection: sqlite3.Connection) -> None:

@@ -2370,3 +2370,35 @@ def test_migration_81_to_82_backfills_incremental_snapshot_tracking(
         assert state[0] > 0
         assert state[1] == 1
         assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
+
+
+def test_migration_83_to_84_guards_snapshot_delete_triggers(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "snapshot-delete-trigger-guards.db"
+    migrate_database(database_path)
+    trigger_name = "dirty_snapshot_turn_outcomes_after_delete"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(f'DROP TRIGGER "{trigger_name}"')
+        connection.execute(
+            f"""
+            CREATE TRIGGER {trigger_name}
+            AFTER DELETE ON turn_outcomes
+            FOR EACH ROW
+            BEGIN
+                SELECT OLD.save_id;
+            END
+            """
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 84")
+        connection.commit()
+
+    migrate_database(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        trigger_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger_name,),
+        ).fetchone()[0]
+        assert "WHEN EXISTS (SELECT 1 FROM saves WHERE id = OLD.save_id)" in trigger_sql
+        assert _migration_versions(connection) == EXPECTED_MIGRATION_VERSIONS
