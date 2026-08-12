@@ -19149,7 +19149,33 @@ describe("frontend helpers", () => {
     expect(screen.getByTitle("Store this provider key locally for future requests.")).toBeInTheDocument();
     expect(screen.getByTitle("Fetch the current model list for fake.")).toBeInTheDocument();
     await userEvent.click(await screen.findByRole("tab", { name: "Save" }));
-    expect(screen.getByRole("textbox", { name: "Director Pressure Guidance" })).toHaveValue("Advance the rival clock.");
+    const directorGuidance = screen.getByRole("textbox", { name: "Director Pressure Guidance" });
+    const directorGuidanceSetting = directorGuidance.closest(".text-setting") as HTMLElement;
+    const directorToggle = screen.getByLabelText("Director Pressure");
+    expect(directorGuidance).toHaveValue("Advance the rival clock.");
+    expect(directorGuidanceSetting).toHaveTextContent("runs after every verified turn");
+    expect(directorToggle.closest("label")?.compareDocumentPosition(directorGuidanceSetting)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    await userEvent.clear(directorGuidance);
+    await userEvent.type(directorGuidance, "Escalate the eclipse clock.");
+    await userEvent.click(within(directorGuidanceSetting).getByRole("button", { name: /^save$/i }));
+    await waitFor(() => expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .some(([, options]) => JSON.parse(String(options.body)).key === "director_pressure_guidance")).toBe(true));
+    const directorGuidanceSave = fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .find(([, options]) => JSON.parse(String(options.body)).key === "director_pressure_guidance");
+    expect(JSON.parse(String(directorGuidanceSave?.[1].body))).toEqual({
+      key: "director_pressure_guidance",
+      value: "Escalate the eclipse clock.",
+      save_id: "save-1"
+    });
+    await userEvent.click(within(directorGuidanceSetting).getByRole("button", { name: /^clear$/i }));
+    await waitFor(() => expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .some(([, options]) => {
+        const body = JSON.parse(String(options.body));
+        return body.key === "director_pressure_guidance" && body.value === "";
+      })).toBe(true));
     expect(screen.getByRole("tab", { name: "Save" })).toHaveAttribute("aria-selected", "true");
 
     expect(screen.getByText("Summarization")).toBeInTheDocument();
@@ -19904,6 +19930,8 @@ describe("frontend helpers", () => {
     });
     const settingsPayload = modelSettingsPayload({
       automatic_summarization: { setting_key: "automatic_summarization_enabled", enabled: true },
+      agentic_context_pipeline: { setting_key: "agentic_context_pipeline_enabled", enabled: true },
+      director_pressure_guidance: { setting_key: "director_pressure_guidance", value: "Advance the clock." },
       image_frequency: { setting_key: "image_generation_frequency", value: 3, minimum: 0, maximum: 999, step: 1 }
     });
     const fetchMock = vi.fn().mockImplementation((path: string) => {
@@ -19923,6 +19951,8 @@ describe("frontend helpers", () => {
     await userEvent.click(screen.getByLabelText("Automatic Summarization Enabled"));
 
     await waitFor(() => expect(screen.getByLabelText("Image Generation Frequency")).toBeDisabled());
+    expect(screen.getByLabelText("Director Pressure Guidance")).toBeDisabled();
+    expect(within(screen.getByLabelText("Director Pressure Guidance").closest(".text-setting") as HTMLElement).getAllByRole("button").every((button) => button.hasAttribute("disabled"))).toBe(true);
 
     resolveLocalSave({
       ok: false,
@@ -19939,6 +19969,8 @@ describe("frontend helpers", () => {
     const settingsPayload = modelSettingsPayload({
       visible_sections: ["save"],
       automatic_summarization: { setting_key: "automatic_summarization_enabled", enabled: true },
+      agentic_context_pipeline: { setting_key: "agentic_context_pipeline_enabled", enabled: true },
+      director_pressure_guidance: { setting_key: "director_pressure_guidance", value: "Advance the clock." },
       image_frequency: { setting_key: "image_generation_frequency", value: 3, minimum: 0, maximum: 999, step: 1 }
     });
     const fetchMock = settingsFetch(settingsPayload);
@@ -19958,6 +19990,7 @@ describe("frontend helpers", () => {
     await waitFor(() => expect(screen.getByRole("tab", { name: "Save" })).toHaveAttribute("aria-selected", "true"));
     expect(await screen.findByText("Load a save to edit save options.")).toBeInTheDocument();
     expect(await screen.findByLabelText("Automatic Summarization Enabled")).toBeDisabled();
+    expect(screen.getByLabelText("Director Pressure Guidance")).toBeDisabled();
     expect(screen.getByLabelText("Image Generation Frequency")).toBeDisabled();
     expect(screen.getByRole("button", { name: /compact history/i })).toBeDisabled();
   });

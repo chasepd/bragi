@@ -1402,6 +1402,15 @@ def test_import_save_sanitizes_director_pressure_guidance(
     bundle_path = tmp_path / "director-guidance.zip"
     service = _chat_bundle_service(repositories, media_dir)
     service.export_save(save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+
+    assert repositories.get_scoped_setting(
+        scope="save",
+        scope_id=_imported_save_id(imported),
+        key="director_pressure_guidance",
+    ) == "Advance the eclipse clock."
+
     _rewrite_bundle_data(
         bundle_path,
         lambda data: _replace_save_app_setting_value(
@@ -1412,11 +1421,11 @@ def test_import_save_sanitizes_director_pressure_guidance(
         ),
     )
 
-    imported = service.import_save(bundle_path)
+    repaired = service.import_save(bundle_path)
 
     assert repositories.get_scoped_setting(
         scope="save",
-        scope_id=_imported_save_id(imported),
+        scope_id=_imported_save_id(repaired),
         key="director_pressure_guidance",
     ) == ""
 
