@@ -240,6 +240,27 @@ class RecordingChatProvider:
         )
 
 
+class TransientThenSuccessfulChatProvider(RecordingChatProvider):
+    def __init__(
+        self,
+        provider_name: str,
+        errors: tuple[Exception, ...],
+    ) -> None:
+        super().__init__(provider_name)
+        self.errors = list(errors)
+
+    async def chat(self, request: ChatRequest) -> ChatResponse:
+        self.chat_requests.append(request)
+        if self.errors:
+            raise self.errors.pop(0)
+        return ChatResponse(
+            body="The observatory door opens on a field of cold stars.",
+            provider=request.provider,
+            model_id=request.model_id,
+            token_usage={"prompt": 11, "completion": 23, "total": 34},
+        )
+
+
 class RecordingContextAndChatProvider(RecordingChatProvider):
     def __init__(self, provider_name: str) -> None:
         super().__init__(provider_name)
@@ -11004,6 +11025,318 @@ def test_submit_existing_player_turn_uses_scenario_specific_chat_model(
     assert result.narrator_message.model == "fullroleplay/narrator"
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        ProviderError(
+            ProviderErrorCategory.NETWORK_ERROR,
+            "socket closed",
+            retry_attempt_count=7,
+            max_retry_attempts=7,
+        ),
+        ProviderError(
+            ProviderErrorCategory.RATE_LIMITED,
+            "slow down",
+            status_code=429,
+            retry_attempt_count=7,
+            max_retry_attempts=7,
+        ),
+        ProviderError(
+            ProviderErrorCategory.PROVIDER_ERROR,
+            "bad gateway",
+            status_code=502,
+            retry_attempt_count=7,
+            max_retry_attempts=7,
+        ),
+    ],
+)
+def test_submit_existing_player_turn_automatically_replays_transient_failure_once(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+    error: ProviderError,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Observatory",
+        premise="A sealed observatory waits above the city.",
+        player_role="Keeper",
+        content={"starting_scene": "The brass door is sealed."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Observatory")
+    source = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I open the observatory door.",
+        narration_status="pending",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = TransientThenSuccessfulChatProvider("fake", (error,))
+    progress: list[chat_service_module.TurnProgress] = []
+    monkeypatch.setattr(chat_service_module, "AUTOMATIC_TURN_RETRY_DELAY_SECONDS", 0)
+    monkeypatch.setattr(
+        chat_service_module,
+        "AUTOMATIC_RATE_LIMIT_RETRY_DELAY_SECONDS",
+        0,
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    result = asyncio.run(
+        service.submit_existing_player_turn(
+            save_id=save.id,
+            player_message_id=source.id,
+            run_post_turn_jobs=False,
+            turn_progress_callback=progress.append,
+        )
+    )
+
+    messages = repositories.list_messages(save.id)
+    assert [message.role for message in messages] == ["player", "narrator"]
+    assert result.player_message.id == source.id
+    assert len(provider.chat_requests) == 2
+    assert any(
+        "retrying turn automatically" in update.status_text.lower()
+        for update in progress
+    )
+    final_statuses = {job.name: job.status for job in progress[-1].jobs}
+    assert final_statuses["submission"] == "succeeded"
+    assert final_statuses["input"] == "succeeded"
+    assert final_statuses["save_narration"] == "succeeded"
+    jobs = _chat_completion_jobs(repositories, save.id)
+    assert jobs[-1]["payload"]["automatic_retry_attempt"] == 1
+    assert jobs[-1]["payload"]["automatic_retry_category"] == error.category.value
+    assert jobs[-1]["result"]["automatic_retry_attempt"] == 1
+    assert jobs[-1]["result"]["automatic_retry_delay_ms"] == 0
+    assert jobs[-1]["result"]["automatic_retry_outcome"] == "succeeded"
+    narration = repositories.get_message_narration_state(
+        save_id=save.id,
+        message_id=source.id,
+    )
+    assert narration is not None
+    assert narration.status == "complete"
+
+
+def test_submit_existing_player_turn_stops_after_one_automatic_replay(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Observatory",
+        premise="A sealed observatory waits above the city.",
+        player_role="Keeper",
+        content={"starting_scene": "The brass door is sealed."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Observatory")
+    source = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I open the observatory door.",
+        narration_status="pending",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    failures = (
+        ProviderError(ProviderErrorCategory.NETWORK_ERROR, "socket closed"),
+        ProviderError(ProviderErrorCategory.NETWORK_ERROR, "still closed"),
+    )
+    provider = TransientThenSuccessfulChatProvider("fake", failures)
+    monkeypatch.setattr(chat_service_module, "AUTOMATIC_TURN_RETRY_DELAY_SECONDS", 0)
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    with pytest.raises(ProviderError, match="still closed"):
+        asyncio.run(
+            service.submit_existing_player_turn(
+                save_id=save.id,
+                player_message_id=source.id,
+                run_post_turn_jobs=False,
+            )
+        )
+
+    assert len(provider.chat_requests) == 2
+    jobs = _chat_completion_jobs(repositories, save.id)
+    assert [job["status"] for job in jobs] == ["failed", "failed"]
+    assert jobs[-1]["result"]["automatic_retry_outcome"] == "failed"
+    assert [message.role for message in repositories.list_messages(save.id)] == [
+        "player"
+    ]
+
+
+def test_submit_existing_player_turn_does_not_replay_permanent_provider_failure(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Observatory",
+        premise="A sealed observatory waits above the city.",
+        player_role="Keeper",
+        content={"starting_scene": "The brass door is sealed."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Observatory")
+    source = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I open the observatory door.",
+        narration_status="pending",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = TransientThenSuccessfulChatProvider(
+        "fake",
+        (
+            ProviderError(
+                ProviderErrorCategory.AUTHENTICATION_FAILED,
+                "invalid key",
+                status_code=401,
+            ),
+        ),
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    with pytest.raises(ProviderError, match="invalid key"):
+        asyncio.run(
+            service.submit_existing_player_turn(
+                save_id=save.id,
+                player_message_id=source.id,
+                run_post_turn_jobs=False,
+            )
+        )
+
+    assert len(provider.chat_requests) == 1
+
+
+def test_automatic_turn_retry_delay_honors_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = CancellationToken()
+
+    async def cancel_instead_of_sleep(_delay: float) -> None:
+        token.cancel()
+
+    monkeypatch.setattr(chat_service_module.asyncio, "sleep", cancel_instead_of_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            chat_service_module._wait_for_automatic_turn_retry(
+                delay=1,
+                cancellation_token=token,
+                cancellation_requested=None,
+            )
+        )
+
+
+def test_submit_existing_player_turn_records_retry_cancelled_during_delay(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Observatory",
+        premise="A sealed observatory waits above the city.",
+        player_role="Keeper",
+        content={"starting_scene": "The brass door is sealed."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Observatory")
+    source = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I open the observatory door.",
+        narration_status="pending",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = TransientThenSuccessfulChatProvider(
+        "fake",
+        (ProviderError(ProviderErrorCategory.NETWORK_ERROR, "socket closed"),),
+    )
+    token = CancellationToken()
+
+    async def cancel_instead_of_sleep(_delay: float) -> None:
+        token.cancel()
+
+    monkeypatch.setattr(chat_service_module.asyncio, "sleep", cancel_instead_of_sleep)
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            service.submit_existing_player_turn(
+                save_id=save.id,
+                player_message_id=source.id,
+                run_post_turn_jobs=False,
+                cancellation_token=token,
+            )
+        )
+
+    jobs = _chat_completion_jobs(repositories, save.id)
+    assert len(jobs) == 2
+    assert jobs[1]["status"] == "cancelled"
+    assert jobs[1]["result"] == {
+        "player_message_id": source.id,
+        "automatic_retry_attempt": 1,
+        "automatic_retry_category": "network_error",
+        "automatic_retry_delay_ms": 1000,
+        "automatic_retry_outcome": "cancelled",
+    }
+
+
+def test_automatic_turn_retry_does_not_replay_after_narration_is_committed(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Observatory",
+        premise="A sealed observatory waits above the city.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Observatory")
+    source = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I open the observatory door.",
+        narration_status="complete",
+    )
+
+    assert not chat_service_module._narration_is_safe_to_replay(
+        repositories,
+        save_id=save.id,
+        player_message_id=source.id,
+    )
+
+
 def test_submit_existing_player_turn_finds_old_player_message_beyond_load_cap(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -17269,10 +17602,10 @@ def test_submit_player_turn_records_exhausted_retry_diagnostics(
         )
 
     jobs = _chat_completion_jobs(repositories, save.id)
-    assert len(jobs) == 1
-    job = jobs[0]
-    assert job["status"] == "failed"
-    assert job["result"] == {
+    assert len(jobs) == 2
+    assert [job["payload"]["automatic_retry_attempt"] for job in jobs] == [0, 1]
+    assert all(job["status"] == "failed" for job in jobs)
+    expected_result = {
         "original_provider": "openrouter",
         "original_model": "anthropic/claude-3.5-sonnet",
         "fallback_used": False,
@@ -17299,6 +17632,14 @@ def test_submit_player_turn_records_exhausted_retry_diagnostics(
                 "http_status": 429,
             },
         ],
+    }
+    assert jobs[0]["result"] == expected_result
+    assert jobs[1]["result"] == {
+        **expected_result,
+        "automatic_retry_attempt": 1,
+        "automatic_retry_category": "rate_limited",
+        "automatic_retry_delay_ms": 5000,
+        "automatic_retry_outcome": "failed",
     }
 
 
