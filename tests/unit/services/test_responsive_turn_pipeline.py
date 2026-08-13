@@ -131,6 +131,8 @@ def test_character_reference_gate_accepts_present_uncased_script_name() -> None:
         "I ask Élodie for directions.",
         "I ask 李梅 for directions.",
         "李梅 waits nearby.",
+        "I speak with zorak.",
+        "I approach zorak.",
     ),
 )
 def test_character_reference_gate_rejects_absent_or_unknown_named_characters(

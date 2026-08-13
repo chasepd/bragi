@@ -24,8 +24,13 @@ _WORD_TOKEN = re.compile(
     flags=re.UNICODE,
 )
 _LOWERCASE_NAME_CUE = re.compile(
-    r"\b(?:ask|call|contact|find|follow|greet|help|join|meet|summon|tell)"
-    r"(?:\s+for)?\s+([^\W\d_][\w'-]*)",
+    r"\b(?:"
+    r"(?:approach|ask|call|contact|find|follow|greet|help|join|meet|summon|tell|visit)"
+    r"(?:\s+for)?"
+    r"|(?:go|speak|talk|travel|walk|wait|wave)\s+"
+    r"(?:at|beside|for|near|to|toward|with)"
+    r"|(?:beside|near|toward|with)"
+    r")\s+([^\W\d_][\w'-]*)",
     flags=re.IGNORECASE | re.UNICODE,
 )
 _NON_NAME_CAPITALIZED_PHRASES = frozenset(

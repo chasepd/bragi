@@ -1124,10 +1124,103 @@ class ContextSearchService:
                 result.responsive_fast_path_used
                 or result.responsive_narrator_spec is not None
             ):
+                if narration_snapshot is None:
+                    raise RuntimeError(
+                        "Context snapshot missing during responsive fallback"
+                    )
+                fallback_build_revision = (
+                    self.repositories.context_candidate_revision_token(
+                        save_id,
+                        ignored_message_id=player_message_id,
+                    )
+                )
+                (
+                    retrieved_sources,
+                    candidate_set,
+                ) = await _rebuild_responsive_fallback_candidates(
+                    repositories=self.repositories,
+                    provider=provider,
+                    provider_name=preference.provider,
+                    model_id=preference.model_id,
+                    save_id=save_id,
+                    player_message_id=player_message_id,
+                    player_message=player_message,
+                    focus_message=focus_message,
+                    snapshot=narration_snapshot,
+                    additional_query_terms=additional_query_terms,
+                )
+                if (
+                    self.repositories.context_candidate_revision_token(
+                        save_id,
+                        ignored_message_id=player_message_id,
+                    )
+                    != fallback_build_revision
+                ):
+                    raise RuntimeError(
+                        "Context changed repeatedly during responsive fallback"
+                    )
+                candidates = candidate_set.candidates
+                candidate_diagnostics = candidate_set.diagnostics
+                scenario = narration_snapshot.details.scenario
+                preselection_revision = fallback_build_revision
+                selection = await _normal_context_selection(
+                    repositories=self.repositories,
+                    providers=self.providers,
+                    preference_provider=preference.provider,
+                    preference_model_id=preference.model_id,
+                    save_id=save_id,
+                    scenario=scenario,
+                    player_message=player_message,
+                    candidates=candidates,
+                    primary_model_unavailable=primary_model_unavailable,
+                    requirement_error=requirement_error,
+                    advertises_tool_calling=advertises_tool_calling,
+                    advertises_structured_output=advertises_structured_output,
+                    tool_provider=tool_provider,
+                )
+                result = selection.result
+                fallback_candidates = _empty_selection_fallback_candidates(
+                    candidates,
+                    fallback_allowed=selection.fallback_allowed,
+                )
+                if fallback_candidates and _context_result_is_empty(result):
+                    result = replace(
+                        _fallback_context_result(fallback_candidates),
+                        retrieval_degraded=True,
+                        retrieval_recovery=(
+                            CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC
+                        ),
+                    )
+                    selection = replace(
+                        selection,
+                        result=result,
+                        fallback_allowed=False,
+                        fallback_used=False,
+                        empty_selection_policy=(
+                            CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC
+                        ),
+                    )
+                result, narration_snapshot = _rehydrate_selected_context(
+                    repositories=self.repositories,
+                    save_id=save_id,
+                    player_message_id=player_message_id,
+                    focus_message=focus_message,
+                    result=result,
+                    fallback_snapshot=narration_snapshot,
+                    preselection_revision=preselection_revision,
+                )
+                if (
+                    self.repositories.context_candidate_revision_token(
+                        save_id,
+                        ignored_message_id=player_message_id,
+                    )
+                    != preselection_revision
+                ):
+                    raise RuntimeError(
+                        "Context changed repeatedly during responsive fallback"
+                    )
                 result = replace(
                     result,
-                    responsive_fast_path_used=False,
-                    responsive_narrator_spec=None,
                     responsive_turn_plan_fallback_reason=(
                         "context_changed_after_selection"
                     ),
@@ -1214,6 +1307,81 @@ def _sync_continuity_index_for_search(
         raise RuntimeError(
             "Continuity index maintenance backlog is still draining; retry the turn"
         )
+
+
+async def _rebuild_responsive_fallback_candidates(
+    *,
+    repositories: PersistenceRepositories,
+    provider: ProviderClient,
+    provider_name: str,
+    model_id: str,
+    save_id: str,
+    player_message_id: str,
+    player_message: str,
+    focus_message: MessageRecord | None,
+    snapshot: NarrationContextSnapshot,
+    additional_query_terms: tuple[str, ...],
+) -> tuple[
+    _IndexedContextSourceRetrieval,
+    _ContextCandidateSet,
+]:
+    messages = (
+        snapshot.details.messages
+        if focus_message is None
+        else [*snapshot.details.messages, focus_message]
+    )
+    messages = _context_search_visible_messages(
+        repositories,
+        save_id=save_id,
+        scene_snapshot=snapshot.scene_snapshot,
+        required_messages=tuple(
+            message for message in messages if message.id == player_message_id
+        ),
+    )
+    retrieved_sources = await _retrieve_indexed_context_sources(
+        repositories,
+        provider=provider,
+        provider_name=provider_name,
+        model_id=model_id,
+        save_id=save_id,
+        latest_player_message=player_message,
+        scene_snapshot=snapshot.scene_snapshot,
+        characters=list(snapshot.characters),
+        character_knowledge_edges=list(snapshot.character_knowledge_edges),
+        entity_links=list(snapshot.entity_links),
+        recent_messages=messages,
+        message_visibility=list(snapshot.message_visibility),
+        additional_query_terms=additional_query_terms,
+        allow_expansion=False,
+    )
+    retrieved_sources = _mark_responsive_expansion_skipped(retrieved_sources)
+    candidate_observations = _observations_with_indexed_sources(
+        repositories,
+        save_id=save_id,
+        observations=snapshot.observations,
+        context_sources=retrieved_sources.records,
+    )
+    candidate_set = _context_candidate_set(
+        scenario=snapshot.details.scenario,
+        scene_snapshot=snapshot.scene_snapshot,
+        characters=list(snapshot.characters),
+        character_knowledge_edges=list(snapshot.character_knowledge_edges),
+        message_visibility=list(snapshot.message_visibility),
+        entity_links=list(snapshot.entity_links),
+        world_state=list(snapshot.world_state),
+        world_state_for_scope=list(snapshot.world_state_for_scope),
+        state_changes=list(snapshot.state_changes),
+        media_assets=list(snapshot.media_assets),
+        memories=list(snapshot.memories),
+        summaries=list(snapshot.summaries),
+        observations=list(candidate_observations),
+        context_sources=list(retrieved_sources.records),
+        recent_messages=messages,
+        player_message_id=player_message_id,
+        include_missing_raw_candidates=False,
+        retrieval_diagnostics=retrieved_sources.diagnostics,
+    )
+    return retrieved_sources, candidate_set
 
 
 def _archive_stale_scene_scratch_for_search(

@@ -129,13 +129,15 @@ class MutatingStructuredContextProvider(RecordingStructuredContextProvider):
     ) -> None:
         super().__init__(response_data)
         self.after_selection = after_selection
+        self.mutated = False
 
     async def generate_structured_output(
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         response = await super().generate_structured_output(request)
-        if request.schema_name != "context_retrieval_expansion":
+        if request.schema_name != "context_retrieval_expansion" and not self.mutated:
+            self.mutated = True
             self.after_selection()
         return response
 
@@ -5198,7 +5200,7 @@ def test_responsive_turn_plan_is_invalidated_when_selected_evidence_changes(
     )
     assert [
         request.schema_name for request in provider.structured_output_requests
-    ] == ["responsive_turn_plan"]
+    ] == ["responsive_turn_plan", "context_search_selection"]
 
 
 def test_context_search_reloads_cache_mutated_during_candidate_build(
