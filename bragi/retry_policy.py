@@ -13,7 +13,11 @@ turn.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 RETRY_COUNT_SETTING = "retry_count"
@@ -33,6 +37,32 @@ PROVIDER_CALL_DEADLINE_STEP = 1.0
 PROVIDER_MAX_ATTEMPTS = DEFAULT_RETRY_COUNT + 1
 MODEL_OUTPUT_MAX_ATTEMPTS = DEFAULT_RETRY_COUNT + 1
 DEFERRED_WORK_MAX_ATTEMPTS = DEFAULT_RETRY_COUNT + 1
+
+RESPONSIVE_FOREGROUND_MAX_PROVIDER_ATTEMPTS = 2
+RESPONSIVE_FOREGROUND_CALL_DEADLINE_SECONDS = 45.0
+RESPONSIVE_FOREGROUND_VERIFICATION_MAX_ATTEMPTS = 2
+
+
+class RetryExecutionClass(StrEnum):
+    """Request class used to resolve internal retry and deadline budgets."""
+
+    QUALITY_FOREGROUND = "quality_foreground"
+    RESPONSIVE_FOREGROUND = "responsive_foreground"
+    BACKGROUND = "background"
+
+
+@dataclass(frozen=True)
+class ResolvedRetryBudget:
+    provider_max_attempts: int
+    provider_call_deadline_seconds: float
+    automatic_turn_retry_allowed: bool
+    verification_max_attempts: int
+
+
+_RETRY_EXECUTION_CLASS: ContextVar[RetryExecutionClass] = ContextVar(
+    "bragi_retry_execution_class",
+    default=RetryExecutionClass.QUALITY_FOREGROUND,
+)
 
 
 def sanitize_retry_count(value: object) -> int:
@@ -92,6 +122,57 @@ def configured_max_attempts(repositories: Any | None = None) -> int:
     """Return initial attempt plus the configured retry count."""
 
     return configured_retry_count(repositories) + 1
+
+
+@contextmanager
+def retry_execution_context(
+    execution_class: RetryExecutionClass,
+) -> Iterator[None]:
+    """Temporarily apply retry behavior to provider calls in this async context."""
+
+    token = _RETRY_EXECUTION_CLASS.set(execution_class)
+    try:
+        yield
+    finally:
+        _RETRY_EXECUTION_CLASS.reset(token)
+
+
+def current_retry_execution_class() -> RetryExecutionClass:
+    return _RETRY_EXECUTION_CLASS.get()
+
+
+def resolved_retry_budget(
+    repositories: Any | None = None,
+) -> ResolvedRetryBudget:
+    """Resolve provider and turn retry limits for the current execution context."""
+
+    provider_max_attempts = configured_max_attempts(repositories)
+    provider_call_deadline_seconds = configured_provider_call_deadline_seconds(
+        repositories
+    )
+    execution_class = current_retry_execution_class()
+    if execution_class is RetryExecutionClass.RESPONSIVE_FOREGROUND:
+        return ResolvedRetryBudget(
+            provider_max_attempts=min(
+                provider_max_attempts,
+                RESPONSIVE_FOREGROUND_MAX_PROVIDER_ATTEMPTS,
+            ),
+            provider_call_deadline_seconds=min(
+                provider_call_deadline_seconds,
+                RESPONSIVE_FOREGROUND_CALL_DEADLINE_SECONDS,
+            ),
+            automatic_turn_retry_allowed=False,
+            verification_max_attempts=min(
+                provider_max_attempts,
+                RESPONSIVE_FOREGROUND_VERIFICATION_MAX_ATTEMPTS,
+            ),
+        )
+    return ResolvedRetryBudget(
+        provider_max_attempts=provider_max_attempts,
+        provider_call_deadline_seconds=provider_call_deadline_seconds,
+        automatic_turn_retry_allowed=True,
+        verification_max_attempts=provider_max_attempts,
+    )
 
 
 RetryCountResolver = Callable[[], int]

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from time import perf_counter
 from typing import cast
@@ -54,7 +54,8 @@ async def call_with_provider_retries[T](
     attempt_diagnostics: list[dict[str, object]] = []
     call_started_at = perf_counter()
     for attempt in range(1, attempts + 1):
-        if _elapsed_seconds(call_started_at) > deadline_seconds:
+        remaining = deadline_seconds - _elapsed_seconds(call_started_at)
+        if remaining <= 0:
             raise _deadline_exceeded_error(
                 provider=provider,
                 task=task,
@@ -64,9 +65,15 @@ async def call_with_provider_retries[T](
                 attempt_diagnostics=attempt_diagnostics,
             )
         started_at = perf_counter()
+        attempt_timeout = asyncio.timeout(remaining)
         try:
-            result = await operation()
-        except Exception as exc:
+            async with attempt_timeout:
+                result = await operation()
+        except Exception as caught:
+            deadline_expired = isinstance(caught, TimeoutError) and bool(
+                getattr(attempt_timeout, "expired", lambda: True)()
+            )
+            exc = _normalize_timeout_error(caught)
             duration_ms = _elapsed_ms(started_at)
             category = _error_category(exc)
             attempt_diagnostics.append(
@@ -76,7 +83,10 @@ async def call_with_provider_retries[T](
                     duration_ms=duration_ms,
                 )
             )
-            if _elapsed_seconds(call_started_at) > deadline_seconds:
+            if (
+                deadline_expired
+                or _elapsed_seconds(call_started_at) >= deadline_seconds
+            ):
                 raise _deadline_exceeded_error(
                     provider=provider,
                     task=task,
@@ -122,8 +132,15 @@ async def call_with_provider_retries[T](
                     deadline_seconds=deadline_seconds,
                     attempt_diagnostics=attempt_diagnostics,
                 ) from exc
-            if delay > remaining:
-                delay = remaining
+            if delay >= remaining:
+                raise _deadline_exceeded_error(
+                    provider=provider,
+                    task=task,
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    deadline_seconds=deadline_seconds,
+                    attempt_diagnostics=attempt_diagnostics,
+                ) from exc
             log_error_event(
                 "provider.retry_scheduled",
                 provider=provider,
@@ -208,6 +225,57 @@ def exhausted_retry_attempt_count(exc: Exception) -> int | None:
     return exc.retry_attempt_count
 
 
+async def stream_with_provider_deadline[T](
+    stream: AsyncIterator[T],
+    *,
+    provider: str,
+    task: str,
+    call_deadline_seconds: float,
+) -> AsyncIterator[T]:
+    """Yield a provider stream within one hard, transient timeout attempt."""
+
+    deadline_seconds = max(0.0, float(call_deadline_seconds))
+    started_at = perf_counter()
+    timeout_context = asyncio.timeout(deadline_seconds)
+    try:
+        async with timeout_context:
+            async for item in stream:
+                yield item
+    except TimeoutError as caught:
+        if bool(getattr(timeout_context, "expired", lambda: True)()):
+            raise _deadline_exceeded_error(
+                provider=provider,
+                task=task,
+                attempt=1,
+                max_attempts=1,
+                deadline_seconds=deadline_seconds,
+                attempt_diagnostics=[
+                    {
+                        "attempt": 1,
+                        "error_category": ProviderErrorCategory.NETWORK_ERROR.value,
+                        "duration_ms": _elapsed_ms(started_at),
+                    }
+                ],
+            ) from caught
+        normalized = _normalize_timeout_error(caught)
+        if not isinstance(normalized, ProviderError):
+            raise
+        raise ProviderError(
+            category=normalized.category,
+            message=normalized.message,
+            retry_attempt_count=1,
+            max_retry_attempts=1,
+            retry_attempts=(
+                _attempt_diagnostics(
+                    attempt=1,
+                    exc=normalized,
+                    duration_ms=_elapsed_ms(started_at),
+                ),
+            ),
+            diagnostics=dict(normalized.diagnostics),
+        ) from caught
+
+
 def _is_transient(exc: Exception) -> bool:
     if not isinstance(exc, ProviderError):
         return False
@@ -222,6 +290,16 @@ def _error_category(exc: Exception) -> str:
     if isinstance(exc, ProviderError):
         return exc.category.value
     return exc.__class__.__name__
+
+
+def _normalize_timeout_error(exc: Exception) -> Exception:
+    if not isinstance(exc, TimeoutError) or isinstance(exc, ProviderError):
+        return exc
+    return ProviderError(
+        category=ProviderErrorCategory.NETWORK_ERROR,
+        message="Provider request timed out",
+        diagnostics={"timeout": True},
+    )
 
 
 def _retry_delay(

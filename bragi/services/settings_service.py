@@ -35,8 +35,11 @@ from bragi.providers.errors import (
     map_exception_to_category,
 )
 from bragi.retry_policy import (
+    DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS,
     DEFAULT_RETRY_COUNT,
+    PROVIDER_CALL_DEADLINE_SETTING,
     RETRY_COUNT_SETTING,
+    sanitize_provider_call_deadline_seconds,
     sanitize_retry_count,
 )
 from bragi.services.agentic_context import (
@@ -695,6 +698,8 @@ class SettingsService:
             )
         elif key == RETRY_COUNT_SETTING:
             value = sanitize_retry_count(value)
+        elif key == PROVIDER_CALL_DEADLINE_SETTING:
+            value = sanitize_provider_call_deadline_seconds(value)
         elif key == SCENARIO_EVOLUTION_TURN_INTERVAL_SETTING:
             value = sanitize_scenario_evolution_turn_interval(value)
         elif key == CHARACTER_ACTION_PLANNING_MAX_CONCURRENCY_SETTING:
@@ -835,6 +840,8 @@ class SettingsService:
                 return sanitize_character_text_proactive_random_cooldown_turns(value)
             if key == RETRY_COUNT_SETTING:
                 return sanitize_retry_count(value)
+            if key == PROVIDER_CALL_DEADLINE_SETTING:
+                return sanitize_provider_call_deadline_seconds(value)
             if key == NARRATOR_PLANNER_RECENT_PLAYER_MESSAGE_WINDOW_SETTING:
                 return sanitize_recent_message_window(
                     value,
@@ -1151,6 +1158,7 @@ def _thinking_support_levels(support: Mapping[str, object]) -> tuple[str, ...]:
 def _default_local_setting(key: str) -> object | None:
     defaults: dict[str, object] = {
         RETRY_COUNT_SETTING: DEFAULT_RETRY_COUNT,
+        PROVIDER_CALL_DEADLINE_SETTING: DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS,
         "context_budget_mode": DEFAULT_CONTEXT_BUDGET_MODE,
         "context_budget_fixed_total_chars": DEFAULT_CONTEXT_BUDGET_FIXED_TOTAL_CHARS,
         "context_budget_adaptive_fraction": DEFAULT_CONTEXT_BUDGET_ADAPTIVE_FRACTION,

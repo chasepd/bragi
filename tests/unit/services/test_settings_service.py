@@ -26,7 +26,7 @@ from bragi.providers.contracts import (
     VideoResponse,
 )
 from bragi.providers.errors import ProviderErrorCategory
-from bragi.retry_policy import RETRY_COUNT_SETTING
+from bragi.retry_policy import PROVIDER_CALL_DEADLINE_SETTING, RETRY_COUNT_SETTING
 from bragi.services.agentic_context import AGENTIC_CONTEXT_PIPELINE_SETTING
 from bragi.services.character_text_service import (
     CHARACTER_TEXT_PROACTIVE_RANDOM_CHANCE_SETTING,
@@ -1603,6 +1603,23 @@ def test_settings_service_sanitizes_global_retry_count(
 
     service.set_local_setting(RETRY_COUNT_SETTING, "invalid")
     assert service.get_local_setting(RETRY_COUNT_SETTING) == 6
+
+
+def test_settings_service_sanitizes_global_provider_call_deadline(
+    repositories: PersistenceRepositories,
+) -> None:
+    service = _settings_service(repositories)
+
+    assert service.get_local_setting(PROVIDER_CALL_DEADLINE_SETTING) == 120.0
+
+    service.set_local_setting(PROVIDER_CALL_DEADLINE_SETTING, 999)
+    assert service.get_local_setting(PROVIDER_CALL_DEADLINE_SETTING) == 600.0
+
+    service.set_local_setting(PROVIDER_CALL_DEADLINE_SETTING, -2)
+    assert service.get_local_setting(PROVIDER_CALL_DEADLINE_SETTING) == 5.0
+
+    service.set_local_setting(PROVIDER_CALL_DEADLINE_SETTING, "invalid")
+    assert service.get_local_setting(PROVIDER_CALL_DEADLINE_SETTING) == 120.0
 
 
 def test_settings_service_resolves_user_scoped_settings_before_global_defaults(

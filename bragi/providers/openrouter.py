@@ -58,6 +58,7 @@ from bragi.providers.reasoning_diagnostics import (
 from bragi.providers.retry import (
     call_with_provider_retries,
     retry_metadata_from_provider_error,
+    stream_with_provider_deadline,
 )
 from bragi.providers.structured_output_validation import (
     StructuredOutputValidationError,
@@ -581,6 +582,7 @@ class OpenRouterClient:
         task: str,
         app_title: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        deadline_seconds = self._configured_call_deadline_seconds()
         transport_kwargs: dict[str, Any] = {}
         if self.stream_transport is request_sse_json:
             transport_kwargs = {
@@ -589,13 +591,19 @@ class OpenRouterClient:
                 "model": _payload_model(payload),
                 "schema_name": _schema_name(payload),
             }
-        async for event in self.stream_transport(
+        stream = self.stream_transport(
             method="POST",
             url=f"{self.base_url}{path}",
             headers=self._headers(app_title=app_title),
             payload=payload,
-            timeout=self.timeout,
+            timeout=min(self.timeout, deadline_seconds),
             **transport_kwargs,
+        )
+        async for event in stream_with_provider_deadline(
+            stream,
+            provider=self.provider_name,
+            task=task,
+            call_deadline_seconds=deadline_seconds,
         ):
             yield event
 

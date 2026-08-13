@@ -938,7 +938,11 @@ def test_venice_stream_chat_posts_streaming_completion_and_yields_chunks() -> No
     )
     secrets = InMemorySecretStore()
     secrets.set_api_key("venice", "venice-secret")
-    client = VeniceClient(secret_store=secrets, stream_transport=stream)
+    client = VeniceClient(
+        secret_store=secrets,
+        stream_transport=stream,
+        call_deadline_seconds=lambda: 45.0,
+    )
 
     async def collect() -> list[str]:
         chunks = []
@@ -962,6 +966,7 @@ def test_venice_stream_chat_posts_streaming_completion_and_yields_chunks() -> No
     assert call["method"] == "POST"
     assert call["url"].endswith("/api/v1/chat/completions")
     assert call["headers"]["Authorization"] == "Bearer venice-secret"
+    assert call["timeout"] == 45.0
     payload = call["payload"]
     assert payload["stream"] is True
     assert payload["stream_options"] == {"include_usage": True}

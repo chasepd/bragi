@@ -1,4 +1,4 @@
-from bragi.retry_policy import RETRY_COUNT_SETTING
+from bragi.retry_policy import PROVIDER_CALL_DEADLINE_SETTING, RETRY_COUNT_SETTING
 from bragi.services.character_text_service import (
     CHARACTER_TEXT_PROACTIVE_RANDOM_CHANCE_SETTING,
     CHARACTER_TEXT_PROACTIVE_RANDOM_COOLDOWN_SETTING,
@@ -94,3 +94,13 @@ def test_retry_count_is_global_and_admin_only() -> None:
     assert role_can_write_scoped_setting("admin", RETRY_COUNT_SETTING)
     assert not role_can_write_scoped_setting("user", RETRY_COUNT_SETTING)
     assert not role_can_write_scoped_setting("child", RETRY_COUNT_SETTING)
+
+
+def test_provider_call_deadline_is_global_and_admin_only() -> None:
+    policy = scoped_setting_policy(PROVIDER_CALL_DEADLINE_SETTING)
+
+    assert policy.scope == "global"
+    assert policy.admin_only is True
+    assert role_can_write_scoped_setting("admin", PROVIDER_CALL_DEADLINE_SETTING)
+    assert not role_can_write_scoped_setting("user", PROVIDER_CALL_DEADLINE_SETTING)
+    assert not role_can_write_scoped_setting("child", PROVIDER_CALL_DEADLINE_SETTING)

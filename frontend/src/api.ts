@@ -438,6 +438,7 @@ export type SettingsModel = {
   scenario_section_model_selectors?: TaskModelSelector[];
   model_routing_profiles?: ModelRoutingProfilesSettings;
   retry_count?: NumberControl;
+  provider_call_deadline_seconds?: NumberControl;
   automatic_summarization?: ToggleControl;
   summarization_context_pressure_threshold?: NumberControl;
   summarization_visibility?: ToggleControl;

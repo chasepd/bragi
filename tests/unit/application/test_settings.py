@@ -13,7 +13,7 @@ from pytest import MonkeyPatch
 
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
-from bragi.retry_policy import RETRY_COUNT_SETTING
+from bragi.retry_policy import PROVIDER_CALL_DEADLINE_SETTING, RETRY_COUNT_SETTING
 from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_SETTING,
     PLAN_FIRST_NARRATOR_SETTING,
@@ -552,6 +552,15 @@ def test_settings_model_exposes_admin_retry_policy_control(
     assert _value(retry_count, "maximum") == 10
     assert _value(retry_count, "step") == 1
 
+    provider_deadline = _value(model, "provider_call_deadline_seconds")
+    assert _value(provider_deadline, "setting_key") == (
+        PROVIDER_CALL_DEADLINE_SETTING
+    )
+    assert _value(provider_deadline, "value") == 120.0
+    assert _value(provider_deadline, "minimum") == 5
+    assert _value(provider_deadline, "maximum") == 600
+    assert _value(provider_deadline, "step") == 1
+
     repositories.set_app_setting(RETRY_COUNT_SETTING, 3)
     updated = settings.build_settings_model(
         repositories=repositories,
@@ -566,6 +575,7 @@ def test_settings_model_exposes_admin_retry_policy_control(
         current_user_role="user",
     )
     assert _value(user_model, "retry_count") is None
+    assert _value(user_model, "provider_call_deadline_seconds") is None
 
 
 def test_settings_model_exposes_task_model_selectors_and_unavailable_warning(

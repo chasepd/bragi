@@ -57,6 +57,7 @@ from bragi.redaction import redact_text
 from bragi.retry_policy import (
     configured_max_attempts,
     configured_retry_count,
+    resolved_retry_budget,
 )
 from bragi.services.action_choice_flags import scenario_action_choices_enabled
 from bragi.services.action_choice_service import (
@@ -1565,7 +1566,9 @@ class ChatService:
 
         automatic_retry_category: str | None = None
         automatic_retry_delay_ms: int | None = None
-        for attempt in (1, 2):
+        retry_budget = resolved_retry_budget(self.repositories)
+        max_turn_attempts = 2 if retry_budget.automatic_turn_retry_allowed else 1
+        for attempt in range(1, max_turn_attempts + 1):
             try:
                 result = await asyncio.create_task(
                     self._submit_existing_player_turn_once(
@@ -1592,7 +1595,7 @@ class ChatService:
                         automatic_retry_delay_ms=automatic_retry_delay_ms,
                     )
                 )
-                if attempt == 2:
+                if attempt > 1:
                     log_event(
                         "chat.automatic_turn_retry_succeeded",
                         save_id=save_id,
@@ -1604,17 +1607,18 @@ class ChatService:
                     )
                 return result
             except ProviderError as exc:
-                if attempt == 2:
-                    log_error_event(
-                        "chat.automatic_turn_retry_failed",
-                        save_id=save_id,
-                        player_message_id=player_message_id,
-                        automatic_retry_attempt=1,
-                        automatic_retry_category=automatic_retry_category,
-                        automatic_retry_delay_ms=automatic_retry_delay_ms,
-                        automatic_retry_outcome="failed",
-                        **exception_log_fields(exc),
-                    )
+                if attempt >= max_turn_attempts:
+                    if attempt > 1:
+                        log_error_event(
+                            "chat.automatic_turn_retry_failed",
+                            save_id=save_id,
+                            player_message_id=player_message_id,
+                            automatic_retry_attempt=1,
+                            automatic_retry_category=automatic_retry_category,
+                            automatic_retry_delay_ms=automatic_retry_delay_ms,
+                            automatic_retry_outcome="failed",
+                            **exception_log_fields(exc),
+                        )
                     raise
                 if not is_transient_provider_error(
                     exc
@@ -1676,7 +1680,7 @@ class ChatService:
                     )
                     raise
             except (ChatTurnCancelled, asyncio.CancelledError):
-                if attempt == 2:
+                if attempt > 1:
                     log_event(
                         "chat.automatic_turn_retry_cancelled",
                         save_id=save_id,
@@ -1688,7 +1692,7 @@ class ChatService:
                     )
                 raise
             except Exception as exc:
-                if attempt == 2:
+                if attempt > 1:
                     log_error_event(
                         "chat.automatic_turn_retry_failed",
                         save_id=save_id,
@@ -6927,7 +6931,7 @@ class ChatService:
         ):
             return _NarratorVerificationTurnResult(diagnostics={})
         max_attempt_count = (
-            configured_max_attempts(self.repositories)
+            resolved_retry_budget(self.repositories).verification_max_attempts
             if max_attempt_count is None
             else max_attempt_count
         )
