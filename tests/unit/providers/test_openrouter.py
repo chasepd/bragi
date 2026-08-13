@@ -1235,7 +1235,11 @@ def test_openrouter_stream_chat_posts_streaming_completion_and_yields_chunks() -
     )
     secrets = InMemorySecretStore()
     secrets.set_api_key("openrouter", "or-secret")
-    client = OpenRouterClient(secret_store=secrets, stream_transport=stream)
+    client = OpenRouterClient(
+        secret_store=secrets,
+        stream_transport=stream,
+        call_deadline_seconds=lambda: 45.0,
+    )
 
     async def collect() -> list[str]:
         chunks = []
@@ -1264,6 +1268,7 @@ def test_openrouter_stream_chat_posts_streaming_completion_and_yields_chunks() -
     assert call["url"].endswith("/api/v1/chat/completions")
     assert call["headers"]["Authorization"] == "Bearer or-secret"
     assert call["headers"]["X-OpenRouter-Title"] == "Bragi"
+    assert call["timeout"] == 45.0
     payload = call["payload"]
     assert payload["stream"] is True
     assert payload["stream_options"] == {"include_usage": True}
@@ -1272,6 +1277,43 @@ def test_openrouter_stream_chat_posts_streaming_completion_and_yields_chunks() -
     assert payload["provider"] == {
         "sort": {"by": "throughput", "partition": "none"},
     }
+
+
+def test_openrouter_stream_timeout_is_normalized_as_transient_provider_error() -> None:
+    class TimingOutStream:
+        def __call__(self, **_kwargs: object) -> TimingOutStream:
+            return self
+
+        def __aiter__(self) -> TimingOutStream:
+            return self
+
+        async def __anext__(self) -> dict[str, Any]:
+            raise TimeoutError("stream stalled")
+
+    secrets = InMemorySecretStore()
+    secrets.set_api_key("openrouter", "or-secret")
+    client = OpenRouterClient(
+        secret_store=secrets,
+        stream_transport=TimingOutStream(),
+        call_deadline_seconds=lambda: 45.0,
+    )
+
+    async def collect() -> None:
+        async for _chunk in client.stream_chat(
+            ChatRequest(
+                provider="openrouter",
+                model_id="openai/gpt-4o-mini",
+                messages=(ChatMessage(role="player", body="Open it."),),
+            )
+        ):
+            pass
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(collect())
+
+    assert exc_info.value.category is ProviderErrorCategory.NETWORK_ERROR
+    assert exc_info.value.retry_attempt_count == 1
+    assert exc_info.value.max_retry_attempts == 1
 
 
 def test_openrouter_chat_renders_state_change_and_media_asset_sections() -> None:

@@ -11,6 +11,7 @@ from bragi.providers.retry import (
     MAX_BACKOFF_SECONDS,
     call_with_provider_retries,
     is_transient_provider_error,
+    stream_with_provider_deadline,
 )
 
 
@@ -315,6 +316,105 @@ def test_call_with_provider_retries_retries_408_request_timeout(
     asyncio.run(run())
 
 
+def test_call_with_provider_retries_wraps_attempt_in_remaining_hard_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        timeout_delays: list[float] = []
+
+        class ExpiringTimeout:
+            async def __aenter__(self) -> None:
+                return None
+
+            async def __aexit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                del exc_type, exc, traceback
+                raise TimeoutError
+
+        def fake_timeout(delay: float) -> ExpiringTimeout:
+            timeout_delays.append(delay)
+            return ExpiringTimeout()
+
+        async def operation() -> dict[str, object]:
+            return {"body": "too late"}
+
+        monkeypatch.setattr("bragi.providers.retry.asyncio.timeout", fake_timeout)
+        monkeypatch.setattr(
+            "bragi.providers.retry.log_error_event",
+            lambda *_args, **_kwargs: None,
+        )
+
+        with pytest.raises(ProviderError) as exc_info:
+            await call_with_provider_retries(
+                operation,
+                provider="fake",
+                task="chat",
+                max_attempts=1,
+                call_deadline_seconds=0.25,
+            )
+
+        assert len(timeout_delays) == 1
+        assert 0 < timeout_delays[0] <= 0.25
+        assert exc_info.value.category is ProviderErrorCategory.NETWORK_ERROR
+        assert exc_info.value.retry_attempt_count == 1
+        assert exc_info.value.max_retry_attempts == 1
+        assert exc_info.value.diagnostics["deadline_exceeded"] is True
+
+    asyncio.run(run())
+
+
+def test_stream_deadline_scope_closes_before_chunk_reaches_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        timeout_active = False
+
+        class TrackingTimeout:
+            async def __aenter__(self) -> None:
+                nonlocal timeout_active
+                timeout_active = True
+
+            async def __aexit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                nonlocal timeout_active
+                del exc_type, exc, traceback
+                timeout_active = False
+
+            def expired(self) -> bool:
+                return False
+
+        async def source() -> Any:
+            yield {"delta": "first"}
+            yield {"delta": "second"}
+
+        monkeypatch.setattr(
+            "bragi.providers.retry.asyncio.timeout",
+            lambda _delay: TrackingTimeout(),
+        )
+
+        received: list[dict[str, str]] = []
+        async for chunk in stream_with_provider_deadline(
+            source(),
+            provider="fake",
+            task="chat",
+            call_deadline_seconds=45,
+        ):
+            assert timeout_active is False
+            received.append(chunk)
+
+        assert received == [{"delta": "first"}, {"delta": "second"}]
+
+    asyncio.run(run())
+
+
 def test_call_with_provider_retries_exhaustion_preserves_retry_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -471,7 +571,7 @@ def test_call_with_provider_retries_aborts_on_global_deadline(
     asyncio.run(run())
 
 
-def test_call_with_provider_retries_clamps_retry_delay_to_deadline_remaining(
+def test_call_with_provider_retries_rejects_backoff_that_consumes_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def run() -> None:
@@ -512,17 +612,19 @@ def test_call_with_provider_retries_clamps_retry_delay_to_deadline_remaining(
             lambda *_args, **_kwargs: None,
         )
 
-        result = await call_with_provider_retries(
-            operation,
-            provider="fake",
-            task="chat",
-            max_attempts=5,
-            call_deadline_seconds=2.0,
-        )
+        with pytest.raises(ProviderError) as exc_info:
+            await call_with_provider_retries(
+                operation,
+                provider="fake",
+                task="chat",
+                max_attempts=5,
+                call_deadline_seconds=2.0,
+            )
 
-        body = cast(dict[str, object], result)["body"]
-        assert body == "ok"
-        assert sleeps[0] == 1.9
+        assert attempts == 1
+        assert sleeps == []
+        assert exc_info.value.category is ProviderErrorCategory.NETWORK_ERROR
+        assert exc_info.value.diagnostics["deadline_exceeded"] is True
 
     asyncio.run(run())
 

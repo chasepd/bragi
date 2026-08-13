@@ -13,9 +13,14 @@ from bragi.retry_policy import (
     MODEL_OUTPUT_MAX_ATTEMPTS,
     PROVIDER_CALL_DEADLINE_SETTING,
     PROVIDER_MAX_ATTEMPTS,
+    RetryExecutionClass,
+    claim_narrator_regeneration,
     configured_max_attempts,
     configured_provider_call_deadline_seconds,
     configured_retry_count,
+    narrator_regeneration_budget,
+    resolved_retry_budget,
+    retry_execution_context,
     sanitize_provider_call_deadline_seconds,
     sanitize_retry_count,
 )
@@ -100,6 +105,9 @@ def test_provider_call_deadline_falls_back_when_repository_lookup_fails() -> Non
     [
         (True, DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS),
         ("45", DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS),
+        (float("nan"), DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS),
+        (float("inf"), DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS),
+        (float("-inf"), DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS),
         (1.0, MIN_PROVIDER_CALL_DEADLINE_SECONDS),
         (
             MAX_PROVIDER_CALL_DEADLINE_SECONDS + 30.0,
@@ -112,3 +120,44 @@ def test_provider_call_deadline_sanitizes_persisted_values(
     value: object, expected: float
 ) -> None:
     assert sanitize_provider_call_deadline_seconds(value) == expected
+
+
+def test_responsive_foreground_retry_budget_caps_provider_and_turn_retries() -> None:
+    repositories = RepositoryFake(value=9, deadline_value=120)
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        budget = resolved_retry_budget(repositories)
+
+    assert budget.provider_max_attempts == 2
+    assert budget.provider_call_deadline_seconds == 45.0
+    assert budget.automatic_turn_retry_allowed is False
+    assert budget.verification_max_attempts == 2
+
+
+@pytest.mark.parametrize(
+    "execution_class",
+    [
+        RetryExecutionClass.QUALITY_FOREGROUND,
+        RetryExecutionClass.BACKGROUND,
+    ],
+)
+def test_quality_and_background_retry_budgets_preserve_configured_behavior(
+    execution_class: RetryExecutionClass,
+) -> None:
+    repositories = RepositoryFake(value=3, deadline_value=90)
+
+    with retry_execution_context(execution_class):
+        budget = resolved_retry_budget(repositories)
+
+    assert budget.provider_max_attempts == 4
+    assert budget.provider_call_deadline_seconds == 90.0
+    assert budget.automatic_turn_retry_allowed is True
+    assert budget.verification_max_attempts == 4
+
+
+def test_narrator_regeneration_budget_is_shared_across_response_checks() -> None:
+    with narrator_regeneration_budget(max_regenerations=1):
+        assert claim_narrator_regeneration() is True
+        assert claim_narrator_regeneration() is False
+
+    assert claim_narrator_regeneration() is True

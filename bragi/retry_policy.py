@@ -13,7 +13,12 @@ turn.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from enum import StrEnum
+from math import isfinite
 from typing import Any
 
 RETRY_COUNT_SETTING = "retry_count"
@@ -34,6 +39,45 @@ PROVIDER_MAX_ATTEMPTS = DEFAULT_RETRY_COUNT + 1
 MODEL_OUTPUT_MAX_ATTEMPTS = DEFAULT_RETRY_COUNT + 1
 DEFERRED_WORK_MAX_ATTEMPTS = DEFAULT_RETRY_COUNT + 1
 
+RESPONSIVE_FOREGROUND_MAX_PROVIDER_ATTEMPTS = 2
+RESPONSIVE_FOREGROUND_CALL_DEADLINE_SECONDS = 45.0
+RESPONSIVE_FOREGROUND_VERIFICATION_MAX_ATTEMPTS = 2
+
+
+class RetryExecutionClass(StrEnum):
+    """Request class used to resolve internal retry and deadline budgets."""
+
+    QUALITY_FOREGROUND = "quality_foreground"
+    RESPONSIVE_FOREGROUND = "responsive_foreground"
+    BACKGROUND = "background"
+
+
+@dataclass(frozen=True)
+class ResolvedRetryBudget:
+    provider_max_attempts: int
+    provider_call_deadline_seconds: float
+    automatic_turn_retry_allowed: bool
+    verification_max_attempts: int
+
+
+_RETRY_EXECUTION_CLASS: ContextVar[RetryExecutionClass] = ContextVar(
+    "bragi_retry_execution_class",
+    default=RetryExecutionClass.QUALITY_FOREGROUND,
+)
+
+
+@dataclass
+class _NarratorRegenerationBudgetState:
+    remaining: int
+
+
+_NARRATOR_REGENERATION_BUDGET: ContextVar[
+    _NarratorRegenerationBudgetState | None
+] = ContextVar(
+    "bragi_narrator_regeneration_budget",
+    default=None,
+)
+
 
 def sanitize_retry_count(value: object) -> int:
     """Return a safe retry count for persisted or API-provided values."""
@@ -48,9 +92,12 @@ def sanitize_provider_call_deadline_seconds(value: object) -> float:
 
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS
+    numeric_value = float(value)
+    if not isfinite(numeric_value):
+        return DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS
     return float(
         min(
-            max(float(value), MIN_PROVIDER_CALL_DEADLINE_SECONDS),
+            max(numeric_value, MIN_PROVIDER_CALL_DEADLINE_SECONDS),
             MAX_PROVIDER_CALL_DEADLINE_SECONDS,
         )
     )
@@ -92,6 +139,93 @@ def configured_max_attempts(repositories: Any | None = None) -> int:
     """Return initial attempt plus the configured retry count."""
 
     return configured_retry_count(repositories) + 1
+
+
+@contextmanager
+def retry_execution_context(
+    execution_class: RetryExecutionClass,
+) -> Iterator[None]:
+    """Temporarily apply retry behavior to provider calls in this async context."""
+
+    token = _RETRY_EXECUTION_CLASS.set(execution_class)
+    try:
+        yield
+    finally:
+        _RETRY_EXECUTION_CLASS.reset(token)
+
+
+def current_retry_execution_class() -> RetryExecutionClass:
+    return _RETRY_EXECUTION_CLASS.get()
+
+
+@contextmanager
+def narrator_regeneration_budget(
+    *,
+    max_regenerations: int | None,
+) -> Iterator[None]:
+    """Share a narrator regeneration allowance across all response checks.
+
+    ``None`` preserves the configured quality/background behavior, where each
+    check retains its own attempt loop. Responsive foreground turns instead
+    install one shared mutable allowance that is propagated into the turn task.
+    """
+
+    state = (
+        None
+        if max_regenerations is None
+        else _NarratorRegenerationBudgetState(remaining=max(0, max_regenerations))
+    )
+    token = _NARRATOR_REGENERATION_BUDGET.set(state)
+    try:
+        yield
+    finally:
+        _NARRATOR_REGENERATION_BUDGET.reset(token)
+
+
+def claim_narrator_regeneration() -> bool:
+    """Claim one shared regeneration, or allow configured unbounded behavior."""
+
+    state = _NARRATOR_REGENERATION_BUDGET.get()
+    if state is None:
+        return True
+    if state.remaining <= 0:
+        return False
+    state.remaining -= 1
+    return True
+
+
+def resolved_retry_budget(
+    repositories: Any | None = None,
+) -> ResolvedRetryBudget:
+    """Resolve provider and turn retry limits for the current execution context."""
+
+    provider_max_attempts = configured_max_attempts(repositories)
+    provider_call_deadline_seconds = configured_provider_call_deadline_seconds(
+        repositories
+    )
+    execution_class = current_retry_execution_class()
+    if execution_class is RetryExecutionClass.RESPONSIVE_FOREGROUND:
+        return ResolvedRetryBudget(
+            provider_max_attempts=min(
+                provider_max_attempts,
+                RESPONSIVE_FOREGROUND_MAX_PROVIDER_ATTEMPTS,
+            ),
+            provider_call_deadline_seconds=min(
+                provider_call_deadline_seconds,
+                RESPONSIVE_FOREGROUND_CALL_DEADLINE_SECONDS,
+            ),
+            automatic_turn_retry_allowed=False,
+            verification_max_attempts=min(
+                provider_max_attempts,
+                RESPONSIVE_FOREGROUND_VERIFICATION_MAX_ATTEMPTS,
+            ),
+        )
+    return ResolvedRetryBudget(
+        provider_max_attempts=provider_max_attempts,
+        provider_call_deadline_seconds=provider_call_deadline_seconds,
+        automatic_turn_retry_allowed=True,
+        verification_max_attempts=provider_max_attempts,
+    )
 
 
 RetryCountResolver = Callable[[], int]

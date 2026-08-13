@@ -951,12 +951,13 @@ function ModelSettings({ settings, updateLocal, disabled }: { settings?: Setting
       <ModelRoutingProfileControls settings={settings} />
       <SimpleModelSelectorSettings settings={settings} disabled={disabled} />
       <RoleplaySharedModelSettings settings={settings} updateLocal={updateLocal} disabled={disabled} />
-      {settings.retry_count ? (
+      {settings.retry_count || settings.provider_call_deadline_seconds ? (
         <AdvancedSettingsSection
           title="Retry policy"
-          summary="Retries after first attempt."
+          summary="Retries and total provider-call deadline."
         >
-          <NumberSetting control={settings.retry_count} disabled={disabled} updateLocal={updateLocal} />
+          {settings.retry_count ? <NumberSetting control={settings.retry_count} disabled={disabled} updateLocal={updateLocal} /> : null}
+          {settings.provider_call_deadline_seconds ? <NumberSetting control={settings.provider_call_deadline_seconds} disabled={disabled} updateLocal={updateLocal} /> : null}
         </AdvancedSettingsSection>
       ) : null}
       {groups.length || fallbacks.length || otherSelectors.length ? (

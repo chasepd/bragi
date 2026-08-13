@@ -6167,6 +6167,10 @@ def test_settings_api_scopes_settings_and_enforces_roles(
             "/api/settings/scoped",
             json={"key": "retry_count", "value": 99},
         )
+        admin_deadline_saved = admin_client.post(
+            "/api/settings/scoped",
+            json={"key": "provider_call_deadline_seconds", "value": 999},
+        )
         admin_updated_settings = admin_client.get("/api/settings")
 
         assert user_client.post(
@@ -6204,6 +6208,10 @@ def test_settings_api_scopes_settings_and_enforces_roles(
         user_retry_setting = user_client.post(
             "/api/settings/scoped",
             json={"key": "retry_count", "value": 2},
+        )
+        user_deadline_setting = user_client.post(
+            "/api/settings/scoped",
+            json={"key": "provider_call_deadline_seconds", "value": 45},
         )
         user_provider_key = user_client.post(
             "/api/settings/provider-key",
@@ -6257,8 +6265,16 @@ def test_settings_api_scopes_settings_and_enforces_roles(
         "step": 1,
     }
     assert admin_retry_saved.status_code == 200
+    assert admin_deadline_saved.status_code == 200
     assert admin_updated_settings.status_code == 200
     assert admin_updated_settings.json()["retry_count"]["value"] == 10
+    assert admin_updated_settings.json()["provider_call_deadline_seconds"] == {
+        "setting_key": "provider_call_deadline_seconds",
+        "value": 600.0,
+        "minimum": 5,
+        "maximum": 600,
+        "step": 1,
+    }
     assert user_settings.json()["visible_sections"] == [
         "save",
         "local",
@@ -6276,6 +6292,7 @@ def test_settings_api_scopes_settings_and_enforces_roles(
     assert user_other_save.status_code == 404
     assert user_admin_setting.status_code == 403
     assert user_retry_setting.status_code == 403
+    assert user_deadline_setting.status_code == 403
     assert user_provider_key.status_code == 403
     assert (
         state.repositories.get_effective_setting(
@@ -6306,6 +6323,10 @@ def test_settings_api_scopes_settings_and_enforces_roles(
         is None
     )
     assert state.repositories.get_effective_setting("retry_count") == 10
+    assert (
+        state.repositories.get_effective_setting("provider_call_deadline_seconds")
+        == 600.0
+    )
     assert child_settings.status_code == 200
     assert child_settings.json()["visible_sections"] == ["local"]
     assert child_settings.json()["user_narration_guidance"] == {

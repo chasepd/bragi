@@ -2,10 +2,49 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from types import SimpleNamespace
 
 import pytest
 
+from bragi.retry_policy import RetryExecutionClass, retry_execution_context
+from bragi_web import runtime as runtime_module
 from bragi_web.runtime import RuntimeAccessLock, SaveEventHub
+
+
+def test_provider_clients_resolve_retry_budget_from_execution_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[dict[str, object]] = []
+
+    class RecordingProvider:
+        def __init__(self, **kwargs: object) -> None:
+            clients.append(kwargs)
+
+    class RepositoryFake:
+        def get_effective_setting(self, key: str) -> object:
+            return 6 if key == "retry_count" else 120
+
+    monkeypatch.delenv("BRAGI_WEB_FAKE_PROVIDERS", raising=False)
+    monkeypatch.setattr(
+        runtime_module,
+        "bragi_runtime_bindings",
+        lambda: SimpleNamespace(
+            OpenRouterClient=RecordingProvider,
+            VeniceClient=RecordingProvider,
+        ),
+    )
+
+    runtime_module._provider_clients(object(), repositories=RepositoryFake())
+
+    retry_resolver = clients[0]["retry_max_attempts"]
+    deadline_resolver = clients[0]["call_deadline_seconds"]
+    assert callable(retry_resolver)
+    assert callable(deadline_resolver)
+    assert retry_resolver() == 7
+    assert deadline_resolver() == 120.0
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        assert retry_resolver() == 2
+        assert deadline_resolver() == 45.0
 
 
 def test_runtime_access_lock_excludes_sync_access_during_async_access() -> None:

@@ -55,8 +55,12 @@ from bragi.providers.http_client import SAFE_PROVIDER_RESPONSE_HEADERS
 from bragi.providers.retry import is_transient_provider_error
 from bragi.redaction import redact_text
 from bragi.retry_policy import (
-    configured_max_attempts,
+    RetryExecutionClass,
+    claim_narrator_regeneration,
     configured_retry_count,
+    current_retry_execution_class,
+    narrator_regeneration_budget,
+    resolved_retry_budget,
 )
 from bragi.services.action_choice_flags import scenario_action_choices_enabled
 from bragi.services.action_choice_service import (
@@ -1565,34 +1569,44 @@ class ChatService:
 
         automatic_retry_category: str | None = None
         automatic_retry_delay_ms: int | None = None
-        for attempt in (1, 2):
+        retry_budget = resolved_retry_budget(self.repositories)
+        max_turn_attempts = 2 if retry_budget.automatic_turn_retry_allowed else 1
+        for attempt in range(1, max_turn_attempts + 1):
             try:
-                result = await asyncio.create_task(
-                    self._submit_existing_player_turn_once(
-                        save_id=save_id,
-                        player_message_id=player_message_id,
-                        source_message_role=source_message_role,
-                        run_post_turn_jobs=run_post_turn_jobs,
-                        await_post_turn_jobs=await_post_turn_jobs,
-                        defer_action_choices=defer_action_choices,
-                        turn_started=started_at,
-                        log_turn_started=log_turn_started and attempt == 1,
-                        summarize_before_context=summarize_before_context,
-                        regeneration_feedback=regeneration_feedback,
-                        turn_directive=turn_directive,
-                        current_user_id=current_user_id,
-                        cancellation_token=token,
-                        cancellation_requested=cancellation_requested,
-                        retry_progress_callback=retry_progress_callback,
-                        narrator_stream_callback=narrator_stream_callback,
-                        turn_progress_callback=turn_progress_callback,
-                        _turn_progress=turn_progress,
-                        automatic_retry_attempt=attempt - 1,
-                        automatic_retry_category=automatic_retry_category,
-                        automatic_retry_delay_ms=automatic_retry_delay_ms,
-                    )
+                max_regenerations = (
+                    None
+                    if retry_budget.automatic_turn_retry_allowed
+                    else max(0, retry_budget.verification_max_attempts - 1)
                 )
-                if attempt == 2:
+                with narrator_regeneration_budget(
+                    max_regenerations=max_regenerations
+                ):
+                    result = await asyncio.create_task(
+                        self._submit_existing_player_turn_once(
+                            save_id=save_id,
+                            player_message_id=player_message_id,
+                            source_message_role=source_message_role,
+                            run_post_turn_jobs=run_post_turn_jobs,
+                            await_post_turn_jobs=await_post_turn_jobs,
+                            defer_action_choices=defer_action_choices,
+                            turn_started=started_at,
+                            log_turn_started=log_turn_started and attempt == 1,
+                            summarize_before_context=summarize_before_context,
+                            regeneration_feedback=regeneration_feedback,
+                            turn_directive=turn_directive,
+                            current_user_id=current_user_id,
+                            cancellation_token=token,
+                            cancellation_requested=cancellation_requested,
+                            retry_progress_callback=retry_progress_callback,
+                            narrator_stream_callback=narrator_stream_callback,
+                            turn_progress_callback=turn_progress_callback,
+                            _turn_progress=turn_progress,
+                            automatic_retry_attempt=attempt - 1,
+                            automatic_retry_category=automatic_retry_category,
+                            automatic_retry_delay_ms=automatic_retry_delay_ms,
+                        )
+                    )
+                if attempt > 1:
                     log_event(
                         "chat.automatic_turn_retry_succeeded",
                         save_id=save_id,
@@ -1604,17 +1618,18 @@ class ChatService:
                     )
                 return result
             except ProviderError as exc:
-                if attempt == 2:
-                    log_error_event(
-                        "chat.automatic_turn_retry_failed",
-                        save_id=save_id,
-                        player_message_id=player_message_id,
-                        automatic_retry_attempt=1,
-                        automatic_retry_category=automatic_retry_category,
-                        automatic_retry_delay_ms=automatic_retry_delay_ms,
-                        automatic_retry_outcome="failed",
-                        **exception_log_fields(exc),
-                    )
+                if attempt >= max_turn_attempts:
+                    if attempt > 1:
+                        log_error_event(
+                            "chat.automatic_turn_retry_failed",
+                            save_id=save_id,
+                            player_message_id=player_message_id,
+                            automatic_retry_attempt=1,
+                            automatic_retry_category=automatic_retry_category,
+                            automatic_retry_delay_ms=automatic_retry_delay_ms,
+                            automatic_retry_outcome="failed",
+                            **exception_log_fields(exc),
+                        )
                     raise
                 if not is_transient_provider_error(
                     exc
@@ -1676,7 +1691,7 @@ class ChatService:
                     )
                     raise
             except (ChatTurnCancelled, asyncio.CancelledError):
-                if attempt == 2:
+                if attempt > 1:
                     log_event(
                         "chat.automatic_turn_retry_cancelled",
                         save_id=save_id,
@@ -1688,7 +1703,7 @@ class ChatService:
                     )
                 raise
             except Exception as exc:
-                if attempt == 2:
+                if attempt > 1:
                     log_error_event(
                         "chat.automatic_turn_retry_failed",
                         save_id=save_id,
@@ -3589,7 +3604,9 @@ class ChatService:
         current_completion = completion
         current_response = response
         current_body = narrator_body
-        max_attempt_count = configured_max_attempts(self.repositories)
+        max_attempt_count = resolved_retry_budget(
+            self.repositories
+        ).verification_max_attempts
         violations = denied_phrase_violations(
             current_body,
             phrases=phrase_denylist,
@@ -3612,6 +3629,8 @@ class ChatService:
                     narrator_body=current_body,
                     diagnostics=diagnostics,
                 )
+            if not claim_narrator_regeneration():
+                break
             log_debug_event(
                 "chat.narrator_phrase_denylist_violation",
                 save_id=save_id,
@@ -3695,7 +3714,9 @@ class ChatService:
         retry_progress_callback: ProviderRetryProgressCallback | None,
     ) -> _NarratorScriptGuardTurnResult:
         mode = script_guard_mode(self.repositories, save_id=save_id)
-        max_attempt_count = configured_max_attempts(self.repositories)
+        max_attempt_count = resolved_retry_budget(
+            self.repositories
+        ).verification_max_attempts
         violations = _narrator_script_policy_violations(
             repositories=self.repositories,
             save_id=save_id,
@@ -3730,6 +3751,8 @@ class ChatService:
         current_response = response
         current_body = narrator_body
         for attempt in range(2, max_attempt_count + 1):
+            if not claim_narrator_regeneration():
+                break
             retry_base = replace(
                 fallback_request_base,
                 regeneration_feedback=_combine_regeneration_feedback(
@@ -3872,11 +3895,17 @@ class ChatService:
         current_completion = completion
         current_response = response
         current_body = narrator_body
-        max_attempt_count = configured_max_attempts(self.repositories)
+        max_attempt_count = resolved_retry_budget(
+            self.repositories
+        ).verification_max_attempts
         current_audit = first_audit
         attempt_count = 1
         retry_empty = False
+        retry_used = False
         for attempt in range(2, max_attempt_count + 1):
+            if not claim_narrator_regeneration():
+                break
+            retry_used = True
             retry_base = replace(
                 fallback_request_base,
                 regeneration_feedback=_combine_regeneration_feedback(
@@ -3933,7 +3962,7 @@ class ChatService:
                     "second": current_audit.to_json(),
                     "attempt_count": attempt_count,
                     "max_attempts": max_attempt_count,
-                    "auto_retry_used": True,
+                    "auto_retry_used": retry_used,
                     "retry_empty": retry_empty,
                     "suspicious": suspicious,
                 }
@@ -3982,7 +4011,10 @@ class ChatService:
             else None
         )
         use_streaming = (
-            narrator_stream_callback is not None and streaming_provider is not None
+            narrator_stream_callback is not None
+            and streaming_provider is not None
+            and current_retry_execution_class()
+            is not RetryExecutionClass.RESPONSIVE_FOREGROUND
         )
         diagnostics: dict[str, object] = {
             "original_provider": request.provider,
@@ -3995,7 +4027,9 @@ class ChatService:
             "transport_mode": "streaming" if use_streaming else "non_streaming",
         }
         try:
-            if streaming_provider is not None and narrator_stream_callback is not None:
+            if use_streaming:
+                assert streaming_provider is not None
+                assert narrator_stream_callback is not None
                 response = await self._complete_streaming_chat(
                     provider=streaming_provider,
                     request=request,
@@ -6927,7 +6961,7 @@ class ChatService:
         ):
             return _NarratorVerificationTurnResult(diagnostics={})
         max_attempt_count = (
-            configured_max_attempts(self.repositories)
+            resolved_retry_budget(self.repositories).verification_max_attempts
             if max_attempt_count is None
             else max_attempt_count
         )
@@ -6997,6 +7031,7 @@ class ChatService:
             not retry_for_verification
             and not retry_for_npc
             or attempt_count >= max_attempt_count
+            or not claim_narrator_regeneration()
         ):
             return _NarratorVerificationTurnResult(
                 diagnostics=diagnostics,

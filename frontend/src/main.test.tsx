@@ -274,6 +274,7 @@ function modelSettingsPayload(overrides: Partial<SettingsModel> = {}): SettingsM
     roleplay_model_groups: [],
     scenario_section_model_selectors: [],
     retry_count: { setting_key: "retry_count", value: 6, minimum: 0, maximum: 10, step: 1 },
+    provider_call_deadline_seconds: { setting_key: "provider_call_deadline_seconds", value: 120, minimum: 5, maximum: 600, step: 1 },
     ...overrides
   };
 }
@@ -20763,17 +20764,23 @@ describe("frontend helpers", () => {
     await userEvent.click(retryToggle);
 
     const retryCount = screen.getByLabelText("Retries after first");
+    const providerDeadline = screen.getByLabelText("Provider Call Deadline (seconds)");
     expect(retryCount).toHaveValue(6);
+    expect(providerDeadline).toHaveValue(120);
     await userEvent.clear(retryCount);
     await userEvent.type(retryCount, "2");
     fireEvent.blur(retryCount);
+    await userEvent.clear(providerDeadline);
+    await userEvent.type(providerDeadline, "45");
+    fireEvent.blur(providerDeadline);
 
-    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/scoped")).toBe(true));
-    const retryCall = fetchMock.mock.calls.find(([path]) => path === "/api/settings/scoped");
-    expect(JSON.parse(String(retryCall?.[1]?.body))).toEqual({
-      key: "retry_count",
-      value: 2
-    });
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([path]) => path === "/api/settings/scoped")).toHaveLength(2));
+    expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .map(([, init]) => JSON.parse(String(init.body)))).toEqual([
+        { key: "retry_count", value: 2 },
+        { key: "provider_call_deadline_seconds", value: 45 }
+      ]);
   });
 
   it("renders provider generation settings with metadata support gates", async () => {

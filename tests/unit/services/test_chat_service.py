@@ -55,6 +55,7 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.structured_schema import validate_strict_json_schema
+from bragi.retry_policy import RetryExecutionClass, retry_execution_context
 from bragi.services import chat_service as chat_service_module
 from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_SETTING,
@@ -2661,8 +2662,17 @@ def test_submit_player_turn_applies_phrase_guard_before_persisting_narrator(
     ]
 
 
-def test_submit_player_turn_phrase_guard_fails_after_seven_total_attempts(
+@pytest.mark.parametrize(
+    ("execution_class", "expected_requests"),
+    [
+        (RetryExecutionClass.QUALITY_FOREGROUND, 7),
+        (RetryExecutionClass.RESPONSIVE_FOREGROUND, 2),
+    ],
+)
+def test_submit_player_turn_phrase_guard_respects_regeneration_budget(
     repositories: PersistenceRepositories,
+    execution_class: RetryExecutionClass,
+    expected_requests: int,
 ) -> None:
     scenario = repositories.create_scenario(
         type="full_roleplay",
@@ -2701,7 +2711,10 @@ def test_submit_player_turn_phrase_guard_fails_after_seven_total_attempts(
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
 
-    with pytest.raises(ValueError, match="generated text phrase denylist"):
+    with (
+        retry_execution_context(execution_class),
+        pytest.raises(ValueError, match="generated text phrase denylist"),
+    ):
         asyncio.run(
             service.submit_player_turn(
                 save_id=save.id,
@@ -2711,9 +2724,65 @@ def test_submit_player_turn_phrase_guard_fails_after_seven_total_attempts(
             )
         )
 
-    assert len(provider.chat_requests) == 7
+    assert len(provider.chat_requests) == expected_requests
     persisted = repositories.list_messages(save.id)
     assert [message.role for message in persisted] == ["player"]
+
+
+def test_responsive_regeneration_budget_is_shared_by_script_and_phrase_guards(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(
+        SCRIPT_GUARD_MODE_SETTING,
+        SCRIPT_GUARD_MODE_LATIN_ONLY_REJECT,
+    )
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=SAVE_GENERATED_PHRASE_DENYLIST_SETTING,
+        value="save-only phrase",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="openrouter",
+        model_id="anthropic/claude-3.5-sonnet",
+    )
+    provider = SequenceChatProvider(
+        "openrouter",
+        (
+            "玩家喜欢简洁叙事。",
+            "The save-only phrase lands flat.",
+            "The lantern holds.",
+        ),
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"openrouter": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    with (
+        retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND),
+        pytest.raises(ValueError, match="generated text phrase denylist"),
+    ):
+        asyncio.run(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+            )
+        )
+
+    assert len(provider.chat_requests) == 2
 
 
 def test_submit_player_turn_final_guard_repairs_script_violation_from_phrase_retry(
@@ -4494,6 +4563,79 @@ def test_submit_player_turn_uses_seven_attempts_after_narrator_passivity_issue(
     assert "gives the player space" in retry_feedback
     job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
     assert job_result["narrator_verifier"]["npc_passivity_issue_count"] == 1
+    assert job_result["narrator_verifier_retry_used"] is True
+
+
+def test_responsive_foreground_verification_allows_one_regeneration(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting(
+        RESPONSE_VERIFICATION_MODE_SETTING,
+        RESPONSE_VERIFICATION_MODE_RETRY_ONCE,
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = SequenceChatProvider(
+        "fake",
+        (
+            "Mara gives you space to decide what to do next.",
+            "Mara cuts across the stair and demands the beacon key.",
+        ),
+    )
+    spec = NarratorMessageSpec(
+        intent="Answer the player's move.",
+        thesis="Mara should put pressure on the beacon choice.",
+        must_say=(),
+        avoid=(),
+        tone="tense and grounded",
+        uncertainties=(),
+        evidence_source_ids=("character:mara",),
+    )
+    verifier = ScriptedNarratorVerifier(
+        NarratorVerificationResult(
+            passed=True,
+            npc_passivity_issues=(
+                "Mara has urgent leverage but only gives the player space.",
+            ),
+            confidence=0.88,
+        )
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+        narrator_planner=ScriptedNarratorPlanner(spec),
+        narrator_verifier=verifier,
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        result = asyncio.run(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+            )
+        )
+
+    assert len(provider.chat_requests) == 2
+    assert result.narrator_message.body == (
+        "Mara cuts across the stair and demands the beacon key."
+    )
+    job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
+    assert job_result["narrator_verifier_max_attempts"] == 2
     assert job_result["narrator_verifier_retry_used"] is True
 
 
@@ -10005,6 +10147,58 @@ def test_submit_player_turn_falls_back_when_stream_fails_before_text(
     assert result.narrator_message.body == "Fallback narrator response."
 
 
+def test_responsive_foreground_uses_one_non_streaming_provider_budget(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(SCRIPT_GUARD_MODE_SETTING, SCRIPT_GUARD_MODE_OFF)
+    repositories.set_scoped_setting(
+        scope="global",
+        key=GENERATED_PHRASE_DENYLIST_SETTING,
+        value="",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="openrouter",
+        model_id="anthropic/claude-3.5-sonnet",
+    )
+    provider = StreamingChatProvider(
+        "openrouter",
+        (ProviderError(ProviderErrorCategory.NETWORK_ERROR, "stream broke"),),
+        fallback_body="Responsive narrator response.",
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"openrouter": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+    drafts: list[str] = []
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        result = asyncio.run(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I strike the lens.",
+                run_post_turn_jobs=False,
+                narrator_stream_callback=drafts.append,
+            )
+        )
+
+    assert provider.stream_requests == []
+    assert len(provider.chat_requests) == 1
+    assert result.narrator_message.body == "Responsive narrator response."
+    job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
+    assert job_result["streaming_attempted"] is False
+    assert job_result["transport_mode"] == "non_streaming"
+
+
 def test_submit_player_turn_uses_configured_fallback_after_streaming_retry_failure(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -11217,6 +11411,54 @@ def test_submit_existing_player_turn_stops_after_one_automatic_replay(
     ]
 
 
+def test_responsive_foreground_does_not_replay_entire_turn(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Observatory",
+        premise="A sealed observatory waits above the city.",
+        player_role="Keeper",
+        content={"starting_scene": "The brass door is sealed."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Observatory")
+    source = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I open the observatory door.",
+        narration_status="pending",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = TransientThenSuccessfulChatProvider(
+        "fake",
+        (ProviderError(ProviderErrorCategory.NETWORK_ERROR, "socket closed"),),
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    with (
+        retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND),
+        pytest.raises(ProviderError, match="socket closed"),
+    ):
+        asyncio.run(
+            service.submit_existing_player_turn(
+                save_id=save.id,
+                player_message_id=source.id,
+                run_post_turn_jobs=False,
+            )
+        )
+
+    assert len(provider.chat_requests) == 1
+
+
 def test_submit_existing_player_turn_does_not_replay_permanent_provider_failure(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -11537,8 +11779,17 @@ def test_submit_player_turn_retries_once_after_npc_knowledge_leak(
     ]
 
 
-def test_submit_player_turn_soft_fails_by_default_when_retry_still_leaks(
+@pytest.mark.parametrize(
+    ("execution_class", "expected_requests"),
+    [
+        (RetryExecutionClass.QUALITY_FOREGROUND, 7),
+        (RetryExecutionClass.RESPONSIVE_FOREGROUND, 2),
+    ],
+)
+def test_submit_player_turn_soft_fail_respects_npc_audit_regeneration_budget(
     repositories: PersistenceRepositories,
+    execution_class: RetryExecutionClass,
+    expected_requests: int,
 ) -> None:
     scenario = repositories.create_scenario(
         type="full_roleplay",
@@ -11581,15 +11832,16 @@ def test_submit_player_turn_soft_fails_by_default_when_retry_still_leaks(
         npc_knowledge_audit_service=auditor,
     )
 
-    result = asyncio.run(
-        service.submit_player_turn(
-            save_id=save.id,
-            body="I ask Nira if she wants to enter the chart room.",
-            speaker_name="Avery",
+    with retry_execution_context(execution_class):
+        result = asyncio.run(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I ask Nira if she wants to enter the chart room.",
+                speaker_name="Avery",
+            )
         )
-    )
 
-    assert len(provider.chat_requests) == 7
+    assert len(provider.chat_requests) == expected_requests
     assert result.narrator_message.body == (
         "Nira says, \"Still, the archive-code joke happened immediately.\""
     )

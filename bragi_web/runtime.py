@@ -635,19 +635,20 @@ def _provider_clients(
     *,
     repositories: Any | None = None,
 ) -> dict[str, Any]:
-    from bragi.retry_policy import (
-        configured_max_attempts,
-        configured_provider_call_deadline_seconds,
-    )
+    from bragi.retry_policy import resolved_retry_budget
 
     bindings = bragi_runtime_bindings()
     retry_max_attempts = (
-        (lambda: configured_max_attempts(repositories))
+        (lambda: resolved_retry_budget(repositories).provider_max_attempts)
         if repositories is not None
         else None
     )
     call_deadline_seconds = (
-        (lambda: configured_provider_call_deadline_seconds(repositories))
+        (
+            lambda: resolved_retry_budget(
+                repositories
+            ).provider_call_deadline_seconds
+        )
         if repositories is not None
         else None
     )
