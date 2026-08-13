@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
+from math import isfinite
 from typing import Any
 
 RETRY_COUNT_SETTING = "retry_count"
@@ -65,6 +66,19 @@ _RETRY_EXECUTION_CLASS: ContextVar[RetryExecutionClass] = ContextVar(
 )
 
 
+@dataclass
+class _NarratorRegenerationBudgetState:
+    remaining: int
+
+
+_NARRATOR_REGENERATION_BUDGET: ContextVar[
+    _NarratorRegenerationBudgetState | None
+] = ContextVar(
+    "bragi_narrator_regeneration_budget",
+    default=None,
+)
+
+
 def sanitize_retry_count(value: object) -> int:
     """Return a safe retry count for persisted or API-provided values."""
 
@@ -78,9 +92,12 @@ def sanitize_provider_call_deadline_seconds(value: object) -> float:
 
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS
+    numeric_value = float(value)
+    if not isfinite(numeric_value):
+        return DEFAULT_PROVIDER_CALL_DEADLINE_SECONDS
     return float(
         min(
-            max(float(value), MIN_PROVIDER_CALL_DEADLINE_SECONDS),
+            max(numeric_value, MIN_PROVIDER_CALL_DEADLINE_SECONDS),
             MAX_PROVIDER_CALL_DEADLINE_SECONDS,
         )
     )
@@ -139,6 +156,42 @@ def retry_execution_context(
 
 def current_retry_execution_class() -> RetryExecutionClass:
     return _RETRY_EXECUTION_CLASS.get()
+
+
+@contextmanager
+def narrator_regeneration_budget(
+    *,
+    max_regenerations: int | None,
+) -> Iterator[None]:
+    """Share a narrator regeneration allowance across all response checks.
+
+    ``None`` preserves the configured quality/background behavior, where each
+    check retains its own attempt loop. Responsive foreground turns instead
+    install one shared mutable allowance that is propagated into the turn task.
+    """
+
+    state = (
+        None
+        if max_regenerations is None
+        else _NarratorRegenerationBudgetState(remaining=max(0, max_regenerations))
+    )
+    token = _NARRATOR_REGENERATION_BUDGET.set(state)
+    try:
+        yield
+    finally:
+        _NARRATOR_REGENERATION_BUDGET.reset(token)
+
+
+def claim_narrator_regeneration() -> bool:
+    """Claim one shared regeneration, or allow configured unbounded behavior."""
+
+    state = _NARRATOR_REGENERATION_BUDGET.get()
+    if state is None:
+        return True
+    if state.remaining <= 0:
+        return False
+    state.remaining -= 1
+    return True
 
 
 def resolved_retry_budget(
