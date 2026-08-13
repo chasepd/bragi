@@ -211,6 +211,15 @@ def test_list_chat_turn_outcomes_filters_stratum_and_reports_safe_route_flags(
         fast_path=False,
         combined_path=False,
     )
+    add_outcome(6, status="failed", mode="quality")
+    repositories.record_job_step(
+        job_id="outcome-job-6",
+        name="chat.responsiveness_stratum",
+        status="succeeded",
+        provider="fake",
+        model="next-chat",
+        metadata={"turn_responsiveness_mode": "responsive"},
+    )
 
     records = repositories.list_chat_turn_outcomes(
         save_id=save.id,
@@ -227,6 +236,18 @@ def test_list_chat_turn_outcomes_filters_stratum_and_reports_safe_route_flags(
         ("failed", None, None),
         ("succeeded", False, True),
         ("succeeded", True, False),
+    ]
+
+    executed_after_settings_change = repositories.list_chat_turn_outcomes(
+        save_id=save.id,
+        provider="fake",
+        model="next-chat",
+        mode="responsive",
+        limit=30,
+    )
+
+    assert [record.status for record in executed_after_settings_change] == [
+        "failed"
     ]
 
 

@@ -39,7 +39,10 @@ The response fields use two independent, bounded windows:
 - `sample_count` and `estimate` describe the latest 30 successful
   response-committed turns. `estimate` contains nearest-rank `p50_ms` and
   `p95_ms`, and remains `null` until five matching successes exist.
-- `outcomes` describes the latest 30 terminal turns. `failure_rate` is
+- `outcomes` describes the latest 30 terminal durable new-turn submissions:
+  player turns, story continuations, and timeskips. Recovery retries,
+  regenerations, and edit jobs are intentionally outside this comparison
+  window. `failure_rate` is
   `(failed_count + interrupted_count) / terminal_count`.
 - Route counts cover successful turns with route telemetry.
   `fast_path_count` is the deterministic fast path,
@@ -50,8 +53,10 @@ The response fields use two independent, bounded windows:
 
 For a trustworthy comparison:
 
-1. Use the same configured narrator provider and model for both modes. Do not
-   combine different provider/model strata.
+1. Use the same executed narrator provider and model for both modes. Bragi
+   records that stratum when the turn pipeline actually runs, so a settings
+   change while a queued turn waits does not relabel the eventual execution.
+   Do not combine different provider/model strata.
 2. Let normal use accumulate at least 20 successful turns in each mode. Either
    use comparable saves or switch one save's mode; the endpoint reports only
    the currently effective mode when requested.

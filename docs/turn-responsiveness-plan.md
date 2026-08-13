@@ -54,8 +54,10 @@ log before implementation.
 - `GET /api/chat/timing-summary?save_id=...`: authenticated aggregate timing for
   the effective responsiveness mode and current narrator provider/model. It
   returns no estimate until five matching successful turns exist. The response
-  also includes a latest-30 terminal outcome window with failure/interruption
-  rate and successful fast, combined, standard, and unclassified route counts.
+  also includes a latest-30 terminal durable new-submission window with
+  failure/interruption rate and successful fast, combined, standard, and
+  unclassified route counts. Recovery retries, regenerations, and edit jobs are
+  outside that comparison window.
 
 ### Job steps
 
@@ -70,6 +72,7 @@ log before implementation.
 - `chat.verification`
 - `chat.commit`
 - `chat.response_committed`
+- `chat.responsiveness_stratum`
 - `chat.responsiveness_route`
 - `post_turn.continuity_ready`
 - `post_turn.image_ready`
@@ -198,7 +201,10 @@ log when applicable.
   report latest-30 terminal failure/interruption rate and successful
   fast/combined/standard route usage in the same mode/provider/model stratum.
 - Snapshot the configured narrator provider/model in new durable web chat jobs
-  and record only two boolean adaptive-route flags after a successful turn.
+  for pre-execution failures. At the actual turn execution boundary, record the
+  effective mode and narrator provider/model; query that execution stratum in
+  preference to the creation snapshot. Record only two boolean adaptive-route
+  flags after a successful turn.
 - Keep older timing samples compatible and mark successes without route
   telemetry as unclassified.
 - Update troubleshooting and operator guidance.
@@ -364,7 +370,10 @@ For every program PR:
   snapshot, and propagation of the successful adaptive route to durable web
   telemetry. The implementation extends the existing authenticated timing
   summary with latest-30 terminal outcomes and records only configured
-  provider/model plus two boolean route flags. Older successful timing samples
+  provider/model, effective mode, and two boolean route flags. The first pinned
+  review found an Important race between creation-time settings and settings at
+  execution after continuity catch-up; execution-boundary stratum telemetry and
+  query precedence close that race. Older successful timing samples
   remain compatible and are explicitly unclassified when they predate route
   telemetry. Operator guidance now defines matched collection, formulas,
   privacy boundaries, small-sample handling, and paint-event measurement. The
@@ -443,10 +452,18 @@ For every program PR:
   aggregates, and add PR 8 as the gated closeout after deployment supplies
   enough matched organic samples.
 - 2026-08-13: Define the outcome window as the latest 30 terminal turns in the
-  current mode and configured narrator provider/model stratum, independent from
-  the latest 30 successful timing window. Count failed plus cancelled turns in
-  failure rate; count route usage only for successful classified turns and
+  current mode and executed narrator provider/model stratum, independent from
+  the latest 30 successful timing window. Scope it to durable new-turn
+  submissions: player turns, story continuations, and timeskips; exclude
+  recovery retries, regenerations, and edits. Count failed plus cancelled turns
+  in failure rate; count route usage only for successful classified turns and
   expose older successes as unclassified rather than guessing their route.
+- 2026-08-13: Treat creation-time mode/provider/model as a fallback only for a
+  durable submission that fails before the turn pipeline executes. Persist the
+  effective mode/provider/model at the actual ChatService execution boundary,
+  refresh it at narrator execution, and prefer the latest execution stratum in
+  aggregate queries so settings changes during queue or continuity waits cannot
+  misclassify a turn.
 
 ## Exact Next Action
 

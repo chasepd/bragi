@@ -211,6 +211,7 @@ _SAFE_TEXT_METADATA_KEYS = frozenset(
         "openrouter_selected_provider",
         "skipped_reason",
         "status",
+        "turn_responsiveness_mode",
     }
 )
 _SAFE_TEXT_LIST_METADATA_KEYS = frozenset(
@@ -14115,19 +14116,35 @@ class PersistenceRepositories:
               ON step.job_id = job.id
              AND step.name = 'chat.response_committed'
              AND step.status = 'succeeded'
+            LEFT JOIN job_steps AS stratum
+              ON stratum.id = (
+                   SELECT candidate.id
+                   FROM job_steps AS candidate
+                   WHERE candidate.job_id = job.id
+                     AND candidate.name = 'chat.responsiveness_stratum'
+                     AND candidate.status = 'succeeded'
+                   ORDER BY candidate.completed_at DESC, candidate.rowid DESC
+                   LIMIT 1
+                 )
             WHERE submission.save_id = ?
               AND job.type = 'chat_turn'
               AND job.status = 'succeeded'
               AND narrator.role = 'narrator'
               AND COALESCE(
+                    stratum.provider,
                     json_extract(job.payload_json, '$.narrator_provider'),
                     narrator.provider
                   ) = ?
               AND COALESCE(
+                    stratum.model,
                     json_extract(job.payload_json, '$.narrator_model'),
                     narrator.model
                   ) = ?
               AND COALESCE(
+                    json_extract(
+                      stratum.metadata_json,
+                      '$.turn_responsiveness_mode'
+                    ),
                     json_extract(job.payload_json, '$.turn_responsiveness_mode'),
                     'quality'
                   ) = ?
@@ -14181,18 +14198,34 @@ class PersistenceRepositories:
               ON route.job_id = job.id
              AND route.name = 'chat.responsiveness_route'
              AND route.status = 'succeeded'
+            LEFT JOIN job_steps AS stratum
+              ON stratum.id = (
+                   SELECT candidate.id
+                   FROM job_steps AS candidate
+                   WHERE candidate.job_id = job.id
+                     AND candidate.name = 'chat.responsiveness_stratum'
+                     AND candidate.status = 'succeeded'
+                   ORDER BY candidate.completed_at DESC, candidate.rowid DESC
+                   LIMIT 1
+                 )
             WHERE submission.save_id = ?
               AND job.type = 'chat_turn'
               AND job.status IN ('succeeded', 'failed', 'cancelled')
               AND COALESCE(
+                    stratum.provider,
                     json_extract(job.payload_json, '$.narrator_provider'),
                     narrator.provider
                   ) = ?
               AND COALESCE(
+                    stratum.model,
                     json_extract(job.payload_json, '$.narrator_model'),
                     narrator.model
                   ) = ?
               AND COALESCE(
+                    json_extract(
+                      stratum.metadata_json,
+                      '$.turn_responsiveness_mode'
+                    ),
                     json_extract(job.payload_json, '$.turn_responsiveness_mode'),
                     'quality'
                   ) = ?

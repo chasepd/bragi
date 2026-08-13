@@ -44,6 +44,7 @@ _SAFE_TEXT_METADATA_KEYS = frozenset(
     {
         "openrouter_selected_model",
         "openrouter_selected_provider",
+        "turn_responsiveness_mode",
     }
 )
 _SAFE_TEXT_LIST_METADATA_KEYS = frozenset({"openrouter_provider_attempts"})

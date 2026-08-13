@@ -10015,6 +10015,14 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
         "responsive_fast_path_used": False,
         "responsive_turn_plan_used": False,
     }
+    stratum_step = next(
+        step
+        for step in repositories.list_job_steps(job_id)
+        if step.name == "chat.responsiveness_stratum"
+    )
+    assert stratum_step.provider == "fake"
+    assert stratum_step.model == "fake-chat"
+    assert stratum_step.metadata == {"turn_responsiveness_mode": "quality"}
 
 
 def test_post_turn_jobs_expose_initial_phase_progress_before_runtime_callback(
