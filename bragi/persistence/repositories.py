@@ -16424,8 +16424,7 @@ def _safe_job_step_metadata(
     for key, value in (metadata or {}).items():
         normalized_key = str(key)
         if isinstance(value, bool):
-            if normalized_key == "changed":
-                safe[normalized_key] = value
+            safe[normalized_key] = value
             continue
         if isinstance(value, int | float):
             safe[normalized_key] = value

@@ -232,6 +232,7 @@ from bragi.services.provider_diagnostics import safe_provider_error_diagnostics
 from bragi.services.provider_fallbacks import structured_output_with_fallback
 from bragi.services.runtime_telemetry import (
     provider_task_context,
+    runtime_job_step,
     runtime_telemetry_context,
 )
 from bragi.services.scenario_evolution_policy import scenario_evolution_turn_interval
@@ -4099,13 +4100,14 @@ class ChatService:
     ) -> _ChatCompletionResult:
         if not enabled:
             return completion
-        safety = await self.content_safety_service.review_narration(
-            body=completion.response.body,
-            content_rating=completion.request.content_rating,
-            fade_to_black_enabled=completion.request.fade_to_black_enabled,
-            save_id=save_id,
-            source_request=completion.request,
-        )
+        with runtime_job_step("chat.output_safety", root=True):
+            safety = await self.content_safety_service.review_narration(
+                body=completion.response.body,
+                content_rating=completion.request.content_rating,
+                fade_to_black_enabled=completion.request.fade_to_black_enabled,
+                save_id=save_id,
+                source_request=completion.request,
+            )
         safety_diagnostics = {
             "action": safety.action.value,
             "minimum_rating": safety.minimum_rating,
@@ -6892,7 +6894,8 @@ class ChatService:
         if planner is None:
             return None
         try:
-            return await planner.plan(save_id=save_id, request=request)
+            with runtime_job_step("chat.narrator_planning", root=True):
+                return await planner.plan(save_id=save_id, request=request)
         except Exception as exc:
             log_error_event(
                 "chat.narrator_planning_failed",

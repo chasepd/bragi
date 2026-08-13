@@ -8765,6 +8765,126 @@ def test_chat_turn_uses_runtime_pre_narrator_phase_progress(
     )
 
 
+def test_chat_turn_persists_user_facing_phase_spans(tmp_path: Path) -> None:
+    class TimedProgressRuntime(_RuntimeDouble):
+        async def submit_player_message_for_initial_render(
+            self,
+            *,
+            body: str,
+            speaker_name: str | None,
+            active_save_id: object,
+            turn_progress_callback: Callable[[object], None] | None = None,
+        ) -> object:
+            del body, speaker_name, active_save_id
+            assert turn_progress_callback is not None
+            statuses = {name: "pending" for name in _EXPECTED_CHAT_TURN_PHASES}
+
+            def publish(status_text: str, **updates: str) -> None:
+                statuses.update(updates)
+                turn_progress_callback(
+                    {
+                        "status_text": status_text,
+                        "jobs": [
+                            {"name": name, "status": statuses[name]}
+                            for name in _EXPECTED_CHAT_TURN_PHASES
+                        ],
+                    }
+                )
+
+            publish(
+                "Checking submitted content",
+                submission="succeeded",
+                classification="running",
+                history="running",
+            )
+            publish(
+                "Saving player input",
+                classification="succeeded",
+                history="succeeded",
+                input="running",
+            )
+            publish(
+                "Selecting context",
+                input="succeeded",
+                character_planning="running",
+                context_selection="running",
+            )
+            publish(
+                "Preparing narrator prompt",
+                character_planning="succeeded",
+                context_selection="succeeded",
+                prompt="running",
+            )
+            publish(
+                "Writing narrator response",
+                prompt="succeeded",
+                narrator="running",
+            )
+            publish(
+                "Checking response",
+                narrator="succeeded",
+                response_checks="running",
+            )
+            publish(
+                "Saving narrator response",
+                response_checks="succeeded",
+                save_narration="running",
+            )
+            publish(
+                "Narrator response saved",
+                save_narration="succeeded",
+                action_choices="skipped",
+            )
+            return SimpleNamespace(
+                model=_chat_model("The bell answers."),
+                has_post_turn_jobs=False,
+                save_id="save-1",
+                player_message_id="player-1",
+                narrator_message_id="narrator-1",
+            )
+
+    state = _state_double(tmp_path, TimedProgressRuntime())
+    persisted_steps: list[SimpleNamespace] = []
+
+    def record_job_step(**values: object) -> None:
+        persisted_steps.append(SimpleNamespace(**values))
+
+    state.repositories.record_job_step = record_job_step
+    state.jobs = JobRegistry(repositories=state.repositories)
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        created = client.post(
+            "/api/chat",
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
+        )
+        assert created.status_code == 200
+        job = _wait_for_terminal_job(
+            client,
+            created.json()["id"],
+            save_id="save-1",
+        )
+
+    assert job["status"] == "succeeded"
+    steps = persisted_steps
+    assert [step.name for step in steps] == [
+        "chat.preflight",
+        "chat.input_safety",
+        "chat.history",
+        "chat.character_planning",
+        "chat.context",
+        "chat.narrator_generation",
+        "chat.verification",
+        "chat.commit",
+        "chat.response_committed",
+    ]
+    assert all(step.status == "succeeded" for step in steps)
+    assert all(step.duration_ms is not None for step in steps)
+
+
 def test_timeskip_exposes_initial_pre_narrator_phase_progress(
     tmp_path: Path,
 ) -> None:

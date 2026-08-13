@@ -59,6 +59,7 @@ from bragi_common.story_continuation import (
 from bragi_web.auth_throttle import AuthAttemptThrottle
 from bragi_web.bragi_adapter import (
     bragi_diagnostics_bindings,
+    bragi_runtime_bindings,
     bragi_settings_bindings,
     lazy_bragi_api_symbol,
     resolve_lazy_symbol,
@@ -257,6 +258,15 @@ _CHAT_TURN_PROGRESS_JOB_ORDER = (
     "save_narration",
     "action_choices",
 )
+_CHAT_TURN_TELEMETRY_STEPS = {
+    "classification": "chat.input_safety",
+    "history": "chat.history",
+    "character_planning": "chat.character_planning",
+    "context_selection": "chat.context",
+    "narrator": "chat.narrator_generation",
+    "response_checks": "chat.verification",
+    "save_narration": "chat.commit",
+}
 _REQUEST_STATE: ContextVar[WebAppState | None] = ContextVar(
     "bragi_request_state",
     default=None,
@@ -3269,7 +3279,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 turn_progress_callback,
                 flush_turn_progress,
                 latest_turn_progress_jobs,
-            ) = _turn_progress_callback(handle, initial_progress)
+            ) = _turn_progress_callback(
+                handle,
+                state.repositories,
+                initial_progress,
+            )
             retry_callback, flush_retry_progress = _retry_progress_callback(
                 handle,
                 task_label="chat",
@@ -3387,7 +3401,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 turn_progress_callback,
                 flush_turn_progress,
                 latest_turn_progress_jobs,
-            ) = _turn_progress_callback(handle, initial_progress)
+            ) = _turn_progress_callback(
+                handle,
+                state.repositories,
+                initial_progress,
+            )
             retry_callback, flush_retry_progress = _retry_progress_callback(
                 handle,
                 task_label="chat",
@@ -3620,7 +3638,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 turn_progress_callback,
                 flush_turn_progress,
                 latest_turn_progress_jobs,
-            ) = _turn_progress_callback(handle, initial_progress)
+            ) = _turn_progress_callback(
+                handle,
+                state.repositories,
+                initial_progress,
+            )
             retry_callback, flush_retry_progress = _retry_progress_callback(
                 handle,
                 task_label="chat",
@@ -9413,6 +9435,20 @@ async def _wait_for_background_post_turn_catchup(
     *,
     save_id: str,
 ) -> None:
+    with bragi_runtime_bindings().runtime_job_step("chat.preflight", root=True):
+        await _wait_for_background_post_turn_catchup_without_telemetry(
+            state,
+            handle,
+            save_id=save_id,
+        )
+
+
+async def _wait_for_background_post_turn_catchup_without_telemetry(
+    state: WebAppState,
+    handle: JobHandle,
+    *,
+    save_id: str,
+) -> None:
     active_jobs = _active_background_post_turn_jobs(state, save_id=save_id)
     list_outbox_steps = getattr(
         state.repositories,
@@ -9512,20 +9548,23 @@ async def _queue_post_turn_jobs_background(
             prepared_action_choices=prepared_action_choices,
             current_user_id=current_user_id,
         )
-        result = await _run_post_turn_jobs_with_ordered_progress(
-            state,
-            post_turn_handle,
-            save_id=save_id,
-            player_message_id=player_message_id,
-            narrator_message_id=narrator_message_id,
-            turn_revision=turn_revision,
-            prior_phase_jobs=None,
-            current_user_id=current_user_id,
-            optional_jobs=optional_jobs,
-        )
-        if bool(getattr(result, "continuity_degraded", False)):
-            await post_turn_handle.event("runtime", to_jsonable(result))
-            raise RuntimeError("Post-turn continuity is degraded; retry pending")
+        with bragi_runtime_bindings().runtime_job_step(
+            "post_turn.continuity_ready"
+        ):
+            result = await _run_post_turn_jobs_with_ordered_progress(
+                state,
+                post_turn_handle,
+                save_id=save_id,
+                player_message_id=player_message_id,
+                narrator_message_id=narrator_message_id,
+                turn_revision=turn_revision,
+                prior_phase_jobs=None,
+                current_user_id=current_user_id,
+                optional_jobs=optional_jobs,
+            )
+            if bool(getattr(result, "continuity_degraded", False)):
+                await post_turn_handle.event("runtime", to_jsonable(result))
+                raise RuntimeError("Post-turn continuity is degraded; retry pending")
         await post_turn_handle.advance_completion_level(CONTINUITY_READY)
         for optional_job in optional_jobs:
             if optional_job.task is not None:
@@ -9656,20 +9695,21 @@ async def _run_post_turn_jobs_inline_fallback(
         prepared_action_choices=prepared_action_choices,
         current_user_id=current_user_id,
     )
-    result = await _run_post_turn_jobs_with_ordered_progress(
-        state,
-        handle,
-        save_id=save_id,
-        player_message_id=player_message_id,
-        narrator_message_id=narrator_message_id,
-        turn_revision=turn_revision,
-        prior_phase_jobs=prior_phase_jobs,
-        current_user_id=current_user_id,
-        optional_jobs=optional_jobs,
-    )
-    if bool(getattr(result, "continuity_degraded", False)):
-        await handle.event("runtime", to_jsonable(result))
-        raise RuntimeError("Post-turn continuity is degraded; retry pending")
+    with bragi_runtime_bindings().runtime_job_step("post_turn.continuity_ready"):
+        result = await _run_post_turn_jobs_with_ordered_progress(
+            state,
+            handle,
+            save_id=save_id,
+            player_message_id=player_message_id,
+            narrator_message_id=narrator_message_id,
+            turn_revision=turn_revision,
+            prior_phase_jobs=prior_phase_jobs,
+            current_user_id=current_user_id,
+            optional_jobs=optional_jobs,
+        )
+        if bool(getattr(result, "continuity_degraded", False)):
+            await handle.event("runtime", to_jsonable(result))
+            raise RuntimeError("Post-turn continuity is degraded; retry pending")
     await handle.advance_completion_level(CONTINUITY_READY)
 
     async def finish_optional_jobs() -> None:
@@ -9773,13 +9813,15 @@ async def _queue_deferred_automatic_image_if_prepared(
         return None
 
     async def worker(post_turn_handle: JobHandle) -> Any:
+        del post_turn_handle
         kwargs: dict[str, object] = {
             "save_id": save_id,
             "prepared_automatic_image": prepared_automatic_image,
         }
         if _call_accepts_keyword(run_deferred, "current_user_id"):
             kwargs["current_user_id"] = current_user_id
-        return await run_deferred(**kwargs)
+        with bragi_runtime_bindings().runtime_job_step("post_turn.image_ready"):
+            return await run_deferred(**kwargs)
 
     try:
         return await state.jobs.create(
@@ -9816,11 +9858,44 @@ def _initial_chat_turn_progress(status_text: str) -> dict[str, object]:
 
 def _turn_progress_callback(
     handle: JobHandle,
+    repositories: object,
     initial_progress: dict[str, object],
 ) -> tuple[Any, Any, Callable[[], list[dict[str, str]]]]:
     loop = asyncio.get_running_loop()
     tasks: list[asyncio.Task[None]] = []
     latest_jobs = _progress_jobs(initial_progress)
+    observed_statuses = {job["name"]: job["status"] for job in latest_jobs}
+    phase_started: dict[str, tuple[float, str]] = {}
+
+    def record_phase_transitions(jobs: list[dict[str, str]]) -> None:
+        now = perf_counter()
+        now_iso = datetime.now(UTC).isoformat()
+        for job in jobs:
+            phase = job["name"]
+            step_name = _CHAT_TURN_TELEMETRY_STEPS.get(phase)
+            if step_name is None:
+                continue
+            status = job["status"]
+            previous = observed_statuses.get(phase)
+            if status == previous:
+                continue
+            observed_statuses[phase] = status
+            if status == "running":
+                phase_started[phase] = (now, now_iso)
+                continue
+            if status not in {"succeeded", "failed", "cancelled", "skipped"}:
+                continue
+            started, started_at = phase_started.pop(phase, (now, now_iso))
+            bragi_runtime_bindings().record_job_step(
+                repositories=repositories,
+                job_id=handle.record.id,
+                name=step_name,
+                status=status,
+                task="chat",
+                started_at=started_at,
+                completed_at=now_iso,
+                duration_ms=max(0, round((now - started) * 1000)),
+            )
 
     def callback(progress: object) -> None:
         nonlocal latest_jobs
@@ -9830,6 +9905,7 @@ def _turn_progress_callback(
             latest_jobs = jobs
 
         def schedule() -> None:
+            record_phase_transitions(jobs)
             tasks.append(asyncio.create_task(handle.event("progress", payload)))
 
         loop.call_soon_threadsafe(schedule)
@@ -10030,13 +10106,17 @@ def _initial_chat_turn_result(turn: object) -> object:
 
 
 async def _emit_initial_chat_turn_event(handle: JobHandle, turn: object) -> None:
-    delta = getattr(turn, "delta", None)
-    if delta is not None:
-        await handle.event("chat_turn_delta", delta)
-        return
-    model = getattr(turn, "model", None)
-    if model is not None:
-        await handle.event("runtime", model)
+    with bragi_runtime_bindings().runtime_job_step(
+        "chat.response_committed",
+        root=True,
+    ):
+        delta = getattr(turn, "delta", None)
+        if delta is not None:
+            await handle.event("chat_turn_delta", delta)
+            return
+        model = getattr(turn, "model", None)
+        if model is not None:
+            await handle.event("runtime", model)
 
 
 def _raise_for_initial_chat_turn_failure(

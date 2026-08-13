@@ -124,8 +124,25 @@ import {
   WorldDataScenario,
   WorldDataSuggestionGroupRow
 } from "./api";
+
 import { BrandLockup, BrandMark } from "./brand";
 import "./styles.css";
+
+type ClientChatPaintEvent =
+  | "client.chat.optimistic_player_painted"
+  | "client.chat.placeholder_painted"
+  | "client.chat.narrator_painted";
+
+function scheduleClientPaintEvent(
+  event: ClientChatPaintEvent,
+  startedAtMs: number,
+) {
+  window.requestAnimationFrame(() => {
+    logClientEvent("info", event, {
+      duration_ms: Math.max(0, Math.round(Date.now() - startedAtMs))
+    });
+  });
+}
 
 declare global {
   interface ImportMetaEnv {
@@ -3206,6 +3223,18 @@ function Workbench({
   }, [onLayoutPointerMove, resizingSide, stopLayoutResize]);
 
   const runJob = useCallback<RunJob>((created, options = { applyResult: true }) => {
+    const narratorPaintStartedAtMs = created.created_at
+      ? created.created_at * 1000
+      : Date.now();
+    let narratorPaintScheduled = false;
+    const scheduleNarratorPaint = () => {
+      if (created.type !== "chat_turn" || narratorPaintScheduled) return;
+      narratorPaintScheduled = true;
+      scheduleClientPaintEvent(
+        "client.chat.narrator_painted",
+        narratorPaintStartedAtMs,
+      );
+    };
     if (!jobBelongsToActiveSave(created, activeSaveIdRef.current)) return () => undefined;
     if (jobWatchers.current[created.id]) return jobWatchers.current[created.id];
     if (created.status !== "queued" && created.status !== "running") {
@@ -3241,8 +3270,10 @@ function Workbench({
           if (isRuntimeModel(done.result)) {
             appliedRuntimeResult = true;
             applyRuntimeModel(done.result);
+            scheduleNarratorPaint();
           } else if (isChatTurnDelta(done.result)) {
             appliedRuntimeResult = applyChatTurnDelta(done.result);
+            if (appliedRuntimeResult) scheduleNarratorPaint();
           }
         }
         if (appliesToCurrentSave && done.status === "succeeded") {
@@ -3300,11 +3331,14 @@ function Workbench({
         if (name === "runtime" && isRuntimeModel(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
           setPendingMessage(null);
           applyRuntimeModel(data);
+          scheduleNarratorPaint();
           client.invalidateQueries({ queryKey: ["chat", "submission-status", data.active_save_id ?? activeSaveIdRef.current] });
         }
         if (name === "chat_turn_delta" && isChatTurnDelta(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
           setPendingMessage(null);
-          if (!applyChatTurnDelta(data)) {
+          if (applyChatTurnDelta(data)) {
+            scheduleNarratorPaint();
+          } else {
             refreshWorkbench(data.save_id, ALL_WORKBENCH_REFRESH_TARGETS);
           }
           client.invalidateQueries({ queryKey: ["chat", "submission-status", data.save_id] });
@@ -6726,7 +6760,12 @@ function Composer({
             setSubmittingSaveId(submittedSaveId);
             setSubmitError("");
             setBody("");
+            const paintStartedAtMs = Date.now();
             onPendingMessage(pendingPlayerChronicleMessage(submittedBody, submittedSaveId, pendingAfterMessageId));
+            scheduleClientPaintEvent(
+              "client.chat.optimistic_player_painted",
+              paintStartedAtMs,
+            );
             submit.mutate(chatSubmitVariables(submittedBody, submittedSaveId, failedSubmitRef.current));
           }
         }}
@@ -6923,7 +6962,12 @@ function CyoaActionPicker({
     submittingSaveIdRef.current = submittedSaveId;
     setSubmittingSaveId(submittedSaveId);
     setSubmitError("");
+    const paintStartedAtMs = Date.now();
     onPendingMessage(pendingPlayerChronicleMessage(submittedBody, submittedSaveId, pendingAfterMessageId));
+    scheduleClientPaintEvent(
+      "client.chat.optimistic_player_painted",
+      paintStartedAtMs,
+    );
     submit.mutate(chatSubmitVariables(submittedBody, submittedSaveId, failedSubmitRef.current));
   };
   const regenerateOptions = () => {
