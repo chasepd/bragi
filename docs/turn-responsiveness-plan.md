@@ -96,7 +96,7 @@ log when applicable.
 | 0 | `docs/turn-responsiveness-plan` | `complete` | [#130](https://github.com/chasepd/bragi/pull/130) | Persisted this execution plan and update protocol. |
 | 1 | `feat/turn-latency-telemetry` | `complete` | [#131](https://github.com/chasepd/bragi/pull/131) | Added critical-path spans, user-paint events, and deterministic latency harnesses. |
 | 2 | `feat/turn-progress-ux` | `complete` | [#132](https://github.com/chasepd/bragi/pull/132) | Added narrator placeholder, timing summaries, and job-delivery cleanup. |
-| 3 | `fix/foreground-retry-budgets` | `pending` | #129 | Enforce hard deadlines and responsive foreground retry limits. |
+| 3 | `fix/foreground-retry-budgets` | `in_progress` | #129 | Enforce hard deadlines and responsive foreground retry limits. |
 | 4 | `feat/responsive-turn-mode` | `pending` | #129 | Add portable save-scoped mode and responsive routing/budget behavior. |
 | 5 | `perf/adaptive-turn-pipeline` | `pending` | #129 | Add deterministic fast path and combined structured planning path. |
 | 6 | `perf/post-turn-media-responsiveness` | `pending` | #129 | Start images earlier and improve media loading feedback. |
