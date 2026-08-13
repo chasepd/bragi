@@ -99,7 +99,7 @@ log when applicable.
 | 3 | `fix/foreground-retry-budgets` | `complete` | [#133](https://github.com/chasepd/bragi/pull/133) | Enforced hard deadlines and responsive foreground retry limits. |
 | 4 | `feat/responsive-turn-mode` | `complete` | [#134](https://github.com/chasepd/bragi/pull/134) | Added portable save-scoped mode and responsive routing/budget behavior. |
 | 5 | `perf/adaptive-turn-pipeline` | `complete` | [#135](https://github.com/chasepd/bragi/pull/135) | Added deterministic fast path and combined structured planning path. |
-| 6 | `perf/post-turn-media-responsiveness` | `pending` | #129 | Start images earlier and improve media loading feedback. |
+| 6 | `perf/post-turn-media-responsiveness` | `in_progress` | #129 | Start images earlier and improve media loading feedback. |
 | 7 | `docs/turn-responsiveness-results` | `pending` | #129 | Evaluate organic aggregates, document results, and close the program only if gates pass. |
 
 ## PR Requirements
