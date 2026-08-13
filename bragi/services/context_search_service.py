@@ -2388,7 +2388,7 @@ async def _select_context_with_structured_output(
             primary_model_id=model_id,
             exc=exc,
         )
-    except (TimeoutError, ValueError, TypeError) as exc:
+    except TimeoutError:
         log_error_event(
             "provider.structured_output_failed",
             provider=provider_name,
@@ -2396,7 +2396,23 @@ async def _select_context_with_structured_output(
             task="context_search",
             duration_ms=_elapsed_ms(started_at),
             candidate_count=len(candidates),
-            **exception_log_fields(exc),
+            error_category="timeout",
+        )
+        return _deterministic_context_selection(
+            candidates,
+            primary_provider=provider_name,
+            primary_model_id=model_id,
+            error_category="timeout",
+        )
+    except (ValueError, TypeError):
+        log_error_event(
+            "provider.structured_output_failed",
+            provider=provider_name,
+            model=model_id,
+            task="context_search",
+            duration_ms=_elapsed_ms(started_at),
+            candidate_count=len(candidates),
+            error_category="schema_validation_failed",
         )
         return _deterministic_context_selection(
             candidates,
@@ -2607,7 +2623,7 @@ async def _select_responsive_turn_plan(
         ):
             raise ValueError("Responsive narrator plan used unknown evidence")
         narrator_spec = replace(narrator_spec, evidence_refinement=None)
-    except (ProviderError, TimeoutError, ValueError, TypeError, KeyError) as exc:
+    except ProviderError as exc:
         log_error_event(
             "context_search.responsive_turn_plan_failed",
             provider=provider_name,
@@ -2616,6 +2632,28 @@ async def _select_responsive_turn_plan(
             duration_ms=_elapsed_ms(started_at),
             candidate_count=len(candidates),
             **exception_log_fields(exc),
+        )
+        return None
+    except TimeoutError:
+        log_error_event(
+            "context_search.responsive_turn_plan_failed",
+            provider=provider_name,
+            model=model_id,
+            task="context_search",
+            duration_ms=_elapsed_ms(started_at),
+            candidate_count=len(candidates),
+            error_category="timeout",
+        )
+        return None
+    except (ValueError, TypeError, KeyError):
+        log_error_event(
+            "context_search.responsive_turn_plan_failed",
+            provider=provider_name,
+            model=model_id,
+            task="context_search",
+            duration_ms=_elapsed_ms(started_at),
+            candidate_count=len(candidates),
+            error_category="schema_validation_failed",
         )
         return None
     log_event(
