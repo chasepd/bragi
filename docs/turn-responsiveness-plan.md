@@ -97,7 +97,7 @@ log when applicable.
 | 1 | `feat/turn-latency-telemetry` | `complete` | [#131](https://github.com/chasepd/bragi/pull/131) | Added critical-path spans, user-paint events, and deterministic latency harnesses. |
 | 2 | `feat/turn-progress-ux` | `complete` | [#132](https://github.com/chasepd/bragi/pull/132) | Added narrator placeholder, timing summaries, and job-delivery cleanup. |
 | 3 | `fix/foreground-retry-budgets` | `complete` | [#133](https://github.com/chasepd/bragi/pull/133) | Enforced hard deadlines and responsive foreground retry limits. |
-| 4 | `feat/responsive-turn-mode` | `in_progress` | #129 | Add portable save-scoped mode and responsive routing/budget behavior. |
+| 4 | `feat/responsive-turn-mode` | `complete` | [#134](https://github.com/chasepd/bragi/pull/134) | Added portable save-scoped mode and responsive routing/budget behavior. |
 | 5 | `perf/adaptive-turn-pipeline` | `pending` | #129 | Add deterministic fast path and combined structured planning path. |
 | 6 | `perf/post-turn-media-responsiveness` | `pending` | #129 | Start images earlier and improve media loading feedback. |
 | 7 | `docs/turn-responsiveness-results` | `pending` | #129 | Evaluate organic aggregates, document results, and close the program only if gates pass. |
@@ -226,6 +226,7 @@ For every program PR:
 | 2026-08-12 | PR 1 ([#131](https://github.com/chasepd/bragi/pull/131)) | quality, instrumentation baseline | 0 | n/a | n/a | n/a | Telemetry begins with this PR, so no eligible pre-instrumentation samples exist. No personal runtime data or live provider was inspected; matched organic aggregates begin after deployment. |
 | 2026-08-12 | PR 2 ([#132](https://github.com/chasepd/bragi/pull/132)) | quality, progress UX | 0 | n/a | n/a | n/a | The endpoint reads local privacy-safe aggregates only; implementation and tests used synthetic data, and no personal runtime data was inspected. |
 | 2026-08-13 | PR 3 ([#133](https://github.com/chasepd/bragi/pull/133)) | quality and internal responsive retry policy | 0 | n/a | n/a | n/a | Provider deadlines and execution budgets were verified with deterministic fakes. Responsive mode is not yet user-selectable, so no organic comparison samples exist; no personal runtime data or live provider was inspected. |
+| 2026-08-13 | PR 4 ([#134](https://github.com/chasepd/bragi/pull/134)) | quality and selectable responsive mode | 0 | n/a | n/a | n/a | The save mode, budgets, routing, and mode-stratified timing were verified with deterministic fakes and synthetic timing data. Organic comparison begins after deployment; no personal runtime data or live provider was inspected. |
 
 ## PR Evidence
 
@@ -282,6 +283,24 @@ For every program PR:
   stream cannot open a fresh non-streaming provider budget; this does not alter
   the browser contract because provisional prose remains disabled. No other
   stable interface or product requirement deviated from the plan.
+- PR 4 ([#134](https://github.com/chasepd/bragi/pull/134)), pinned reviewed
+  implementation commit `567aa25`: red tests first exposed the absent portable
+  setting and permissions, missing import sanitization, unbounded planner
+  history and structured helpers, missing responsive OpenRouter routing, a
+  quality foreground runtime context on responsive saves, foreground context
+  leaking into post-turn work, and timing summaries that mixed or hard-coded
+  modes. The first independent review then reproduced two tool-calling gaps:
+  tool helpers retained optional thinking and 10,000-token reserves, while
+  invalid tool feedback could still make seven application-level calls. The
+  fixes apply the same 2,048-token and optional-thinking policy to tool calls,
+  preserve mandatory thinking, and limit responsive feedback to two calls
+  while quality retains configured behavior. Full nine-phase validation passed
+  after the fixes. A fresh pinned-commit re-review scored the final code 9.7/10
+  with no Critical, Important, or Minor findings. The implementation preserves
+  narrator model and output-limit selection, save forks/snapshots/bundles,
+  child permissions, explicit OpenRouter routing profiles, privacy-safe timing
+  strata, and unchanged quality behavior. No stable interface or product
+  requirement deviated from the plan.
 
 ## Decision And Change Log
 
@@ -320,16 +339,20 @@ For every program PR:
   failure plus non-streaming fallback inside one two-attempt/45-second budget.
 - 2026-08-13: Invalid non-finite provider deadlines resolve to the safe default,
   matching other malformed persisted setting values.
+- 2026-08-13: Treat tool-call context selection as a foreground structured
+  helper in responsive mode. It shares the 2,048-token cap, optional-thinking
+  suppression, mandatory-thinking exception, and two-call feedback limit;
+  quality mode retains the configured feedback count.
 
 ## Exact Next Action
 
-After PR 3 merges, fetch the resulting `origin/main` and create a fresh sibling
-worktree on `feat/responsive-turn-mode` for PR 4. Mark PR 4 in progress in the
-first commit, then begin with red tests for the portable save-scoped
-`turn_responsiveness_mode` setting, permissions, forks, snapshots, export, and
-import. Add quality/responsive routing so quality remains unchanged while
-responsive foreground work selects PR 3's retry budget, disables optional
-helper thinking, caps structured helper output at 2,048 tokens, uses an
-8-player/8-narrator planner window, and requests OpenRouter latency sorting only
-when no explicit routing profile overrides it. Do not change the narrator model
-or its configured output limit.
+After PR 4 merges, fetch the resulting `origin/main` and create a fresh sibling
+worktree on `perf/adaptive-turn-pipeline` for PR 5. Mark PR 5 in progress in the
+first commit, then begin with red tests for every deterministic fast-path
+eligibility gate and for ineligible responsive turns using one provider-enforced
+`responsive_turn_plan` structured call. Preserve input/output safety,
+deterministic guards, prompt budgeting, narration persistence, and post-turn
+state work on the fast path. Validate every selected source ID against
+application-built candidates, retain the existing helper pipeline as the
+responsive-budget fallback for unavailable or invalid combined output, and do
+not ask normal chat prose to emit structured data.
