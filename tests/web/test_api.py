@@ -59,7 +59,13 @@ from bragi.services.settings_service import SettingsService
 from bragi.services.world_data_service import ScenarioEdit
 from bragi_web.api.app import create_app
 from bragi_web.auth_throttle import AuthAttemptThrottle
-from bragi_web.jobs import JobHandle, JobRecord, JobRegistry, JobRegistryLimits
+from bragi_web.jobs import (
+    JobHandle,
+    JobRecord,
+    JobRegistry,
+    JobRegistryFullError,
+    JobRegistryLimits,
+)
 from bragi_web.observability import clear_recent_events, recent_events
 from bragi_web.runtime import (
     BundlePreviewState,
@@ -9561,7 +9567,12 @@ def test_chat_turn_completes_after_initial_render_and_queues_post_turn_job(
     assert post_turn_job["status"] == "succeeded"
 
 
-def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> None:
+@pytest.mark.parametrize("transient_early_queue_failure", [False, True])
+def test_post_turn_jobs_queue_deferred_automatic_image_job(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    transient_early_queue_failure: bool,
+) -> None:
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)
     repositories = PersistenceRepositories(
@@ -9670,6 +9681,25 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
     runtime = DeferredImageRuntime()
     state = _state_double(tmp_path, runtime)
     state.jobs._repositories = repositories  # noqa: SLF001 - production telemetry wiring
+    original_create = state.jobs.create
+    automatic_image_queue_attempts = 0
+
+    async def create_with_transient_image_pressure(
+        job_type: str,
+        worker: object,
+        **kwargs: object,
+    ) -> JobRecord:
+        nonlocal automatic_image_queue_attempts
+        if job_type == "automatic_image_generation":
+            automatic_image_queue_attempts += 1
+            if transient_early_queue_failure and automatic_image_queue_attempts == 1:
+                raise JobRegistryFullError(1)
+        return cast(
+            JobRecord,
+            await original_create(job_type, cast(Any, worker), **kwargs),
+        )
+
+    monkeypatch.setattr(state.jobs, "create", create_with_transient_image_pressure)
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
@@ -9682,7 +9712,10 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
         assert created.status_code == 200
         _wait_for_terminal_job(client, created.json()["id"], save_id="save-1")
         assert runtime.continuity_started.wait(timeout=2)
-        assert runtime.image_started.wait(timeout=2)
+        if transient_early_queue_failure:
+            assert not runtime.image_started.wait(timeout=0.1)
+        else:
+            assert runtime.image_started.wait(timeout=2)
         for _ in range(100):
             post_turn_jobs = [
                 job
@@ -9697,6 +9730,7 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
         assert post_turn_jobs[0]["completion_level"] == "response_committed"
 
         runtime.release_continuity.set()
+        assert runtime.image_started.wait(timeout=2)
         for _ in range(100):
             current_post_turn = client.get(
                 _job_url(post_turn_jobs[0]["id"], "save-1")
@@ -9731,6 +9765,9 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
         )
 
     assert runtime.deferred_calls == [prepared_payload]
+    assert automatic_image_queue_attempts == (
+        2 if transient_early_queue_failure else 1
+    )
     assert post_turn_finished["completion_level"] == (
         "optional_enrichments_complete"
     )

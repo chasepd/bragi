@@ -9659,11 +9659,12 @@ async def _run_post_turn_jobs_with_ordered_progress(
 
     pump_task = asyncio.create_task(pump_progress())
     image_job_task: asyncio.Task[JobRecord | None] | None = None
+    prepared_image_payload: dict[str, object] | None = None
 
     def prepared_automatic_image_callback(
         prepared_automatic_image: dict[str, object],
     ) -> None:
-        nonlocal image_job_task
+        nonlocal image_job_task, prepared_image_payload
         if image_job_task is not None:
             observe(
                 "web.prepared_automatic_image_duplicate_handoff",
@@ -9672,6 +9673,7 @@ async def _run_post_turn_jobs_with_ordered_progress(
                 narrator_message_id=narrator_message_id,
             )
             return
+        prepared_image_payload = prepared_automatic_image
         image_job_task = asyncio.create_task(
             _queue_prepared_automatic_image(
                 state,
@@ -9736,6 +9738,14 @@ async def _run_post_turn_jobs_with_ordered_progress(
                 **error_fields(exc),
             )
             image_job = None
+        if image_job is None and prepared_image_payload is not None:
+            image_job = await _queue_prepared_automatic_image(
+                state,
+                save_id=save_id,
+                narrator_message_id=narrator_message_id,
+                prepared_automatic_image=prepared_image_payload,
+                current_user_id=current_user_id,
+            )
         if image_job is not None and optional_jobs is not None:
             optional_jobs.append(image_job)
         return result
