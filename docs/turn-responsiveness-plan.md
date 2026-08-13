@@ -94,7 +94,7 @@ log when applicable.
 | PR | Branch | Status | Issue/PR | Required outcome |
 | --- | --- | --- | --- | --- |
 | 0 | `docs/turn-responsiveness-plan` | `complete` | [#130](https://github.com/chasepd/bragi/pull/130) | Persisted this execution plan and update protocol. |
-| 1 | `feat/turn-latency-telemetry` | `pending` | #129 | Add critical-path spans, user-paint events, and deterministic latency harnesses. |
+| 1 | `feat/turn-latency-telemetry` | `in_progress` | #129 | Add critical-path spans, user-paint events, and deterministic latency harnesses. |
 | 2 | `feat/turn-progress-ux` | `pending` | #129 | Add narrator placeholder, timing summaries, and job-delivery cleanup. |
 | 3 | `fix/foreground-retry-budgets` | `pending` | #129 | Enforce hard deadlines and responsive foreground retry limits. |
 | 4 | `feat/responsive-turn-mode` | `pending` | #129 | Add portable save-scoped mode and responsive routing/budget behavior. |
@@ -246,9 +246,13 @@ For every program PR:
 - 2026-08-12: Use organic aggregate samples rather than paid canaries.
 - 2026-08-12: Cover the full audited program, including transport and media
   responsiveness.
+- 2026-08-12: PR 1 emits paint telemetry for the existing optimistic player and
+  committed narrator UI. The stable `client.chat.placeholder_painted` event is
+  implemented in PR 2 with the placeholder that it measures; emitting it before
+  that UI exists would create misleading telemetry.
 
 ## Exact Next Action
 
-Complete PR 0 review and CI, merge it, then create
-`feat/turn-latency-telemetry` from the updated `origin/main` and mark PR 1
-`in_progress`.
+Implement PR 1 with red-green coverage for critical-path spans, streaming
+first-chunk metrics, and existing client paint milestones. Validate and review
+the PR, then record its evidence and exact PR 2 handoff here before merge.
