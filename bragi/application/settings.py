@@ -190,6 +190,11 @@ from bragi.services.text_script_policy import (
     SCRIPT_GUARD_MODE_SETTING,
     script_guard_mode,
 )
+from bragi.services.turn_responsiveness import (
+    TURN_RESPONSIVENESS_MODE_OPTIONS,
+    TURN_RESPONSIVENESS_MODE_SETTING,
+    turn_responsiveness_mode,
+)
 from bragi.services.user_narration_guidance import (
     USER_NARRATION_GUIDANCE_SETTING,
     sanitize_user_narration_guidance,
@@ -555,6 +560,7 @@ class SettingsModel:
     model_routing_profiles: ModelRoutingProfilesModel | None
     retry_count: NumberControl | None
     provider_call_deadline_seconds: NumberControl | None
+    turn_responsiveness_mode: ChoiceControl | None
     automatic_summarization: ToggleControl | None
     summarization_context_pressure_threshold: NumberControl | None
     summarization_visibility: ToggleControl | None
@@ -783,6 +789,16 @@ def build_settings_model(
             step=int(PROVIDER_CALL_DEADLINE_STEP),
         )
         if is_admin
+        else None,
+        turn_responsiveness_mode=ChoiceControl(
+            setting_key=TURN_RESPONSIVENESS_MODE_SETTING,
+            selected=turn_responsiveness_mode(
+                repositories,
+                save_id=active_save_id,
+            ),
+            options=TURN_RESPONSIVENESS_MODE_OPTIONS,
+        )
+        if save_controls_visible
         else None,
         automatic_summarization=ToggleControl(
             setting_key="automatic_summarization_enabled",

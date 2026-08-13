@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import cast
 
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.retry_policy import RetryExecutionClass, retry_execution_context
 from bragi.services.chat_history_settings import (
     DEFAULT_NARRATOR_PLANNER_RECENT_NARRATOR_MESSAGE_WINDOW,
     DEFAULT_NARRATOR_PLANNER_RECENT_PLAYER_MESSAGE_WINDOW,
@@ -15,6 +16,7 @@ from bragi.services.chat_history_settings import (
     narrator_planner_chat_history_window_settings,
     sanitize_recent_message_window,
 )
+from bragi.services.turn_responsiveness import RESPONSIVE_PLANNER_MESSAGE_WINDOW
 
 
 class FakeRepositories:
@@ -106,4 +108,29 @@ def test_narrator_planner_chat_history_windows_use_explicit_overrides() -> None:
     assert settings == ChatHistoryWindowSettings(
         player_messages=9,
         narrator_messages=DEFAULT_NARRATOR_PLANNER_RECENT_NARRATOR_MESSAGE_WINDOW,
+    )
+
+
+def test_responsive_foreground_caps_planner_history_without_changing_quality() -> None:
+    repositories = cast(
+        PersistenceRepositories,
+        FakeRepositories(
+            {
+                NARRATOR_PLANNER_RECENT_PLAYER_MESSAGE_WINDOW_SETTING: 20,
+                NARRATOR_PLANNER_RECENT_NARRATOR_MESSAGE_WINDOW_SETTING: 18,
+            }
+        ),
+    )
+
+    quality = narrator_planner_chat_history_window_settings(repositories)
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        responsive = narrator_planner_chat_history_window_settings(repositories)
+
+    assert quality == ChatHistoryWindowSettings(
+        player_messages=20,
+        narrator_messages=18,
+    )
+    assert responsive == ChatHistoryWindowSettings(
+        player_messages=RESPONSIVE_PLANNER_MESSAGE_WINDOW,
+        narrator_messages=RESPONSIVE_PLANNER_MESSAGE_WINDOW,
     )

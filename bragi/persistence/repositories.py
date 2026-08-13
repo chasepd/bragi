@@ -14086,6 +14086,7 @@ class PersistenceRepositories:
         save_id: str,
         provider: str,
         model: str,
+        mode: str,
         limit: int = 30,
     ) -> list[int]:
         if limit <= 0:
@@ -14119,12 +14120,16 @@ class PersistenceRepositories:
               AND narrator.role = 'narrator'
               AND narrator.provider = ?
               AND narrator.model = ?
+              AND COALESCE(
+                    json_extract(job.payload_json, '$.turn_responsiveness_mode'),
+                    'quality'
+                  ) = ?
               AND job.created_at IS NOT NULL
               AND step.completed_at IS NOT NULL
             ORDER BY step.completed_at DESC, step.rowid DESC
             LIMIT ?
             """,
-            (save_id, provider, model, min(limit, 30)),
+            (save_id, provider, model, mode, min(limit, 30)),
         )
         return [int(row["duration_ms"]) for row in rows]
 

@@ -72,6 +72,11 @@ from bragi.services.text_script_policy import (
     SCRIPT_GUARD_MODE_LATIN_ONLY_REJECT,
     SCRIPT_GUARD_MODE_SETTING,
 )
+from bragi.services.turn_responsiveness import (
+    TURN_RESPONSIVENESS_MODE_QUALITY,
+    TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    TURN_RESPONSIVENESS_MODE_SETTING,
+)
 
 API_KEY_SENTINEL = "sk-settings-service-sqlite-sentinel"
 
@@ -1621,6 +1626,44 @@ def test_settings_service_sanitizes_global_provider_call_deadline(
     service.set_local_setting(PROVIDER_CALL_DEADLINE_SETTING, "invalid")
     assert service.get_local_setting(PROVIDER_CALL_DEADLINE_SETTING) == 120.0
 
+
+def test_settings_service_sanitizes_save_turn_responsiveness_mode(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A beacon tower.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    service = _settings_service(repositories)
+
+    assert service.get_local_setting(
+        TURN_RESPONSIVENESS_MODE_SETTING,
+        save_id=save.id,
+    ) == TURN_RESPONSIVENESS_MODE_QUALITY
+
+    service.set_local_setting(
+        TURN_RESPONSIVENESS_MODE_SETTING,
+        TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+        save_id=save.id,
+    )
+    assert service.get_local_setting(
+        TURN_RESPONSIVENESS_MODE_SETTING,
+        save_id=save.id,
+    ) == TURN_RESPONSIVENESS_MODE_RESPONSIVE
+
+    service.set_local_setting(
+        TURN_RESPONSIVENESS_MODE_SETTING,
+        "turbo",
+        save_id=save.id,
+    )
+    assert service.get_local_setting(
+        TURN_RESPONSIVENESS_MODE_SETTING,
+        save_id=save.id,
+    ) == TURN_RESPONSIVENESS_MODE_QUALITY
 
 def test_settings_service_resolves_user_scoped_settings_before_global_defaults(
     repositories: PersistenceRepositories,

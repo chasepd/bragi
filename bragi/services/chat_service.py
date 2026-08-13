@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Coroutine, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
+from functools import wraps
 from time import perf_counter
-from typing import Any, Protocol, cast
+from typing import Any, Concatenate, Protocol, cast
 from uuid import uuid4
 
 from bragi.app_logging import (
@@ -61,6 +62,8 @@ from bragi.retry_policy import (
     current_retry_execution_class,
     narrator_regeneration_budget,
     resolved_retry_budget,
+    retry_execution_context,
+    retry_execution_context_is_explicit,
 )
 from bragi.services.action_choice_flags import scenario_action_choices_enabled
 from bragi.services.action_choice_service import (
@@ -284,6 +287,7 @@ from bragi.services.turn_outcome import (
     turn_outcome_coverage,
     turn_outcome_from_mapping,
 )
+from bragi.services.turn_responsiveness import retry_execution_class_for_save
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 from bragi.services.user_narration_guidance import (
     USER_NARRATION_GUIDANCE_SETTING,
@@ -1004,6 +1008,48 @@ class _FinalPromptTrimCandidate:
     always_include: bool = False
 
 
+class _HasRepositories(Protocol):
+    repositories: PersistenceRepositories
+
+
+def _with_responsive_save_execution[
+    OwnerT: _HasRepositories,
+    **P,
+    ResultT,
+](
+    method: Callable[
+        Concatenate[OwnerT, P],
+        Coroutine[Any, Any, ResultT],
+    ],
+) -> Callable[
+    Concatenate[OwnerT, P],
+    Coroutine[Any, Any, ResultT],
+]:
+    """Install responsive execution once at a public save-operation boundary."""
+
+    @wraps(method)
+    async def wrapped(
+        self: OwnerT,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> ResultT:
+        if retry_execution_context_is_explicit():
+            return await method(self, *args, **kwargs)
+        save_id = cast(Mapping[str, object], kwargs).get("save_id")
+        if not isinstance(save_id, str):
+            raise TypeError("Responsive save execution requires save_id")
+        execution_class = retry_execution_class_for_save(
+            self.repositories,
+            save_id=save_id,
+        )
+        if execution_class is not RetryExecutionClass.RESPONSIVE_FOREGROUND:
+            return await method(self, *args, **kwargs)
+        with retry_execution_context(execution_class):
+            return await method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class ChatService:
     def __init__(
         self,
@@ -1079,6 +1125,7 @@ class ChatService:
             set[asyncio.Task[dict[str, object]]],
         ] = {}
 
+    @_with_responsive_save_execution
     async def submit_player_turn(
         self,
         *,
@@ -1184,6 +1231,7 @@ class ChatService:
                 _turn_progress=turn_progress,
             )
 
+    @_with_responsive_save_execution
     async def submit_timeskip_turn(
         self,
         *,
@@ -1324,6 +1372,7 @@ class ChatService:
             self.repositories.rollback_transaction()
             raise
 
+    @_with_responsive_save_execution
     async def look_around(
         self,
         *,
@@ -1535,6 +1584,7 @@ class ChatService:
             markdown_blocks=markdown_blocks,
         )
 
+    @_with_responsive_save_execution
     async def submit_existing_player_turn(
         self,
         *,
@@ -3328,23 +3378,25 @@ class ChatService:
                     "Action choices ready",
                 )
             elif not defer_action_choices:
-                action_choice_task = asyncio.create_task(
-                    self._generate_prepared_action_choices(
-                        prepared_action_choices,
+                with retry_execution_context(RetryExecutionClass.BACKGROUND):
+                    action_choice_task = asyncio.create_task(
+                        self._generate_prepared_action_choices(
+                            prepared_action_choices,
+                        )
                     )
-                )
         post_turn_task: asyncio.Task[dict[str, object]] | None = None
         if run_post_turn_jobs:
             stage_started = perf_counter()
-            post_turn_task = asyncio.create_task(
-                self.run_post_turn_jobs(
-                    save_id=save_id,
-                    player_message_id=player_message.id,
-                    narrator_message_id=narrator_message.id,
-                    verified_coverage=verified_plan_coverage,
-                    current_user_id=current_user_id,
+            with retry_execution_context(RetryExecutionClass.BACKGROUND):
+                post_turn_task = asyncio.create_task(
+                    self.run_post_turn_jobs(
+                        save_id=save_id,
+                        player_message_id=player_message.id,
+                        narrator_message_id=narrator_message.id,
+                        verified_coverage=verified_plan_coverage,
+                        current_user_id=current_user_id,
+                    )
                 )
-            )
             if not await_post_turn_jobs:
                 self._track_background_post_turn_task(
                     save_id=save_id,

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from bragi.persistence.repositories import PersistenceRepositories
+from bragi.retry_policy import RetryExecutionClass, current_retry_execution_class
+from bragi.services.turn_responsiveness import RESPONSIVE_PLANNER_MESSAGE_WINDOW
 
 RECENT_PLAYER_MESSAGE_WINDOW_SETTING = "recent_player_message_window"
 RECENT_NARRATOR_MESSAGE_WINDOW_SETTING = "recent_narrator_message_window"
@@ -60,6 +62,14 @@ def narrator_planner_chat_history_window_settings(
     *,
     save_id: str | None = None,
 ) -> ChatHistoryWindowSettings:
+    if (
+        current_retry_execution_class()
+        is RetryExecutionClass.RESPONSIVE_FOREGROUND
+    ):
+        return ChatHistoryWindowSettings(
+            player_messages=RESPONSIVE_PLANNER_MESSAGE_WINDOW,
+            narrator_messages=RESPONSIVE_PLANNER_MESSAGE_WINDOW,
+        )
     return ChatHistoryWindowSettings(
         player_messages=sanitize_recent_message_window(
             repositories.get_effective_setting(

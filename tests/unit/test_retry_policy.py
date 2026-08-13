@@ -21,6 +21,7 @@ from bragi.retry_policy import (
     narrator_regeneration_budget,
     resolved_retry_budget,
     retry_execution_context,
+    retry_execution_context_is_explicit,
     sanitize_provider_call_deadline_seconds,
     sanitize_retry_count,
 )
@@ -161,3 +162,12 @@ def test_narrator_regeneration_budget_is_shared_across_response_checks() -> None
         assert claim_narrator_regeneration() is False
 
     assert claim_narrator_regeneration() is True
+
+
+def test_retry_execution_context_reports_only_explicit_scopes() -> None:
+    assert retry_execution_context_is_explicit() is False
+
+    with retry_execution_context(RetryExecutionClass.BACKGROUND):
+        assert retry_execution_context_is_explicit() is True
+
+    assert retry_execution_context_is_explicit() is False

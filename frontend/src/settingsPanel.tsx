@@ -2404,6 +2404,7 @@ function SaveSettingsControls({
     <div className="settings-stack">
       {!activeSaveId ? <p className="muted">Load a save to edit save options.</p> : null}
       <SaveModelOverrideSettings settings={settings} activeSaveId={activeSaveId} />
+      {settings.turn_responsiveness_mode ? <ChoiceSetting control={settings.turn_responsiveness_mode} disabled={saveDisabled} updateLocal={updateLocal} /> : null}
       <section className="settings-subsection">
         <h3>Summarization</h3>
         {settings.automatic_summarization ? <ToggleSetting control={settings.automatic_summarization} disabled={saveDisabled} updateLocal={updateLocal} /> : null}

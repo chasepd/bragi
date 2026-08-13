@@ -6186,6 +6186,17 @@ def test_settings_api_scopes_settings_and_enforces_roles(
                 "save_id": mira_save.id,
             },
         )
+        user_responsiveness = user_client.post(
+            "/api/settings/scoped",
+            json={
+                "key": "turn_responsiveness_mode",
+                "value": "responsive",
+                "save_id": mira_save.id,
+            },
+        )
+        user_updated_settings = user_client.get(
+            f"/api/settings?save_id={mira_save.id}"
+        )
         user_guidance = user_client.post(
             "/api/settings/scoped",
             json={
@@ -6245,6 +6256,14 @@ def test_settings_api_scopes_settings_and_enforces_roles(
                 "save_id": child_save.id,
             },
         )
+        child_responsiveness = child_client.post(
+            "/api/settings/scoped",
+            json={
+                "key": "turn_responsiveness_mode",
+                "value": "responsive",
+                "save_id": child_save.id,
+            },
+        )
         child_rating = child_client.post(
             "/api/settings/local",
             json={"key": "content_filter_rating", "value": "g"},
@@ -6288,6 +6307,12 @@ def test_settings_api_scopes_settings_and_enforces_roles(
         "value": "",
     }
     assert user_saved.status_code == 200
+    assert user_responsiveness.status_code == 200
+    assert user_updated_settings.json()["turn_responsiveness_mode"] == {
+        "setting_key": "turn_responsiveness_mode",
+        "selected": "responsive",
+        "options": ["quality", "responsive"],
+    }
     assert user_guidance.status_code == 200
     assert user_other_save.status_code == 404
     assert user_admin_setting.status_code == 403
@@ -6337,6 +6362,8 @@ def test_settings_api_scopes_settings_and_enforces_roles(
     assert child_display_mode.status_code == 200
     assert child_guidance.status_code == 403
     assert child_save_setting.status_code == 403
+    assert child_responsiveness.status_code == 403
+    assert "turn_responsiveness_mode" not in child_settings.json()
     assert child_rating.status_code == 200
     assert child_rating_too_high.status_code == 400
     assert child_rating_too_high.json() == {
@@ -7682,6 +7709,12 @@ def test_concurrent_duplicate_chat_posts_return_one_job(tmp_path: Path) -> None:
         sqlite3.connect(database_path, check_same_thread=False)
     )
     save = _create_auth_save(repositories, title="Lantern Save", owner_user_id=None)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key="turn_responsiveness_mode",
+        value="responsive",
+    )
     runtime = BlockingRuntime(save.id)
     state = _state_double(tmp_path, runtime)
     state.repositories = repositories
@@ -7714,6 +7747,15 @@ def test_concurrent_duplicate_chat_posts_return_one_job(tmp_path: Path) -> None:
         "SELECT COUNT(*) FROM chat_turn_submissions WHERE save_id = ?",
         (save.id,),
     ).fetchone()[0] == 1
+    assert repositories.connection.execute(
+        """
+        SELECT json_extract(job.payload_json, '$.turn_responsiveness_mode')
+        FROM jobs AS job
+        JOIN chat_turn_submissions AS submission ON submission.job_id = job.id
+        WHERE submission.save_id = ?
+        """,
+        (save.id,),
+    ).fetchone()[0] == "responsive"
 
 
 def test_chat_regenerate_rejects_same_save_active_chat_turn(tmp_path: Path) -> None:

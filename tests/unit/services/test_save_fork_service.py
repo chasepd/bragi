@@ -9,6 +9,10 @@ import pytest
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.services.save_fork_service import SaveForkService
+from bragi.services.turn_responsiveness import (
+    TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    TURN_RESPONSIVENESS_MODE_SETTING,
+)
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 
 
@@ -151,6 +155,12 @@ def test_fork_from_player_message_uses_preceding_turn_snapshot(
         content={},
     )
     original = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=original.id,
+        key=TURN_RESPONSIVENESS_MODE_SETTING,
+        value=TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    )
     snapshot_service = TurnSnapshotService(repositories)
     snapshot_service.capture_baseline_snapshot(original.id)
     opening = repositories.append_message(
@@ -204,6 +214,11 @@ def test_fork_from_player_message_uses_preceding_turn_snapshot(
     assert forked_messages[-1].role == "player"
     assert forked_messages[-1].id != player.id
     assert result.message_count == 2
+    assert repositories.get_scoped_setting(
+        scope="save",
+        scope_id=result.save.id,
+        key=TURN_RESPONSIVENESS_MODE_SETTING,
+    ) == TURN_RESPONSIVENESS_MODE_RESPONSIVE
     assert repositories.list_world_state(result.save.id)[0].value == {"lit": False}
     assert snapshot_service.latest_snapshot_for_message(
         save_id=result.save.id,

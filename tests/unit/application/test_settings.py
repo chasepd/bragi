@@ -67,6 +67,11 @@ from bragi.services.post_turn_inference import (
 )
 from bragi.services.secrets import InMemorySecretStore
 from bragi.services.settings_service import SettingsService
+from bragi.services.turn_responsiveness import (
+    TURN_RESPONSIVENESS_MODE_QUALITY,
+    TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    TURN_RESPONSIVENESS_MODE_SETTING,
+)
 
 _MISSING = object()
 _SENTINEL_SECRET = "super-secret-token"
@@ -576,6 +581,50 @@ def test_settings_model_exposes_admin_retry_policy_control(
     )
     assert _value(user_model, "retry_count") is None
     assert _value(user_model, "provider_call_deadline_seconds") is None
+
+
+def test_settings_model_exposes_save_responsiveness_to_adults_only(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A beacon tower.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=TURN_RESPONSIVENESS_MODE_SETTING,
+        value=TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    )
+
+    for role in ("admin", "user"):
+        model = settings.build_settings_model(
+            repositories=repositories,
+            providers=(),
+            active_save_id=save.id,
+            current_user_role=role,
+        )
+        control = _value(model, "turn_responsiveness_mode")
+        assert _value(control, "setting_key") == TURN_RESPONSIVENESS_MODE_SETTING
+        assert _value(control, "selected") == TURN_RESPONSIVENESS_MODE_RESPONSIVE
+        assert _value(control, "options") == (
+            TURN_RESPONSIVENESS_MODE_QUALITY,
+            TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+        )
+
+    child = settings.build_settings_model(
+        repositories=repositories,
+        providers=(),
+        active_save_id=save.id,
+        current_user_role="child",
+    )
+    assert _value(child, "turn_responsiveness_mode") is None
 
 
 def test_settings_model_exposes_task_model_selectors_and_unavailable_warning(

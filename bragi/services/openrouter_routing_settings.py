@@ -15,6 +15,7 @@ from bragi.providers.contracts import (
     StructuredOutputRequest,
     ToolCallRequest,
 )
+from bragi.retry_policy import RetryExecutionClass, current_retry_execution_class
 from bragi.services.generation_settings import (
     request_with_model_thinking_preference,
 )
@@ -334,6 +335,13 @@ def request_with_openrouter_routing[
         provider=request.provider,
         task=task,
     )
+    if (
+        request.provider == OPENROUTER_PROVIDER_NAME
+        and payload is None
+        and current_retry_execution_class()
+        is RetryExecutionClass.RESPONSIVE_FOREGROUND
+    ):
+        payload = {"sort": "latency"}
     app_title = (
         openrouter_app_title_for_task(task)
         if request.provider == OPENROUTER_PROVIDER_NAME

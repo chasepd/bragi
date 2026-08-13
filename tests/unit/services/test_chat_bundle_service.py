@@ -43,6 +43,11 @@ from bragi.services.scenario_evolution_policy import (
     save_scenario_evolution_turn_interval_setting_key,
     scenario_template_evolution_turn_interval_setting_key,
 )
+from bragi.services.turn_responsiveness import (
+    TURN_RESPONSIVENESS_MODE_QUALITY,
+    TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    TURN_RESPONSIVENESS_MODE_SETTING,
+)
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 
 SCENARIO_ID = "scenario-ashfall"
@@ -4176,6 +4181,48 @@ def test_import_save_sanitizes_post_turn_inference_mode_before_reexport(
         scope="save",
         key=POST_TURN_INFERENCE_MODE_SETTING,
     ) == json.dumps(POST_TURN_INFERENCE_MODE_DEFAULT)
+
+
+def test_export_import_preserves_and_sanitizes_turn_responsiveness_mode(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    original_save = _seed_bundle_save(repositories, media_dir)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=original_save.id,
+        key=TURN_RESPONSIVENESS_MODE_SETTING,
+        value=TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    )
+    bundle_path = tmp_path / "responsive-turn.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+    service.export_save(original_save.id, bundle_path)
+
+    imported = service.import_save(bundle_path)
+
+    assert repositories.get_scoped_setting(
+        scope="save",
+        scope_id=_imported_save_id(imported),
+        key=TURN_RESPONSIVENESS_MODE_SETTING,
+    ) == TURN_RESPONSIVENESS_MODE_RESPONSIVE
+
+    _rewrite_bundle_data(
+        bundle_path,
+        lambda data: _replace_save_app_setting_value(
+            data,
+            scope="save",
+            key=TURN_RESPONSIVENESS_MODE_SETTING,
+            value="turbo",
+        ),
+    )
+    repaired = service.import_save(bundle_path)
+
+    assert repositories.get_scoped_setting(
+        scope="save",
+        scope_id=_imported_save_id(repaired),
+        key=TURN_RESPONSIVENESS_MODE_SETTING,
+    ) == TURN_RESPONSIVENESS_MODE_QUALITY
 
 
 def test_export_omits_message_revision_history_by_default(

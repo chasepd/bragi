@@ -17,6 +17,7 @@ from bragi.providers.contracts import (
     ToolCallRequest,
     ToolDefinition,
 )
+from bragi.retry_policy import RetryExecutionClass, retry_execution_context
 from bragi.services.generation_settings import MODEL_THINKING_PREFERENCES_SETTING
 from bragi.services.openrouter_routing_settings import (
     OPENROUTER_ROUTING_PROFILES_SETTING,
@@ -280,6 +281,53 @@ def test_request_with_openrouter_routing_sets_and_clears_provider_payload(
     assert routed.openrouter_app_title == "Bragi"
     assert cleared.openrouter_provider_routing is None
     assert cleared.openrouter_app_title is None
+
+
+def test_responsive_foreground_requests_latency_sort_without_explicit_profile(
+    repositories: PersistenceRepositories,
+) -> None:
+    request = ChatRequest(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        messages=(ChatMessage(role="player", body="Continue."),),
+    )
+
+    quality = request_with_openrouter_routing(repositories, request, task="chat")
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        responsive = request_with_openrouter_routing(
+            repositories,
+            request,
+            task="chat",
+        )
+
+    assert quality.openrouter_provider_routing is None
+    assert responsive.openrouter_provider_routing == {"sort": "latency"}
+
+
+def test_responsive_foreground_preserves_explicit_openrouter_routing_profile(
+    repositories: PersistenceRepositories,
+) -> None:
+    repositories.set_app_setting(
+        OPENROUTER_ROUTING_PROFILES_SETTING,
+        {"global": {"data_collection": "deny", "sort": "price"}},
+    )
+    request = ChatRequest(
+        provider="openrouter",
+        model_id="openai/gpt-5-mini",
+        messages=(ChatMessage(role="player", body="Continue."),),
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        responsive = request_with_openrouter_routing(
+            repositories,
+            request,
+            task="chat",
+        )
+
+    assert responsive.openrouter_provider_routing == {
+        "data_collection": "deny",
+        "sort": "price",
+    }
 
 
 def test_request_with_openrouter_routing_applies_thinking_for_structured_output(

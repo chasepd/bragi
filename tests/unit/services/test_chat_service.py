@@ -55,7 +55,11 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.structured_schema import validate_strict_json_schema
-from bragi.retry_policy import RetryExecutionClass, retry_execution_context
+from bragi.retry_policy import (
+    RetryExecutionClass,
+    current_retry_execution_class,
+    retry_execution_context,
+)
 from bragi.services import chat_service as chat_service_module
 from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_SETTING,
@@ -167,6 +171,10 @@ from bragi.services.text_script_policy import (
     SCRIPT_GUARD_MODE_SETTING,
     SCRIPT_GUARD_MODE_SOURCE_AWARE_REJECT,
 )
+from bragi.services.turn_responsiveness import (
+    TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    TURN_RESPONSIVENESS_MODE_SETTING,
+)
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 from bragi.world_time_model import canonical_world_time_from_legacy
 
@@ -241,6 +249,26 @@ class RecordingChatProvider:
             provider=request.provider,
             model_id=request.model_id,
         )
+
+
+class ExecutionClassRecordingChatProvider(RecordingChatProvider):
+    def __init__(self, provider_name: str) -> None:
+        super().__init__(provider_name)
+        self.chat_execution_classes: list[RetryExecutionClass] = []
+
+    async def chat(self, request: ChatRequest) -> ChatResponse:
+        self.chat_execution_classes.append(current_retry_execution_class())
+        return await super().chat(request)
+
+
+class PostTurnExecutionRecordingChatService(ChatService):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.post_turn_execution_classes: list[RetryExecutionClass] = []
+
+    async def run_post_turn_jobs(self, **_kwargs: Any) -> dict[str, object]:
+        self.post_turn_execution_classes.append(current_retry_execution_class())
+        return {}
 
 
 class TransientThenSuccessfulChatProvider(RecordingChatProvider):
@@ -10571,6 +10599,62 @@ def test_submit_player_turn_applies_supported_chat_generation_settings(
     request = provider.chat_requests[0]
     assert request.temperature == 1.1
     assert request.max_output_tokens == 1800
+
+
+def test_responsive_save_preserves_narrator_model_and_output_limit(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=TURN_RESPONSIVENESS_MODE_SETTING,
+        value=TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    )
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="anthropic/claude-3.5-sonnet",
+        display_name="Claude 3.5 Sonnet",
+        capabilities=["chat"],
+        supported_parameters=["max_output_tokens"],
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="openrouter",
+        model_id="anthropic/claude-3.5-sonnet",
+    )
+    repositories.set_app_setting("chat_max_output_tokens_enabled", True)
+    repositories.set_app_setting("chat_max_output_tokens", 1800)
+    provider = ExecutionClassRecordingChatProvider("openrouter")
+    service = PostTurnExecutionRecordingChatService(
+        repositories=repositories,
+        providers={"openrouter": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+
+    asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I climb toward the beacon lens.",
+            speaker_name="Mara",
+        )
+    )
+
+    assert provider.chat_execution_classes == [
+        RetryExecutionClass.RESPONSIVE_FOREGROUND
+    ]
+    assert service.post_turn_execution_classes == [RetryExecutionClass.BACKGROUND]
+    [request] = provider.chat_requests
+    assert request.model_id == "anthropic/claude-3.5-sonnet"
+    assert request.max_output_tokens == 1800
+    assert request.openrouter_provider_routing == {"sort": "latency"}
 
 
 def test_submit_player_turn_applies_openrouter_reasoning_override(

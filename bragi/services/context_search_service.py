@@ -47,7 +47,7 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, provider_error_is_model_not_found
 from bragi.redaction import redact_text
-from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
+from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, resolved_retry_budget
 from bragi.services.agentic_context import EvidenceRefinementRequest
 from bragi.services.context_assembly import (
     scenario_claim_candidates,
@@ -2905,7 +2905,7 @@ async def _select_context_with_tool_feedback(
     selected_keys: set[tuple[str, str]] = set()
     selected_items: list[SelectedContextItem] = []
     last_errors: list[str] = []
-    max_attempt_count = configured_max_attempts(repositories)
+    max_attempt_count = resolved_retry_budget(repositories).verification_max_attempts
 
     for _turn in range(max_attempt_count):
         turn_request = budget_tool_call_request(

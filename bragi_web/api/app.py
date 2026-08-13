@@ -9318,9 +9318,15 @@ async def _create_idempotent_chat_job_summary(
     operation: str,
     request_fingerprint: str,
 ) -> dict[str, Any]:
+    from bragi.services.turn_responsiveness import turn_responsiveness_mode
+
     job_id = uuid4().hex
     creator_user_id = _owner_user_id_for_request(state)
     exclusive_key = _chat_turn_exclusive_key(save_id)
+    effective_mode = turn_responsiveness_mode(
+        state.repositories,
+        save_id=save_id,
+    )
 
     def persist(record: JobRecord) -> None:
         create_submission = getattr(
@@ -9341,6 +9347,7 @@ async def _create_idempotent_chat_job_summary(
                 "source": "web",
                 "exclusive_key": exclusive_key or "",
                 "operation": operation,
+                "turn_responsiveness_mode": effective_mode,
             },
         )
 
