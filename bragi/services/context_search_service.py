@@ -111,6 +111,7 @@ from bragi.services.responsive_turn_pipeline import (
     TURN_OPERATION_LOOK_AROUND,
     TURN_OPERATION_NEW_PLAYER,
     TURN_OPERATION_RECOVERY,
+    ResponsiveFastPathEligibility,
     character_references_are_resolved,
     responsive_fast_path_eligibility,
 )
@@ -580,9 +581,12 @@ class ContextSearchService:
             )
             scenario = details.scenario
             player_message = _message_body(messages, player_message_id)
-            provider_expansion_allowed = allow_expansion and not (
+            responsive_foreground = (
                 current_retry_execution_class()
                 is RetryExecutionClass.RESPONSIVE_FOREGROUND
+            )
+            provider_expansion_allowed = allow_expansion and not (
+                responsive_foreground
                 and turn_operation != TURN_OPERATION_LOOK_AROUND
             )
             if cache_entry is None:
@@ -918,31 +922,40 @@ class ContextSearchService:
                     "Context-search provider does not support structured output "
                     "or tool calling"
                 )
-            fast_path = responsive_fast_path_eligibility(
-                operation=turn_operation,
-                precomputed_snapshot_valid=cache_status == "hit",
-                strong_local_recall=(
-                    retrieved_sources.diagnostics.get("strong_local_recall") is True
-                ),
-                character_references_resolved=character_references_are_resolved(
-                    player_message=player_message,
-                    characters=narration_snapshot.characters,
-                    present_character_ids=frozenset(
-                        narration_snapshot.scene_snapshot.present_character_ids
-                        if narration_snapshot.scene_snapshot is not None
-                        else ()
+            fast_path = (
+                responsive_fast_path_eligibility(
+                    operation=turn_operation,
+                    precomputed_snapshot_valid=cache_status == "hit",
+                    strong_local_recall=(
+                        retrieved_sources.diagnostics.get("strong_local_recall")
+                        is True
                     ),
-                    locations=narration_snapshot.locations,
-                    scenario=scenario,
-                ),
-                continuity_ready=not self.repositories.list_post_turn_outbox_steps(
-                    save_id=save_id,
-                    statuses=("pending", "running", "failed"),
-                ),
-                retrieval_degraded=False,
-            )
-            responsive_foreground = (
-                "not_responsive_foreground" not in fast_path.reasons
+                    character_references_resolved=(
+                        character_references_are_resolved(
+                            player_message=player_message,
+                            characters=narration_snapshot.characters,
+                            present_character_ids=frozenset(
+                                narration_snapshot.scene_snapshot.present_character_ids
+                                if narration_snapshot.scene_snapshot is not None
+                                else ()
+                            ),
+                            locations=narration_snapshot.locations,
+                            scenario=scenario,
+                        )
+                    ),
+                    continuity_ready=(
+                        not self.repositories.list_post_turn_outbox_steps(
+                            save_id=save_id,
+                            statuses=("pending", "running", "failed"),
+                        )
+                    ),
+                    retrieval_degraded=False,
+                )
+                if responsive_foreground
+                else ResponsiveFastPathEligibility(
+                    eligible=False,
+                    reasons=("not_responsive_foreground",),
+                )
             )
             if responsive_foreground:
                 log_event(
