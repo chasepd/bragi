@@ -99,7 +99,7 @@ log when applicable.
 | 3 | `fix/foreground-retry-budgets` | `complete` | [#133](https://github.com/chasepd/bragi/pull/133) | Enforced hard deadlines and responsive foreground retry limits. |
 | 4 | `feat/responsive-turn-mode` | `complete` | [#134](https://github.com/chasepd/bragi/pull/134) | Added portable save-scoped mode and responsive routing/budget behavior. |
 | 5 | `perf/adaptive-turn-pipeline` | `complete` | [#135](https://github.com/chasepd/bragi/pull/135) | Added deterministic fast path and combined structured planning path. |
-| 6 | `perf/post-turn-media-responsiveness` | `complete` | PR pending | Start images earlier and improve media loading feedback. |
+| 6 | `perf/post-turn-media-responsiveness` | `complete` | [#136](https://github.com/chasepd/bragi/pull/136) | Start images earlier and improve media loading feedback. |
 | 7 | `docs/turn-responsiveness-results` | `pending` | #129 | Evaluate organic aggregates, document results, and close the program only if gates pass. |
 
 ## PR Requirements
@@ -228,7 +228,7 @@ For every program PR:
 | 2026-08-13 | PR 3 ([#133](https://github.com/chasepd/bragi/pull/133)) | quality and internal responsive retry policy | 0 | n/a | n/a | n/a | Provider deadlines and execution budgets were verified with deterministic fakes. Responsive mode is not yet user-selectable, so no organic comparison samples exist; no personal runtime data or live provider was inspected. |
 | 2026-08-13 | PR 4 ([#134](https://github.com/chasepd/bragi/pull/134)) | quality and selectable responsive mode | 0 | n/a | n/a | n/a | The save mode, budgets, routing, and mode-stratified timing were verified with deterministic fakes and synthetic timing data. Organic comparison begins after deployment; no personal runtime data or live provider was inspected. |
 | 2026-08-13 | PR 5 ([#135](https://github.com/chasepd/bragi/pull/135)) | quality and adaptive responsive pipelines | 0 | n/a | n/a | n/a | Fast and combined routes, provider-call waves, fallbacks, guards, and race handling were verified with deterministic fakes. Organic comparison remains pending deployment; no personal runtime data or live provider was inspected. |
-| 2026-08-13 | PR 6 (pending) | post-turn media responsiveness | 0 | n/a | n/a | n/a | Early image handoff, milestone ordering, transient queue-pressure recovery, source-linked progress, and media cache behavior were verified with deterministic fakes. Organic comparison remains pending deployment; no personal runtime data, media, or live provider was inspected. |
+| 2026-08-13 | PR 6 ([#136](https://github.com/chasepd/bragi/pull/136)) | post-turn media responsiveness | 0 | n/a | n/a | n/a | Early image handoff, milestone ordering, transient queue-pressure recovery, source-linked progress, and media cache behavior were verified with deterministic fakes. Organic comparison remains pending deployment; no personal runtime data, media, or live provider was inspected. |
 
 ## PR Evidence
 
@@ -320,7 +320,7 @@ For every program PR:
   validation passed after the fixes. A fresh pinned-commit re-review scored the
   final code 9.8/10 with no Critical, Important, or Minor findings. No stable
   interface or product requirement deviated from the plan.
-- PR 6 (PR pending), pinned reviewed implementation commit `f6b2491`: red tests
+- PR 6 ([#136](https://github.com/chasepd/bragi/pull/136)), pinned reviewed implementation commit `f6b2491`: red tests
   first exposed the absence of an early prepared-image handoff and proved that
   image work could not overlap continuity. The implementation emits the
   already-frozen pre-post-turn image payload from the existing pressure-aware
@@ -409,9 +409,8 @@ For every program PR:
 
 ## Exact Next Action
 
-Open PR 6 from `perf/post-turn-media-responsiveness` with `Refs #129`, replace
-the pending references above with its link, and monitor CI until green and
-mergeable. After PR 6 merges, fetch the resulting `origin/main` and create a
+Monitor PR 6 until CI is green and the PR is mergeable. After PR 6 merges,
+fetch the resulting `origin/main` and create a
 fresh sibling worktree on `docs/turn-responsiveness-results` for PR 7. Read only
 privacy-safe aggregate timing summaries and proceed with results closeout only
 when at least 20 matched samples exist per mode; otherwise record the gate as
