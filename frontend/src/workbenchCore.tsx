@@ -3832,6 +3832,7 @@ function Workbench({
           </InlineNotice>
         ) : null}
         <Chronicle
+          key={activeSaveId ?? "no-save"}
           model={model}
           runJob={runJob}
           pendingMessages={activePendingMessages}
