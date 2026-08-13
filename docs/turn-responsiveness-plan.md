@@ -106,7 +106,7 @@ log when applicable.
 | 4 | `feat/responsive-turn-mode` | `complete` | [#134](https://github.com/chasepd/bragi/pull/134) | Added portable save-scoped mode and responsive routing/budget behavior. |
 | 5 | `perf/adaptive-turn-pipeline` | `complete` | [#135](https://github.com/chasepd/bragi/pull/135) | Added deterministic fast path and combined structured planning path. |
 | 6 | `perf/post-turn-media-responsiveness` | `complete` | [#136](https://github.com/chasepd/bragi/pull/136) | Start images earlier and improve media loading feedback. |
-| 7 | `docs/turn-responsiveness-results` | `in_progress` | #129 | Add the missing privacy-safe outcome/route aggregates, operator guidance, and record the current sample gate. |
+| 7 | `docs/turn-responsiveness-results` | `complete` | [#137](https://github.com/chasepd/bragi/pull/137) | Added the missing privacy-safe outcome/route aggregates, operator guidance, and recorded the current sample gate. |
 | 8 | `docs/turn-responsiveness-organic-closeout` | `blocked` | #129 | Evaluate organic aggregates and close the program only if every gate passes. |
 
 ## PR Requirements
@@ -365,10 +365,12 @@ For every program PR:
   visibility; newly generated assets use persisted thumbnails. The frontend
   aggregate compressed-size budgets increased by 300 bytes for the new status
   and invalidation behavior. No personal runtime data or live provider was used.
-- PR 7: red tests first exposed the missing mode/provider/model-scoped terminal
-  outcome query, aggregate failure and route calculations, configured narrator
-  snapshot, and propagation of the successful adaptive route to durable web
-  telemetry. The implementation extends the existing authenticated timing
+- PR 7 ([#137](https://github.com/chasepd/bragi/pull/137)), pinned reviewed
+  implementation commit `4cc58a8`: red tests first exposed the missing
+  mode/provider/model-scoped terminal outcome query, aggregate failure and route
+  calculations, configured narrator snapshot, and propagation of the successful
+  adaptive route to durable web telemetry. The implementation extends the
+  existing authenticated timing
   summary with latest-30 terminal outcomes and records only configured
   provider/model, effective mode, and two boolean route flags. The first pinned
   review found an Important race between creation-time settings and settings at
@@ -379,10 +381,12 @@ For every program PR:
   timing and terminal outcomes. Older successful timing samples
   remain compatible and are explicitly unclassified when they predate route
   telemetry. Operator guidance now defines matched collection, formulas,
-  privacy boundaries, small-sample handling, and paint-event measurement. The
-  organic gate is not met: the project issue and aggregate log contain zero
-  deployed eligible samples, so #129 remains open and PR 8 is blocked pending
-  normal use. Validation and pinned-review evidence will be added before merge.
+  privacy boundaries, small-sample handling, and paint-event measurement. Full
+  nine-phase validation passed after the fixes. A final independent
+  pinned-commit review scored the implementation 9.8/10 with no Critical,
+  Important, or Minor findings. The organic gate is not met: the project issue
+  and aggregate log contain zero deployed eligible samples, so #129 remains
+  open and PR 8 is blocked pending normal use.
 
 ## Decision And Change Log
 
@@ -470,10 +474,11 @@ For every program PR:
 
 ## Exact Next Action
 
-Finish PR 7's validation and pinned review, record the PR link and evidence,
-then merge it with #129 still open. After the merged reporting change is
-deployed, wait for at least 20 successful privacy-safe samples per mode in one
-matched configured narrator provider/model stratum. Only then create a fresh
-worktree for PR 8, read the authenticated aggregate summaries, record the
-comparison, and close #129 if every success gate passes. Do not inspect or share
-local databases, logs, prompts, narration, identifiers, or media.
+Monitor PR 7 ([#137](https://github.com/chasepd/bragi/pull/137)) until CI is
+green and it is mergeable, then merge it with #129 still open. After the merged
+reporting change is deployed, wait for at least 20 successful privacy-safe
+samples per mode in one matched executed narrator provider/model stratum. Only
+then create a fresh worktree for PR 8, read the authenticated aggregate
+summaries, record the comparison, and close #129 if every success gate passes.
+Do not inspect or share local databases, logs, prompts, narration, identifiers,
+or media.
