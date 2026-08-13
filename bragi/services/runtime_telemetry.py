@@ -357,6 +357,7 @@ class TelemetryProviderClient:
                     started=started,
                     started_at=started_at,
                     error=str(exc) or exc.__class__.__name__,
+                    metadata=_provider_error_metadata(exc),
                 )
                 raise
             _record_provider_call(
@@ -445,6 +446,7 @@ class TelemetryProviderClient:
                         metadata={
                             **_token_usage_metadata(token_usage),
                             **stream_metadata,
+                            **_provider_error_metadata(exc),
                             **_stream_performance_metadata(
                                 started=started,
                                 first_chunk_ms=first_chunk_ms,
@@ -572,9 +574,42 @@ def _response_metadata(response: object) -> dict[str, object]:
             }
         )
         metadata.update(_openrouter_provider_metadata(raw_metadata))
+        metadata.update(_retry_metadata(raw_metadata.get("_bragi_retry")))
     token_usage = getattr(response, "token_usage", None)
     if isinstance(token_usage, Mapping):
         metadata.update(_token_usage_metadata(token_usage))
+    return metadata
+
+
+def _provider_error_metadata(exc: Exception) -> dict[str, object]:
+    attempt_count = getattr(exc, "retry_attempt_count", None)
+    max_attempts = getattr(exc, "max_retry_attempts", None)
+    return _retry_count_metadata(
+        attempt_count=attempt_count,
+        max_attempts=max_attempts,
+    )
+
+
+def _retry_metadata(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    return _retry_count_metadata(
+        attempt_count=value.get("attempt_count"),
+        max_attempts=value.get("max_attempts"),
+    )
+
+
+def _retry_count_metadata(
+    *,
+    attempt_count: object,
+    max_attempts: object,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {}
+    if isinstance(attempt_count, int) and not isinstance(attempt_count, bool):
+        metadata["attempt_count"] = attempt_count
+        metadata["retry_count"] = max(0, attempt_count - 1)
+    if isinstance(max_attempts, int) and not isinstance(max_attempts, bool):
+        metadata["max_attempts"] = max_attempts
     return metadata
 
 

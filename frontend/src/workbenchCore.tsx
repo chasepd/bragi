@@ -407,6 +407,7 @@ type PendingChronicleMessage = ChronicleMessage & {
 type NarratorPaintMeasurement = {
   jobId: string;
   messageId: string;
+  saveId: string;
   startedAtMs: number;
 };
 type LocalCharacterTextMessage = CharacterTextMessage & {
@@ -3239,11 +3240,13 @@ function Workbench({
         || narratorPaintRequested
       ) return;
       const messageId = narratorMessageIdFromResult(result);
-      if (!messageId) return;
+      const saveId = created.save_id ?? activeSaveIdRef.current;
+      if (!messageId || !saveId) return;
       narratorPaintRequested = true;
       setNarratorPaintMeasurement({
         jobId: created.id,
         messageId,
+        saveId,
         startedAtMs: options.paintStartedAtMs,
       });
     };
@@ -5318,7 +5321,7 @@ function Chronicle({
         `optimistic:${optimisticPaintMeasurement.paint_started_at_ms}`,
       );
     }
-    if (narratorPaintMeasurement) {
+    if (narratorPaintMeasurement?.saveId === activeSaveId) {
       recordPaint(
         "client.chat.narrator_painted",
         narratorPaintMeasurement.messageId,
