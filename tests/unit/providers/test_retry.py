@@ -11,6 +11,7 @@ from bragi.providers.retry import (
     MAX_BACKOFF_SECONDS,
     call_with_provider_retries,
     is_transient_provider_error,
+    stream_with_provider_deadline,
 )
 
 
@@ -362,6 +363,54 @@ def test_call_with_provider_retries_wraps_attempt_in_remaining_hard_deadline(
         assert exc_info.value.retry_attempt_count == 1
         assert exc_info.value.max_retry_attempts == 1
         assert exc_info.value.diagnostics["deadline_exceeded"] is True
+
+    asyncio.run(run())
+
+
+def test_stream_deadline_scope_closes_before_chunk_reaches_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        timeout_active = False
+
+        class TrackingTimeout:
+            async def __aenter__(self) -> None:
+                nonlocal timeout_active
+                timeout_active = True
+
+            async def __aexit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                nonlocal timeout_active
+                del exc_type, exc, traceback
+                timeout_active = False
+
+            def expired(self) -> bool:
+                return False
+
+        async def source() -> Any:
+            yield {"delta": "first"}
+            yield {"delta": "second"}
+
+        monkeypatch.setattr(
+            "bragi.providers.retry.asyncio.timeout",
+            lambda _delay: TrackingTimeout(),
+        )
+
+        received: list[dict[str, str]] = []
+        async for chunk in stream_with_provider_deadline(
+            source(),
+            provider="fake",
+            task="chat",
+            call_deadline_seconds=45,
+        ):
+            assert timeout_active is False
+            received.append(chunk)
+
+        assert received == [{"delta": "first"}, {"delta": "second"}]
 
     asyncio.run(run())
 
