@@ -94,7 +94,7 @@ log when applicable.
 | PR | Branch | Status | Issue/PR | Required outcome |
 | --- | --- | --- | --- | --- |
 | 0 | `docs/turn-responsiveness-plan` | `complete` | [#130](https://github.com/chasepd/bragi/pull/130) | Persisted this execution plan and update protocol. |
-| 1 | `feat/turn-latency-telemetry` | `in_progress` | #129 | Add critical-path spans, user-paint events, and deterministic latency harnesses. |
+| 1 | `feat/turn-latency-telemetry` | `complete` | [#131](https://github.com/chasepd/bragi/pull/131) | Added critical-path spans, user-paint events, and deterministic latency harnesses. |
 | 2 | `feat/turn-progress-ux` | `pending` | #129 | Add narrator placeholder, timing summaries, and job-delivery cleanup. |
 | 3 | `fix/foreground-retry-budgets` | `pending` | #129 | Enforce hard deadlines and responsive foreground retry limits. |
 | 4 | `feat/responsive-turn-mode` | `pending` | #129 | Add portable save-scoped mode and responsive routing/budget behavior. |
@@ -223,6 +223,7 @@ For every program PR:
 | Date | Commit/PR | Mode and stratum | Samples | Median | p95 | Failure/interruption rate | Notes |
 | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
 | 2026-08-12 | audit at `940d585` | quality, code audit only | 0 | n/a | n/a | n/a | No personal runtime data inspected. |
+| 2026-08-12 | PR 1 ([#131](https://github.com/chasepd/bragi/pull/131)) | quality, instrumentation baseline | 0 | n/a | n/a | n/a | Telemetry begins with this PR, so no eligible pre-instrumentation samples exist. No personal runtime data or live provider was inspected; matched organic aggregates begin after deployment. |
 
 ## PR Evidence
 
@@ -232,6 +233,19 @@ For every program PR:
   that blocker by recording the PR, completed status, evidence, and next action.
   No aggregate runtime measurements apply to this PR and there were no product
   or interface deviations.
+- PR 1 ([#131](https://github.com/chasepd/bragi/pull/131)), pinned implementation
+  commit `414ed60`: red tests first exposed the missing span API, production
+  planner and output-safety call-site coverage, paint delivery edge cases, and
+  the absence of persisted retry counts. The final harness drives the real API,
+  job registry, runtime, and `ChatService` path under a virtual clock; it proves
+  two provider-call waves, one retry, 200 ms completion, critical-span ordering,
+  and metadata privacy without API keys or wall-clock sleeps. Changed-file
+  validation escalated to the full nine-phase suite and passed unit/web tests,
+  integration tests, typechecking, lint, frontend tests, build, and audit. A
+  pinned-SHA review scored the implementation 9.5/10 with no Critical or
+  Important findings. The only planned interface deferral is
+  `client.chat.placeholder_painted`, which remains in PR 2 so it cannot report a
+  UI milestone before the placeholder exists.
 
 ## Decision And Change Log
 
@@ -250,9 +264,16 @@ For every program PR:
   committed narrator UI. The stable `client.chat.placeholder_painted` event is
   implemented in PR 2 with the placeholder that it measures; emitting it before
   that UI exists would create misleading telemetry.
+- 2026-08-12: Successful and exhausted provider calls persist only numeric
+  `attempt_count`, `retry_count`, and `max_attempts` from provider retry
+  metadata. This makes provider-call waves measurable without persisting
+  transport payloads or prose.
 
 ## Exact Next Action
 
-Implement PR 1 with red-green coverage for critical-path spans, streaming
-first-chunk metrics, and existing client paint milestones. Validate and review
-the PR, then record its evidence and exact PR 2 handoff here before merge.
+After PR 1 ([#131](https://github.com/chasepd/bragi/pull/131)) is green and
+merged, fetch `origin` and create a fresh sibling worktree from the updated
+`origin/main` on `feat/turn-progress-ux`. Mark PR 2 `in_progress` in its first
+commit, then add red-green coverage for the in-chronicle narrator placeholder,
+timing-summary endpoint, two-second successful fallback polling, direct valid
+`job_changed` application, and narrower chat-delta invalidations.
