@@ -3251,6 +3251,7 @@ function Workbench({
     if (jobWatchers.current[created.id]) return jobWatchers.current[created.id];
     if (created.status !== "queued" && created.status !== "running") {
       if (created.status === "succeeded") {
+        requestNarratorPaint(created.result);
         options.onSucceeded?.(created.result);
       }
       if (created.status === "failed") {
@@ -5049,6 +5050,10 @@ function pendingMessageForActiveSave(message: PendingChronicleMessage | null, ac
 
 function narratorMessageIdFromResult(result: unknown): string | null {
   if (isChatTurnDelta(result)) return result.narrator_message_id;
+  if (result && typeof result === "object") {
+    const messageId = (result as { narrator_message_id?: unknown }).narrator_message_id;
+    if (typeof messageId === "string" && messageId) return messageId;
+  }
   if (!isRuntimeModel(result)) return null;
   const messages = result.chronicle?.messages ?? [];
   for (let index = messages.length - 1; index >= 0; index -= 1) {

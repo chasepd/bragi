@@ -8765,7 +8765,11 @@ def test_chat_turn_uses_runtime_pre_narrator_phase_progress(
     )
 
 
-def test_chat_turn_persists_user_facing_phase_spans(tmp_path: Path) -> None:
+@pytest.mark.parametrize("context_status", ["succeeded", "degraded"])
+def test_chat_turn_persists_user_facing_phase_spans(
+    tmp_path: Path,
+    context_status: str,
+) -> None:
     class TimedProgressRuntime(_RuntimeDouble):
         async def submit_player_message_for_initial_render(
             self,
@@ -8812,7 +8816,7 @@ def test_chat_turn_persists_user_facing_phase_spans(tmp_path: Path) -> None:
             publish(
                 "Preparing narrator prompt",
                 character_planning="succeeded",
-                context_selection="succeeded",
+                context_selection=context_status,
                 prompt="running",
             )
             publish(
@@ -8883,6 +8887,10 @@ def test_chat_turn_persists_user_facing_phase_spans(tmp_path: Path) -> None:
     ]
     assert all(step.status == "succeeded" for step in steps)
     assert all(step.duration_ms is not None for step in steps)
+    context_step = next(step for step in steps if step.name == "chat.context")
+    assert context_step.metadata == (
+        {"degraded": True} if context_status == "degraded" else {}
+    )
 
 
 def test_timeskip_exposes_initial_pre_narrator_phase_progress(

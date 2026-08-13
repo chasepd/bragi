@@ -9883,18 +9883,25 @@ def _turn_progress_callback(
             if status == "running":
                 phase_started[phase] = (now, now_iso)
                 continue
-            if status not in {"succeeded", "failed", "cancelled", "skipped"}:
+            if status not in {
+                "succeeded",
+                "failed",
+                "cancelled",
+                "skipped",
+                "degraded",
+            }:
                 continue
             started, started_at = phase_started.pop(phase, (now, now_iso))
             bragi_runtime_bindings().record_job_step(
                 repositories=repositories,
                 job_id=handle.record.id,
                 name=step_name,
-                status=status,
+                status="succeeded" if status == "degraded" else status,
                 task="chat",
                 started_at=started_at,
                 completed_at=now_iso,
                 duration_ms=max(0, round((now - started) * 1000)),
+                metadata={"degraded": True} if status == "degraded" else None,
             )
 
     def callback(progress: object) -> None:
