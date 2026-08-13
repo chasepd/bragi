@@ -100,7 +100,7 @@ log when applicable.
 | 4 | `feat/responsive-turn-mode` | `complete` | [#134](https://github.com/chasepd/bragi/pull/134) | Added portable save-scoped mode and responsive routing/budget behavior. |
 | 5 | `perf/adaptive-turn-pipeline` | `complete` | [#135](https://github.com/chasepd/bragi/pull/135) | Added deterministic fast path and combined structured planning path. |
 | 6 | `perf/post-turn-media-responsiveness` | `complete` | [#136](https://github.com/chasepd/bragi/pull/136) | Start images earlier and improve media loading feedback. |
-| 7 | `docs/turn-responsiveness-results` | `pending` | #129 | Evaluate organic aggregates, document results, and close the program only if gates pass. |
+| 7 | `docs/turn-responsiveness-results` | `in_progress` | #129 | Evaluate organic aggregates, document results, and close the program only if gates pass. |
 
 ## PR Requirements
 
