@@ -946,6 +946,13 @@ export type ChatSubmissionStatus = {
   blocking_job_status: Job["status"] | null;
   blocking_message_id?: string | null;
 };
+export type ChatTimingSummary = {
+  mode: "quality" | "responsive";
+  provider: string | null;
+  model: string | null;
+  sample_count: number;
+  estimate: { p50_ms: number; p95_ms: number } | null;
+};
 export type WorldDataModel = {
   active_save_id: string | null;
   save?: Record<string, unknown> | null;
@@ -1253,12 +1260,13 @@ type SseParseContext = {
 
 type SseParseResult<T> = { ok: true; value: T } | { ok: false };
 
-type StreamFallbackPoll = (signal: AbortSignal) => Promise<void>;
+type StreamFallbackPoll = (signal: AbortSignal) => Promise<boolean | void>;
 
 const STREAM_CONNECT_TIMEOUT_MS = 10_000;
 const STREAM_STALE_TIMEOUT_MS = 45_000;
-const STREAM_FALLBACK_BASE_MS = 1_000;
-const STREAM_FALLBACK_MAX_MS = 30_000;
+const STREAM_FALLBACK_SUCCESS_MS = 2_000;
+const STREAM_FALLBACK_ERROR_BASE_MS = 1_000;
+const STREAM_FALLBACK_ERROR_MAX_MS = 5_000;
 
 function createStreamFallbackController(fallbackPoll?: StreamFallbackPoll) {
   let state = 0;
@@ -1288,14 +1296,29 @@ function createStreamFallbackController(fallbackPoll?: StreamFallbackPoll) {
       if (state !== 1 || !canPoll()) return;
       const controller = new AbortController();
       pollController = controller;
-      await fallbackPoll?.(controller.signal);
+      let succeeded = false;
+      try {
+        succeeded = (await fallbackPoll?.(controller.signal)) !== false;
+      } catch {
+        succeeded = false;
+      }
       if (pollController === controller) pollController = undefined;
       if (state !== 1) return;
-      const baseDelay = Math.min(
-        STREAM_FALLBACK_BASE_MS * (2 ** attempt++),
-        STREAM_FALLBACK_MAX_MS
+      const nextDelay = succeeded
+        ? STREAM_FALLBACK_SUCCESS_MS
+        : Math.min(
+            STREAM_FALLBACK_ERROR_BASE_MS * (2 ** attempt++),
+            STREAM_FALLBACK_ERROR_MAX_MS,
+          );
+      if (succeeded) attempt = 0;
+      schedulePoll(
+        succeeded
+          ? nextDelay
+          : Math.min(
+              nextDelay * (0.8 + Math.random() * 0.4),
+              STREAM_FALLBACK_ERROR_MAX_MS,
+            ),
       );
-      schedulePoll(baseDelay * (0.8 + Math.random() * 0.4));
     }, delay);
   };
   const pauseOrResume = () => {
@@ -1373,6 +1396,7 @@ export function watchJob(
         if (job.completion_level) {
           onEvent?.("completion_level", { completion_level: job.completion_level });
         }
+        return true;
       } catch (failure) {
         if (closed || signal.aborted) return;
         if (failure instanceof ApiError && failure.status === 404) {
@@ -1396,6 +1420,7 @@ export function watchJob(
           error_name: failure instanceof Error ? failure.name : "Error",
           error_message: failure instanceof Error ? failure.message : "Could not read job"
         });
+        return false;
       }
     }
   );

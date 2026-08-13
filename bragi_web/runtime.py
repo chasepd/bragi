@@ -18,6 +18,7 @@ from typing import Any, cast
 from bragi_web.auth_throttle import AuthAttemptThrottle
 from bragi_web.bragi_adapter import bragi_runtime_bindings
 from bragi_web.jobs import JobRecord, JobRegistry
+from bragi_web.serialization import to_jsonable
 from bragi_web.storage import WebStoragePaths, resolve_web_storage_paths
 
 WEB_SQLITE_BUSY_TIMEOUT_MS = 5000
@@ -543,15 +544,69 @@ def _publish_job_save_event(save_events: SaveEventHub) -> Any:
 
 
 def _save_event_job_summary(record: JobRecord) -> dict[str, object]:
+    latest_progress = next(
+        (
+            _safe_job_progress_summary(event.get("payload"))
+            for event in reversed(record.events)
+            if event.get("event") == "progress"
+        ),
+        None,
+    )
     return {
         "id": record.id,
         "type": record.type,
         "save_id": record.save_id,
         "status": record.status,
+        "completion_level": record.completion_level,
         "error": record.error,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
+        "latest_progress": latest_progress,
     }
+
+
+def _safe_job_progress_summary(progress: object) -> dict[str, object] | None:
+    payload = to_jsonable(progress)
+    if not isinstance(payload, dict):
+        return None
+    summary: dict[str, object] = {}
+    for key in (
+        "kind",
+        "label",
+        "section_id",
+        "status",
+        "status_text",
+        "scenario_type",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str):
+            summary[key] = value[:240]
+    for key in ("completed_count", "total_count"):
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            summary[key] = max(0, value)
+    for key in ("continuity_degraded", "retry_pending"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            summary[key] = value
+    jobs = payload.get("jobs")
+    if isinstance(jobs, list):
+        safe_jobs: list[dict[str, str]] = []
+        for job in jobs[:32]:
+            if not isinstance(job, dict):
+                continue
+            name = job.get("name")
+            status = job.get("status")
+            if not isinstance(name, str) or not isinstance(status, str):
+                continue
+            safe_job = {"name": name[:80], "status": status[:80]}
+            category = job.get("category")
+            if isinstance(category, str):
+                safe_job["category"] = category[:80]
+            safe_jobs.append(safe_job)
+        if safe_jobs:
+            summary["jobs"] = safe_jobs
+    return summary or None
 
 
 def _save_event_visible_to_stream(

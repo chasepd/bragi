@@ -1346,6 +1346,20 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             resolved_save_id = _resolve_chat_save_id(state, save_id)
         return _chat_submission_status(state, resolved_save_id)
 
+    @app.get("/api/chat/timing-summary")
+    def chat_timing_summary(
+        state: StateDep,
+        save_id: str | None = None,
+    ) -> dict[str, Any]:
+        with state.lock:
+            resolved_save_id = _require_save_id(save_id)
+            _raise_unless_save_action_allowed(state, resolved_save_id, "read")
+            from bragi.services.chat_timing_service import ChatTimingService
+
+            return _json_dict(
+                ChatTimingService(state.repositories).summary(resolved_save_id)
+            )
+
     @app.get("/api/character-texts")
     def character_texts(
         state: StateDep,

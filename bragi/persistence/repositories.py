@@ -14080,6 +14080,54 @@ class PersistenceRepositories:
         )
         return _chat_turn_submission_from_row(row) if row is not None else None
 
+    def list_chat_response_commit_durations(
+        self,
+        *,
+        save_id: str,
+        provider: str,
+        model: str,
+        limit: int = 30,
+    ) -> list[int]:
+        if limit <= 0:
+            return []
+        rows = self._fetch_all(
+            """
+            SELECT MAX(
+                       0,
+                       CAST(
+                           ROUND(
+                               (
+                                   julianday(step.completed_at)
+                                   - julianday(job.created_at)
+                               )
+                               * 86400000
+                           ) AS INTEGER
+                       )
+                   ) AS duration_ms
+            FROM chat_turn_submissions AS submission
+            JOIN jobs AS job ON job.id = submission.job_id
+            JOIN messages AS narrator
+              ON narrator.id = submission.narrator_message_id
+             AND narrator.save_id = submission.save_id
+            JOIN job_steps AS step
+              ON step.job_id = job.id
+             AND step.name = 'chat.response_committed'
+             AND step.status = 'succeeded'
+            WHERE submission.save_id = ?
+              AND job.type = 'chat_turn'
+              AND job.status = 'succeeded'
+              AND narrator.role = 'narrator'
+              AND narrator.provider = ?
+              AND narrator.model = ?
+              AND job.created_at IS NOT NULL
+              AND step.completed_at IS NOT NULL
+            ORDER BY step.completed_at DESC, step.rowid DESC
+            LIMIT ?
+            """,
+            (save_id, provider, model, min(limit, 30)),
+        )
+        return [int(row["duration_ms"]) for row in rows]
+
     def create_chat_turn_submission_job(
         self,
         *,
