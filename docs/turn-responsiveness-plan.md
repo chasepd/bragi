@@ -95,7 +95,7 @@ log when applicable.
 | --- | --- | --- | --- | --- |
 | 0 | `docs/turn-responsiveness-plan` | `complete` | [#130](https://github.com/chasepd/bragi/pull/130) | Persisted this execution plan and update protocol. |
 | 1 | `feat/turn-latency-telemetry` | `complete` | [#131](https://github.com/chasepd/bragi/pull/131) | Added critical-path spans, user-paint events, and deterministic latency harnesses. |
-| 2 | `feat/turn-progress-ux` | `in_progress` | #129 | Add narrator placeholder, timing summaries, and job-delivery cleanup. |
+| 2 | `feat/turn-progress-ux` | `complete` | [#132](https://github.com/chasepd/bragi/pull/132) | Added narrator placeholder, timing summaries, and job-delivery cleanup. |
 | 3 | `fix/foreground-retry-budgets` | `pending` | #129 | Enforce hard deadlines and responsive foreground retry limits. |
 | 4 | `feat/responsive-turn-mode` | `pending` | #129 | Add portable save-scoped mode and responsive routing/budget behavior. |
 | 5 | `perf/adaptive-turn-pipeline` | `pending` | #129 | Add deterministic fast path and combined structured planning path. |
@@ -224,6 +224,7 @@ For every program PR:
 | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
 | 2026-08-12 | audit at `940d585` | quality, code audit only | 0 | n/a | n/a | n/a | No personal runtime data inspected. |
 | 2026-08-12 | PR 1 ([#131](https://github.com/chasepd/bragi/pull/131)) | quality, instrumentation baseline | 0 | n/a | n/a | n/a | Telemetry begins with this PR, so no eligible pre-instrumentation samples exist. No personal runtime data or live provider was inspected; matched organic aggregates begin after deployment. |
+| 2026-08-12 | PR 2 ([#132](https://github.com/chasepd/bragi/pull/132)) | quality, progress UX | 0 | n/a | n/a | n/a | The endpoint reads local privacy-safe aggregates only; implementation and tests used synthetic data, and no personal runtime data was inspected. |
 
 ## PR Evidence
 
@@ -246,6 +247,20 @@ For every program PR:
   Important findings. The only planned interface deferral is
   `client.chat.placeholder_painted`, which remains in PR 2 so it cannot report a
   UI milestone before the placeholder exists.
+- PR 2 ([#132](https://github.com/chasepd/bragi/pull/132)), pinned implementation
+  commit `6806433`: backend red tests first exposed the absent timing service and
+  repository query; frontend red tests exposed the old fallback cadence and
+  absent narrator placeholder. Review regressions then reproduced an early SSE
+  event race and unsafe progress projection before their fixes. The completed
+  implementation paints an in-chronicle narrator placeholder immediately,
+  enriches it with bounded progress, timing, and cancellation, replaces it
+  atomically with committed narration, applies valid job changes directly,
+  polls successful fallbacks every two seconds, and narrows chat-delta
+  invalidation. Full nine-phase validation passed. A pinned-SHA review scored
+  the implementation 9.5/10 with no Critical or Important findings. The only
+  implementation-budget change was a small frontend compressed-size allowance
+  increase for the new placeholder and cache behavior; no stable interface or
+  product requirement deviated from the plan.
 
 ## Decision And Change Log
 
@@ -268,11 +283,19 @@ For every program PR:
   `attempt_count`, `retry_count`, and `max_attempts` from provider retry
   metadata. This makes provider-call waves measurable without persisting
   transport payloads or prose.
+- 2026-08-12: Direct `job_changed` progress is projected through a bounded
+  metadata allowlist before SSE delivery. Generated sections, error text, and
+  arbitrary nested progress data never enter the client event.
+- 2026-08-12: Raise the frontend gzip and Brotli size budgets narrowly to cover
+  narrator-placeholder, timing-summary, and direct job-cache behavior. The
+  normal build-size check remains enforced.
 
 ## Exact Next Action
 
-Implement PR 2 in the fresh `feat/turn-progress-ux` worktree with red-green
-coverage for the in-chronicle narrator placeholder, timing-summary endpoint,
-two-second successful fallback polling, direct valid `job_changed` application,
-and narrower chat-delta invalidations. Validate and review the PR, then record
-its evidence and exact PR 3 handoff here before merge.
+After PR 2 merges, fetch the resulting `origin/main` and create the fresh
+`fix/foreground-retry-budgets` worktree for PR 3. Begin with red tests for the
+deadline setting policy, sanitization, API, and admin UI; provider-attempt hard
+deadlines and timeout normalization; and execution-context retry budgets. Then
+implement the 45-second/two-attempt responsive foreground ceiling, prevent
+whole-turn replay after budget exhaustion, and cap responsive verification at
+one regeneration while preserving configured quality and background behavior.
