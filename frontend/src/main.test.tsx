@@ -1944,6 +1944,7 @@ describe("frontend helpers", () => {
       error: null,
       created_at: -1_000_000_000
     } satisfies Job;
+    const chatResponse = deferred<{ ok: boolean; json: () => Promise<Job> }>();
     const baseFetch = workbenchFetch([], runtimeModel({
       chronicle: {
         messages: [
@@ -1959,7 +1960,7 @@ describe("frontend helpers", () => {
       if (path.startsWith("/api/characters")) characterReads += 1;
       if (path.startsWith("/api/media")) mediaReads += 1;
       if (path === "/api/chat") {
-        return Promise.resolve({ ok: true, json: async () => createdJob });
+        return chatResponse.promise;
       }
       if (path.startsWith("/api/chat/timing-summary")) {
         return Promise.resolve({
@@ -1995,7 +1996,21 @@ describe("frontend helpers", () => {
     const optimisticMessage = await screen.findByText("Light the beacon");
     expect(optimisticMessage.closest("[data-message-id='pending-player-message']")).not.toBeNull();
     const placeholder = await screen.findByRole("status", { name: "Narrator response progress" });
-    expect(placeholder).toHaveTextContent("Queued");
+    expect(placeholder).toHaveTextContent("Preparing narrator response");
+    const saveSource = await waitFor(() => {
+      const match = sources.find((candidate) => candidate.url === "/api/saves/save-1/events");
+      if (!match) throw new Error("save watcher was not created");
+      return match;
+    });
+    act(() => {
+      saveSource.dispatch("job_changed", {
+        event_id: 1,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: { job: createdJob }
+      });
+    });
+    await waitFor(() => expect(placeholder).toHaveTextContent("Queued"));
     expect(placeholder).toHaveTextContent("Recent turns: about 10–20s");
     expect(
       optimisticMessage.closest(".chronicle-virtual-row")?.nextElementSibling?.querySelector("article"),
@@ -2024,6 +2039,10 @@ describe("frontend helpers", () => {
       const match = sources.find((candidate) => candidate.url === "/api/jobs/job-paint/events?save_id=save-1");
       if (!match) throw new Error("chat watcher was not created");
       return match;
+    });
+    await act(async () => {
+      chatResponse.resolve({ ok: true, json: async () => createdJob });
+      await chatResponse.promise;
     });
     const delta: ChatTurnDelta = {
       kind: "chat_turn_delta",

@@ -3465,7 +3465,16 @@ def test_job_save_events_omit_result_payloads() -> None:
             completion_level="response_committed",
             result={"debug_prompt": "secret prompt"},
             events=[
-                {"event": "progress", "payload": {"label": "Selecting context"}}
+                {
+                    "event": "progress",
+                    "payload": {
+                        "label": "Selecting context",
+                        "completed_sections": [
+                            ["opening_message", "Private generated section prose."]
+                        ],
+                        "error": "Private provider error detail.",
+                    },
+                }
             ],
         )
     )
@@ -3485,6 +3494,8 @@ def test_job_save_events_omit_result_payloads() -> None:
     assert job["latest_progress"] == {"label": "Selecting context"}
     assert "result" not in job
     assert "debug_prompt" not in str(events[0].payload)
+    assert "Private generated section prose" not in str(events[0].payload)
+    assert "Private provider error detail" not in str(events[0].payload)
 
 
 def test_character_bundle_export_requires_character_save_access(

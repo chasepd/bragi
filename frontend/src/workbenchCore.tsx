@@ -237,13 +237,14 @@ type SettingsSummaryModel = {
   facts?: string[];
   tone?: SettingsSummaryTone;
 };
-type RunJob = (job: Job, options?: {
+type RunJobOptions = {
   applyResult?: boolean;
   clearPendingMessages?: boolean;
   paintStartedAtMs?: number;
   onSucceeded?: (result: unknown) => void;
   onFailed?: (error: string, job: Job) => void;
-}) => () => void;
+};
+type RunJob = (job: Job, options?: RunJobOptions) => () => void;
 type JobActionRequest = {
   key: string;
   path: string;
@@ -2888,6 +2889,7 @@ function Workbench({
   const [trackedJobs, setTrackedJobs] = useState<Record<string, TrackedJob>>({});
   const [scenarioRefreshVersion, setScenarioRefreshVersion] = useState(0);
   const jobWatchers = useRef<Record<string, () => void>>({});
+  const jobRunOptionsRef = useRef<Record<string, RunJobOptions>>({});
   const queuedRefreshesRef = useRef<Map<string, QueuedWorkbenchRefresh>>(new Map());
   const refreshFlushTimerRef = useRef<number | null>(null);
   const runtimeFreshTimerRef = useRef<number | null>(null);
@@ -3327,12 +3329,19 @@ function Workbench({
     };
   }, [onLayoutPointerMove, resizingSide, stopLayoutResize]);
 
-  const runJob = useCallback<RunJob>((created, options = { applyResult: true }) => {
+  const runJob = useCallback<RunJob>((created, requestedOptions) => {
+    const priorOptions = jobRunOptionsRef.current[created.id];
+    const options = requestedOptions
+      ? { ...priorOptions, ...requestedOptions }
+      : priorOptions ?? { applyResult: true };
+    jobRunOptionsRef.current[created.id] = options;
+    const currentOptions = () => jobRunOptionsRef.current[created.id] ?? options;
     let narratorPaintRequested = false;
     const requestNarratorPaint = (result: unknown) => {
+      const activeOptions = currentOptions();
       if (
         created.type !== "chat_turn"
-        || options.paintStartedAtMs === undefined
+        || activeOptions.paintStartedAtMs === undefined
         || narratorPaintRequested
       ) return;
       const messageId = narratorMessageIdFromResult(result);
@@ -3343,20 +3352,25 @@ function Workbench({
         jobId: created.id,
         messageId,
         saveId,
-        startedAtMs: options.paintStartedAtMs,
+        startedAtMs: activeOptions.paintStartedAtMs,
       });
     };
-    if (!jobBelongsToActiveSave(created, activeSaveIdRef.current)) return () => undefined;
+    if (!jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
+      delete jobRunOptionsRef.current[created.id];
+      return () => undefined;
+    }
     if (jobWatchers.current[created.id]) return jobWatchers.current[created.id];
     if (created.status !== "queued" && created.status !== "running") {
+      const activeOptions = currentOptions();
       if (created.status === "succeeded") {
         requestNarratorPaint(created.result);
-        options.onSucceeded?.(created.result);
+        activeOptions.onSucceeded?.(created.result);
       }
       if (created.status === "failed") {
-        options.onFailed?.(created.error || "Background job failed.", created);
+        activeOptions.onFailed?.(created.error || "Background job failed.", created);
       }
-      if (options.clearPendingMessages !== false) setPendingMessage(null);
+      if (activeOptions.clearPendingMessages !== false) setPendingMessage(null);
+      delete jobRunOptionsRef.current[created.id];
       refreshWorkbench(activeSaveIdRef.current, ALL_WORKBENCH_REFRESH_TARGETS);
       return () => undefined;
     }
@@ -3370,6 +3384,7 @@ function Workbench({
     const stop = watchJob(
       created.id,
       (done) => {
+        const activeOptions = currentOptions();
         const appliesToCurrentSave = jobBelongsToActiveSave(done, activeSaveIdRef.current);
         let appliedRuntimeResult = false;
         let appliedChatDelta = false;
@@ -3379,7 +3394,7 @@ function Workbench({
           return next;
         });
         delete jobWatchers.current[done.id];
-        if (appliesToCurrentSave && options.applyResult !== false && done.status === "succeeded") {
+        if (appliesToCurrentSave && activeOptions.applyResult !== false && done.status === "succeeded") {
           if (isRuntimeModel(done.result)) {
             appliedRuntimeResult = true;
             applyRuntimeModel(done.result);
@@ -3392,7 +3407,7 @@ function Workbench({
         if (appliesToCurrentSave && done.status === "succeeded") {
           applyCharacterTextJobResult(client, done.result, done.save_id ?? activeSaveIdRef.current);
         }
-        if (appliesToCurrentSave && done.status === "succeeded") options.onSucceeded?.(done.result);
+        if (appliesToCurrentSave && done.status === "succeeded") activeOptions.onSucceeded?.(done.result);
         const isActionChoiceJob = (
           done.type === "action_choice_generate"
           || done.type === "action_choice_regenerate"
@@ -3427,10 +3442,10 @@ function Workbench({
           if (isActionChoiceJob) {
             appliedRuntimeResult = true;
           }
-          options.onFailed?.(error, done);
+          activeOptions.onFailed?.(error, done);
         }
         if (appliesToCurrentSave) {
-          if (options.clearPendingMessages !== false) {
+          if (activeOptions.clearPendingMessages !== false) {
             setPendingMessage(null);
           }
           refreshWorkbench(
@@ -3442,6 +3457,7 @@ function Workbench({
                 : ALL_WORKBENCH_REFRESH_TARGETS,
           );
         }
+        delete jobRunOptionsRef.current[done.id];
         if (done.type === "model_refresh") client.invalidateQueries({ queryKey: ["settings"] });
       },
       (name, data) => {
@@ -3517,6 +3533,7 @@ function Workbench({
     return () => {
       Object.values(jobWatchers.current).forEach((stop) => stop());
       jobWatchers.current = {};
+      jobRunOptionsRef.current = {};
       if (refreshFlushTimerRef.current !== null) {
         window.clearTimeout(refreshFlushTimerRef.current);
         refreshFlushTimerRef.current = null;
@@ -3565,6 +3582,7 @@ function Workbench({
         }
         jobWatchers.current[jobId]?.();
         delete jobWatchers.current[jobId];
+        delete jobRunOptionsRef.current[jobId];
       }
       return next;
     });
