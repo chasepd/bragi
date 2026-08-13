@@ -95,7 +95,7 @@ log when applicable.
 | --- | --- | --- | --- | --- |
 | 0 | `docs/turn-responsiveness-plan` | `complete` | [#130](https://github.com/chasepd/bragi/pull/130) | Persisted this execution plan and update protocol. |
 | 1 | `feat/turn-latency-telemetry` | `complete` | [#131](https://github.com/chasepd/bragi/pull/131) | Added critical-path spans, user-paint events, and deterministic latency harnesses. |
-| 2 | `feat/turn-progress-ux` | `pending` | #129 | Add narrator placeholder, timing summaries, and job-delivery cleanup. |
+| 2 | `feat/turn-progress-ux` | `in_progress` | #129 | Add narrator placeholder, timing summaries, and job-delivery cleanup. |
 | 3 | `fix/foreground-retry-budgets` | `pending` | #129 | Enforce hard deadlines and responsive foreground retry limits. |
 | 4 | `feat/responsive-turn-mode` | `pending` | #129 | Add portable save-scoped mode and responsive routing/budget behavior. |
 | 5 | `perf/adaptive-turn-pipeline` | `pending` | #129 | Add deterministic fast path and combined structured planning path. |
@@ -271,9 +271,8 @@ For every program PR:
 
 ## Exact Next Action
 
-After PR 1 ([#131](https://github.com/chasepd/bragi/pull/131)) is green and
-merged, fetch `origin` and create a fresh sibling worktree from the updated
-`origin/main` on `feat/turn-progress-ux`. Mark PR 2 `in_progress` in its first
-commit, then add red-green coverage for the in-chronicle narrator placeholder,
-timing-summary endpoint, two-second successful fallback polling, direct valid
-`job_changed` application, and narrower chat-delta invalidations.
+Implement PR 2 in the fresh `feat/turn-progress-ux` worktree with red-green
+coverage for the in-chronicle narrator placeholder, timing-summary endpoint,
+two-second successful fallback polling, direct valid `job_changed` application,
+and narrower chat-delta invalidations. Validate and review the PR, then record
+its evidence and exact PR 3 handoff here before merge.
