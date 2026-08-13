@@ -96,7 +96,7 @@ log when applicable.
 | 0 | `docs/turn-responsiveness-plan` | `complete` | [#130](https://github.com/chasepd/bragi/pull/130) | Persisted this execution plan and update protocol. |
 | 1 | `feat/turn-latency-telemetry` | `complete` | [#131](https://github.com/chasepd/bragi/pull/131) | Added critical-path spans, user-paint events, and deterministic latency harnesses. |
 | 2 | `feat/turn-progress-ux` | `complete` | [#132](https://github.com/chasepd/bragi/pull/132) | Added narrator placeholder, timing summaries, and job-delivery cleanup. |
-| 3 | `fix/foreground-retry-budgets` | `in_progress` | #129 | Enforce hard deadlines and responsive foreground retry limits. |
+| 3 | `fix/foreground-retry-budgets` | `complete` | [#133](https://github.com/chasepd/bragi/pull/133) | Enforced hard deadlines and responsive foreground retry limits. |
 | 4 | `feat/responsive-turn-mode` | `pending` | #129 | Add portable save-scoped mode and responsive routing/budget behavior. |
 | 5 | `perf/adaptive-turn-pipeline` | `pending` | #129 | Add deterministic fast path and combined structured planning path. |
 | 6 | `perf/post-turn-media-responsiveness` | `pending` | #129 | Start images earlier and improve media loading feedback. |
@@ -225,6 +225,7 @@ For every program PR:
 | 2026-08-12 | audit at `940d585` | quality, code audit only | 0 | n/a | n/a | n/a | No personal runtime data inspected. |
 | 2026-08-12 | PR 1 ([#131](https://github.com/chasepd/bragi/pull/131)) | quality, instrumentation baseline | 0 | n/a | n/a | n/a | Telemetry begins with this PR, so no eligible pre-instrumentation samples exist. No personal runtime data or live provider was inspected; matched organic aggregates begin after deployment. |
 | 2026-08-12 | PR 2 ([#132](https://github.com/chasepd/bragi/pull/132)) | quality, progress UX | 0 | n/a | n/a | n/a | The endpoint reads local privacy-safe aggregates only; implementation and tests used synthetic data, and no personal runtime data was inspected. |
+| 2026-08-13 | PR 3 ([#133](https://github.com/chasepd/bragi/pull/133)) | quality and internal responsive retry policy | 0 | n/a | n/a | n/a | Provider deadlines and execution budgets were verified with deterministic fakes. Responsive mode is not yet user-selectable, so no organic comparison samples exist; no personal runtime data or live provider was inspected. |
 
 ## PR Evidence
 
@@ -261,6 +262,26 @@ For every program PR:
   implementation-budget change was a small frontend compressed-size allowance
   increase for the new placeholder and cache behavior; no stable interface or
   product requirement deviated from the plan.
+- PR 3 ([#133](https://github.com/chasepd/bragi/pull/133)), pinned implementation
+  commit `60adad3`: red tests first exposed the missing deadline policy/API/UI,
+  unbounded attempts and stream reads, raw timeout expiry, whole-turn replay,
+  and uncapped response checks. Review regressions then reproduced an async
+  generator timeout scope that cancelled its consumer, streaming fallback that
+  multiplied the foreground provider budget, non-finite deadlines that could
+  fail calls immediately, and separate response guards multiplying responsive
+  regenerations. The completed implementation enforces a remaining hard
+  deadline around every provider attempt and stream read, normalizes expiry as
+  a transient provider timeout, limits responsive foreground work to two
+  provider attempts and 45 seconds without whole-turn replay, and shares one
+  narrator regeneration across script, phrase, verifier, and legacy NPC checks.
+  Quality and background execution retain configured behavior, and mandatory
+  guards still reject invalid output. Full nine-phase validation passed. A
+  fresh pinned-SHA review scored the complete implementation 9.2/10 with no
+  Critical, runtime Important, or Minor findings after fixes. Responsive
+  foreground deliberately uses final-only non-streaming transport so a failed
+  stream cannot open a fresh non-streaming provider budget; this does not alter
+  the browser contract because provisional prose remains disabled. No other
+  stable interface or product requirement deviated from the plan.
 
 ## Decision And Change Log
 
@@ -289,13 +310,26 @@ For every program PR:
 - 2026-08-12: Raise the frontend gzip and Brotli size budgets narrowly to cover
   narrator-placeholder, timing-summary, and direct job-cache behavior. The
   normal build-size check remains enforced.
+- 2026-08-13: Treat responsive verification as one shared narrator-regeneration
+  allowance across deterministic script and phrase guards, structured
+  verification, and the legacy NPC audit. Exhausting that allowance never
+  bypasses a guard; invalid output is still rejected or marked suspicious under
+  the configured audit policy.
+- 2026-08-13: Use non-streaming provider transport for responsive foreground
+  narration. Bragi still delivers final-only prose, and this keeps streaming
+  failure plus non-streaming fallback inside one two-attempt/45-second budget.
+- 2026-08-13: Invalid non-finite provider deadlines resolve to the safe default,
+  matching other malformed persisted setting values.
 
 ## Exact Next Action
 
-After PR 2 merges, fetch the resulting `origin/main` and create the fresh
-`fix/foreground-retry-budgets` worktree for PR 3. Begin with red tests for the
-deadline setting policy, sanitization, API, and admin UI; provider-attempt hard
-deadlines and timeout normalization; and execution-context retry budgets. Then
-implement the 45-second/two-attempt responsive foreground ceiling, prevent
-whole-turn replay after budget exhaustion, and cap responsive verification at
-one regeneration while preserving configured quality and background behavior.
+After PR 3 merges, fetch the resulting `origin/main` and create a fresh sibling
+worktree on `feat/responsive-turn-mode` for PR 4. Mark PR 4 in progress in the
+first commit, then begin with red tests for the portable save-scoped
+`turn_responsiveness_mode` setting, permissions, forks, snapshots, export, and
+import. Add quality/responsive routing so quality remains unchanged while
+responsive foreground work selects PR 3's retry budget, disables optional
+helper thinking, caps structured helper output at 2,048 tokens, uses an
+8-player/8-narrator planner window, and requests OpenRouter latency sorting only
+when no explicit routing profile overrides it. Do not change the narrator model
+or its configured output limit.
