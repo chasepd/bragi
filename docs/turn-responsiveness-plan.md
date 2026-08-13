@@ -99,7 +99,7 @@ log when applicable.
 | 3 | `fix/foreground-retry-budgets` | `complete` | [#133](https://github.com/chasepd/bragi/pull/133) | Enforced hard deadlines and responsive foreground retry limits. |
 | 4 | `feat/responsive-turn-mode` | `complete` | [#134](https://github.com/chasepd/bragi/pull/134) | Added portable save-scoped mode and responsive routing/budget behavior. |
 | 5 | `perf/adaptive-turn-pipeline` | `complete` | [#135](https://github.com/chasepd/bragi/pull/135) | Added deterministic fast path and combined structured planning path. |
-| 6 | `perf/post-turn-media-responsiveness` | `pending` | #129 | Start images earlier and improve media loading feedback. |
+| 6 | `perf/post-turn-media-responsiveness` | `complete` | [#136](https://github.com/chasepd/bragi/pull/136) | Start images earlier and improve media loading feedback. |
 | 7 | `docs/turn-responsiveness-results` | `pending` | #129 | Evaluate organic aggregates, document results, and close the program only if gates pass. |
 
 ## PR Requirements
@@ -228,6 +228,7 @@ For every program PR:
 | 2026-08-13 | PR 3 ([#133](https://github.com/chasepd/bragi/pull/133)) | quality and internal responsive retry policy | 0 | n/a | n/a | n/a | Provider deadlines and execution budgets were verified with deterministic fakes. Responsive mode is not yet user-selectable, so no organic comparison samples exist; no personal runtime data or live provider was inspected. |
 | 2026-08-13 | PR 4 ([#134](https://github.com/chasepd/bragi/pull/134)) | quality and selectable responsive mode | 0 | n/a | n/a | n/a | The save mode, budgets, routing, and mode-stratified timing were verified with deterministic fakes and synthetic timing data. Organic comparison begins after deployment; no personal runtime data or live provider was inspected. |
 | 2026-08-13 | PR 5 ([#135](https://github.com/chasepd/bragi/pull/135)) | quality and adaptive responsive pipelines | 0 | n/a | n/a | n/a | Fast and combined routes, provider-call waves, fallbacks, guards, and race handling were verified with deterministic fakes. Organic comparison remains pending deployment; no personal runtime data or live provider was inspected. |
+| 2026-08-13 | PR 6 ([#136](https://github.com/chasepd/bragi/pull/136)) | post-turn media responsiveness | 0 | n/a | n/a | n/a | Early image handoff, milestone ordering, transient queue-pressure recovery, source-linked progress, and media cache behavior were verified with deterministic fakes. Organic comparison remains pending deployment; no personal runtime data, media, or live provider was inspected. |
 
 ## PR Evidence
 
@@ -319,6 +320,27 @@ For every program PR:
   validation passed after the fixes. A fresh pinned-commit re-review scored the
   final code 9.8/10 with no Critical, Important, or Minor findings. No stable
   interface or product requirement deviated from the plan.
+- PR 6 ([#136](https://github.com/chasepd/bragi/pull/136)), pinned reviewed implementation commit `f6b2491`: red tests
+  first exposed the absence of an early prepared-image handoff and proved that
+  image work could not overlap continuity. The implementation emits the
+  already-frozen pre-post-turn image payload from the existing pressure-aware
+  image step, queues generation immediately, preserves the deferred consume
+  path as a compatibility fallback, and retains the payload for one
+  post-continuity retry if registry pressure rejects the early enqueue. Images
+  remain optional, do not block chat submission, and keep the
+  `response_committed`, `continuity_ready`, and
+  `optional_enrichments_complete` ordering. The UI links a compact arriving
+  status to the source chronicle message, loads thumbnails with asynchronous
+  decoding in the sidebar, reserves the full asset for the modal, and refreshes
+  media only at media-changing terminal transitions. Full nine-phase
+  validation passed. The first pinned review found one Important transient
+  queue-pressure loss; the regression and retry fix closed it, and a fresh
+  pinned-commit review scored the result 9.6/10 with no remaining Critical or
+  Important findings. The existing thumbnail endpoint continues serving the
+  original only when a legacy asset has no usable thumbnail, preserving old-save
+  visibility; newly generated assets use persisted thumbnails. The frontend
+  aggregate compressed-size budgets increased by 300 bytes for the new status
+  and invalidation behavior. No personal runtime data or live provider was used.
 
 ## Decision And Change Log
 
@@ -374,14 +396,23 @@ For every program PR:
   known names and aliases, Unicode-capitalized names, uncased scripts, and
   lowercase address/reference constructions. Ambiguous references use the
   combined or normal helper path instead of weakening eligibility.
+- 2026-08-13: Treat an early prepared-image enqueue as successful only when a
+  child job record exists. Retain the frozen payload through continuity and
+  retry once afterward when transient job-registry pressure rejects the early
+  attempt; this preserves optional enrichment without delaying continuity.
+- 2026-08-13: Keep the existing original-file fallback for legacy assets that
+  lack usable thumbnails. New media loads persisted thumbnails in all sidebar
+  views and fetches the original only after opening the modal.
+- 2026-08-13: Raise the aggregate frontend gzip and Brotli budgets by 300 bytes
+  for source-linked scene-arrival status and precise media invalidation. Raw and
+  per-file ceilings remain unchanged.
 
 ## Exact Next Action
 
-After PR 5 merges, fetch the resulting `origin/main` and create a fresh sibling
-worktree on `perf/post-turn-media-responsiveness` for PR 6. Mark PR 6 in progress
-in the first commit. Begin with red tests proving prepared automatic image work
-starts as soon as preparation completes, overlaps only independent continuity
-steps, preserves pre-post-turn image semantics and milestone ordering, and never
-blocks chat submission. Then add the source-linked scene-arriving tile,
-thumbnail/asynchronous sidebar loading, full-asset modal fetch, and media-only
-invalidation behavior without broad chat-delta refetches.
+Monitor PR 6 until CI is green and the PR is mergeable. After PR 6 merges,
+fetch the resulting `origin/main` and create a
+fresh sibling worktree on `docs/turn-responsiveness-results` for PR 7. Read only
+privacy-safe aggregate timing summaries and proceed with results closeout only
+when at least 20 matched samples exist per mode; otherwise record the gate as
+pending, improve operator guidance that does not require personal data, and keep
+#129 open.

@@ -9618,6 +9618,80 @@ def test_run_post_turn_jobs_stashes_deferred_image_for_consume(
     )
 
 
+def test_run_post_turn_jobs_forwards_prepared_image_before_continuity_finishes(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, narrator_id = _persist_runtime_save(repositories)
+    player_id = repositories.list_messages(save_id)[0].id
+    prepared_payload: dict[str, object] = {"source_message_id": narrator_id}
+    handoff_seen = asyncio.Event()
+    release_continuity = asyncio.Event()
+    received: list[dict[str, object]] = []
+
+    class FakeChatService:
+        def __init__(self, **_kwargs: object) -> None:
+            return None
+
+        async def run_post_turn_jobs(
+            self,
+            *,
+            save_id: str,
+            player_message_id: str,
+            narrator_message_id: str,
+            defer_image_generation: bool = False,
+            prepared_automatic_image_callback: Callable[
+                [dict[str, object]], None
+            ]
+            | None = None,
+        ) -> dict[str, object]:
+            assert defer_image_generation is True
+            assert prepared_automatic_image_callback is not None
+            prepared_automatic_image_callback(prepared_payload)
+            handoff_seen.set()
+            await release_continuity.wait()
+            return {
+                "jobs": [
+                    {
+                        "name": "image",
+                        "status": "queued",
+                        "result": {
+                            "deferred_to_background": True,
+                            "prepared_automatic_image": prepared_payload,
+                        },
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(runtime, "ChatService", FakeChatService)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+
+    async def run() -> None:
+        post_turn = asyncio.create_task(
+            controller.run_post_turn_jobs(
+                save_id=save_id,
+                player_message_id=player_id,
+                narrator_message_id=narrator_id,
+                defer_image_generation=True,
+                prepared_automatic_image_callback=received.append,
+            )
+        )
+        await asyncio.wait_for(handoff_seen.wait(), timeout=1.0)
+        assert not post_turn.done()
+        release_continuity.set()
+        await asyncio.wait_for(post_turn, timeout=1.0)
+
+    asyncio.run(run())
+
+    assert received == [prepared_payload]
+    assert controller.consume_deferred_automatic_image(
+        save_id=save_id,
+        narrator_message_id=narrator_id,
+    ) is None
+
+
 def test_run_post_turn_jobs_waits_for_same_save_submit_lock(
     repositories: PersistenceRepositories,
     tmp_path: Path,

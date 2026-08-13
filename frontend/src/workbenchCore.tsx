@@ -220,8 +220,7 @@ const RUNTIME_MODEL_SIDE_EFFECT_REFRESH_TARGETS: readonly WorkbenchRefreshTarget
   "character-texts",
   "character-text-thread",
   "jobs-active",
-  "chat-status",
-  "media"
+  "chat-status"
 ];
 const CHAT_TURN_DELTA_REFRESH_TARGETS: readonly WorkbenchRefreshTarget[] = [
   "jobs-active",
@@ -331,7 +330,8 @@ function runtimeChangedRefreshTargets(reason: string | null, panel: PanelName): 
   if (["messages_deleted", "world_time_corrected", "custom_instructions_updated"].includes(reason)) {
     return [...base, "chat-history"];
   }
-  return [...base, refreshTargetForPanel(panel)];
+  const panelTarget = refreshTargetForPanel(panel);
+  return panelTarget === "media" ? base : [...base, panelTarget];
 }
 
 function saveEventRefreshTargets(event: SaveEvent, panel: PanelName): WorkbenchRefreshTarget[] {
@@ -3124,6 +3124,9 @@ function Workbench({
       if (terminal || (!existing && isChatJobType(changedJob.type))) {
         queueWorkbenchRefresh(saveId, ["jobs-active", "chat-status"]);
       }
+      if (terminal && mediaChangingJob(changedJob)) {
+        queueWorkbenchRefresh(saveId, ["media"]);
+      }
       return;
     }
     queueWorkbenchRefresh(saveId, saveEventRefreshTargets(event, panel));
@@ -3373,7 +3376,12 @@ function Workbench({
       }
       if (activeOptions.clearPendingMessages !== false) setPendingMessage(null);
       delete jobRunOptionsRef.current[created.id];
-      refreshWorkbench(activeSaveIdRef.current, ALL_WORKBENCH_REFRESH_TARGETS);
+      refreshWorkbench(
+        activeSaveIdRef.current,
+        mediaChangingJob(created)
+          ? ["jobs-active", "media"]
+          : ALL_WORKBENCH_REFRESH_TARGETS,
+      );
       return () => undefined;
     }
     setTrackedJobs((current) => {
@@ -3452,7 +3460,9 @@ function Workbench({
           }
           refreshWorkbench(
             activeSaveIdRef.current,
-            appliedChatDelta
+            mediaChangingJob(done)
+              ? ["jobs-active", "media"]
+              : appliedChatDelta
               ? CHAT_TURN_DELTA_REFRESH_TARGETS
               : appliedRuntimeResult
                 ? RUNTIME_MODEL_SIDE_EFFECT_REFRESH_TARGETS
@@ -3622,6 +3632,11 @@ function Workbench({
     .filter((tracked) => jobBelongsToActiveSave(tracked.job, activeSaveId))
     .filter((tracked) => tracked.job.type !== "character_text_send")
     .sort((left, right) => (left.job.created_at ?? 0) - (right.job.created_at ?? 0));
+  const sceneArrivalMessageIds = new Set(
+    pendingJobs
+      .map(({ job }) => sceneArrivalSourceMessageId(job))
+      .filter((messageId): messageId is string => Boolean(messageId)),
+  );
   const activeSaveChatBlockers = pendingJobs.filter(({ job }) => jobBlocksChatSubmission(job, activeSaveId));
   const backendChatBlocker = chatSubmissionStatus.data?.blocking_job_id
     ? pendingJobs.find((tracked) => tracked.job.id === chatSubmissionStatus.data?.blocking_job_id && isChatJobType(tracked.job.type))
@@ -3824,6 +3839,7 @@ function Workbench({
           onRuntimeChanged={applyRuntimeModel}
           currentUser={currentUser}
           mutationsDisabled={!activeSaveSupported}
+          sceneArrivalMessageIds={sceneArrivalMessageIds}
           onCancelNarrator={activeNarratorJob ? () => cancelTrackedJob(activeNarratorJob) : undefined}
         />
         <PendingJobsTray
@@ -5255,6 +5271,7 @@ type ChronicleMessageRowProps = {
   onAction: (actionId: string, message: ChronicleMessage) => void;
   mutationsDisabled?: boolean;
   storytellerMode?: boolean;
+  sceneImageArriving?: boolean;
   onCancelNarrator?: () => void;
 };
 
@@ -5313,6 +5330,7 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
   onAction,
   mutationsDisabled = false,
   storytellerMode = false,
+  sceneImageArriving = false,
   onCancelNarrator,
 }: ChronicleMessageRowProps) {
   const pendingMessage = message as PendingChronicleMessage;
@@ -5377,6 +5395,13 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
         error ? <InlineNotice key={key} className="message-action-error">{error}</InlineNotice> : null
       ))}
       <MarkdownView message={message} />
+      {sceneImageArriving ? (
+        <span
+          className="scene-arriving-tile"
+          role="status"
+          aria-label="Scene image arriving"
+        />
+      ) : null}
       {message.interrupted_turn ? (
         <div className="interrupted-turn" role="alert">
           <div>
@@ -5433,6 +5458,7 @@ function Chronicle({
   onRuntimeChanged,
   currentUser = null,
   mutationsDisabled = false,
+  sceneArrivalMessageIds = new Set<string>(),
   onCancelNarrator,
 }: {
   model?: RuntimeModel;
@@ -5443,6 +5469,7 @@ function Chronicle({
   onRuntimeChanged?: (model: RuntimeModel) => void;
   currentUser?: CurrentUser | null;
   mutationsDisabled?: boolean;
+  sceneArrivalMessageIds?: ReadonlySet<string>;
   onCancelNarrator?: () => void;
 }) {
   const localPendingMessages = pendingMessages
@@ -5726,6 +5753,7 @@ function Chronicle({
                   pendingJobActionKeys={pendingJobActionKeys}
                   mutationsDisabled={mutationsDisabled}
                   storytellerMode={model?.interaction_mode === "storyteller"}
+                  sceneImageArriving={sceneArrivalMessageIds.has(message.message_id)}
                   onAction={handleChronicleAction}
                   onCancelNarrator={onCancelNarrator}
                 />
@@ -9909,6 +9937,18 @@ function isChatJobType(type: string) {
     || type === "narrator_edit"
     || type === "chat_delete_from_here"
     || type === "chat_fork_from_here";
+}
+
+function mediaChangingJob(job: Pick<Job, "type">) {
+  return /(image|media|video|character_reference)/.test(job.type);
+}
+
+function sceneArrivalSourceMessageId(job: Job): string | null {
+  const sourceMessageId = (
+    job.latest_progress as { source_message_id?: unknown } | null
+  )?.source_message_id;
+  return job.type === "automatic_image_generation"
+    && typeof sourceMessageId === "string" ? sourceMessageId : null;
 }
 
 function jobBlocksChatSubmission(job: Job, activeSaveId: string | null) {

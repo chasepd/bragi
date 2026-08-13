@@ -577,6 +577,7 @@ def _safe_job_progress_summary(progress: object) -> dict[str, object] | None:
         "status",
         "status_text",
         "scenario_type",
+        "source_message_id",
     ):
         value = payload.get(key)
         if isinstance(value, str):
