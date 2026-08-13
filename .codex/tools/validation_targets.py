@@ -89,6 +89,8 @@ DOCS_WITHOUT_SMART_VALIDATION = {
     Path("docs/narration-query-index-audit.md"),
     # Historical privacy review; implementation changes belong in mapped policy docs.
     Path("docs/privacy-review.md"),
+    # Program execution ledger; each implementation PR carries its own mapped tests.
+    Path("docs/turn-responsiveness-plan.md"),
 }
 
 BROAD_RISK_PATHS = {

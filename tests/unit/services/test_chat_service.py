@@ -97,6 +97,7 @@ from bragi.services.chat_history_settings import (
 from bragi.services.chat_service import (
     CancellationToken,
     ChatService,
+    SubmittedTurn,
     _selected_context_sources,
     _verified_post_turn_coverage_for_turn,
 )
@@ -150,6 +151,7 @@ from bragi.services.post_turn_inference import (
     VerifiedPostTurnCoverage,
 )
 from bragi.services.prompt_inspection import PromptInspectionStore
+from bragi.services.runtime_telemetry import runtime_telemetry_context
 from bragi.services.scenario_evolution_policy import (
     SCENARIO_EVOLUTION_TURN_INTERVAL_SETTING,
 )
@@ -3693,13 +3695,25 @@ def test_submit_player_turn_adds_agentic_narrator_message_spec(
         narrator_planner=planner,
     )
 
-    asyncio.run(
-        service.submit_player_turn(
-            save_id=save.id,
-            body="I climb toward the beacon lens.",
-            speaker_name="Mara",
-        )
+    outer_job = repositories.create_job(
+        type="chat_turn",
+        status="running",
+        payload={},
     )
+
+    async def run_turn() -> None:
+        with runtime_telemetry_context(
+            repositories=repositories,
+            job_id=outer_job.id,
+            task="chat",
+        ):
+            await service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+            )
+
+    asyncio.run(run_turn())
 
     assert len(planner.calls) == 1
     assert planner.calls[0][0] == save.id
@@ -3731,6 +3745,12 @@ def test_submit_player_turn_adds_agentic_narrator_message_spec(
         "character:ilyra",
         "state:beacon.lens",
     )
+    stable_steps = {
+        step.name: step for step in repositories.list_job_steps(outer_job.id)
+    }
+    assert stable_steps["chat.narrator_planning"].status == "succeeded"
+    assert stable_steps["chat.output_safety"].status == "succeeded"
+    assert all(step.duration_ms is not None for step in stable_steps.values())
 
 
 def test_submit_player_turn_falls_back_when_narrator_planner_fails(
@@ -3759,16 +3779,35 @@ def test_submit_player_turn_falls_back_when_narrator_planner_fails(
         narrator_planner=planner,
     )
 
-    result = asyncio.run(
-        service.submit_player_turn(
-            save_id=save.id,
-            body="I climb toward the beacon lens.",
-            speaker_name="Mara",
-            run_post_turn_jobs=False,
-        )
+    outer_job = repositories.create_job(
+        type="chat_turn",
+        status="running",
+        payload={},
     )
 
+    async def run_turn() -> SubmittedTurn:
+        with runtime_telemetry_context(
+            repositories=repositories,
+            job_id=outer_job.id,
+            task="chat",
+        ):
+            return await service.submit_player_turn(
+                save_id=save.id,
+                body="I climb toward the beacon lens.",
+                speaker_name="Mara",
+                run_post_turn_jobs=False,
+            )
+
+    result = asyncio.run(run_turn())
+
     assert len(planner.calls) == 1
+    planning_steps = [
+        step
+        for step in repositories.list_job_steps(outer_job.id)
+        if step.name == "chat.narrator_planning"
+    ]
+    assert len(planning_steps) == 1
+    assert planning_steps[0].status == "failed"
     assert len(provider.chat_requests) == 1
     assert provider.chat_requests[0].narration_brief == ""
     assert provider.chat_requests[0].narration_evidence == ()

@@ -59,7 +59,7 @@ from bragi.services.settings_service import SettingsService
 from bragi.services.world_data_service import ScenarioEdit
 from bragi_web.api.app import create_app
 from bragi_web.auth_throttle import AuthAttemptThrottle
-from bragi_web.jobs import JobRecord, JobRegistry, JobRegistryLimits
+from bragi_web.jobs import JobHandle, JobRecord, JobRegistry, JobRegistryLimits
 from bragi_web.observability import clear_recent_events, recent_events
 from bragi_web.runtime import (
     BundlePreviewState,
@@ -8765,6 +8765,134 @@ def test_chat_turn_uses_runtime_pre_narrator_phase_progress(
     )
 
 
+@pytest.mark.parametrize("context_status", ["succeeded", "degraded"])
+def test_chat_turn_persists_user_facing_phase_spans(
+    tmp_path: Path,
+    context_status: str,
+) -> None:
+    class TimedProgressRuntime(_RuntimeDouble):
+        async def submit_player_message_for_initial_render(
+            self,
+            *,
+            body: str,
+            speaker_name: str | None,
+            active_save_id: object,
+            turn_progress_callback: Callable[[object], None] | None = None,
+        ) -> object:
+            del body, speaker_name, active_save_id
+            assert turn_progress_callback is not None
+            statuses = {name: "pending" for name in _EXPECTED_CHAT_TURN_PHASES}
+
+            def publish(status_text: str, **updates: str) -> None:
+                statuses.update(updates)
+                turn_progress_callback(
+                    {
+                        "status_text": status_text,
+                        "jobs": [
+                            {"name": name, "status": statuses[name]}
+                            for name in _EXPECTED_CHAT_TURN_PHASES
+                        ],
+                    }
+                )
+
+            publish(
+                "Checking submitted content",
+                submission="succeeded",
+                classification="running",
+                history="running",
+            )
+            publish(
+                "Saving player input",
+                classification="succeeded",
+                history="succeeded",
+                input="running",
+            )
+            publish(
+                "Selecting context",
+                input="succeeded",
+                character_planning="running",
+                context_selection="running",
+            )
+            publish(
+                "Preparing narrator prompt",
+                character_planning="succeeded",
+                context_selection=context_status,
+                prompt="running",
+            )
+            publish(
+                "Writing narrator response",
+                prompt="succeeded",
+                narrator="running",
+            )
+            publish(
+                "Checking response",
+                narrator="succeeded",
+                response_checks="running",
+            )
+            publish(
+                "Saving narrator response",
+                response_checks="succeeded",
+                save_narration="running",
+            )
+            publish(
+                "Narrator response saved",
+                save_narration="succeeded",
+                action_choices="skipped",
+            )
+            return SimpleNamespace(
+                model=_chat_model("The bell answers."),
+                has_post_turn_jobs=False,
+                save_id="save-1",
+                player_message_id="player-1",
+                narrator_message_id="narrator-1",
+            )
+
+    state = _state_double(tmp_path, TimedProgressRuntime())
+    persisted_steps: list[SimpleNamespace] = []
+
+    def record_job_step(**values: object) -> None:
+        persisted_steps.append(SimpleNamespace(**values))
+
+    state.repositories.record_job_step = record_job_step
+    state.jobs = JobRegistry(repositories=state.repositories)
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        created = client.post(
+            "/api/chat",
+            json={
+                "client_turn_id": str(uuid4()),
+                "body": "Light the beacon",
+                "save_id": "save-1",
+            },
+        )
+        assert created.status_code == 200
+        job = _wait_for_terminal_job(
+            client,
+            created.json()["id"],
+            save_id="save-1",
+        )
+
+    assert job["status"] == "succeeded"
+    steps = persisted_steps
+    assert [step.name for step in steps] == [
+        "chat.preflight",
+        "chat.input_safety",
+        "chat.history",
+        "chat.character_planning",
+        "chat.context",
+        "chat.narrator_generation",
+        "chat.verification",
+        "chat.commit",
+        "chat.response_committed",
+    ]
+    assert all(step.status == "succeeded" for step in steps)
+    assert all(step.duration_ms is not None for step in steps)
+    context_step = next(step for step in steps if step.name == "chat.context")
+    assert context_step.metadata == (
+        {"degraded": True} if context_status == "degraded" else {}
+    )
+
+
 def test_timeskip_exposes_initial_pre_narrator_phase_progress(
     tmp_path: Path,
 ) -> None:
@@ -9404,6 +9532,7 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
 
     runtime = DeferredImageRuntime()
     state = _state_double(tmp_path, runtime)
+    state.jobs._repositories = repositories  # noqa: SLF001 - production telemetry wiring
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
@@ -9458,6 +9587,73 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
     assert post_turn_finished["completion_level"] == (
         "optional_enrichments_complete"
     )
+    continuity_steps = repositories.list_job_steps(post_turn_jobs[0]["id"])
+    assert [(step.name, step.status) for step in continuity_steps] == [
+        ("post_turn.continuity_ready", "succeeded"),
+    ]
+    automatic_image_job = repositories.connection.execute(
+        "SELECT id FROM jobs WHERE type = 'automatic_image_generation'"
+    ).fetchone()
+    assert automatic_image_job is not None
+    image_steps = repositories.list_job_steps(str(automatic_image_job[0]))
+    assert [(step.name, step.status) for step in image_steps] == [
+        ("post_turn.image_ready", "succeeded"),
+    ]
+
+
+def test_inline_post_turn_fallback_records_continuity_ready_span(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(
+        sqlite3.connect(database_path, check_same_thread=False)
+    )
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower above the ash.",
+        player_role="Keeper",
+        content={},
+    )
+    repositories.create_save(
+        scenario_id=scenario.id,
+        title="Lantern Keep",
+        save_id="save-1",
+    )
+
+    class InlineRuntime(_RuntimeDouble):
+        async def run_post_turn_jobs(self, **_kwargs: object) -> dict[str, object]:
+            return {"continuity_degraded": False}
+
+    state = _state_double(tmp_path, InlineRuntime())
+    state.jobs = JobRegistry(repositories=repositories)
+
+    async def run_flow() -> str:
+        async def worker(handle: JobHandle) -> object:
+            return await api_app._run_post_turn_jobs_inline_fallback(
+                cast(WebAppState, state),
+                handle,
+                save_id="save-1",
+                player_message_id="player-1",
+                narrator_message_id="narrator-1",
+            )
+
+        record = await state.jobs.create(
+            "chat_turn",
+            worker,
+            save_id="save-1",
+        )
+        assert record.task is not None
+        await record.task
+        return cast(str, record.id)
+
+    job_id = asyncio.run(run_flow())
+
+    steps = repositories.list_job_steps(job_id)
+    assert [(step.name, step.status) for step in steps] == [
+        ("post_turn.continuity_ready", "succeeded"),
+    ]
 
 
 def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:

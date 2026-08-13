@@ -32,6 +32,8 @@ class RuntimeTelemetryContext:
     repositories: Any
     job_id: str
     task: str | None = None
+    root_repositories: Any | None = None
+    root_job_id: str | None = None
 
 
 _CURRENT_CONTEXT: ContextVar[RuntimeTelemetryContext | None] = ContextVar(
@@ -59,11 +61,22 @@ def runtime_telemetry_context(
     job_id: str,
     task: str | None = None,
 ) -> Any:
+    current = _CURRENT_CONTEXT.get()
     token = _CURRENT_CONTEXT.set(
         RuntimeTelemetryContext(
             repositories=repositories,
             job_id=job_id,
             task=task,
+            root_repositories=(
+                current.root_repositories or current.repositories
+                if current is not None
+                else repositories
+            ),
+            root_job_id=(
+                current.root_job_id or current.job_id
+                if current is not None
+                else job_id
+            ),
         )
     )
     try:
@@ -87,6 +100,92 @@ def provider_task_context(task: str | None) -> Any:
 
 def current_runtime_telemetry_context() -> RuntimeTelemetryContext | None:
     return _CURRENT_CONTEXT.get()
+
+
+@contextmanager
+def runtime_job_step(
+    name: str,
+    *,
+    root: bool = False,
+    metadata: dict[str, object] | None = None,
+) -> Any:
+    """Record one metadata-only runtime span without affecting application work."""
+    context = _CURRENT_CONTEXT.get()
+    if context is None:
+        yield
+        return
+    repositories = (
+        context.root_repositories or context.repositories
+        if root
+        else context.repositories
+    )
+    job_id = context.root_job_id or context.job_id if root else context.job_id
+    started = perf_counter()
+    started_at = _utc_now()
+    try:
+        yield
+    except asyncio.CancelledError:
+        _record_runtime_job_span(
+            repositories=repositories,
+            job_id=job_id,
+            name=name,
+            task=context.task,
+            status="cancelled",
+            started=started,
+            started_at=started_at,
+            error="Cancelled",
+            metadata=metadata,
+        )
+        raise
+    except Exception as exc:
+        _record_runtime_job_span(
+            repositories=repositories,
+            job_id=job_id,
+            name=name,
+            task=context.task,
+            status="failed",
+            started=started,
+            started_at=started_at,
+            error=exc.__class__.__name__,
+            metadata=metadata,
+        )
+        raise
+    _record_runtime_job_span(
+        repositories=repositories,
+        job_id=job_id,
+        name=name,
+        task=context.task,
+        status="succeeded",
+        started=started,
+        started_at=started_at,
+        metadata=metadata,
+    )
+
+
+def _record_runtime_job_span(
+    *,
+    repositories: Any,
+    job_id: str,
+    name: str,
+    task: str | None,
+    status: str,
+    started: float,
+    started_at: str,
+    error: str | None = None,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_job_step(
+        repositories=repositories,
+        job_id=job_id,
+        name=name,
+        status=status,
+        task=task,
+        started_at=started_at,
+        completed_at=_utc_now(),
+        duration_ms=_elapsed_ms(started),
+        error=error,
+        metadata=metadata,
+    )
 
 
 def record_current_job_step(
@@ -168,6 +267,7 @@ def safe_job_step_metadata(metadata: Mapping[str, object] | None) -> dict[str, o
     for key, value in (metadata or {}).items():
         normalized_key = str(key)
         if isinstance(value, bool):
+            safe[normalized_key] = value
             continue
         if isinstance(value, int | float):
             safe[normalized_key] = value
@@ -257,6 +357,7 @@ class TelemetryProviderClient:
                     started=started,
                     started_at=started_at,
                     error=str(exc) or exc.__class__.__name__,
+                    metadata=_provider_error_metadata(exc),
                 )
                 raise
             _record_provider_call(
@@ -283,10 +384,18 @@ class TelemetryProviderClient:
             started_at = _utc_now()
             token_usage: dict[str, int] = {}
             stream_metadata: dict[str, object] = {}
+            first_chunk_ms: int | None = None
+            output_chars = 0
 
             async def stream() -> AsyncIterator[Any]:
+                nonlocal first_chunk_ms, output_chars
                 try:
                     async for chunk in method(*args, **kwargs):
+                        delta = getattr(chunk, "delta", "")
+                        if isinstance(delta, str) and delta:
+                            output_chars += len(delta)
+                            if first_chunk_ms is None:
+                                first_chunk_ms = _elapsed_ms(started)
                         usage = getattr(chunk, "token_usage", None)
                         if isinstance(usage, Mapping):
                             token_usage.update(
@@ -316,6 +425,11 @@ class TelemetryProviderClient:
                         metadata={
                             **_token_usage_metadata(token_usage),
                             **stream_metadata,
+                            **_stream_performance_metadata(
+                                started=started,
+                                first_chunk_ms=first_chunk_ms,
+                                output_chars=output_chars,
+                            ),
                         },
                     )
                     raise
@@ -332,6 +446,12 @@ class TelemetryProviderClient:
                         metadata={
                             **_token_usage_metadata(token_usage),
                             **stream_metadata,
+                            **_provider_error_metadata(exc),
+                            **_stream_performance_metadata(
+                                started=started,
+                                first_chunk_ms=first_chunk_ms,
+                                output_chars=output_chars,
+                            ),
                         },
                     )
                     raise
@@ -346,12 +466,35 @@ class TelemetryProviderClient:
                     metadata={
                         **_token_usage_metadata(token_usage),
                         **stream_metadata,
+                        **_stream_performance_metadata(
+                            started=started,
+                            first_chunk_ms=first_chunk_ms,
+                            output_chars=output_chars,
+                        ),
                     },
                 )
 
             return stream()
 
         return wrapped
+
+
+def _stream_performance_metadata(
+    *,
+    started: float,
+    first_chunk_ms: int | None,
+    output_chars: int,
+) -> dict[str, object]:
+    elapsed_seconds = max(perf_counter() - started, 0.0)
+    metadata: dict[str, object] = {"stream_output_chars": output_chars}
+    if first_chunk_ms is not None:
+        metadata["stream_first_chunk_ms"] = first_chunk_ms
+    if elapsed_seconds > 0:
+        metadata["stream_output_chars_per_second"] = round(
+            output_chars / elapsed_seconds,
+            2,
+        )
+    return metadata
 
 
 def _record_provider_call(
@@ -431,9 +574,42 @@ def _response_metadata(response: object) -> dict[str, object]:
             }
         )
         metadata.update(_openrouter_provider_metadata(raw_metadata))
+        metadata.update(_retry_metadata(raw_metadata.get("_bragi_retry")))
     token_usage = getattr(response, "token_usage", None)
     if isinstance(token_usage, Mapping):
         metadata.update(_token_usage_metadata(token_usage))
+    return metadata
+
+
+def _provider_error_metadata(exc: Exception) -> dict[str, object]:
+    attempt_count = getattr(exc, "retry_attempt_count", None)
+    max_attempts = getattr(exc, "max_retry_attempts", None)
+    return _retry_count_metadata(
+        attempt_count=attempt_count,
+        max_attempts=max_attempts,
+    )
+
+
+def _retry_metadata(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    return _retry_count_metadata(
+        attempt_count=value.get("attempt_count"),
+        max_attempts=value.get("max_attempts"),
+    )
+
+
+def _retry_count_metadata(
+    *,
+    attempt_count: object,
+    max_attempts: object,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {}
+    if isinstance(attempt_count, int) and not isinstance(attempt_count, bool):
+        metadata["attempt_count"] = attempt_count
+        metadata["retry_count"] = max(0, attempt_count - 1)
+    if isinstance(max_attempts, int) and not isinstance(max_attempts, bool):
+        metadata["max_attempts"] = max_attempts
     return metadata
 
 

@@ -99,6 +99,22 @@ function installEventSourceDouble(): EventSourceDoubleInstance[] {
   return sources;
 }
 
+function installAnimationFrameQueue() {
+  const callbacks: FrameRequestCallback[] = [];
+  vi.stubGlobal("requestAnimationFrame", vi.fn((callback: FrameRequestCallback) => {
+    callbacks.push(callback);
+    return callbacks.length;
+  }));
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  const flushFrame = () => {
+    const current = callbacks.splice(0, callbacks.length);
+    act(() => {
+      current.forEach((callback) => callback(performance.now()));
+    });
+  };
+  return { callbacks, flushFrame };
+}
+
 function deferred<T>() {
   let resolve: (value: T) => void = () => undefined;
   let reject: (reason?: unknown) => void = () => undefined;
@@ -1885,6 +1901,194 @@ describe("frontend helpers", () => {
     });
     expect(repaired.continuity_degraded).toBe(false);
     expect(repaired.retry_pending).toBe(false);
+  });
+
+  it("records optimistic and narrator paint after DOM commit with one local clock", async () => {
+    const sources = installEventSourceDouble();
+    const frames = installAnimationFrameQueue();
+    const createdJob = {
+      id: "job-paint",
+      type: "chat_turn",
+      save_id: "save-1",
+      status: "queued",
+      result: null,
+      error: null,
+      created_at: -1_000_000_000
+    } satisfies Job;
+    const baseFetch = workbenchFetch([], runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "opening-1", role: "narrator", speaker_name: null, body: "The beacon waits.", actions: [] }
+        ]
+      }
+    }));
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/chat") {
+        return Promise.resolve({ ok: true, json: async () => createdJob });
+      }
+      if (path === "/api/log/client") {
+        return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+      }
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await screen.findByText("The beacon waits.");
+    const textarea = screen.getByRole("textbox", { name: "Message" });
+    await userEvent.type(textarea, "Light the beacon");
+    fireEvent.submit(textarea.closest("form") as HTMLFormElement);
+
+    const optimisticMessage = await screen.findByText("Light the beacon");
+    expect(optimisticMessage.closest("[data-message-id='pending-player-message']")).not.toBeNull();
+    expect(fetchMock.mock.calls.some(([, init]) => (
+      String(init?.body).includes("client.chat.optimistic_player_painted")
+    ))).toBe(false);
+    frames.flushFrame();
+    expect(fetchMock.mock.calls.some(([, init]) => (
+      String(init?.body).includes("client.chat.optimistic_player_painted")
+    ))).toBe(false);
+    frames.flushFrame();
+    const optimisticPaintCall = fetchMock.mock.calls.find(([path, init]) => (
+      path === "/api/log/client"
+      && String(init?.body).includes("client.chat.optimistic_player_painted")
+    ));
+    expect(optimisticPaintCall).toBeDefined();
+    expect(String(optimisticPaintCall?.[1]?.body)).not.toContain("Light the beacon");
+
+    const source = await waitFor(() => {
+      const match = sources.find((candidate) => candidate.url === "/api/jobs/job-paint/events?save_id=save-1");
+      if (!match) throw new Error("chat watcher was not created");
+      return match;
+    });
+    const delta: ChatTurnDelta = {
+      kind: "chat_turn_delta",
+      version: 1,
+      save_id: "save-1",
+      status: "Turn complete",
+      error: null,
+      player_message_id: "player-1",
+      narrator_message_id: "narrator-1",
+      messages: [
+        { message_id: "player-1", role: "player", speaker_name: "Keeper", body: "Light the beacon", actions: [] },
+        { message_id: "narrator-1", role: "narrator", speaker_name: null, body: "The bell answers.", actions: [] }
+      ],
+      action_choices: null,
+      save: null,
+      fallback_used: false,
+      context_trimmed: false,
+      continuity_degraded: false,
+      retry_pending: false
+    };
+
+    act(() => {
+      source.dispatch("chat_turn_delta", delta);
+      source.dispatch("done", { ...createdJob, status: "succeeded", result: delta });
+    });
+
+    const narratorMessage = await screen.findByText("The bell answers.");
+    expect(narratorMessage.closest("[data-message-id='narrator-1']")).not.toBeNull();
+    expect(fetchMock.mock.calls.some(([, init]) => (
+      String(init?.body).includes("client.chat.narrator_painted")
+    ))).toBe(false);
+    frames.flushFrame();
+    expect(fetchMock.mock.calls.some(([, init]) => (
+      String(init?.body).includes("client.chat.narrator_painted")
+    ))).toBe(false);
+    frames.flushFrame();
+    const paintLogs = fetchMock.mock.calls.filter(([path, init]) => (
+      path === "/api/log/client"
+      && String(init?.body).includes("client.chat.narrator_painted")
+    ));
+    expect(paintLogs).toHaveLength(1);
+    const narratorPayload = JSON.parse(String(paintLogs[0][1]?.body));
+    expect(narratorPayload.fields.duration_ms).toBeGreaterThanOrEqual(0);
+    expect(narratorPayload.fields.duration_ms).toBeLessThan(10_000);
+    expect(String(paintLogs[0][1]?.body)).not.toContain("The bell answers");
+  });
+
+  it("records narrator paint for an immediately succeeded replay submit", async () => {
+    installEventSourceDouble();
+    const frames = installAnimationFrameQueue();
+    let model = runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "opening-1", role: "narrator", speaker_name: null, body: "The beacon waits.", actions: [] }
+        ]
+      }
+    });
+    const baseFetch = workbenchFetch([], model);
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/chat") {
+        model = runtimeModel({
+          chronicle: {
+            messages: [
+              { message_id: "opening-1", role: "narrator", speaker_name: null, body: "The beacon waits.", actions: [] },
+              { message_id: "player-replay", role: "player", speaker_name: "Keeper", body: "Light the beacon", actions: [] },
+              { message_id: "narrator-replay", role: "narrator", speaker_name: null, body: "The replayed bell answers.", actions: [] }
+            ]
+          }
+        });
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            id: "job-replay",
+            type: "chat_turn",
+            save_id: "save-1",
+            status: "succeeded",
+            result: {
+              kind: "chat_turn_replay",
+              save_id: "save-1",
+              player_message_id: "player-replay",
+              narrator_message_id: "narrator-replay",
+              requires_full_refresh: true
+            },
+            error: null,
+            created_at: -1_000_000_000
+          })
+        });
+      }
+      if (path.startsWith("/api/runtime")) {
+        return Promise.resolve({ ok: true, json: async () => model });
+      }
+      if (path === "/api/log/client") {
+        return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+      }
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await screen.findByText("The beacon waits.");
+    const textarea = screen.getByRole("textbox", { name: "Message" });
+    await userEvent.type(textarea, "Light the beacon");
+    fireEvent.submit(textarea.closest("form") as HTMLFormElement);
+
+    const narrator = await screen.findByText("The replayed bell answers.");
+    expect(narrator.closest("[data-message-id='narrator-replay']")).not.toBeNull();
+    frames.flushFrame();
+    frames.flushFrame();
+
+    const paintLogs = fetchMock.mock.calls.filter(([path, init]) => (
+      path === "/api/log/client"
+      && String(init?.body).includes("client.chat.narrator_painted")
+    ));
+    expect(paintLogs).toHaveLength(1);
+    const payload = JSON.parse(String(paintLogs[0][1]?.body));
+    expect(payload.fields.duration_ms).toBeGreaterThanOrEqual(0);
+    expect(payload.fields.duration_ms).toBeLessThan(10_000);
   });
 
   it("hides pending character text rows even after reply text exists", async () => {
@@ -16160,7 +16364,10 @@ describe("frontend helpers", () => {
       body: "Search the moonlit shelves",
       pending_after_message_id: "narrator-1"
     }));
-    await waitFor(() => expect(runJob).toHaveBeenCalledWith(job));
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(
+      job,
+      { paintStartedAtMs: expect.any(Number) },
+    ));
   });
 
   it("submits a custom CYOA action through the same chat path", async () => {
@@ -16581,7 +16788,10 @@ describe("frontend helpers", () => {
       json: async () => ({ id: "job-1", type: "chat_turn", status: "queued", result: null, error: null })
     });
 
-    await waitFor(() => expect(runJob).toHaveBeenCalledWith(expect.objectContaining({ id: "job-1" })));
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "job-1" }),
+      expect.anything(),
+    ));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 

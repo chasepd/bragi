@@ -41,6 +41,9 @@ class BragiRuntimeBindings:
     SettingsService: Any
     BragiRuntime: Any
     build_settings_model: Any
+    record_current_job_step: Any
+    record_job_step: Any
+    runtime_job_step: Any
     runtime_telemetry_context: Any
     wrap_provider_clients_for_telemetry: Any
 
@@ -147,6 +150,12 @@ def bragi_runtime_bindings() -> BragiRuntimeBindings:
         SettingsService=_required(settings_service, "SettingsService"),
         BragiRuntime=_required(runtime, "BragiRuntime"),
         build_settings_model=_required(settings, "build_settings_model"),
+        record_current_job_step=_required(
+            runtime_telemetry,
+            "record_current_job_step",
+        ),
+        record_job_step=_required(runtime_telemetry, "record_job_step"),
+        runtime_job_step=_required(runtime_telemetry, "runtime_job_step"),
         runtime_telemetry_context=_required(
             runtime_telemetry,
             "runtime_telemetry_context",

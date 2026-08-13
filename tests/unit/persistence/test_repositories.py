@@ -8805,6 +8805,7 @@ def test_repository_records_job_steps_with_safe_metadata_and_redacted_errors(
 
     assert step.error == "provider rejected Bearer [redacted]"
     assert step.metadata == {
+        "cached": True,
         "openrouter_provider_attempt_statuses": [529, 200],
         "openrouter_provider_attempts": ["Together", "DeepInfra"],
         "openrouter_selected_model": "anthropic/claude-sonnet",
