@@ -954,6 +954,18 @@ export type ChatTimingSummary = {
   model: string | null;
   sample_count: number;
   estimate: { p50_ms: number; p95_ms: number } | null;
+  outcomes: {
+    terminal_count: number;
+    success_count: number;
+    failed_count: number;
+    interrupted_count: number;
+    failure_rate: number | null;
+    route_sample_count: number;
+    fast_path_count: number;
+    combined_path_count: number;
+    standard_path_count: number;
+    unclassified_success_count: number;
+  };
 };
 export type WorldDataModel = {
   active_save_id: string | null;

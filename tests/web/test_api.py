@@ -56,6 +56,10 @@ from bragi.services.model_preferences import SAVE_MODEL_OVERRIDES_SETTING
 from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.secrets import InMemorySecretStore
 from bragi.services.settings_service import SettingsService
+from bragi.services.turn_responsiveness import (
+    TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    TURN_RESPONSIVENESS_MODE_SETTING,
+)
 from bragi.services.world_data_service import ScenarioEdit
 from bragi_web.api.app import create_app
 from bragi_web.auth_throttle import AuthAttemptThrottle
@@ -7629,6 +7633,18 @@ def test_chat_timing_summary_returns_authenticated_model_scoped_aggregate(
         "model": "fake-chat",
         "sample_count": 5,
         "estimate": {"p50_ms": 3_000, "p95_ms": 5_000},
+        "outcomes": {
+            "terminal_count": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "interrupted_count": 0,
+            "failure_rate": None,
+            "route_sample_count": 0,
+            "fast_path_count": 0,
+            "combined_path_count": 0,
+            "standard_path_count": 0,
+            "unclassified_success_count": 0,
+        },
     }
 
 
@@ -9015,6 +9031,7 @@ def test_chat_turn_persists_user_facing_phase_spans(
         "chat.narrator_generation",
         "chat.verification",
         "chat.commit",
+        "chat.responsiveness_route",
         "chat.response_committed",
     ]
     assert all(step.status == "succeeded" for step in steps)
@@ -9023,6 +9040,13 @@ def test_chat_turn_persists_user_facing_phase_spans(
     assert context_step.metadata == (
         {"degraded": True} if context_status == "degraded" else {}
     )
+    route_step = next(
+        step for step in steps if step.name == "chat.responsiveness_route"
+    )
+    assert route_step.metadata == {
+        "responsive_fast_path_used": False,
+        "responsive_turn_plan_used": False,
+    }
 
 
 def test_timeskip_exposes_initial_pre_narrator_phase_progress(
@@ -9981,6 +10005,169 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
     assert result["player_message_id"] == result["messages"][0]["message_id"]
     assert result["narrator_message_id"] == result["messages"][1]["message_id"]
     assert result["save"]["save_id"] == save.id
+    persisted = repositories.get_persisted_job(job_id)
+    assert persisted is not None
+    assert persisted.payload["turn_responsiveness_mode"] == "quality"
+    assert persisted.payload["narrator_provider"] == "fake"
+    assert persisted.payload["narrator_model"] == "fake-chat"
+    route_step = next(
+        step
+        for step in repositories.list_job_steps(job_id)
+        if step.name == "chat.responsiveness_route"
+    )
+    assert route_step.metadata == {
+        "responsive_fast_path_used": False,
+        "responsive_turn_plan_used": False,
+    }
+    stratum_step = next(
+        step
+        for step in repositories.list_job_steps(job_id)
+        if step.name == "chat.responsiveness_stratum"
+    )
+    assert stratum_step.provider == "fake"
+    assert stratum_step.model == "fake-chat"
+    assert stratum_step.metadata == {"turn_responsiveness_mode": "quality"}
+
+
+def test_chat_turn_records_execution_stratum_after_preflight_settings_change(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class StratumProvider:
+        provider_name = "fake"
+
+        async def chat(self, request: ChatRequest) -> ChatResponse:
+            return ChatResponse(
+                body="The changed beacon answers.",
+                provider=request.provider,
+                model_id=request.model_id,
+                token_usage={"total": 12},
+            )
+
+        async def generate_structured_output(
+            self,
+            request: StructuredOutputRequest,
+        ) -> StructuredOutputResponse:
+            if request.schema_name == "content_safety_review":
+                data: dict[str, object] = {
+                    "action": "allow",
+                    "category": "none",
+                    "reason": "Test fixture content is within the ceiling.",
+                    "minimum_rating": "g",
+                }
+            else:
+                data = {"selections": []}
+            return StructuredOutputResponse(
+                data=data,
+                provider=request.provider,
+                model_id=request.model_id,
+                token_usage={"total": 3},
+            )
+
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(
+        sqlite3.connect(database_path, check_same_thread=False)
+    )
+    save = _create_auth_save(repositories, title="Stratum Save", owner_user_id=None)
+    for model_id in ("fake-chat", "fake-next"):
+        repositories.save_provider_model(
+            provider="fake",
+            model_id=model_id,
+            display_name=model_id,
+            capabilities=["chat", "structured_output"],
+            context_window=32768,
+        )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    repositories.set_model_preference(
+        task="context_search",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = cast(ProviderClient, StratumProvider())
+    runtime = BragiRuntime(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=tmp_path / "media",
+        active_save_id=save.id,
+    )
+    state = _state_double(tmp_path, runtime)
+    state.repositories = repositories
+    state.jobs._repositories = repositories  # noqa: SLF001 - production wiring
+    state.providers = runtime.providers
+    preflight_started = threading.Event()
+    release_preflight = threading.Event()
+
+    async def blocked_preflight(
+        _state: object,
+        _handle: object,
+        *,
+        save_id: str,
+    ) -> None:
+        assert save_id == save.id
+        preflight_started.set()
+        await asyncio.to_thread(release_preflight.wait)
+
+    monkeypatch.setattr(
+        api_app,
+        "_wait_for_background_post_turn_catchup",
+        blocked_preflight,
+    )
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        created = client.post(
+            "/api/chat",
+            json={
+                "body": "Light the changed beacon",
+                "save_id": save.id,
+                "client_turn_id": "22222222-2222-4222-8222-222222222222",
+            },
+        )
+        assert created.status_code == 200
+        assert preflight_started.wait(timeout=2)
+        job_id = created.json()["id"]
+        created_job = repositories.get_persisted_job(job_id)
+        assert created_job is not None
+        assert created_job.payload["turn_responsiveness_mode"] == "quality"
+        assert created_job.payload["narrator_model"] == "fake-chat"
+
+        repositories.set_scoped_setting(
+            scope="save",
+            scope_id=save.id,
+            key=TURN_RESPONSIVENESS_MODE_SETTING,
+            value=TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+        )
+        repositories.set_model_preference(
+            task="chat",
+            provider="fake",
+            model_id="fake-next",
+        )
+        release_preflight.set()
+        terminal = _wait_for_terminal_job(client, job_id, save_id=save.id)
+        summary = client.get(
+            f"/api/chat/timing-summary?save_id={save.id}"
+        ).json()
+
+    assert terminal["status"] == "succeeded"
+    strata = [
+        step
+        for step in repositories.list_job_steps(job_id)
+        if step.name == "chat.responsiveness_stratum"
+    ]
+    assert strata
+    assert {
+        (step.provider, step.model, step.metadata["turn_responsiveness_mode"])
+        for step in strata
+    } == {("fake", "fake-next", "responsive")}
+    assert summary["mode"] == "responsive"
+    assert summary["model"] == "fake-next"
+    assert summary["sample_count"] == 1
+    assert summary["outcomes"]["terminal_count"] == 1
+    assert summary["outcomes"]["success_count"] == 1
 
 
 def test_post_turn_jobs_expose_initial_phase_progress_before_runtime_callback(

@@ -512,6 +512,8 @@ class SubmittedRuntimeTurn:
     context_trimmed: bool = False
     prepared_action_choices: PreparedActionChoiceGeneration | None = None
     delta: ChatTurnDeltaModel | None = None
+    responsive_fast_path_used: bool = False
+    responsive_turn_plan_used: bool = False
 
     @property
     def input_committed(self) -> bool:
@@ -3765,6 +3767,12 @@ class BragiRuntime:
                         "prepared_action_choices",
                         None,
                     ),
+                    responsive_fast_path_used=bool(
+                        getattr(submitted_turn, "responsive_fast_path_used", False)
+                    ),
+                    responsive_turn_plan_used=bool(
+                        getattr(submitted_turn, "responsive_turn_plan_used", False)
+                    ),
                     delta=self.build_chat_turn_delta(
                         save_id=save_id,
                         player_message=submitted_turn.player_message,
@@ -5337,6 +5345,12 @@ class BragiRuntime:
                     "prepared_action_choices",
                     None,
                 ),
+                responsive_fast_path_used=bool(
+                    getattr(submitted_turn, "responsive_fast_path_used", False)
+                ),
+                responsive_turn_plan_used=bool(
+                    getattr(submitted_turn, "responsive_turn_plan_used", False)
+                ),
                 delta=delta,
             )
         finally:
@@ -5520,6 +5534,12 @@ class BragiRuntime:
                     submitted_turn,
                     "prepared_action_choices",
                     None,
+                ),
+                responsive_fast_path_used=bool(
+                    getattr(submitted_turn, "responsive_fast_path_used", False)
+                ),
+                responsive_turn_plan_used=bool(
+                    getattr(submitted_turn, "responsive_turn_plan_used", False)
                 ),
                 delta=delta,
             )

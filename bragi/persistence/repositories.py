@@ -36,6 +36,7 @@ from bragi.persistence.models import (
     CharacterTextProvenanceRecord,
     CharacterTextThreadParticipantRecord,
     CharacterTextThreadRecord,
+    ChatTurnOutcomeRecord,
     ChatTurnSubmissionRecord,
     ContextObservationCurationHealthRecord,
     ContextObservationCurationStateRecord,
@@ -210,6 +211,7 @@ _SAFE_TEXT_METADATA_KEYS = frozenset(
         "openrouter_selected_provider",
         "skipped_reason",
         "status",
+        "turn_responsiveness_mode",
     }
 )
 _SAFE_TEXT_LIST_METADATA_KEYS = frozenset(
@@ -14114,13 +14116,35 @@ class PersistenceRepositories:
               ON step.job_id = job.id
              AND step.name = 'chat.response_committed'
              AND step.status = 'succeeded'
+            LEFT JOIN job_steps AS stratum
+              ON stratum.id = (
+                   SELECT candidate.id
+                   FROM job_steps AS candidate
+                   WHERE candidate.job_id = job.id
+                     AND candidate.name = 'chat.responsiveness_stratum'
+                     AND candidate.status = 'succeeded'
+                   ORDER BY candidate.completed_at DESC, candidate.rowid DESC
+                   LIMIT 1
+                 )
             WHERE submission.save_id = ?
               AND job.type = 'chat_turn'
               AND job.status = 'succeeded'
               AND narrator.role = 'narrator'
-              AND narrator.provider = ?
-              AND narrator.model = ?
               AND COALESCE(
+                    stratum.provider,
+                    json_extract(job.payload_json, '$.narrator_provider'),
+                    narrator.provider
+                  ) = ?
+              AND COALESCE(
+                    stratum.model,
+                    json_extract(job.payload_json, '$.narrator_model'),
+                    narrator.model
+                  ) = ?
+              AND COALESCE(
+                    json_extract(
+                      stratum.metadata_json,
+                      '$.turn_responsiveness_mode'
+                    ),
                     json_extract(job.payload_json, '$.turn_responsiveness_mode'),
                     'quality'
                   ) = ?
@@ -14132,6 +14156,101 @@ class PersistenceRepositories:
             (save_id, provider, model, mode, min(limit, 30)),
         )
         return [int(row["duration_ms"]) for row in rows]
+
+    def list_chat_turn_outcomes(
+        self,
+        *,
+        save_id: str,
+        provider: str,
+        model: str,
+        mode: str,
+        limit: int = 30,
+    ) -> list[ChatTurnOutcomeRecord]:
+        if limit <= 0:
+            return []
+        rows = self._fetch_all(
+            """
+            SELECT job.status,
+                   MAX(
+                       CASE
+                           WHEN route.name = 'chat.responsiveness_route'
+                           THEN json_extract(
+                               route.metadata_json,
+                               '$.responsive_fast_path_used'
+                           )
+                       END
+                   ) AS fast_path_used,
+                   MAX(
+                       CASE
+                           WHEN route.name = 'chat.responsiveness_route'
+                           THEN json_extract(
+                               route.metadata_json,
+                               '$.responsive_turn_plan_used'
+                           )
+                       END
+                   ) AS combined_path_used
+            FROM chat_turn_submissions AS submission
+            JOIN jobs AS job ON job.id = submission.job_id
+            LEFT JOIN messages AS narrator
+              ON narrator.id = submission.narrator_message_id
+             AND narrator.save_id = submission.save_id
+            LEFT JOIN job_steps AS route
+              ON route.job_id = job.id
+             AND route.name = 'chat.responsiveness_route'
+             AND route.status = 'succeeded'
+            LEFT JOIN job_steps AS stratum
+              ON stratum.id = (
+                   SELECT candidate.id
+                   FROM job_steps AS candidate
+                   WHERE candidate.job_id = job.id
+                     AND candidate.name = 'chat.responsiveness_stratum'
+                     AND candidate.status = 'succeeded'
+                   ORDER BY candidate.completed_at DESC, candidate.rowid DESC
+                   LIMIT 1
+                 )
+            WHERE submission.save_id = ?
+              AND job.type = 'chat_turn'
+              AND job.status IN ('succeeded', 'failed', 'cancelled')
+              AND COALESCE(
+                    stratum.provider,
+                    json_extract(job.payload_json, '$.narrator_provider'),
+                    narrator.provider
+                  ) = ?
+              AND COALESCE(
+                    stratum.model,
+                    json_extract(job.payload_json, '$.narrator_model'),
+                    narrator.model
+                  ) = ?
+              AND COALESCE(
+                    json_extract(
+                      stratum.metadata_json,
+                      '$.turn_responsiveness_mode'
+                    ),
+                    json_extract(job.payload_json, '$.turn_responsiveness_mode'),
+                    'quality'
+                  ) = ?
+            GROUP BY job.id
+            ORDER BY job.completed_at DESC, job.rowid DESC
+            LIMIT ?
+            """,
+            (save_id, provider, model, mode, min(limit, 30)),
+        )
+        return [
+            ChatTurnOutcomeRecord(
+                status=str(row["status"]),
+                fast_path_used=(
+                    bool(row["fast_path_used"])
+                    if row["fast_path_used"] is not None
+                    else None
+                ),
+                combined_path_used=(
+                    bool(row["combined_path_used"])
+                    if row["combined_path_used"] is not None
+                    else None
+                ),
+            )
+            for row in rows
+        ]
 
     def create_chat_turn_submission_job(
         self,

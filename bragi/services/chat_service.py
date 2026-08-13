@@ -244,6 +244,7 @@ from bragi.services.responsive_turn_pipeline import (
 )
 from bragi.services.runtime_telemetry import (
     provider_task_context,
+    record_current_job_step,
     runtime_job_step,
     runtime_telemetry_context,
 )
@@ -292,7 +293,11 @@ from bragi.services.turn_outcome import (
     turn_outcome_coverage,
     turn_outcome_from_mapping,
 )
-from bragi.services.turn_responsiveness import retry_execution_class_for_save
+from bragi.services.turn_responsiveness import (
+    TURN_RESPONSIVENESS_MODE_QUALITY,
+    TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    retry_execution_class_for_save,
+)
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 from bragi.services.user_narration_guidance import (
     USER_NARRATION_GUIDANCE_SETTING,
@@ -537,6 +542,8 @@ class SubmittedTurn:
     context_trimmed: bool = False
     prepared_action_choices: PreparedActionChoiceGeneration | None = None
     turn_revision: TurnRevisionBoundary | None = None
+    responsive_fast_path_used: bool = False
+    responsive_turn_plan_used: bool = False
 
 
 @dataclass(frozen=True)
@@ -1163,6 +1170,7 @@ class ChatService:
         )
         if preference is None:
             raise ValueError("No chat model preference configured")
+        _record_turn_responsiveness_stratum(preference)
         if known_model_is_unavailable(
             self.repositories,
             provider=preference.provider,
@@ -1272,6 +1280,7 @@ class ChatService:
         )
         if preference is None:
             raise ValueError("No chat model preference configured")
+        _record_turn_responsiveness_stratum(preference)
         if known_model_is_unavailable(
             self.repositories,
             provider=preference.provider,
@@ -1812,6 +1821,7 @@ class ChatService:
         )
         if preference is None:
             raise ValueError("No chat model preference configured")
+        _record_turn_responsiveness_stratum(preference)
         details = self.repositories.load_save_details(
             save_id,
             message_limit=RAW_CONTEXT_RECORD_LIMIT,
@@ -3539,6 +3549,10 @@ class ChatService:
                 prepared_action_choices if defer_action_choices else None
             ),
             turn_revision=turn_revision,
+            responsive_fast_path_used=context_result.responsive_fast_path_used,
+            responsive_turn_plan_used=(
+                context_result.responsive_narrator_spec is not None
+            ),
         )
 
     async def _await_background_post_turn_catchup(self, *, save_id: str) -> None:
@@ -13788,6 +13802,26 @@ def _chat_model_preference_for_save(
         repositories=repositories,
         save_id=save_id,
         purpose="chat",
+    )
+
+
+def _record_turn_responsiveness_stratum(
+    preference: ModelPreferenceRecord,
+) -> None:
+    mode = (
+        TURN_RESPONSIVENESS_MODE_RESPONSIVE
+        if current_retry_execution_class()
+        is RetryExecutionClass.RESPONSIVE_FOREGROUND
+        else TURN_RESPONSIVENESS_MODE_QUALITY
+    )
+    record_current_job_step(
+        name="chat.responsiveness_stratum",
+        status="succeeded",
+        provider=preference.provider,
+        model=preference.model_id,
+        task="chat",
+        duration_ms=0,
+        metadata={"turn_responsiveness_mode": mode},
     )
 
 
