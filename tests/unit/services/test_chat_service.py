@@ -20272,6 +20272,162 @@ def test_submit_player_turn_overlaps_plan_first_character_planning_and_context(
     assert provider.chat_requests[0].narrator_prompt_mode == "plan_first"
 
 
+def test_responsive_fast_path_skips_all_optional_foreground_helpers(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"player_character_name": "Ily"},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting(PLAN_FIRST_NARRATOR_SETTING, True)
+    repositories.set_app_setting(CHARACTER_ACTION_PLANNING_ENABLED_SETTING, True)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=SAVE_GENERATED_PHRASE_DENYLIST_SETTING,
+        value="save-only phrase",
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    class RecordingCharacterPlanner:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def plan_for_turn(
+            self,
+            **kwargs: object,
+        ) -> CharacterActionPlanningResult:
+            self.calls.append(str(kwargs["player_message_id"]))
+            return CharacterActionPlanningResult()
+
+    character_planner = RecordingCharacterPlanner()
+    narrator_planner = ScriptedNarratorPlanner(
+        NarratorMessageSpec(
+            intent="This planner must be skipped.",
+            thesis="This planner must be skipped.",
+            must_say=(),
+            avoid=(),
+            tone="",
+            uncertainties=(),
+            evidence_source_ids=(),
+        )
+    )
+    verifier = ScriptedNarratorVerifier(NarratorVerificationResult(passed=True))
+    auditor = ScriptedNpcKnowledgeAuditor((NpcKnowledgeAuditResult(enabled=True),))
+    provider = SequenceChatProvider(
+        "fake",
+        ("The save-only phrase lands flat.", "The signal lantern holds."),
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(
+            ContextSearchResult(responsive_fast_path_used=True)
+        ),
+        narrator_planner=narrator_planner,
+        narrator_verifier=verifier,
+        character_action_planning_service=character_planner,
+        npc_knowledge_audit_service=auditor,
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        asyncio.run(
+            service.submit_player_turn(
+                save_id=save.id,
+                body="I ask Mira what she sees.",
+                speaker_name="Ily",
+                run_post_turn_jobs=False,
+            )
+        )
+
+    assert character_planner.calls == []
+    assert narrator_planner.calls == []
+    assert verifier.calls == []
+    assert auditor.calls == []
+    assert len(provider.chat_requests) == 2
+    assert "save-only phrase" in provider.chat_requests[1].regeneration_feedback
+    job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
+    assert job_result["responsive_fast_path_used"] is True
+    assert job_result["narrator_verifier_skipped"] == "responsive_fast_path"
+    assert job_result["npc_knowledge_audit"]["skipped_reason"] == (
+        "responsive_fast_path"
+    )
+
+
+def test_responsive_combined_plan_skips_separate_planners(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"player_character_name": "Ily"},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(CONTENT_FILTER_RATING_SETTING, "unrated")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_app_setting(PLAN_FIRST_NARRATOR_SETTING, True)
+    repositories.set_app_setting(CHARACTER_ACTION_PLANNING_ENABLED_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+
+    class FailingCharacterPlanner:
+        async def plan_for_turn(
+            self,
+            **kwargs: object,
+        ) -> CharacterActionPlanningResult:
+            raise AssertionError(f"character planner called: {kwargs}")
+
+    combined_spec = NarratorMessageSpec(
+        intent="Answer the player.",
+        thesis="The signal remains visible through the ash.",
+        must_say=("The signal remains visible.",),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=("message:latest",),
+    )
+    separate_planner = ScriptedNarratorPlanner(combined_spec)
+    provider = RecordingChatProvider("fake")
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        asyncio.run(
+            ChatService(
+                repositories=repositories,
+                providers={"fake": provider},
+                context_search_service=ScriptedContextSearch(
+                    ContextSearchResult(responsive_narrator_spec=combined_spec)
+                ),
+                narrator_planner=separate_planner,
+                character_action_planning_service=FailingCharacterPlanner(),
+            ).submit_player_turn(
+                save_id=save.id,
+                body="I study the signal through the ash.",
+                speaker_name="Ily",
+                run_post_turn_jobs=False,
+            )
+        )
+
+    assert separate_planner.calls == []
+    assert provider.chat_requests[0].narrator_prompt_mode == "plan_first"
+    job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
+    assert job_result["responsive_turn_plan_used"] is True
+
+
 def test_storyteller_character_planning_never_applies_direction_presence(
     repositories: PersistenceRepositories,
 ) -> None:

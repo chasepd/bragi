@@ -196,6 +196,10 @@ from bragi.services.model_preferences import (
     scenario_generation_model_preference,
 )
 from bragi.services.prompt_inspection import PromptInspectionStore
+from bragi.services.responsive_turn_pipeline import (
+    TURN_OPERATION_EDIT,
+    TURN_OPERATION_REGENERATE,
+)
 from bragi.services.save_fork_service import SaveForkService
 from bragi.services.save_service import SaveService
 from bragi.services.scenario_bundle_service import (
@@ -5959,6 +5963,11 @@ class BragiRuntime:
                     "current_user_id",
                 ):
                     kwargs["current_user_id"] = current_user_id
+                if _call_accepts_keyword(
+                    chat_service.submit_player_turn,
+                    "turn_operation",
+                ):
+                    kwargs["turn_operation"] = TURN_OPERATION_REGENERATE
                 if (
                     retry_progress_callback is not None
                     and _call_accepts_keyword(
@@ -5993,6 +6002,11 @@ class BragiRuntime:
                     "current_user_id",
                 ):
                     kwargs["current_user_id"] = current_user_id
+                if _call_accepts_keyword(
+                    chat_service.submit_existing_player_turn,
+                    "turn_operation",
+                ):
+                    kwargs["turn_operation"] = TURN_OPERATION_EDIT
                 if (
                     retry_progress_callback is not None
                     and _call_accepts_keyword(

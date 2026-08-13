@@ -7604,17 +7604,25 @@ def test_delete_messages_from_here_soft_deletes_suffix_without_provider_preferen
 
 
 @pytest.mark.parametrize(
-    ("action", "expected_method", "expected_status", "replacement_body"),
+    (
+        "action",
+        "expected_method",
+        "expected_operation",
+        "expected_status",
+        "replacement_body",
+    ),
     [
         (
             "regenerate",
             "submit_player_turn",
+            "regenerate",
             "Message regenerated",
             "I open the sealed door.",
         ),
         (
             "edit_resubmit",
             "submit_existing_player_turn",
+            "edit",
             "Edited message resubmitted",
             "I knock once and listen at the sealed door.",
         ),
@@ -7626,13 +7634,14 @@ def test_message_revision_initial_render_defers_post_turn_jobs_and_returns_ids(
     monkeypatch: MonkeyPatch,
     action: str,
     expected_method: str,
+    expected_operation: str,
     expected_status: str,
     replacement_body: str,
 ) -> None:
     runtime = _import_runtime_without_gtk(monkeypatch)
     save_id, ids = _persist_revision_save(repositories)
     _configure_chat_and_context_preferences(repositories)
-    calls: list[tuple[str, bool]] = []
+    calls: list[tuple[str, bool, str]] = []
     post_turn_calls: list[tuple[str, str, str]] = []
 
     class FakeChatService:
@@ -7646,8 +7655,11 @@ def test_message_revision_initial_render_defers_post_turn_jobs_and_returns_ids(
             body: str,
             speaker_name: str | None = None,
             run_post_turn_jobs: bool = True,
+            turn_operation: str = "",
         ) -> object:
-            calls.append(("submit_player_turn", run_post_turn_jobs))
+            calls.append(
+                ("submit_player_turn", run_post_turn_jobs, turn_operation)
+            )
             player = repositories.append_message(
                 save_id=save_id,
                 role="player",
@@ -7672,8 +7684,15 @@ def test_message_revision_initial_render_defers_post_turn_jobs_and_returns_ids(
             save_id: str,
             player_message_id: str,
             run_post_turn_jobs: bool = True,
+            turn_operation: str = "",
         ) -> object:
-            calls.append(("submit_existing_player_turn", run_post_turn_jobs))
+            calls.append(
+                (
+                    "submit_existing_player_turn",
+                    run_post_turn_jobs,
+                    turn_operation,
+                )
+            )
             player = next(
                 message
                 for message in repositories.list_messages(save_id)
@@ -7720,7 +7739,7 @@ def test_message_revision_initial_render_defers_post_turn_jobs_and_returns_ids(
     active_messages = repositories.list_messages(save_id)
     replacement_player = active_messages[-2]
     replacement_narrator = active_messages[-1]
-    assert calls == [(expected_method, False)]
+    assert calls == [(expected_method, False, expected_operation)]
     assert post_turn_calls == []
     assert _value(turn, "save_id") == save_id
     assert _value(turn, "player_message_id") == replacement_player.id

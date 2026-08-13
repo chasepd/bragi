@@ -48,7 +48,14 @@ from bragi.providers.contracts import (
 from bragi.providers.errors import ProviderError, provider_error_is_model_not_found
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, resolved_retry_budget
-from bragi.services.agentic_context import EvidenceRefinementRequest
+from bragi.services.agentic_context import (
+    EvidenceRefinementRequest,
+    NarratorMessageSpec,
+    agentic_context_pipeline_enabled,
+    narrator_message_plan_instruction,
+    narrator_message_plan_schema,
+    narrator_message_spec_from_plan_data,
+)
 from bragi.services.context_assembly import (
     scenario_claim_candidates,
     scenario_section_candidates,
@@ -94,6 +101,13 @@ from bragi.services.provider_fallbacks import (
 from bragi.services.request_budget import (
     budget_structured_output_request,
     budget_tool_call_request,
+)
+from bragi.services.responsive_turn_pipeline import (
+    TURN_OPERATION_LOOK_AROUND,
+    TURN_OPERATION_NEW_PLAYER,
+    TURN_OPERATION_RECOVERY,
+    character_references_are_resolved,
+    responsive_fast_path_eligibility,
 )
 from bragi.services.scenario_canon import ensure_scenario_canon_for_save
 from bragi.services.tool_call_helpers import (
@@ -198,6 +212,18 @@ class ContextSearchResult:
         default=None,
         compare=False,
         repr=False,
+    )
+    precomputed_snapshot_used: bool = field(default=False, compare=False)
+    strong_local_recall: bool = field(default=False, compare=False)
+    responsive_fast_path_used: bool = field(default=False, compare=False)
+    responsive_narrator_spec: NarratorMessageSpec | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    responsive_turn_plan_fallback_reason: str | None = field(
+        default=None,
+        compare=False,
     )
 
 
@@ -395,6 +421,23 @@ class ContextSearchService:
             focus_message=None,
             additional_query_terms=(),
             allow_expansion=True,
+            turn_operation=TURN_OPERATION_RECOVERY,
+        )
+
+    async def search_for_turn(
+        self,
+        *,
+        save_id: str,
+        player_message_id: str,
+        turn_operation: str = TURN_OPERATION_NEW_PLAYER,
+    ) -> ContextSearchResult:
+        return await self._search(
+            save_id=save_id,
+            player_message_id=player_message_id,
+            focus_message=None,
+            additional_query_terms=(),
+            allow_expansion=True,
+            turn_operation=turn_operation,
         )
 
     async def refine_for_plan(
@@ -428,6 +471,7 @@ class ContextSearchService:
                 )
             ),
             allow_expansion=False,
+            turn_operation=TURN_OPERATION_RECOVERY,
         )
         return _merge_context_search_results(prior_result, refined)
 
@@ -443,6 +487,7 @@ class ContextSearchService:
             focus_message=focus_message,
             additional_query_terms=(),
             allow_expansion=True,
+            turn_operation=TURN_OPERATION_LOOK_AROUND,
         )
 
     async def _search(
@@ -453,6 +498,7 @@ class ContextSearchService:
         focus_message: MessageRecord | None,
         additional_query_terms: tuple[str, ...],
         allow_expansion: bool,
+        turn_operation: str,
     ) -> ContextSearchResult:
         preference = roleplay_model_preference(
             repositories=self.repositories,
@@ -854,62 +900,124 @@ class ContextSearchService:
                     "Context-search provider does not support structured output "
                     "or tool calling"
                 )
-            if not candidates:
+            fast_path = responsive_fast_path_eligibility(
+                operation=turn_operation,
+                precomputed_snapshot_valid=cache_status == "hit",
+                strong_local_recall=(
+                    retrieved_sources.diagnostics.get("strong_local_recall") is True
+                ),
+                character_references_resolved=character_references_are_resolved(
+                    player_message=player_message,
+                    characters=narration_snapshot.characters,
+                    present_character_ids=frozenset(
+                        narration_snapshot.scene_snapshot.present_character_ids
+                        if narration_snapshot.scene_snapshot is not None
+                        else ()
+                    ),
+                    locations=narration_snapshot.locations,
+                    scenario=scenario,
+                ),
+                continuity_ready=not self.repositories.list_post_turn_outbox_steps(
+                    save_id=save_id,
+                    statuses=("pending", "running", "failed"),
+                ),
+                retrieval_degraded=False,
+            )
+            responsive_foreground = (
+                "not_responsive_foreground" not in fast_path.reasons
+            )
+            if responsive_foreground:
+                log_event(
+                    "context_search.responsive_route_evaluated",
+                    operation=turn_operation,
+                    fast_path_used=fast_path.eligible,
+                    fast_path_ineligible_reasons=list(fast_path.reasons),
+                )
+            responsive_plan_fallback_reason: str | None = None
+            if fast_path.eligible:
                 selection = _ContextSelectionOutcome(
-                    ContextSearchResult(),
+                    replace(
+                        _fallback_context_result(
+                            candidates,
+                            relevance_note=(
+                                "Selected by deterministic responsive fast path."
+                            ),
+                        ),
+                        responsive_fast_path_used=True,
+                    ),
                     primary_provider=preference.provider,
                     primary_model_id=preference.model_id,
                 )
-            elif primary_model_unavailable and advertises_tool_calling:
-                selection = await _select_context_with_unavailable_tool_route(
+            elif (
+                structured_provider is not None
+                and responsive_foreground
+                and agentic_context_pipeline_enabled(
+                    self.repositories,
+                    save_id=save_id,
+                )
+                and turn_operation != TURN_OPERATION_LOOK_AROUND
+            ):
+                combined = await _select_responsive_turn_plan(
                     repositories=self.repositories,
-                    providers=self.providers,
+                    provider=structured_provider,
                     provider_name=preference.provider,
                     model_id=preference.model_id,
                     save_id=save_id,
                     scenario=scenario,
                     player_message=player_message,
                     candidates=candidates,
+                    characters=narration_snapshot.characters,
                 )
-            elif primary_model_unavailable and advertises_structured_output:
-                selection = await _select_context_with_unavailable_structured_route(
-                    repositories=self.repositories,
-                    providers=self.providers,
-                    provider_name=preference.provider,
-                    model_id=preference.model_id,
-                    save_id=save_id,
-                    scenario=scenario,
-                    player_message=player_message,
-                    candidates=candidates,
-                )
-            elif primary_model_unavailable:
-                raise ValueError(
-                    requirement_error or "Context-search model is unavailable"
-                )
-            elif tool_provider is not None:
-                selection = await _select_context_with_tool_calls(
-                    repositories=self.repositories,
-                    providers=self.providers,
-                    provider=tool_provider,
-                    provider_name=preference.provider,
-                    model_id=preference.model_id,
-                    save_id=save_id,
-                    scenario=scenario,
-                    player_message=player_message,
-                    candidates=candidates,
-                )
+                if combined is not None:
+                    selection = combined
+                else:
+                    responsive_plan_fallback_reason = "combined_plan_invalid"
+                    selection = await _normal_context_selection(
+                        repositories=self.repositories,
+                        providers=self.providers,
+                        preference_provider=preference.provider,
+                        preference_model_id=preference.model_id,
+                        save_id=save_id,
+                        scenario=scenario,
+                        player_message=player_message,
+                        candidates=candidates,
+                        primary_model_unavailable=primary_model_unavailable,
+                        requirement_error=requirement_error,
+                        advertises_tool_calling=advertises_tool_calling,
+                        advertises_structured_output=advertises_structured_output,
+                        tool_provider=tool_provider,
+                    )
             else:
-                selection = await _select_context_with_structured_output(
+                selection = await _normal_context_selection(
                     repositories=self.repositories,
                     providers=self.providers,
-                    provider_name=preference.provider,
-                    model_id=preference.model_id,
+                    preference_provider=preference.provider,
+                    preference_model_id=preference.model_id,
                     save_id=save_id,
                     scenario=scenario,
                     player_message=player_message,
                     candidates=candidates,
+                    primary_model_unavailable=primary_model_unavailable,
+                    requirement_error=requirement_error,
+                    advertises_tool_calling=advertises_tool_calling,
+                    advertises_structured_output=advertises_structured_output,
+                    tool_provider=tool_provider,
                 )
+            if (
+                responsive_foreground
+                and not fast_path.eligible
+                and turn_operation != TURN_OPERATION_LOOK_AROUND
+                and responsive_plan_fallback_reason is None
+            ):
+                responsive_plan_fallback_reason = "combined_plan_unavailable"
             result = selection.result
+            if responsive_plan_fallback_reason is not None:
+                result = replace(
+                    result,
+                    responsive_turn_plan_fallback_reason=(
+                        responsive_plan_fallback_reason
+                    ),
+                )
             empty_selection_fallback_candidates = _empty_selection_fallback_candidates(
                 candidates,
                 fallback_allowed=selection.fallback_allowed,
@@ -918,11 +1026,15 @@ class ContextSearchService:
                 empty_selection_fallback_candidates
                 and _context_result_is_empty(result)
             ):
-                result = _fallback_context_result(empty_selection_fallback_candidates)
                 result = replace(
-                    result,
+                    _fallback_context_result(empty_selection_fallback_candidates),
                     retrieval_degraded=True,
                     retrieval_recovery=CONTEXT_RETRIEVAL_RECOVERY_DETERMINISTIC,
+                    responsive_fast_path_used=result.responsive_fast_path_used,
+                    responsive_narrator_spec=result.responsive_narrator_spec,
+                    responsive_turn_plan_fallback_reason=(
+                        result.responsive_turn_plan_fallback_reason
+                    ),
                 )
                 selection = replace(
                     selection,
@@ -977,6 +1089,10 @@ class ContextSearchService:
                     retrieved_sources.diagnostics.get("retrieval_round_used") is True
                 ),
                 narration_snapshot=narration_snapshot,
+                precomputed_snapshot_used=cache_status == "hit",
+                strong_local_recall=(
+                    retrieved_sources.diagnostics.get("strong_local_recall") is True
+                ),
             )
             log_event(
                 "context_search.context_selected",
@@ -1308,6 +1424,13 @@ def _rehydrate_selected_context(
             continuity_index_synced=result.continuity_index_synced,
             retrieval_degraded=result.retrieval_degraded,
             retrieval_recovery=result.retrieval_recovery,
+            precomputed_snapshot_used=result.precomputed_snapshot_used,
+            strong_local_recall=result.strong_local_recall,
+            responsive_fast_path_used=result.responsive_fast_path_used,
+            responsive_narrator_spec=result.responsive_narrator_spec,
+            responsive_turn_plan_fallback_reason=(
+                result.responsive_turn_plan_fallback_reason
+            ),
         ),
         snapshot,
     )
@@ -2262,6 +2385,264 @@ async def _select_context_with_structured_output(
         fallback_provider=response.provider if fallback_used else None,
         fallback_model_id=response.model_id if fallback_used else None,
     )
+
+
+async def _normal_context_selection(
+    *,
+    repositories: PersistenceRepositories,
+    providers: dict[str, ProviderClient],
+    preference_provider: str,
+    preference_model_id: str,
+    save_id: str,
+    scenario: ScenarioRecord | None,
+    player_message: str,
+    candidates: tuple[_ContextCandidate, ...],
+    primary_model_unavailable: bool,
+    requirement_error: str | None,
+    advertises_tool_calling: bool,
+    advertises_structured_output: bool,
+    tool_provider: ToolCallProvider | None,
+) -> _ContextSelectionOutcome:
+    if not candidates:
+        return _ContextSelectionOutcome(
+            ContextSearchResult(),
+            primary_provider=preference_provider,
+            primary_model_id=preference_model_id,
+        )
+    if primary_model_unavailable and advertises_tool_calling:
+        return await _select_context_with_unavailable_tool_route(
+            repositories=repositories,
+            providers=providers,
+            provider_name=preference_provider,
+            model_id=preference_model_id,
+            save_id=save_id,
+            scenario=scenario,
+            player_message=player_message,
+            candidates=candidates,
+        )
+    if primary_model_unavailable and advertises_structured_output:
+        return await _select_context_with_unavailable_structured_route(
+            repositories=repositories,
+            providers=providers,
+            provider_name=preference_provider,
+            model_id=preference_model_id,
+            save_id=save_id,
+            scenario=scenario,
+            player_message=player_message,
+            candidates=candidates,
+        )
+    if primary_model_unavailable:
+        raise ValueError(requirement_error or "Context-search model is unavailable")
+    if tool_provider is not None:
+        return await _select_context_with_tool_calls(
+            repositories=repositories,
+            providers=providers,
+            provider=tool_provider,
+            provider_name=preference_provider,
+            model_id=preference_model_id,
+            save_id=save_id,
+            scenario=scenario,
+            player_message=player_message,
+            candidates=candidates,
+        )
+    return await _select_context_with_structured_output(
+        repositories=repositories,
+        providers=providers,
+        provider_name=preference_provider,
+        model_id=preference_model_id,
+        save_id=save_id,
+        scenario=scenario,
+        player_message=player_message,
+        candidates=candidates,
+    )
+
+
+async def _select_responsive_turn_plan(
+    *,
+    repositories: PersistenceRepositories,
+    provider: StructuredOutputProvider,
+    provider_name: str,
+    model_id: str,
+    save_id: str,
+    scenario: ScenarioRecord | None,
+    player_message: str,
+    candidates: tuple[_ContextCandidate, ...],
+    characters: tuple[CharacterRecord, ...],
+) -> _ContextSelectionOutcome | None:
+    """Select context and create a typed narrator plan in one provider call."""
+
+    evidence_source_ids = tuple(
+        dict.fromkeys(
+            (
+                *(
+                    f"{candidate.source_type}:{candidate.source_id}"
+                    for candidate in candidates
+                ),
+                "message:latest",
+            )
+        )
+    )
+    selection_schema = _context_selection_schema(candidates)
+    selection_properties = selection_schema.get("properties")
+    if not isinstance(selection_properties, dict):
+        return None
+    selections_schema = selection_properties.get("selections")
+    if not isinstance(selections_schema, dict):
+        return None
+    request = request_with_openrouter_routing(
+        repositories,
+        StructuredOutputRequest(
+            provider=provider_name,
+            model_id=model_id,
+            schema_name="responsive_turn_plan",
+            schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "selections": selections_schema,
+                    "narrator_plan": narrator_message_plan_schema(
+                        evidence_source_ids=evidence_source_ids,
+                        character_ids=tuple(character.id for character in characters),
+                    ),
+                },
+                "required": ["selections", "narrator_plan"],
+            },
+            messages=_responsive_turn_plan_messages(
+                scenario=scenario,
+                player_message=player_message,
+                candidates=candidates,
+            ),
+            temperature=0.0,
+        ),
+        task="context_search",
+        save_id=save_id,
+    )
+    started_at = perf_counter()
+    try:
+        response = await provider.generate_structured_output(
+            budget_structured_output_request(
+                repositories,
+                request,
+                task="context_search",
+            )
+        )
+        data = response.data
+        result = _context_result_from_structured_data(data, candidates)
+        raw_plan = data.get("narrator_plan")
+        if not isinstance(raw_plan, dict):
+            raise ValueError("Responsive narrator plan must be an object")
+        selected_evidence_source_ids = {
+            f"{item.source_type}:{item.source_id}"
+            for item in _selected_context_items(result)
+        }
+        selected_evidence_source_ids.add("message:latest")
+        if not _plan_evidence_ids_are_known(
+            raw_plan,
+            selected_evidence_source_ids,
+        ):
+            raise ValueError("Responsive narrator plan used unknown evidence")
+        source_text_by_id = {
+            f"{candidate.source_type}:{candidate.source_id}": candidate.text
+            for candidate in candidates
+            if f"{candidate.source_type}:{candidate.source_id}"
+            in selected_evidence_source_ids
+        }
+        source_text_by_id["message:latest"] = player_message
+        narrator_spec = narrator_message_spec_from_plan_data(
+            raw_plan,
+            source_text_by_id=source_text_by_id,
+            characters=characters,
+        )
+        if any(
+            rejection.reason == "unknown_evidence_source_id"
+            for rejection in narrator_spec.planner_rejections
+        ):
+            raise ValueError("Responsive narrator plan used unknown evidence")
+        narrator_spec = replace(narrator_spec, evidence_refinement=None)
+    except (ProviderError, TimeoutError, ValueError, TypeError, KeyError) as exc:
+        log_error_event(
+            "context_search.responsive_turn_plan_failed",
+            provider=provider_name,
+            model=model_id,
+            task="context_search",
+            duration_ms=_elapsed_ms(started_at),
+            candidate_count=len(candidates),
+            **exception_log_fields(exc),
+        )
+        return None
+    log_event(
+        "context_search.responsive_turn_plan_succeeded",
+        provider=response.provider,
+        model=response.model_id,
+        task="context_search",
+        duration_ms=_elapsed_ms(started_at),
+        candidate_count=len(candidates),
+        token_usage=response.token_usage,
+    )
+    return _ContextSelectionOutcome(
+        replace(result, responsive_narrator_spec=narrator_spec),
+        primary_provider=provider_name,
+        primary_model_id=model_id,
+        final_provider=response.provider,
+        final_model_id=response.model_id,
+    )
+
+
+def _responsive_turn_plan_messages(
+    *,
+    scenario: ScenarioRecord | None,
+    player_message: str,
+    candidates: tuple[_ContextCandidate, ...],
+) -> tuple[ChatMessage, ...]:
+    scenario_type = scenario.type if scenario is not None else ""
+    return (
+        ChatMessage(
+            role="system",
+            body=(
+                f"{_context_selection_instruction(scenario_type)}\n\n"
+                f"{narrator_message_plan_instruction()}\n\n"
+                "Use the enforced responsive_turn_plan schema. Select the minimum "
+                "relevant local context and create the narrator plan from only the "
+                "selected evidence plus message:latest. Do not write final prose."
+            ),
+        ),
+        ChatMessage(
+            role="user",
+            body=(
+                f"{_scenario_context_text(scenario)}\n\n"
+                f"Player message:\n{player_message}\n\n"
+                f"{_candidate_list_text(candidates)}"
+            ),
+        ),
+    )
+
+
+def _plan_evidence_ids_are_known(
+    value: object,
+    allowed_ids: set[str],
+    *,
+    field_name: str = "",
+) -> bool:
+    if isinstance(value, dict):
+        return all(
+            _plan_evidence_ids_are_known(
+                child,
+                allowed_ids,
+                field_name=str(key),
+            )
+            for key, child in value.items()
+        )
+    if isinstance(value, list):
+        if field_name in {
+            "evidence_source_ids",
+            "attempt_evidence_source_ids",
+            "source_ids",
+        }:
+            return all(isinstance(item, str) and item in allowed_ids for item in value)
+        return all(
+            _plan_evidence_ids_are_known(item, allowed_ids) for item in value
+        )
+    return True
 
 
 async def _select_context_with_unavailable_structured_route(
@@ -3513,20 +3894,34 @@ def _merge_context_search_results(
         retrieval_recovery=refined.retrieval_recovery or prior.retrieval_recovery,
         retrieval_round_used=True,
         narration_snapshot=refined.narration_snapshot or prior.narration_snapshot,
+        precomputed_snapshot_used=(
+            prior.precomputed_snapshot_used or refined.precomputed_snapshot_used
+        ),
+        strong_local_recall=prior.strong_local_recall or refined.strong_local_recall,
+        responsive_fast_path_used=prior.responsive_fast_path_used,
+        responsive_narrator_spec=(
+            refined.responsive_narrator_spec or prior.responsive_narrator_spec
+        ),
+        responsive_turn_plan_fallback_reason=(
+            refined.responsive_turn_plan_fallback_reason
+            or prior.responsive_turn_plan_fallback_reason
+        ),
     )
 
 
 def _fallback_context_result(
     candidates: tuple[_ContextCandidate, ...],
+    *,
+    relevance_note: str = (
+        "Selected by deterministic fallback after empty context selection."
+    ),
 ) -> ContextSearchResult:
     items: list[SelectedContextItem] = []
     for candidate in _fallback_candidates(candidates):
         items.append(
             _selected_context_item(
                 candidate,
-                relevance_note=(
-                    "Selected by deterministic fallback after empty context selection."
-                ),
+                relevance_note=relevance_note,
             )
         )
     return _context_result_from_items(items)
@@ -5184,6 +5579,10 @@ def _result_json(
             _item_json(item) for item in result.selected_recent_messages
         ],
         "retrieval_degraded": result.retrieval_degraded,
+        "precomputed_snapshot_used": result.precomputed_snapshot_used,
+        "strong_local_recall": result.strong_local_recall,
+        "responsive_fast_path_used": result.responsive_fast_path_used,
+        "responsive_turn_plan_used": result.responsive_narrator_spec is not None,
     }
     if result.retrieval_recovery is not None:
         payload["retrieval_recovery"] = result.retrieval_recovery

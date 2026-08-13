@@ -237,6 +237,11 @@ from bragi.services.post_turn_inference import (
 from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.provider_diagnostics import safe_provider_error_diagnostics
 from bragi.services.provider_fallbacks import structured_output_with_fallback
+from bragi.services.responsive_turn_pipeline import (
+    TURN_OPERATION_NEW_PLAYER,
+    TURN_OPERATION_RECOVERY,
+    TURN_OPERATION_TIMESKIP,
+)
 from bragi.services.runtime_telemetry import (
     provider_task_context,
     runtime_job_step,
@@ -1143,6 +1148,7 @@ class ChatService:
         narrator_stream_callback: NarratorStreamCallback | None = None,
         turn_progress_callback: TurnProgressCallback | None = None,
         post_input_context: PostInputContext | None = None,
+        turn_operation: str = TURN_OPERATION_NEW_PLAYER,
     ) -> SubmittedTurn:
         turn_started = perf_counter()
         turn_progress = _TurnProgressPublisher(
@@ -1229,6 +1235,7 @@ class ChatService:
                 narrator_stream_callback=narrator_stream_callback,
                 turn_progress_callback=turn_progress_callback,
                 _turn_progress=turn_progress,
+                turn_operation=turn_operation,
             )
 
     @_with_responsive_save_execution
@@ -1338,6 +1345,7 @@ class ChatService:
                 narrator_stream_callback=narrator_stream_callback,
                 turn_progress_callback=turn_progress_callback,
                 _turn_progress=turn_progress,
+                turn_operation=TURN_OPERATION_TIMESKIP,
             )
 
     def _append_message_with_snapshot(
@@ -1606,6 +1614,7 @@ class ChatService:
         narrator_stream_callback: NarratorStreamCallback | None = None,
         turn_progress_callback: TurnProgressCallback | None = None,
         _turn_progress: _TurnProgressPublisher | None = None,
+        turn_operation: str = TURN_OPERATION_RECOVERY,
     ) -> SubmittedTurn:
         started_at = turn_started or perf_counter()
         token = cancellation_token or CancellationToken()
@@ -1654,6 +1663,7 @@ class ChatService:
                             automatic_retry_attempt=attempt - 1,
                             automatic_retry_category=automatic_retry_category,
                             automatic_retry_delay_ms=automatic_retry_delay_ms,
+                            turn_operation=turn_operation,
                         )
                     )
                 if attempt > 1:
@@ -1792,6 +1802,7 @@ class ChatService:
         automatic_retry_attempt: int = 0,
         automatic_retry_category: str | None = None,
         automatic_retry_delay_ms: int | None = None,
+        turn_operation: str = TURN_OPERATION_RECOVERY,
     ) -> SubmittedTurn:
         turn_started = turn_started or perf_counter()
         preference = _chat_model_preference_for_save(
@@ -2094,6 +2105,7 @@ class ChatService:
                     save_id=save_id,
                     player_message_id=player_message.id,
                     cancellation_token=cancellation_token,
+                    turn_operation=turn_operation,
                 )
                 failed = False
             except ChatTurnCancelled:
@@ -2152,7 +2164,40 @@ class ChatService:
             )
             return result, failed
 
-        if plan_first_narrator_enabled(self.repositories, save_id=save_id):
+        if (
+            current_retry_execution_class()
+            is RetryExecutionClass.RESPONSIVE_FOREGROUND
+        ):
+            context_result, context_search_failed = (
+                await run_context_selection_stage()
+            )
+            responsive_skip_reason = (
+                "responsive_fast_path"
+                if context_result.responsive_fast_path_used
+                else (
+                    "responsive_turn_plan"
+                    if context_result.responsive_narrator_spec is not None
+                    else ""
+                )
+            )
+            if responsive_skip_reason:
+                character_action_planning_result = CharacterActionPlanningResult(
+                    skipped_reason=responsive_skip_reason,
+                )
+                turn_progress.publish(
+                    "character_planning",
+                    "skipped",
+                    "Character planning skipped",
+                )
+                log_event(
+                    "chat.character_action_planning_skipped",
+                    skipped_reason=responsive_skip_reason,
+                )
+            else:
+                character_action_planning_result = (
+                    await run_character_planning_stage()
+                )
+        elif plan_first_narrator_enabled(self.repositories, save_id=save_id):
             character_task = asyncio.create_task(run_character_planning_stage())
             context_task = asyncio.create_task(run_context_selection_stage())
             try:
@@ -2430,10 +2475,15 @@ class ChatService:
                 ),
             },
         )
-        narrator_spec = await self._plan_narrator_message_if_configured(
-            save_id=save_id,
-            request=planner_request,
-        )
+        if context_result.responsive_fast_path_used:
+            narrator_spec = None
+        elif context_result.responsive_narrator_spec is not None:
+            narrator_spec = context_result.responsive_narrator_spec
+        else:
+            narrator_spec = await self._plan_narrator_message_if_configured(
+                save_id=save_id,
+                request=planner_request,
+            )
         refinement_request = (
             narrator_spec.evidence_refinement if narrator_spec is not None else None
         )
@@ -2890,24 +2940,45 @@ class ChatService:
             raise ValueError(error)
         turn_progress.publish("narrator", "succeeded", "Narrator response ready")
         turn_progress.publish("response_checks", "running", "Checking response")
-        verification_diagnostics = await self._verify_narrator_message_if_configured(
-            save_id=save_id,
-            player_message=player_message,
-            verification_source_request=rich_reference_request,
-            fallback_request_base=base_request,
-            narrator_spec=usable_narrator_spec,
-            completion=completion,
-            response=response,
-            narrator_body=narrator_body,
-            narrator_stream_callback=stream_callback,
-            retry_progress_callback=retry_progress_callback,
-            narration_snapshot=narration_snapshot,
-        )
+        if context_result.responsive_fast_path_used:
+            verification_diagnostics = _NarratorVerificationTurnResult(
+                diagnostics={
+                    "narrator_verifier_skipped": "responsive_fast_path",
+                }
+            )
+        else:
+            verification_diagnostics = (
+                await self._verify_narrator_message_if_configured(
+                    save_id=save_id,
+                    player_message=player_message,
+                    verification_source_request=rich_reference_request,
+                    fallback_request_base=base_request,
+                    narrator_spec=usable_narrator_spec,
+                    completion=completion,
+                    response=response,
+                    narrator_body=narrator_body,
+                    narrator_stream_callback=stream_callback,
+                    retry_progress_callback=retry_progress_callback,
+                    narration_snapshot=narration_snapshot,
+                )
+            )
         if verification_diagnostics.retry_completion is not None:
             completion = verification_diagnostics.retry_completion
             response = verification_diagnostics.retry_response or response
             narrator_body = verification_diagnostics.retry_body or narrator_body
-        if verification_diagnostics.npc_audit_result is not None:
+        if context_result.responsive_fast_path_used:
+            audit_result = _NpcKnowledgeAuditTurnResult(
+                completion=completion,
+                response=response,
+                narrator_body=narrator_body,
+                diagnostics={
+                    "npc_knowledge_audit": {
+                        "enabled": False,
+                        "skipped_reason": "responsive_fast_path",
+                    }
+                },
+            )
+        elif verification_diagnostics.npc_audit_result is not None:
             audit_result = verification_diagnostics.npc_audit_result
         else:
             audit_result = await self._audit_npc_knowledge_with_retry(
@@ -2931,6 +3002,15 @@ class ChatService:
             **script_guard_diagnostics,
             **verification_diagnostics.diagnostics,
             **audit_result.diagnostics,
+            "responsive_fast_path_used": (
+                context_result.responsive_fast_path_used
+            ),
+            "responsive_turn_plan_used": (
+                context_result.responsive_narrator_spec is not None
+            ),
+            "responsive_turn_plan_fallback_reason": (
+                context_result.responsive_turn_plan_fallback_reason
+            ),
         }
         audit_mode = npc_knowledge_audit_mode(
             self.repositories,
@@ -6675,15 +6755,28 @@ class ChatService:
         save_id: str,
         player_message_id: str,
         cancellation_token: CancellationToken | None = None,
+        turn_operation: str = TURN_OPERATION_RECOVERY,
     ) -> ContextSearchResult:
         if self.context_search_service is None:
             return ContextSearchResult()
-        search_task = asyncio.create_task(
-            self.context_search_service.search(
+        search_for_turn = getattr(
+            self.context_search_service,
+            "search_for_turn",
+            None,
+        )
+        search_call = (
+            search_for_turn(
+                save_id=save_id,
+                player_message_id=player_message_id,
+                turn_operation=turn_operation,
+            )
+            if callable(search_for_turn)
+            else self.context_search_service.search(
                 save_id=save_id,
                 player_message_id=player_message_id,
             )
         )
+        search_task = asyncio.create_task(search_call)
         loop = asyncio.get_running_loop()
 
         def cancel_search() -> None:
@@ -6692,7 +6785,7 @@ class ChatService:
         if cancellation_token is not None:
             cancellation_token.on_cancel(cancel_search)
         try:
-            result = await search_task
+            result = cast(ContextSearchResult, await search_task)
             continuity_degraded = bool(
                 self.repositories.list_post_turn_outbox_steps(
                     save_id=save_id,
@@ -6708,6 +6801,9 @@ class ChatService:
                 selected_memories=(),
                 selected_observations=(),
                 retrieval_degraded=True,
+                responsive_fast_path_used=False,
+                responsive_narrator_spec=None,
+                responsive_turn_plan_fallback_reason="continuity_degraded",
                 retrieval_recovery=(
                     "Continuity repair is pending; unresolved derived context was "
                     "excluded and the recent chronicle remains authoritative."
