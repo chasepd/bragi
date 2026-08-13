@@ -3816,6 +3816,13 @@ def test_update_after_turn_replaces_scene_present_character_ids(
         name="Archivist Elian",
         aliases=["elian"],
         source_message_id=player_message.id,
+        locked_fields=["present"],
+    )
+    absent_character = repositories.add_character(
+        save_id=save.id,
+        name="Quartermaster Ren",
+        source_message_id=player_message.id,
+        locked_fields=["present"],
     )
     repositories.upsert_scene_snapshot(
         save_id=save.id,
@@ -3827,7 +3834,7 @@ def test_update_after_turn_replaces_scene_present_character_ids(
         scene=module.ExtractedSceneSnapshot(
             source_message_id=narrator_message.id,
             situation="Ilyra steadies Mara by the lens.",
-            present_character_names=("Captain Ilyra",),
+            present_character_names=("Captain Ilyra", "Quartermaster Ren"),
             reason="Only Ilyra remains present in the current scene.",
             confidence=0.88,
         ),
@@ -3848,8 +3855,13 @@ def test_update_after_turn_replaces_scene_present_character_ids(
     assert _count(result, "scene_snapshot") == 1
     snapshot = repositories.get_scene_snapshot(save.id)
     assert snapshot is not None
-    assert snapshot.present_character_ids == [current_character.id]
-    assert repositories.list_context_update_suggestions(save.id) == []
+    assert set(snapshot.present_character_ids) == {
+        current_character.id,
+        stale_character.id,
+    }
+    assert absent_character.id not in snapshot.present_character_ids
+    suggestions = repositories.list_context_update_suggestions(save.id)
+    assert any(row.field_path == "present_character_ids" for row in suggestions)
 
 
 def test_update_after_turn_clears_scene_present_character_ids(

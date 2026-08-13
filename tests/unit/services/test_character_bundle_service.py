@@ -625,7 +625,7 @@ def _seed_source_character(
             'Trusts the player with caveats.',
             'Helps after the player names the north signal.', 'traveling',
             'location-source', 'Keep the lens secret.', 'message-source',
-            '["name","location_id"]', 1, 'message-source', 'message-source'
+            '["name","location_id","present"]', 1, 'message-source', 'message-source'
         )
         """,
         (CHARACTER_ID, save.id),

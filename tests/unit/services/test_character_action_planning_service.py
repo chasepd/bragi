@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -1067,8 +1068,10 @@ def test_character_action_planning_includes_active_threads(
     assert "hidden favor" not in request_text
 
 
-def test_character_turn_assessments_apply_entering_and_leaving(
+@pytest.mark.parametrize("presence_locked", [False, True])
+def test_character_turn_assessments_apply_entering_and_leaving_with_locks(
     repositories: PersistenceRepositories,
+    presence_locked: bool,
 ) -> None:
     save_id, _player_message_id, characters = _create_save_with_characters(
         repositories
@@ -1079,6 +1082,13 @@ def test_character_turn_assessments_apply_entering_and_leaving(
         present_character_ids=[characters["mara"]],
         snapshot_id="snapshot-1",
     )
+    if presence_locked:
+        mara = repositories.get_character(characters["mara"])
+        ren = repositories.get_character(characters["ren"])
+        assert mara is not None
+        assert ren is not None
+        repositories.update_character(replace(mara, locked_fields=["present"]))
+        repositories.update_character(replace(ren, locked_fields=["present"]))
     player_message_id = repositories.append_message(
         save_id=save_id,
         role="player",
@@ -1116,11 +1126,11 @@ def test_character_turn_assessments_apply_entering_and_leaving(
 
     snapshot = repositories.get_scene_snapshot(save_id)
     assert snapshot is not None
-    assert characters["mara"] not in snapshot.present_character_ids
-    assert characters["ren"] in snapshot.present_character_ids
+    assert (characters["mara"] in snapshot.present_character_ids) is presence_locked
+    assert (characters["ren"] in snapshot.present_character_ids) is not presence_locked
     assert result.assessments[0].leaves_scene is True
     assert result.assessments[1].enters_scene is True
-    assert result.applied_presence_update is True
+    assert result.applied_presence_update is not presence_locked
 
 
 def test_character_action_planning_batch_exposes_allowed_evidence_source_ids(

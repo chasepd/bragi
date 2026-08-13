@@ -72,6 +72,7 @@ from bragi.services.active_thread_lifecycle import (
 from bragi.services.character_locks import (
     CHARACTER_AGENCY_FIELDS,
     character_field_is_locked,
+    reconcile_character_presence_locks,
 )
 from bragi.services.continuity_index_service import ContinuityIndexService
 from bragi.services.evidence import quote_matches_source
@@ -5393,6 +5394,32 @@ class _ContextUpdateApplier:
                 is not None
             ]
         existing = self.repositories.get_scene_snapshot(self.save_id)
+        if existing is None and present_character_ids is not None:
+            locked_character_ids = {
+                character.id
+                for character in self.repositories.list_characters(self.save_id)
+                if character_field_is_locked(character.locked_fields, "present")
+            }
+            proposed_presence = set(present_character_ids)
+            present_character_ids = sorted(
+                reconcile_character_presence_locks(
+                    current_present_ids=(),
+                    proposed_present_ids=proposed_presence,
+                    locked_character_ids=locked_character_ids,
+                )
+            )
+            if set(present_character_ids) != proposed_presence:
+                self._queue_suggestion(
+                    update_type="update",
+                    entity_type="scene_snapshot",
+                    entity_id="current",
+                    field_path="present_character_ids",
+                    before=[],
+                    after=sorted(proposed_presence),
+                    reason=extracted.reason,
+                    confidence=extracted.confidence,
+                    source_message_ids=[extracted.source_message_id],
+                )
         previous_location_id = existing.current_location_id if existing else None
         normalized_time = _normalize_scene_time(extracted.in_world_time)
         if existing is None:
@@ -5783,6 +5810,31 @@ class _ContextUpdateApplier:
         if field_path in _SCENE_WORLD_TIME_FIELDS:
             value = _normalize_scene_time(value)
         before = getattr(snapshot, field_path)
+        if field_path == "present_character_ids":
+            proposed_presence = set(cast(list[str], value))
+            locked_character_ids = {
+                character.id
+                for character in self.repositories.list_characters(self.save_id)
+                if character_field_is_locked(character.locked_fields, "present")
+            }
+            reconciled_presence = reconcile_character_presence_locks(
+                current_present_ids=cast(list[str], before),
+                proposed_present_ids=proposed_presence,
+                locked_character_ids=locked_character_ids,
+            )
+            if reconciled_presence != proposed_presence:
+                self._queue_suggestion(
+                    update_type="update",
+                    entity_type="scene_snapshot",
+                    entity_id=snapshot.id,
+                    field_path=field_path,
+                    before=before,
+                    after=sorted(proposed_presence),
+                    reason=reason,
+                    confidence=confidence,
+                    source_message_ids=[source_message_id],
+                )
+            value = sorted(reconciled_presence)
         if before == value or (
             not _scene_field_allows_empty_replacement(field_path)
             and _is_empty_update(value)

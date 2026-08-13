@@ -18722,7 +18722,7 @@ describe("frontend helpers", () => {
           linked_memory_ids: [],
           linked_state_ids: [],
           linked_summary_ids: [],
-          locked_fields: ["voice"]
+          locked_fields: ["voice", "present"]
         }
       ],
       link_targets: [],
@@ -18749,8 +18749,11 @@ describe("frontend helpers", () => {
       screen.getByLabelText("Current clothing"),
       "Borrowed green raincoat over a linen shirt."
     );
+    expect(screen.getByLabelText("Present")).toBeChecked();
+    await userEvent.click(screen.getByLabelText("Present"));
     await userEvent.click(screen.getByRole("tab", { name: "Locks" }));
     expect(screen.getByLabelText("Lock Voice")).toBeChecked();
+    expect(screen.getByLabelText("Lock Present")).toBeChecked();
     await userEvent.click(screen.getByLabelText("Lock Voice"));
     await userEvent.click(screen.getByLabelText("Lock Appearance"));
     await userEvent.click(screen.getByLabelText("Lock Current clothing"));
@@ -18764,7 +18767,8 @@ describe("frontend helpers", () => {
           {
             character_id: "character-1",
             current_clothing: "Borrowed green raincoat over a linen shirt.",
-            locked_fields: ["appearance", "current_clothing"]
+            present: false,
+            locked_fields: ["appearance", "current_clothing", "present"]
           }
         ]
       }

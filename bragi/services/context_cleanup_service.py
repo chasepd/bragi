@@ -39,7 +39,10 @@ from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.redaction import redact_text
 from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, configured_max_attempts
 from bragi.services.active_thread_lifecycle import active_thread_is_prompt_visible
-from bragi.services.character_locks import character_field_is_locked
+from bragi.services.character_locks import (
+    character_field_is_locked,
+    reconcile_character_presence_locks,
+)
 from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.openrouter_routing_settings import (
     request_with_openrouter_routing,
@@ -1094,6 +1097,24 @@ class ContextCleanupService:
         )
         if value_error is not None:
             return value_error
+        if (
+            action.target_type == "scene_snapshot"
+            and action.field_path == "present_character_ids"
+            and isinstance(action.value, list)
+        ):
+            snapshot = cast(SceneSnapshotRecord, target)
+            locked_ids = {
+                character.id
+                for character in self.repositories.list_characters(save_id)
+                if character_field_is_locked(character.locked_fields, "present")
+            }
+            reconciled = reconcile_character_presence_locks(
+                current_present_ids=snapshot.present_character_ids,
+                proposed_present_ids=cast(list[str], action.value),
+                locked_character_ids=locked_ids,
+            )
+            if reconciled != set(action.value):
+                return "Cleanup character presence is locked"
         reference_error = _reference_validation_error(
             self.repositories,
             save_id,
