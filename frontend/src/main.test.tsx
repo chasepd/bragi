@@ -8986,6 +8986,47 @@ describe("frontend helpers", () => {
     expect(scenarioCalls).toBe(scenarioCallsBeforeEvent);
   });
 
+  it("keeps the save event stream open across panel switches and refreshes the selected panel", async () => {
+    const sources = installEventSourceDouble();
+    vi.stubGlobal("fetch", workbenchFetch([]));
+    const { Workbench } = await import("./main");
+    const client = new QueryClient();
+    const invalidateQueries = vi.spyOn(client, "invalidateQueries");
+
+    render(
+      <QueryClientProvider client={client}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    const saveSource = await waitFor(() => {
+      const source = sources.find((candidate) => candidate.url === "/api/saves/save-1/events");
+      if (!source) throw new Error("save watcher was not created");
+      return source;
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Characters" }));
+    await screen.findByRole("heading", { name: "Characters" });
+
+    const saveSources = sources.filter((source) => source.url === "/api/saves/save-1/events");
+    expect(saveSources).toEqual([saveSource]);
+    expect(saveSource.closed).toBe(false);
+
+    invalidateQueries.mockClear();
+    act(() => {
+      saveSource.dispatch("runtime_changed", {
+        event_id: 1,
+        save_id: "save-1",
+        type: "runtime_changed",
+        payload: { reason: "unclassified_change" }
+      });
+    });
+
+    await waitFor(() => expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ["characters", "save-1"]
+    }));
+  });
+
   it("does not refetch runtime immediately after a live runtime job event applies a fresh model", async () => {
     const sources = installEventSourceDouble();
     const initialModel = runtimeModel({
