@@ -69,6 +69,7 @@ import {
   CharacterTextsModel,
   CharacterTextThread,
   ChatSubmissionStatus,
+  ChatTimingSummary,
   ChatTurnDelta,
   ChatHistoryMessage,
   ChatHistoryModel,
@@ -190,6 +191,7 @@ type WorkbenchRefreshTarget =
   | "character-text-thread"
   | "jobs-active"
   | "chat-status"
+  | "chat-timing"
   | "settings"
   | "media";
 type QueuedWorkbenchRefresh = {
@@ -220,6 +222,11 @@ const RUNTIME_MODEL_SIDE_EFFECT_REFRESH_TARGETS: readonly WorkbenchRefreshTarget
   "jobs-active",
   "chat-status",
   "media"
+];
+const CHAT_TURN_DELTA_REFRESH_TARGETS: readonly WorkbenchRefreshTarget[] = [
+  "jobs-active",
+  "chat-status",
+  "chat-timing",
 ];
 type SettingsTab = "providers" | "openrouter" | "models" | "save" | "local" | "diagnostics" | "users";
 type SettingsSummaryTone = "neutral" | "healthy" | "warning" | "attention";
@@ -329,12 +336,44 @@ function runtimeChangedRefreshTargets(reason: string | null, panel: PanelName): 
 function saveEventRefreshTargets(event: SaveEvent, panel: PanelName): WorkbenchRefreshTarget[] {
   if (event.type === "runtime_changed") return runtimeChangedRefreshTargets(saveEventReason(event), panel);
   if (event.type === "world_data_changed") return runtimeChangedRefreshTargets(saveEventReason(event), panel);
-  if (event.type === "job_changed") return ["jobs-active", "chat-status"];
+  if (event.type === "job_changed") return [];
   if (event.type === "character_texts_changed") return ["character-texts", "character-text-thread", "chat-status"];
   if (event.type === "scenarios_changed") return ["scenarios"];
   if (event.type === "saves_changed") return ["runtime", "scenarios"];
   if (event.type === "save_deleted") return ["runtime", "scenarios", "jobs-active", "chat-status"];
   return ALL_WORKBENCH_REFRESH_TARGETS.slice();
+}
+
+function jobFromSaveEvent(event: SaveEvent): Job | null {
+  if (!event.payload || typeof event.payload !== "object") return null;
+  const job = (event.payload as { job?: unknown }).job;
+  if (!job || typeof job !== "object") return null;
+  const record = job as Record<string, unknown>;
+  const statuses: Job["status"][] = ["queued", "running", "succeeded", "failed", "cancelled"];
+  if (
+    typeof record.id !== "string"
+    || !record.id
+    || typeof record.type !== "string"
+    || !record.type
+    || typeof record.status !== "string"
+    || !statuses.includes(record.status as Job["status"])
+  ) return null;
+  const saveId = typeof record.save_id === "string" ? record.save_id : event.save_id;
+  if (!saveId || (event.save_id && saveId !== event.save_id)) return null;
+  return {
+    id: record.id,
+    type: record.type,
+    save_id: saveId,
+    status: record.status as Job["status"],
+    completion_level: typeof record.completion_level === "string"
+      ? record.completion_level as Job["completion_level"]
+      : null,
+    result: null,
+    error: typeof record.error === "string" ? record.error : null,
+    created_at: typeof record.created_at === "number" ? record.created_at : undefined,
+    updated_at: typeof record.updated_at === "number" ? record.updated_at : undefined,
+    latest_progress: record.latest_progress ?? null,
+  };
 }
 
 function useJobActionRunner(runJob: RunJob) {
@@ -403,6 +442,10 @@ type PendingChronicleMessage = ChronicleMessage & {
   pending_after_message_id?: string | null;
   pending_save_id?: string | null;
   paint_started_at_ms?: number;
+  pending_kind?: "player" | "narrator_placeholder";
+  pending_progress?: string;
+  pending_started_at_ms?: number;
+  pending_timing_estimate?: ChatTimingSummary["estimate"];
 };
 type NarratorPaintMeasurement = {
   jobId: string;
@@ -2473,6 +2516,10 @@ function chatSubmissionStatusPath(activeSaveId: string | null) {
     : "/api/chat/submission-status";
 }
 
+function chatTimingSummaryPath(activeSaveId: string) {
+  return `/api/chat/timing-summary?save_id=${encodeURIComponent(activeSaveId)}`;
+}
+
 function runtimePath(saveId: string | null) {
   return saveId
     ? `/api/runtime/shell?save_id=${encodeURIComponent(saveId)}`
@@ -2912,6 +2959,13 @@ function Workbench({
     enabled: Boolean(model),
     retry: false
   });
+  const chatTimingSummary = useQuery({
+    queryKey: ["chat", "timing-summary", activeSaveId],
+    queryFn: ({ signal }) => apiRead<ChatTimingSummary>(chatTimingSummaryPath(activeSaveId!), signal),
+    enabled: Boolean(model && activeSaveId),
+    staleTime: 30_000,
+    retry: false
+  });
   const characterTextsSummary = useQuery({
     queryKey: ["character-texts", activeSaveId],
     queryFn: ({ signal }) => apiRead<CharacterTextsModel>(characterTextsPath(activeSaveId), signal),
@@ -2976,6 +3030,9 @@ function Workbench({
       if (target === "chat-status") {
         client.invalidateQueries({ queryKey: ["chat", "submission-status", saveId] });
       }
+      if (target === "chat-timing") {
+        client.invalidateQueries({ queryKey: ["chat", "timing-summary", saveId] });
+      }
       if (target === "settings") {
         client.invalidateQueries({ queryKey: ["settings"] });
       }
@@ -3027,8 +3084,46 @@ function Workbench({
 
   const refreshForSaveEvent = useCallback((event: SaveEvent) => {
     const saveId = event.save_id ?? activeSaveIdRef.current;
+    if (event.type === "job_changed") {
+      const changedJob = jobFromSaveEvent(event);
+      if (!changedJob || !saveId) {
+        queueWorkbenchRefresh(saveId, ["jobs-active", "chat-status"]);
+        return;
+      }
+      const queryKey = ["jobs", "active", saveId] as const;
+      const currentJobs = client.getQueryData<{ jobs: Job[] }>(queryKey)?.jobs ?? [];
+      const existing = currentJobs.find((job) => job.id === changedJob.id);
+      const terminal = ["succeeded", "failed", "cancelled"].includes(changedJob.status);
+      void client.cancelQueries({ queryKey, exact: true });
+      client.setQueryData<{ jobs: Job[] }>(queryKey, (current) => {
+        const jobs = current?.jobs ?? [];
+        if (terminal) {
+          return { jobs: jobs.filter((job) => job.id !== changedJob.id) };
+        }
+        const matched = jobs.some((job) => job.id === changedJob.id);
+        return {
+          jobs: matched
+            ? jobs.map((job) => job.id === changedJob.id ? { ...job, ...changedJob } : job)
+            : [...jobs, changedJob],
+        };
+      });
+      if (!terminal) {
+        setTrackedJobs((current) => {
+          const tracked = current[changedJob.id];
+          if (!tracked) return current;
+          return {
+            ...current,
+            [changedJob.id]: trackedActiveJob(changedJob, tracked),
+          };
+        });
+      }
+      if (terminal || (!existing && isChatJobType(changedJob.type))) {
+        queueWorkbenchRefresh(saveId, ["jobs-active", "chat-status"]);
+      }
+      return;
+    }
     queueWorkbenchRefresh(saveId, saveEventRefreshTargets(event, panel));
-  }, [panel, queueWorkbenchRefresh]);
+  }, [client, panel, queueWorkbenchRefresh]);
 
   const applyRuntimeModel = useCallback((nextModel: RuntimeModel, fallbackSaveId: string | null = activeSaveIdRef.current) => {
     const nextSaveId = nextModel.active_save_id ?? fallbackSaveId;
@@ -3052,7 +3147,7 @@ function Workbench({
     setSelectedSaveId(delta.save_id);
     setSaveSelectionError("");
     noteRuntimeModelFresh(delta.save_id);
-    queueWorkbenchRefresh(delta.save_id, RUNTIME_MODEL_SIDE_EFFECT_REFRESH_TARGETS);
+    queueWorkbenchRefresh(delta.save_id, CHAT_TURN_DELTA_REFRESH_TARGETS);
     return true;
   }, [client, noteRuntimeModelFresh, queueWorkbenchRefresh]);
 
@@ -3109,7 +3204,8 @@ function Workbench({
           runtimePath(activeSaveId)
         ));
       }
-      await Promise.allSettled(refreshes);
+      const results = await Promise.allSettled(refreshes);
+      return results.every((result) => result.status === "fulfilled");
     });
   }, [activeSaveId, client, refreshForSaveEvent, refreshWorkbench]);
 
@@ -3276,6 +3372,7 @@ function Workbench({
       (done) => {
         const appliesToCurrentSave = jobBelongsToActiveSave(done, activeSaveIdRef.current);
         let appliedRuntimeResult = false;
+        let appliedChatDelta = false;
         setTrackedJobs((current) => {
           const next = { ...current };
           delete next[done.id];
@@ -3288,8 +3385,8 @@ function Workbench({
             applyRuntimeModel(done.result);
             requestNarratorPaint(done.result);
           } else if (isChatTurnDelta(done.result)) {
-            appliedRuntimeResult = applyChatTurnDelta(done.result);
-            if (appliedRuntimeResult) requestNarratorPaint(done.result);
+            appliedChatDelta = applyChatTurnDelta(done.result);
+            if (appliedChatDelta) requestNarratorPaint(done.result);
           }
         }
         if (appliesToCurrentSave && done.status === "succeeded") {
@@ -3338,7 +3435,11 @@ function Workbench({
           }
           refreshWorkbench(
             activeSaveIdRef.current,
-            appliedRuntimeResult ? RUNTIME_MODEL_SIDE_EFFECT_REFRESH_TARGETS : ALL_WORKBENCH_REFRESH_TARGETS,
+            appliedChatDelta
+              ? CHAT_TURN_DELTA_REFRESH_TARGETS
+              : appliedRuntimeResult
+                ? RUNTIME_MODEL_SIDE_EFFECT_REFRESH_TARGETS
+                : ALL_WORKBENCH_REFRESH_TARGETS,
           );
         }
         if (done.type === "model_refresh") client.invalidateQueries({ queryKey: ["settings"] });
@@ -3555,7 +3656,23 @@ function Workbench({
   const persistedChronicleMessages = model?.chronicle?.messages ?? [];
   const pendingAfterMessageId = persistedChronicleMessages[persistedChronicleMessages.length - 1]?.message_id ?? null;
   const activePendingMessage = pendingMessageForActiveSave(pendingMessage, activeSaveId);
-  const activePendingMessages = [activePendingMessage].filter((message): message is PendingChronicleMessage => Boolean(message));
+  const activeNarratorJob = chatBlockerJobs.find(({ job }) => isChatJobType(job.type)) ?? null;
+  const activeNarratorPlaceholder: PendingChronicleMessage | null = activePendingMessage ? {
+    message_id: "pending-narrator-placeholder",
+    role: "narrator",
+    speaker_name: null,
+    body: activeNarratorJob?.progress || "Preparing narrator response",
+    actions: [],
+    pending_after_message_id: activePendingMessage.message_id,
+    pending_save_id: activeSaveId,
+    paint_started_at_ms: activePendingMessage.paint_started_at_ms,
+    pending_kind: "narrator_placeholder",
+    pending_progress: activeNarratorJob?.progress || "Preparing narrator response",
+    pending_started_at_ms: activePendingMessage.paint_started_at_ms,
+    pending_timing_estimate: chatTimingSummary.data?.estimate ?? null,
+  } : null;
+  const activePendingMessages = [activePendingMessage, activeNarratorPlaceholder]
+    .filter((message): message is PendingChronicleMessage => Boolean(message));
   const chatInputDisabled = !activeSaveSupported || !model?.composer_enabled || Boolean(activePendingMessage) || hasActiveSaveChatBlocker || !chatCanSubmit;
 
   return (
@@ -3687,11 +3804,11 @@ function Workbench({
           onRuntimeChanged={applyRuntimeModel}
           currentUser={currentUser}
           mutationsDisabled={!activeSaveSupported}
+          onCancelNarrator={activeNarratorJob ? () => cancelTrackedJob(activeNarratorJob) : undefined}
         />
         <PendingJobsTray
           jobs={pendingJobs}
           mode={pendingJobsDisplayMode}
-          blockingJobIds={chatBlockerJobs.map((tracked) => tracked.job.id)}
           onCancel={cancelTrackedJob}
         />
         {chatSubmissionStatusNotice ? (
@@ -5028,6 +5145,7 @@ function mergeChroniclePage(model: RuntimeModel | undefined, page: ChronicleMode
 }
 
 function hasPersistedPendingMessage(persisted: ChronicleMessage[], pendingMessage: PendingChronicleMessage) {
+  if (pendingMessage.pending_kind === "narrator_placeholder") return false;
   const anchorMessageId = pendingMessage.pending_after_message_id;
   if (anchorMessageId !== undefined) {
     const anchorIndex = anchorMessageId === null
@@ -5049,6 +5167,16 @@ function matchesPendingMessage(message: ChronicleMessage, pendingMessage: Pendin
 
 function pendingMessageForActiveSave(message: PendingChronicleMessage | null, activeSaveId: string | null) {
   return message?.pending_save_id === activeSaveId ? message : null;
+}
+
+function broadTimingRange(estimate: NonNullable<ChatTimingSummary["estimate"]>): string {
+  const broadSeconds = (milliseconds: number) => Math.max(
+    5,
+    Math.round(milliseconds / 5_000) * 5,
+  );
+  const lower = broadSeconds(estimate.p50_ms);
+  const upper = Math.max(lower, broadSeconds(estimate.p95_ms));
+  return `${lower}–${upper}s`;
 }
 
 function narratorMessageIdFromResult(result: unknown): string | null {
@@ -5107,7 +5235,55 @@ type ChronicleMessageRowProps = {
   onAction: (actionId: string, message: ChronicleMessage) => void;
   mutationsDisabled?: boolean;
   storytellerMode?: boolean;
+  onCancelNarrator?: () => void;
 };
+
+function NarratorPlaceholderRow({
+  message,
+  onCancel,
+}: {
+  message: PendingChronicleMessage;
+  onCancel?: () => void;
+}) {
+  const startedAtMs = message.pending_started_at_ms;
+  const [, setTick] = useState(0);
+  const elapsedSeconds = startedAtMs === undefined
+    ? 0
+    : Math.max(0, Math.floor((performance.now() - startedAtMs) / 1_000));
+  useEffect(() => {
+    if (startedAtMs === undefined) return;
+    const timer = window.setInterval(() => setTick((value) => value + 1), 250);
+    return () => window.clearInterval(timer);
+  }, [startedAtMs]);
+  return (
+    <article
+      className="message narrator narrator-placeholder"
+      data-message-id={message.message_id}
+      role="status"
+      aria-label="Narrator response progress"
+    >
+      <header>
+        <span>Narrator</span>
+        {elapsedSeconds >= 3 ? <small>{elapsedSeconds}s elapsed</small> : null}
+      </header>
+      <div className="narrator-placeholder-body">
+        <Loader2 className="spin" size={16} aria-hidden="true" />
+        <span>{message.pending_progress || "Preparing narrator response"}</span>
+      </div>
+      {message.pending_timing_estimate ? (
+        <small className="narrator-placeholder-estimate">
+          Recent turns: about {broadTimingRange(message.pending_timing_estimate)}
+        </small>
+      ) : null}
+      {onCancel ? (
+        <button type="button" onClick={onCancel} aria-label="Cancel narrator response">
+          <Square size={13} aria-hidden="true" />
+          Cancel
+        </button>
+      ) : null}
+    </article>
+  );
+}
 
 const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
   message,
@@ -5116,8 +5292,18 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
   pendingJobActionKeys,
   onAction,
   mutationsDisabled = false,
-  storytellerMode = false
+  storytellerMode = false,
+  onCancelNarrator,
 }: ChronicleMessageRowProps) {
+  const pendingMessage = message as PendingChronicleMessage;
+  if (pendingMessage.pending_kind === "narrator_placeholder") {
+    return (
+      <NarratorPlaceholderRow
+        message={pendingMessage}
+        onCancel={onCancelNarrator}
+      />
+    );
+  }
   const isDirection = storytellerMode && message.role === "player";
   const messageActionErrors = message.actions
     .map((action) => {
@@ -5226,7 +5412,8 @@ function Chronicle({
   narratorPaintMeasurement = null,
   onRuntimeChanged,
   currentUser = null,
-  mutationsDisabled = false
+  mutationsDisabled = false,
+  onCancelNarrator,
 }: {
   model?: RuntimeModel;
   runJob: RunJob;
@@ -5236,12 +5423,22 @@ function Chronicle({
   onRuntimeChanged?: (model: RuntimeModel) => void;
   currentUser?: CurrentUser | null;
   mutationsDisabled?: boolean;
+  onCancelNarrator?: () => void;
 }) {
   const localPendingMessages = pendingMessages
     ?? (pendingMessage ? [pendingMessage] : []);
   const messages = chronicleMessages(model, localPendingMessages);
   const optimisticPaintMeasurement = localPendingMessages.find(
-    (message) => message.paint_started_at_ms !== undefined,
+    (message) => (
+      message.pending_kind !== "narrator_placeholder"
+      && message.paint_started_at_ms !== undefined
+    ),
+  ) ?? null;
+  const placeholderPaintMeasurement = localPendingMessages.find(
+    (message) => (
+      message.pending_kind === "narrator_placeholder"
+      && message.paint_started_at_ms !== undefined
+    ),
   ) ?? null;
   const activeSaveId = model?.active_save_id ?? null;
   const canMutatePresence = !mutationsDisabled && currentUser?.role !== "child";
@@ -5321,6 +5518,14 @@ function Chronicle({
         `optimistic:${optimisticPaintMeasurement.paint_started_at_ms}`,
       );
     }
+    if (placeholderPaintMeasurement?.paint_started_at_ms !== undefined) {
+      recordPaint(
+        "client.chat.placeholder_painted",
+        placeholderPaintMeasurement.message_id,
+        placeholderPaintMeasurement.paint_started_at_ms,
+        `placeholder:${placeholderPaintMeasurement.paint_started_at_ms}`,
+      );
+    }
     if (narratorPaintMeasurement?.saveId === activeSaveId) {
       recordPaint(
         "client.chat.narrator_painted",
@@ -5329,7 +5534,7 @@ function Chronicle({
         `narrator:${narratorPaintMeasurement.jobId}`,
       );
     }
-  }, [messageWindowSignal, narratorPaintMeasurement, optimisticPaintMeasurement]);
+  }, [messageWindowSignal, narratorPaintMeasurement, optimisticPaintMeasurement, placeholderPaintMeasurement]);
   const oldestMessageId = model?.chronicle?.oldest_message_id ?? messages[0]?.message_id ?? null;
   const chronicleVirtualizer = useVirtualizer<HTMLElement, HTMLDivElement>({
     count: messages.length,
@@ -5502,6 +5707,7 @@ function Chronicle({
                   mutationsDisabled={mutationsDisabled}
                   storytellerMode={model?.interaction_mode === "storyteller"}
                   onAction={handleChronicleAction}
+                  onCancelNarrator={onCancelNarrator}
                 />
               </div>
             );
@@ -5583,12 +5789,10 @@ function Chronicle({
 function PendingJobsTray({
   jobs,
   mode = "compact",
-  blockingJobIds = [],
   onCancel
 }: {
   jobs: TrackedJob[];
   mode?: PendingJobsDisplayMode;
-  blockingJobIds?: string[];
   onCancel: (job: TrackedJob) => void;
 }) {
   const [compactDetailsOpen, setCompactDetailsOpen] = useState(false);
@@ -5598,22 +5802,12 @@ function PendingJobsTray({
   const expandedFull = mode === "expanded_full";
   const compactCanExpand = !expanded && displayedJobs.length > 1;
   const compactDetailsVisible = compactCanExpand && compactDetailsOpen;
-  const blockingJobs = blockingJobIds
-    .map((jobId) => jobs.find((tracked) => tracked.job.id === jobId))
-    .filter((tracked): tracked is TrackedJob => Boolean(tracked));
-  const primaryBlocker = blockingJobs[0] ?? null;
   return (
     <section className={expanded ? "pending-jobs-tray expanded" : "pending-jobs-tray compact"} aria-label="Pending jobs" aria-live="polite">
       <div className="pending-jobs-head">
         <span>Pending jobs</span>
         <strong>{displayedJobs.length}</strong>
       </div>
-      {primaryBlocker ? (
-        <div className="pending-jobs-blocker" role="status">
-          <strong>Chat is waiting for {jobTypeLabel(primaryBlocker.job.type)}</strong>
-          <span>{primaryBlocker.progress || labelize(primaryBlocker.job.status)}</span>
-        </div>
-      ) : null}
       <div className="pending-job-list">
         {expanded ? (
           displayedJobs.map((tracked) => (
@@ -5674,13 +5868,15 @@ function PendingJobsCompactSummary({
   onCancel: (job: TrackedJob) => void;
   onToggleDetails?: () => void;
 }) {
-  const summary = (jobs.length === 1 && postTurnCompletionLabel(jobs[0].job))
-    || compactJobGroups(jobs).map((group) => group.count > 1 ? `${group.label} x${group.count}` : group.label).join("; ");
+  const summary = jobs.length === 1
+    ? postTurnCompletionLabel(jobs[0].job) || jobs[0].progress
+    : compactJobGroups(jobs).map((group) => group.count > 1 ? `${group.label} x${group.count}` : group.label).join("; ");
   return (
     <div className="pending-job-row compact-summary">
       <Loader2 className="spin" size={15} />
       <div>
         <strong>Active jobs</strong>
+        {jobs.length === 1 ? <span>{jobTypeLabel(jobs[0].job.type)}</span> : null}
         <span>{summary}</span>
       </div>
       {jobs.length === 1 ? (
@@ -6467,6 +6663,7 @@ function pendingPlayerChronicleMessage(
     pending_after_message_id: pendingAfterMessageId,
     pending_save_id: saveId,
     paint_started_at_ms: paintStartedAtMs,
+    pending_kind: "player",
   };
 }
 

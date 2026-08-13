@@ -60,6 +60,70 @@ def test_repositories_clear_model_preference(
     )
 
 
+def test_list_chat_response_commit_durations_filters_model_status_and_limit(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Timing Test",
+        premise="A neutral timing fixture.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Timing Test")
+    for index, (provider, model, status, duration_ms) in enumerate([
+        ("fake", "fake-chat", "succeeded", 1_000),
+        ("fake", "fake-chat", "failed", 2_000),
+        ("fake", "other-chat", "succeeded", 3_000),
+        ("fake", "fake-chat", "succeeded", 4_000),
+        ("fake", "fake-chat", "succeeded", 5_000),
+    ]):
+        job_id = f"timing-job-{index}"
+        narrator_id = f"timing-narrator-{index}"
+        repositories.connection.execute(
+            """
+            INSERT INTO jobs(id, save_id, type, status, payload_json, created_at)
+            VALUES (?, ?, 'chat_turn', ?, '{}', '2026-08-12 00:00:00')
+            """,
+            (job_id, save.id, status),
+        )
+        repositories.connection.execute(
+            """
+            INSERT INTO messages(id, save_id, role, body, provider, model)
+            VALUES (?, ?, 'narrator', 'Timing fixture response.', ?, ?)
+            """,
+            (narrator_id, save.id, provider, model),
+        )
+        repositories.connection.execute(
+            """
+            INSERT INTO chat_turn_submissions(
+                save_id, client_turn_id, operation, request_fingerprint,
+                job_id, narrator_message_id
+            ) VALUES (?, ?, 'submit', ?, ?, ?)
+            """,
+            (save.id, f"turn-{index}", f"fingerprint-{index}", job_id, narrator_id),
+        )
+        repositories.connection.execute(
+            """
+            INSERT INTO job_steps(
+                id, job_id, name, status, completed_at, duration_ms, metadata_json
+            ) VALUES (?, ?, 'chat.response_committed', 'succeeded',
+                      datetime('2026-08-12 00:00:00', ?), 0, '{}')
+            """,
+            (f"timing-step-{index}", job_id, f"+{duration_ms / 1000} seconds"),
+        )
+    repositories.commit()
+
+    durations = repositories.list_chat_response_commit_durations(
+        save_id=save.id,
+        provider="fake",
+        model="fake-chat",
+        limit=2,
+    )
+
+    assert durations == [5_000, 4_000]
+
+
 def test_message_safety_transition_round_trips_and_edits_clear_it(
     repositories: PersistenceRepositories,
 ) -> None:

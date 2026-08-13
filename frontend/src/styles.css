@@ -965,36 +965,6 @@ h1 {
   background: var(--accent-2);
 }
 
-.pending-jobs-blocker {
-  grid-column: 1 / -1;
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  min-width: 0;
-  border: 1px solid rgba(240, 207, 115, 0.26);
-  border-radius: 7px;
-  padding: 7px 9px;
-  color: #f3ead3;
-  background: rgba(240, 207, 115, 0.07);
-}
-
-.pending-jobs-blocker strong,
-.pending-jobs-blocker span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.pending-jobs-blocker strong {
-  font-size: 13px;
-}
-
-.pending-jobs-blocker span {
-  color: var(--muted);
-  font-size: 12px;
-}
-
 .pending-job-list {
   display: grid;
   gap: 7px;
@@ -1095,6 +1065,22 @@ h1 {
   margin-left: auto;
   border-left-color: var(--accent-2);
   background: rgba(118, 183, 168, 0.085);
+}
+
+.narrator-placeholder header small {
+  margin-left: auto;
+}
+
+.narrator-placeholder-body,
+.narrator-placeholder > button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.narrator-placeholder-estimate {
+  display: block;
+  margin-top: 8px;
 }
 
 .message header {
@@ -5008,12 +4994,6 @@ h1 {
   .mobile-app-shell .pending-jobs-tray.compact .pending-job-list {
     grid-column: 1;
     grid-row: auto;
-  }
-
-  .pending-jobs-blocker {
-    align-items: stretch;
-    flex-direction: column;
-    gap: 2px;
   }
 
   .pending-jobs-head {

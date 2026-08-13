@@ -543,14 +543,24 @@ def _publish_job_save_event(save_events: SaveEventHub) -> Any:
 
 
 def _save_event_job_summary(record: JobRecord) -> dict[str, object]:
+    latest_progress = next(
+        (
+            event.get("payload")
+            for event in reversed(record.events)
+            if event.get("event") == "progress"
+        ),
+        None,
+    )
     return {
         "id": record.id,
         "type": record.type,
         "save_id": record.save_id,
         "status": record.status,
+        "completion_level": record.completion_level,
         "error": record.error,
         "created_at": record.created_at,
         "updated_at": record.updated_at,
+        "latest_progress": latest_progress,
     }
 
 

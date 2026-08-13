@@ -1647,7 +1647,9 @@ describe("frontend helpers", () => {
     await vi.advanceTimersByTimeAsync(0);
 
     expect(fetchMock).toHaveBeenCalledWith("/api/jobs/job-1", expect.anything());
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(updates).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
 
     expect(updates).toHaveBeenCalledWith(expect.objectContaining({ id: "job-1", status: "succeeded" }));
     expect(fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1")).toHaveLength(2);
@@ -1707,7 +1709,7 @@ describe("frontend helpers", () => {
     vi.useRealTimers();
   });
 
-  it("backs off job polling and stops it when SSE recovers", async () => {
+  it("polls successful job reads every two seconds and stops when SSE recovers", async () => {
     vi.useFakeTimers();
     vi.spyOn(Math, "random").mockReturnValue(0.5);
     const { watchJob } = await import("./api");
@@ -1727,25 +1729,52 @@ describe("frontend helpers", () => {
     const jobCalls = () => fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1").length;
     expect(jobCalls()).toBe(1);
 
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(jobCalls()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(jobCalls()).toBe(2);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(jobCalls()).toBe(3);
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(jobCalls()).toBe(6);
+
+    sources[0].dispatchOpen();
+    await vi.advanceTimersByTimeAsync(44_000);
+    expect(jobCalls()).toBe(6);
+    expect(sources[0].closed).toBe(false);
+
+    stop();
+    vi.useRealTimers();
+  });
+
+  it("caps fallback polling backoff at five seconds after repeated read errors", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0.5);
+    const { watchJob } = await import("./api");
+    const sources = installEventSourceDouble();
+    const fetchMock = vi.fn().mockImplementation((path: string) => (
+      path === "/api/log/client"
+        ? Promise.resolve({ ok: true, json: async () => ({ ok: true }) })
+        : Promise.reject(new TypeError("network down"))
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const stop = watchJob("job-1", vi.fn());
+    sources[0].dispatchNativeError();
+    const jobCalls = () => fetchMock.mock.calls.filter(([path]) => path === "/api/jobs/job-1").length;
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(jobCalls()).toBe(1);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(jobCalls()).toBe(2);
     await vi.advanceTimersByTimeAsync(2_000);
     expect(jobCalls()).toBe(3);
     await vi.advanceTimersByTimeAsync(4_000);
-    await vi.advanceTimersByTimeAsync(8_000);
-    await vi.advanceTimersByTimeAsync(16_000);
+    expect(jobCalls()).toBe(4);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(jobCalls()).toBe(5);
+    await vi.advanceTimersByTimeAsync(5_000);
     expect(jobCalls()).toBe(6);
-    await vi.advanceTimersByTimeAsync(29_999);
-    expect(jobCalls()).toBe(6);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(jobCalls()).toBe(7);
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(jobCalls()).toBe(8);
-
-    sources[0].dispatchOpen();
-    await vi.advanceTimersByTimeAsync(44_000);
-    expect(jobCalls()).toBe(8);
-    expect(sources[0].closed).toBe(false);
 
     stop();
     vi.useRealTimers();
@@ -1922,9 +1951,27 @@ describe("frontend helpers", () => {
         ]
       }
     }));
+    let worldReads = 0;
+    let characterReads = 0;
+    let mediaReads = 0;
     const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path.startsWith("/api/world-data")) worldReads += 1;
+      if (path.startsWith("/api/characters")) characterReads += 1;
+      if (path.startsWith("/api/media")) mediaReads += 1;
       if (path === "/api/chat") {
         return Promise.resolve({ ok: true, json: async () => createdJob });
+      }
+      if (path.startsWith("/api/chat/timing-summary")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            mode: "quality",
+            provider: "fake",
+            model: "fake-chat",
+            sample_count: 8,
+            estimate: { p50_ms: 8_000, p95_ms: 18_000 }
+          })
+        });
       }
       if (path === "/api/log/client") {
         return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
@@ -1947,6 +1994,12 @@ describe("frontend helpers", () => {
 
     const optimisticMessage = await screen.findByText("Light the beacon");
     expect(optimisticMessage.closest("[data-message-id='pending-player-message']")).not.toBeNull();
+    const placeholder = await screen.findByRole("status", { name: "Narrator response progress" });
+    expect(placeholder).toHaveTextContent("Queued");
+    expect(placeholder).toHaveTextContent("Recent turns: about 10–20s");
+    expect(
+      optimisticMessage.closest(".chronicle-virtual-row")?.nextElementSibling?.querySelector("article"),
+    ).toBe(placeholder);
     expect(fetchMock.mock.calls.some(([, init]) => (
       String(init?.body).includes("client.chat.optimistic_player_painted")
     ))).toBe(false);
@@ -1961,6 +2014,11 @@ describe("frontend helpers", () => {
     ));
     expect(optimisticPaintCall).toBeDefined();
     expect(String(optimisticPaintCall?.[1]?.body)).not.toContain("Light the beacon");
+    const placeholderPaintCall = fetchMock.mock.calls.find(([path, init]) => (
+      path === "/api/log/client"
+      && String(init?.body).includes("client.chat.placeholder_painted")
+    ));
+    expect(placeholderPaintCall).toBeDefined();
 
     const source = await waitFor(() => {
       const match = sources.find((candidate) => candidate.url === "/api/jobs/job-paint/events?save_id=save-1");
@@ -1988,12 +2046,28 @@ describe("frontend helpers", () => {
     };
 
     act(() => {
+      source.dispatch("progress", { label: "Selecting relevant context" });
+    });
+    expect(await within(placeholder).findByText("Selecting relevant context")).toBeInTheDocument();
+    await userEvent.click(within(placeholder).getByRole("button", { name: "Cancel narrator response" }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/jobs/job-paint/cancel?save_id=save-1",
+      expect.anything(),
+    );
+    const sideEffectReadsBeforeDelta = { worldReads, characterReads, mediaReads };
+
+    act(() => {
       source.dispatch("chat_turn_delta", delta);
       source.dispatch("done", { ...createdJob, status: "succeeded", result: delta });
     });
 
     const narratorMessage = await screen.findByText("The bell answers.");
     expect(narratorMessage.closest("[data-message-id='narrator-1']")).not.toBeNull();
+    expect(screen.queryByRole("status", { name: "Narrator response progress" })).not.toBeInTheDocument();
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    });
+    expect({ worldReads, characterReads, mediaReads }).toEqual(sideEffectReadsBeforeDelta);
     expect(fetchMock.mock.calls.some(([, init]) => (
       String(init?.body).includes("client.chat.narrator_painted")
     ))).toBe(false);
@@ -6874,6 +6948,42 @@ describe("frontend helpers", () => {
     ]);
   });
 
+  it("shows narrator placeholder elapsed time only after three seconds", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const { Chronicle } = await import("./main");
+    const client = new QueryClient();
+
+    render(
+      <QueryClientProvider client={client}>
+        <Chronicle
+          model={runtimeModel()}
+          runJob={vi.fn()}
+          pendingMessages={[{
+            message_id: "pending-narrator-placeholder",
+            role: "narrator",
+            speaker_name: null,
+            body: "Preparing narrator response",
+            actions: [],
+            pending_kind: "narrator_placeholder",
+            pending_progress: "Preparing narrator response",
+            pending_started_at_ms: 0,
+          }]}
+        />
+      </QueryClientProvider>,
+    );
+
+    const placeholder = screen.getByRole("status", { name: "Narrator response progress" });
+    expect(placeholder).not.toHaveTextContent("elapsed");
+    now = 2_999;
+    await act(async () => vi.advanceTimersByTimeAsync(2_999));
+    expect(placeholder).not.toHaveTextContent("elapsed");
+    now = 3_000;
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(placeholder).toHaveTextContent("3s elapsed");
+  });
+
   it("does not show an optimistic player artifact after the narrator response persists", async () => {
     const { chronicleMessages } = await import("./main");
     const model = runtimeModel({
@@ -7989,7 +8099,7 @@ describe("frontend helpers", () => {
 
     expect(textarea).toHaveValue("Prepare the follow-up bit");
     expect(screen.getByTitle("Send")).toBeDisabled();
-    expect(screen.getByText("Chat is waiting for Chat turn")).toBeInTheDocument();
+    expect(screen.getByLabelText("Pending jobs")).toBeInTheDocument();
     expect(screen.getByText("Running")).toBeInTheDocument();
 
     fireEvent.submit(textarea.closest("form") as HTMLFormElement);
@@ -8848,7 +8958,7 @@ describe("frontend helpers", () => {
     expect(runtimeCalls).toBe(runtimeCallsBeforeEvent);
   });
 
-  it("refreshes only active job and chat status queries for job save events", async () => {
+  it("refetches only active jobs and chat status when a new chat job appears", async () => {
     const sources = installEventSourceDouble();
     let runtimeCalls = 0;
     let activeJobCalls = 0;
@@ -8934,6 +9044,86 @@ describe("frontend helpers", () => {
     expect(characterCalls).toBe(countsBeforeEvent.characterCalls);
     expect(historyCalls).toBe(countsBeforeEvent.historyCalls);
     expect(scenarioCalls).toBe(countsBeforeEvent.scenarioCalls);
+  });
+
+  it("applies non-chat job creation directly and refetches malformed or terminal job events", async () => {
+    const sources = installEventSourceDouble();
+    const baseFetch = workbenchFetch([], runtimeModel());
+    let activeJobCalls = 0;
+    let submissionStatusCalls = 0;
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path.startsWith("/api/jobs?status=active")) activeJobCalls += 1;
+      if (path.startsWith("/api/chat/submission-status")) submissionStatusCalls += 1;
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>,
+    );
+
+    const saveSource = await waitFor(() => {
+      const source = sources.find((candidate) => candidate.url === "/api/saves/save-1/events");
+      if (!source) throw new Error("save watcher was not created");
+      return source;
+    });
+    await waitFor(() => expect(activeJobCalls).toBeGreaterThan(0));
+    await waitFor(() => expect(submissionStatusCalls).toBeGreaterThan(0));
+    const initialCounts = { activeJobCalls, submissionStatusCalls };
+    act(() => {
+      saveSource.dispatch("job_changed", {
+        event_id: 1,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: {
+          job: {
+            id: "image-job-1",
+            type: "image_generation",
+            save_id: "save-1",
+            status: "running",
+            latest_progress: { label: "Rendering scene" }
+          }
+        }
+      });
+    });
+    expect(await screen.findByText("Rendering scene")).toBeInTheDocument();
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    });
+    expect({ activeJobCalls, submissionStatusCalls }).toEqual(initialCounts);
+
+    act(() => {
+      saveSource.dispatch("job_changed", {
+        event_id: 2,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: { job: { id: 7 } }
+      });
+    });
+    await waitFor(() => expect(activeJobCalls).toBeGreaterThan(initialCounts.activeJobCalls));
+    await waitFor(() => expect(submissionStatusCalls).toBeGreaterThan(initialCounts.submissionStatusCalls));
+    const afterMalformed = { activeJobCalls, submissionStatusCalls };
+
+    act(() => {
+      saveSource.dispatch("job_changed", {
+        event_id: 3,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: {
+          job: {
+            id: "image-job-1",
+            type: "image_generation",
+            save_id: "save-1",
+            status: "succeeded"
+          }
+        }
+      });
+    });
+    await waitFor(() => expect(activeJobCalls).toBeGreaterThan(afterMalformed.activeJobCalls));
+    await waitFor(() => expect(submissionStatusCalls).toBeGreaterThan(afterMalformed.submissionStatusCalls));
   });
 
   it("polls the runtime after save SSE fails so missed updates still show the narrator response", async () => {
@@ -12658,7 +12848,7 @@ describe("frontend helpers", () => {
     expect(within(tray).getByText("Character cleanup")).toBeInTheDocument();
   });
 
-  it("does not let stale active-job hydration restore catch-up after live narration progress", async () => {
+  it("applies valid known job progress without refetching active jobs", async () => {
     const sources = installEventSourceDouble();
     const catchupProgress = {
       kind: "post_turn_catchup" as const,
@@ -12679,15 +12869,10 @@ describe("frontend helpers", () => {
       latest_progress: catchupProgress
     } satisfies Job];
     const baseFetch = workbenchFetch(activeJobs, runtimeModel());
-    const staleActiveResponse = deferred<{
-      ok: boolean;
-      json: () => Promise<{ jobs: Job[] }>;
-    }>();
     let activeJobRequests = 0;
     const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
       if (path.startsWith("/api/jobs?status=active")) {
         activeJobRequests += 1;
-        if (activeJobRequests === 2) return staleActiveResponse.promise;
       }
       return baseFetch(path, init);
     });
@@ -12711,28 +12896,18 @@ describe("frontend helpers", () => {
         event_id: 1,
         save_id: "save-1",
         type: "job_changed",
-        payload: { job: activeJobs[0] }
+        payload: {
+          job: {
+            ...activeJobs[0],
+            updated_at: 2,
+            latest_progress: { label: "Selecting context" }
+          }
+        }
       });
-    });
-    await waitFor(() => expect(activeJobRequests).toBe(2));
-
-    act(() => {
-      jobSource?.dispatch("progress", { label: "Selecting context" });
     });
     expect(await screen.findByText("Selecting context")).toBeInTheDocument();
-
-    await act(async () => {
-      staleActiveResponse.resolve({
-        ok: true,
-        json: async () => ({ jobs: [{ ...activeJobs[0], updated_at: 2 }] })
-      });
-      await staleActiveResponse.promise;
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText("Selecting context")).toBeInTheDocument();
-      expect(screen.queryByText("Waiting for prior turn continuity")).not.toBeInTheDocument();
-    });
+    expect(activeJobRequests).toBe(1);
+    expect(screen.queryByText("Waiting for prior turn continuity")).not.toBeInTheDocument();
   });
 
   it("does not render narrator output before the final job result", async () => {

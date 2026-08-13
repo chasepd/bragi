@@ -3462,7 +3462,11 @@ def test_job_save_events_omit_result_payloads() -> None:
             save_id="save-1",
             creator_user_id="user-1",
             status="succeeded",
+            completion_level="response_committed",
             result={"debug_prompt": "secret prompt"},
+            events=[
+                {"event": "progress", "payload": {"label": "Selecting context"}}
+            ],
         )
     )
 
@@ -3477,6 +3481,8 @@ def test_job_save_events_omit_result_payloads() -> None:
     job = events[0].payload["job"]
     assert job["id"] == "job-debug"
     assert job["status"] == "succeeded"
+    assert job["completion_level"] == "response_committed"
+    assert job["latest_progress"] == {"label": "Selecting context"}
     assert "result" not in job
     assert "debug_prompt" not in str(events[0].payload)
 
@@ -7512,6 +7518,52 @@ def test_chat_submission_status_blocks_when_no_save_is_available(
         "blocking_job_id": None,
         "blocking_job_status": None,
         "blocking_message_id": None,
+    }
+
+
+def test_chat_timing_summary_returns_authenticated_model_scoped_aggregate(
+    tmp_path: Path,
+) -> None:
+    state = _auth_state(tmp_path)
+    scenario = state.repositories.create_scenario(
+        type="full_roleplay",
+        title="Timing Test",
+        premise="A neutral timing fixture.",
+        player_role="Keeper",
+        content={},
+    )
+    state.repositories.create_save(
+        scenario_id=scenario.id,
+        title="Timing Test",
+        save_id="save-1",
+    )
+    state.repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    state.repositories.list_chat_response_commit_durations = lambda **_kwargs: [
+        1_000,
+        2_000,
+        3_000,
+        4_000,
+        5_000,
+    ]
+
+    app = create_app(cast(WebAppState, state))
+    with TestClient(app, authenticate=False) as anonymous:
+        unauthorized = anonymous.get("/api/chat/timing-summary?save_id=save-1")
+    with TestClient(app) as client:
+        response = client.get("/api/chat/timing-summary?save_id=save-1")
+
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    assert response.json() == {
+        "mode": "quality",
+        "provider": "fake",
+        "model": "fake-chat",
+        "sample_count": 5,
+        "estimate": {"p50_ms": 3_000, "p95_ms": 5_000},
     }
 
 
