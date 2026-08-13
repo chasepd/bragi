@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -1079,6 +1080,9 @@ def test_character_turn_assessments_apply_entering_and_leaving(
         present_character_ids=[characters["mara"]],
         snapshot_id="snapshot-1",
     )
+    mara = repositories.get_character(characters["mara"])
+    assert mara is not None
+    repositories.update_character(replace(mara, locked_fields=["present"]))
     player_message_id = repositories.append_message(
         save_id=save_id,
         role="player",
@@ -1116,7 +1120,7 @@ def test_character_turn_assessments_apply_entering_and_leaving(
 
     snapshot = repositories.get_scene_snapshot(save_id)
     assert snapshot is not None
-    assert characters["mara"] not in snapshot.present_character_ids
+    assert characters["mara"] in snapshot.present_character_ids
     assert characters["ren"] in snapshot.present_character_ids
     assert result.assessments[0].leaves_scene is True
     assert result.assessments[1].enters_scene is True

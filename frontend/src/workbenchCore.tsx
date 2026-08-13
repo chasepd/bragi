@@ -1106,7 +1106,8 @@ const CHARACTER_LOCK_FIELDS = [
   ["cooperation_conditions", "Cooperation conditions"],
   ["status", "Status"],
   ["location_id", "Location"],
-  ["private_notes", "Private notes"]
+  ["private_notes", "Private notes"],
+  ["present", "Present"]
 ] as const;
 const CHARACTER_LOCK_FIELD_IDS: ReadonlySet<string> = new Set(CHARACTER_LOCK_FIELDS.map(([id]) => id));
 const CHARACTER_LOCK_FIELD_ALIASES: Record<string, string> = {

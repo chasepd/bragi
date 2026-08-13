@@ -29,6 +29,7 @@ from bragi.services.active_thread_lifecycle import (
     active_thread_is_prompt_visible,
     normalize_active_thread_status,
 )
+from bragi.services.character_locks import character_field_is_locked
 from bragi.services.dating_route_policy import (
     escalation_policy_for_stage,
     intimacy_profile_guidance,
@@ -1295,6 +1296,12 @@ def _apply_presence_decisions(
     changed = False
     for decision in decisions:
         if not _assessment_has_grounded_presence(decision):
+            continue
+        character = repositories.get_character(decision.character_id)
+        if character is not None and character_field_is_locked(
+            character.locked_fields,
+            "present",
+        ):
             continue
         before_ids = set(present_ids)
         if decision.leaves_scene:

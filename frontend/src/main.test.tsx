@@ -18754,6 +18754,7 @@ describe("frontend helpers", () => {
     await userEvent.click(screen.getByLabelText("Lock Voice"));
     await userEvent.click(screen.getByLabelText("Lock Appearance"));
     await userEvent.click(screen.getByLabelText("Lock Current clothing"));
+    await userEvent.click(screen.getByLabelText("Lock Present"));
     await userEvent.click(screen.getByRole("button", { name: /save/i }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/characters/apply", expect.anything()));
@@ -18764,7 +18765,7 @@ describe("frontend helpers", () => {
           {
             character_id: "character-1",
             current_clothing: "Borrowed green raincoat over a linen shirt.",
-            locked_fields: ["appearance", "current_clothing"]
+            locked_fields: ["appearance", "current_clothing", "present"]
           }
         ]
       }

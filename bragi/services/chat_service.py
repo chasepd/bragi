@@ -99,6 +99,7 @@ from bragi.services.character_action_planning_service import (
     format_character_turn_assessment,
     planning_scene_text,
 )
+from bragi.services.character_locks import character_field_is_locked
 from bragi.services.character_registry_maintenance_service import (
     CharacterRegistryMaintenanceService,
 )
@@ -9975,6 +9976,12 @@ def _apply_scene_presence_candidate(
     else:
         return "skipped", "unsupported_scene_presence_action", False
     changed = present_ids != before_ids
+    character = repositories.get_character(character_id)
+    if changed and character is not None and character_field_is_locked(
+        character.locked_fields,
+        "present",
+    ):
+        return "skipped", "locked_character_presence", False
     if changed or snapshot is None:
         _upsert_snapshot_preserving_fields(
             repositories=repositories,

@@ -36,6 +36,7 @@ _NON_PORTABLE_LOCKED_FIELDS = frozenset(
         "source_message_id",
         "first_seen_message_id",
         "last_updated_message_id",
+        "present",
     }
 )
 

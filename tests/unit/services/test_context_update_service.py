@@ -3816,6 +3816,7 @@ def test_update_after_turn_replaces_scene_present_character_ids(
         name="Archivist Elian",
         aliases=["elian"],
         source_message_id=player_message.id,
+        locked_fields=["present"],
     )
     repositories.upsert_scene_snapshot(
         save_id=save.id,
@@ -3848,8 +3849,12 @@ def test_update_after_turn_replaces_scene_present_character_ids(
     assert _count(result, "scene_snapshot") == 1
     snapshot = repositories.get_scene_snapshot(save.id)
     assert snapshot is not None
-    assert snapshot.present_character_ids == [current_character.id]
-    assert repositories.list_context_update_suggestions(save.id) == []
+    assert set(snapshot.present_character_ids) == {
+        current_character.id,
+        stale_character.id,
+    }
+    suggestions = repositories.list_context_update_suggestions(save.id)
+    assert any(row.field_path == "present_character_ids" for row in suggestions)
 
 
 def test_update_after_turn_clears_scene_present_character_ids(

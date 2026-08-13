@@ -34,6 +34,7 @@ CHARACTER_FACT_LOCK_FIELDS = frozenset(
         "status",
         "location_id",
         "private_notes",
+        "present",
     }
 )
 
@@ -106,3 +107,16 @@ def character_field_is_locked(
     if canonical is None:
         return field_path.strip() in {field.strip() for field in locked_fields}
     return canonical in normalize_character_fact_locks(locked_fields)
+
+
+def reconcile_character_presence_locks(
+    *,
+    current_present_ids: Iterable[str],
+    proposed_present_ids: Iterable[str],
+    locked_character_ids: Iterable[str],
+) -> set[str]:
+    """Apply a proposed scene roster while preserving locked memberships."""
+    current = set(current_present_ids)
+    proposed = set(proposed_present_ids)
+    locked = set(locked_character_ids)
+    return (proposed - locked) | (current & locked)

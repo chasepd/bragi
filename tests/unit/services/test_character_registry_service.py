@@ -1203,6 +1203,38 @@ def test_apply_edits_omitted_locked_fields_preserves_auto_locking(
     assert updated.locked_fields == ["aliases", "status"]
 
 
+def test_apply_edits_persists_present_as_explicit_character_lock(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        character_id="character-ilyra",
+    )
+
+    CharacterRegistryService(repositories).apply_edits(
+        CharacterRegistryEdits(
+            characters=(
+                CharacterRegistryRow(
+                    character_id=character.id,
+                    name=character.name,
+                    present=True,
+                    locked_fields=("present",),
+                ),
+            ),
+        ),
+        active_save_id=save.id,
+    )
+
+    updated = repositories.get_character(character.id)
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert updated is not None
+    assert updated.locked_fields == ["present"]
+    assert snapshot is not None
+    assert character.id in snapshot.present_character_ids
+
+
 def test_apply_edits_rejects_blank_existing_character_name(
     repositories: PersistenceRepositories,
 ) -> None:

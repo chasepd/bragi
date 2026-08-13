@@ -584,6 +584,49 @@ def test_analyze_and_apply_respects_canonical_scene_time_phase_lock(
     assert rejected.reason.startswith("Cleanup field is locked")
 
 
+def test_analyze_and_apply_rejects_locked_character_presence_change(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player, narrator = _create_save_with_messages(repositories)
+    character = repositories.add_character(
+        save_id=save.id,
+        name="Captain Ilyra",
+        locked_fields=["present"],
+    )
+    scene = repositories.upsert_scene_snapshot(
+        save_id=save.id,
+        present_character_ids=[character.id],
+        source_message_id=player.id,
+    )
+    provider = FakeStructuredCleanupProvider(
+        [
+            {"notes": [{"message_id": narrator.id, "note": "Ilyra left"}]},
+            {
+                "actions": [
+                    _action(
+                        operation="update",
+                        target_type="scene_snapshot",
+                        target_id=scene.id,
+                        field_path="present_character_ids",
+                        value=[],
+                        evidence_message_ids=[narrator.id],
+                    )
+                ]
+            },
+        ]
+    )
+
+    result = asyncio.run(_service(repositories, provider).analyze_and_apply(save.id))
+
+    assert result.applied_actions == 0
+    assert result.rejected_actions == 1
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert snapshot is not None
+    assert snapshot.present_character_ids == [character.id]
+    rejected = repositories.list_context_update_audit(save.id)[0]
+    assert rejected.reason.startswith("Cleanup character presence is locked")
+
+
 def test_analyze_and_apply_archives_supported_context_records_and_links(
     repositories: PersistenceRepositories,
 ) -> None:
