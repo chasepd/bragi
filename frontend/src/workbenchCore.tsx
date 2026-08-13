@@ -2879,6 +2879,8 @@ function Workbench({
 }) {
   const client = useQueryClient();
   const [panel, setPanel] = useState<PanelName>("media");
+  const panelRef = useRef(panel);
+  panelRef.current = panel;
   const [draftOpen, setDraftOpen] = useState(false);
   const [phoneOpen, setPhoneOpen] = useState(false);
   const [lookAroundOpen, setLookAroundOpen] = useState(false);
@@ -3129,8 +3131,8 @@ function Workbench({
       }
       return;
     }
-    queueWorkbenchRefresh(saveId, saveEventRefreshTargets(event, panel));
-  }, [client, panel, queueWorkbenchRefresh]);
+    queueWorkbenchRefresh(saveId, saveEventRefreshTargets(event, panelRef.current));
+  }, [client, queueWorkbenchRefresh]);
 
   const applyRuntimeModel = useCallback((nextModel: RuntimeModel, fallbackSaveId: string | null = activeSaveIdRef.current) => {
     const nextSaveId = nextModel.active_save_id ?? fallbackSaveId;
