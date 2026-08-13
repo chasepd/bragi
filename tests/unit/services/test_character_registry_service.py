@@ -1234,6 +1234,27 @@ def test_apply_edits_persists_present_as_explicit_character_lock(
     assert snapshot is not None
     assert character.id in snapshot.present_character_ids
 
+    CharacterRegistryService(repositories).apply_edits(
+        CharacterRegistryEdits(
+            characters=(
+                CharacterRegistryRow(
+                    character_id=character.id,
+                    name=character.name,
+                    present=False,
+                    locked_fields=("present",),
+                ),
+            ),
+        ),
+        active_save_id=save.id,
+    )
+
+    snapshot = repositories.get_scene_snapshot(save.id)
+    assert snapshot is not None
+    assert character.id not in snapshot.present_character_ids
+    updated = repositories.get_character(character.id)
+    assert updated is not None
+    assert updated.locked_fields == ["present"]
+
 
 def test_apply_edits_rejects_blank_existing_character_name(
     repositories: PersistenceRepositories,

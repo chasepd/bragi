@@ -5668,8 +5668,18 @@ def test_plan_first_verifier_receives_rich_reference_request(
     )
 
 
+@pytest.mark.parametrize(
+    ("action", "initially_present", "narration"),
+    [
+        ("leave", True, "Lio leaves the beacon gallery to fetch the archive map."),
+        ("enter", False, "Lio enters the beacon gallery with the archive map."),
+    ],
+)
 def test_submit_player_turn_skips_locked_rendered_planned_scene_presence(
     repositories: PersistenceRepositories,
+    action: str,
+    initially_present: bool,
+    narration: str,
 ) -> None:
     scenario = repositories.create_scenario(
         type="full_roleplay",
@@ -5690,7 +5700,7 @@ def test_submit_player_turn_skips_locked_rendered_planned_scene_presence(
         save_id=save.id,
         situation="Mara and Lio stand in the beacon gallery.",
         objective="Keep the lens lit.",
-        present_character_ids=[mara.id, lio.id],
+        present_character_ids=[mara.id, *([lio.id] if initially_present else [])],
     )
     repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
     repositories.set_model_preference(
@@ -5698,7 +5708,11 @@ def test_submit_player_turn_skips_locked_rendered_planned_scene_presence(
         provider="fake",
         model_id="fake-chat",
     )
-    candidate = _scene_presence_candidate(lio.id, action="leave")
+    candidate = _scene_presence_candidate(
+        lio.id,
+        action=action,
+        evidence_quote=f"Lio {action}s",
+    )
     spec = NarratorMessageSpec(
         intent="Answer the player move.",
         thesis="Lio leaves if rendered.",
@@ -5711,7 +5725,7 @@ def test_submit_player_turn_skips_locked_rendered_planned_scene_presence(
     )
     provider = SequenceChatProvider(
         "fake",
-        ("Lio leaves the beacon gallery to fetch the archive map.",),
+        (narration,),
     )
     service = ChatService(
         repositories=repositories,
@@ -5734,7 +5748,10 @@ def test_submit_player_turn_skips_locked_rendered_planned_scene_presence(
 
     snapshot = repositories.get_scene_snapshot(save.id)
     assert snapshot is not None
-    assert set(snapshot.present_character_ids) == {mara.id, lio.id}
+    assert set(snapshot.present_character_ids) == {
+        mara.id,
+        *({lio.id} if initially_present else set()),
+    }
     assert snapshot.situation == "Mara and Lio stand in the beacon gallery."
     assert snapshot.objective == "Keep the lens lit."
     planned = _chat_completion_jobs(repositories, save.id)[-1]["result"][

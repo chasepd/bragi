@@ -588,14 +588,19 @@ def test_analyze_and_apply_rejects_locked_character_presence_change(
     repositories: PersistenceRepositories,
 ) -> None:
     save, player, narrator = _create_save_with_messages(repositories)
-    character = repositories.add_character(
+    present_character = repositories.add_character(
         save_id=save.id,
         name="Captain Ilyra",
         locked_fields=["present"],
     )
+    absent_character = repositories.add_character(
+        save_id=save.id,
+        name="Quartermaster Ren",
+        locked_fields=["present"],
+    )
     scene = repositories.upsert_scene_snapshot(
         save_id=save.id,
-        present_character_ids=[character.id],
+        present_character_ids=[present_character.id],
         source_message_id=player.id,
     )
     provider = FakeStructuredCleanupProvider(
@@ -608,7 +613,7 @@ def test_analyze_and_apply_rejects_locked_character_presence_change(
                         target_type="scene_snapshot",
                         target_id=scene.id,
                         field_path="present_character_ids",
-                        value=[],
+                        value=[absent_character.id],
                         evidence_message_ids=[narrator.id],
                     )
                 ]
@@ -622,7 +627,7 @@ def test_analyze_and_apply_rejects_locked_character_presence_change(
     assert result.rejected_actions == 1
     snapshot = repositories.get_scene_snapshot(save.id)
     assert snapshot is not None
-    assert snapshot.present_character_ids == [character.id]
+    assert snapshot.present_character_ids == [present_character.id]
     rejected = repositories.list_context_update_audit(save.id)[0]
     assert rejected.reason.startswith("Cleanup character presence is locked")
 

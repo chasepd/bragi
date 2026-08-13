@@ -3818,6 +3818,12 @@ def test_update_after_turn_replaces_scene_present_character_ids(
         source_message_id=player_message.id,
         locked_fields=["present"],
     )
+    absent_character = repositories.add_character(
+        save_id=save.id,
+        name="Quartermaster Ren",
+        source_message_id=player_message.id,
+        locked_fields=["present"],
+    )
     repositories.upsert_scene_snapshot(
         save_id=save.id,
         situation="Ilyra and Elian stand by the beacon.",
@@ -3828,7 +3834,7 @@ def test_update_after_turn_replaces_scene_present_character_ids(
         scene=module.ExtractedSceneSnapshot(
             source_message_id=narrator_message.id,
             situation="Ilyra steadies Mara by the lens.",
-            present_character_names=("Captain Ilyra",),
+            present_character_names=("Captain Ilyra", "Quartermaster Ren"),
             reason="Only Ilyra remains present in the current scene.",
             confidence=0.88,
         ),
@@ -3853,6 +3859,7 @@ def test_update_after_turn_replaces_scene_present_character_ids(
         current_character.id,
         stale_character.id,
     }
+    assert absent_character.id not in snapshot.present_character_ids
     suggestions = repositories.list_context_update_suggestions(save.id)
     assert any(row.field_path == "present_character_ids" for row in suggestions)
 

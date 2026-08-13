@@ -1081,8 +1081,11 @@ def test_character_turn_assessments_apply_entering_and_leaving(
         snapshot_id="snapshot-1",
     )
     mara = repositories.get_character(characters["mara"])
+    ren = repositories.get_character(characters["ren"])
     assert mara is not None
+    assert ren is not None
     repositories.update_character(replace(mara, locked_fields=["present"]))
+    repositories.update_character(replace(ren, locked_fields=["present"]))
     player_message_id = repositories.append_message(
         save_id=save_id,
         role="player",
@@ -1121,10 +1124,10 @@ def test_character_turn_assessments_apply_entering_and_leaving(
     snapshot = repositories.get_scene_snapshot(save_id)
     assert snapshot is not None
     assert characters["mara"] in snapshot.present_character_ids
-    assert characters["ren"] in snapshot.present_character_ids
+    assert characters["ren"] not in snapshot.present_character_ids
     assert result.assessments[0].leaves_scene is True
     assert result.assessments[1].enters_scene is True
-    assert result.applied_presence_update is True
+    assert result.applied_presence_update is False
 
 
 def test_character_action_planning_batch_exposes_allowed_evidence_source_ids(
