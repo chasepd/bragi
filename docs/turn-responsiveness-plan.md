@@ -93,7 +93,7 @@ log when applicable.
 
 | PR | Branch | Status | Issue/PR | Required outcome |
 | --- | --- | --- | --- | --- |
-| 0 | `docs/turn-responsiveness-plan` | `in_progress` | #129 | Persist this execution plan and update protocol. |
+| 0 | `docs/turn-responsiveness-plan` | `complete` | [#130](https://github.com/chasepd/bragi/pull/130) | Persisted this execution plan and update protocol. |
 | 1 | `feat/turn-latency-telemetry` | `pending` | #129 | Add critical-path spans, user-paint events, and deterministic latency harnesses. |
 | 2 | `feat/turn-progress-ux` | `pending` | #129 | Add narrator placeholder, timing summaries, and job-delivery cleanup. |
 | 3 | `fix/foreground-retry-budgets` | `pending` | #129 | Enforce hard deadlines and responsive foreground retry limits. |
@@ -223,6 +223,15 @@ For every program PR:
 | Date | Commit/PR | Mode and stratum | Samples | Median | p95 | Failure/interruption rate | Notes |
 | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
 | 2026-08-12 | audit at `940d585` | quality, code audit only | 0 | n/a | n/a | n/a | No personal runtime data inspected. |
+
+## PR Evidence
+
+- PR 0 ([#130](https://github.com/chasepd/bragi/pull/130)): documentation-only;
+  runtime validation was skipped per `AGENTS.md`, `git diff --check` passed, and
+  an independent pinned-SHA review found one process blocker. This update fixes
+  that blocker by recording the PR, completed status, evidence, and next action.
+  No aggregate runtime measurements apply to this PR and there were no product
+  or interface deviations.
 
 ## Decision And Change Log
 
