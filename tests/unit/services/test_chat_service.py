@@ -20437,7 +20437,7 @@ def test_responsive_fast_path_skips_all_optional_foreground_helpers(
     )
 
     with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
-        asyncio.run(
+        submitted = asyncio.run(
             service.submit_player_turn(
                 save_id=save.id,
                 body="I ask Mira what she sees.",
@@ -20454,6 +20454,8 @@ def test_responsive_fast_path_skips_all_optional_foreground_helpers(
     assert "save-only phrase" in provider.chat_requests[1].regeneration_feedback
     job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
     assert job_result["responsive_fast_path_used"] is True
+    assert submitted.responsive_fast_path_used is True
+    assert submitted.responsive_turn_plan_used is False
     assert job_result["narrator_verifier_skipped"] == "responsive_fast_path"
     assert job_result["npc_knowledge_audit"]["skipped_reason"] == (
         "responsive_fast_path"
@@ -20501,7 +20503,7 @@ def test_responsive_combined_plan_skips_separate_planners(
     provider = RecordingChatProvider("fake")
 
     with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
-        asyncio.run(
+        submitted = asyncio.run(
             ChatService(
                 repositories=repositories,
                 providers={"fake": provider},
@@ -20522,6 +20524,8 @@ def test_responsive_combined_plan_skips_separate_planners(
     assert provider.chat_requests[0].narrator_prompt_mode == "plan_first"
     job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
     assert job_result["responsive_turn_plan_used"] is True
+    assert submitted.responsive_fast_path_used is False
+    assert submitted.responsive_turn_plan_used is True
 
 
 def test_storyteller_character_planning_never_applies_direction_presence(

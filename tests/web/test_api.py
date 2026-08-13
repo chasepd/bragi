@@ -7629,6 +7629,18 @@ def test_chat_timing_summary_returns_authenticated_model_scoped_aggregate(
         "model": "fake-chat",
         "sample_count": 5,
         "estimate": {"p50_ms": 3_000, "p95_ms": 5_000},
+        "outcomes": {
+            "terminal_count": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "interrupted_count": 0,
+            "failure_rate": None,
+            "route_sample_count": 0,
+            "fast_path_count": 0,
+            "combined_path_count": 0,
+            "standard_path_count": 0,
+            "unclassified_success_count": 0,
+        },
     }
 
 
@@ -9015,6 +9027,7 @@ def test_chat_turn_persists_user_facing_phase_spans(
         "chat.narrator_generation",
         "chat.verification",
         "chat.commit",
+        "chat.responsiveness_route",
         "chat.response_committed",
     ]
     assert all(step.status == "succeeded" for step in steps)
@@ -9023,6 +9036,13 @@ def test_chat_turn_persists_user_facing_phase_spans(
     assert context_step.metadata == (
         {"degraded": True} if context_status == "degraded" else {}
     )
+    route_step = next(
+        step for step in steps if step.name == "chat.responsiveness_route"
+    )
+    assert route_step.metadata == {
+        "responsive_fast_path_used": False,
+        "responsive_turn_plan_used": False,
+    }
 
 
 def test_timeskip_exposes_initial_pre_narrator_phase_progress(
@@ -9981,6 +10001,20 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
     assert result["player_message_id"] == result["messages"][0]["message_id"]
     assert result["narrator_message_id"] == result["messages"][1]["message_id"]
     assert result["save"]["save_id"] == save.id
+    persisted = repositories.get_persisted_job(job_id)
+    assert persisted is not None
+    assert persisted.payload["turn_responsiveness_mode"] == "quality"
+    assert persisted.payload["narrator_provider"] == "fake"
+    assert persisted.payload["narrator_model"] == "fake-chat"
+    route_step = next(
+        step
+        for step in repositories.list_job_steps(job_id)
+        if step.name == "chat.responsiveness_route"
+    )
+    assert route_step.metadata == {
+        "responsive_fast_path_used": False,
+        "responsive_turn_plan_used": False,
+    }
 
 
 def test_post_turn_jobs_expose_initial_phase_progress_before_runtime_callback(

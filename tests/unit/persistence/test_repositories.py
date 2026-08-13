@@ -145,6 +145,91 @@ def test_list_chat_response_commit_durations_filters_model_status_and_limit(
     assert responsive_durations == [6_000]
 
 
+def test_list_chat_turn_outcomes_filters_stratum_and_reports_safe_route_flags(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Outcome Test",
+        premise="A neutral outcome fixture.",
+        player_role="Keeper",
+        content={},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Outcome Test")
+
+    def add_outcome(
+        index: int,
+        *,
+        status: str,
+        mode: str = "responsive",
+        model: str = "fake-chat",
+        fast_path: bool | None = None,
+        combined_path: bool | None = None,
+    ) -> None:
+        job_id = f"outcome-job-{index}"
+        repositories.create_chat_turn_submission_job(
+            save_id=save.id,
+            client_turn_id=f"outcome-turn-{index}",
+            operation="chat",
+            request_fingerprint=f"outcome-fingerprint-{index}",
+            creator_user_id=None,
+            job_id=job_id,
+            payload={
+                "turn_responsiveness_mode": mode,
+                "narrator_provider": "fake",
+                "narrator_model": model,
+            },
+        )
+        if status == "cancelled":
+            repositories.cancel_job(job_id)
+        else:
+            repositories.update_job(job_id, status=status)
+        repositories.connection.execute(
+            "UPDATE jobs SET completed_at = ? WHERE id = ?",
+            (f"2026-08-13 00:00:0{index}", job_id),
+        )
+        if fast_path is not None and combined_path is not None:
+            repositories.record_job_step(
+                job_id=job_id,
+                name="chat.responsiveness_route",
+                status="succeeded",
+                metadata={
+                    "responsive_fast_path_used": fast_path,
+                    "responsive_turn_plan_used": combined_path,
+                },
+            )
+        repositories.commit()
+
+    add_outcome(1, status="succeeded", fast_path=True, combined_path=False)
+    add_outcome(2, status="succeeded", fast_path=False, combined_path=True)
+    add_outcome(3, status="failed")
+    add_outcome(4, status="cancelled", model="other-chat")
+    add_outcome(
+        5,
+        status="succeeded",
+        mode="quality",
+        fast_path=False,
+        combined_path=False,
+    )
+
+    records = repositories.list_chat_turn_outcomes(
+        save_id=save.id,
+        provider="fake",
+        model="fake-chat",
+        mode="responsive",
+        limit=30,
+    )
+
+    assert [
+        (record.status, record.fast_path_used, record.combined_path_used)
+        for record in records
+    ] == [
+        ("failed", None, None),
+        ("succeeded", False, True),
+        ("succeeded", True, False),
+    ]
+
+
 def test_message_safety_transition_round_trips_and_edits_clear_it(
     repositories: PersistenceRepositories,
 ) -> None:

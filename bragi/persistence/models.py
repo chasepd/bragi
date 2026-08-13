@@ -898,6 +898,13 @@ class ChatTurnSubmissionRecord:
 
 
 @dataclass(frozen=True)
+class ChatTurnOutcomeRecord:
+    status: str
+    fast_path_used: bool | None = None
+    combined_path_used: bool | None = None
+
+
+@dataclass(frozen=True)
 class ScheduledTaskRecord:
     id: str
     task_type: str

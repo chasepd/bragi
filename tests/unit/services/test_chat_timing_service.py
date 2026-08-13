@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from bragi.persistence.migrations import migrate_database
+from bragi.persistence.models import ChatTurnOutcomeRecord
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.services.chat_timing_service import ChatTimingService
 from bragi.services.turn_responsiveness import (
@@ -109,3 +110,46 @@ def test_timing_summary_uses_effective_responsive_mode_for_samples(
 
     assert summary.mode == "responsive"
     assert calls[0]["mode"] == "responsive"
+
+
+def test_timing_summary_reports_failure_rate_and_successful_route_usage(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id = _save_with_chat_model(repositories)
+    repositories.list_chat_response_commit_durations = lambda **_kwargs: [  # type: ignore[method-assign]
+        1_000,
+        2_000,
+    ]
+    repositories.list_chat_turn_outcomes = lambda **_kwargs: [  # type: ignore[method-assign]
+        ChatTurnOutcomeRecord(
+            status="succeeded",
+            fast_path_used=True,
+            combined_path_used=False,
+        ),
+        ChatTurnOutcomeRecord(
+            status="succeeded",
+            fast_path_used=False,
+            combined_path_used=True,
+        ),
+        ChatTurnOutcomeRecord(
+            status="succeeded",
+            fast_path_used=False,
+            combined_path_used=False,
+        ),
+        ChatTurnOutcomeRecord(status="succeeded"),
+        ChatTurnOutcomeRecord(status="failed"),
+        ChatTurnOutcomeRecord(status="cancelled"),
+    ]
+
+    outcomes = ChatTimingService(repositories).summary(save_id).outcomes
+
+    assert outcomes.terminal_count == 6
+    assert outcomes.success_count == 4
+    assert outcomes.failed_count == 1
+    assert outcomes.interrupted_count == 1
+    assert outcomes.failure_rate == pytest.approx(1 / 3)
+    assert outcomes.route_sample_count == 3
+    assert outcomes.fast_path_count == 1
+    assert outcomes.combined_path_count == 1
+    assert outcomes.standard_path_count == 1
+    assert outcomes.unclassified_success_count == 1

@@ -537,6 +537,8 @@ class SubmittedTurn:
     context_trimmed: bool = False
     prepared_action_choices: PreparedActionChoiceGeneration | None = None
     turn_revision: TurnRevisionBoundary | None = None
+    responsive_fast_path_used: bool = False
+    responsive_turn_plan_used: bool = False
 
 
 @dataclass(frozen=True)
@@ -3539,6 +3541,10 @@ class ChatService:
                 prepared_action_choices if defer_action_choices else None
             ),
             turn_revision=turn_revision,
+            responsive_fast_path_used=context_result.responsive_fast_path_used,
+            responsive_turn_plan_used=(
+                context_result.responsive_narrator_spec is not None
+            ),
         )
 
     async def _await_background_post_turn_catchup(self, *, save_id: str) -> None:

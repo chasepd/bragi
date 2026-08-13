@@ -36,6 +36,7 @@ from bragi.persistence.models import (
     CharacterTextProvenanceRecord,
     CharacterTextThreadParticipantRecord,
     CharacterTextThreadRecord,
+    ChatTurnOutcomeRecord,
     ChatTurnSubmissionRecord,
     ContextObservationCurationHealthRecord,
     ContextObservationCurationStateRecord,
@@ -14118,8 +14119,14 @@ class PersistenceRepositories:
               AND job.type = 'chat_turn'
               AND job.status = 'succeeded'
               AND narrator.role = 'narrator'
-              AND narrator.provider = ?
-              AND narrator.model = ?
+              AND COALESCE(
+                    json_extract(job.payload_json, '$.narrator_provider'),
+                    narrator.provider
+                  ) = ?
+              AND COALESCE(
+                    json_extract(job.payload_json, '$.narrator_model'),
+                    narrator.model
+                  ) = ?
               AND COALESCE(
                     json_extract(job.payload_json, '$.turn_responsiveness_mode'),
                     'quality'
@@ -14132,6 +14139,85 @@ class PersistenceRepositories:
             (save_id, provider, model, mode, min(limit, 30)),
         )
         return [int(row["duration_ms"]) for row in rows]
+
+    def list_chat_turn_outcomes(
+        self,
+        *,
+        save_id: str,
+        provider: str,
+        model: str,
+        mode: str,
+        limit: int = 30,
+    ) -> list[ChatTurnOutcomeRecord]:
+        if limit <= 0:
+            return []
+        rows = self._fetch_all(
+            """
+            SELECT job.status,
+                   MAX(
+                       CASE
+                           WHEN route.name = 'chat.responsiveness_route'
+                           THEN json_extract(
+                               route.metadata_json,
+                               '$.responsive_fast_path_used'
+                           )
+                       END
+                   ) AS fast_path_used,
+                   MAX(
+                       CASE
+                           WHEN route.name = 'chat.responsiveness_route'
+                           THEN json_extract(
+                               route.metadata_json,
+                               '$.responsive_turn_plan_used'
+                           )
+                       END
+                   ) AS combined_path_used
+            FROM chat_turn_submissions AS submission
+            JOIN jobs AS job ON job.id = submission.job_id
+            LEFT JOIN messages AS narrator
+              ON narrator.id = submission.narrator_message_id
+             AND narrator.save_id = submission.save_id
+            LEFT JOIN job_steps AS route
+              ON route.job_id = job.id
+             AND route.name = 'chat.responsiveness_route'
+             AND route.status = 'succeeded'
+            WHERE submission.save_id = ?
+              AND job.type = 'chat_turn'
+              AND job.status IN ('succeeded', 'failed', 'cancelled')
+              AND COALESCE(
+                    json_extract(job.payload_json, '$.narrator_provider'),
+                    narrator.provider
+                  ) = ?
+              AND COALESCE(
+                    json_extract(job.payload_json, '$.narrator_model'),
+                    narrator.model
+                  ) = ?
+              AND COALESCE(
+                    json_extract(job.payload_json, '$.turn_responsiveness_mode'),
+                    'quality'
+                  ) = ?
+            GROUP BY job.id
+            ORDER BY job.completed_at DESC, job.rowid DESC
+            LIMIT ?
+            """,
+            (save_id, provider, model, mode, min(limit, 30)),
+        )
+        return [
+            ChatTurnOutcomeRecord(
+                status=str(row["status"]),
+                fast_path_used=(
+                    bool(row["fast_path_used"])
+                    if row["fast_path_used"] is not None
+                    else None
+                ),
+                combined_path_used=(
+                    bool(row["combined_path_used"])
+                    if row["combined_path_used"] is not None
+                    else None
+                ),
+            )
+            for row in rows
+        ]
 
     def create_chat_turn_submission_job(
         self,

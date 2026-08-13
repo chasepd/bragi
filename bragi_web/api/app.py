@@ -9327,6 +9327,17 @@ async def _create_idempotent_chat_job_summary(
         state.repositories,
         save_id=save_id,
     )
+    from bragi.services.model_preferences import roleplay_model_preference
+
+    narrator_preference = (
+        roleplay_model_preference(
+            repositories=state.repositories,
+            save_id=save_id,
+            purpose="chat",
+        )
+        if callable(getattr(state.repositories, "get_app_setting", None))
+        else None
+    )
 
     def persist(record: JobRecord) -> None:
         create_submission = getattr(
@@ -9348,6 +9359,14 @@ async def _create_idempotent_chat_job_summary(
                 "exclusive_key": exclusive_key or "",
                 "operation": operation,
                 "turn_responsiveness_mode": effective_mode,
+                **(
+                    {
+                        "narrator_provider": narrator_preference.provider,
+                        "narrator_model": narrator_preference.model_id,
+                    }
+                    if narrator_preference is not None
+                    else {}
+                ),
             },
         )
 
@@ -10226,6 +10245,20 @@ def _initial_chat_turn_result(turn: object) -> object:
 
 
 async def _emit_initial_chat_turn_event(handle: JobHandle, turn: object) -> None:
+    bragi_runtime_bindings().record_current_job_step(
+        name="chat.responsiveness_route",
+        status="succeeded",
+        task="chat",
+        duration_ms=0,
+        metadata={
+            "responsive_fast_path_used": bool(
+                getattr(turn, "responsive_fast_path_used", False)
+            ),
+            "responsive_turn_plan_used": bool(
+                getattr(turn, "responsive_turn_plan_used", False)
+            ),
+        },
+    )
     with bragi_runtime_bindings().runtime_job_step(
         "chat.response_committed",
         root=True,

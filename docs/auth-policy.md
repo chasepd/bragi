@@ -105,7 +105,7 @@ or per user/session before using a save ID.
 | `/api/saves/{save_id}/engine-health` | Save-scoped | Read metadata-only engine diagnostics for an accessible save; child blocked. |
 | `/api/chat-history` | Save-scoped | Read history only for an accessible save. |
 | `/api/chat/submission-status` | Save-scoped | Read queued/running state only for an accessible save. |
-| `/api/chat/timing-summary` | Save-scoped | Read aggregate narrator timing only for an accessible save. |
+| `/api/chat/timing-summary` | Save-scoped | Read metadata-only narrator timing, terminal-outcome, and adaptive-route aggregates for an accessible save. |
 | `/api/character-texts` | Save-scoped | Read visible phone contacts, contact repair candidates, and thread summaries only for an accessible save. |
 | `/api/character-texts/threads/{thread_id}` | Save-scoped | Read character text thread history only when the thread belongs to an accessible save. |
 | `/api/character-texts/groups` | Save-scoped | Create character text group threads only in an accessible save when role policy allows chat and the player has every selected character's number. |

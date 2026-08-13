@@ -19,6 +19,63 @@ performance.
 - Check Performance for slow job, step, or model averages.
 - Check Event Stream for repeated `web.request.completed` rows with long
   durations on the same route.
+- For an adult or administrator-operated save, use Save settings > Turn
+  Responsiveness Mode to compare the default `quality` pipeline with the
+  bounded `responsive` pipeline. Responsive mode keeps all mandatory safety and
+  continuity checks; turns that are not eligible for its fast or combined path
+  use the standard helper route under the responsive retry budget.
+
+## Measuring Turn Responsiveness Safely
+
+The authenticated
+`GET /api/chat/timing-summary?save_id=<save-id>` endpoint returns metadata-only
+aggregates for the save's current responsiveness mode and configured narrator
+provider/model. It never returns prompts, narration, scenario details, message
+ids, job ids, or save ids. Use the response as the source for performance
+comparisons instead of reading a local database or collecting chat logs.
+
+The response fields use two independent, bounded windows:
+
+- `sample_count` and `estimate` describe the latest 30 successful
+  response-committed turns. `estimate` contains nearest-rank `p50_ms` and
+  `p95_ms`, and remains `null` until five matching successes exist.
+- `outcomes` describes the latest 30 terminal turns. `failure_rate` is
+  `(failed_count + interrupted_count) / terminal_count`.
+- Route counts cover successful turns with route telemetry.
+  `fast_path_count` is the deterministic fast path,
+  `combined_path_count` is the provider-enforced combined structured planner,
+  and `standard_path_count` is the normal quality path or the responsive
+  fallback path. `unclassified_success_count` identifies older successful turns
+  recorded before route telemetry existed.
+
+For a trustworthy comparison:
+
+1. Use the same configured narrator provider and model for both modes. Do not
+   combine different provider/model strata.
+2. Let normal use accumulate at least 20 successful turns in each mode. Either
+   use comparable saves or switch one save's mode; the endpoint reports only
+   the currently effective mode when requested.
+3. Recheck the endpoint in each mode and record only mode, provider/model,
+   sample counts, p50, p95, failure rate, and route counts. Never copy the
+   request's save id or add transcript, prompt, local database, log, or media
+   data to a report.
+4. Calculate improvement as `(quality - responsive) / quality`. The turn
+   responsiveness program requires at least 25% median improvement, at least
+   20% p95 improvement, and no more than a five-percentage-point increase in
+   failed or interrupted turns.
+5. In Settings > Diagnostics > Event Stream, filter the metadata-only client
+   events for `client.chat.optimistic_player_painted` and
+   `client.chat.placeholder_painted`. Record only the sample count and
+   nearest-rank p95 of `duration_ms`; both p95 values must remain below 250 ms.
+   Recent events are process-local, so collect them before a restart and do not
+   export the raw rows.
+
+If there are fewer than 20 successful samples in either mode, provider/model
+does not match, or successful responsive turns are still unclassified, record
+the comparison as pending. Do not infer a result from a small or mixed sample.
+If latency improves but failures exceed the gate, keep quality mode as the
+default and investigate provider and active-save health rather than weakening
+safety or continuity rules.
 
 ## Provider Failures
 

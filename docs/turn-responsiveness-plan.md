@@ -53,7 +53,9 @@ log before implementation.
 
 - `GET /api/chat/timing-summary?save_id=...`: authenticated aggregate timing for
   the effective responsiveness mode and current narrator provider/model. It
-  returns no estimate until five matching successful turns exist.
+  returns no estimate until five matching successful turns exist. The response
+  also includes a latest-30 terminal outcome window with failure/interruption
+  rate and successful fast, combined, standard, and unclassified route counts.
 
 ### Job steps
 
@@ -68,6 +70,7 @@ log before implementation.
 - `chat.verification`
 - `chat.commit`
 - `chat.response_committed`
+- `chat.responsiveness_route`
 - `post_turn.continuity_ready`
 - `post_turn.image_ready`
 
@@ -100,7 +103,8 @@ log when applicable.
 | 4 | `feat/responsive-turn-mode` | `complete` | [#134](https://github.com/chasepd/bragi/pull/134) | Added portable save-scoped mode and responsive routing/budget behavior. |
 | 5 | `perf/adaptive-turn-pipeline` | `complete` | [#135](https://github.com/chasepd/bragi/pull/135) | Added deterministic fast path and combined structured planning path. |
 | 6 | `perf/post-turn-media-responsiveness` | `complete` | [#136](https://github.com/chasepd/bragi/pull/136) | Start images earlier and improve media loading feedback. |
-| 7 | `docs/turn-responsiveness-results` | `in_progress` | #129 | Evaluate organic aggregates, document results, and close the program only if gates pass. |
+| 7 | `docs/turn-responsiveness-results` | `in_progress` | #129 | Add the missing privacy-safe outcome/route aggregates, operator guidance, and record the current sample gate. |
+| 8 | `docs/turn-responsiveness-organic-closeout` | `blocked` | #129 | Evaluate organic aggregates and close the program only if every gate passes. |
 
 ## PR Requirements
 
@@ -188,7 +192,20 @@ log when applicable.
   only for the modal.
 - Refetch media only for media-job transitions or media-changing deltas.
 
-### PR 7: Organic-results closeout
+### PR 7: Measurement readiness and current gate
+
+- Extend the timing summary without exposing content or identifiers so it can
+  report latest-30 terminal failure/interruption rate and successful
+  fast/combined/standard route usage in the same mode/provider/model stratum.
+- Snapshot the configured narrator provider/model in new durable web chat jobs
+  and record only two boolean adaptive-route flags after a successful turn.
+- Keep older timing samples compatible and mark successes without route
+  telemetry as unclassified.
+- Update troubleshooting and operator guidance.
+- Record the current organic sample gate without reading a local database,
+  logs, prompts, narration, identifiers, or media.
+
+### PR 8: Organic-results closeout
 
 - Wait for at least 20 privacy-safe samples per mode in a matched narrator
   provider/model stratum.
@@ -229,6 +246,7 @@ For every program PR:
 | 2026-08-13 | PR 4 ([#134](https://github.com/chasepd/bragi/pull/134)) | quality and selectable responsive mode | 0 | n/a | n/a | n/a | The save mode, budgets, routing, and mode-stratified timing were verified with deterministic fakes and synthetic timing data. Organic comparison begins after deployment; no personal runtime data or live provider was inspected. |
 | 2026-08-13 | PR 5 ([#135](https://github.com/chasepd/bragi/pull/135)) | quality and adaptive responsive pipelines | 0 | n/a | n/a | n/a | Fast and combined routes, provider-call waves, fallbacks, guards, and race handling were verified with deterministic fakes. Organic comparison remains pending deployment; no personal runtime data or live provider was inspected. |
 | 2026-08-13 | PR 6 ([#136](https://github.com/chasepd/bragi/pull/136)) | post-turn media responsiveness | 0 | n/a | n/a | n/a | Early image handoff, milestone ordering, transient queue-pressure recovery, source-linked progress, and media cache behavior were verified with deterministic fakes. Organic comparison remains pending deployment; no personal runtime data, media, or live provider was inspected. |
+| 2026-08-13 | PR 7 measurement-readiness review | quality and responsive, no deployed matched stratum available | 0 | n/a | n/a | n/a | The umbrella issue and durable aggregate log contained no eligible samples. No local database, logs, prompts, narration, identifiers, media, or live provider were inspected. Organic closeout remains blocked until deployment yields at least 20 successful samples per mode in one matched narrator provider/model stratum. |
 
 ## PR Evidence
 
@@ -341,6 +359,18 @@ For every program PR:
   visibility; newly generated assets use persisted thumbnails. The frontend
   aggregate compressed-size budgets increased by 300 bytes for the new status
   and invalidation behavior. No personal runtime data or live provider was used.
+- PR 7: red tests first exposed the missing mode/provider/model-scoped terminal
+  outcome query, aggregate failure and route calculations, configured narrator
+  snapshot, and propagation of the successful adaptive route to durable web
+  telemetry. The implementation extends the existing authenticated timing
+  summary with latest-30 terminal outcomes and records only configured
+  provider/model plus two boolean route flags. Older successful timing samples
+  remain compatible and are explicitly unclassified when they predate route
+  telemetry. Operator guidance now defines matched collection, formulas,
+  privacy boundaries, small-sample handling, and paint-event measurement. The
+  organic gate is not met: the project issue and aggregate log contain zero
+  deployed eligible samples, so #129 remains open and PR 8 is blocked pending
+  normal use. Validation and pinned-review evidence will be added before merge.
 
 ## Decision And Change Log
 
@@ -406,13 +436,24 @@ For every program PR:
 - 2026-08-13: Raise the aggregate frontend gzip and Brotli budgets by 300 bytes
   for source-linked scene-arrival status and precise media invalidation. Raw and
   per-file ceilings remain unchanged.
+- 2026-08-13: Split measurement readiness from organic closeout after the PR 7
+  audit found that successful response timing could not answer the planned
+  mode-scoped failure/interruption or fast/combined-route questions. Extend the
+  existing authenticated summary with bounded metadata-only outcome and route
+  aggregates, and add PR 8 as the gated closeout after deployment supplies
+  enough matched organic samples.
+- 2026-08-13: Define the outcome window as the latest 30 terminal turns in the
+  current mode and configured narrator provider/model stratum, independent from
+  the latest 30 successful timing window. Count failed plus cancelled turns in
+  failure rate; count route usage only for successful classified turns and
+  expose older successes as unclassified rather than guessing their route.
 
 ## Exact Next Action
 
-Monitor PR 6 until CI is green and the PR is mergeable. After PR 6 merges,
-fetch the resulting `origin/main` and create a
-fresh sibling worktree on `docs/turn-responsiveness-results` for PR 7. Read only
-privacy-safe aggregate timing summaries and proceed with results closeout only
-when at least 20 matched samples exist per mode; otherwise record the gate as
-pending, improve operator guidance that does not require personal data, and keep
-#129 open.
+Finish PR 7's validation and pinned review, record the PR link and evidence,
+then merge it with #129 still open. After the merged reporting change is
+deployed, wait for at least 20 successful privacy-safe samples per mode in one
+matched configured narrator provider/model stratum. Only then create a fresh
+worktree for PR 8, read the authenticated aggregate summaries, record the
+comparison, and close #129 if every success gate passes. Do not inspect or share
+local databases, logs, prompts, narration, identifiers, or media.
