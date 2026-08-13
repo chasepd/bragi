@@ -144,6 +144,36 @@ def test_list_chat_response_commit_durations_filters_model_status_and_limit(
 
     assert responsive_durations == [6_000]
 
+    repositories.record_job_step(
+        job_id="timing-job-4",
+        name="chat.responsiveness_stratum",
+        status="succeeded",
+        provider="fake",
+        model="intermediate-chat",
+        metadata={"turn_responsiveness_mode": "responsive"},
+    )
+    repositories.record_job_step(
+        job_id="timing-job-4",
+        name="chat.responsiveness_stratum",
+        status="succeeded",
+        provider="fake",
+        model="next-chat",
+        metadata={"turn_responsiveness_mode": "responsive"},
+    )
+
+    assert repositories.list_chat_response_commit_durations(
+        save_id=save.id,
+        provider="fake",
+        model="intermediate-chat",
+        mode="responsive",
+    ) == []
+    assert repositories.list_chat_response_commit_durations(
+        save_id=save.id,
+        provider="fake",
+        model="next-chat",
+        mode="responsive",
+    ) == [5_000]
+
 
 def test_list_chat_turn_outcomes_filters_stratum_and_reports_safe_route_flags(
     repositories: PersistenceRepositories,
@@ -217,6 +247,14 @@ def test_list_chat_turn_outcomes_filters_stratum_and_reports_safe_route_flags(
         name="chat.responsiveness_stratum",
         status="succeeded",
         provider="fake",
+        model="intermediate-chat",
+        metadata={"turn_responsiveness_mode": "responsive"},
+    )
+    repositories.record_job_step(
+        job_id="outcome-job-6",
+        name="chat.responsiveness_stratum",
+        status="succeeded",
+        provider="fake",
         model="next-chat",
         metadata={"turn_responsiveness_mode": "responsive"},
     )
@@ -249,6 +287,12 @@ def test_list_chat_turn_outcomes_filters_stratum_and_reports_safe_route_flags(
     assert [record.status for record in executed_after_settings_change] == [
         "failed"
     ]
+    assert repositories.list_chat_turn_outcomes(
+        save_id=save.id,
+        provider="fake",
+        model="intermediate-chat",
+        mode="responsive",
+    ) == []
 
 
 def test_message_safety_transition_round_trips_and_edits_clear_it(

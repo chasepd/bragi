@@ -373,7 +373,10 @@ For every program PR:
   provider/model, effective mode, and two boolean route flags. The first pinned
   review found an Important race between creation-time settings and settings at
   execution after continuity catch-up; execution-boundary stratum telemetry and
-  query precedence close that race. Older successful timing samples
+  query precedence close that race. Regressions block web preflight while
+  changing mode/model, then prove the executed stratum reaches the aggregate;
+  repository tests prove the latest of multiple execution strata controls both
+  timing and terminal outcomes. Older successful timing samples
   remain compatible and are explicitly unclassified when they predate route
   telemetry. Operator guidance now defines matched collection, formulas,
   privacy boundaries, small-sample handling, and paint-event measurement. The
