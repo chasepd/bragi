@@ -37,6 +37,7 @@ from bragi.providers.contracts import (
     ToolCallResponse,
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.retry_policy import RetryExecutionClass, retry_execution_context
 from bragi.services import context_search_service as context_search_module
 from bragi.services.agentic_context import ContextCurationService, CurationDecision
 from bragi.services.context_search_service import (
@@ -1846,6 +1847,45 @@ def test_context_search_tool_feedback_exhaustion_without_accepted_calls_uses_fal
     )
     jobs = _context_search_jobs(repositories, save.id)
     assert jobs[-1]["status"] == "succeeded"
+
+
+def test_responsive_context_search_limits_invalid_tool_feedback_to_two_calls(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(
+        repositories,
+        model_capabilities=[ProviderCapability.TOOL_CALLING.value],
+    )
+    provider = SequenceToolContextProvider(
+        responses=[
+            (
+                ProviderToolCall(
+                    id="call-missing",
+                    name="select_context_source",
+                    arguments_json=json.dumps(
+                        {
+                            "source_id": "not-a-candidate",
+                            "relevance_note": "This id was not offered.",
+                        }
+                    ),
+                ),
+            )
+        ]
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        asyncio.run(
+            service.search(
+                save_id=save.id,
+                player_message_id=player_message.id,
+            )
+        )
+
+    assert len(provider.tool_call_requests) == 2
 
 
 def test_context_search_tool_no_selection_uses_continuity_floor(

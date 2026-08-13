@@ -143,6 +143,78 @@ def test_responsive_foreground_preserves_mandatory_structured_thinking() -> None
     assert responsive.reasoning == request.reasoning
 
 
+def test_responsive_foreground_caps_tool_helpers_and_disables_optional_thinking(
+) -> None:
+    repository_mock = Mock()
+    repository_mock.list_provider_models.return_value = []
+    repositories = cast(PersistenceRepositories, repository_mock)
+    request = ToolCallRequest(
+        provider="fake",
+        model_id="helper",
+        messages=(ToolCallMessage(role="user", body="Select context."),),
+        tools=(
+            ToolDefinition(
+                name="select",
+                description="Select context.",
+                parameters={"type": "object", "additionalProperties": False},
+            ),
+        ),
+        max_output_tokens=9_000,
+        reasoning=ChatReasoningConfig(effort="high", exclude=True),
+    )
+
+    quality = budget_tool_call_request(repositories, request, task="context_search")
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        responsive = budget_tool_call_request(
+            repositories,
+            request,
+            task="context_search",
+        )
+
+    assert quality.max_output_tokens == 9_000
+    assert quality.reasoning == request.reasoning
+    assert responsive.max_output_tokens == (
+        RESPONSIVE_STRUCTURED_HELPER_MAX_OUTPUT_TOKENS
+    )
+    assert responsive.reasoning == ChatReasoningConfig(effort="none", exclude=True)
+
+
+def test_responsive_foreground_preserves_mandatory_tool_thinking() -> None:
+    repository_mock = Mock()
+    repository_mock.list_provider_models.return_value = [
+        Mock(
+            model_id="helper",
+            available=True,
+            thinking={"mandatory": True},
+            context_window=None,
+        )
+    ]
+    repositories = cast(PersistenceRepositories, repository_mock)
+    reasoning = ChatReasoningConfig(effort="high", exclude=True)
+    request = ToolCallRequest(
+        provider="fake",
+        model_id="helper",
+        messages=(ToolCallMessage(role="user", body="Select context."),),
+        tools=(
+            ToolDefinition(
+                name="select",
+                description="Select context.",
+                parameters={"type": "object", "additionalProperties": False},
+            ),
+        ),
+        reasoning=reasoning,
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        responsive = budget_tool_call_request(
+            repositories,
+            request,
+            task="context_search",
+        )
+
+    assert responsive.reasoning == reasoning
+
+
 def test_chat_budget_rejects_irreducible_core_before_dispatch() -> None:
     request = ChatRequest(
         provider="fake",

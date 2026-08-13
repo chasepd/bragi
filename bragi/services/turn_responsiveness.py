@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import replace
 
 from bragi.persistence.repositories import PersistenceRepositories
-from bragi.providers.contracts import ChatReasoningConfig, StructuredOutputRequest
+from bragi.providers.contracts import (
+    ChatReasoningConfig,
+    StructuredOutputRequest,
+    ToolCallRequest,
+)
 from bragi.retry_policy import RetryExecutionClass, current_retry_execution_class
 
 TURN_RESPONSIVENESS_MODE_SETTING = "turn_responsiveness_mode"
@@ -76,7 +80,42 @@ def responsive_structured_helper_request(
         else min(configured_max, RESPONSIVE_STRUCTURED_HELPER_MAX_OUTPUT_TOKENS)
     )
     reasoning = request.reasoning
-    if not _model_requires_thinking(repositories, request):
+    if not _model_requires_thinking(
+        repositories,
+        provider=request.provider,
+        model_id=request.model_id,
+    ):
+        reasoning = ChatReasoningConfig(effort="none", exclude=True)
+    return replace(
+        request,
+        max_output_tokens=max_output_tokens,
+        reasoning=reasoning,
+    )
+
+
+def responsive_tool_helper_request(
+    repositories: PersistenceRepositories | None,
+    request: ToolCallRequest,
+) -> ToolCallRequest:
+    """Apply the same responsive helper policy to tool-enforced output."""
+
+    if (
+        current_retry_execution_class()
+        is not RetryExecutionClass.RESPONSIVE_FOREGROUND
+    ):
+        return request
+    configured_max = request.max_output_tokens
+    max_output_tokens = (
+        RESPONSIVE_STRUCTURED_HELPER_MAX_OUTPUT_TOKENS
+        if configured_max is None
+        else min(configured_max, RESPONSIVE_STRUCTURED_HELPER_MAX_OUTPUT_TOKENS)
+    )
+    reasoning = request.reasoning
+    if not _model_requires_thinking(
+        repositories,
+        provider=request.provider,
+        model_id=request.model_id,
+    ):
         reasoning = ChatReasoningConfig(effort="none", exclude=True)
     return replace(
         request,
@@ -87,13 +126,15 @@ def responsive_structured_helper_request(
 
 def _model_requires_thinking(
     repositories: PersistenceRepositories | None,
-    request: StructuredOutputRequest,
+    *,
+    provider: str,
+    model_id: str,
 ) -> bool:
     if repositories is None:
         return False
     return any(
-        model.model_id == request.model_id
+        model.model_id == model_id
         and model.available
         and model.thinking.get("mandatory") is True
-        for model in repositories.list_provider_models(request.provider)
+        for model in repositories.list_provider_models(provider)
     )

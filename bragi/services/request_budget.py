@@ -17,7 +17,10 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.token_accounting import estimate_text_tokens
-from bragi.services.turn_responsiveness import responsive_structured_helper_request
+from bragi.services.turn_responsiveness import (
+    responsive_structured_helper_request,
+    responsive_tool_helper_request,
+)
 
 DEFAULT_CHAT_OUTPUT_RESERVE = 10_000
 DEFAULT_STRUCTURED_OUTPUT_RESERVE = 10_000
@@ -213,6 +216,7 @@ def budget_tool_call_request(
     *,
     task: str,
 ) -> ToolCallRequest:
+    request = responsive_tool_helper_request(repositories, request)
     if repositories is None:
         log_event(
             "provider.request_budget_unenforced",
