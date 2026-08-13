@@ -8427,6 +8427,83 @@ describe("frontend helpers", () => {
     expect(screen.queryByText("Late Save A done.")).not.toBeInTheDocument();
   });
 
+  it("starts a switched save with fresh chronicle scroll state at the latest message", async () => {
+    installEventSourceDouble();
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(1200);
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(300);
+    let model = runtimeModel({
+      saves: [
+        { save_id: "save-1", title: "Lantern Keep", active: true },
+        { save_id: "save-2", title: "Signal Tower", active: false }
+      ],
+      chronicle: {
+        messages: [
+          { message_id: "save-1-message", role: "narrator", speaker_name: null, body: "Save A text.", actions: [] }
+        ]
+      }
+    });
+    const saveTwo = runtimeModel({
+      active_save_id: "save-2",
+      active_save_title: "Signal Tower",
+      saves: [
+        { save_id: "save-1", title: "Lantern Keep", active: false },
+        { save_id: "save-2", title: "Signal Tower", active: true }
+      ],
+      chronicle: {
+        messages: Array.from({ length: 24 }, (_, index) => ({
+          message_id: `save-2-message-${index + 1}`,
+          role: "narrator",
+          speaker_name: null,
+          body: index === 23 ? "Save B latest text." : `Save B text ${index + 1}.`,
+          actions: []
+        }))
+      }
+    });
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => {
+        if (path.startsWith("/api/runtime")) return model;
+        if (path === "/api/scenarios") return { scenarios: [] };
+        if (path.startsWith("/api/jobs?status=active")) return { jobs: [] };
+        if (path === "/api/settings") return modelSettingsPayload();
+        if (path.startsWith("/api/chat/submission-status")) return {
+          save_id: model.active_save_id,
+          can_submit: true,
+          reason: null,
+          blocking_job_id: null,
+          blocking_job_status: null
+        };
+        if (path === "/api/saves/save-2/load") {
+          model = saveTwo;
+          return saveTwo;
+        }
+        return {};
+      }
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    const firstChronicle = await screen.findByRole("log", { name: "Chronicle" });
+    await screen.findByText("Save A text.");
+    firstChronicle.scrollTop = 120;
+    fireEvent.scroll(firstChronicle);
+
+    await userEvent.click(screen.getByRole("button", { name: "Load Signal Tower" }));
+
+    await screen.findByText("Save B latest text.");
+    const switchedChronicle = screen.getByRole("log", { name: "Chronicle" });
+    expect(switchedChronicle).not.toBe(firstChronicle);
+    expect(firstChronicle.isConnected).toBe(false);
+    expect(switchedChronicle.scrollTop).toBeGreaterThan(120);
+    expect(screen.queryByRole("button", { name: "Jump to latest" })).not.toBeInTheDocument();
+  });
+
   it("hides an optimistic submitted message after switching saves before the chat job resolves", async () => {
     installEventSourceDouble();
     let resolveChat: (response: { ok: boolean; json: () => Promise<Job> }) => void = () => undefined;
