@@ -114,9 +114,24 @@ def test_character_reference_gate_accepts_present_and_player_names() -> None:
     )
 
 
+def test_character_reference_gate_accepts_present_uncased_script_name() -> None:
+    assert character_references_are_resolved(
+        player_message="I ask 李梅 what she sees.",
+        characters=(_character("li-mei", "李梅"),),
+        present_character_ids=frozenset({"li-mei"}),
+    )
+
+
 @pytest.mark.parametrize(
     "player_message",
-    ("I call for Mira.", "I ask Zorak for directions."),
+    (
+        "I call for Mira.",
+        "I ask Zorak for directions.",
+        "I ask zorak for directions.",
+        "I ask Élodie for directions.",
+        "I ask 李梅 for directions.",
+        "李梅 waits nearby.",
+    ),
 )
 def test_character_reference_gate_rejects_absent_or_unknown_named_characters(
     player_message: str,

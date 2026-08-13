@@ -1113,6 +1113,29 @@ class ContextSearchService:
                 fallback_snapshot=narration_snapshot,
                 preselection_revision=preselection_revision,
             )
+            context_changed_after_selection = (
+                self.repositories.context_candidate_revision_token(
+                    save_id,
+                    ignored_message_id=player_message_id,
+                )
+                != preselection_revision
+            )
+            if context_changed_after_selection and (
+                result.responsive_fast_path_used
+                or result.responsive_narrator_spec is not None
+            ):
+                result = replace(
+                    result,
+                    responsive_fast_path_used=False,
+                    responsive_narrator_spec=None,
+                    responsive_turn_plan_fallback_reason=(
+                        "context_changed_after_selection"
+                    ),
+                )
+                log_event(
+                    "context_search.responsive_artifact_invalidated",
+                    reason="context_changed_after_selection",
+                )
             result = replace(
                 result,
                 continuity_index_synced=continuity_index_synced,

@@ -19,8 +19,14 @@ TURN_OPERATION_TIMESKIP = "timeskip"
 TURN_OPERATION_LOOK_AROUND = "look_around"
 TURN_OPERATION_RECOVERY = "recovery"
 
-_POTENTIAL_NAME = re.compile(
-    r"(?<![\w'-])([A-Z][\w'-]*(?:\s+[A-Z][\w'-]*)*)(?![\w'-])"
+_WORD_TOKEN = re.compile(
+    r"(?<![\w'-])([^\W\d_][\w'-]*)(?![\w'-])",
+    flags=re.UNICODE,
+)
+_LOWERCASE_NAME_CUE = re.compile(
+    r"\b(?:ask|call|contact|find|follow|greet|help|join|meet|summon|tell)"
+    r"(?:\s+for)?\s+([^\W\d_][\w'-]*)",
+    flags=re.IGNORECASE | re.UNICODE,
 )
 _NON_NAME_CAPITALIZED_PHRASES = frozenset(
     {
@@ -120,14 +126,29 @@ def character_references_are_resolved(
         )
         if value.strip()
     }
-    for match in _POTENTIAL_NAME.finditer(player_message):
-        phrase = match.group(1).casefold().strip()
+    for match in _WORD_TOKEN.finditer(player_message):
+        raw_phrase = match.group(1).strip()
+        uncased_script = not any(
+            character.islower() or character.isupper()
+            for character in raw_phrase
+            if character.isalpha()
+        )
+        if not raw_phrase[0].isupper() and not uncased_script:
+            continue
+        phrase = raw_phrase.casefold()
         if phrase in _NON_NAME_CAPITALIZED_PHRASES:
             continue
         if any(
             phrase == known or phrase in known.split() or known in phrase.split()
             for known in known_phrases
         ):
+            continue
+        return False
+    for match in _LOWERCASE_NAME_CUE.finditer(player_message):
+        phrase = match.group(1).casefold().strip()
+        if phrase in _NON_NAME_CAPITALIZED_PHRASES:
+            continue
+        if any(phrase == known or phrase in known.split() for known in known_phrases):
             continue
         return False
     return True

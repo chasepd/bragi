@@ -5151,6 +5151,56 @@ def test_responsive_turn_plan_rejects_model_selected_unknown_source_id(
     assert provider.expansion_requests == []
 
 
+def test_responsive_turn_plan_is_invalidated_when_selected_evidence_changes(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The cracked bridge bell marks a broken oath.",
+        tags=["bell", "oath"],
+        source_message_id=player_message.id,
+    )
+    provider = MutatingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": memory.id,
+                    "relevance_note": "The bell memory answers this turn.",
+                }
+            ],
+            "narrator_plan": _responsive_narrator_plan(
+                evidence_source_ids=[f"memory:{memory.id}"]
+            ),
+        },
+        after_selection=lambda: repositories.archive_memory(memory.id),
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        result = asyncio.run(
+            service.search_for_turn(
+                save_id=save.id,
+                player_message_id=player_message.id,
+                turn_operation="new_player",
+            )
+        )
+
+    assert result.selected_memories == ()
+    assert result.responsive_narrator_spec is None
+    assert result.responsive_fast_path_used is False
+    assert result.responsive_turn_plan_fallback_reason == (
+        "context_changed_after_selection"
+    )
+    assert [
+        request.schema_name for request in provider.structured_output_requests
+    ] == ["responsive_turn_plan"]
+
+
 def test_context_search_reloads_cache_mutated_during_candidate_build(
     repositories: PersistenceRepositories,
 ) -> None:
