@@ -47,7 +47,12 @@ from bragi.providers.contracts import (
 )
 from bragi.providers.errors import ProviderError, provider_error_is_model_not_found
 from bragi.redaction import redact_text
-from bragi.retry_policy import MODEL_OUTPUT_MAX_ATTEMPTS, resolved_retry_budget
+from bragi.retry_policy import (
+    MODEL_OUTPUT_MAX_ATTEMPTS,
+    RetryExecutionClass,
+    current_retry_execution_class,
+    resolved_retry_budget,
+)
 from bragi.services.agentic_context import (
     EvidenceRefinementRequest,
     NarratorMessageSpec,
@@ -575,6 +580,11 @@ class ContextSearchService:
             )
             scenario = details.scenario
             player_message = _message_body(messages, player_message_id)
+            provider_expansion_allowed = allow_expansion and not (
+                current_retry_execution_class()
+                is RetryExecutionClass.RESPONSIVE_FOREGROUND
+                and turn_operation != TURN_OPERATION_LOOK_AROUND
+            )
             if cache_entry is None:
                 continuity_index_synced = True
                 narration_snapshot = load_narration_context_snapshot(
@@ -642,8 +652,12 @@ class ContextSearchService:
                 recent_messages=messages,
                 message_visibility=list(narration_snapshot.message_visibility),
                 additional_query_terms=additional_query_terms,
-                allow_expansion=allow_expansion,
+                allow_expansion=provider_expansion_allowed,
             )
+            if allow_expansion and not provider_expansion_allowed:
+                retrieved_sources = _mark_responsive_expansion_skipped(
+                    retrieved_sources
+                )
             candidate_observations = _observations_with_indexed_sources(
                 self.repositories,
                 save_id=save_id,
@@ -787,8 +801,12 @@ class ContextSearchService:
                     recent_messages=messages,
                     message_visibility=list(narration_snapshot.message_visibility),
                     additional_query_terms=additional_query_terms,
-                    allow_expansion=allow_expansion,
+                    allow_expansion=provider_expansion_allowed,
                 )
+                if allow_expansion and not provider_expansion_allowed:
+                    retrieved_sources = _mark_responsive_expansion_skipped(
+                        retrieved_sources
+                    )
                 candidate_observations = _observations_with_indexed_sources(
                     self.repositories,
                     save_id=save_id,
@@ -1773,6 +1791,23 @@ async def _retrieve_indexed_context_sources(
             "retrieval_round_used": True,
         },
     )
+
+
+def _mark_responsive_expansion_skipped(
+    retrieval: _IndexedContextSourceRetrieval,
+) -> _IndexedContextSourceRetrieval:
+    diagnostics = {
+        key: value
+        for key, value in retrieval.diagnostics.items()
+        if key not in {"planner_refinement_used", "retrieval_expansion_used"}
+    }
+    diagnostics.update(
+        {
+            "retrieval_expansion_skipped_reason": "responsive_turn_plan",
+            "retrieval_round_used": False,
+        }
+    )
+    return replace(retrieval, diagnostics=diagnostics)
 
 
 async def _structured_retrieval_expansion(

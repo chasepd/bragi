@@ -5071,6 +5071,7 @@ def test_responsive_turn_combines_context_selection_and_narrator_plan(
     assert [
         request.schema_name for request in provider.structured_output_requests
     ] == ["responsive_turn_plan"]
+    assert provider.expansion_requests == []
     assert provider.chat_requests == []
 
 
@@ -5105,6 +5106,7 @@ def test_invalid_responsive_turn_plan_falls_back_to_normal_structured_helper(
     assert [
         request.schema_name for request in provider.structured_output_requests
     ] == ["responsive_turn_plan", "context_search_selection"]
+    assert provider.expansion_requests == []
 
 
 def test_responsive_turn_plan_rejects_model_selected_unknown_source_id(
@@ -5146,6 +5148,7 @@ def test_responsive_turn_plan_rejects_model_selected_unknown_source_id(
     assert [
         request.schema_name for request in provider.structured_output_requests
     ] == ["responsive_turn_plan", "context_search_selection"]
+    assert provider.expansion_requests == []
 
 
 def test_context_search_reloads_cache_mutated_during_candidate_build(
