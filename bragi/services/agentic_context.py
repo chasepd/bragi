@@ -3070,6 +3070,49 @@ def _planner_schema(
     }
 
 
+def narrator_message_plan_schema(
+    *,
+    evidence_source_ids: tuple[str, ...],
+    character_ids: tuple[str, ...],
+) -> dict[str, object]:
+    """Expose the typed narrator-plan shape for combined structured routes."""
+
+    return _planner_schema(
+        evidence_source_ids=evidence_source_ids,
+        character_ids=character_ids,
+        target_entity_ids_by_type=_planner_target_entity_ids(
+            set(evidence_source_ids)
+        ),
+    )
+
+
+def narrator_message_plan_instruction() -> str:
+    """Return the normal planner instruction for a combined structured call."""
+
+    request = ChatRequest(provider="internal", model_id="internal", messages=())
+    return _planner_messages(request)[0].body
+
+
+def narrator_message_spec_from_plan_data(
+    data: dict[str, object],
+    *,
+    source_text_by_id: dict[str, str],
+    characters: tuple[CharacterRecord, ...],
+) -> NarratorMessageSpec:
+    """Parse and canonicalize a combined-route plan against local inventory."""
+
+    source_ids = set(source_text_by_id)
+    return _narrator_message_spec_from_data(
+        data,
+        inventory=_PlannerInventory(
+            source_text_by_id=dict(source_text_by_id),
+            characters=characters,
+            target_entity_ids_by_type=_planner_target_entity_ids(source_ids),
+            enforce_canonical_ids=True,
+        ),
+    )
+
+
 def _planner_messages(request: ChatRequest) -> tuple[ChatMessage, ...]:
     return (
         ChatMessage(

@@ -98,7 +98,7 @@ log when applicable.
 | 2 | `feat/turn-progress-ux` | `complete` | [#132](https://github.com/chasepd/bragi/pull/132) | Added narrator placeholder, timing summaries, and job-delivery cleanup. |
 | 3 | `fix/foreground-retry-budgets` | `complete` | [#133](https://github.com/chasepd/bragi/pull/133) | Enforced hard deadlines and responsive foreground retry limits. |
 | 4 | `feat/responsive-turn-mode` | `complete` | [#134](https://github.com/chasepd/bragi/pull/134) | Added portable save-scoped mode and responsive routing/budget behavior. |
-| 5 | `perf/adaptive-turn-pipeline` | `pending` | #129 | Add deterministic fast path and combined structured planning path. |
+| 5 | `perf/adaptive-turn-pipeline` | `complete` | [#135](https://github.com/chasepd/bragi/pull/135) | Added deterministic fast path and combined structured planning path. |
 | 6 | `perf/post-turn-media-responsiveness` | `pending` | #129 | Start images earlier and improve media loading feedback. |
 | 7 | `docs/turn-responsiveness-results` | `pending` | #129 | Evaluate organic aggregates, document results, and close the program only if gates pass. |
 
@@ -227,6 +227,7 @@ For every program PR:
 | 2026-08-12 | PR 2 ([#132](https://github.com/chasepd/bragi/pull/132)) | quality, progress UX | 0 | n/a | n/a | n/a | The endpoint reads local privacy-safe aggregates only; implementation and tests used synthetic data, and no personal runtime data was inspected. |
 | 2026-08-13 | PR 3 ([#133](https://github.com/chasepd/bragi/pull/133)) | quality and internal responsive retry policy | 0 | n/a | n/a | n/a | Provider deadlines and execution budgets were verified with deterministic fakes. Responsive mode is not yet user-selectable, so no organic comparison samples exist; no personal runtime data or live provider was inspected. |
 | 2026-08-13 | PR 4 ([#134](https://github.com/chasepd/bragi/pull/134)) | quality and selectable responsive mode | 0 | n/a | n/a | n/a | The save mode, budgets, routing, and mode-stratified timing were verified with deterministic fakes and synthetic timing data. Organic comparison begins after deployment; no personal runtime data or live provider was inspected. |
+| 2026-08-13 | PR 5 ([#135](https://github.com/chasepd/bragi/pull/135)) | quality and adaptive responsive pipelines | 0 | n/a | n/a | n/a | Fast and combined routes, provider-call waves, fallbacks, guards, and race handling were verified with deterministic fakes. Organic comparison remains pending deployment; no personal runtime data or live provider was inspected. |
 
 ## PR Evidence
 
@@ -301,6 +302,23 @@ For every program PR:
   child permissions, explicit OpenRouter routing profiles, privacy-safe timing
   strata, and unchanged quality behavior. No stable interface or product
   requirement deviated from the plan.
+- PR 5 ([#135](https://github.com/chasepd/bragi/pull/135)), pinned reviewed
+  implementation commit `ee1db07`: the initial red eligibility test exposed the
+  absent routing module, and subsequent red tests exposed missing orchestration,
+  operation provenance, application-side source validation, an extra retrieval
+  expansion provider wave, and adaptive-artifact races. Independent review then
+  reproduced stale combined-plan evidence and lowercase/Unicode unresolved-name
+  gaps; a fresh review required the full normal context-helper fallback after a
+  provider-time mutation. The final implementation gives eligible responsive
+  turns zero helper-provider calls, gives valid ineligible turns exactly one
+  `responsive_turn_plan` call, and invokes the existing context helper under the
+  responsive budget when combined output is unavailable, invalid, or invalidated
+  by a context revision. Quality mode avoids responsive-only gate work. Input and
+  output safety, phrase and script guards, prompt budgets, narration persistence,
+  and post-turn state work remain shared and mandatory. Full nine-phase
+  validation passed after the fixes. A fresh pinned-commit re-review scored the
+  final code 9.8/10 with no Critical, Important, or Minor findings. No stable
+  interface or product requirement deviated from the plan.
 
 ## Decision And Change Log
 
@@ -343,16 +361,27 @@ For every program PR:
   helper in responsive mode. It shares the 2,048-token cap, optional-thinking
   suppression, mandatory-thinking exception, and two-call feedback limit;
   quality mode retains the configured feedback count.
+- 2026-08-13: Suppress provider-backed retrieval expansion before responsive
+  combined planning. Initial indexed retrieval remains deterministic, so a
+  valid ineligible turn makes exactly one helper-provider call; invalid or
+  unavailable combined output may then use the documented normal helper
+  fallback under the same responsive execution budget.
+- 2026-08-13: Treat any context revision after adaptive selection as invalidating
+  both fast-path and combined-plan artifacts. Rebuild candidates from the
+  rehydrated snapshot and run normal context selection; fail closed if context
+  changes again during that fallback.
+- 2026-08-13: Resolve fast-path character references conservatively across
+  known names and aliases, Unicode-capitalized names, uncased scripts, and
+  lowercase address/reference constructions. Ambiguous references use the
+  combined or normal helper path instead of weakening eligibility.
 
 ## Exact Next Action
 
-After PR 4 merges, fetch the resulting `origin/main` and create a fresh sibling
-worktree on `perf/adaptive-turn-pipeline` for PR 5. Mark PR 5 in progress in the
-first commit, then begin with red tests for every deterministic fast-path
-eligibility gate and for ineligible responsive turns using one provider-enforced
-`responsive_turn_plan` structured call. Preserve input/output safety,
-deterministic guards, prompt budgeting, narration persistence, and post-turn
-state work on the fast path. Validate every selected source ID against
-application-built candidates, retain the existing helper pipeline as the
-responsive-budget fallback for unavailable or invalid combined output, and do
-not ask normal chat prose to emit structured data.
+After PR 5 merges, fetch the resulting `origin/main` and create a fresh sibling
+worktree on `perf/post-turn-media-responsiveness` for PR 6. Mark PR 6 in progress
+in the first commit. Begin with red tests proving prepared automatic image work
+starts as soon as preparation completes, overlaps only independent continuity
+steps, preserves pre-post-turn image semantics and milestone ordering, and never
+blocks chat submission. Then add the source-linked scene-arriving tile,
+thumbnail/asynchronous sidebar loading, full-asset modal fetch, and media-only
+invalidation behavior without broad chat-delta refetches.

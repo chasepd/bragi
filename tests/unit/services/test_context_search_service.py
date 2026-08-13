@@ -129,13 +129,15 @@ class MutatingStructuredContextProvider(RecordingStructuredContextProvider):
     ) -> None:
         super().__init__(response_data)
         self.after_selection = after_selection
+        self.mutated = False
 
     async def generate_structured_output(
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
         response = await super().generate_structured_output(request)
-        if request.schema_name != "context_retrieval_expansion":
+        if request.schema_name != "context_retrieval_expansion" and not self.mutated:
+            self.mutated = True
             self.after_selection()
         return response
 
@@ -5001,6 +5003,206 @@ def test_context_search_uses_post_turn_precomputed_snapshot(
     assert stale_result_json["diagnostics"]["cache_status"] == "miss"
 
 
+def test_responsive_turn_uses_deterministic_fast_path_when_all_gates_pass(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, _prior_player_message = _save_with_context_search_preference(repositories)
+    repositories.upsert_context_source(
+        save_id=save.id,
+        source_type="memory",
+        source_id="silver-bell-memory",
+        title="Silver bell",
+        body="I listen for the silver bell.",
+        metadata={},
+    )
+    provider = RecordingStructuredContextProvider()
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+    service.precompute_next_turn(save.id)
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I listen for the silver bell.",
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        result = asyncio.run(
+            service.search_for_turn(
+                save_id=save.id,
+                player_message_id=player_message.id,
+                turn_operation="new_player",
+            )
+        )
+
+    assert result.responsive_fast_path_used is True
+    assert result.precomputed_snapshot_used is True
+    assert result.strong_local_recall is True
+    assert provider.structured_output_requests == []
+
+
+def test_responsive_turn_combines_context_selection_and_narrator_plan(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [],
+            "narrator_plan": _responsive_narrator_plan(),
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        result = asyncio.run(
+            service.search_for_turn(
+                save_id=save.id,
+                player_message_id=player_message.id,
+                turn_operation="new_player",
+            )
+        )
+
+    assert result.responsive_fast_path_used is False
+    assert result.responsive_narrator_spec is not None
+    assert result.responsive_narrator_spec.intent == "Continue the scene."
+    assert [
+        request.schema_name for request in provider.structured_output_requests
+    ] == ["responsive_turn_plan"]
+    assert provider.expansion_requests == []
+    assert provider.chat_requests == []
+
+
+def test_invalid_responsive_turn_plan_falls_back_to_normal_structured_helper(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [],
+            "narrator_plan": _responsive_narrator_plan(
+                evidence_source_ids=["memory:unknown"]
+            ),
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        result = asyncio.run(
+            service.search_for_turn(
+                save_id=save.id,
+                player_message_id=player_message.id,
+                turn_operation="new_player",
+            )
+        )
+
+    assert result.responsive_narrator_spec is None
+    assert result.responsive_turn_plan_fallback_reason == "combined_plan_invalid"
+    assert [
+        request.schema_name for request in provider.structured_output_requests
+    ] == ["responsive_turn_plan", "context_search_selection"]
+    assert provider.expansion_requests == []
+
+
+def test_responsive_turn_plan_rejects_model_selected_unknown_source_id(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    provider = RecordingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "world_state",
+                    "source_id": "unknown-source",
+                    "relevance_note": "This source was never offered.",
+                }
+            ],
+            "narrator_plan": _responsive_narrator_plan(),
+        }
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        result = asyncio.run(
+            service.search_for_turn(
+                save_id=save.id,
+                player_message_id=player_message.id,
+                turn_operation="new_player",
+            )
+        )
+
+    assert result.responsive_narrator_spec is None
+    assert result.responsive_turn_plan_fallback_reason == "combined_plan_invalid"
+    assert all(
+        item.source_id != "unknown-source"
+        for item in context_search_module._selected_context_items(result)
+    )
+    assert [
+        request.schema_name for request in provider.structured_output_requests
+    ] == ["responsive_turn_plan", "context_search_selection"]
+    assert provider.expansion_requests == []
+
+
+def test_responsive_turn_plan_is_invalidated_when_selected_evidence_changes(
+    repositories: PersistenceRepositories,
+) -> None:
+    save, player_message = _save_with_context_search_preference(repositories)
+    memory = repositories.add_memory(
+        save_id=save.id,
+        body="The cracked bridge bell marks a broken oath.",
+        tags=["bell", "oath"],
+        source_message_id=player_message.id,
+    )
+    provider = MutatingStructuredContextProvider(
+        {
+            "selections": [
+                {
+                    "source_type": "memory",
+                    "source_id": memory.id,
+                    "relevance_note": "The bell memory answers this turn.",
+                }
+            ],
+            "narrator_plan": _responsive_narrator_plan(
+                evidence_source_ids=[f"memory:{memory.id}"]
+            ),
+        },
+        after_selection=lambda: repositories.archive_memory(memory.id),
+    )
+    service = ContextSearchService(
+        repositories=repositories,
+        providers={"fake": provider},
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        result = asyncio.run(
+            service.search_for_turn(
+                save_id=save.id,
+                player_message_id=player_message.id,
+                turn_operation="new_player",
+            )
+        )
+
+    assert result.selected_memories == ()
+    assert result.responsive_narrator_spec is None
+    assert result.responsive_fast_path_used is False
+    assert result.responsive_turn_plan_fallback_reason == (
+        "context_changed_after_selection"
+    )
+    assert [
+        request.schema_name for request in provider.structured_output_requests
+    ] == ["responsive_turn_plan", "context_search_selection"]
+
+
 def test_context_search_reloads_cache_mutated_during_candidate_build(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -6083,6 +6285,38 @@ def _save_with_context_search_preference(
             ),
         )
     return save, player_message
+
+
+def _responsive_narrator_plan(
+    *,
+    evidence_source_ids: list[str] | None = None,
+) -> dict[str, object]:
+    evidence_ids = evidence_source_ids or ["message:latest"]
+    return {
+        "intent": "Continue the scene.",
+        "thesis": "Answer the player's immediate action.",
+        "narrative_beats": [],
+        "required_facts": [],
+        "must_say": [],
+        "avoid": [],
+        "agency_constraints": [],
+        "tone": "grounded",
+        "uncertainties": [],
+        "evidence_source_ids": evidence_ids,
+        "npc_intents": [],
+        "state_commit_candidates": [],
+        "attempted_action": "",
+        "attempt_feasibility": [],
+        "attempt_evidence_source_ids": [],
+        "attempt_evidence_quote": "",
+        "evidence_refinement": {
+            "terms": [],
+            "phrases": [],
+            "entity_ids": [],
+            "source_ids": [],
+            "reason": "",
+        },
+    }
 
 
 def _save_with_context_search_preference_without_candidates(
