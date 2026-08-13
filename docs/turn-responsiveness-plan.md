@@ -1,0 +1,254 @@
+# Turn Responsiveness Program
+
+Umbrella issue: [#129](https://github.com/chasepd/bragi/issues/129)
+
+This document is the durable source of truth for Bragi's multi-PR turn
+responsiveness program. Update it in every program PR so the work can resume
+without depending on chat context.
+
+## Locked Decisions
+
+- Existing quality behavior remains the default.
+- Add an opt-in, save-scoped `responsive` mode.
+- Responsive mode may skip or combine quality helpers only when deterministic
+  eligibility checks say the local context is sufficient.
+- Content-rating safety, phrase and script guards, authentication, and
+  deterministic state integrity are never weakened.
+- Show an in-chronicle narrator placeholder, but never expose unchecked prose.
+- Preserve the prior-turn continuity barrier. This program does not introduce
+  a stale-state narration path.
+- Evaluate live performance using privacy-safe aggregates from organic use. CI
+  remains deterministic, keyless, and free of live provider calls.
+- Do not record prompts, narration, save identifiers, personal scenario data,
+  API keys, media, or local databases in issues, PRs, benchmarks, telemetry
+  metadata, or this document.
+
+## Success Gates
+
+- Optimistic player and narrator-placeholder paint p95 is below 250 ms.
+- SSE fallback detects terminal job completion within five seconds.
+- At least 20 organic samples exist for both modes in the same narrator
+  provider/model stratum.
+- Responsive mode improves response-committed median by at least 25 percent and
+  p95 by at least 20 percent against the matched quality baseline.
+- Failed or interrupted turns increase by no more than five percentage points.
+- All mandatory safety and deterministic continuity tests remain green.
+
+If a gate fails, keep #129 open, record the result below, and request product
+direction instead of weakening safety or adaptive eligibility rules.
+
+## Stable Interfaces And Telemetry
+
+The program owns these names. Changing one requires an entry in the decision
+log before implementation.
+
+### Settings
+
+- `turn_responsiveness_mode`: portable save setting with `quality` and
+  `responsive` values. Missing or invalid values resolve to `quality`.
+- `provider_call_deadline_seconds`: existing global admin setting, made writable
+  through the supported settings API and UI.
+
+### HTTP
+
+- `GET /api/chat/timing-summary?save_id=...`: authenticated aggregate timing for
+  the effective responsiveness mode and current narrator provider/model. It
+  returns no estimate until five matching successful turns exist.
+
+### Job steps
+
+- `chat.preflight`
+- `chat.input_safety`
+- `chat.history`
+- `chat.context`
+- `chat.character_planning`
+- `chat.narrator_planning`
+- `chat.narrator_generation`
+- `chat.output_safety`
+- `chat.verification`
+- `chat.commit`
+- `chat.response_committed`
+- `post_turn.continuity_ready`
+- `post_turn.image_ready`
+
+Step metadata may contain only safe categorical or numeric values: effective
+mode, provider/model, retry count, cache/refinement/fast-path flags, token
+counts, and bounded reasoning/routing enums. It must never contain model input
+or output text.
+
+### Client events
+
+- `client.chat.optimistic_player_painted`
+- `client.chat.placeholder_painted`
+- `client.chat.narrator_painted`
+
+Existing SSE event names and the committed `chat_turn_delta` contract remain
+compatible. This program does not add provisional narration events.
+
+## PR Ledger
+
+Statuses are `pending`, `in_progress`, `blocked`, or `complete`. Each PR must
+update its row before merge and append evidence to the measurement or decision
+log when applicable.
+
+| PR | Branch | Status | Issue/PR | Required outcome |
+| --- | --- | --- | --- | --- |
+| 0 | `docs/turn-responsiveness-plan` | `complete` | [#130](https://github.com/chasepd/bragi/pull/130) | Persisted this execution plan and update protocol. |
+| 1 | `feat/turn-latency-telemetry` | `pending` | #129 | Add critical-path spans, user-paint events, and deterministic latency harnesses. |
+| 2 | `feat/turn-progress-ux` | `pending` | #129 | Add narrator placeholder, timing summaries, and job-delivery cleanup. |
+| 3 | `fix/foreground-retry-budgets` | `pending` | #129 | Enforce hard deadlines and responsive foreground retry limits. |
+| 4 | `feat/responsive-turn-mode` | `pending` | #129 | Add portable save-scoped mode and responsive routing/budget behavior. |
+| 5 | `perf/adaptive-turn-pipeline` | `pending` | #129 | Add deterministic fast path and combined structured planning path. |
+| 6 | `perf/post-turn-media-responsiveness` | `pending` | #129 | Start images earlier and improve media loading feedback. |
+| 7 | `docs/turn-responsiveness-results` | `pending` | #129 | Evaluate organic aggregates, document results, and close the program only if gates pass. |
+
+## PR Requirements
+
+### PR 1: Critical-path telemetry and deterministic benchmarks
+
+- Record the stable job-step spans above without a persistence migration.
+- Extend provider-stream telemetry with time to first chunk and output rate when
+  streaming transport is used. Do not enable browser prose streaming.
+- Emit metadata-only client paint events.
+- Add a delayed fake or loopback integration harness for milestone ordering,
+  provider-call wave counts, retries, and completion timing. Avoid API keys and
+  wall-clock sleeps.
+- Record the initial quality-mode organic baseline below.
+
+### PR 2: Immediate feedback and job delivery
+
+- Insert a narrator placeholder directly after the optimistic player entry.
+  Drive its copy from existing phases, show elapsed time after three seconds,
+  expose cancellation, and replace it atomically with committed narration.
+- Add the timing-summary endpoint. Use the latest 30 successful matching turns
+  and show a broad p50-p95 range only after five samples.
+- Poll every two seconds after successful nonterminal fallback polls. Back off
+  only after errors and cap that delay at five seconds.
+- Apply valid `job_changed` payloads directly. Refetch global job/submission
+  state only on chat-job creation, terminal transition, SSE recovery, or
+  malformed payloads.
+- Avoid media and world invalidations for chat deltas that did not change them.
+
+### PR 3: Provider deadlines and foreground retries
+
+- Add the existing deadline setting to settings policy, sanitization, API, and
+  admin UI.
+- Wrap every provider attempt in its remaining hard deadline and normalize
+  expiry to the existing transient timeout category.
+- Add an internal retry budget resolved from execution context:
+  - Quality and background work retain configured retry behavior.
+  - Responsive foreground work allows at most two provider attempts and a
+    45-second hard deadline.
+  - Responsive work does not replay the entire turn after exhausting that
+    budget.
+  - Responsive verification allows at most one regeneration.
+
+### PR 4: Save-scoped responsive mode
+
+- Add the portable setting and expose it to administrators and adult users in
+  Save settings. Child users cannot change it.
+- Ensure save forks, snapshots, export, and import preserve it.
+- Quality mode must preserve existing behavior.
+- Responsive mode uses PR 3's foreground retry budget, disables optional helper
+  thinking, caps foreground structured helper output at 2,048 tokens, uses an
+  8-player/8-narrator planner window, and requests OpenRouter latency sorting
+  only when no explicit routing profile overrides it.
+- Do not change narrator model choice or its configured output limit.
+
+### PR 5: Adaptive critical-path reduction
+
+- A responsive new-player turn is fast-path eligible only when all are true:
+  - A valid precomputed narration snapshot exists.
+  - Initial indexed retrieval reports strong local recall.
+  - No unresolved or absent named character is referenced.
+  - Prior continuity is ready and retrieval is not degraded.
+  - The operation is not regenerate, edit, timeskip, look-around, or recovery.
+- Eligible turns use deterministic candidates and skip character action
+  planning, narrator planning, response verification, and NPC knowledge audit.
+  They retain input/output safety, prompt budgeting, deterministic guards,
+  narration persistence, and all post-turn state work.
+- Ineligible responsive turns use one provider-enforced
+  `responsive_turn_plan` structured call combining validated context-source
+  selection with the typed narrator plan.
+- Validate every model-selected source ID against application-built candidates.
+- If the combined route is unavailable or invalid, use the existing quality
+  helper path under the responsive retry budget.
+- Never ask ordinary chat prose to emit structured data.
+
+### PR 6: Post-turn and media responsiveness
+
+- Launch prepared automatic image generation as soon as preparation completes
+  and run it concurrently with independent continuity work while preserving
+  pre-post-turn image semantics.
+- Preserve accurate `response_committed`, `continuity_ready`, and
+  `optional_enrichments_complete` ordering. Images remain optional and never
+  block chat submission.
+- Show a source-linked scene-arriving tile.
+- Use thumbnails and asynchronous decoding in the sidebar; fetch the full asset
+  only for the modal.
+- Refetch media only for media-job transitions or media-changing deltas.
+
+### PR 7: Organic-results closeout
+
+- Wait for at least 20 privacy-safe samples per mode in a matched narrator
+  provider/model stratum.
+- Record sample counts, median, p95, failure rate, and fast/combined-path usage
+  below without identifiers or content.
+- Update troubleshooting and operator guidance.
+- Close #129 only when every success gate passes.
+
+## Execution Protocol
+
+For every program PR:
+
+1. Fetch `origin` and create a fresh sibling worktree and branch from the latest
+   `origin/main`. Never reuse a prior PR worktree for new changes.
+2. Set that PR's ledger status to `in_progress` in its first commit.
+3. For application code, follow TDD and record the failing test and failure
+   reason in the PR description or decision log.
+4. Use the project `test-engineering` guidance for tests.
+5. Validate in fast-fail order with `.codex/tools/validate.py`: lint,
+   typecheck, targeted tests, then smart validation. Restart at lint after a
+   code fix. Run full validation for provider retry, persistence/portability,
+   or broad turn-pipeline changes.
+6. Use the project `code-review` workflow. Critical and Important findings are
+   blockers until fixed or rejected with technical evidence.
+7. Update this document before merge with the PR link, status, validation and
+   review evidence, aggregate results, deviations, and exact next action.
+8. Open the PR with `Refs #129`, monitor CI until green and mergeable, and merge
+   before creating the next PR worktree from updated `origin/main`.
+
+## Measurement Log
+
+| Date | Commit/PR | Mode and stratum | Samples | Median | p95 | Failure/interruption rate | Notes |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| 2026-08-12 | audit at `940d585` | quality, code audit only | 0 | n/a | n/a | n/a | No personal runtime data inspected. |
+
+## PR Evidence
+
+- PR 0 ([#130](https://github.com/chasepd/bragi/pull/130)): documentation-only;
+  runtime validation was skipped per `AGENTS.md`, `git diff --check` passed, and
+  an independent pinned-SHA review found one process blocker. This update fixes
+  that blocker by recording the PR, completed status, evidence, and next action.
+  No aggregate runtime measurements apply to this PR and there were no product
+  or interface deviations.
+
+## Decision And Change Log
+
+- 2026-08-12: Preserve quality behavior as the default and add responsive mode
+  per save.
+- 2026-08-12: Responsive mode uses adaptive helpers rather than routing-only or
+  an unconditional minimal pipeline.
+- 2026-08-12: Ship a narrator placeholder first and do not expose provisional
+  prose in this program.
+- 2026-08-12: Use relative performance gates plus a user-feedback SLO rather
+  than an absolute provider-dependent turn target.
+- 2026-08-12: Use organic aggregate samples rather than paid canaries.
+- 2026-08-12: Cover the full audited program, including transport and media
+  responsiveness.
+
+## Exact Next Action
+
+Complete PR 0 review and CI, merge it, then create
+`feat/turn-latency-telemetry` from the updated `origin/main` and mark PR 1
+`in_progress`.
