@@ -197,6 +197,29 @@ def test_runtime_job_step_can_attribute_nested_work_to_root_job(
     assert repositories.list_job_steps(nested_job.id) == []
 
 
+def test_runtime_job_step_records_cancelled_status(
+    repositories: PersistenceRepositories,
+) -> None:
+    job = repositories.create_job(type="chat_turn", status="running", payload={})
+
+    async def run_test() -> None:
+        with runtime_telemetry_context(
+            repositories=repositories,
+            job_id=job.id,
+            task="chat",
+        ):
+            with runtime_job_step("chat.output_safety"):
+                raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run_test())
+
+    steps = repositories.list_job_steps(job.id)
+    assert len(steps) == 1
+    assert steps[0].status == "cancelled"
+    assert steps[0].error == "Cancelled"
+
+
 def test_stream_wrapper_records_first_chunk_and_output_rate(
     repositories: PersistenceRepositories,
     monkeypatch: pytest.MonkeyPatch,

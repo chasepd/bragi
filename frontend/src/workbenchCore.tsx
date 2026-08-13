@@ -128,18 +128,17 @@ import {
 import { BrandLockup, BrandMark } from "./brand";
 import "./styles.css";
 
-type ClientChatPaintEvent =
-  | "client.chat.optimistic_player_painted"
-  | "client.chat.placeholder_painted"
-  | "client.chat.narrator_painted";
-
 function scheduleClientPaintEvent(
-  event: ClientChatPaintEvent,
+  event: string,
   startedAtMs: number,
+  target: Element,
 ) {
   window.requestAnimationFrame(() => {
-    logClientEvent("info", event, {
-      duration_ms: Math.max(0, Math.round(Date.now() - startedAtMs))
+    window.requestAnimationFrame(() => {
+      if (!target.isConnected) return;
+      logClientEvent("info", event, {
+        duration_ms: Math.max(0, Math.round(performance.now() - startedAtMs))
+      });
     });
   });
 }
@@ -234,6 +233,7 @@ type SettingsSummaryModel = {
 type RunJob = (job: Job, options?: {
   applyResult?: boolean;
   clearPendingMessages?: boolean;
+  paintStartedAtMs?: number;
   onSucceeded?: (result: unknown) => void;
   onFailed?: (error: string, job: Job) => void;
 }) => () => void;
@@ -402,6 +402,12 @@ export type TrackedJob = { job: Job; progress: string; phases?: TrackedJobPhase[
 type PendingChronicleMessage = ChronicleMessage & {
   pending_after_message_id?: string | null;
   pending_save_id?: string | null;
+  paint_started_at_ms?: number;
+};
+type NarratorPaintMeasurement = {
+  jobId: string;
+  messageId: string;
+  startedAtMs: number;
 };
 type LocalCharacterTextMessage = CharacterTextMessage & {
   local_after_message_id?: string | null;
@@ -2848,6 +2854,7 @@ function Workbench({
   const [pendingSaveId, setPendingSaveId] = useState<string | null>(null);
   const [saveSelectionError, setSaveSelectionError] = useState("");
   const [pendingMessage, setPendingMessage] = useState<PendingChronicleMessage | null>(null);
+  const [narratorPaintMeasurement, setNarratorPaintMeasurement] = useState<NarratorPaintMeasurement | null>(null);
   const [layout, setLayout] = useState<WorkbenchLayout>(loadWorkbenchLayout);
   const [resizingSide, setResizingSide] = useState<ResizeSide | null>(null);
   const layoutDrag = useRef<{ side: ResizeSide; startX: number; startLayout: WorkbenchLayout } | null>(null);
@@ -3107,6 +3114,7 @@ function Workbench({
 
   useEffect(() => {
     setPendingMessage((current) => pendingMessageForActiveSave(current, activeSaveId));
+    setNarratorPaintMeasurement(null);
     setLookAroundAnswer(null);
   }, [activeSaveId]);
 
@@ -3223,17 +3231,21 @@ function Workbench({
   }, [onLayoutPointerMove, resizingSide, stopLayoutResize]);
 
   const runJob = useCallback<RunJob>((created, options = { applyResult: true }) => {
-    const narratorPaintStartedAtMs = created.created_at
-      ? created.created_at * 1000
-      : Date.now();
-    let narratorPaintScheduled = false;
-    const scheduleNarratorPaint = () => {
-      if (created.type !== "chat_turn" || narratorPaintScheduled) return;
-      narratorPaintScheduled = true;
-      scheduleClientPaintEvent(
-        "client.chat.narrator_painted",
-        narratorPaintStartedAtMs,
-      );
+    let narratorPaintRequested = false;
+    const requestNarratorPaint = (result: unknown) => {
+      if (
+        created.type !== "chat_turn"
+        || options.paintStartedAtMs === undefined
+        || narratorPaintRequested
+      ) return;
+      const messageId = narratorMessageIdFromResult(result);
+      if (!messageId) return;
+      narratorPaintRequested = true;
+      setNarratorPaintMeasurement({
+        jobId: created.id,
+        messageId,
+        startedAtMs: options.paintStartedAtMs,
+      });
     };
     if (!jobBelongsToActiveSave(created, activeSaveIdRef.current)) return () => undefined;
     if (jobWatchers.current[created.id]) return jobWatchers.current[created.id];
@@ -3270,10 +3282,10 @@ function Workbench({
           if (isRuntimeModel(done.result)) {
             appliedRuntimeResult = true;
             applyRuntimeModel(done.result);
-            scheduleNarratorPaint();
+            requestNarratorPaint(done.result);
           } else if (isChatTurnDelta(done.result)) {
             appliedRuntimeResult = applyChatTurnDelta(done.result);
-            if (appliedRuntimeResult) scheduleNarratorPaint();
+            if (appliedRuntimeResult) requestNarratorPaint(done.result);
           }
         }
         if (appliesToCurrentSave && done.status === "succeeded") {
@@ -3331,13 +3343,13 @@ function Workbench({
         if (name === "runtime" && isRuntimeModel(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
           setPendingMessage(null);
           applyRuntimeModel(data);
-          scheduleNarratorPaint();
+          requestNarratorPaint(data);
           client.invalidateQueries({ queryKey: ["chat", "submission-status", data.active_save_id ?? activeSaveIdRef.current] });
         }
         if (name === "chat_turn_delta" && isChatTurnDelta(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
           setPendingMessage(null);
           if (applyChatTurnDelta(data)) {
-            scheduleNarratorPaint();
+            requestNarratorPaint(data);
           } else {
             refreshWorkbench(data.save_id, ALL_WORKBENCH_REFRESH_TARGETS);
           }
@@ -3667,6 +3679,7 @@ function Workbench({
           model={model}
           runJob={runJob}
           pendingMessages={activePendingMessages}
+          narratorPaintMeasurement={narratorPaintMeasurement}
           onRuntimeChanged={applyRuntimeModel}
           currentUser={currentUser}
           mutationsDisabled={!activeSaveSupported}
@@ -5034,6 +5047,17 @@ function pendingMessageForActiveSave(message: PendingChronicleMessage | null, ac
   return message?.pending_save_id === activeSaveId ? message : null;
 }
 
+function narratorMessageIdFromResult(result: unknown): string | null {
+  if (isChatTurnDelta(result)) return result.narrator_message_id;
+  if (!isRuntimeModel(result)) return null;
+  const messages = result.chronicle?.messages ?? [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === "narrator") return message.message_id;
+  }
+  return null;
+}
+
 function chronicleJobActionKey(messageId: string, actionId: string) {
   return `${messageId}:${actionId}`;
 }
@@ -5094,7 +5118,10 @@ const ChronicleMessageRow = React.memo(function ChronicleMessageRow({
     })
     .filter((item) => item.error);
   return (
-    <article className={`message ${isDirection ? "direction" : message.role}`}>
+    <article
+      className={`message ${isDirection ? "direction" : message.role}`}
+      data-message-id={message.message_id}
+    >
       <header>
         <span>{isDirection ? "Direction" : message.speaker_name || message.role}</span>
         {message.revision_count ? <small className="message-edited">Edited</small> : null}
@@ -5188,6 +5215,7 @@ function Chronicle({
   runJob,
   pendingMessage,
   pendingMessages,
+  narratorPaintMeasurement = null,
   onRuntimeChanged,
   currentUser = null,
   mutationsDisabled = false
@@ -5196,14 +5224,17 @@ function Chronicle({
   runJob: RunJob;
   pendingMessage?: PendingChronicleMessage | null;
   pendingMessages?: PendingChronicleMessage[];
+  narratorPaintMeasurement?: NarratorPaintMeasurement | null;
   onRuntimeChanged?: (model: RuntimeModel) => void;
   currentUser?: CurrentUser | null;
   mutationsDisabled?: boolean;
 }) {
-  const messages = chronicleMessages(
-    model,
-    pendingMessages ?? pendingMessage ?? null
-  );
+  const localPendingMessages = pendingMessages
+    ?? (pendingMessage ? [pendingMessage] : []);
+  const messages = chronicleMessages(model, localPendingMessages);
+  const optimisticPaintMeasurement = localPendingMessages.find(
+    (message) => message.paint_started_at_ms !== undefined,
+  ) ?? null;
   const activeSaveId = model?.active_save_id ?? null;
   const canMutatePresence = !mutationsDisabled && currentUser?.role !== "child";
   const [editing, setEditing] = useState<ChronicleMessage | null>(null);
@@ -5240,6 +5271,7 @@ function Chronicle({
     }
   };
   const scrollRef = useRef<HTMLElement | null>(null);
+  const reportedPaintMeasurementsRef = useRef(new Set<string>());
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const scrollMetricsRef = useRef<{ activeSaveId: string | null; scrollHeight: number } | null>(null);
   const chronicleAnchorFrameRef = useRef<number | null>(null);
@@ -5256,6 +5288,40 @@ function Chronicle({
     latestMessage?.revision_count ?? 0,
     latestMessage?.body.length ?? 0
   ].join(":");
+  useLayoutEffect(() => {
+    const root = scrollRef.current;
+    if (!root) return;
+    const recordPaint = (
+      event: string,
+      messageId: string,
+      startedAtMs: number,
+      token: string,
+    ) => {
+      if (reportedPaintMeasurementsRef.current.has(token)) return;
+      const target = root.querySelector(
+        `[data-message-id="${CSS.escape(messageId)}"]`,
+      );
+      if (!target) return;
+      reportedPaintMeasurementsRef.current.add(token);
+      scheduleClientPaintEvent(event, startedAtMs, target);
+    };
+    if (optimisticPaintMeasurement?.paint_started_at_ms !== undefined) {
+      recordPaint(
+        "client.chat.optimistic_player_painted",
+        optimisticPaintMeasurement.message_id,
+        optimisticPaintMeasurement.paint_started_at_ms,
+        `optimistic:${optimisticPaintMeasurement.paint_started_at_ms}`,
+      );
+    }
+    if (narratorPaintMeasurement) {
+      recordPaint(
+        "client.chat.narrator_painted",
+        narratorPaintMeasurement.messageId,
+        narratorPaintMeasurement.startedAtMs,
+        `narrator:${narratorPaintMeasurement.jobId}`,
+      );
+    }
+  }, [messageWindowSignal, narratorPaintMeasurement, optimisticPaintMeasurement]);
   const oldestMessageId = model?.chronicle?.oldest_message_id ?? messages[0]?.message_id ?? null;
   const chronicleVirtualizer = useVirtualizer<HTMLElement, HTMLDivElement>({
     count: messages.length,
@@ -6352,6 +6418,7 @@ type ChatSubmitVariables = {
   body: string;
   saveId: string | null;
   key: string;
+  paintStartedAtMs: number;
 };
 
 function clientTurnId(): string {
@@ -6367,18 +6434,20 @@ function clientTurnId(): string {
 function chatSubmitVariables(
   body: string,
   saveId: string | null,
-  previous: ChatSubmitVariables | null
+  previous: ChatSubmitVariables | null,
+  paintStartedAtMs: number,
 ): ChatSubmitVariables {
   if (previous && previous.saveId === saveId && previous.body.trim() === body.trim()) {
-    return previous;
+    return { ...previous, paintStartedAtMs };
   }
-  return { body, saveId, key: clientTurnId() };
+  return { body, saveId, key: clientTurnId(), paintStartedAtMs };
 }
 
 function pendingPlayerChronicleMessage(
   body: string,
   saveId: string | null,
-  pendingAfterMessageId: string | null
+  pendingAfterMessageId: string | null,
+  paintStartedAtMs: number,
 ): PendingChronicleMessage {
   return {
     message_id: "pending-player-message",
@@ -6388,7 +6457,8 @@ function pendingPlayerChronicleMessage(
     actions: [],
     markdown_blocks: [{ kind: "paragraph", spans: [{ kind: "text", text: body }] }],
     pending_after_message_id: pendingAfterMessageId,
-    pending_save_id: saveId
+    pending_save_id: saveId,
+    paint_started_at_ms: paintStartedAtMs,
   };
 }
 
@@ -6661,7 +6731,7 @@ function Composer({
       failedSubmitRef.current = null;
       if (submitted.saveId !== activeSaveIdRef.current) return;
       setSubmitError("");
-      runJob(job);
+      runJob(job, { paintStartedAtMs: submitted.paintStartedAtMs });
     },
     onError: (error, submitted) => {
       failedSubmitRef.current = submitted;
@@ -6760,13 +6830,19 @@ function Composer({
             setSubmittingSaveId(submittedSaveId);
             setSubmitError("");
             setBody("");
-            const paintStartedAtMs = Date.now();
-            onPendingMessage(pendingPlayerChronicleMessage(submittedBody, submittedSaveId, pendingAfterMessageId));
-            scheduleClientPaintEvent(
-              "client.chat.optimistic_player_painted",
+            const paintStartedAtMs = performance.now();
+            onPendingMessage(pendingPlayerChronicleMessage(
+              submittedBody,
+              submittedSaveId,
+              pendingAfterMessageId,
               paintStartedAtMs,
-            );
-            submit.mutate(chatSubmitVariables(submittedBody, submittedSaveId, failedSubmitRef.current));
+            ));
+            submit.mutate(chatSubmitVariables(
+              submittedBody,
+              submittedSaveId,
+              failedSubmitRef.current,
+              paintStartedAtMs,
+            ));
           }
         }}
       >
@@ -6907,7 +6983,7 @@ function CyoaActionPicker({
       if (submitted.saveId !== activeSaveIdRef.current) return;
       setSubmitError("");
       setManualBody("");
-      runJob(job);
+      runJob(job, { paintStartedAtMs: submitted.paintStartedAtMs });
     },
     onError: (error, submitted) => {
       failedSubmitRef.current = submitted;
@@ -6962,13 +7038,19 @@ function CyoaActionPicker({
     submittingSaveIdRef.current = submittedSaveId;
     setSubmittingSaveId(submittedSaveId);
     setSubmitError("");
-    const paintStartedAtMs = Date.now();
-    onPendingMessage(pendingPlayerChronicleMessage(submittedBody, submittedSaveId, pendingAfterMessageId));
-    scheduleClientPaintEvent(
-      "client.chat.optimistic_player_painted",
+    const paintStartedAtMs = performance.now();
+    onPendingMessage(pendingPlayerChronicleMessage(
+      submittedBody,
+      submittedSaveId,
+      pendingAfterMessageId,
       paintStartedAtMs,
-    );
-    submit.mutate(chatSubmitVariables(submittedBody, submittedSaveId, failedSubmitRef.current));
+    ));
+    submit.mutate(chatSubmitVariables(
+      submittedBody,
+      submittedSaveId,
+      failedSubmitRef.current,
+      paintStartedAtMs,
+    ));
   };
   const regenerateOptions = () => {
     if (!canRegenerate || !actionChoices?.narrator_message_id) return;

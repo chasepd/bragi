@@ -59,7 +59,7 @@ from bragi.services.settings_service import SettingsService
 from bragi.services.world_data_service import ScenarioEdit
 from bragi_web.api.app import create_app
 from bragi_web.auth_throttle import AuthAttemptThrottle
-from bragi_web.jobs import JobRecord, JobRegistry, JobRegistryLimits
+from bragi_web.jobs import JobHandle, JobRecord, JobRegistry, JobRegistryLimits
 from bragi_web.observability import clear_recent_events, recent_events
 from bragi_web.runtime import (
     BundlePreviewState,
@@ -9524,6 +9524,7 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
 
     runtime = DeferredImageRuntime()
     state = _state_double(tmp_path, runtime)
+    state.jobs._repositories = repositories  # noqa: SLF001 - production telemetry wiring
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
@@ -9578,6 +9579,73 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
     assert post_turn_finished["completion_level"] == (
         "optional_enrichments_complete"
     )
+    continuity_steps = repositories.list_job_steps(post_turn_jobs[0]["id"])
+    assert [(step.name, step.status) for step in continuity_steps] == [
+        ("post_turn.continuity_ready", "succeeded"),
+    ]
+    automatic_image_job = repositories.connection.execute(
+        "SELECT id FROM jobs WHERE type = 'automatic_image_generation'"
+    ).fetchone()
+    assert automatic_image_job is not None
+    image_steps = repositories.list_job_steps(str(automatic_image_job[0]))
+    assert [(step.name, step.status) for step in image_steps] == [
+        ("post_turn.image_ready", "succeeded"),
+    ]
+
+
+def test_inline_post_turn_fallback_records_continuity_ready_span(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(
+        sqlite3.connect(database_path, check_same_thread=False)
+    )
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower above the ash.",
+        player_role="Keeper",
+        content={},
+    )
+    repositories.create_save(
+        scenario_id=scenario.id,
+        title="Lantern Keep",
+        save_id="save-1",
+    )
+
+    class InlineRuntime(_RuntimeDouble):
+        async def run_post_turn_jobs(self, **_kwargs: object) -> dict[str, object]:
+            return {"continuity_degraded": False}
+
+    state = _state_double(tmp_path, InlineRuntime())
+    state.jobs = JobRegistry(repositories=repositories)
+
+    async def run_flow() -> str:
+        async def worker(handle: JobHandle) -> object:
+            return await api_app._run_post_turn_jobs_inline_fallback(
+                cast(WebAppState, state),
+                handle,
+                save_id="save-1",
+                player_message_id="player-1",
+                narrator_message_id="narrator-1",
+            )
+
+        record = await state.jobs.create(
+            "chat_turn",
+            worker,
+            save_id="save-1",
+        )
+        assert record.task is not None
+        await record.task
+        return cast(str, record.id)
+
+    job_id = asyncio.run(run_flow())
+
+    steps = repositories.list_job_steps(job_id)
+    assert [(step.name, step.status) for step in steps] == [
+        ("post_turn.continuity_ready", "succeeded"),
+    ]
 
 
 def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:

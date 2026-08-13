@@ -99,6 +99,22 @@ function installEventSourceDouble(): EventSourceDoubleInstance[] {
   return sources;
 }
 
+function installAnimationFrameQueue() {
+  const callbacks: FrameRequestCallback[] = [];
+  vi.stubGlobal("requestAnimationFrame", vi.fn((callback: FrameRequestCallback) => {
+    callbacks.push(callback);
+    return callbacks.length;
+  }));
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  const flushFrame = () => {
+    const current = callbacks.splice(0, callbacks.length);
+    act(() => {
+      current.forEach((callback) => callback(performance.now()));
+    });
+  };
+  return { callbacks, flushFrame };
+}
+
 function deferred<T>() {
   let resolve: (value: T) => void = () => undefined;
   let reject: (reason?: unknown) => void = () => undefined;
@@ -1887,28 +1903,34 @@ describe("frontend helpers", () => {
     expect(repaired.retry_pending).toBe(false);
   });
 
-  it("records committed narrator paint once after a chat delta reaches the UI", async () => {
+  it("records optimistic and narrator paint after DOM commit with one local clock", async () => {
     const sources = installEventSourceDouble();
-    vi.stubGlobal("requestAnimationFrame", vi.fn((callback: FrameRequestCallback) => {
-      callback(0);
-      return 1;
-    }));
-    const activeJob = {
+    const frames = installAnimationFrameQueue();
+    const createdJob = {
       id: "job-paint",
       type: "chat_turn",
       save_id: "save-1",
-      status: "running",
+      status: "queued",
       result: null,
       error: null,
-      created_at: Date.now() / 1000 - 1
+      created_at: -1_000_000_000
     } satisfies Job;
-    const fetchMock = workbenchFetch([activeJob], runtimeModel({
+    const baseFetch = workbenchFetch([], runtimeModel({
       chronicle: {
         messages: [
           { message_id: "opening-1", role: "narrator", speaker_name: null, body: "The beacon waits.", actions: [] }
         ]
       }
     }));
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/chat") {
+        return Promise.resolve({ ok: true, json: async () => createdJob });
+      }
+      if (path === "/api/log/client") {
+        return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+      }
+      return baseFetch(path, init);
+    });
     vi.stubGlobal("fetch", fetchMock);
     const { Workbench } = await import("./main");
 
@@ -1919,6 +1941,27 @@ describe("frontend helpers", () => {
     );
 
     await screen.findByText("The beacon waits.");
+    const textarea = screen.getByRole("textbox", { name: "Message" });
+    await userEvent.type(textarea, "Light the beacon");
+    fireEvent.submit(textarea.closest("form") as HTMLFormElement);
+
+    const optimisticMessage = await screen.findByText("Light the beacon");
+    expect(optimisticMessage.closest("[data-message-id='pending-player-message']")).not.toBeNull();
+    expect(fetchMock.mock.calls.some(([, init]) => (
+      String(init?.body).includes("client.chat.optimistic_player_painted")
+    ))).toBe(false);
+    frames.flushFrame();
+    expect(fetchMock.mock.calls.some(([, init]) => (
+      String(init?.body).includes("client.chat.optimistic_player_painted")
+    ))).toBe(false);
+    frames.flushFrame();
+    const optimisticPaintCall = fetchMock.mock.calls.find(([path, init]) => (
+      path === "/api/log/client"
+      && String(init?.body).includes("client.chat.optimistic_player_painted")
+    ));
+    expect(optimisticPaintCall).toBeDefined();
+    expect(String(optimisticPaintCall?.[1]?.body)).not.toContain("Light the beacon");
+
     const source = await waitFor(() => {
       const match = sources.find((candidate) => candidate.url === "/api/jobs/job-paint/events?save_id=save-1");
       if (!match) throw new Error("chat watcher was not created");
@@ -1946,19 +1989,28 @@ describe("frontend helpers", () => {
 
     act(() => {
       source.dispatch("chat_turn_delta", delta);
-      source.dispatch("done", { ...activeJob, status: "succeeded", result: delta });
+      source.dispatch("done", { ...createdJob, status: "succeeded", result: delta });
     });
 
-    expect(await screen.findByText("The bell answers.")).toBeInTheDocument();
-    await waitFor(() => {
-      const paintLogs = fetchMock.mock.calls.filter(([path, init]) => (
-        path === "/api/log/client"
-        && String(init?.body).includes("client.chat.narrator_painted")
-      ));
-      expect(paintLogs).toHaveLength(1);
-      expect(String(paintLogs[0][1]?.body)).toContain("duration_ms");
-      expect(String(paintLogs[0][1]?.body)).not.toContain("The bell answers");
-    });
+    const narratorMessage = await screen.findByText("The bell answers.");
+    expect(narratorMessage.closest("[data-message-id='narrator-1']")).not.toBeNull();
+    expect(fetchMock.mock.calls.some(([, init]) => (
+      String(init?.body).includes("client.chat.narrator_painted")
+    ))).toBe(false);
+    frames.flushFrame();
+    expect(fetchMock.mock.calls.some(([, init]) => (
+      String(init?.body).includes("client.chat.narrator_painted")
+    ))).toBe(false);
+    frames.flushFrame();
+    const paintLogs = fetchMock.mock.calls.filter(([path, init]) => (
+      path === "/api/log/client"
+      && String(init?.body).includes("client.chat.narrator_painted")
+    ));
+    expect(paintLogs).toHaveLength(1);
+    const narratorPayload = JSON.parse(String(paintLogs[0][1]?.body));
+    expect(narratorPayload.fields.duration_ms).toBeGreaterThanOrEqual(0);
+    expect(narratorPayload.fields.duration_ms).toBeLessThan(10_000);
+    expect(String(paintLogs[0][1]?.body)).not.toContain("The bell answers");
   });
 
   it("hides pending character text rows even after reply text exists", async () => {
@@ -15677,10 +15729,6 @@ describe("frontend helpers", () => {
         ? { id: "job-1", type: "chat_turn", status: "queued", result: null, error: null }
         : { saves: [], active_save_id: "save-1", chronicle: { messages: [] }, composer_enabled: true }
     }));
-    vi.stubGlobal("requestAnimationFrame", vi.fn((callback: FrameRequestCallback) => {
-      callback(0);
-      return 1;
-    }));
     vi.stubGlobal("fetch", fetchMock);
 
     render(
@@ -15701,13 +15749,6 @@ describe("frontend helpers", () => {
       save_id: "save-1",
       speaker_name: null
     });
-    const optimisticPaintCall = fetchMock.mock.calls.find(([path, init]) => (
-      path === "/api/log/client"
-      && String(init?.body).includes("client.chat.optimistic_player_painted")
-    ));
-    expect(optimisticPaintCall).toBeDefined();
-    expect(String(optimisticPaintCall?.[1].body)).toContain("duration_ms");
-    expect(String(optimisticPaintCall?.[1].body)).not.toContain("Light the beacon");
   });
 
   it("renders CYOA action choices without the default composer textarea", async () => {
@@ -16245,7 +16286,10 @@ describe("frontend helpers", () => {
       body: "Search the moonlit shelves",
       pending_after_message_id: "narrator-1"
     }));
-    await waitFor(() => expect(runJob).toHaveBeenCalledWith(job));
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(
+      job,
+      { paintStartedAtMs: expect.any(Number) },
+    ));
   });
 
   it("submits a custom CYOA action through the same chat path", async () => {
@@ -16666,7 +16710,10 @@ describe("frontend helpers", () => {
       json: async () => ({ id: "job-1", type: "chat_turn", status: "queued", result: null, error: null })
     });
 
-    await waitFor(() => expect(runJob).toHaveBeenCalledWith(expect.objectContaining({ id: "job-1" })));
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "job-1" }),
+      expect.anything(),
+    ));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
