@@ -80,4 +80,3 @@ def test_timing_summary_uses_latest_thirty_matching_successes_and_nearest_rank(
     assert summary.estimate is not None
     assert summary.estimate.p50_ms == 4_000
     assert summary.estimate.p95_ms == 7_000
-
