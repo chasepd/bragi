@@ -9,6 +9,7 @@ from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     ChatMessage,
     ChatPromptPurpose,
+    ChatReasoningConfig,
     ChatRequest,
     StructuredOutputRequest,
     ToolCallMessage,
@@ -16,6 +17,7 @@ from bragi.providers.contracts import (
     ToolDefinition,
 )
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
+from bragi.retry_policy import RetryExecutionClass, retry_execution_context
 from bragi.services.request_budget import (
     budget_chat_request,
     budget_structured_output_request,
@@ -23,6 +25,9 @@ from bragi.services.request_budget import (
     enforce_chat_request_budget,
     enforce_structured_output_request_budget,
     enforce_tool_call_request_budget,
+)
+from bragi.services.turn_responsiveness import (
+    RESPONSIVE_STRUCTURED_HELPER_MAX_OUTPUT_TOKENS,
 )
 
 
@@ -71,6 +76,71 @@ def test_unknown_windows_still_apply_provider_output_caps() -> None:
     assert chat.max_output_tokens == 10_000
     assert structured.max_output_tokens == 10_000
     assert tool.max_output_tokens == 10_000
+
+
+def test_responsive_foreground_caps_structured_helpers_and_disables_optional_thinking(
+) -> None:
+    repository_mock = Mock()
+    repository_mock.list_provider_models.return_value = []
+    repositories = cast(PersistenceRepositories, repository_mock)
+    request = StructuredOutputRequest(
+        provider="fake",
+        model_id="helper",
+        messages=(ChatMessage(role="user", body="Select context."),),
+        schema_name="selection",
+        schema={"type": "object", "additionalProperties": False},
+        max_output_tokens=9_000,
+        reasoning=ChatReasoningConfig(effort="high", exclude=True),
+    )
+
+    quality = budget_structured_output_request(
+        repositories,
+        request,
+        task="context_search",
+    )
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        responsive = budget_structured_output_request(
+            repositories,
+            request,
+            task="context_search",
+        )
+
+    assert quality.max_output_tokens == 9_000
+    assert quality.reasoning == request.reasoning
+    assert responsive.max_output_tokens == (
+        RESPONSIVE_STRUCTURED_HELPER_MAX_OUTPUT_TOKENS
+    )
+    assert responsive.reasoning == ChatReasoningConfig(effort="none", exclude=True)
+
+
+def test_responsive_foreground_preserves_mandatory_structured_thinking() -> None:
+    repository_mock = Mock()
+    repository_mock.list_provider_models.return_value = [
+        Mock(
+            model_id="helper",
+            available=True,
+            thinking={"mandatory": True},
+            context_window=None,
+        )
+    ]
+    repositories = cast(PersistenceRepositories, repository_mock)
+    request = StructuredOutputRequest(
+        provider="fake",
+        model_id="helper",
+        messages=(ChatMessage(role="user", body="Select context."),),
+        schema_name="selection",
+        schema={"type": "object", "additionalProperties": False},
+        reasoning=ChatReasoningConfig(effort="high", exclude=True),
+    )
+
+    with retry_execution_context(RetryExecutionClass.RESPONSIVE_FOREGROUND):
+        responsive = budget_structured_output_request(
+            repositories,
+            request,
+            task="context_search",
+        )
+
+    assert responsive.reasoning == request.reasoning
 
 
 def test_chat_budget_rejects_irreducible_core_before_dispatch() -> None:

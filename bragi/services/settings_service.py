@@ -178,6 +178,11 @@ from bragi.services.text_script_policy import (
     SCRIPT_GUARD_MODE_SETTING,
     sanitize_script_guard_mode,
 )
+from bragi.services.turn_responsiveness import (
+    DEFAULT_TURN_RESPONSIVENESS_MODE,
+    TURN_RESPONSIVENESS_MODE_SETTING,
+    sanitize_turn_responsiveness_mode,
+)
 from bragi.services.user_narration_guidance import (
     DEFAULT_USER_NARRATION_GUIDANCE,
     USER_NARRATION_GUIDANCE_SETTING,
@@ -700,6 +705,8 @@ class SettingsService:
             value = sanitize_retry_count(value)
         elif key == PROVIDER_CALL_DEADLINE_SETTING:
             value = sanitize_provider_call_deadline_seconds(value)
+        elif key == TURN_RESPONSIVENESS_MODE_SETTING:
+            value = sanitize_turn_responsiveness_mode(value)
         elif key == SCENARIO_EVOLUTION_TURN_INTERVAL_SETTING:
             value = sanitize_scenario_evolution_turn_interval(value)
         elif key == CHARACTER_ACTION_PLANNING_MAX_CONCURRENCY_SETTING:
@@ -842,6 +849,8 @@ class SettingsService:
                 return sanitize_retry_count(value)
             if key == PROVIDER_CALL_DEADLINE_SETTING:
                 return sanitize_provider_call_deadline_seconds(value)
+            if key == TURN_RESPONSIVENESS_MODE_SETTING:
+                return sanitize_turn_responsiveness_mode(value)
             if key == NARRATOR_PLANNER_RECENT_PLAYER_MESSAGE_WINDOW_SETTING:
                 return sanitize_recent_message_window(
                     value,
@@ -1206,5 +1215,6 @@ def _default_local_setting(key: str) -> object | None:
         CHARACTER_TEXT_PROACTIVE_RANDOM_COOLDOWN_SETTING: (
             DEFAULT_CHARACTER_TEXT_PROACTIVE_RANDOM_COOLDOWN_TURNS
         ),
+        TURN_RESPONSIVENESS_MODE_SETTING: DEFAULT_TURN_RESPONSIVENESS_MODE,
     }
     return defaults.get(key)

@@ -19488,6 +19488,7 @@ describe("frontend helpers", () => {
       ],
       task_model_selectors: [],
       roleplay_shared_models: { setting_key: "roleplay_shared_models", enabled: true },
+      turn_responsiveness_mode: { setting_key: "turn_responsiveness_mode", selected: "quality", options: ["quality", "responsive"] },
       roleplay_model_groups: [],
       visible_sections: ["providers", "models", "save", "local", "diagnostics"],
       automatic_summarization: { setting_key: "automatic_summarization_enabled", enabled: true },
@@ -19584,6 +19585,21 @@ describe("frontend helpers", () => {
     expect(screen.getByRole("tab", { name: "Save" })).toHaveAttribute("aria-selected", "true");
 
     expect(screen.getByText("Summarization")).toBeInTheDocument();
+    const responsiveness = screen.getByLabelText("Turn Responsiveness Mode");
+    expect(within(responsiveness).getByRole("option", { name: "Quality" })).toBeInTheDocument();
+    expect(within(responsiveness).getByRole("option", { name: "Responsive" })).toBeInTheDocument();
+    await userEvent.selectOptions(responsiveness, "responsive");
+    await waitFor(() => expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .some(([, options]) => JSON.parse(String(options.body)).key === "turn_responsiveness_mode")).toBe(true));
+    const responsivenessCall = fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .find(([, options]) => JSON.parse(String(options.body)).key === "turn_responsiveness_mode");
+    expect(JSON.parse(String(responsivenessCall?.[1].body))).toEqual({
+      key: "turn_responsiveness_mode",
+      value: "responsive",
+      save_id: "save-1"
+    });
     expect(screen.getByText("Context Automation")).toBeInTheDocument();
     expect(screen.getByText("Media Automation")).toBeInTheDocument();
     expect(screen.getByText("Chat History")).toBeInTheDocument();

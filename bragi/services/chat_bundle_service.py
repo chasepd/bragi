@@ -77,6 +77,10 @@ from bragi.services.scenario_service import (
     strip_deprecated_scenario_character_sections,
 )
 from bragi.services.turn_outcome import remap_turn_outcome_payload
+from bragi.services.turn_responsiveness import (
+    TURN_RESPONSIVENESS_MODE_SETTING,
+    sanitize_turn_responsiveness_mode,
+)
 from bragi.services.turn_snapshot_service import (
     TurnSnapshotService,
     portable_context_observation_curation_state_row,
@@ -3760,6 +3764,8 @@ def _apply_save_app_settings(
             value = sanitize_post_turn_inference_mode(value)
         if key == DIRECTOR_PRESSURE_GUIDANCE_SETTING and scope == "save":
             value = sanitize_director_pressure_guidance(value)
+        if key == TURN_RESPONSIVENESS_MODE_SETTING and scope == "save":
+            value = sanitize_turn_responsiveness_mode(value)
         if scope == "save" and key in {
             RECENT_PLAYER_MESSAGE_WINDOW_SETTING,
             NARRATOR_PLANNER_RECENT_PLAYER_MESSAGE_WINDOW_SETTING,

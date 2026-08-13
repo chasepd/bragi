@@ -9,6 +9,10 @@ import pytest
 from bragi.persistence.migrations import migrate_database
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.services.chat_timing_service import ChatTimingService
+from bragi.services.turn_responsiveness import (
+    TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    TURN_RESPONSIVENESS_MODE_SETTING,
+)
 
 
 @pytest.fixture
@@ -74,9 +78,34 @@ def test_timing_summary_uses_latest_thirty_matching_successes_and_nearest_rank(
         "save_id": save_id,
         "provider": "fake",
         "model": "fake-chat",
+        "mode": "quality",
         "limit": 30,
     }]
     assert summary.sample_count == 7
     assert summary.estimate is not None
     assert summary.estimate.p50_ms == 4_000
     assert summary.estimate.p95_ms == 7_000
+
+
+def test_timing_summary_uses_effective_responsive_mode_for_samples(
+    repositories: PersistenceRepositories,
+) -> None:
+    save_id = _save_with_chat_model(repositories)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save_id,
+        key=TURN_RESPONSIVENESS_MODE_SETTING,
+        value=TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+    )
+    calls: list[dict[str, object]] = []
+
+    def durations(**kwargs: object) -> list[int]:
+        calls.append(kwargs)
+        return []
+
+    repositories.list_chat_response_commit_durations = durations  # type: ignore[method-assign]
+
+    summary = ChatTimingService(repositories).summary(save_id)
+
+    assert summary.mode == "responsive"
+    assert calls[0]["mode"] == "responsive"

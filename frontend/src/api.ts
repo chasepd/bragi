@@ -439,6 +439,7 @@ export type SettingsModel = {
   model_routing_profiles?: ModelRoutingProfilesSettings;
   retry_count?: NumberControl;
   provider_call_deadline_seconds?: NumberControl;
+  turn_responsiveness_mode?: ChoiceControl;
   automatic_summarization?: ToggleControl;
   summarization_context_pressure_threshold?: NumberControl;
   summarization_visibility?: ToggleControl;

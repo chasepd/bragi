@@ -70,6 +70,7 @@ from bragi.services.scenario_evolution_policy import (
     SCENARIO_EVOLUTION_TURN_INTERVAL_SETTING,
 )
 from bragi.services.text_script_policy import SCRIPT_GUARD_MODE_SETTING
+from bragi.services.turn_responsiveness import TURN_RESPONSIVENESS_MODE_SETTING
 from bragi.services.user_narration_guidance import USER_NARRATION_GUIDANCE_SETTING
 
 
@@ -151,6 +152,7 @@ _SAVE_SCOPED_SETTINGS = frozenset(
         SCRIPT_GUARD_MODE_SETTING,
         SAVE_GENERATED_PHRASE_DENYLIST_SETTING,
         SCENARIO_EVOLUTION_TURN_INTERVAL_SETTING,
+        TURN_RESPONSIVENESS_MODE_SETTING,
     }
 )
 

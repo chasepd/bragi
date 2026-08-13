@@ -1844,6 +1844,7 @@ const SETTINGS_TAB_TOOLTIPS: Record<SettingsTab, string> = {
   users: "Manage Bragi users and local passwords."
 };
 const SAVE_SCOPED_SETTING_KEYS = new Set([
+  "turn_responsiveness_mode",
   "automatic_summarization_enabled",
   "summarization_context_pressure_threshold",
   "show_summarization_activity",
@@ -9405,6 +9406,7 @@ function settingLabel(settingKey: string) {
 }
 
 const fallbackSettingLabels: Record<string, string> = {
+  turn_responsiveness_mode: "Turn Responsiveness Mode",
   agentic_context_pipeline_enabled: "Agentic Context Pipeline",
   plan_first_narrator_enabled: "Plan-First Narrator",
   director_pressure_enabled: "Director Pressure",

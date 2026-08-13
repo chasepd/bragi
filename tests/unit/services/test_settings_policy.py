@@ -16,6 +16,7 @@ from bragi.services.settings_policy import (
     role_can_write_scoped_setting,
     scoped_setting_policy,
 )
+from bragi.services.turn_responsiveness import TURN_RESPONSIVENESS_MODE_SETTING
 from bragi.services.user_narration_guidance import USER_NARRATION_GUIDANCE_SETTING
 
 
@@ -104,3 +105,14 @@ def test_provider_call_deadline_is_global_and_admin_only() -> None:
     assert role_can_write_scoped_setting("admin", PROVIDER_CALL_DEADLINE_SETTING)
     assert not role_can_write_scoped_setting("user", PROVIDER_CALL_DEADLINE_SETTING)
     assert not role_can_write_scoped_setting("child", PROVIDER_CALL_DEADLINE_SETTING)
+
+
+def test_turn_responsiveness_mode_is_save_scoped_for_adults_only() -> None:
+    policy = scoped_setting_policy(TURN_RESPONSIVENESS_MODE_SETTING)
+
+    assert policy.scope == "save"
+    assert policy.admin_only is False
+    assert policy.child_allowed is False
+    assert role_can_write_scoped_setting("admin", TURN_RESPONSIVENESS_MODE_SETTING)
+    assert role_can_write_scoped_setting("user", TURN_RESPONSIVENESS_MODE_SETTING)
+    assert not role_can_write_scoped_setting("child", TURN_RESPONSIVENESS_MODE_SETTING)

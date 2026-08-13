@@ -64,6 +64,10 @@ _RETRY_EXECUTION_CLASS: ContextVar[RetryExecutionClass] = ContextVar(
     "bragi_retry_execution_class",
     default=RetryExecutionClass.QUALITY_FOREGROUND,
 )
+_RETRY_EXECUTION_CONTEXT_IS_EXPLICIT: ContextVar[bool] = ContextVar(
+    "bragi_retry_execution_context_is_explicit",
+    default=False,
+)
 
 
 @dataclass
@@ -147,15 +151,23 @@ def retry_execution_context(
 ) -> Iterator[None]:
     """Temporarily apply retry behavior to provider calls in this async context."""
 
-    token = _RETRY_EXECUTION_CLASS.set(execution_class)
+    class_token = _RETRY_EXECUTION_CLASS.set(execution_class)
+    explicit_token = _RETRY_EXECUTION_CONTEXT_IS_EXPLICIT.set(True)
     try:
         yield
     finally:
-        _RETRY_EXECUTION_CLASS.reset(token)
+        _RETRY_EXECUTION_CONTEXT_IS_EXPLICIT.reset(explicit_token)
+        _RETRY_EXECUTION_CLASS.reset(class_token)
 
 
 def current_retry_execution_class() -> RetryExecutionClass:
     return _RETRY_EXECUTION_CLASS.get()
+
+
+def retry_execution_context_is_explicit() -> bool:
+    """Return whether a caller deliberately selected an execution class."""
+
+    return _RETRY_EXECUTION_CONTEXT_IS_EXPLICIT.get()
 
 
 @contextmanager

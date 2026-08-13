@@ -71,21 +71,31 @@ def test_list_chat_response_commit_durations_filters_model_status_and_limit(
         content={},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Timing Test")
-    for index, (provider, model, status, duration_ms) in enumerate([
-        ("fake", "fake-chat", "succeeded", 1_000),
-        ("fake", "fake-chat", "failed", 2_000),
-        ("fake", "other-chat", "succeeded", 3_000),
-        ("fake", "fake-chat", "succeeded", 4_000),
-        ("fake", "fake-chat", "succeeded", 5_000),
+    for index, (provider, model, status, duration_ms, mode) in enumerate([
+        ("fake", "fake-chat", "succeeded", 1_000, None),
+        ("fake", "fake-chat", "failed", 2_000, "quality"),
+        ("fake", "other-chat", "succeeded", 3_000, "quality"),
+        ("fake", "fake-chat", "succeeded", 4_000, "quality"),
+        ("fake", "fake-chat", "succeeded", 5_000, "quality"),
+        ("fake", "fake-chat", "succeeded", 6_000, "responsive"),
     ]):
         job_id = f"timing-job-{index}"
         narrator_id = f"timing-narrator-{index}"
         repositories.connection.execute(
             """
             INSERT INTO jobs(id, save_id, type, status, payload_json, created_at)
-            VALUES (?, ?, 'chat_turn', ?, '{}', '2026-08-12 00:00:00')
+            VALUES (?, ?, 'chat_turn', ?, ?, '2026-08-12 00:00:00')
             """,
-            (job_id, save.id, status),
+            (
+                job_id,
+                save.id,
+                status,
+                json.dumps(
+                    {}
+                    if mode is None
+                    else {"turn_responsiveness_mode": mode}
+                ),
+            ),
         )
         repositories.connection.execute(
             """
@@ -118,10 +128,21 @@ def test_list_chat_response_commit_durations_filters_model_status_and_limit(
         save_id=save.id,
         provider="fake",
         model="fake-chat",
+        mode="quality",
         limit=2,
     )
 
     assert durations == [5_000, 4_000]
+
+    responsive_durations = repositories.list_chat_response_commit_durations(
+        save_id=save.id,
+        provider="fake",
+        model="fake-chat",
+        mode="responsive",
+        limit=2,
+    )
+
+    assert responsive_durations == [6_000]
 
 
 def test_message_safety_transition_round_trips_and_edits_clear_it(

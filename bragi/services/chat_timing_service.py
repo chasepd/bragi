@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.services.model_preferences import roleplay_model_preference
+from bragi.services.turn_responsiveness import turn_responsiveness_mode
 
 MIN_TIMING_SAMPLES = 5
 MAX_TIMING_SAMPLES = 30
@@ -34,6 +35,7 @@ class ChatTimingService:
         self.repositories = repositories
 
     def summary(self, save_id: str) -> ChatTimingSummary:
+        mode = turn_responsiveness_mode(self.repositories, save_id=save_id)
         preference = roleplay_model_preference(
             repositories=self.repositories,
             save_id=save_id,
@@ -41,7 +43,7 @@ class ChatTimingService:
         )
         if preference is None:
             return ChatTimingSummary(
-                mode="quality",
+                mode=mode,
                 provider=None,
                 model=None,
                 sample_count=0,
@@ -51,6 +53,7 @@ class ChatTimingService:
             save_id=save_id,
             provider=preference.provider,
             model=preference.model_id,
+            mode=mode,
             limit=MAX_TIMING_SAMPLES,
         )
         estimate = None
@@ -61,7 +64,7 @@ class ChatTimingService:
                 p95_ms=_nearest_rank(ordered, 95),
             )
         return ChatTimingSummary(
-            mode="quality",
+            mode=mode,
             provider=preference.provider,
             model=preference.model_id,
             sample_count=len(durations),
