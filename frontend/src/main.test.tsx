@@ -9146,6 +9146,92 @@ describe("frontend helpers", () => {
     await waitFor(() => expect(submissionStatusCalls).toBeGreaterThan(afterMalformed.submissionStatusCalls));
   });
 
+  it("shows automatic scene arrival without refetching media until the job finishes", async () => {
+    const sources = installEventSourceDouble();
+    const model = runtimeModel({
+      chronicle: {
+        messages: [{
+          message_id: "narrator-1",
+          role: "narrator",
+          speaker_name: "Narrator",
+          body: "The beacon lens hums awake.",
+          actions: []
+        }]
+      }
+    });
+    const baseFetch = workbenchFetch([], model);
+    vi.stubGlobal("fetch", baseFetch);
+    const { Workbench } = await import("./main");
+    const client = new QueryClient();
+    const invalidateQueries = vi.spyOn(client, "invalidateQueries");
+    const mediaInvalidationCount = () => invalidateQueries.mock.calls.filter(
+      ([filters]) => filters?.queryKey?.[0] === "media",
+    ).length;
+
+    render(
+      <QueryClientProvider client={client}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    const saveSource = await waitFor(() => {
+      const source = sources.find((candidate) => candidate.url === "/api/saves/save-1/events");
+      if (!source) throw new Error("save watcher was not created");
+      return source;
+    });
+    await screen.findByText("The beacon lens hums awake.");
+    const mediaInvalidationsBeforeJob = mediaInvalidationCount();
+
+    act(() => {
+      saveSource.dispatch("job_changed", {
+        event_id: 1,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: {
+          job: {
+            id: "automatic-image-1",
+            type: "automatic_image_generation",
+            save_id: "save-1",
+            status: "running",
+            latest_progress: {
+              kind: "scene_arriving",
+              status_text: "Scene image arriving",
+              source_message_id: "narrator-1"
+            }
+          }
+        }
+      });
+    });
+
+    expect(await screen.findByRole("status", {
+      name: "Scene image arriving"
+    })).toBeInTheDocument();
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    });
+    expect(mediaInvalidationCount()).toBe(mediaInvalidationsBeforeJob);
+
+    act(() => {
+      saveSource.dispatch("job_changed", {
+        event_id: 2,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: {
+          job: {
+            id: "automatic-image-1",
+            type: "automatic_image_generation",
+            save_id: "save-1",
+            status: "succeeded"
+          }
+        }
+      });
+    });
+
+    await waitFor(() => expect(mediaInvalidationCount()).toBeGreaterThan(
+      mediaInvalidationsBeforeJob,
+    ));
+  });
+
   it("polls the runtime after save SSE fails so missed updates still show the narrator response", async () => {
     const sources = installEventSourceDouble();
     const initialModel = runtimeModel({
@@ -15761,9 +15847,11 @@ describe("frontend helpers", () => {
     await userEvent.click(thumbnail);
 
     const primaryPreview = screen.getByRole("button", { name: "Open full media viewer for Storm ship" });
-    expect(within(primaryPreview).getByRole("img", {
+    const primaryImage = within(primaryPreview).getByRole("img", {
       name: "Storm ship"
-    })).toHaveAttribute("src", "/api/media/media-storm?save_id=save-1");
+    });
+    expect(primaryImage).toHaveAttribute("src", "/api/media/media-storm/thumbnail?save_id=save-1");
+    expect(primaryImage).toHaveAttribute("decoding", "async");
 
     await userEvent.click(primaryPreview);
 
@@ -15771,6 +15859,49 @@ describe("frontend helpers", () => {
     expect(within(dialog).getByRole("img", {
       name: "Storm ship"
     })).toHaveAttribute("src", "/api/media/media-storm?save_id=save-1");
+  });
+
+  it("links an arriving automatic scene image to its source chronicle message", async () => {
+    const { Chronicle } = await import("./main");
+    const model = runtimeModel({
+      chronicle: {
+        messages: [
+          {
+            message_id: "narrator-1",
+            role: "narrator",
+            speaker_name: "Narrator",
+            body: "The beacon lens hums awake.",
+            actions: []
+          },
+          {
+            message_id: "narrator-2",
+            role: "narrator",
+            speaker_name: "Narrator",
+            body: "The watch descends the stair.",
+            actions: []
+          }
+        ]
+      }
+    });
+
+    render(
+      <Chronicle
+        model={model}
+        runJob={vi.fn()}
+        pendingMessage={null}
+        sceneArrivalMessageIds={new Set(["narrator-1"])}
+      />
+    );
+
+    const sourceMessage = screen.getByText("The beacon lens hums awake.").closest("article");
+    const otherMessage = screen.getByText("The watch descends the stair.").closest("article");
+    expect(sourceMessage).not.toBeNull();
+    expect(within(sourceMessage as HTMLElement).getByRole("status", {
+      name: "Scene image arriving"
+    })).toBeInTheDocument();
+    expect(within(otherMessage as HTMLElement).queryByRole("status", {
+      name: "Scene image arriving"
+    })).not.toBeInTheDocument();
   });
 
   it("keeps media selection keyboard behavior in sync with pointer clicks", async () => {

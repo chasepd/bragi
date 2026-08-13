@@ -1083,6 +1083,23 @@ h1 {
   margin-top: 8px;
 }
 
+.scene-arriving-tile {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(201, 155, 74, 0.26);
+  border-radius: 7px;
+  background: rgba(201, 155, 74, 0.075);
+  color: #e6c477;
+  font-size: 13px;
+}
+
+.scene-arriving-tile::after {
+  content: "Scene image arriving";
+}
+
 .message header {
   display: flex;
   gap: 8px;

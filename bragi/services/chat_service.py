@@ -598,6 +598,7 @@ class PostTurnProgress:
 
 TurnProgressCallback = Callable[[TurnProgress], None]
 PostTurnProgressCallback = Callable[[PostTurnProgress], None]
+PreparedAutomaticImageCallback = Callable[[dict[str, object]], None]
 PostInputContext = Callable[[], AbstractAsyncContextManager[None]]
 PostTurnWorldUpdateContext = Callable[[], AbstractAsyncContextManager[None]]
 NarratorStreamCallback = Callable[[str], None]
@@ -4639,6 +4640,8 @@ class ChatService:
         verified_coverage: VerifiedPostTurnCoverage | None = None,
         current_user_id: str | None = None,
         defer_image_generation: bool = False,
+        prepared_automatic_image_callback: PreparedAutomaticImageCallback
+        | None = None,
         resume_only: bool = False,
     ) -> dict[str, object]:
         boundary = self._coerce_turn_revision(
@@ -5155,6 +5158,9 @@ class ChatService:
             "image": lambda: self._generate_automatic_image_after_turn_step(
                 prepared_image=prepared_image,
                 defer_image_generation=defer_image_generation,
+                prepared_automatic_image_callback=(
+                    prepared_automatic_image_callback
+                ),
                 current_user_id=current_user_id,
             ),
         }
@@ -7476,6 +7482,8 @@ class ChatService:
         *,
         prepared_image: object | None,
         defer_image_generation: bool,
+        prepared_automatic_image_callback: PreparedAutomaticImageCallback
+        | None,
         current_user_id: str | None,
     ) -> str | _PostTurnStepResult:
         if prepared_image is None:
@@ -7495,11 +7503,24 @@ class ChatService:
         to_json = getattr(prepared_image, "to_json", None)
         if not callable(to_json):
             return "skipped"
+        payload = cast(dict[str, object], to_json())
+        handed_off = False
+        if prepared_automatic_image_callback is not None:
+            try:
+                prepared_automatic_image_callback(payload)
+                handed_off = True
+            except Exception as exc:
+                log_error_event(
+                    "chat.prepared_automatic_image_handoff_failed",
+                    save_id=getattr(prepared_image, "save_id", None),
+                    **exception_log_fields(exc),
+                )
         return _PostTurnStepResult(
             "queued",
             {
                 "deferred_to_background": True,
-                "prepared_automatic_image": to_json(),
+                "early_handoff": handed_off,
+                "prepared_automatic_image": payload,
             },
         )
 

@@ -138,6 +138,7 @@ from bragi.services.chat_service import (
     ChatTurnCancelled,
     NarratorStreamCallback,
     PostTurnProgressCallback,
+    PreparedAutomaticImageCallback,
     TurnProgressCallback,
     TurnRevisionBoundary,
     timeskip_message_body,
@@ -3874,6 +3875,8 @@ class BragiRuntime:
         progress_callback: PostTurnProgressCallback | None = None,
         current_user_id: str | None = None,
         defer_image_generation: bool = False,
+        prepared_automatic_image_callback: PreparedAutomaticImageCallback
+        | None = None,
     ) -> RuntimeModel:
         try:
             chat_service = ChatService(
@@ -3898,6 +3901,27 @@ class BragiRuntime:
                 kwargs["current_user_id"] = current_user_id
             if defer_image_generation and "defer_image_generation" in parameters:
                 kwargs["defer_image_generation"] = True
+            prepared_image_delivered = False
+
+            def deliver_prepared_image(payload: dict[str, object]) -> None:
+                nonlocal prepared_image_delivered
+                if prepared_automatic_image_callback is None:
+                    return
+                try:
+                    prepared_automatic_image_callback(payload)
+                    prepared_image_delivered = True
+                except Exception as exc:
+                    log_error_event(
+                        "runtime.prepared_automatic_image_handoff_failed",
+                        save_id=save_id,
+                        **exception_log_fields(exc),
+                    )
+
+            if (
+                prepared_automatic_image_callback is not None
+                and "prepared_automatic_image_callback" in parameters
+            ):
+                kwargs["prepared_automatic_image_callback"] = deliver_prepared_image
 
             async def run_post_turn() -> dict[str, object]:
                 if "world_update_context" in parameters:
@@ -3918,7 +3942,9 @@ class BragiRuntime:
 
             coordinator_result = await run_post_turn()
             prepared = _prepared_image_from_coordinator_result(coordinator_result)
-            if prepared is not None:
+            if prepared is not None and not prepared_image_delivered:
+                deliver_prepared_image(prepared)
+            if prepared is not None and not prepared_image_delivered:
                 if len(self._deferred_automatic_image_payloads) > 64:
                     self._deferred_automatic_image_payloads.clear()
                 self._deferred_automatic_image_payloads[

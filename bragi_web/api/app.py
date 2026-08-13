@@ -11,7 +11,7 @@ import os
 import secrets
 import socket
 import sqlite3
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass, replace
@@ -9658,6 +9658,33 @@ async def _run_post_turn_jobs_with_ordered_progress(
         progress_queue.put_nowait(progress)
 
     pump_task = asyncio.create_task(pump_progress())
+    image_job_task: asyncio.Task[JobRecord | None] | None = None
+
+    def prepared_automatic_image_callback(
+        prepared_automatic_image: dict[str, object],
+    ) -> None:
+        nonlocal image_job_task
+        if image_job_task is not None:
+            observe(
+                "web.prepared_automatic_image_duplicate_handoff",
+                level="error",
+                save_id=save_id,
+                narrator_message_id=narrator_message_id,
+            )
+            return
+        image_job_task = asyncio.create_task(
+            _queue_prepared_automatic_image(
+                state,
+                save_id=save_id,
+                narrator_message_id=narrator_message_id,
+                prepared_automatic_image=prepared_automatic_image,
+                current_user_id=current_user_id,
+            )
+        )
+        image_job_task.add_done_callback(
+            lambda task: None if task.cancelled() else task.exception()
+        )
+
     try:
         kwargs: dict[str, object] = {
             "save_id": save_id,
@@ -9680,13 +9707,35 @@ async def _run_post_turn_jobs_with_ordered_progress(
             "defer_image_generation",
         ):
             kwargs["defer_image_generation"] = True
+        if _call_accepts_keyword(
+            state.runtime.run_post_turn_jobs,
+            "prepared_automatic_image_callback",
+        ):
+            kwargs["prepared_automatic_image_callback"] = (
+                prepared_automatic_image_callback
+            )
         result = await state.runtime.run_post_turn_jobs(**kwargs)
-        image_job = await _queue_deferred_automatic_image_if_prepared(
-            state,
-            save_id=save_id,
-            narrator_message_id=narrator_message_id,
-            current_user_id=current_user_id,
-        )
+        try:
+            image_job = (
+                await image_job_task
+                if image_job_task is not None
+                else await _queue_deferred_automatic_image_if_prepared(
+                    state,
+                    save_id=save_id,
+                    narrator_message_id=narrator_message_id,
+                    current_user_id=current_user_id,
+                )
+            )
+        except Exception as exc:
+            observe(
+                "web.optional_enrichment_queue_failed",
+                level="error",
+                save_id=save_id,
+                narrator_message_id=narrator_message_id,
+                enrichment="image",
+                **error_fields(exc),
+            )
+            image_job = None
         if image_job is not None and optional_jobs is not None:
             optional_jobs.append(image_job)
         return result
@@ -9825,6 +9874,32 @@ async def _queue_deferred_automatic_image_if_prepared(
     )
     if prepared_automatic_image is None:
         return None
+    return await _queue_prepared_automatic_image(
+        state,
+        save_id=save_id,
+        narrator_message_id=narrator_message_id,
+        prepared_automatic_image=prepared_automatic_image,
+        current_user_id=current_user_id,
+    )
+
+
+async def _queue_prepared_automatic_image(
+    state: WebAppState,
+    *,
+    save_id: str,
+    narrator_message_id: str,
+    prepared_automatic_image: Mapping[str, object],
+    current_user_id: str | None = None,
+) -> JobRecord | None:
+    prepared_source_message_id = prepared_automatic_image.get(
+        "source_message_id"
+    )
+    source_message_id = (
+        prepared_source_message_id
+        if isinstance(prepared_source_message_id, str)
+        and prepared_source_message_id
+        else narrator_message_id
+    )
     run_deferred = getattr(
         state.runtime,
         "run_deferred_automatic_image",
@@ -9834,7 +9909,14 @@ async def _queue_deferred_automatic_image_if_prepared(
         return None
 
     async def worker(post_turn_handle: JobHandle) -> Any:
-        del post_turn_handle
+        await post_turn_handle.event(
+            "progress",
+            {
+                "kind": "scene_arriving",
+                "status_text": "Scene image arriving",
+                "source_message_id": source_message_id,
+            },
+        )
         kwargs: dict[str, object] = {
             "save_id": save_id,
             "prepared_automatic_image": prepared_automatic_image,

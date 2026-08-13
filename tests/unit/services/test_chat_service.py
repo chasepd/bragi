@@ -17404,6 +17404,102 @@ def test_run_post_turn_jobs_defers_automatic_image_generation_when_requested(
     )
 
 
+def test_run_post_turn_jobs_hands_off_prepared_image_while_continuity_runs(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I climb toward the beacon lens.",
+    )
+    narrator_message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon lens hums awake.",
+        provider="fake",
+        model="fake-chat",
+    )
+    events: list[str] = []
+    media_service = PreparedImageRecordingMediaService(
+        repositories=repositories,
+        events=events,
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={},
+        context_search_service=None,
+        media_service=media_service,
+    )
+
+    state_started = asyncio.Event()
+    release_state = asyncio.Event()
+    image_handed_off = asyncio.Event()
+    handed_off_payloads: list[dict[str, object]] = []
+
+    async def state_step(**_kwargs: object) -> str:
+        events.append("state_started")
+        state_started.set()
+        await release_state.wait()
+        repositories.upsert_world_state(
+            save_id=save.id,
+            key="POST_PREPARE_STATE_beacon_lens",
+            value={"status": "mutated after image prepare"},
+            category="scene",
+            source_message_id=narrator_message.id,
+        )
+        events.append("state_finished")
+        return "succeeded"
+
+    async def context_step(**_kwargs: object) -> str:
+        return "succeeded"
+
+    def prepared_image_callback(payload: dict[str, object]) -> None:
+        events.append("automatic_media_handed_off")
+        handed_off_payloads.append(payload)
+        image_handed_off.set()
+
+    monkeypatch.setattr(service, "_extract_state_and_memory_if_configured", state_step)
+    monkeypatch.setattr(service, "_update_context_if_configured", context_step)
+
+    async def run() -> None:
+        post_turn = asyncio.create_task(
+            service.run_post_turn_jobs(
+                save_id=save.id,
+                player_message_id=player_message.id,
+                narrator_message_id=narrator_message.id,
+                defer_image_generation=True,
+                prepared_automatic_image_callback=prepared_image_callback,
+            )
+        )
+        await asyncio.wait_for(state_started.wait(), timeout=1.0)
+        await asyncio.wait_for(image_handed_off.wait(), timeout=1.0)
+        assert not post_turn.done()
+        release_state.set()
+        await asyncio.wait_for(post_turn, timeout=1.0)
+
+    asyncio.run(run())
+
+    assert len(handed_off_payloads) == 1
+    assert handed_off_payloads[0]["source_message_id"] == narrator_message.id
+    assert handed_off_payloads[0]["scene_context"] == (
+        "A red lens hums in the tower."
+    )
+    assert media_service.generated_prepared == []
+    _assert_event_before(events, "automatic_media_prepare", "state_finished")
+    _assert_event_before(events, "automatic_media_handed_off", "state_finished")
+
+
 def test_generate_deferred_automatic_image_reconstructs_and_generates(
     repositories: PersistenceRepositories,
 ) -> None:

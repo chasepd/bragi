@@ -241,7 +241,14 @@ function MediaPrimaryPreview({ asset, activeSaveId }: { asset: MediaAsset; activ
       </span>
     );
   }
-  return <img className="scene-image" src={mediaAssetPath(asset.id, activeSaveId)} alt={asset.prompt_preview} />;
+  return (
+    <img
+      className="scene-image"
+      src={mediaAssetThumbnailPath(asset.id, activeSaveId)}
+      alt={asset.prompt_preview}
+      decoding="async"
+    />
+  );
 }
 
 function MediaHistoryTile({ asset, activeSaveId }: { asset: MediaAsset; activeSaveId: string | null }) {

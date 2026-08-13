@@ -9597,6 +9597,8 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
             self.submit_count = 0
             self.image_started = threading.Event()
             self.release_image = threading.Event()
+            self.continuity_started = threading.Event()
+            self.release_continuity = threading.Event()
             self.second_turn_started = threading.Event()
 
         async def submit_player_message_for_initial_render(
@@ -9632,8 +9634,17 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
             narrator_message_id: str,
             progress_callback: object | None = None,
             defer_image_generation: bool = False,
+            prepared_automatic_image_callback: Callable[
+                [dict[str, object]], None
+            ]
+            | None = None,
         ) -> dict[str, object]:
-            self._payloads[(save_id, narrator_message_id)] = prepared_payload
+            self.continuity_started.set()
+            if prepared_automatic_image_callback is not None:
+                prepared_automatic_image_callback(prepared_payload)
+            else:
+                self._payloads[(save_id, narrator_message_id)] = prepared_payload
+            await asyncio.to_thread(self.release_continuity.wait)
             return {"prepared_automatic_image": prepared_payload}
 
         def consume_deferred_automatic_image(
@@ -9670,6 +9681,7 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
         )
         assert created.status_code == 200
         _wait_for_terminal_job(client, created.json()["id"], save_id="save-1")
+        assert runtime.continuity_started.wait(timeout=2)
         assert runtime.image_started.wait(timeout=2)
         for _ in range(100):
             post_turn_jobs = [
@@ -9677,10 +9689,19 @@ def test_post_turn_jobs_queue_deferred_automatic_image_job(tmp_path: Path) -> No
                 for job in client.get("/api/jobs?status=active").json()["jobs"]
                 if job["type"] == "post_turn_background"
             ]
-            if (
-                post_turn_jobs
-                and post_turn_jobs[0]["completion_level"] == "continuity_ready"
-            ):
+            if post_turn_jobs:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("post-turn job did not become visible")
+        assert post_turn_jobs[0]["completion_level"] == "response_committed"
+
+        runtime.release_continuity.set()
+        for _ in range(100):
+            current_post_turn = client.get(
+                _job_url(post_turn_jobs[0]["id"], "save-1")
+            ).json()
+            if current_post_turn["completion_level"] == "continuity_ready":
                 break
             time.sleep(0.01)
         else:
