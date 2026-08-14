@@ -342,7 +342,6 @@ def test_model_settings_payload_stays_bounded_with_large_split_catalog(
 ) -> None:
     settings = _import_settings_without_gtk(monkeypatch)
     _seed_settings_data(repositories)
-    repositories.set_app_setting("use_shared_roleplay_models", False)
     for index in range(289):
         repositories.save_provider_model(
             provider="openrouter",
@@ -361,9 +360,25 @@ def test_model_settings_payload_stays_bounded_with_large_split_catalog(
             thinking={"levels": ["low", "medium", "high"]},
         )
 
-    selects: list[str] = []
+    shared_selects: list[str] = []
     repositories.connection.set_trace_callback(
-        lambda statement: selects.append(statement)
+        lambda statement: shared_selects.append(statement)
+        if statement.lstrip().upper().startswith("SELECT")
+        else None
+    )
+    try:
+        settings.build_model_settings_model(
+            repositories=repositories,
+            providers=("openrouter", "venice"),
+            current_user_role="admin",
+        )
+    finally:
+        repositories.connection.set_trace_callback(None)
+
+    repositories.set_app_setting("use_shared_roleplay_models", False)
+    split_selects: list[str] = []
+    repositories.connection.set_trace_callback(
+        lambda statement: split_selects.append(statement)
         if statement.lstrip().upper().startswith("SELECT")
         else None
     )
@@ -379,7 +394,49 @@ def test_model_settings_payload_stays_bounded_with_large_split_catalog(
 
     assert len(model.model_options) == 300
     assert len(payload.encode()) < 2_000_000
-    assert len(selects) < 150
+    assert len(split_selects) < 100
+    assert abs(len(split_selects) - len(shared_selects)) < 10
+
+
+def test_model_settings_model_hides_admin_controls_for_non_admin(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    _seed_settings_data(repositories)
+
+    model = settings.build_model_settings_model(
+        repositories=repositories,
+        providers=("openrouter", "venice"),
+        current_user_role="user",
+    )
+
+    assert model.model_options == ()
+    assert model.model_option_pools == {}
+    assert model.task_model_selectors == ()
+    assert model.roleplay_model_groups == ()
+    assert model.model_routing_profiles is None
+
+
+def test_save_settings_model_hides_controls_for_child(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    _seed_settings_data(repositories)
+
+    model = settings.build_save_settings_model(
+        repositories=repositories,
+        providers=("openrouter", "venice"),
+        active_save_id="save-1",
+        current_user_role="child",
+        current_user_id="child-1",
+    )
+
+    assert model.model_options == ()
+    assert model.save_model_override_selectors == ()
+    assert model.turn_responsiveness_mode is None
+    assert model.context_budget is None
 
 
 def test_provider_settings_model_hides_provider_cards_for_non_admin(

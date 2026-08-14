@@ -425,7 +425,7 @@ export function SettingsPanel({
     },
     onSuccess: async (_data, variables) => {
       if (SAVE_SCOPED_SETTING_KEYS.has(variables.key)) {
-        client.invalidateQueries({ queryKey: ["settings", "save"] });
+        client.invalidateQueries({ queryKey: ["settings", "save", variables.save_id ?? null] });
         client.invalidateQueries({ queryKey: ["runtime"] });
       } else if (LOCAL_SETTING_KEYS.has(variables.key)) {
         client.invalidateQueries({ queryKey: ["settings", "local"] });
@@ -1404,6 +1404,14 @@ function ModelSelectorGroups({ selectors, emptyLabel, saveId = null }: { selecto
 
 function ModelRoutingLaneRow({ lane, compact = false, saveId = null }: { lane: ModelRoutingLane; compact?: boolean; saveId?: string | null }) {
   const client = useQueryClient();
+  const invalidateSettings = () => {
+    if (saveId) {
+      client.invalidateQueries({ queryKey: ["settings", "save", saveId] });
+      return;
+    }
+    client.invalidateQueries({ queryKey: ["settings", "models"] });
+    client.invalidateQueries({ queryKey: ["settings", "save"] });
+  };
   const commonSelected = commonSelectedModelValue(lane.selectors, lane.options);
   const optionSignature = lane.options.map(modelOptionValue).join("\u0001");
   const [selectedValue, setSelectedValue] = useState(commonSelected);
@@ -1439,8 +1447,7 @@ function ModelRoutingLaneRow({ lane, compact = false, saveId = null }: { lane: M
     },
     onError: (failure) => setError(failure instanceof Error ? failure.message : "Could not save model preferences"),
     onSettled: () => {
-      client.invalidateQueries({ queryKey: ["settings", "models"] });
-      client.invalidateQueries({ queryKey: ["settings", "save"] });
+      invalidateSettings();
       client.invalidateQueries({ queryKey: ["runtime"] });
     }
   });
@@ -3796,6 +3803,14 @@ function thinkingLevelTooltip(control: ThinkingLevelControl): string {
 
 function ModelSelector({ selector, labelOverride, saveId = null }: { selector: TaskModelSelector; labelOverride?: string; saveId?: string | null }) {
   const client = useQueryClient();
+  const invalidateSettings = () => {
+    if (saveId) {
+      client.invalidateQueries({ queryKey: ["settings", "save", saveId] });
+      return;
+    }
+    client.invalidateQueries({ queryKey: ["settings", "models"] });
+    client.invalidateQueries({ queryKey: ["settings", "save"] });
+  };
   const [error, setError] = useState("");
   const selectedValue = modelPreferenceValue(selector.selected_provider, selector.selected_model_id);
   const label = labelOverride ?? selector.label ?? taskLabel(selector.task);
@@ -3807,8 +3822,7 @@ function ModelSelector({ selector, labelOverride, saveId = null }: { selector: T
     ),
     onSuccess: () => {
       setError("");
-      client.invalidateQueries({ queryKey: ["settings", "models"] });
-      client.invalidateQueries({ queryKey: ["settings", "save"] });
+      invalidateSettings();
       client.invalidateQueries({ queryKey: ["runtime"] });
     },
     onError: (failure) => setError(failure instanceof Error ? failure.message : "Could not save model preference")
@@ -3817,8 +3831,7 @@ function ModelSelector({ selector, labelOverride, saveId = null }: { selector: T
     mutationFn: () => deleteJson(modelPreferencePath(selector.task, saveId)),
     onSuccess: () => {
       setError("");
-      client.invalidateQueries({ queryKey: ["settings", "models"] });
-      client.invalidateQueries({ queryKey: ["settings", "save"] });
+      invalidateSettings();
       client.invalidateQueries({ queryKey: ["runtime"] });
     },
     onError: (failure) => setError(failure instanceof Error ? failure.message : "Could not clear model preference")
@@ -3839,8 +3852,7 @@ function ModelSelector({ selector, labelOverride, saveId = null }: { selector: T
     },
     onSuccess: () => {
       setError("");
-      client.invalidateQueries({ queryKey: ["settings", "models"] });
-      client.invalidateQueries({ queryKey: ["settings", "save"] });
+      invalidateSettings();
       client.invalidateQueries({ queryKey: ["runtime"] });
     },
     onError: (failure) => setError(failure instanceof Error ? failure.message : "Could not save thinking level")

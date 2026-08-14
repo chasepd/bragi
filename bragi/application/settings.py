@@ -622,7 +622,7 @@ class SettingsModel:
     debug_logging: ToggleControl | None
     pending_jobs_display_mode: ChoiceControl | None
     user_narration_guidance: TextControl | None
-    content_rating: ContentRatingControl
+    content_rating: ContentRatingControl | None
     fade_to_black: ToggleControl | None
     automatic_image_generation: ToggleControl | None
     image_style_preset: ChoiceControl | None
@@ -806,6 +806,10 @@ def build_model_settings_model(
         current_user_role=current_user_role,
         _include_openrouter=False,
         _include_save_model_selectors=False,
+        _include_provider_controls=False,
+        _include_save_controls=False,
+        _include_local_controls=False,
+        _include_legacy_controls=False,
     )
     normalizer = _ModelOptionNormalizer()
     task_selectors = normalizer.references(settings.task_model_selectors)
@@ -863,6 +867,10 @@ def build_save_settings_model(
         current_user_id=current_user_id,
         _include_openrouter=False,
         _include_global_model_selectors=False,
+        _include_provider_controls=False,
+        _include_global_model_controls=False,
+        _include_local_controls=False,
+        _include_legacy_controls=False,
     )
     normalizer = _ModelOptionNormalizer()
     selectors = normalizer.references(settings.save_model_override_selectors)
@@ -922,6 +930,11 @@ def build_settings_model(
     _include_openrouter: bool = True,
     _include_global_model_selectors: bool = True,
     _include_save_model_selectors: bool = True,
+    _include_provider_controls: bool = True,
+    _include_global_model_controls: bool = True,
+    _include_save_controls: bool = True,
+    _include_local_controls: bool = True,
+    _include_legacy_controls: bool = True,
 ) -> SettingsModel:
     repositories = cast(PersistenceRepositories, _SettingsReadCache(repositories))
     option_token = _MODEL_OPTION_POOL_CACHE.set({})
@@ -939,6 +952,11 @@ def build_settings_model(
             _include_openrouter=_include_openrouter,
             _include_global_model_selectors=_include_global_model_selectors,
             _include_save_model_selectors=_include_save_model_selectors,
+            _include_provider_controls=_include_provider_controls,
+            _include_global_model_controls=_include_global_model_controls,
+            _include_save_controls=_include_save_controls,
+            _include_local_controls=_include_local_controls,
+            _include_legacy_controls=_include_legacy_controls,
         )
     finally:
         _MODEL_OPTION_POOL_CACHE.reset(option_token)
@@ -958,53 +976,68 @@ def _build_settings_model(
     _include_openrouter: bool = True,
     _include_global_model_selectors: bool = True,
     _include_save_model_selectors: bool = True,
+    _include_provider_controls: bool = True,
+    _include_global_model_controls: bool = True,
+    _include_save_controls: bool = True,
+    _include_local_controls: bool = True,
+    _include_legacy_controls: bool = True,
 ) -> SettingsModel:
     is_admin = current_user_role in {None, "admin"}
     is_user = current_user_role == "user"
     is_child = current_user_role == "child"
-    save_controls_visible = is_admin or is_user
+    save_controls_visible = (is_admin or is_user) and _include_save_controls
+    global_model_controls_visible = is_admin and _include_global_model_controls
+    local_controls_visible = _include_local_controls
     visible_sections = _visible_sections(current_user_role)
-    content_safety = effective_content_safety_policy(
-        repositories,
-        user_id=current_user_id,
+    content_safety = (
+        effective_content_safety_policy(repositories, user_id=current_user_id)
+        if local_controls_visible
+        else None
     )
-    child_admin_grant = is_child and content_safety.rating == CONTENT_RATING_PG_13
+    child_admin_grant = bool(
+        is_child
+        and content_safety is not None
+        and content_safety.rating == CONTENT_RATING_PG_13
+    )
     return SettingsModel(
         provider_cards=tuple(
             _provider_card(repositories=repositories, provider=provider)
             for provider in providers
         )
-        if is_admin and _include_global_model_selectors
+        if is_admin and _include_provider_controls
         else (),
         task_model_selectors=tuple(
             _task_selector(repositories=repositories, task=task) for task in TASKS
         )
-        if is_admin and _include_global_model_selectors
+        if global_model_controls_visible and _include_global_model_selectors
         else (),
         save_model_override_selectors=_save_model_override_selectors(
             repositories=repositories,
             active_save_id=active_save_id,
         )
-        if is_admin and active_save_id and _include_save_model_selectors
+        if is_admin
+        and active_save_id
+        and _include_save_controls
+        and _include_save_model_selectors
         else (),
         roleplay_shared_models=ToggleControl(
             setting_key=ROLEPLAY_SHARED_MODE_SETTING,
             enabled=shared_roleplay_models_enabled(repositories),
         )
-        if is_admin and _include_global_model_selectors
+        if global_model_controls_visible and _include_global_model_selectors
         else None,
         roleplay_model_groups=(
             _roleplay_model_groups(repositories)
-            if is_admin and _include_global_model_selectors
+            if global_model_controls_visible and _include_global_model_selectors
             else ()
         ),
         scenario_section_model_selectors=_scenario_section_model_selectors(
             repositories
         )
-        if is_admin and _include_global_model_selectors
+        if global_model_controls_visible and _include_global_model_selectors
         else (),
         model_routing_profiles=model_routing_profiles_model(repositories)
-        if is_admin
+        if global_model_controls_visible
         else None,
         retry_count=NumberControl(
             setting_key=RETRY_COUNT_SETTING,
@@ -1020,7 +1053,7 @@ def _build_settings_model(
             maximum=MAX_RETRY_COUNT,
             step=RETRY_COUNT_STEP,
         )
-        if is_admin
+        if global_model_controls_visible
         else None,
         provider_call_deadline_seconds=NumberControl(
             setting_key=PROVIDER_CALL_DEADLINE_SETTING,
@@ -1036,7 +1069,7 @@ def _build_settings_model(
             maximum=int(MAX_PROVIDER_CALL_DEADLINE_SECONDS),
             step=int(PROVIDER_CALL_DEADLINE_STEP),
         )
-        if is_admin
+        if global_model_controls_visible
         else None,
         turn_responsiveness_mode=ChoiceControl(
             setting_key=TURN_RESPONSIVENESS_MODE_SETTING,
@@ -1247,7 +1280,7 @@ def _build_settings_model(
             setting_key=GENERATED_PHRASE_DENYLIST_SETTING,
             value=generated_phrase_denylist_text(repositories),
         )
-        if is_admin
+        if is_admin and _include_save_controls
         else None,
         save_generated_phrase_denylist=TextControl(
             setting_key=SAVE_GENERATED_PHRASE_DENYLIST_SETTING,
@@ -1269,7 +1302,7 @@ def _build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and _include_legacy_controls
         else None,
         structured_output_fallback=ToggleControl(
             setting_key="structured_output_fallback_enabled",
@@ -1282,7 +1315,7 @@ def _build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and _include_legacy_controls
         else None,
         tool_call_fallback=ToggleControl(
             setting_key="tool_call_fallback_enabled",
@@ -1295,7 +1328,7 @@ def _build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and _include_legacy_controls
         else None,
         image_fallback=ToggleControl(
             setting_key="image_fallback_enabled",
@@ -1308,7 +1341,7 @@ def _build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and _include_legacy_controls
         else None,
         video_fallback=ToggleControl(
             setting_key="video_fallback_enabled",
@@ -1321,7 +1354,7 @@ def _build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and _include_legacy_controls
         else None,
         venice_image_safe_mode=ToggleControl(
             setting_key="venice_image_safe_mode",
@@ -1348,11 +1381,15 @@ def _build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and local_controls_visible
         else None,
-        pending_jobs_display_mode=_pending_jobs_display_mode_control(
-            repositories,
-            current_user_id=current_user_id,
+        pending_jobs_display_mode=(
+            _pending_jobs_display_mode_control(
+                repositories,
+                current_user_id=current_user_id,
+            )
+            if local_controls_visible
+            else None
         ),
         user_narration_guidance=TextControl(
             setting_key=USER_NARRATION_GUIDANCE_SETTING,
@@ -1364,7 +1401,9 @@ def _build_settings_model(
                     current_user_id=current_user_id,
                 )
             ),
-        ),
+        )
+        if local_controls_visible
+        else None,
         content_rating=ContentRatingControl(
             setting_key=CONTENT_FILTER_RATING_SETTING,
             selected=content_safety.rating,
@@ -1376,9 +1415,11 @@ def _build_settings_model(
             if is_child
             else CONTENT_RATING_OPTIONS,
             admin_granted=child_admin_grant,
-        ),
+        )
+        if content_safety is not None
+        else None,
         fade_to_black=None
-        if is_child
+        if is_child or content_safety is None
         else ToggleControl(
             setting_key=FADE_TO_BLACK_ENABLED_SETTING,
             enabled=content_safety.fade_to_black_enabled,
@@ -1464,7 +1505,11 @@ def _build_settings_model(
         )
         if save_controls_visible
         else None,
-        secret_storage_warning=secret_storage_warning if is_admin else None,
+        secret_storage_warning=(
+            secret_storage_warning
+            if is_admin and _include_provider_controls
+            else None
+        ),
         visible_sections=visible_sections,
     )
 
