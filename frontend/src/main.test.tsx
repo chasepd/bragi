@@ -12863,22 +12863,33 @@ describe("frontend helpers", () => {
     );
 
     const fullSettingsReads = () => fetchMock.mock.calls.filter(([path]) => path === "/api/settings?save_id=save-1");
+    const sectionReads = (path: string) => fetchMock.mock.calls.filter(([calledPath]) => calledPath === path);
     await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/shell")).toBe(true));
     expect(fullSettingsReads()).toHaveLength(0);
     expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings")).toBe(false);
 
     await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/providers")).toBe(true));
+    await waitFor(() => expect(sectionReads("/api/settings/providers")).toHaveLength(1));
+    expect(sectionReads("/api/settings/openrouter")).toHaveLength(0);
+    expect(sectionReads("/api/settings/models")).toHaveLength(0);
+    expect(sectionReads("/api/settings/save?save_id=save-1")).toHaveLength(0);
+    expect(sectionReads("/api/settings/local")).toHaveLength(0);
     expect(fullSettingsReads()).toHaveLength(0);
     await userEvent.click(screen.getByRole("tab", { name: "OpenRouter" }));
-    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/openrouter")).toBe(true));
+    await waitFor(() => expect(sectionReads("/api/settings/openrouter")).toHaveLength(1));
+    expect(sectionReads("/api/settings/models")).toHaveLength(0);
+    expect(sectionReads("/api/settings/save?save_id=save-1")).toHaveLength(0);
+    expect(sectionReads("/api/settings/local")).toHaveLength(0);
     await userEvent.click(screen.getByRole("tab", { name: "Models" }));
-    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/models")).toBe(true));
+    await waitFor(() => expect(sectionReads("/api/settings/models")).toHaveLength(1));
+    expect(sectionReads("/api/settings/save?save_id=save-1")).toHaveLength(0);
+    expect(sectionReads("/api/settings/local")).toHaveLength(0);
     await userEvent.click(screen.getByRole("tab", { name: "Save" }));
-    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/save?save_id=save-1")).toBe(true));
+    await waitFor(() => expect(sectionReads("/api/settings/save?save_id=save-1")).toHaveLength(1));
+    expect(sectionReads("/api/settings/local")).toHaveLength(0);
     await userEvent.click(screen.getByRole("tab", { name: "Local" }));
-    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/local")).toBe(true));
+    await waitFor(() => expect(sectionReads("/api/settings/local")).toHaveLength(1));
     expect(fullSettingsReads()).toHaveLength(0);
   });
 
