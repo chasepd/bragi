@@ -76,7 +76,10 @@ class BragiApiBindings:
 @dataclass(frozen=True)
 class BragiSettingsBindings:
     build_settings_model: Any
+    build_model_settings_model: Any
+    build_openrouter_settings_model: Any
     build_provider_settings_model: Any
+    build_save_settings_model: Any
     build_local_settings_model: Any
     configuration_diagnostics: Any
 
@@ -214,10 +217,15 @@ def bragi_settings_bindings() -> BragiSettingsBindings:
     settings = _module("bragi.application.settings")
     return BragiSettingsBindings(
         build_settings_model=_required(settings, "build_settings_model"),
+        build_model_settings_model=_required(settings, "build_model_settings_model"),
+        build_openrouter_settings_model=_required(
+            settings, "build_openrouter_settings_model"
+        ),
         build_provider_settings_model=_required(
             settings,
             "build_provider_settings_model",
         ),
+        build_save_settings_model=_required(settings, "build_save_settings_model"),
         build_local_settings_model=_required(
             settings,
             "build_local_settings_model",

@@ -5451,6 +5451,50 @@ def test_provider_settings_endpoint_returns_only_provider_section(
     assert "openrouter_routing" not in payload
 
 
+def test_model_settings_endpoint_returns_normalized_model_section(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BRAGI_WEB_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("BRAGI_WEB_FAKE_PROVIDERS", "1")
+
+    with TestClient(create_app()) as client:
+        models = client.get("/api/settings/models")
+
+    assert models.status_code == 200
+    payload = models.json()
+    assert payload["model_options"]
+    assert payload["model_option_pools"]
+    assert payload["task_model_selectors"]
+    assert all(
+        "option_pool" in selector and "options" not in selector
+        for selector in payload["task_model_selectors"]
+    )
+    assert "provider_cards" not in payload
+    assert "automatic_summarization" not in payload
+
+
+def test_openrouter_and_save_settings_endpoints_return_only_their_sections(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BRAGI_WEB_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("BRAGI_WEB_FAKE_PROVIDERS", "1")
+
+    with TestClient(create_app()) as client:
+        openrouter = client.get("/api/settings/openrouter")
+        save = client.get("/api/settings/save")
+
+    assert openrouter.status_code == 200
+    assert set(openrouter.json()) == {"openrouter_routing"}
+    assert save.status_code == 200
+    save_payload = save.json()
+    assert "automatic_summarization" in save_payload
+    assert "task_model_selectors" not in save_payload
+    assert "openrouter_routing" not in save_payload
+    assert "provider_cards" not in save_payload
+
+
 def test_settings_omit_secret_storage_warning_when_service_has_none(
     tmp_path: Path,
 ) -> None:

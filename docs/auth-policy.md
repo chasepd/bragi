@@ -186,6 +186,9 @@ or per user/session before using a save ID.
 | `/api/settings` | Authenticated | Return only settings visible to the current role. |
 | `/api/settings/shell` | Authenticated | Return only lightweight workbench presentation settings visible to the current role. |
 | `/api/settings/providers` | Authenticated | Return only provider settings visible to the current role; admin-only secret storage warnings stay hidden from non-admin users. |
+| `/api/settings/models` | Authenticated | Return normalized global model settings only when visible to the current role. |
+| `/api/settings/openrouter` | Authenticated | Return OpenRouter routing settings only when visible to the current role. |
+| `/api/settings/save` | Authenticated | Return only role-visible settings for the requested accessible save. |
 | `/api/log/client` | Authenticated | Accept sanitized client logs from authenticated sessions. |
 | `/api/settings/provider-key` | Admin-only | Set provider keys only as admin. |
 | `/api/settings/provider-key/{provider}` | Admin-only | Clear provider keys only as admin. |

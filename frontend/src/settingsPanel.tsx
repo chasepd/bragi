@@ -59,7 +59,9 @@ import type {
   JobStepSummary,
   LocalSettingsModel,
   MaintenanceJobDiagnostic,
+  ModelSettingsModel,
   ModelOption,
+  OpenRouterSettingsModel,
   OpenRouterProviderCatalogEntry,
   OpenRouterRoutingProfile,
   OpenRouterRoutingSettings as OpenRouterRoutingSettingsModel,
@@ -70,10 +72,12 @@ import type {
   RuntimePerformanceReport,
   RuntimePerformanceRow,
   RuntimeSlowOperation,
+  SaveSettingsModel,
   SchedulerHealthReport,
   SchedulerHealthTask,
   SettingsModel,
   TaskModelSelector,
+  TaskModelSelectorReference,
   TerminalJobSummary,
   ThinkingLevelControl,
   ToggleControl,
@@ -129,7 +133,6 @@ import {
   selectedOption,
   SETTINGS_TAB_TOOLTIPS,
   EMPTY_DIAGNOSTICS_FILTERS,
-  settingsQueryOptions,
   settingLabel,
   settingTooltip,
   scriptGuardModeLabel,
@@ -245,16 +248,82 @@ function localSettingsQueryOptions() {
   };
 }
 
+function openRouterSettingsQueryOptions() {
+  return {
+    queryKey: ["settings", "openrouter"] as const,
+    queryFn: ({ signal }: { signal: AbortSignal }) => apiRead<OpenRouterSettingsModel>("/api/settings/openrouter", signal),
+    staleTime: SETTINGS_SECTION_STALE_MS
+  };
+}
+
+function modelSettingsQueryOptions() {
+  return {
+    queryKey: ["settings", "models"] as const,
+    queryFn: async ({ signal }: { signal: AbortSignal }) => {
+      const section = await apiRead<ModelSettingsModel>("/api/settings/models", signal);
+      return hydrateNormalizedSettings(section);
+    },
+    staleTime: SETTINGS_SECTION_STALE_MS
+  };
+}
+
+function saveSettingsQueryOptions(activeSaveId: string | null) {
+  const path = activeSaveId
+    ? `/api/settings/save?save_id=${encodeURIComponent(activeSaveId)}`
+    : "/api/settings/save";
+  return {
+    queryKey: ["settings", "save", activeSaveId] as const,
+    queryFn: async ({ signal }: { signal: AbortSignal }) => {
+      const section = await apiRead<SaveSettingsModel>(path, signal);
+      return hydrateNormalizedSettings(section);
+    },
+    staleTime: SETTINGS_SECTION_STALE_MS
+  };
+}
+
+function hydrateNormalizedSettings(
+  settings: ModelSettingsModel | SaveSettingsModel
+): SettingsModel {
+  const pools = new Map<string, ModelOption[]>();
+  const optionsFor = (selector: TaskModelSelectorReference): TaskModelSelector => {
+    let options = pools.get(selector.option_pool);
+    if (!options) {
+      options = (settings.model_option_pools[selector.option_pool] ?? [])
+        .map((index) => settings.model_options[index]);
+      pools.set(selector.option_pool, options);
+    }
+    const { option_pool: _optionPool, ...rest } = selector;
+    return { ...rest, options };
+  };
+  if ("task_model_selectors" in settings) {
+    return {
+      ...settings,
+      provider_cards: [],
+      save_model_override_selectors: [],
+      task_model_selectors: settings.task_model_selectors.map(optionsFor),
+      roleplay_model_groups: settings.roleplay_model_groups.map((group) => ({
+        ...group,
+        selectors: group.selectors.map(optionsFor)
+      })),
+      scenario_section_model_selectors: settings.scenario_section_model_selectors?.map(optionsFor)
+    };
+  }
+  return {
+    ...settings,
+    provider_cards: [],
+    task_model_selectors: [],
+    roleplay_model_groups: [],
+    scenario_section_model_selectors: [],
+    save_model_override_selectors: settings.save_model_override_selectors?.map(optionsFor)
+  };
+}
+
 function visibleSettingsSectionsForRole(role?: string | null): SettingsTab[] {
   if (role === "child") return ["local"];
   if (role === "user") return ["save", "local", "diagnostics"];
   const tabs: SettingsTab[] = ["providers", "openrouter", "models", "save", "local", "diagnostics"];
   if (role === "admin") tabs.push("users");
   return tabs;
-}
-
-function tabUsesFullSettings(tab: SettingsTab): boolean {
-  return tab === "openrouter" || tab === "models" || tab === "save";
 }
 
 export function SettingsPanel({
@@ -281,9 +350,17 @@ export function SettingsPanel({
     (section: SettingsTab) => visibleSectionSet.has(section),
     [visibleSectionSet]
   );
-  const settings = useQuery({
-    ...settingsQueryOptions(activeSaveId),
-    enabled: tabUsesFullSettings(tab) && sectionVisible(tab)
+  const openRouterSettings = useQuery({
+    ...openRouterSettingsQueryOptions(),
+    enabled: tab === "openrouter" && sectionVisible("openrouter")
+  });
+  const modelSettings = useQuery({
+    ...modelSettingsQueryOptions(),
+    enabled: tab === "models" && sectionVisible("models")
+  });
+  const saveSettings = useQuery({
+    ...saveSettingsQueryOptions(activeSaveId),
+    enabled: tab === "save" && sectionVisible("save")
   });
   const providerSettings = useQuery({
     ...providerSettingsQueryOptions(),
@@ -298,25 +375,39 @@ export function SettingsPanel({
       ? providerSettings.data
       : tab === "local"
         ? localSettings.data
-        : settings.data
+        : tab === "openrouter"
+          ? openRouterSettings.data
+          : tab === "models"
+            ? modelSettings.data
+            : tab === "save"
+              ? saveSettings.data
+              : undefined
   );
   const activeSettingsLoading = (
     tab === "providers"
       ? providerSettings.isLoading
       : tab === "local"
         ? localSettings.isLoading
-        : tabUsesFullSettings(tab)
-          ? settings.isLoading
-          : false
+        : tab === "openrouter"
+          ? openRouterSettings.isLoading
+          : tab === "models"
+            ? modelSettings.isLoading
+            : tab === "save"
+              ? saveSettings.isLoading
+              : false
   );
   const activeSettingsError = (
     tab === "providers"
       ? providerSettings.error
       : tab === "local"
         ? localSettings.error
-        : tabUsesFullSettings(tab)
-          ? settings.error
-          : null
+        : tab === "openrouter"
+          ? openRouterSettings.error
+          : tab === "models"
+            ? modelSettings.error
+            : tab === "save"
+              ? saveSettings.error
+              : null
   );
   const updateScoped = useMutation({
     mutationFn: ({
@@ -334,7 +425,7 @@ export function SettingsPanel({
     },
     onSuccess: async (_data, variables) => {
       if (SAVE_SCOPED_SETTING_KEYS.has(variables.key)) {
-        client.invalidateQueries({ queryKey: ["settings", "full"] });
+        client.invalidateQueries({ queryKey: ["settings", "save"] });
         client.invalidateQueries({ queryKey: ["runtime"] });
       } else if (LOCAL_SETTING_KEYS.has(variables.key)) {
         client.invalidateQueries({ queryKey: ["settings", "local"] });
@@ -344,7 +435,8 @@ export function SettingsPanel({
           await client.resetQueries();
         }
       } else {
-        client.invalidateQueries({ queryKey: ["settings", "full"] });
+        client.invalidateQueries({ queryKey: ["settings", "models"] });
+        client.invalidateQueries({ queryKey: ["settings", "openrouter"] });
       }
     }
   });
@@ -400,15 +492,15 @@ export function SettingsPanel({
           onRefresh={async (provider) => {
             runJob(await postJson<Job>(`/api/settings/model-refresh/${provider}`, {}));
             client.invalidateQueries({ queryKey: ["settings", "providers"] });
-            client.invalidateQueries({ queryKey: ["settings", "full"] });
+            client.invalidateQueries({ queryKey: ["settings", "models"] });
           }}
         />
       ) : null}
-      {tab === "openrouter" && sectionVisible("openrouter") ? <OpenRouterRoutingSettings settings={settings.data} updateLocal={updateSetting} disabled={updateScoped.isPending} /> : null}
-      {tab === "models" && sectionVisible("models") ? <ModelSettings settings={settings.data} updateLocal={updateSetting} disabled={updateScoped.isPending} /> : null}
+      {tab === "openrouter" && sectionVisible("openrouter") ? <OpenRouterRoutingSettings settings={openRouterSettings.data} updateLocal={updateSetting} disabled={updateScoped.isPending} /> : null}
+      {tab === "models" && sectionVisible("models") ? <ModelSettings settings={modelSettings.data} updateLocal={updateSetting} disabled={updateScoped.isPending} /> : null}
       {tab === "save" && sectionVisible("save") ? (
         <SaveSettingsControls
-          settings={settings.data}
+          settings={saveSettings.data}
           activeSaveId={activeSaveId}
           storytellerMode={storytellerMode}
           updateLocal={updateSetting}
@@ -1020,7 +1112,8 @@ function SimpleModelSelectorRow({ group, disabled }: { group: SimpleModelSelecto
     },
     onError: (failure) => setError(failure instanceof Error ? failure.message : "Could not save simple model selectors"),
     onSettled: () => {
-      client.invalidateQueries({ queryKey: ["settings", "full"] });
+      client.invalidateQueries({ queryKey: ["settings", "models"] });
+      client.invalidateQueries({ queryKey: ["settings", "save"] });
       client.invalidateQueries({ queryKey: ["runtime"] });
     }
   });
@@ -1168,7 +1261,8 @@ function ModelRoutingProfileControls({ settings }: { settings: SettingsModel }) 
   }, [profileSettings?.last_loaded_profile_id, profileSignature]);
 
   const invalidate = (includeRuntime = false) => {
-    client.invalidateQueries({ queryKey: ["settings", "full"] });
+    client.invalidateQueries({ queryKey: ["settings", "models"] });
+    client.invalidateQueries({ queryKey: ["settings", "save"] });
     if (includeRuntime) client.invalidateQueries({ queryKey: ["runtime"] });
   };
   const saveProfile = useMutation({
@@ -1345,7 +1439,8 @@ function ModelRoutingLaneRow({ lane, compact = false, saveId = null }: { lane: M
     },
     onError: (failure) => setError(failure instanceof Error ? failure.message : "Could not save model preferences"),
     onSettled: () => {
-      client.invalidateQueries({ queryKey: ["settings", "full"] });
+      client.invalidateQueries({ queryKey: ["settings", "models"] });
+      client.invalidateQueries({ queryKey: ["settings", "save"] });
       client.invalidateQueries({ queryKey: ["runtime"] });
     }
   });
@@ -1560,7 +1655,7 @@ function OpenRouterRoutingSettings({
   updateLocal,
   disabled
 }: {
-  settings?: SettingsModel;
+  settings?: Partial<SettingsModel>;
   updateLocal: (key: string, value: unknown) => void;
   disabled: boolean;
 }) {
@@ -3712,7 +3807,8 @@ function ModelSelector({ selector, labelOverride, saveId = null }: { selector: T
     ),
     onSuccess: () => {
       setError("");
-      client.invalidateQueries({ queryKey: ["settings", "full"] });
+      client.invalidateQueries({ queryKey: ["settings", "models"] });
+      client.invalidateQueries({ queryKey: ["settings", "save"] });
       client.invalidateQueries({ queryKey: ["runtime"] });
     },
     onError: (failure) => setError(failure instanceof Error ? failure.message : "Could not save model preference")
@@ -3721,7 +3817,8 @@ function ModelSelector({ selector, labelOverride, saveId = null }: { selector: T
     mutationFn: () => deleteJson(modelPreferencePath(selector.task, saveId)),
     onSuccess: () => {
       setError("");
-      client.invalidateQueries({ queryKey: ["settings", "full"] });
+      client.invalidateQueries({ queryKey: ["settings", "models"] });
+      client.invalidateQueries({ queryKey: ["settings", "save"] });
       client.invalidateQueries({ queryKey: ["runtime"] });
     },
     onError: (failure) => setError(failure instanceof Error ? failure.message : "Could not clear model preference")
@@ -3742,7 +3839,8 @@ function ModelSelector({ selector, labelOverride, saveId = null }: { selector: T
     },
     onSuccess: () => {
       setError("");
-      client.invalidateQueries({ queryKey: ["settings", "full"] });
+      client.invalidateQueries({ queryKey: ["settings", "models"] });
+      client.invalidateQueries({ queryKey: ["settings", "save"] });
       client.invalidateQueries({ queryKey: ["runtime"] });
     },
     onError: (failure) => setError(failure instanceof Error ? failure.message : "Could not save thinking level")

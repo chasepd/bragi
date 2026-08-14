@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import builtins
 import importlib
+import json
 import sqlite3
 import sys
 from collections.abc import Iterator, Mapping
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -299,6 +301,85 @@ def test_provider_settings_model_exposes_only_provider_section(
     assert _value(model, "secret_storage_warning") == "Secret storage unavailable."
     assert not hasattr(model, "task_model_selectors")
     assert not hasattr(model, "pending_jobs_display_mode")
+
+
+def test_model_settings_model_normalizes_shared_model_options(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    _seed_settings_data(repositories)
+
+    model = settings.build_model_settings_model(
+        repositories=repositories,
+        providers=("openrouter", "venice"),
+        current_user_role="admin",
+    )
+
+    selectors = [*_list(_value(model, "task_model_selectors"))]
+    for group in _list(_value(model, "roleplay_model_groups")):
+        selectors.extend(_list(_value(group, "selectors")))
+    selectors.extend(_list(_value(model, "scenario_section_model_selectors")))
+    catalog = _list(_value(model, "model_options"))
+    pools = _value(model, "model_option_pools")
+
+    assert selectors
+    assert catalog
+    assert isinstance(pools, Mapping)
+    assert all(not hasattr(selector, "options") for selector in selectors)
+    assert all(_value(selector, "option_pool") in pools for selector in selectors)
+    assert len(catalog) == len(
+        {
+            (_value(option, "provider"), _value(option, "model_id"))
+            for option in catalog
+        }
+    )
+
+
+def test_model_settings_payload_stays_bounded_with_large_split_catalog(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    _seed_settings_data(repositories)
+    repositories.set_app_setting("use_shared_roleplay_models", False)
+    for index in range(289):
+        repositories.save_provider_model(
+            provider="openrouter",
+            model_id=f"synthetic/model-{index:03d}",
+            display_name=f"Synthetic Model {index:03d}",
+            capabilities=[
+                "chat",
+                "structured_output",
+                "tool_calling",
+                "image_generation",
+                "image_to_image",
+                "text_to_video",
+                "image_to_video",
+                "vision",
+            ],
+            thinking={"levels": ["low", "medium", "high"]},
+        )
+
+    selects: list[str] = []
+    repositories.connection.set_trace_callback(
+        lambda statement: selects.append(statement)
+        if statement.lstrip().upper().startswith("SELECT")
+        else None
+    )
+    try:
+        model = settings.build_model_settings_model(
+            repositories=repositories,
+            providers=("openrouter", "venice"),
+            current_user_role="admin",
+        )
+    finally:
+        repositories.connection.set_trace_callback(None)
+    payload = json.dumps(asdict(model), separators=(",", ":"))
+
+    assert len(model.model_options) == 300
+    assert len(payload.encode()) < 2_000_000
+    assert len(selects) < 150
 
 
 def test_provider_settings_model_hides_provider_cards_for_non_admin(

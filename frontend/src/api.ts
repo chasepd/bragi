@@ -484,6 +484,32 @@ export type SettingsModel = {
 };
 export type ProviderSettingsModel = Pick<SettingsModel, "provider_cards" | "secret_storage_warning">;
 export type LocalSettingsModel = Pick<SettingsModel, "pending_jobs_display_mode" | "user_narration_guidance" | "content_rating" | "fade_to_black" | "debug_logging">;
+export type TaskModelSelectorReference = Omit<TaskModelSelector, "options"> & {
+  option_pool: string;
+};
+export type RoleplayModelGroupReference = Omit<RoleplayModelGroup, "selectors"> & {
+  selectors: TaskModelSelectorReference[];
+};
+export type NormalizedModelSettings = {
+  model_options: ModelOption[];
+  model_option_pools: Record<string, number[]>;
+};
+export type ModelSettingsModel = NormalizedModelSettings & {
+  task_model_selectors: TaskModelSelectorReference[];
+  roleplay_shared_models?: ToggleControl;
+  roleplay_model_groups: RoleplayModelGroupReference[];
+  scenario_section_model_selectors?: TaskModelSelectorReference[];
+  model_routing_profiles?: ModelRoutingProfilesSettings;
+  retry_count?: NumberControl;
+  provider_call_deadline_seconds?: NumberControl;
+};
+export type SaveSettingsModel = NormalizedModelSettings & Omit<
+  Partial<SettingsModel>,
+  "save_model_override_selectors" | "task_model_selectors" | "roleplay_model_groups" | "scenario_section_model_selectors"
+> & {
+  save_model_override_selectors?: TaskModelSelectorReference[];
+};
+export type OpenRouterSettingsModel = Pick<SettingsModel, "openrouter_routing">;
 export type ProviderCard = {
   provider: string;
   enabled: boolean;
