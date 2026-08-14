@@ -437,6 +437,7 @@ export function SettingsPanel({
       } else {
         client.invalidateQueries({ queryKey: ["settings", "models"] });
         client.invalidateQueries({ queryKey: ["settings", "openrouter"] });
+        client.invalidateQueries({ queryKey: ["settings", "save"] });
       }
     }
   });
@@ -493,6 +494,7 @@ export function SettingsPanel({
             runJob(await postJson<Job>(`/api/settings/model-refresh/${provider}`, {}));
             client.invalidateQueries({ queryKey: ["settings", "providers"] });
             client.invalidateQueries({ queryKey: ["settings", "models"] });
+            client.invalidateQueries({ queryKey: ["settings", "save"] });
           }}
         />
       ) : null}

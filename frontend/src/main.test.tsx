@@ -12822,12 +12822,22 @@ describe("frontend helpers", () => {
               secret_storage_warning: fullSettings.secret_storage_warning
             };
           }
+          if (path === "/api/settings/models") {
+            return normalizedSettingsPayload(fullSettings, "models");
+          }
+          if (path === "/api/settings/openrouter") {
+            return { openrouter_routing: fullSettings.openrouter_routing };
+          }
           if (path === "/api/settings/save?save_id=save-1") {
+            return normalizedSettingsPayload(fullSettings, "save");
+          }
+          if (path === "/api/settings/local") {
             return {
-              ...fullSettings,
-              model_options: [],
-              model_option_pools: {},
-              save_model_override_selectors: []
+              pending_jobs_display_mode: fullSettings.pending_jobs_display_mode,
+              user_narration_guidance: fullSettings.user_narration_guidance,
+              content_rating: fullSettings.content_rating,
+              fade_to_black: fullSettings.fade_to_black,
+              debug_logging: fullSettings.debug_logging
             };
           }
           if (path.startsWith("/api/chat/submission-status")) {
@@ -12861,8 +12871,14 @@ describe("frontend helpers", () => {
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
     await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/providers")).toBe(true));
     expect(fullSettingsReads()).toHaveLength(0);
+    await userEvent.click(screen.getByRole("tab", { name: "OpenRouter" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/openrouter")).toBe(true));
+    await userEvent.click(screen.getByRole("tab", { name: "Models" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/models")).toBe(true));
     await userEvent.click(screen.getByRole("tab", { name: "Save" }));
     await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/save?save_id=save-1")).toBe(true));
+    await userEvent.click(screen.getByRole("tab", { name: "Local" }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/local")).toBe(true));
     expect(fullSettingsReads()).toHaveLength(0);
   });
 
