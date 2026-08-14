@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import builtins
 import importlib
+import json
 import sqlite3
 import sys
 from collections.abc import Iterator, Mapping
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -299,6 +301,142 @@ def test_provider_settings_model_exposes_only_provider_section(
     assert _value(model, "secret_storage_warning") == "Secret storage unavailable."
     assert not hasattr(model, "task_model_selectors")
     assert not hasattr(model, "pending_jobs_display_mode")
+
+
+def test_model_settings_model_normalizes_shared_model_options(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    _seed_settings_data(repositories)
+
+    model = settings.build_model_settings_model(
+        repositories=repositories,
+        providers=("openrouter", "venice"),
+        current_user_role="admin",
+    )
+
+    selectors = [*_list(_value(model, "task_model_selectors"))]
+    for group in _list(_value(model, "roleplay_model_groups")):
+        selectors.extend(_list(_value(group, "selectors")))
+    selectors.extend(_list(_value(model, "scenario_section_model_selectors")))
+    catalog = _list(_value(model, "model_options"))
+    pools = _value(model, "model_option_pools")
+
+    assert selectors
+    assert catalog
+    assert isinstance(pools, Mapping)
+    assert all(not hasattr(selector, "options") for selector in selectors)
+    assert all(_value(selector, "option_pool") in pools for selector in selectors)
+    assert len(catalog) == len(
+        {
+            (_value(option, "provider"), _value(option, "model_id"))
+            for option in catalog
+        }
+    )
+
+
+def test_model_settings_payload_stays_bounded_with_large_split_catalog(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    _seed_settings_data(repositories)
+    for index in range(289):
+        repositories.save_provider_model(
+            provider="openrouter",
+            model_id=f"synthetic/model-{index:03d}",
+            display_name=f"Synthetic Model {index:03d}",
+            capabilities=[
+                "chat",
+                "structured_output",
+                "tool_calling",
+                "image_generation",
+                "image_to_image",
+                "text_to_video",
+                "image_to_video",
+                "vision",
+            ],
+            thinking={"levels": ["low", "medium", "high"]},
+        )
+
+    shared_selects: list[str] = []
+    repositories.connection.set_trace_callback(
+        lambda statement: shared_selects.append(statement)
+        if statement.lstrip().upper().startswith("SELECT")
+        else None
+    )
+    try:
+        settings.build_model_settings_model(
+            repositories=repositories,
+            providers=("openrouter", "venice"),
+            current_user_role="admin",
+        )
+    finally:
+        repositories.connection.set_trace_callback(None)
+
+    repositories.set_app_setting("use_shared_roleplay_models", False)
+    split_selects: list[str] = []
+    repositories.connection.set_trace_callback(
+        lambda statement: split_selects.append(statement)
+        if statement.lstrip().upper().startswith("SELECT")
+        else None
+    )
+    try:
+        model = settings.build_model_settings_model(
+            repositories=repositories,
+            providers=("openrouter", "venice"),
+            current_user_role="admin",
+        )
+    finally:
+        repositories.connection.set_trace_callback(None)
+    payload = json.dumps(asdict(model), separators=(",", ":"))
+
+    assert len(model.model_options) == 300
+    assert len(payload.encode()) < 2_000_000
+    assert len(split_selects) < 100
+    assert abs(len(split_selects) - len(shared_selects)) < 10
+
+
+def test_model_settings_model_hides_admin_controls_for_non_admin(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    _seed_settings_data(repositories)
+
+    model = settings.build_model_settings_model(
+        repositories=repositories,
+        providers=("openrouter", "venice"),
+        current_user_role="user",
+    )
+
+    assert model.model_options == ()
+    assert model.model_option_pools == {}
+    assert model.task_model_selectors == ()
+    assert model.roleplay_model_groups == ()
+    assert model.model_routing_profiles is None
+
+
+def test_save_settings_model_hides_controls_for_child(
+    repositories: PersistenceRepositories,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = _import_settings_without_gtk(monkeypatch)
+    _seed_settings_data(repositories)
+
+    model = settings.build_save_settings_model(
+        repositories=repositories,
+        providers=("openrouter", "venice"),
+        active_save_id="save-1",
+        current_user_role="child",
+        current_user_id="child-1",
+    )
+
+    assert model.model_options == ()
+    assert model.save_model_override_selectors == ()
+    assert model.turn_responsiveness_mode is None
+    assert model.context_budget is None
 
 
 def test_provider_settings_model_hides_provider_cards_for_non_admin(

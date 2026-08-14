@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 from bragi.persistence.models import (
     ModelPreferenceRecord,
@@ -372,6 +374,16 @@ STEP_SUMMARIZATION_CONTEXT_PRESSURE_THRESHOLD = 0.05
 DEFAULT_AUTOMATIC_IMAGE_GENERATION_ENABLED = False
 DEFAULT_VENICE_IMAGE_SAFE_MODE = True
 
+_MODEL_OPTION_POOL_CACHE: ContextVar[
+    dict[str, tuple[ModelOption, ...]] | None
+] = ContextVar("settings_model_option_pool_cache", default=None)
+_PROVIDER_NAME_CACHE: ContextVar[tuple[str, ...] | None] = ContextVar(
+    "settings_provider_name_cache", default=None
+)
+_PROVIDER_MODEL_CACHE: ContextVar[
+    dict[str, tuple[ProviderModelRecord, ...]] | None
+] = ContextVar("settings_provider_model_cache", default=None)
+
 @dataclass(frozen=True)
 class ProviderCardModel:
     provider: str
@@ -446,10 +458,33 @@ class TaskModelSelector:
 
 
 @dataclass(frozen=True)
+class TaskModelSelectorReference:
+    task: str
+    selected_provider: str | None
+    selected_model_id: str | None
+    selected_available: bool
+    warning: str | None
+    option_pool: str
+    label: str | None = None
+    section_id: str | None = None
+    inherited_provider: str | None = None
+    inherited_model_id: str | None = None
+    clearable: bool = False
+    thinking: ThinkingLevelControl | None = None
+
+
+@dataclass(frozen=True)
 class RoleplayModelGroup:
     roleplay_type: str
     label: str
     selectors: tuple[TaskModelSelector, ...]
+
+
+@dataclass(frozen=True)
+class RoleplayModelGroupReference:
+    roleplay_type: str
+    label: str
+    selectors: tuple[TaskModelSelectorReference, ...]
 
 
 @dataclass(frozen=True)
@@ -587,7 +622,7 @@ class SettingsModel:
     debug_logging: ToggleControl | None
     pending_jobs_display_mode: ChoiceControl | None
     user_narration_guidance: TextControl | None
-    content_rating: ContentRatingControl
+    content_rating: ContentRatingControl | None
     fade_to_black: ToggleControl | None
     automatic_image_generation: ToggleControl | None
     image_style_preset: ChoiceControl | None
@@ -621,6 +656,60 @@ class LocalSettingsModel:
     content_rating: ContentRatingControl
     fade_to_black: ToggleControl | None
     debug_logging: ToggleControl | None
+
+
+@dataclass(frozen=True)
+class ModelSettingsModel:
+    model_options: tuple[ModelOption, ...]
+    model_option_pools: dict[str, tuple[int, ...]]
+    task_model_selectors: tuple[TaskModelSelectorReference, ...]
+    roleplay_shared_models: ToggleControl | None
+    roleplay_model_groups: tuple[RoleplayModelGroupReference, ...]
+    scenario_section_model_selectors: tuple[TaskModelSelectorReference, ...]
+    model_routing_profiles: ModelRoutingProfilesModel | None
+    retry_count: NumberControl | None
+    provider_call_deadline_seconds: NumberControl | None
+
+
+@dataclass(frozen=True)
+class OpenRouterSettingsModel:
+    openrouter_routing: OpenRouterRoutingSettingsModel | None
+
+
+@dataclass(frozen=True)
+class SaveSettingsModel:
+    model_options: tuple[ModelOption, ...]
+    model_option_pools: dict[str, tuple[int, ...]]
+    save_model_override_selectors: tuple[TaskModelSelectorReference, ...]
+    turn_responsiveness_mode: ChoiceControl | None
+    automatic_summarization: ToggleControl | None
+    summarization_context_pressure_threshold: NumberControl | None
+    summarization_visibility: ToggleControl | None
+    agentic_context_pipeline: ToggleControl | None
+    plan_first_narrator: ToggleControl | None
+    director_pressure: ToggleControl | None
+    director_pressure_guidance: TextControl | None
+    character_action_planning: ToggleControl | None
+    character_action_planning_max_concurrency: NumberControl | None
+    character_texts: ToggleControl | None
+    character_text_proactive_random_chance: NumberControl | None
+    character_text_proactive_random_cooldown: NumberControl | None
+    post_turn_inference_mode: ChoiceControl | None
+    npc_knowledge_audit_mode: ChoiceControl | None
+    generated_text_script_guard_mode: ChoiceControl | None
+    generated_phrase_denylist: TextControl | None
+    save_generated_phrase_denylist: TextControl | None
+    venice_image_safe_mode: ToggleControl | None
+    automatic_image_generation: ToggleControl | None
+    image_style_preset: ChoiceControl | None
+    chat_temperature: OptionalNumberControl | None
+    chat_max_output_tokens: OptionalNumberControl | None
+    image_dimension_preset: SupportedChoiceControl | None
+    automatic_media_mode: ChoiceControl | None
+    image_frequency: NumberControl | None
+    manual_confirmation: ManualConfirmationControls | None
+    chat_history: ChatHistoryControls | None
+    context_budget: ContextBudgetControls | None
 
 
 def build_provider_settings_model(
@@ -705,6 +794,130 @@ def build_local_settings_model(
     )
 
 
+def build_model_settings_model(
+    *,
+    repositories: PersistenceRepositories,
+    providers: tuple[str, ...],
+    current_user_role: str | None = None,
+) -> ModelSettingsModel:
+    settings = build_settings_model(
+        repositories=repositories,
+        providers=providers,
+        current_user_role=current_user_role,
+        _include_openrouter=False,
+        _include_save_model_selectors=False,
+        _include_provider_controls=False,
+        _include_save_controls=False,
+        _include_local_controls=False,
+        _include_legacy_controls=False,
+    )
+    normalizer = _ModelOptionNormalizer()
+    task_selectors = normalizer.references(settings.task_model_selectors)
+    roleplay_groups = tuple(
+        RoleplayModelGroupReference(
+            roleplay_type=group.roleplay_type,
+            label=group.label,
+            selectors=normalizer.references(group.selectors),
+        )
+        for group in settings.roleplay_model_groups
+    )
+    scenario_selectors = normalizer.references(
+        settings.scenario_section_model_selectors
+    )
+    return ModelSettingsModel(
+        model_options=normalizer.options,
+        model_option_pools=normalizer.pools,
+        task_model_selectors=task_selectors,
+        roleplay_shared_models=settings.roleplay_shared_models,
+        roleplay_model_groups=roleplay_groups,
+        scenario_section_model_selectors=scenario_selectors,
+        model_routing_profiles=settings.model_routing_profiles,
+        retry_count=settings.retry_count,
+        provider_call_deadline_seconds=settings.provider_call_deadline_seconds,
+    )
+
+
+def build_openrouter_settings_model(
+    *,
+    repositories: PersistenceRepositories,
+    current_user_role: str | None = None,
+) -> OpenRouterSettingsModel:
+    return OpenRouterSettingsModel(
+        openrouter_routing=(
+            openrouter_routing_settings_model(repositories)
+            if current_user_role in {None, "admin"}
+            else None
+        )
+    )
+
+
+def build_save_settings_model(
+    *,
+    repositories: PersistenceRepositories,
+    providers: tuple[str, ...],
+    active_save_id: str | None = None,
+    current_user_role: str | None = None,
+    current_user_id: str | None = None,
+) -> SaveSettingsModel:
+    settings = build_settings_model(
+        repositories=repositories,
+        providers=providers,
+        active_save_id=active_save_id,
+        current_user_role=current_user_role,
+        current_user_id=current_user_id,
+        _include_openrouter=False,
+        _include_global_model_selectors=False,
+        _include_provider_controls=False,
+        _include_global_model_controls=False,
+        _include_local_controls=False,
+        _include_legacy_controls=False,
+    )
+    normalizer = _ModelOptionNormalizer()
+    selectors = normalizer.references(settings.save_model_override_selectors)
+    return SaveSettingsModel(
+        model_options=normalizer.options,
+        model_option_pools=normalizer.pools,
+        save_model_override_selectors=selectors,
+        turn_responsiveness_mode=settings.turn_responsiveness_mode,
+        automatic_summarization=settings.automatic_summarization,
+        summarization_context_pressure_threshold=(
+            settings.summarization_context_pressure_threshold
+        ),
+        summarization_visibility=settings.summarization_visibility,
+        agentic_context_pipeline=settings.agentic_context_pipeline,
+        plan_first_narrator=settings.plan_first_narrator,
+        director_pressure=settings.director_pressure,
+        director_pressure_guidance=settings.director_pressure_guidance,
+        character_action_planning=settings.character_action_planning,
+        character_action_planning_max_concurrency=(
+            settings.character_action_planning_max_concurrency
+        ),
+        character_texts=settings.character_texts,
+        character_text_proactive_random_chance=(
+            settings.character_text_proactive_random_chance
+        ),
+        character_text_proactive_random_cooldown=(
+            settings.character_text_proactive_random_cooldown
+        ),
+        post_turn_inference_mode=settings.post_turn_inference_mode,
+        npc_knowledge_audit_mode=settings.npc_knowledge_audit_mode,
+        generated_text_script_guard_mode=settings.generated_text_script_guard_mode,
+        generated_phrase_denylist=settings.generated_phrase_denylist,
+        save_generated_phrase_denylist=settings.save_generated_phrase_denylist,
+        venice_image_safe_mode=settings.venice_image_safe_mode,
+        automatic_image_generation=settings.automatic_image_generation,
+        image_style_preset=settings.image_style_preset,
+        chat_temperature=settings.chat_temperature,
+        chat_max_output_tokens=settings.chat_max_output_tokens,
+        image_dimension_preset=settings.image_dimension_preset,
+        automatic_media_mode=settings.automatic_media_mode,
+        image_frequency=settings.image_frequency,
+        manual_confirmation=settings.manual_confirmation,
+        chat_history=settings.chat_history,
+        context_budget=settings.context_budget,
+    )
+
+
 def build_settings_model(
     *,
     repositories: PersistenceRepositories,
@@ -714,49 +927,117 @@ def build_settings_model(
     current_user_id: str | None = None,
     log_file_path: Path | None = None,
     secret_storage_warning: str | None = None,
+    _include_openrouter: bool = True,
+    _include_global_model_selectors: bool = True,
+    _include_save_model_selectors: bool = True,
+    _include_provider_controls: bool = True,
+    _include_global_model_controls: bool = True,
+    _include_save_controls: bool = True,
+    _include_local_controls: bool = True,
+    _include_legacy_controls: bool = True,
+) -> SettingsModel:
+    repositories = cast(PersistenceRepositories, _SettingsReadCache(repositories))
+    option_token = _MODEL_OPTION_POOL_CACHE.set({})
+    provider_name_token = _PROVIDER_NAME_CACHE.set(None)
+    provider_model_token = _PROVIDER_MODEL_CACHE.set({})
+    try:
+        return _build_settings_model(
+            repositories=repositories,
+            providers=providers,
+            active_save_id=active_save_id,
+            current_user_role=current_user_role,
+            current_user_id=current_user_id,
+            log_file_path=log_file_path,
+            secret_storage_warning=secret_storage_warning,
+            _include_openrouter=_include_openrouter,
+            _include_global_model_selectors=_include_global_model_selectors,
+            _include_save_model_selectors=_include_save_model_selectors,
+            _include_provider_controls=_include_provider_controls,
+            _include_global_model_controls=_include_global_model_controls,
+            _include_save_controls=_include_save_controls,
+            _include_local_controls=_include_local_controls,
+            _include_legacy_controls=_include_legacy_controls,
+        )
+    finally:
+        _MODEL_OPTION_POOL_CACHE.reset(option_token)
+        _PROVIDER_NAME_CACHE.reset(provider_name_token)
+        _PROVIDER_MODEL_CACHE.reset(provider_model_token)
+
+
+def _build_settings_model(
+    *,
+    repositories: PersistenceRepositories,
+    providers: tuple[str, ...],
+    active_save_id: str | None = None,
+    current_user_role: str | None = None,
+    current_user_id: str | None = None,
+    log_file_path: Path | None = None,
+    secret_storage_warning: str | None = None,
+    _include_openrouter: bool = True,
+    _include_global_model_selectors: bool = True,
+    _include_save_model_selectors: bool = True,
+    _include_provider_controls: bool = True,
+    _include_global_model_controls: bool = True,
+    _include_save_controls: bool = True,
+    _include_local_controls: bool = True,
+    _include_legacy_controls: bool = True,
 ) -> SettingsModel:
     is_admin = current_user_role in {None, "admin"}
     is_user = current_user_role == "user"
     is_child = current_user_role == "child"
-    save_controls_visible = is_admin or is_user
+    save_controls_visible = (is_admin or is_user) and _include_save_controls
+    global_model_controls_visible = is_admin and _include_global_model_controls
+    local_controls_visible = _include_local_controls
     visible_sections = _visible_sections(current_user_role)
-    content_safety = effective_content_safety_policy(
-        repositories,
-        user_id=current_user_id,
+    content_safety = (
+        effective_content_safety_policy(repositories, user_id=current_user_id)
+        if local_controls_visible
+        else None
     )
-    child_admin_grant = is_child and content_safety.rating == CONTENT_RATING_PG_13
+    child_admin_grant = bool(
+        is_child
+        and content_safety is not None
+        and content_safety.rating == CONTENT_RATING_PG_13
+    )
     return SettingsModel(
         provider_cards=tuple(
             _provider_card(repositories=repositories, provider=provider)
             for provider in providers
         )
-        if is_admin
+        if is_admin and _include_provider_controls
         else (),
         task_model_selectors=tuple(
             _task_selector(repositories=repositories, task=task) for task in TASKS
         )
-        if is_admin
+        if global_model_controls_visible and _include_global_model_selectors
         else (),
         save_model_override_selectors=_save_model_override_selectors(
             repositories=repositories,
             active_save_id=active_save_id,
         )
-        if is_admin and active_save_id
+        if is_admin
+        and active_save_id
+        and _include_save_controls
+        and _include_save_model_selectors
         else (),
         roleplay_shared_models=ToggleControl(
             setting_key=ROLEPLAY_SHARED_MODE_SETTING,
             enabled=shared_roleplay_models_enabled(repositories),
         )
-        if is_admin
+        if global_model_controls_visible and _include_global_model_selectors
         else None,
-        roleplay_model_groups=_roleplay_model_groups(repositories) if is_admin else (),
+        roleplay_model_groups=(
+            _roleplay_model_groups(repositories)
+            if global_model_controls_visible and _include_global_model_selectors
+            else ()
+        ),
         scenario_section_model_selectors=_scenario_section_model_selectors(
             repositories
         )
-        if is_admin
+        if global_model_controls_visible and _include_global_model_selectors
         else (),
         model_routing_profiles=model_routing_profiles_model(repositories)
-        if is_admin
+        if global_model_controls_visible
         else None,
         retry_count=NumberControl(
             setting_key=RETRY_COUNT_SETTING,
@@ -772,7 +1053,7 @@ def build_settings_model(
             maximum=MAX_RETRY_COUNT,
             step=RETRY_COUNT_STEP,
         )
-        if is_admin
+        if global_model_controls_visible
         else None,
         provider_call_deadline_seconds=NumberControl(
             setting_key=PROVIDER_CALL_DEADLINE_SETTING,
@@ -788,7 +1069,7 @@ def build_settings_model(
             maximum=int(MAX_PROVIDER_CALL_DEADLINE_SECONDS),
             step=int(PROVIDER_CALL_DEADLINE_STEP),
         )
-        if is_admin
+        if global_model_controls_visible
         else None,
         turn_responsiveness_mode=ChoiceControl(
             setting_key=TURN_RESPONSIVENESS_MODE_SETTING,
@@ -999,7 +1280,7 @@ def build_settings_model(
             setting_key=GENERATED_PHRASE_DENYLIST_SETTING,
             value=generated_phrase_denylist_text(repositories),
         )
-        if is_admin
+        if is_admin and _include_save_controls
         else None,
         save_generated_phrase_denylist=TextControl(
             setting_key=SAVE_GENERATED_PHRASE_DENYLIST_SETTING,
@@ -1021,7 +1302,7 @@ def build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and _include_legacy_controls
         else None,
         structured_output_fallback=ToggleControl(
             setting_key="structured_output_fallback_enabled",
@@ -1034,7 +1315,7 @@ def build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and _include_legacy_controls
         else None,
         tool_call_fallback=ToggleControl(
             setting_key="tool_call_fallback_enabled",
@@ -1047,7 +1328,7 @@ def build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and _include_legacy_controls
         else None,
         image_fallback=ToggleControl(
             setting_key="image_fallback_enabled",
@@ -1060,7 +1341,7 @@ def build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and _include_legacy_controls
         else None,
         video_fallback=ToggleControl(
             setting_key="video_fallback_enabled",
@@ -1073,7 +1354,7 @@ def build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and _include_legacy_controls
         else None,
         venice_image_safe_mode=ToggleControl(
             setting_key="venice_image_safe_mode",
@@ -1100,11 +1381,15 @@ def build_settings_model(
                 )
             ),
         )
-        if is_admin
+        if is_admin and local_controls_visible
         else None,
-        pending_jobs_display_mode=_pending_jobs_display_mode_control(
-            repositories,
-            current_user_id=current_user_id,
+        pending_jobs_display_mode=(
+            _pending_jobs_display_mode_control(
+                repositories,
+                current_user_id=current_user_id,
+            )
+            if local_controls_visible
+            else None
         ),
         user_narration_guidance=TextControl(
             setting_key=USER_NARRATION_GUIDANCE_SETTING,
@@ -1116,7 +1401,9 @@ def build_settings_model(
                     current_user_id=current_user_id,
                 )
             ),
-        ),
+        )
+        if local_controls_visible
+        else None,
         content_rating=ContentRatingControl(
             setting_key=CONTENT_FILTER_RATING_SETTING,
             selected=content_safety.rating,
@@ -1128,9 +1415,11 @@ def build_settings_model(
             if is_child
             else CONTENT_RATING_OPTIONS,
             admin_granted=child_admin_grant,
-        ),
+        )
+        if content_safety is not None
+        else None,
         fade_to_black=None
-        if is_child
+        if is_child or content_safety is None
         else ToggleControl(
             setting_key=FADE_TO_BLACK_ENABLED_SETTING,
             enabled=content_safety.fade_to_black_enabled,
@@ -1174,7 +1463,7 @@ def build_settings_model(
         if save_controls_visible
         else None,
         openrouter_routing=openrouter_routing_settings_model(repositories)
-        if is_admin
+        if is_admin and _include_openrouter
         else None,
         automatic_media_mode=_automatic_media_mode_control(
             repositories,
@@ -1216,9 +1505,164 @@ def build_settings_model(
         )
         if save_controls_visible
         else None,
-        secret_storage_warning=secret_storage_warning if is_admin else None,
+        secret_storage_warning=(
+            secret_storage_warning
+            if is_admin and _include_provider_controls
+            else None
+        ),
         visible_sections=visible_sections,
     )
+
+
+class _SettingsReadCache:
+    def __init__(self, repositories: PersistenceRepositories) -> None:
+        self._repositories = repositories
+        self._model_preferences: dict[str, ModelPreferenceRecord] | None = None
+        self._provider_configs: tuple[ProviderConfigRecord, ...] | None = None
+        self._provider_models: dict[str, tuple[ProviderModelRecord, ...]] = {}
+        self._app_settings: dict[str, object | None] = {}
+        self._scoped_settings: dict[tuple[str, str | None, str], object | None] = {}
+        self._saves: dict[str, Any] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._repositories, name)
+
+    def get_model_preference(self, task: str) -> ModelPreferenceRecord | None:
+        if self._model_preferences is None:
+            self._model_preferences = {
+                preference.task: preference
+                for preference in self._repositories.list_model_preferences()
+            }
+        return self._model_preferences.get(task)
+
+    def list_model_preferences(self) -> list[ModelPreferenceRecord]:
+        if self._model_preferences is None:
+            self.get_model_preference("")
+        return list((self._model_preferences or {}).values())
+
+    def list_provider_configs(self) -> list[ProviderConfigRecord]:
+        if self._provider_configs is None:
+            self._provider_configs = tuple(
+                self._repositories.list_provider_configs()
+            )
+        return list(self._provider_configs)
+
+    def list_provider_models(self, provider: str) -> list[ProviderModelRecord]:
+        models = self._provider_models.get(provider)
+        if models is None:
+            models = tuple(self._repositories.list_provider_models(provider))
+            self._provider_models[provider] = models
+        return list(models)
+
+    def get_app_setting(self, key: str) -> object | None:
+        if key not in self._app_settings:
+            self._app_settings[key] = self._repositories.get_app_setting(key)
+        return self._app_settings[key]
+
+    def get_scoped_setting(
+        self,
+        *,
+        scope: str,
+        key: str,
+        scope_id: str | None = None,
+    ) -> object | None:
+        cache_key = (scope, scope_id, key)
+        if cache_key not in self._scoped_settings:
+            self._scoped_settings[cache_key] = self._repositories.get_scoped_setting(
+                scope=scope,
+                key=key,
+                scope_id=scope_id,
+            )
+        return self._scoped_settings[cache_key]
+
+    def get_save(self, save_id: str) -> Any:
+        if save_id not in self._saves:
+            self._saves[save_id] = self._repositories.get_save(save_id)
+        return self._saves[save_id]
+
+    def get_effective_setting(
+        self,
+        key: str,
+        *,
+        save_id: str | None = None,
+        user_id: str | None = None,
+        scenario_id: str | None = None,
+    ) -> object | None:
+        if save_id is not None:
+            value = self.get_scoped_setting(scope="save", scope_id=save_id, key=key)
+            if value is not None:
+                return value
+            save = self.get_save(save_id)
+            if save is not None:
+                scenario_id = scenario_id or save.scenario_id
+        if scenario_id is not None:
+            value = self.get_scoped_setting(
+                scope="scenario", scope_id=scenario_id, key=key
+            )
+            if value is not None:
+                return value
+        if user_id is not None:
+            value = self.get_scoped_setting(scope="user", scope_id=user_id, key=key)
+            if value is not None:
+                return value
+        return self.get_scoped_setting(scope="global", key=key)
+
+
+class _ModelOptionNormalizer:
+    def __init__(self) -> None:
+        self._options: list[ModelOption] = []
+        self._option_indexes: dict[tuple[str, str], int] = {}
+        self._pool_ids: dict[tuple[tuple[str, str], ...], str] = {}
+        self._pools: dict[str, tuple[int, ...]] = {}
+
+    @property
+    def options(self) -> tuple[ModelOption, ...]:
+        return tuple(self._options)
+
+    @property
+    def pools(self) -> dict[str, tuple[int, ...]]:
+        return dict(self._pools)
+
+    def references(
+        self,
+        selectors: tuple[TaskModelSelector, ...],
+    ) -> tuple[TaskModelSelectorReference, ...]:
+        return tuple(self._reference(selector) for selector in selectors)
+
+    def _reference(self, selector: TaskModelSelector) -> TaskModelSelectorReference:
+        return TaskModelSelectorReference(
+            task=selector.task,
+            selected_provider=selector.selected_provider,
+            selected_model_id=selector.selected_model_id,
+            selected_available=selector.selected_available,
+            warning=selector.warning,
+            option_pool=self._pool_id(selector.options),
+            label=selector.label,
+            section_id=selector.section_id,
+            inherited_provider=selector.inherited_provider,
+            inherited_model_id=selector.inherited_model_id,
+            clearable=selector.clearable,
+            thinking=selector.thinking,
+        )
+
+    def _pool_id(self, options: tuple[ModelOption, ...]) -> str:
+        signature = tuple((option.provider, option.model_id) for option in options)
+        existing = self._pool_ids.get(signature)
+        if existing is not None:
+            return existing
+        pool_id = f"pool_{len(self._pool_ids)}"
+        indexes: list[int] = []
+        for option in options:
+            key = (option.provider, option.model_id)
+            index = self._option_indexes.get(key)
+            if index is None:
+                index = len(self._options)
+                self._option_indexes[key] = index
+                self._options.append(option)
+            indexes.append(index)
+        self._pool_ids[signature] = pool_id
+        self._pools[pool_id] = tuple(indexes)
+        return pool_id
 
 
 def _provider_card(
@@ -1474,15 +1918,21 @@ def _task_selector_from_preference(
 ) -> TaskModelSelector:
     selected_provider = preference.provider if preference else None
     selected_model_id = preference.model_id if preference else None
-    options = tuple(
-        _model_option(model)
-        for provider in _provider_names(
-            repositories,
-            preference_provider=selected_provider,
+    option_cache = _MODEL_OPTION_POOL_CACHE.get()
+    option_pool_key = f"{_task_purpose(task)}\0{selected_provider or ''}"
+    options = option_cache.get(option_pool_key) if option_cache is not None else None
+    if options is None:
+        options = tuple(
+            _model_option(model)
+            for provider in _provider_names(
+                repositories,
+                preference_provider=selected_provider,
+            )
+            for model in _provider_models(repositories, provider)
+            if _supports_task(model, task)
         )
-        for model in repositories.list_provider_models(provider)
-        if _supports_task(model, task)
-    )
+        if option_cache is not None:
+            option_cache[option_pool_key] = options
     selected_available = _selected_available(
         options=options,
         provider=selected_provider,
@@ -1730,10 +2180,30 @@ def _provider_names(
     *,
     preference_provider: str | None,
 ) -> tuple[str, ...]:
-    names = {config.provider for config in repositories.list_provider_configs()}
+    cached = _PROVIDER_NAME_CACHE.get()
+    if cached is None:
+        cached = tuple(
+            sorted(config.provider for config in repositories.list_provider_configs())
+        )
+        _PROVIDER_NAME_CACHE.set(cached)
+    names = set(cached)
     if preference_provider:
         names.add(preference_provider)
     return tuple(sorted(names))
+
+
+def _provider_models(
+    repositories: PersistenceRepositories,
+    provider: str,
+) -> tuple[ProviderModelRecord, ...]:
+    cache = _PROVIDER_MODEL_CACHE.get()
+    if cache is None:
+        return tuple(repositories.list_provider_models(provider))
+    models = cache.get(provider)
+    if models is None:
+        models = tuple(repositories.list_provider_models(provider))
+        cache[provider] = models
+    return models
 
 
 def _model_option(model: ProviderModelRecord) -> ModelOption:

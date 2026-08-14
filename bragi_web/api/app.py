@@ -5600,6 +5600,69 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             }
         return payload
 
+    @app.get("/api/settings/models")
+    def model_settings(state: StateDep) -> dict[str, Any]:
+        with state.lock:
+            current_user = _save_access_user(state)
+            payload = _json_dict(
+                bragi_settings_bindings().build_model_settings_model(
+                    repositories=state.repositories,
+                    providers=tuple(state.providers.keys()),
+                    current_user_role=(
+                        current_user.role if current_user is not None else None
+                    ),
+                )
+            )
+            payload = {
+                key: value for key, value in payload.items() if value is not None
+            }
+        return payload
+
+    @app.get("/api/settings/openrouter")
+    def openrouter_settings(state: StateDep) -> dict[str, Any]:
+        with state.lock:
+            current_user = _save_access_user(state)
+            payload = _json_dict(
+                bragi_settings_bindings().build_openrouter_settings_model(
+                    repositories=state.repositories,
+                    current_user_role=(
+                        current_user.role if current_user is not None else None
+                    ),
+                )
+            )
+            payload = {
+                key: value for key, value in payload.items() if value is not None
+            }
+        return payload
+
+    @app.get("/api/settings/save")
+    def save_settings(
+        state: StateDep,
+        save_id: str | None = None,
+    ) -> dict[str, Any]:
+        with state.lock:
+            current_user = _save_access_user(state)
+            checked_save_id = (
+                _require_save_id(save_id) if save_id is not None else None
+            )
+            payload = _json_dict(
+                bragi_settings_bindings().build_save_settings_model(
+                    repositories=state.repositories,
+                    providers=tuple(state.providers.keys()),
+                    active_save_id=checked_save_id,
+                    current_user_role=(
+                        current_user.role if current_user is not None else None
+                    ),
+                    current_user_id=(
+                        current_user.id if current_user is not None else None
+                    ),
+                )
+            )
+            payload = {
+                key: value for key, value in payload.items() if value is not None
+            }
+        return payload
+
     @app.get("/api/settings/local")
     def local_settings(state: StateDep) -> dict[str, Any]:
         with state.lock:

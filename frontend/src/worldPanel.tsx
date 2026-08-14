@@ -106,8 +106,6 @@ import {
   SAVE_SCOPED_SETTING_KEYS,
   SegmentedTabs,
   selectedOption,
-  settingsPath,
-  settingsQueryOptions,
   settingLabel,
   settingTooltip,
   taskLabel,

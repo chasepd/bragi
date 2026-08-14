@@ -529,7 +529,56 @@ function isSettingsReadPath(path: string) {
 function isAnySettingsReadPath(path: string) {
   return isSettingsReadPath(path)
     || path === "/api/settings/providers"
-    || path === "/api/settings/local";
+    || path === "/api/settings/local"
+    || path === "/api/settings/models"
+    || path === "/api/settings/openrouter"
+    || path === "/api/settings/save"
+    || path.startsWith("/api/settings/save?");
+}
+
+function normalizedSettingsPayload(settingsPayload: SettingsModel, kind: "models" | "save") {
+  const modelOptions: ModelOption[] = [];
+  const modelIndexes = new Map<string, number>();
+  const pools: Record<string, number[]> = {};
+  const selector = (value: TaskModelSelector) => {
+    const option_pool = `pool_${Object.keys(pools).length}`;
+    pools[option_pool] = value.options.map((option) => {
+      const key = `${option.provider}\u0000${option.model_id}`;
+      const existing = modelIndexes.get(key);
+      if (existing !== undefined) return existing;
+      const index = modelOptions.length;
+      modelIndexes.set(key, index);
+      modelOptions.push(option);
+      return index;
+    });
+    const { options: _options, ...rest } = value;
+    return { ...rest, option_pool };
+  };
+  if (kind === "models") {
+    return {
+      ...settingsPayload,
+      model_options: modelOptions,
+      model_option_pools: pools,
+      task_model_selectors: settingsPayload.task_model_selectors.map(selector),
+      roleplay_model_groups: settingsPayload.roleplay_model_groups.map((group) => ({
+        ...group,
+        selectors: group.selectors.map(selector)
+      })),
+      scenario_section_model_selectors: settingsPayload.scenario_section_model_selectors?.map(selector)
+    };
+  }
+  const {
+    task_model_selectors: _taskSelectors,
+    roleplay_model_groups: _roleplayGroups,
+    scenario_section_model_selectors: _scenarioSelectors,
+    ...saveSettings
+  } = settingsPayload;
+  return {
+    ...saveSettings,
+    model_options: modelOptions,
+    model_option_pools: pools,
+    save_model_override_selectors: settingsPayload.save_model_override_selectors?.map(selector)
+  };
 }
 
 function settingsPayloadForPath(path: string, settingsPayload: SettingsModel) {
@@ -547,6 +596,11 @@ function settingsPayloadForPath(path: string, settingsPayload: SettingsModel) {
       fade_to_black: settingsPayload.fade_to_black,
       debug_logging: settingsPayload.debug_logging
     };
+  }
+  if (path === "/api/settings/models") return normalizedSettingsPayload(settingsPayload, "models");
+  if (path === "/api/settings/openrouter") return { openrouter_routing: settingsPayload.openrouter_routing };
+  if (path === "/api/settings/save" || path.startsWith("/api/settings/save?")) {
+    return normalizedSettingsPayload(settingsPayload, "save");
   }
   return isSettingsReadPath(path) ? settingsPayload : {};
 }
@@ -12731,7 +12785,7 @@ describe("frontend helpers", () => {
     expect(shell.style.getPropertyValue("--right-panel-width")).toBe("370px");
   });
 
-  it("uses shell settings for the workbench and loads full Settings on demand", async () => {
+  it("uses shell settings and loads each Settings section on demand", async () => {
     const model = runtimeModel();
     const shellSettings = {
       pending_jobs_display_mode: {
@@ -12768,7 +12822,24 @@ describe("frontend helpers", () => {
               secret_storage_warning: fullSettings.secret_storage_warning
             };
           }
-          if (path === "/api/settings?save_id=save-1") return fullSettings;
+          if (path === "/api/settings/models") {
+            return normalizedSettingsPayload(fullSettings, "models");
+          }
+          if (path === "/api/settings/openrouter") {
+            return { openrouter_routing: fullSettings.openrouter_routing };
+          }
+          if (path === "/api/settings/save?save_id=save-1") {
+            return normalizedSettingsPayload(fullSettings, "save");
+          }
+          if (path === "/api/settings/local") {
+            return {
+              pending_jobs_display_mode: fullSettings.pending_jobs_display_mode,
+              user_narration_guidance: fullSettings.user_narration_guidance,
+              content_rating: fullSettings.content_rating,
+              fade_to_black: fullSettings.fade_to_black,
+              debug_logging: fullSettings.debug_logging
+            };
+          }
           if (path.startsWith("/api/chat/submission-status")) {
             return {
               save_id: model.active_save_id,
@@ -12792,16 +12863,34 @@ describe("frontend helpers", () => {
     );
 
     const fullSettingsReads = () => fetchMock.mock.calls.filter(([path]) => path === "/api/settings?save_id=save-1");
+    const sectionReads = (path: string) => fetchMock.mock.calls.filter(([calledPath]) => calledPath === path);
     await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/shell")).toBe(true));
     expect(fullSettingsReads()).toHaveLength(0);
     expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings")).toBe(false);
 
     await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/settings/providers")).toBe(true));
+    await waitFor(() => expect(sectionReads("/api/settings/providers")).toHaveLength(1));
+    expect(sectionReads("/api/settings/openrouter")).toHaveLength(0);
+    expect(sectionReads("/api/settings/models")).toHaveLength(0);
+    expect(sectionReads("/api/settings/save?save_id=save-1")).toHaveLength(0);
+    expect(sectionReads("/api/settings/local")).toHaveLength(0);
     expect(fullSettingsReads()).toHaveLength(0);
+    await userEvent.click(screen.getByRole("tab", { name: "OpenRouter" }));
+    await waitFor(() => expect(sectionReads("/api/settings/openrouter")).toHaveLength(1));
+    expect(sectionReads("/api/settings/models")).toHaveLength(0);
+    expect(sectionReads("/api/settings/save?save_id=save-1")).toHaveLength(0);
+    expect(sectionReads("/api/settings/local")).toHaveLength(0);
+    await userEvent.click(screen.getByRole("tab", { name: "Models" }));
+    await waitFor(() => expect(sectionReads("/api/settings/models")).toHaveLength(1));
+    expect(sectionReads("/api/settings/save?save_id=save-1")).toHaveLength(0);
+    expect(sectionReads("/api/settings/local")).toHaveLength(0);
     await userEvent.click(screen.getByRole("tab", { name: "Save" }));
-    await waitFor(() => expect(fullSettingsReads()).toHaveLength(1));
+    await waitFor(() => expect(sectionReads("/api/settings/save?save_id=save-1")).toHaveLength(1));
+    expect(sectionReads("/api/settings/local")).toHaveLength(0);
+    await userEvent.click(screen.getByRole("tab", { name: "Local" }));
+    await waitFor(() => expect(sectionReads("/api/settings/local")).toHaveLength(1));
+    expect(fullSettingsReads()).toHaveLength(0);
   });
 
   it("resizes workbench segments with the keyboard and persists dimensions", async () => {
