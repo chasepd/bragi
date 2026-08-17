@@ -44,6 +44,12 @@ def test_provider_chat_messages_include_npc_knowledge_boundary() -> None:
     assert "refuse, delay, mislead, negotiate, leave, escalate" in messages[0][
         "content"
     ]
+    assert "when motives, boundaries, relationships, leverage, or events" in (
+        messages[0]["content"]
+    )
+    assert "may decline to react at all when those factors do not support it" in (
+        messages[0]["content"]
+    )
     assert "Avoid routine passive ending beats" in messages[0]["content"]
     assert "give the player space" in messages[0]["content"]
     assert "concrete visible initiative" in messages[0]["content"]

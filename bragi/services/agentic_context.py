@@ -1702,8 +1702,9 @@ def format_narrator_message_spec(spec: NarratorMessageSpec) -> str:
         "Narration turn plan",
         f"Intent: {spec.intent}",
         f"Thesis: {spec.thesis}",
-        f"Tone: {spec.tone}",
     ]
+    if spec.tone.strip():
+        parts.append(f"Tone: {spec.tone}")
     if spec.narrative_beats:
         parts.append("Narrative beats:")
         for index, beat in enumerate(spec.narrative_beats, start=1):
@@ -3033,7 +3034,14 @@ def _planner_schema(
                 "items": agency_constraint,
                 "maxItems": 12,
             },
-            "tone": {"type": "string"},
+            "tone": {
+                "type": "string",
+                "description": (
+                    "Short concrete register for the narrator response in a few "
+                    "plain words (for example \"dry comedy\" or \"quiet dread\"). "
+                    "Do not add editorial flourishes or genre-emotive adjectives."
+                ),
+            },
             "uncertainties": string_array,
             "evidence_source_ids": evidence_array,
             "npc_intents": {"type": "array", "items": npc_intent, "maxItems": 12},
@@ -3124,6 +3132,10 @@ def _planner_messages(request: ChatRequest) -> tuple[ChatMessage, ...]:
                 "ordered narrative beats, required facts or reveals, player "
                 "agency constraints, unresolved uncertainties, and any "
                 "state-affecting commit candidates as candidates only. "
+                "Plan plain, concrete narrator prose: describe beats in "
+                "neutral terms without purple prose, melodrama, or editorial "
+                "flourishes, and keep tone to a short concrete register so "
+                "the final prose stays economical and understated. "
                 "Describe the player character's attempted action or "
                 "declaration in attempted_action with exact evidence, and "
                 "assess feasibility/preconditions in attempt_feasibility; "
@@ -3151,10 +3163,11 @@ def _planner_messages(request: ChatRequest) -> tuple[ChatMessage, ...]:
                 "or react. When the cast exceeds the npc_intents item cap, "
                 "prioritize the characters with the most decisive visible "
                 "initiative and note overflow in uncertainties. "
-                "Favor visible initiative: present NPCs should interrupt, "
+                "Favor motivated action: present NPCs may interrupt, "
                 "demand, refuse, leave, escalate, advance clocks, or otherwise "
-                "change the situation when supported; leave them restrained "
-                "only when evidence or route pacing supports restraint. "
+                "change the situation when motives, leverage, hazards, or "
+                "route pacing support it, and may also stay restrained when "
+                "they do not. "
                 "Preserve the full spectrum of NPC stances: a naturally "
                 "trusting character may cooperate, while a hostile, "
                 "self-interested, unfair, or unreasonable character should act "

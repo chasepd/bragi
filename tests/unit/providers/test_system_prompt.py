@@ -11,6 +11,10 @@ def test_default_response_style_uses_plain_prose_formatting_guidance() -> None:
     assert DEFAULT_RESPONSE_STYLE_SECTION == (
         "Response style:\n"
         "- Keep responses reasonably short.\n"
+        "- Prefer plain, concrete, economical prose. State what happens and "
+        "let events carry the weight.\n"
+        "- Avoid purple prose, melodrama, and clichés. Do not stack adjectives "
+        "or adverbs, and do not describe ordinary actions as if they were epic.\n"
         "- Put dialogue in quotation marks.\n"
         "- Put non-dialogue narration in italics.\n"
         "- Format text messages with > at the beginning of each message."

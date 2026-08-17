@@ -1679,7 +1679,7 @@ def _generation_instruction(
             )
     else:
         scope = (
-            " For choose your own adventure scenarios, write vivid book-like "
+            " For choose your own adventure scenarios, write clear book-like "
             "setup that creates concrete changed situations for player choices. "
             "The narrator text must not include numbered options; Bragi "
             "generates action choices in a separate structured step."
@@ -2039,7 +2039,7 @@ def _section_label(section_id: str) -> str:
 
 
 def _section_guidance(section_id: str) -> str:
-    return _SECTION_GUIDANCE.get(section_id, "Write concise, vivid scenario text.")
+    return _SECTION_GUIDANCE.get(section_id, "Write concise scenario text.")
 
 
 def _select_sections(

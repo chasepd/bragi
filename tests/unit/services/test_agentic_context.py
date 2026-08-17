@@ -2636,6 +2636,48 @@ def test_planner_prompt_instructs_batched_intents_and_knowledge_candidates() -> 
     assert "character_learned_memory or character_knowledge_edge" in system_body
     assert "uncommitted until verified" in system_body
     assert "never invent target ids" in system_body
+    assert "Favor motivated action" in system_body
+    assert "short concrete register" in system_body
+
+
+def test_planner_prompt_instructs_plain_concrete_prose() -> None:
+    request = ChatRequest(
+        provider="fake-chat",
+        model_id="narrator",
+        messages=(ChatMessage(role="player", body="What do I see?"),),
+    )
+
+    messages = agentic_context_module._planner_messages(request)
+
+    system_body = messages[0].body
+    assert "plain, concrete narrator prose" in system_body
+    assert "without purple prose, melodrama, or editorial" in system_body
+
+
+def test_format_narrator_message_spec_emits_tone_only_when_non_trivial() -> None:
+    with_tone = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="The scene settles.",
+        must_say=(),
+        avoid=(),
+        tone="quiet dread",
+        uncertainties=(),
+        evidence_source_ids=(),
+    )
+    brief = format_narrator_message_spec(with_tone)
+    assert "Tone: quiet dread" in brief
+
+    without_tone = NarratorMessageSpec(
+        intent="Answer the player move.",
+        thesis="The scene settles.",
+        must_say=(),
+        avoid=(),
+        tone="  ",
+        uncertainties=(),
+        evidence_source_ids=(),
+    )
+    brief = format_narrator_message_spec(without_tone)
+    assert "Tone:" not in brief
 
 
 def test_narrator_planner_rejects_malformed_candidate_value_shapes(
