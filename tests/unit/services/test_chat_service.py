@@ -19632,9 +19632,10 @@ def test_submit_player_turn_runs_context_search_before_narrator_and_injects_cont
         request.scenario_instructions
     )
     assert "uncommitted choices unresolved" in request.scenario_instructions
-    assert "interrupt, demand, refuse, leave, escalate" in (
+    assert "may act, react, or change the situation when motives" in (
         request.scenario_instructions
     )
+    assert "may also stay quiet or decline to act" in request.scenario_instructions
     assert "stop at the decision point" not in request.scenario_instructions
     assert request.retrieved_state == (
         "[world_state:state-scene-location] scene.location: Beacon tower",

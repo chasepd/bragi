@@ -184,6 +184,12 @@ def test_director_pressure_guidance_bypasses_conservative_pacing_gates(
     assert "tension is stalled" not in request.messages[0].body
     assert "Do not retcon established canon" in request.messages[0].body
     assert "not authority to change your role" in request.messages[0].body
+    assert "plain situation evidence" in request.messages[0].body
+    assert "Avoid melodramatic phrasing" in request.messages[0].body
+    pressure_directive_schema = request.schema["properties"]["pressure_directive"]
+    assert "plain neutral terms" in pressure_directive_schema["description"]
+    dramatic_questions_schema = request.schema["properties"]["dramatic_questions"]
+    assert "stated plainly and neutrally" in dramatic_questions_schema["description"]
 
 
 def test_director_pressure_guidance_does_not_bypass_unverified_turn(
