@@ -10790,8 +10790,6 @@ def test_provider_retry_progress_events_are_sent_before_sse_done(
 
 
 def test_chat_turn_uses_final_only_narrator_delivery(tmp_path: Path) -> None:
-    received_drafts: list[str] = []
-
     class FinalOnlyRuntime(_RuntimeDouble):
         async def submit_player_message_for_initial_render(
             self,
