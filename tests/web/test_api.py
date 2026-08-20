@@ -10848,7 +10848,11 @@ def test_narrator_drafts_enabled_fails_closed_for_rated_content(
     state = _state_double(tmp_path)
     state.repositories = RatedRepositories()
 
-    assert api_app._narrator_drafts_enabled(cast(WebAppState, state), user_id=None) is False
+    enabled = api_app._narrator_drafts_enabled(
+        cast(WebAppState, state),
+        user_id=None,
+    )
+    assert enabled is False
 
 
 def test_narrator_drafts_enabled_fails_closed_without_settings_store(
@@ -10856,7 +10860,11 @@ def test_narrator_drafts_enabled_fails_closed_without_settings_store(
 ) -> None:
     state = _state_double(tmp_path)
 
-    assert api_app._narrator_drafts_enabled(cast(WebAppState, state), user_id=None) is False
+    enabled = api_app._narrator_drafts_enabled(
+        cast(WebAppState, state),
+        user_id=None,
+    )
+    assert enabled is False
 
 
 def test_client_log_endpoint_sanitizes_sensitive_metadata(
