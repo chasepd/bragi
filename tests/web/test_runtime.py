@@ -6,12 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from bragi.retry_policy import RetryExecutionClass, retry_execution_context
 from bragi.providers.http_client import (
     httpx_request_bytes,
     httpx_request_json,
     httpx_request_sse_json,
 )
+from bragi.retry_policy import RetryExecutionClass, retry_execution_context
 from bragi_web import runtime as runtime_module
 from bragi_web.runtime import RuntimeAccessLock, SaveEventHub
 
