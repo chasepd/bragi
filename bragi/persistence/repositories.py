@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import time
 import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
@@ -325,10 +326,15 @@ class PersistenceRepositories:
             deterministic=True,
         )
         self._transaction_depth = 0
+        self._revision_token_cache: dict[
+            tuple[str, str | None], tuple[float, str]
+        ] = {}
+        self._revision_token_cache_ttl_seconds = 1.0
 
     def commit(self) -> None:
         if self._transaction_depth == 0:
             self.connection.commit()
+            self._revision_token_cache.clear()
 
     def begin_transaction(self) -> None:
         self._begin_transaction("BEGIN")
@@ -352,6 +358,7 @@ class PersistenceRepositories:
         self._transaction_depth -= 1
         if self._transaction_depth == 0:
             self.connection.commit()
+            self._revision_token_cache.clear()
         else:
             savepoint_name = _transaction_savepoint_name(self._transaction_depth)
             self.connection.execute(f"RELEASE SAVEPOINT {savepoint_name}")
@@ -1245,6 +1252,28 @@ class PersistenceRepositories:
         save_id: str,
         *,
         ignored_message_id: str | None = None,
+    ) -> str:
+        cache_key = (save_id, ignored_message_id)
+        cached = self._revision_token_cache.get(cache_key)
+        if cached is not None:
+            cached_at, token = cached
+            if (
+                cached_at + self._revision_token_cache_ttl_seconds
+                >= _monotonic_now()
+            ):
+                return token
+        token = self._compute_context_candidate_revision_token(
+            save_id=save_id,
+            ignored_message_id=ignored_message_id,
+        )
+        self._revision_token_cache[cache_key] = (_monotonic_now(), token)
+        return token
+
+    def _compute_context_candidate_revision_token(
+        self,
+        save_id: str,
+        *,
+        ignored_message_id: str | None,
     ) -> str:
         save_row = self._fetch_one(
             """
@@ -16678,6 +16707,10 @@ def _json_digest(value: object) -> str:
 
 def _text_digest(value: str) -> str:
     return sha256(value.encode("utf-8")).hexdigest()
+
+
+def _monotonic_now() -> float:
+    return time.monotonic()
 
 
 def _dedupe_strings(values: list[str] | tuple[str, ...]) -> list[str]:

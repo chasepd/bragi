@@ -10154,3 +10154,19 @@ def test_turn_outcome_lookup_returns_none_for_unknown_message(
         )
         is None
     )
+
+
+def test_context_candidate_revision_token_is_cached_within_a_search_window(
+    repositories: PersistenceRepositories,
+) -> None:
+    """Repeated reads within the TTL reuse the cached value."""
+    save_id, _message_id = _persist_repository_save(repositories)
+    repositories._revision_token_cache_ttl_seconds = 60.0
+    try:
+        first = repositories.context_candidate_revision_token(save_id)
+        second = repositories.context_candidate_revision_token(save_id)
+        assert first == second
+        assert (save_id, None) in repositories._revision_token_cache
+    finally:
+        repositories._revision_token_cache_ttl_seconds = 1.0
+        repositories._revision_token_cache.clear()
