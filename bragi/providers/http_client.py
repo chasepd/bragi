@@ -16,6 +16,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+import httpx
+
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
 from bragi.providers.errors import (
     ProviderError,
@@ -939,6 +941,98 @@ class _NoRedirectHandler(HTTPRedirectHandler):
 
 
 _NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler)
+
+
+_HTTPX_SHARED_CLIENTS: dict[tuple[bool, int], httpx.AsyncClient] = {}
+_HTTPX_LOCK = threading.Lock()
+
+
+def _get_httpx_client(*, http2: bool, max_connections: int) -> httpx.AsyncClient:
+    key = (http2, max_connections)
+    cached = _HTTPX_SHARED_CLIENTS.get(key)
+    if cached is not None:
+        return cached
+    with _HTTPX_LOCK:
+        cached = _HTTPX_SHARED_CLIENTS.get(key)
+        if cached is not None:
+            return cached
+        client = httpx.AsyncClient(
+            http2=http2,
+            limits=httpx.Limits(
+                max_keepalive_connections=max_connections,
+                max_connections=max_connections,
+            ),
+            follow_redirects=False,
+            timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
+        )
+        _HTTPX_SHARED_CLIENTS[key] = client
+        return client
+
+
+async def _httpx_request_json(
+    *,
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    payload: dict[str, Any] | None,
+    timeout: float,
+    http2: bool,
+) -> JsonHttpResponse:
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request_headers = dict(headers)
+    request_headers.setdefault("Content-Type", "application/json")
+    client = _get_httpx_client(http2=http2, max_connections=20)
+    response = await client.request(
+        method=method,
+        url=url,
+        headers=request_headers,
+        content=body,
+        timeout=timeout,
+    )
+    payload_text = response.text
+    try:
+        payload_obj = json.loads(payload_text) if payload_text else {}
+    except json.JSONDecodeError:
+        payload_obj = {}
+    return JsonHttpResponse(
+        status_code=response.status_code,
+        payload=payload_obj,
+        headers=_safe_response_headers(dict(response.headers)),
+    )
+
+
+async def _httpx_request_bytes(
+    *,
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    payload: dict[str, Any] | None,
+    timeout: float,
+    http2: bool,
+    max_response_bytes: int = MAX_PROVIDER_RESPONSE_BYTES,
+) -> BinaryHttpResponse:
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request_headers = dict(headers)
+    request_headers.setdefault("Content-Type", "application/json")
+    client = _get_httpx_client(http2=http2, max_connections=20)
+    response = await client.request(
+        method=method,
+        url=url,
+        headers=request_headers,
+        content=body,
+        timeout=timeout,
+    )
+    return BinaryHttpResponse(
+        status_code=response.status_code,
+        body=response.content[:max_response_bytes],
+        headers=_safe_response_headers(dict(response.headers)),
+    )
+
+
+def _http2_enabled() -> bool:
+    import os
+
+    return os.environ.get("BRAGI_PROVIDER_HTTP2", "").strip() == "1"
 
 
 def _elapsed_ms(started_at: float) -> int:
