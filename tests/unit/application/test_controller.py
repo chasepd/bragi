@@ -3907,6 +3907,95 @@ def test_save_scenario_draft_skips_structured_outcome_seed_when_provider_would_f
     assert "sk-live-secret" not in (_status_text(model) or "")
 
 
+class RuntimeInvalidCanonProvider(RuntimeCanonProvider):
+    """Canon provider that returns claims the validator must reject.
+
+    The default RuntimeCanonProvider mirrors the source sentence as both the
+    evidence and the claim. This subclass returns a claim that adds facts not
+    present in the evidence, which the canon compiler rejects with
+    ``ValueError("Scenario canon claim adds facts absent from its evidence")``.
+    """
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        payload = json.loads(request.messages[-1].body)
+        sections = payload["sections"]
+        return StructuredOutputResponse(
+            data={
+                "sections": [
+                    {
+                        "section_id": section_id,
+                        "claims": [
+                            {
+                                "claim": "The harbour master is secretly Mira.",
+                                "evidence_quote": text,
+                                "entity_anchors": [
+                                    {
+                                        "entity_type": "concept",
+                                        "entity_key": section_id,
+                                        "display_name": section_id,
+                                    }
+                                ],
+                                "fact_type": "other",
+                                "fact_key": section_id,
+                                "authority": "canonical",
+                                "temporal_status": "durable",
+                                "reveal_policy": "open",
+                                "known_by": [],
+                            }
+                        ],
+                    }
+                    for section_id, text in sections.items()
+                ]
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+        )
+
+
+def test_save_scenario_draft_returns_runtime_model_error_when_canon_fails(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    provider = RuntimeInvalidCanonProvider()
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        providers={"canon": provider, "fake": RuntimeFakeProvider()},
+    )
+    repositories.set_model_preference(
+        task="context_update",
+        provider="canon",
+        model_id="fake-canon",
+    )
+    repositories.save_provider_model(
+        provider="canon",
+        model_id="fake-canon",
+        display_name="Fake Canon",
+        capabilities=["structured_output"],
+    )
+
+    pre_existing_saves = list(repositories.list_saves())
+    sections = _reviewed_full_roleplay_sections()
+    sections["lore"] = "The harbour bell rings at dusk."
+    model = asyncio.run(
+        controller.save_scenario_draft(
+            scenario_type="full_roleplay",
+            sections=sections,
+            save_title="Rolled-back Save",
+        )
+    )
+
+    assert "adds facts absent" in _error_text(model)
+    assert list(repositories.list_saves()) == pre_existing_saves
+    assert _value(model, "active_save_id") is None
+
+
 def test_save_scenario_draft_ignores_legacy_loss_condition_metadata(
     repositories: PersistenceRepositories,
     tmp_path: Path,

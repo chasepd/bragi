@@ -14234,6 +14234,37 @@ describe("frontend helpers", () => {
     expect(onRuntimeChanged).not.toHaveBeenCalled();
   });
 
+  it("keeps manual scenario creation open when the create body carries a backend error", async () => {
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => path === "/api/scenarios/manual"
+        ? runtimeModel({ error: "The new save could not be created." })
+        : {}
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const onClose = vi.fn();
+    const onRuntimeChanged = vi.fn();
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel()} onClose={onClose} onRuntimeChanged={onRuntimeChanged} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    const dialog = screen.getByRole("dialog", { name: "New scenario" });
+    await userEvent.type(within(dialog).getByLabelText("Title"), "Mist Run");
+    await userEvent.type(within(dialog).getByLabelText("Premise"), "The fog has teeth.");
+    await userEvent.type(within(dialog).getByLabelText("Player Role"), "Keeper");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+
+    expect(await within(dialog).findByText("The new save could not be created.")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "New scenario" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Create" })).toBeEnabled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onRuntimeChanged).not.toHaveBeenCalled();
+  });
+
   it("resets scenario draft textareas when a new draft replaces the old one", async () => {
     const sources = installEventSourceDouble();
     const oldDraft = {
@@ -15129,6 +15160,116 @@ describe("frontend helpers", () => {
     expect(screen.getByRole("button", { name: /save draft/i })).toBeEnabled();
     expect(onClose).not.toHaveBeenCalled();
     expect(onRuntimeChanged).not.toHaveBeenCalled();
+  });
+
+  it("keeps scenario draft open when the save body carries a backend error", async () => {
+    const draft: ScenarioDraft = {
+      scenario_type: "full_roleplay",
+      regeneration_seed: "save seed",
+      source_metadata: [],
+      sections: [
+        ["title", "Fog Gate"],
+        ["premise", "Old premise"],
+        ["player_role", "Keeper"]
+      ]
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => path === "/api/scenarios/draft/save"
+        ? runtimeModel({ error: "Scenario canon claim adds facts absent from its evidence" })
+        : {}
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const onClose = vi.fn();
+    const onRuntimeChanged = vi.fn();
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel({ scenario_draft: draft })} initialMode="draft" onClose={onClose} onRuntimeChanged={onRuntimeChanged} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /save draft/i }));
+
+    expect(await screen.findByText("Scenario canon claim adds facts absent from its evidence")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "New scenario" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /save draft/i })).toBeEnabled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onRuntimeChanged).not.toHaveBeenCalled();
+  });
+
+  it("keeps scenario draft open when the save body carries a failure_text", async () => {
+    const draft: ScenarioDraft = {
+      scenario_type: "full_roleplay",
+      regeneration_seed: "save seed",
+      source_metadata: [],
+      sections: [
+        ["title", "Fog Gate"],
+        ["premise", "Old premise"],
+        ["player_role", "Keeper"]
+      ]
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => path === "/api/scenarios/draft/save"
+        ? runtimeModel({ failure_text: "Provider request timed out after 60 seconds" })
+        : {}
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const onClose = vi.fn();
+    const onRuntimeChanged = vi.fn();
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel({ scenario_draft: draft })} initialMode="draft" onClose={onClose} onRuntimeChanged={onRuntimeChanged} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /save draft/i }));
+
+    expect(await screen.findByText("Provider request timed out after 60 seconds")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "New scenario" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /save draft/i })).toBeEnabled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onRuntimeChanged).not.toHaveBeenCalled();
+  });
+
+  it("closes the scenario draft when the save body has no error", async () => {
+    const draft: ScenarioDraft = {
+      scenario_type: "full_roleplay",
+      regeneration_seed: "save seed",
+      source_metadata: [],
+      sections: [
+        ["title", "Fog Gate"],
+        ["premise", "Old premise"],
+        ["player_role", "Keeper"]
+      ]
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => path === "/api/scenarios/draft/save"
+        ? runtimeModel({ active_save_id: "save-fresh", active_save_title: "Fog Gate" })
+        : {}
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const onClose = vi.fn();
+    const onRuntimeChanged = vi.fn();
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel({ scenario_draft: draft })} initialMode="draft" onClose={onClose} onRuntimeChanged={onRuntimeChanged} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /save draft/i }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/scenarios/draft/save", expect.anything()));
+    expect(onClose).toHaveBeenCalled();
+    expect(onRuntimeChanged).toHaveBeenCalledWith(expect.objectContaining({ active_save_id: "save-fresh" }));
+    expect(screen.queryByText(/fact|timed out|could not/i)).not.toBeInTheDocument();
   });
 
   it("hides draft initial media generation for child users", async () => {

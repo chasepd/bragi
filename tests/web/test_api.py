@@ -12612,6 +12612,63 @@ def test_failed_scenario_draft_save_does_not_generate_choices_for_active_save(
     assert runtime.regenerate_calls == []
 
 
+def test_save_scenario_draft_releases_runtime_lock_during_canon_compile(
+    tmp_path: Path,
+) -> None:
+    save_started = threading.Event()
+    save_can_proceed = threading.Event()
+
+    class SlowSaveRuntime(_RuntimeDouble):
+        async def save_scenario_draft(self, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            save_started.set()
+            await asyncio.to_thread(save_can_proceed.wait, 5.0)
+            return {
+                **_chat_model("Save forked"),
+                "active_save_id": "save-slow",
+                "active_save_title": "Slow Save",
+            }
+
+    runtime = SlowSaveRuntime()
+    state = _state_double(tmp_path, runtime)
+
+    responses: list[object] = []
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        def post_save() -> None:
+            responses.append(
+                client.post(
+                    "/api/scenarios/draft/save",
+                    json={
+                        "scenario_type": "full_roleplay",
+                        "sections": {"title": "Slow Save"},
+                        "action_choices_enabled": False,
+                        "save_title": "Slow Save",
+                    },
+                )
+            )
+
+        save_thread = threading.Thread(target=post_save)
+        save_thread.start()
+
+        assert save_started.wait(timeout=2.0), "save request never entered runtime"
+
+        start = time.monotonic()
+        with state.lock:
+            lock_acquired_in = time.monotonic() - start
+
+        save_can_proceed.set()
+        save_thread.join(timeout=2.0)
+
+    assert responses, "save request never produced a response"
+    assert cast(Any, responses[0]).status_code == 200
+    assert cast(Any, responses[0]).json()["active_save_id"] == "save-slow"
+    assert lock_acquired_in < 0.5, (
+        f"runtime lock was held for {lock_acquired_in:.3f}s during the slow save; "
+        "the endpoint is still wrapping the provider call in the global lock"
+    )
+
+
 def test_legacy_action_choice_draft_uses_normalized_result_to_queue_generation(
     tmp_path: Path,
 ) -> None:
