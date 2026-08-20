@@ -32,6 +32,7 @@ from bragi.persistence.models import (
     MessageVisibilityRecord,
     ModelPreferenceRecord,
     PostTurnOutboxRecord,
+    SaveDetailsRecord,
     SaveScenarioUpdateRecord,
     SceneSnapshotRecord,
     SummaryRecord,
@@ -2307,6 +2308,13 @@ class ChatService:
             else prose_history_settings
         )
         planner_uses_prose_context = planner_history_settings == prose_history_settings
+        turn_deterministic_sources = _turn_deterministic_context_sources(
+            repositories=self.repositories,
+            save_id=save_id,
+            player_message=player_message,
+            narration_snapshot=narration_snapshot,
+            details=narration_snapshot.details,
+        )
         budgeted_context = _budgeted_narrator_context(
             repositories=self.repositories,
             save_id=save_id,
@@ -2319,6 +2327,7 @@ class ChatService:
                 character_action_planning_result
             ),
             history_settings=prose_history_settings,
+            deterministic_sources=turn_deterministic_sources,
         )
         planner_budgeted_context = (
             budgeted_context
@@ -2335,6 +2344,7 @@ class ChatService:
                     character_action_planning_result
                 ),
                 history_settings=planner_history_settings,
+                deterministic_sources=turn_deterministic_sources,
             )
         )
         save = narration_snapshot.details.save
@@ -2539,6 +2549,11 @@ class ChatService:
         if (
             refinement_request is not None
             and not context_result.retrieval_round_used
+            and not _refinement_already_satisfied(
+                refinement_request,
+                context_result=context_result,
+                save_id=save_id,
+            )
         ):
             refined_context = await self._refine_context_for_plan(
                 save_id=save_id,
@@ -2552,6 +2567,17 @@ class ChatService:
                 narration_snapshot = (
                     refined_context.narration_snapshot or narration_snapshot
                 )
+                refined_deterministic_sources = (
+                    _turn_deterministic_context_sources(
+                        repositories=self.repositories,
+                        save_id=save_id,
+                        player_message=player_message,
+                        narration_snapshot=narration_snapshot,
+                        details=narration_snapshot.details,
+                    )
+                    if refined_context.narration_snapshot is not None
+                    else turn_deterministic_sources
+                )
                 budgeted_context = _budgeted_narrator_context(
                     repositories=self.repositories,
                     save_id=save_id,
@@ -2564,6 +2590,7 @@ class ChatService:
                         character_action_planning_result
                     ),
                     history_settings=prose_history_settings,
+                    deterministic_sources=refined_deterministic_sources,
                 )
                 planner_budgeted_context = (
                     budgeted_context
@@ -2582,6 +2609,7 @@ class ChatService:
                             character_action_planning_result
                         ),
                         history_settings=planner_history_settings,
+                        deterministic_sources=refined_deterministic_sources,
                     )
                 )
                 budgeted_context = replace(
@@ -12141,6 +12169,59 @@ def _context_search_selected_counts(
     }
 
 
+def _turn_deterministic_context_sources(
+    *,
+    repositories: PersistenceRepositories,
+    save_id: str,
+    player_message: MessageRecord,
+    narration_snapshot: NarrationContextSnapshot | None,
+    details: SaveDetailsRecord,
+) -> tuple[ContextSource, ...]:
+    """Build deterministic context sources once for reuse across prompt builds.
+
+    The narrator prompt assembly queries `deterministic_context_sources` once
+    per historical window. All inputs are snapshot-derived, so the result can
+    be computed a single time per turn and shared by every window build.
+    """
+
+    if narration_snapshot is None:
+        snapshot = repositories.get_scene_snapshot(save_id)
+        return deterministic_context_sources(
+            repositories=repositories,
+            save_id=save_id,
+            details=details,
+            scene_snapshot=snapshot,
+            focus_message=player_message,
+            locations=None,
+            characters=None,
+            active_threads=None,
+            character_knowledge_edges=tuple(
+                repositories.list_character_knowledge_edges(save_id)
+            ),
+            entity_links=tuple(repositories.list_entity_links(save_id)),
+            memories=tuple(repositories.list_memories(save_id)),
+            world_state=tuple(repositories.list_world_state(save_id)),
+            summaries=tuple(repositories.list_summaries(save_id)),
+            message_visibility=tuple(repositories.list_message_visibility(save_id)),
+        )
+    return deterministic_context_sources(
+        repositories=repositories,
+        save_id=save_id,
+        details=details,
+        scene_snapshot=narration_snapshot.scene_snapshot,
+        focus_message=player_message,
+        locations=narration_snapshot.locations,
+        characters=narration_snapshot.characters,
+        active_threads=narration_snapshot.active_threads,
+        character_knowledge_edges=tuple(narration_snapshot.character_knowledge_edges),
+        entity_links=tuple(narration_snapshot.entity_links),
+        memories=tuple(narration_snapshot.memories),
+        world_state=tuple(narration_snapshot.world_state),
+        summaries=tuple(narration_snapshot.summaries),
+        message_visibility=tuple(narration_snapshot.message_visibility),
+    )
+
+
 def _budgeted_narrator_context(
     *,
     repositories: PersistenceRepositories,
@@ -12152,6 +12233,7 @@ def _budgeted_narrator_context(
     narration_snapshot: NarrationContextSnapshot | None = None,
     excluded_character_voice_ids: frozenset[str] = frozenset(),
     history_settings: ChatHistoryWindowSettings | None = None,
+    deterministic_sources: tuple[ContextSource, ...] | None = None,
 ) -> _BudgetedNarratorContext:
     details = (
         narration_snapshot.details
@@ -12208,34 +12290,37 @@ def _budgeted_narrator_context(
         else tuple(repositories.list_summaries(save_id))
     )
     visible_summary_records = summary_records
-    deterministic_sources = deterministic_context_sources(
-        repositories=repositories,
-        save_id=save_id,
-        details=details,
-        scene_snapshot=(
-            narration_snapshot.scene_snapshot
-            if narration_snapshot is not None
-            else snapshot
-        ),
-        focus_message=player_message,
-        locations=(
-            narration_snapshot.locations if narration_snapshot is not None else None
-        ),
-        characters=(
-            narration_snapshot.characters if narration_snapshot is not None else None
-        ),
-        active_threads=(
-            narration_snapshot.active_threads
-            if narration_snapshot is not None
-            else None
-        ),
-        character_knowledge_edges=visible_knowledge_edge_records,
-        entity_links=visible_entity_link_records,
-        memories=visible_memory_records,
-        world_state=visible_world_state_records,
-        summaries=visible_summary_records,
-        message_visibility=message_visibility_records,
-    )
+    if deterministic_sources is None:
+        deterministic_sources = deterministic_context_sources(
+            repositories=repositories,
+            save_id=save_id,
+            details=details,
+            scene_snapshot=(
+                narration_snapshot.scene_snapshot
+                if narration_snapshot is not None
+                else snapshot
+            ),
+            focus_message=player_message,
+            locations=(
+                narration_snapshot.locations if narration_snapshot is not None else None
+            ),
+            characters=(
+                narration_snapshot.characters
+                if narration_snapshot is not None
+                else None
+            ),
+            active_threads=(
+                narration_snapshot.active_threads
+                if narration_snapshot is not None
+                else None
+            ),
+            character_knowledge_edges=visible_knowledge_edge_records,
+            entity_links=visible_entity_link_records,
+            memories=visible_memory_records,
+            world_state=visible_world_state_records,
+            summaries=visible_summary_records,
+            message_visibility=message_visibility_records,
+        )
     pre_turn_hint_sources = pre_turn_scene_hint_sources(
         repositories=repositories,
         save_id=save_id,
@@ -12544,6 +12629,36 @@ def _context_result_selected_count(result: ContextSearchResult) -> int:
             result.selected_recent_messages,
         )
     )
+
+
+def _refinement_already_satisfied(
+    refinement: EvidenceRefinementRequest,
+    *,
+    context_result: ContextSearchResult,
+    save_id: str,
+) -> bool:
+    """Return True when refinement could only request already-selected sources.
+
+    A planner asks for evidence refinement when it cannot find an essential
+    source among the selected context. If the request names no search terms,
+    phrases, or entities and every named source id is already selected, a
+    second retrieval would be pure overhead.
+    """
+
+    if refinement.terms or refinement.phrases or refinement.entity_ids:
+        return False
+    source_ids = set(refinement.source_ids)
+    if not source_ids:
+        return False
+    selected_key_ids = _selected_context_items(context_result)
+    selected_source_ids = {
+        item.source_id
+        for item in selected_key_ids
+    }
+    if not source_ids.issubset(selected_source_ids):
+        return False
+    log_event("chat.context_refinement_skipped", save_id=save_id)
+    return True
 
 
 def _character_voice_profile_sources(

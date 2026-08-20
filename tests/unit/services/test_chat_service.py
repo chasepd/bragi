@@ -93,6 +93,7 @@ from bragi.services.character_text_service import (
 from bragi.services.character_text_world_update_service import (
     CHARACTER_TEXT_WORLD_UPDATE_RETRY_JOB_TYPE,
 )
+from bragi.services.context_assembly import ContextSource
 from bragi.services.chat_history_settings import (
     NARRATOR_PLANNER_RECENT_NARRATOR_MESSAGE_WINDOW_SETTING,
     NARRATOR_PLANNER_RECENT_PLAYER_MESSAGE_WINDOW_SETTING,
@@ -4202,6 +4203,138 @@ def test_submit_player_turn_replans_once_after_authoritative_context_refinement(
     assert planner.calls[1][1].retrieved_memories
     assert provider.chat_requests[0].retrieved_memories
     assert "western archive" in provider.chat_requests[0].narration_brief
+
+
+def test_submit_player_turn_skips_refinement_when_requested_evidence_already_selected(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A beacon is going dark.",
+        player_role="Keeper",
+        content={"opening_message": "The beacon snaps awake."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Keeper Save")
+    repositories.set_app_setting(PLAN_FIRST_NARRATOR_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    source_spec = NarratorMessageSpec(
+        intent="Resolve the pending question.",
+        thesis="Answer directly.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        evidence_refinement=EvidenceRefinementRequest(
+            source_ids=("memory-antivenom",),
+            reason="Confirm the already-selected evidence is essential.",
+        ),
+    )
+    final_spec = replace(source_spec, evidence_refinement=None)
+    selected = ContextSearchResult(
+        selected_memories=(
+            SelectedContextItem(
+                source_type="memory",
+                source_id="memory-antivenom",
+                text="The physician stored antivenom in the western archive.",
+                relevance_note="Selected by retrieval.",
+            ),
+        ),
+    )
+    context_search = RefiningScriptedContextSearch(
+        selected,
+        ContextSearchResult(
+            selected_memories=selected.selected_memories,
+            retrieval_round_used=True,
+        ),
+    )
+    planner = SequenceNarratorPlanner((source_spec, final_spec))
+    provider = RecordingChatProvider("fake")
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={"fake": provider},
+            context_search_service=context_search,
+            narrator_planner=planner,
+        ).submit_player_turn(
+            save_id=save.id,
+            body="Where did she store it?",
+            speaker_name="Mara",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    assert context_search.refinement_calls == []
+    assert len(planner.calls) == 1
+    assert provider.chat_requests[0].retrieved_memories
+    assert "western archive" in provider.chat_requests[0].retrieved_memories[0]
+
+
+def test_submit_player_turn_builds_deterministic_context_sources_once(
+    repositories: PersistenceRepositories,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(PLAN_FIRST_NARRATOR_SETTING, True)
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    spec = NarratorMessageSpec(
+        intent="Narrate the response.",
+        thesis="Describe the keeper's next step.",
+        must_say=(),
+        avoid=(),
+        tone="grounded",
+        uncertainties=(),
+        evidence_source_ids=(),
+        evidence_refinement=None,
+    )
+    planner = SequenceNarratorPlanner((spec, spec))
+    context_search = ScriptedContextSearch(ContextSearchResult())
+    provider = RecordingChatProvider("fake")
+    calls: list[object] = []
+    original_sources = chat_service_module.deterministic_context_sources
+
+    def counting(**kwargs: object) -> tuple[ContextSource, ...]:
+        calls.append(kwargs)
+        return original_sources(**kwargs)
+
+    monkeypatch.setattr(
+        chat_service_module,
+        "deterministic_context_sources",
+        counting,
+    )
+
+    asyncio.run(
+        ChatService(
+            repositories=repositories,
+            providers={"fake": provider},
+            context_search_service=context_search,
+            narrator_planner=planner,
+        ).submit_player_turn(
+            save_id=save.id,
+            body="The keeper strikes the bell.",
+            speaker_name="Mara",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    assert len(calls) == 1
 
 
 def test_submit_player_turn_uses_response_planning_model_preference(

@@ -146,6 +146,7 @@ MAX_CONTEXT_EXACT_PHRASE_CHARS = 512
 MAX_CONTEXT_EXACT_PHRASES = 4
 CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT = 64
 RAW_CONTEXT_RECORD_LIMIT = 512
+CONTEXT_SELECTION_MAX_TOOL_ROUNDS = 2
 CONTINUITY_FLOOR_STATE_LIMIT = 4
 CONTINUITY_FLOOR_MEMORY_LIMIT = 4
 CONTINUITY_FLOOR_MEMORY_MIN_IMPORTANCE = 0.8
@@ -3563,7 +3564,10 @@ async def _select_context_with_tool_feedback(
     selected_keys: set[tuple[str, str]] = set()
     selected_items: list[SelectedContextItem] = []
     last_errors: list[str] = []
-    max_attempt_count = resolved_retry_budget(repositories).verification_max_attempts
+    max_attempt_count = min(
+        resolved_retry_budget(repositories).verification_max_attempts,
+        CONTEXT_SELECTION_MAX_TOOL_ROUNDS,
+    )
 
     for _turn in range(max_attempt_count):
         turn_request = budget_tool_call_request(
