@@ -6,6 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from bragi.providers.http_client import (
+    httpx_request_bytes,
+    httpx_request_json,
+    httpx_request_sse_json,
+)
 from bragi.retry_policy import RetryExecutionClass, retry_execution_context
 from bragi_web import runtime as runtime_module
 from bragi_web.runtime import RuntimeAccessLock, SaveEventHub
@@ -193,3 +198,58 @@ def _hold_sync_lock(
     with lock:
         entered.set()
         release.wait()
+
+
+def test_provider_clients_use_httpx_transports_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[dict[str, object]] = []
+
+    class RecordingProvider:
+        def __init__(self, **kwargs: object) -> None:
+            clients.append(kwargs)
+
+    monkeypatch.delenv("BRAGI_WEB_FAKE_PROVIDERS", raising=False)
+    monkeypatch.delenv("BRAGI_WEB_PROVIDER_HTTPX", raising=False)
+    monkeypatch.setattr(
+        runtime_module,
+        "bragi_runtime_bindings",
+        lambda: SimpleNamespace(
+            OpenRouterClient=RecordingProvider,
+            VeniceClient=RecordingProvider,
+        ),
+    )
+
+    runtime_module._provider_clients(object())
+
+    assert clients[0]["transport"] is httpx_request_json
+    assert clients[0]["binary_transport"] is httpx_request_bytes
+    assert clients[0]["stream_transport"] is httpx_request_sse_json
+    assert clients[1]["transport"] is httpx_request_json
+
+
+def test_provider_clients_fall_back_to_urllib_when_httpx_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[dict[str, object]] = []
+
+    class RecordingProvider:
+        def __init__(self, **kwargs: object) -> None:
+            clients.append(kwargs)
+
+    monkeypatch.delenv("BRAGI_WEB_FAKE_PROVIDERS", raising=False)
+    monkeypatch.setenv("BRAGI_WEB_PROVIDER_HTTPX", "0")
+    monkeypatch.setattr(
+        runtime_module,
+        "bragi_runtime_bindings",
+        lambda: SimpleNamespace(
+            OpenRouterClient=RecordingProvider,
+            VeniceClient=RecordingProvider,
+        ),
+    )
+
+    runtime_module._provider_clients(object())
+
+    assert "transport" not in clients[0]
+    assert "binary_transport" not in clients[0]
+    assert "stream_transport" not in clients[0]

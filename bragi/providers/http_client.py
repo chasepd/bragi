@@ -956,77 +956,534 @@ def _get_httpx_client(*, http2: bool, max_connections: int) -> httpx.AsyncClient
         cached = _HTTPX_SHARED_CLIENTS.get(key)
         if cached is not None:
             return cached
-        client = httpx.AsyncClient(
-            http2=http2,
-            limits=httpx.Limits(
-                max_keepalive_connections=max_connections,
-                max_connections=max_connections,
-            ),
-            follow_redirects=False,
-            timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
-        )
+        try:
+            client = httpx.AsyncClient(
+                http2=http2,
+                limits=httpx.Limits(
+                    max_keepalive_connections=max_connections,
+                    max_connections=max_connections,
+                ),
+                follow_redirects=False,
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=300.0,
+                    write=10.0,
+                    pool=10.0,
+                ),
+            )
+        except (ImportError, RuntimeError) as exc:
+            # HTTP/2 support requires the optional ``h2`` package; degrade
+            # gracefully to HTTP/1.1 when it is not installed.
+            log_error_event(
+                "provider.http2_unavailable",
+                error=f"HTTP/2 requested but unavailable: {exc}",
+            )
+            key = (False, max_connections)
+            cached = _HTTPX_SHARED_CLIENTS.get(key)
+            if cached is not None:
+                _HTTPX_SHARED_CLIENTS[(http2, max_connections)] = cached
+                return cached
+            client = httpx.AsyncClient(
+                http2=False,
+                limits=httpx.Limits(
+                    max_keepalive_connections=max_connections,
+                    max_connections=max_connections,
+                ),
+                follow_redirects=False,
+                timeout=httpx.Timeout(
+                    connect=10.0,
+                    read=300.0,
+                    write=10.0,
+                    pool=10.0,
+                ),
+            )
+            _HTTPX_SHARED_CLIENTS[key] = client
+            _HTTPX_SHARED_CLIENTS[(http2, max_connections)] = client
+            return client
         _HTTPX_SHARED_CLIENTS[key] = client
         return client
 
 
-async def _httpx_request_json(
+async def httpx_request_json(
     *,
     method: str,
     url: str,
     headers: Mapping[str, str],
     payload: dict[str, Any] | None,
     timeout: float,
-    http2: bool,
-) -> JsonHttpResponse:
-    body = json.dumps(payload).encode("utf-8") if payload is not None else None
-    request_headers = dict(headers)
-    request_headers.setdefault("Content-Type", "application/json")
-    client = _get_httpx_client(http2=http2, max_connections=20)
-    response = await client.request(
-        method=method,
-        url=url,
-        headers=request_headers,
-        content=body,
-        timeout=timeout,
-    )
-    payload_text = response.text
-    try:
-        payload_obj = json.loads(payload_text) if payload_text else {}
-    except json.JSONDecodeError:
-        payload_obj = {}
-    return JsonHttpResponse(
-        status_code=response.status_code,
-        payload=payload_obj,
-        headers=_safe_response_headers(dict(response.headers)),
-    )
-
-
-async def _httpx_request_bytes(
-    *,
-    method: str,
-    url: str,
-    headers: Mapping[str, str],
-    payload: dict[str, Any] | None,
-    timeout: float,
-    http2: bool,
+    provider: str | None = None,
+    task: str | None = None,
+    model: str | None = None,
+    schema_name: str | None = None,
+    http2: bool | None = None,
     max_response_bytes: int = MAX_PROVIDER_RESPONSE_BYTES,
-) -> BinaryHttpResponse:
+    max_connections: int = 20,
+) -> JsonHttpResponse:
+    started_at = perf_counter()
+    path = urlsplit(url).path
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     request_headers = dict(headers)
     request_headers.setdefault("Content-Type", "application/json")
-    client = _get_httpx_client(http2=http2, max_connections=20)
-    response = await client.request(
+    client = _get_httpx_client(
+        http2=_http2_enabled() if http2 is None else http2,
+        max_connections=max_connections,
+    )
+    log_event(
+        "provider.http_started",
         method=method,
-        url=url,
-        headers=request_headers,
-        content=body,
+        path=path,
         timeout=timeout,
+        payload_bytes=len(body) if body is not None else 0,
+        **_safe_started_diagnostics(
+            provider=provider,
+            task=task,
+            model=model,
+            schema_name=schema_name,
+            payload=payload,
+        ),
     )
-    return BinaryHttpResponse(
+    status_code = -1
+    response_headers: dict[str, str] = {}
+    try:
+        async with client.stream(
+            method=method,
+            url=url,
+            headers=request_headers,
+            content=body,
+            timeout=timeout,
+        ) as response:
+            _raise_for_httpx_status(
+                response,
+                method=method,
+                path=path,
+                started_at=started_at,
+                provider=provider,
+                task=task,
+                model=model,
+                schema_name=schema_name,
+            )
+            raw_body = await _read_httpx_limited(
+                response,
+                max_bytes=max_response_bytes,
+                method=method,
+                path=path,
+                started_at=started_at,
+                provider=provider,
+                task=task,
+                model=model,
+                schema_name=schema_name,
+            )
+            status_code = response.status_code
+            response_headers = dict(response.headers)
+            payload_text = raw_body.decode("utf-8", errors="replace")
+            try:
+                payload_obj = json.loads(payload_text) if payload_text else {}
+            except json.JSONDecodeError as exc:
+                category = ProviderErrorCategory.PROVIDER_ERROR
+                log_error_event(
+                    "provider.http_failed",
+                    method=method,
+                    path=path,
+                    status_code=status_code,
+                    duration_ms=_elapsed_ms(started_at),
+                    error_category=category.value,
+                    error="Provider returned invalid JSON",
+                    provider=provider,
+                    task=task,
+                    model=model,
+                    schema_name=schema_name,
+                )
+                raise ProviderError(
+                    category=category,
+                    message="Provider returned invalid JSON",
+                    status_code=status_code,
+                ) from exc
+    except httpx.HTTPError as exc:
+        status_code = _httpx_response_status(exc) or 0
+        category = _httpx_error_category(exc)
+        log_error_event(
+            "provider.http_failed",
+            method=method,
+            path=path,
+            status_code=status_code,
+            duration_ms=_elapsed_ms(started_at),
+            error_category=category.value,
+            error=str(exc),
+            provider=provider,
+            task=task,
+            model=model,
+            schema_name=schema_name,
+        )
+        raise ProviderError(
+            category=category,
+            message=str(exc),
+            status_code=status_code,
+        ) from exc
+    result = JsonHttpResponse(
+        status_code=status_code,
+        payload=payload_obj,
+        headers=_safe_response_headers(response_headers),
+    )
+    log_event(
+        "provider.http_succeeded",
+        method=method,
+        path=path,
+        status_code=status_code,
+        duration_ms=_elapsed_ms(started_at),
+    )
+    return result
+
+
+async def httpx_request_bytes(
+    *,
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    payload: dict[str, Any] | None,
+    timeout: float,
+    provider: str | None = None,
+    task: str | None = None,
+    model: str | None = None,
+    schema_name: str | None = None,
+    http2: bool | None = None,
+    max_response_bytes: int = MAX_PROVIDER_RESPONSE_BYTES,
+    max_connections: int = 20,
+) -> BinaryHttpResponse:
+    started_at = perf_counter()
+    path = urlsplit(url).path
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request_headers = dict(headers)
+    request_headers.setdefault("Content-Type", "application/json")
+    client = _get_httpx_client(
+        http2=_http2_enabled() if http2 is None else http2,
+        max_connections=max_connections,
+    )
+    log_event(
+        "provider.http_started",
+        method=method,
+        path=path,
+        timeout=timeout,
+        payload_bytes=len(body) if body is not None else 0,
+        **_safe_started_diagnostics(
+            provider=provider,
+            task=task,
+            model=model,
+            schema_name=schema_name,
+            payload=payload,
+        ),
+    )
+    status_code = -1
+    response_headers: dict[str, str] = {}
+    try:
+        async with client.stream(
+            method=method,
+            url=url,
+            headers=request_headers,
+            content=body,
+            timeout=timeout,
+        ) as response:
+            _raise_for_httpx_status(
+                response,
+                method=method,
+                path=path,
+                started_at=started_at,
+                provider=provider,
+                task=task,
+                model=model,
+                schema_name=schema_name,
+            )
+            response_body = await _read_httpx_limited(
+                response,
+                max_bytes=max_response_bytes,
+                method=method,
+                path=path,
+                started_at=started_at,
+                provider=provider,
+                task=task,
+                model=model,
+                schema_name=schema_name,
+            )
+            status_code = response.status_code
+            response_headers = dict(response.headers)
+    except httpx.HTTPError as exc:
+        status_code = _httpx_response_status(exc) or 0
+        category = _httpx_error_category(exc)
+        log_error_event(
+            "provider.http_failed",
+            method=method,
+            path=path,
+            status_code=status_code,
+            duration_ms=_elapsed_ms(started_at),
+            error_category=category.value,
+            error=str(exc),
+            provider=provider,
+            task=task,
+            model=model,
+            schema_name=schema_name,
+        )
+        raise ProviderError(
+            category=category,
+            message=str(exc),
+            status_code=status_code,
+        ) from exc
+    result = BinaryHttpResponse(
+        status_code=status_code,
+        body=response_body,
+        headers=_safe_response_headers(response_headers),
+    )
+    log_event(
+        "provider.http_succeeded",
+        method=method,
+        path=path,
+        status_code=status_code,
+        duration_ms=_elapsed_ms(started_at),
+    )
+    return result
+
+
+async def httpx_request_sse_json(
+    *,
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    payload: dict[str, Any] | None,
+    timeout: float,
+    provider: str | None = None,
+    task: str | None = None,
+    model: str | None = None,
+    schema_name: str | None = None,
+    max_response_bytes: int = MAX_PROVIDER_RESPONSE_BYTES,
+    http2: bool | None = None,
+    max_connections: int = 20,
+) -> AsyncIterator[dict[str, Any]]:
+    started_at = perf_counter()
+    path = urlsplit(url).path
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request_headers = dict(headers)
+    request_headers.setdefault("Content-Type", "application/json")
+    request_headers.setdefault("Accept", "text/event-stream")
+    client = _get_httpx_client(
+        http2=_http2_enabled() if http2 is None else http2,
+        max_connections=max_connections,
+    )
+    log_event(
+        "provider.http_stream_started",
+        method=method,
+        path=path,
+        timeout=timeout,
+        payload_bytes=len(body) if body is not None else 0,
+        **_safe_started_diagnostics(
+            provider=provider,
+            task=task,
+            model=model,
+            schema_name=schema_name,
+            payload=payload,
+        ),
+    )
+    byte_count = 0
+    data_lines: list[str] = []
+    try:
+        async with client.stream(
+            method=method,
+            url=url,
+            headers=request_headers,
+            content=body,
+            timeout=timeout,
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                byte_count += len(line.encode("utf-8")) + 1
+                if byte_count > max_response_bytes:
+                    raise ProviderError(
+                        category=ProviderErrorCategory.PROVIDER_ERROR,
+                        message=(
+                            "Provider stream exceeded "
+                            f"{max_response_bytes} bytes"
+                        ),
+                    )
+                if line == "":
+                    if data_lines:
+                        event_data = "\n".join(data_lines)
+                        data_lines.clear()
+                        compact = event_data.strip()
+                        if compact and compact != "[DONE]":
+                            yield _parse_stream_payload(compact)
+                    continue
+                if line.startswith(":"):
+                    continue
+                field, separator, value = line.partition(":")
+                if field != "data":
+                    continue
+                data_lines.append(
+                    value[1:] if separator and value.startswith(" ") else value
+                )
+    except httpx.HTTPError as exc:
+        status_code = _httpx_response_status(exc)
+        log_error_event(
+            "provider.http_stream_failed",
+            method=method,
+            path=path,
+            status_code=status_code,
+            duration_ms=_elapsed_ms(started_at),
+            error_category=_httpx_error_category(exc).value,
+            error=str(exc),
+            provider=provider,
+            task=task,
+            model=model,
+            schema_name=schema_name,
+        )
+        raise ProviderError(
+            category=_httpx_error_category(exc),
+            message=str(exc),
+            status_code=status_code,
+        ) from exc
+    except ProviderError as exc:
+        log_error_event(
+            "provider.http_stream_failed",
+            method=method,
+            path=path,
+            status_code=exc.status_code,
+            duration_ms=_elapsed_ms(started_at),
+            error_category=exc.category.value,
+            error=str(exc),
+            provider=provider,
+            task=task,
+            model=model,
+            schema_name=schema_name,
+        )
+        raise
+    if data_lines:
+        event_data = "\n".join(data_lines)
+        compact = event_data.strip()
+        if compact and compact != "[DONE]":
+            yield _parse_stream_payload(compact)
+    log_event(
+        "provider.http_stream_succeeded",
+        method=method,
+        path=path,
+        duration_ms=_elapsed_ms(started_at),
+    )
+
+
+def _parse_stream_payload(compact: str) -> dict[str, Any]:
+    try:
+        payload_obj = json.loads(compact)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(
+            category=ProviderErrorCategory.PROVIDER_ERROR,
+            message="Provider stream event was not valid JSON",
+        ) from exc
+    if not isinstance(payload_obj, dict):
+        raise ProviderError(
+            category=ProviderErrorCategory.PROVIDER_ERROR,
+            message="Provider stream event must be a JSON object",
+        )
+    return payload_obj
+
+
+def _httpx_response_status(exc: httpx.HTTPError) -> int | None:
+    response = getattr(exc, "response", None)
+    return response.status_code if response is not None else None
+
+
+def _raise_for_httpx_status(
+    response: httpx.Response,
+    *,
+    method: str,
+    path: str,
+    started_at: float,
+    provider: str | None,
+    task: str | None,
+    model: str | None,
+    schema_name: str | None,
+) -> None:
+    """Map a non-2xx transport response to a ProviderError with telemetry."""
+
+    if response.status_code < 400:
+        return
+    category = map_http_status_to_category(response.status_code)
+    error = f"Provider response failed with {response.status_code}"
+    log_error_event(
+        "provider.http_failed",
+        method=method,
+        path=path,
         status_code=response.status_code,
-        body=response.content[:max_response_bytes],
-        headers=_safe_response_headers(dict(response.headers)),
+        duration_ms=_elapsed_ms(started_at),
+        error_category=category.value,
+        error=error,
+        provider=provider,
+        task=task,
+        model=model,
+        schema_name=schema_name,
     )
+    raise ProviderError(
+        category=category,
+        message=error,
+        status_code=response.status_code,
+    )
+
+
+async def _read_httpx_limited(
+    response: httpx.Response,
+    *,
+    max_bytes: int,
+    method: str,
+    path: str,
+    started_at: float,
+    provider: str | None,
+    task: str | None,
+    model: str | None,
+    schema_name: str | None,
+) -> bytes:
+    """Read a response body while enforcing the same size bound as urllib."""
+
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in response.aiter_bytes():
+        size += len(chunk)
+        if size > max_bytes:
+            error = f"Provider response exceeded {max_bytes} bytes"
+            log_error_event(
+                "provider.http_failed",
+                method=method,
+                path=path,
+                status_code=response.status_code,
+                duration_ms=_elapsed_ms(started_at),
+                error_category=ProviderErrorCategory.PROVIDER_ERROR.value,
+                error=error,
+                provider=provider,
+                task=task,
+                model=model,
+                schema_name=schema_name,
+            )
+            raise ProviderError(
+                category=ProviderErrorCategory.PROVIDER_ERROR,
+                message=error,
+                status_code=response.status_code,
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _httpx_error_category(exc: httpx.HTTPError) -> ProviderErrorCategory:
+    status_code = _httpx_response_status(exc)
+    if status_code is not None:
+        return map_http_status_to_category(status_code)
+    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError)):
+        return ProviderErrorCategory.NETWORK_ERROR
+    return ProviderErrorCategory.PROVIDER_ERROR
+
+
+def dispatch_transport(transport: Any, **kwargs: Any) -> Any:
+    """Invoke a provider transport that may be sync or async.
+
+    Sync transports run their blocking I/O in a worker thread; async
+    transports (httpx) are awaited in place on the caller's event loop.
+    """
+
+    if asyncio.iscoroutinefunction(transport):
+        return transport(**kwargs)
+    return asyncio.to_thread(transport, **kwargs)
 
 
 def _http2_enabled() -> bool:

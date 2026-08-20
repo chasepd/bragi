@@ -3604,6 +3604,7 @@ class BragiRuntime:
         narrator_stream_callback: NarratorStreamCallback | None = None,
         turn_progress_callback: TurnProgressCallback | None = None,
         post_input_catchup: Callable[[], Awaitable[None]] | None = None,
+        incremental_delivery: bool = False,
     ) -> SubmittedRuntimeTurn:
         return await self._submit_player_message(
             body=body,
@@ -3615,6 +3616,7 @@ class BragiRuntime:
             narrator_stream_callback=narrator_stream_callback,
             turn_progress_callback=turn_progress_callback,
             post_input_catchup=post_input_catchup,
+            incremental_delivery=incremental_delivery,
         )
 
     async def retry_interrupted_turn_for_initial_render(
@@ -4106,6 +4108,51 @@ class BragiRuntime:
             status=f"Continuity recovery finished: {completed} turns processed.",
             active_save_id=save_id,
         )
+
+    async def run_context_precompute_warm(
+        self,
+        *,
+        active_save_id: str | None | object = ...,
+    ) -> dict[str, object]:
+        save_id = (
+            self.active_save_id
+            if active_save_id is ...
+            else cast(str | None, active_save_id)
+        )
+        if save_id is None:
+            raise ValueError("No active save selected")
+
+        async def warm() -> dict[str, object]:
+            chat_service = ChatService(
+                repositories=self.repositories,
+                providers=self.providers,
+                context_search_service=self.context_search_service,
+                summary_service=self._summary_service(),
+                media_service=self._media_service(),
+                prompt_inspection_store=self._prompt_inspection_store_if_enabled(),
+            )
+            result = await asyncio.to_thread(
+                chat_service._precompute_next_turn_context,
+                save_id=save_id,
+            )
+            return {
+                "status": "warmed" if result.status == "succeeded" else result.status,
+                "active_save_id": save_id,
+            }
+
+        try:
+            return await warm()
+        except Exception as exc:
+            log_error_event(
+                "runtime.context_precompute_warm_failed",
+                save_id=save_id,
+                **exception_log_fields(exc),
+            )
+            return {
+                "status": "failed",
+                "active_save_id": save_id,
+                "error": _user_visible_error(exc),
+            }
 
     async def run_state_pruning(
         self,
@@ -4968,6 +5015,7 @@ class BragiRuntime:
         narrator_stream_callback: NarratorStreamCallback | None = None,
         turn_progress_callback: TurnProgressCallback | None = None,
         post_input_catchup: Callable[[], Awaitable[None]] | None = None,
+        incremental_delivery: bool = False,
     ) -> SubmittedRuntimeTurn:
         submitted_save_id = (
             self.active_save_id
@@ -5023,6 +5071,7 @@ class BragiRuntime:
                         save_id=submitted_save_id,
                         post_input_catchup=post_input_catchup,
                     ),
+                    incremental_delivery=incremental_delivery,
                 )
             async with self._save_operation_lock(submitted_save_id):
                 return await self._submit_player_message_unlocked(
@@ -5035,6 +5084,7 @@ class BragiRuntime:
                     narrator_stream_callback=narrator_stream_callback,
                     turn_progress_callback=turn_progress_callback,
                     post_input_context=None,
+                    incremental_delivery=incremental_delivery,
                 )
         finally:
             if submitted_save_id is not None:
@@ -5173,6 +5223,7 @@ class BragiRuntime:
         narrator_stream_callback: NarratorStreamCallback | None,
         turn_progress_callback: TurnProgressCallback | None,
         post_input_context: Callable[[], AbstractAsyncContextManager[None]] | None,
+        incremental_delivery: bool = False,
     ) -> SubmittedRuntimeTurn:
         cancellation_token = CancellationToken()
         self._active_chat_cancellations[submitted_save_id] = cancellation_token
@@ -5212,6 +5263,7 @@ class BragiRuntime:
                     narrator_stream_callback=narrator_stream_callback,
                     turn_progress_callback=turn_progress_callback,
                     post_input_context=post_input_context,
+                    incremental_delivery=incremental_delivery,
                 )
             except ChatTurnCancelled:
                 log_event(
@@ -10320,6 +10372,7 @@ async def _submit_player_turn_with_optional_cancellation(
     narrator_stream_callback: NarratorStreamCallback | None = None,
     turn_progress_callback: TurnProgressCallback | None = None,
     post_input_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+    incremental_delivery: bool = False,
 ) -> Any:
     kwargs: dict[str, object] = {
         "save_id": save_id,
@@ -10360,6 +10413,11 @@ async def _submit_player_turn_with_optional_cancellation(
         and _call_accepts_keyword(submit_player_turn, "post_input_context")
     ):
         kwargs["post_input_context"] = post_input_context
+    if incremental_delivery and _call_accepts_keyword(
+        submit_player_turn,
+        "incremental_delivery",
+    ):
+        kwargs["incremental_delivery"] = True
     return await submit_player_turn(**kwargs)
 
 

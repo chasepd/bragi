@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import threading
+from collections.abc import AsyncIterator
 from email.message import Message
 from urllib.error import HTTPError
 
@@ -15,7 +16,11 @@ from bragi.providers.http_client import (
     JsonHttpResponse,
     _iter_sse_data,
     _safe_started_diagnostics,
+    dispatch_transport,
     ensure_success,
+    httpx_request_bytes,
+    httpx_request_json,
+    httpx_request_sse_json,
     request_bytes,
     request_json,
     request_sse_json,
@@ -637,3 +642,202 @@ def test_request_binary_suppresses_venice_http_error_body_and_keeps_safe_headers
     assert "request-secret" not in repr(fields)
     assert "private image prompt" not in repr(fields)
     assert "venice-secret" not in repr(fields)
+
+
+def test_httpx_request_json_parses_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _FakeStreamResponse(
+        status_code=200,
+        headers={"content-type": "application/json"},
+        chunks=(b'{"ok": true, "items": 3}',)
+    )
+    client = _FakeStreamClient(response)
+    monkeypatch.setattr(
+        "bragi.providers.http_client._get_httpx_client",
+        lambda **_: client,
+    )
+
+    result = asyncio.run(
+        httpx_request_json(
+            method="POST",
+            url="https://api.example.test/chat",
+            headers={"Authorization": "Bearer token"},
+            payload={"model": "fake-chat"},
+            timeout=30.0,
+            provider="fake",
+            task="chat",
+            model="fake-chat",
+            schema_name="narrator",
+        )
+    )
+
+    assert result.status_code == 200
+    assert result.payload == {"ok": True, "items": 3}
+    assert result.headers == {"content-type": "application/json"}
+    assert client.requests[0]["method"] == "POST"
+    assert client.requests[0]["url"] == "https://api.example.test/chat"
+    assert client.requests[0]["content"] == b'{"model": "fake-chat"}'
+
+
+def test_httpx_request_json_raises_on_non_success_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _FakeStreamResponse(
+        status_code=429,
+        headers={"retry-after": "2"},
+    )
+    monkeypatch.setattr(
+        "bragi.providers.http_client._get_httpx_client",
+        lambda **kwargs: _FakeStreamClient(response),
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            httpx_request_json(
+                method="POST",
+                url="https://api.example.test/chat",
+                headers={},
+                payload=None,
+                timeout=30.0,
+                provider="fake",
+                task="chat",
+            )
+        )
+
+    assert exc_info.value.category == ProviderErrorCategory.RATE_LIMITED
+    assert exc_info.value.status_code == 429
+
+
+def test_httpx_request_bytes_raises_when_response_exceeds_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _FakeStreamResponse(
+        status_code=200,
+        chunks=(b"0123456789", b"abcdef"),
+    )
+    monkeypatch.setattr(
+        "bragi.providers.http_client._get_httpx_client",
+        lambda **kwargs: _FakeStreamClient(response),
+    )
+
+    with pytest.raises(ProviderError) as exc_info:
+        asyncio.run(
+            httpx_request_bytes(
+                method="GET",
+                url="https://api.example.test/image",
+                headers={},
+                payload=None,
+                timeout=30.0,
+                max_response_bytes=4,
+                provider="fake",
+                task="image_generation",
+            )
+        )
+
+    assert exc_info.value.category == ProviderErrorCategory.PROVIDER_ERROR
+
+
+async def _collect_stream(
+    stream: AsyncIterator[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [event async for event in stream]
+
+
+class _FakeStreamResponse:
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        headers: dict[str, str] | None = None,
+        chunks: tuple[bytes, ...] = (),
+        lines: tuple[str, ...] = (),
+    ) -> None:
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._chunks = chunks
+        self._lines = lines
+
+    def raise_for_status(self) -> None:
+        return None
+
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aiter_lines(self) -> AsyncIterator[str]:
+        for line in self._lines:
+            yield line
+
+
+class _FakeStreamContext:
+    def __init__(self, response: _FakeStreamResponse) -> None:
+        self._response = response
+
+    async def __aenter__(self) -> _FakeStreamResponse:
+        return self._response
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+class _FakeStreamClient:
+    def __init__(self, response: _FakeStreamResponse) -> None:
+        self._response = response
+        self.requests: list[dict[str, object]] = []
+
+    def stream(self, **kwargs: object) -> _FakeStreamContext:
+        self.requests.append(kwargs)
+        return _FakeStreamContext(self._response)
+
+
+def test_httpx_request_sse_json_yields_parsed_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _FakeStreamResponse(
+        status_code=200,
+        headers={"content-type": "text/event-stream"},
+        lines=(
+            ": keepalive",
+            "",
+            'data: {"choices":[{"delta":{"content":"The"}}]}',
+            "",
+            "data: [DONE]",
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        "bragi.providers.http_client._get_httpx_client",
+        lambda **kwargs: _FakeStreamClient(response),
+    )
+
+    events = asyncio.run(
+        _collect_stream(
+            httpx_request_sse_json(
+                method="POST",
+                url="https://api.example.test/chat",
+                headers={},
+                payload={"stream": True},
+                timeout=30.0,
+            )
+        )
+    )
+
+    assert events == [{"choices": [{"delta": {"content": "The"}}]}]
+
+
+def test_dispatch_transport_runs_sync_and_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def async_transport(**kwargs: object) -> str:
+        return f"async-{kwargs['value']}"
+
+    def sync_transport(**kwargs: object) -> str:
+        return f"sync-{kwargs['value']}"
+
+    async def run() -> tuple[str, str]:
+        async_result = await dispatch_transport(async_transport, value=1)
+        sync_result = await dispatch_transport(sync_transport, value=2)
+        return async_result, sync_result
+
+    assert asyncio.run(run()) == ("async-1", "sync-2")

@@ -10811,6 +10811,8 @@ def test_chat_turn_uses_final_only_narrator_delivery(tmp_path: Path) -> None:
             )
 
     state = _state_double(tmp_path, FinalOnlyRuntime())
+    state.repositories.get_effective_setting = lambda _key, **kwargs: "unrated"
+    state.repositories.get_user = lambda _user_id: None
     with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/chat",
@@ -10834,6 +10836,35 @@ def test_chat_turn_uses_final_only_narrator_delivery(tmp_path: Path) -> None:
     event_names = [event["event"] for event in snapshot.events]
     assert "narrator_draft" in event_names
     assert event_names.index("progress") < event_names.index("runtime")
+
+
+def test_narrator_drafts_enabled_fails_closed_for_rated_content(
+    tmp_path: Path,
+) -> None:
+    class RatedRepositories:
+        def get_effective_setting(self, _key: str, **kwargs: object) -> object:
+            return "pg-13"
+
+    state = _state_double(tmp_path)
+    state.repositories = RatedRepositories()
+
+    enabled = api_app._narrator_drafts_enabled(
+        cast(WebAppState, state),
+        user_id=None,
+    )
+    assert enabled is False
+
+
+def test_narrator_drafts_enabled_fails_closed_without_settings_store(
+    tmp_path: Path,
+) -> None:
+    state = _state_double(tmp_path)
+
+    enabled = api_app._narrator_drafts_enabled(
+        cast(WebAppState, state),
+        user_id=None,
+    )
+    assert enabled is False
 
 
 def test_client_log_endpoint_sanitizes_sensitive_metadata(

@@ -83,6 +83,7 @@ import {
   Job,
   JobStepsModel,
   JobStepSummary,
+  NarratorDraft,
   isPostTurnCatchupProgress,
   logClientEvent,
   MarkdownBlock,
@@ -445,6 +446,7 @@ type PendingChronicleMessage = ChronicleMessage & {
   paint_started_at_ms?: number;
   pending_kind?: "player" | "narrator_placeholder";
   pending_progress?: string;
+  pending_draft?: string;
   pending_started_at_ms?: number;
   pending_timing_estimate?: ChatTimingSummary["estimate"];
 };
@@ -2874,6 +2876,7 @@ function Workbench({
   const [draftPrefill, setDraftPrefill] = useState<ScenarioDraftPrefill | null>(null);
   const [mobileSheet, setMobileSheet] = useState<MobileSheetName | null>(null);
   const [trackedJobs, setTrackedJobs] = useState<Record<string, TrackedJob>>({});
+  const [narratorDrafts, setNarratorDrafts] = useState<Record<string, NarratorDraft>>({});
   const [scenarioRefreshVersion, setScenarioRefreshVersion] = useState(0);
   const jobWatchers = useRef<Record<string, () => void>>({});
   const jobRunOptionsRef = useRef<Record<string, RunJobOptions>>({});
@@ -3388,6 +3391,12 @@ function Workbench({
           delete next[done.id];
           return next;
         });
+        setNarratorDrafts((current) => {
+          if (!(done.id in current)) return current;
+          const next = { ...current };
+          delete next[done.id];
+          return next;
+        });
         delete jobWatchers.current[done.id];
         if (appliesToCurrentSave && activeOptions.applyResult !== false && done.status === "succeeded") {
           if (isRuntimeModel(done.result)) {
@@ -3466,12 +3475,21 @@ function Workbench({
         }
         if (name === "chat_turn_delta" && isChatTurnDelta(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
           setPendingMessage(null);
+          setNarratorDrafts((current) => {
+            if (!(created.id in current)) return current;
+            const next = { ...current };
+            delete next[created.id];
+            return next;
+          });
           if (applyChatTurnDelta(data)) {
             requestNarratorPaint(data);
           } else {
             refreshWorkbench(data.save_id, ALL_WORKBENCH_REFRESH_TARGETS);
           }
           client.invalidateQueries({ queryKey: ["chat", "submission-status", data.save_id] });
+        }
+        if (name === "narrator_draft" && isNarratorDraft(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
+          setNarratorDrafts((current) => ({ ...current, [created.id]: data }));
         }
         if (name === "progress") {
           const phases = postTurnProgressPhases(data);
@@ -3583,6 +3601,18 @@ function Workbench({
       }
       return next;
     });
+    setNarratorDrafts((current) => {
+      let pruned = false;
+      const next: Record<string, NarratorDraft> = {};
+      for (const [jobId, draft] of Object.entries(current)) {
+        if (draft.save_id !== activeSaveId) {
+          pruned = true;
+          continue;
+        }
+        next[jobId] = draft;
+      }
+      return pruned ? next : current;
+    });
   }, [activeSaveId]);
 
   useEffect(() => {
@@ -3677,17 +3707,21 @@ function Workbench({
   const pendingAfterMessageId = persistedChronicleMessages[persistedChronicleMessages.length - 1]?.message_id ?? null;
   const activePendingMessage = pendingMessageForActiveSave(pendingMessage, activeSaveId);
   const activeNarratorJob = chatBlockerJobs.find(({ job }) => isChatJobType(job.type)) ?? null;
+  const activeNarratorDraft = activeNarratorJob
+    ? narratorDrafts[activeNarratorJob.job.id]?.draft ?? null
+    : null;
   const activeNarratorPlaceholder: PendingChronicleMessage | null = activePendingMessage ? {
     message_id: "pending-narrator-placeholder",
     role: "narrator",
     speaker_name: null,
-    body: activeNarratorJob?.progress || "Preparing narrator response",
+    body: activeNarratorDraft || activeNarratorJob?.progress || "Preparing narrator response",
     actions: [],
     pending_after_message_id: activePendingMessage.message_id,
     pending_save_id: activeSaveId,
     paint_started_at_ms: activePendingMessage.paint_started_at_ms,
     pending_kind: "narrator_placeholder",
     pending_progress: activeNarratorJob?.progress || "Preparing narrator response",
+    pending_draft: activeNarratorDraft ?? undefined,
     pending_started_at_ms: activePendingMessage.paint_started_at_ms,
     pending_timing_estimate: chatTimingSummary.data?.estimate ?? null,
   } : null;
@@ -5280,20 +5314,31 @@ function NarratorPlaceholderRow({
   }, [startedAtMs]);
   return (
     <article
-      className="message narrator narrator-placeholder"
+      className={message.pending_draft
+        ? "message narrator narrator-placeholder has-draft"
+        : "message narrator narrator-placeholder"}
       data-message-id={message.message_id}
+      data-draft={message.pending_draft ? "true" : "false"}
       role="status"
-      aria-label="Narrator response progress"
+      aria-label={message.pending_draft ? "Narrator response preview" : "Narrator response progress"}
     >
       <header>
         <span>Narrator</span>
         {elapsedSeconds >= 3 ? <small>{elapsedSeconds}s elapsed</small> : null}
       </header>
-      <div className="narrator-placeholder-body">
-        <Loader2 className="spin" size={16} aria-hidden="true" />
-        <span>{message.pending_progress || "Preparing narrator response"}</span>
-      </div>
-      {message.pending_timing_estimate ? (
+      {message.pending_draft ? (
+        <div className="narrator-placeholder-body narrator-draft-body">
+          <span>{message.pending_draft}</span>
+        </div>
+      ) : (
+        <div className="narrator-placeholder-body">
+          <Loader2 className="spin" size={16} aria-hidden="true" />
+          <span>{message.pending_progress || "Preparing narrator response"}</span>
+        </div>
+      )}
+      {message.pending_draft ? (
+        <small className="narrator-placeholder-estimate">Draft preview — not yet checked</small>
+      ) : message.pending_timing_estimate ? (
         <small className="narrator-placeholder-estimate">
           Recent turns: about {broadTimingRange(message.pending_timing_estimate)}
         </small>
@@ -10070,6 +10115,17 @@ function isChatTurnDelta(value: unknown): value is ChatTurnDelta {
     && delta.version === 1
     && typeof delta.save_id === "string"
     && Array.isArray(delta.messages)
+  );
+}
+
+function isNarratorDraft(value: unknown): value is NarratorDraft {
+  if (!value || typeof value !== "object") return false;
+  const draft = value as Partial<NarratorDraft>;
+  return (
+    draft.kind === "narrator_draft"
+    && draft.version === 1
+    && typeof draft.save_id === "string"
+    && typeof draft.draft === "string"
   );
 }
 

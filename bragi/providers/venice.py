@@ -46,8 +46,12 @@ from bragi.providers.http_client import (
     BinaryHttpResponse,
     BinaryHttpTransport,
     JsonHttpTransport,
+    dispatch_transport,
     ensure_binary_success,
     ensure_success,
+    httpx_request_bytes,
+    httpx_request_json,
+    httpx_request_sse_json,
     request_bytes,
     request_json,
     request_sse_json,
@@ -654,6 +658,56 @@ class VeniceClient:
             retry_progress_callback=retry_progress_callback,
         )
 
+    def _json_transport_kwargs(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        task: str,
+    ) -> dict[str, Any]:
+        if self.transport is request_json or self.transport is httpx_request_json:
+            return {
+                "provider": self.provider_name,
+                "task": task,
+                "model": _payload_model(payload),
+                "schema_name": _schema_name(payload),
+            }
+        return {}
+
+    def _bytes_transport_kwargs(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        task: str,
+    ) -> dict[str, Any]:
+        if (
+            self.binary_transport is request_bytes
+            or self.binary_transport is httpx_request_bytes
+        ):
+            return {
+                "provider": self.provider_name,
+                "task": task,
+                "model": _payload_model(payload),
+            }
+        return {}
+
+    def _stream_transport_kwargs(
+        self,
+        payload: dict[str, Any],
+        *,
+        task: str,
+    ) -> dict[str, Any]:
+        if (
+            self.stream_transport is request_sse_json
+            or self.stream_transport is httpx_request_sse_json
+        ):
+            return {
+                "provider": self.provider_name,
+                "task": task,
+                "model": _payload_model(payload),
+                "schema_name": _schema_name(payload),
+            }
+        return {}
+
     async def _post_stream(
         self,
         *,
@@ -663,14 +717,6 @@ class VeniceClient:
         timeout: float | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         deadline_seconds = self._configured_call_deadline_seconds()
-        transport_kwargs: dict[str, Any] = {}
-        if self.stream_transport is request_sse_json:
-            transport_kwargs = {
-                "provider": self.provider_name,
-                "task": task,
-                "model": _payload_model(payload),
-                "schema_name": _schema_name(payload),
-            }
         stream = self.stream_transport(
             method="POST",
             url=_provider_url(self.base_url, path),
@@ -680,7 +726,7 @@ class VeniceClient:
                 self.timeout if timeout is None else timeout,
                 deadline_seconds,
             ),
-            **transport_kwargs,
+            **self._stream_transport_kwargs(payload, task=task),
         )
         async for event in stream_with_provider_deadline(
             stream,
@@ -699,23 +745,15 @@ class VeniceClient:
         timeout: float,
         task: str,
     ) -> dict[str, Any]:
-        transport_kwargs: dict[str, Any] = {}
-        if self.transport is request_json:
-            transport_kwargs = {
-                "provider": self.provider_name,
-                "task": task,
-                "model": _payload_model(payload),
-                "schema_name": _schema_name(payload),
-            }
         response = await _await_provider_transport(
-            asyncio.to_thread(
+            dispatch_transport(
                 self.transport,
                 method=method,
                 url=_provider_url(self.base_url, path),
                 headers=self._headers(),
                 payload=payload,
                 timeout=timeout,
-                **transport_kwargs,
+                **self._json_transport_kwargs(payload, task=task),
             ),
             timeout=timeout,
             method=method,
@@ -844,15 +882,8 @@ class VeniceClient:
         include_auth: bool = True,
         allowed_absolute_hosts: frozenset[str] = frozenset(),
     ) -> BinaryHttpResponse:
-        transport_kwargs: dict[str, Any] = {}
-        if self.binary_transport is request_bytes:
-            transport_kwargs = {
-                "provider": self.provider_name,
-                "task": task,
-                "model": _payload_model(payload),
-            }
         return await _await_provider_transport(
-            asyncio.to_thread(
+            dispatch_transport(
                 self.binary_transport,
                 method=method,
                 url=_provider_url(
@@ -863,7 +894,7 @@ class VeniceClient:
                 headers=self._headers() if include_auth else {},
                 payload=payload,
                 timeout=timeout,
-                **transport_kwargs,
+                **self._bytes_transport_kwargs(payload, task=task),
             ),
             timeout=timeout,
             method=method,

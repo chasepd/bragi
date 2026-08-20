@@ -35,6 +35,36 @@ from bragi_web.scheduler import (
 )
 
 
+def test_context_precompute_warm_due_requires_continuity_ready() -> None:
+    from bragi_web.scheduler import _context_precompute_warm_due
+
+    class Repositories:
+        def __init__(self, outbox_rows: list[object]) -> None:
+            self.outbox_rows = outbox_rows
+
+        def list_post_turn_outbox_steps(
+            self,
+            *,
+            save_id: str,
+            statuses: tuple[str, ...],
+        ) -> list[object]:
+            assert save_id == "save-1"
+            return self.outbox_rows
+
+    assert _context_precompute_warm_due(
+        Repositories([]),
+        save_id="save-1",
+    )
+    assert not _context_precompute_warm_due(
+        Repositories([object()]),
+        save_id="save-1",
+    )
+    assert _context_precompute_warm_due(
+        SimpleNamespace(),
+        save_id="save-1",
+    )
+
+
 def test_world_suggestion_scheduler_queues_review_for_active_save(
     tmp_path: Path,
 ) -> None:
