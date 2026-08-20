@@ -3601,6 +3601,18 @@ function Workbench({
       }
       return next;
     });
+    setNarratorDrafts((current) => {
+      let pruned = false;
+      const next: Record<string, NarratorDraft> = {};
+      for (const [jobId, draft] of Object.entries(current)) {
+        if (draft.save_id !== activeSaveId) {
+          pruned = true;
+          continue;
+        }
+        next[jobId] = draft;
+      }
+      return pruned ? next : current;
+    });
   }, [activeSaveId]);
 
   useEffect(() => {
