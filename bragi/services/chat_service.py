@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import threading
 from collections.abc import Callable, Coroutine, Iterable, Mapping
@@ -633,6 +634,34 @@ def _post_input_context(
     return factory()
 
 
+_CURRENT_CHAT_SERVICE: contextvars.ContextVar[ChatService | None] = (
+    contextvars.ContextVar("_CURRENT_CHAT_SERVICE", default=None)
+)
+
+
+def _current_chat_service() -> ChatService | None:
+    return _CURRENT_CHAT_SERVICE.get()
+
+
+class _TurnStaticCache:
+    """Per-turn memoization layer for static lookup helpers.
+
+    The chat service performs dozens of read-only lookups per turn (model
+    metadata, settings, content safety, history windows, generation
+    settings). None of these can change mid-turn, so caching them once per
+    turn is safe and removes redundant SQL round-trips.
+    """
+
+    def __init__(self) -> None:
+        self.values: dict[str, object] = {}
+
+    def get(self, key: str) -> object | None:
+        return self.values.get(key)
+
+    def set(self, key: str, value: object) -> None:
+        self.values[key] = value
+
+
 class _TurnProgressPublisher:
     def __init__(
         self,
@@ -1138,6 +1167,8 @@ class ChatService:
             str,
             set[asyncio.Task[dict[str, object]]],
         ] = {}
+        self._turn_static_cache: dict[str, object] = {}
+        self._turn_static_cache_keys: set[str] = set()
 
     @_with_responsive_save_execution
     async def submit_player_turn(
@@ -1160,6 +1191,8 @@ class ChatService:
         turn_operation: str = TURN_OPERATION_NEW_PLAYER,
     ) -> SubmittedTurn:
         turn_started = perf_counter()
+        self._reset_turn_static_cache()
+        chat_service_token = _CURRENT_CHAT_SERVICE.set(self)
         turn_progress = _TurnProgressPublisher(
             save_id=save_id,
             callback=turn_progress_callback,
@@ -1227,26 +1260,29 @@ class ChatService:
             started_at=stage_started,
             player_message_id=player_message.id,
         )
-        async with _post_input_context(post_input_context):
-            return await self.submit_existing_player_turn(
-                save_id=save_id,
-                player_message_id=player_message.id,
-                run_post_turn_jobs=run_post_turn_jobs,
-                await_post_turn_jobs=await_post_turn_jobs,
-                defer_action_choices=defer_action_choices,
-                regeneration_feedback=regeneration_feedback,
-                current_user_id=current_user_id,
-                turn_started=turn_started,
-                log_turn_started=False,
-                summarize_before_context=False,
-                cancellation_token=cancellation_token,
-                cancellation_requested=cancellation_requested,
-                retry_progress_callback=retry_progress_callback,
-                narrator_stream_callback=narrator_stream_callback,
-                turn_progress_callback=turn_progress_callback,
-                _turn_progress=turn_progress,
-                turn_operation=turn_operation,
-            )
+        try:
+            async with _post_input_context(post_input_context):
+                return await self.submit_existing_player_turn(
+                    save_id=save_id,
+                    player_message_id=player_message.id,
+                    run_post_turn_jobs=run_post_turn_jobs,
+                    await_post_turn_jobs=await_post_turn_jobs,
+                    defer_action_choices=defer_action_choices,
+                    regeneration_feedback=regeneration_feedback,
+                    current_user_id=current_user_id,
+                    turn_started=turn_started,
+                    log_turn_started=False,
+                    summarize_before_context=False,
+                    cancellation_token=cancellation_token,
+                    cancellation_requested=cancellation_requested,
+                    retry_progress_callback=retry_progress_callback,
+                    narrator_stream_callback=narrator_stream_callback,
+                    turn_progress_callback=turn_progress_callback,
+                    _turn_progress=turn_progress,
+                    turn_operation=turn_operation,
+                )
+        finally:
+            _CURRENT_CHAT_SERVICE.reset(chat_service_token)
 
     @_with_responsive_save_execution
     async def submit_timeskip_turn(
@@ -3555,6 +3591,23 @@ class ChatService:
                 context_result.responsive_narrator_spec is not None
             ),
         )
+
+    def _reset_turn_static_cache(self) -> None:
+        """Clear the per-turn lookup cache before a new turn starts."""
+        self._turn_static_cache.clear()
+        self._turn_static_cache_keys.clear()
+
+    def _cache_turn_static(
+        self,
+        key: str,
+        loader: Callable[[], object],
+    ) -> object:
+        if key in self._turn_static_cache:
+            return self._turn_static_cache[key]
+        value = loader()
+        self._turn_static_cache[key] = value
+        self._turn_static_cache_keys.add(key)
+        return value
 
     async def _await_background_post_turn_catchup(self, *, save_id: str) -> None:
         tasks = tuple(self._background_post_turn_tasks_by_save.get(save_id, ()))
@@ -13519,6 +13572,29 @@ def _model_context_window(
     provider: str,
     model_id: str,
 ) -> int | None:
+    chat_service = _current_chat_service()
+    if chat_service is not None:
+        cache = chat_service._turn_static_cache
+        cache_key = f"model_context_window:{provider}:{model_id}"
+        if cache_key in cache:
+            return cache[cache_key]  # type: ignore[return-value]
+        value = _compute_model_context_window(
+            repositories=repositories, provider=provider, model_id=model_id
+        )
+        cache[cache_key] = value
+        chat_service._turn_static_cache_keys.add(cache_key)
+        return value
+    return _compute_model_context_window(
+        repositories=repositories, provider=provider, model_id=model_id
+    )
+
+
+def _compute_model_context_window(
+    *,
+    repositories: PersistenceRepositories,
+    provider: str,
+    model_id: str,
+) -> int | None:
     for model in repositories.list_provider_models(provider):
         if model.model_id == model_id:
             return model.context_window
@@ -13531,8 +13607,9 @@ def _model_supports_structured_output(
     provider: str,
     model_id: str,
 ) -> bool:
-    return model_supports_any_capability(
+    return _cache_model_capability(
         repositories,
+        key="structured_output",
         provider=provider,
         model_id=model_id,
         required=STRUCTURED_OUTPUT_CAPABILITIES,
@@ -13545,8 +13622,9 @@ def _model_supports_tool_calling(
     provider: str,
     model_id: str,
 ) -> bool:
-    return model_supports_any_capability(
+    return _cache_model_capability(
         repositories,
+        key="tool_calling",
         provider=provider,
         model_id=model_id,
         required=TOOL_CALLING_CAPABILITIES,
@@ -13559,11 +13637,43 @@ def _model_supports_chat_fallback(
     provider: str,
     model_id: str,
 ) -> bool:
+    return _cache_model_capability(
+        repositories,
+        key="chat_fallback",
+        provider=provider,
+        model_id=model_id,
+        required=CHAT_CAPABILITIES,
+    )
+
+
+def _cache_model_capability(
+    repositories: PersistenceRepositories,
+    *,
+    key: str,
+    provider: str,
+    model_id: str,
+    required: frozenset[str],
+) -> bool:
+    chat_service = _current_chat_service()
+    if chat_service is not None:
+        cache_key = f"model_capability:{key}:{provider}:{model_id}"
+        cached = chat_service._turn_static_cache.get(cache_key)
+        if cached is not None:
+            return bool(cached)
+        value = model_supports_any_capability(
+            repositories,
+            provider=provider,
+            model_id=model_id,
+            required=required,
+        )
+        chat_service._turn_static_cache[cache_key] = value
+        chat_service._turn_static_cache_keys.add(cache_key)
+        return value
     return model_supports_any_capability(
         repositories,
         provider=provider,
         model_id=model_id,
-        required=CHAT_CAPABILITIES,
+        required=required,
     )
 
 

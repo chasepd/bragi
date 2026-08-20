@@ -25126,3 +25126,95 @@ def test_submit_player_turn_skips_planned_active_thread_change_for_locked_field(
     assert {
         decision["reason"] for decision in planned["decisions"]
     } == {"locked_active_thread_field"}
+
+
+def _placeholder_provider(provider_name: str):
+    from bragi.providers.contracts import ChatResponse, ProviderConfigStatus
+
+    class _Provider:
+        async def validate_config(self):
+            return ProviderConfigStatus(
+                provider=provider_name,
+                configured=True,
+                authenticated=True,
+            )
+
+        async def list_models(self):
+            return []
+
+        async def chat(self, request):
+            return ChatResponse(
+                body="ok",
+                provider=request.provider,
+                model_id=request.model_id,
+                token_usage={},
+            )
+
+        async def generate_image(self, request):
+            raise AssertionError("chat turns must not request image generation")
+
+        async def generate_structured_output(self, request):
+            raise AssertionError("chat turns must not request structured output")
+
+        async def generate_tool_calls(self, request):
+            raise AssertionError("chat turns must not request tool calls")
+
+        async def describe_image(self, request):
+            raise AssertionError("chat turns must not describe images")
+
+    provider = _Provider()
+    provider.provider_name = provider_name
+    return provider
+
+
+
+def test_model_context_window_lookup_is_cached_within_a_turn(
+    repositories: PersistenceRepositories,
+) -> None:
+    """The per-turn static cache memoizes provider_models lookups."""
+    from bragi.services.chat_service import (
+        _CURRENT_CHAT_SERVICE,
+        _current_chat_service,
+        _model_context_window,
+    )
+
+    repositories.save_provider_model(
+        provider="openrouter",
+        model_id="anthropic/claude-3.5-sonnet",
+        display_name="Claude",
+        capabilities=["chat"],
+        context_window=8_000,
+    )
+
+    chat_service = ChatService(
+        repositories=repositories,
+        providers={"openrouter": _placeholder_provider("openrouter")},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+    )
+    chat_service._reset_turn_static_cache()
+    token = _CURRENT_CHAT_SERVICE.set(chat_service)
+    try:
+        first = _model_context_window(
+            repositories=repositories,
+            provider="openrouter",
+            model_id="anthropic/claude-3.5-sonnet",
+        )
+        second = _model_context_window(
+            repositories=repositories,
+            provider="openrouter",
+            model_id="anthropic/claude-3.5-sonnet",
+        )
+        assert first == 8_000
+        assert second == 8_000
+        cache_key = (
+            "model_context_window:openrouter:anthropic/claude-3.5-sonnet"
+        )
+        assert cache_key in chat_service._turn_static_cache
+        assert chat_service._turn_static_cache[cache_key] == 8_000
+    finally:
+        _CURRENT_CHAT_SERVICE.reset(token)
+
+    chat_service._reset_turn_static_cache()
+    assert chat_service._turn_static_cache == {}
+    assert chat_service._turn_static_cache_keys == set()
+    assert _current_chat_service() is None
