@@ -20,6 +20,7 @@ WORLD_SUGGESTION_REVIEW_TASK = "world_suggestion_review"
 DATING_ROUTE_PROFILE_ENRICHMENT_TASK = "dating_route_profile_enrichment"
 STATE_PRUNING_TASK = "state_pruning"
 POST_TURN_OUTBOX_RECOVERY_TASK = "post_turn_outbox_recovery"
+CONTEXT_PRECOMPUTE_WARM_TASK = "context_precompute_warm"
 STATE_EXTRACTION_RETRY_DRAIN_TASK = "state_extraction_retry_drain"
 CONTEXT_UPDATE_RETRY_DRAIN_TASK = "context_update_retry_drain"
 OBSERVATION_CURATION_DRAIN_TASK = "observation_curation_drain"
@@ -49,6 +50,7 @@ WORLD_SUGGESTION_REVIEW_INTERVAL_SECONDS = 60
 DATING_ROUTE_PROFILE_ENRICHMENT_INTERVAL_SECONDS = 60
 STATE_PRUNING_INTERVAL_SECONDS = 60
 POST_TURN_OUTBOX_RECOVERY_INTERVAL_SECONDS = 15
+CONTEXT_PRECOMPUTE_WARM_INTERVAL_SECONDS = 60
 STATE_EXTRACTION_RETRY_DRAIN_INTERVAL_SECONDS = 60
 CONTEXT_UPDATE_RETRY_DRAIN_INTERVAL_SECONDS = 60
 OBSERVATION_CURATION_DRAIN_INTERVAL_SECONDS = 60
@@ -787,6 +789,31 @@ def _post_turn_outbox_recovery_due(repositories: Any, save_id: str) -> bool:
     )
 
 
+def _context_precompute_warm_due(repositories: Any, save_id: str) -> bool:
+    """Warm the next-turn context snapshot only when continuity is caught up.
+
+    Precomputing while a post-turn pipeline is still writing a fresh state,
+    memory, context, time-reconciliation, or text step would race the
+    writes and produce a snapshot that the next turn immediately replaces.
+    The turn-time fast path already regenerates on a stale fingerprint, so
+    the warm job is pure idle-time benefit.
+    """
+
+    list_outbox = getattr(
+        repositories,
+        "list_post_turn_outbox_steps",
+        None,
+    )
+    if callable(list_outbox):
+        incomplete = list_outbox(
+            save_id=save_id,
+            statuses=("pending", "running", "failed"),
+        )
+        if incomplete:
+            return False
+    return True
+
+
 def _observation_curation_drain_due(repositories: Any, save_id: str) -> bool:
     from bragi.services.agentic_context import agentic_context_pipeline_enabled
 
@@ -1092,6 +1119,16 @@ _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
         should_schedule=_post_turn_outbox_recovery_due,
     ),
     _MaintenanceTaskDefinition(
+        task_type=CONTEXT_PRECOMPUTE_WARM_TASK,
+        interval_seconds=CONTEXT_PRECOMPUTE_WARM_INTERVAL_SECONDS,
+        progress_label="Warming next-turn context",
+        runtime_method="run_context_precompute_warm",
+        event_reason="context_precompute_warm",
+        should_schedule=_context_precompute_warm_due,
+        publish_save_event=False,
+        serialize_with_save_operations=False,
+    ),
+    _MaintenanceTaskDefinition(
         task_type=STATE_EXTRACTION_RETRY_DRAIN_TASK,
         interval_seconds=STATE_EXTRACTION_RETRY_DRAIN_INTERVAL_SECONDS,
         progress_label="Retrying state extraction",
@@ -1161,6 +1198,7 @@ _STATE_RETRY_BLOCKED_TASKS = frozenset(
         CONTEXT_UPDATE_RETRY_DRAIN_TASK,
         MEMORY_CONSOLIDATION_TASK,
         CHARACTER_REGISTRY_MAINTENANCE_TASK,
+        CONTEXT_PRECOMPUTE_WARM_TASK,
     }
 )
 
@@ -1168,6 +1206,7 @@ _CONTEXT_RETRY_BLOCKED_TASKS = frozenset(
     {
         MEMORY_CONSOLIDATION_TASK,
         CHARACTER_REGISTRY_MAINTENANCE_TASK,
+        CONTEXT_PRECOMPUTE_WARM_TASK,
     }
 )
 

@@ -237,3 +237,62 @@ def test_actual_chat_job_orders_critical_spans_and_counts_retry_waves(
         state.close()
         with sqlite3.connect(tmp_path / "web-data" / "bragi.sqlite3") as connection:
             assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+def test_context_precompute_warm_fills_next_turn_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BRAGI_WEB_DATA_DIR", str(tmp_path / "web-data"))
+    monkeypatch.setenv("BRAGI_WEB_FAKE_PROVIDERS", "1")
+
+    state = create_state()
+    state.auth_required = False
+    try:
+        scenario = state.repositories.create_scenario(
+            type="full_roleplay",
+            title="Lantern Keep",
+            premise="A beacon is going dark.",
+            player_role="Keeper",
+            content={"opening_message": "The beacon snaps awake."},
+        )
+        save = state.repositories.create_save(
+            scenario_id=scenario.id,
+            title="Lantern Save",
+        )
+        state.repositories.save_provider_model(
+            provider="fake",
+            model_id="fake-chat",
+            display_name="Fake Chat",
+            capabilities=["chat", "structured_output"],
+            context_window=32768,
+        )
+        for task in ("chat", "context_search"):
+            state.repositories.set_model_preference(
+                task=task,
+                provider="fake",
+                model_id="fake-chat",
+            )
+
+        result = asyncio.run(
+            state.runtime.run_context_precompute_warm(
+                active_save_id=save.id,
+            )
+        )
+
+        assert result["status"] == "warmed"
+        jobs = state.repositories.list_recent_jobs(
+            save_id=save.id,
+            types=("context_precompute",),
+        )
+        assert [job.status for job in jobs] == ["succeeded"]
+        cache_entry = state.runtime.context_search_service._valid_next_turn_cache(
+            save.id,
+            player_message_id="",
+        )
+        assert cache_entry is not None
+        assert cache_entry.fingerprint
+    finally:
+        state.close()
+        with sqlite3.connect(tmp_path / "web-data" / "bragi.sqlite3") as connection:
+            assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
