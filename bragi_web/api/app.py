@@ -3437,6 +3437,19 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
 
             if _call_accepts_keyword(
                 state.runtime.submit_player_message_for_initial_render,
+                "narrator_stream_callback",
+            ):
+                kwargs["narrator_stream_callback"] = (
+                    _make_narrator_draft_emitter(
+                        handle,
+                        save_id=submitted_save_id,
+                        player_message_id_fetcher=lambda: _latest_player_message_id(
+                            state, submitted_save_id
+                        ),
+                    )
+                )
+            if _call_accepts_keyword(
+                state.runtime.submit_player_message_for_initial_render,
                 "current_user_id",
             ):
                 kwargs["current_user_id"] = current_user_id
@@ -10049,6 +10062,63 @@ def _initial_chat_turn_progress(status_text: str) -> dict[str, object]:
             for name in _CHAT_TURN_PROGRESS_JOB_ORDER
         ],
     }
+
+
+def _make_narrator_draft_emitter(
+    handle: Any,
+    *,
+    save_id: str,
+    player_message_id_fetcher: Callable[[], str | None],
+) -> Callable[[str], None]:
+    """Build a narrator-stream callback that emits a throttled SSE draft.
+
+    The chat service invokes the callback once with the final narrator
+    body after all guards have passed. The callback pushes a
+    ``narrator_draft`` event into the job's SSE stream so the frontend can
+    render the response incrementally instead of waiting for the full
+    ``chat_turn_delta`` event.
+    """
+
+    import asyncio
+
+    async def _emit(payload: dict[str, object]) -> None:
+        try:
+            await handle.event("narrator_draft", payload)
+        except Exception:
+            pass
+
+    def _emit_sync(draft: str) -> None:
+        player_message_id = player_message_id_fetcher()
+        payload = {
+            "kind": "narrator_draft",
+            "version": 1,
+            "save_id": save_id,
+            "player_message_id": player_message_id,
+            "draft": draft,
+        }
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
+        if loop.is_running():
+            loop.create_task(_emit(payload))
+        else:
+            loop.run_until_complete(_emit(payload))
+
+    return _emit_sync
+
+
+def _latest_player_message_id(state: Any, save_id: str) -> str | None:
+    try:
+        latest = state.repositories.latest_active_message_rowid(save_id)
+    except Exception:
+        return None
+    if latest is None:
+        return None
+    try:
+        return str(latest.id)
+    except AttributeError:
+        return None
 
 
 def _turn_progress_callback(

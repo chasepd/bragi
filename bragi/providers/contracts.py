@@ -184,6 +184,25 @@ class ChatRequest:
         compare=False,
         repr=False,
     )
+    _provider_messages_cache: list[dict[str, str]] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+        init=False,
+    )
+    _rendered_text_cache: str | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+        init=False,
+    )
+
+    def __post_init__(self) -> None:
+        # Per-request caches for derived rendering. dataclasses.replace
+        # passes the original cache through, so we reset it for every
+        # fresh instance (including those produced by replace()).
+        object.__setattr__(self, "_provider_messages_cache", None)
+        object.__setattr__(self, "_rendered_text_cache", None)
 
 
 @dataclass(frozen=True)

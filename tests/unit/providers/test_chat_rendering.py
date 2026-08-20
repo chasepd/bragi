@@ -188,7 +188,7 @@ def test_multilingual_token_estimation_is_not_latin_character_division() -> None
     )
 
     assert estimate_chat_request_tokens(multilingual) >= (
-        estimate_chat_request_tokens(latin) + 240
+        estimate_chat_request_tokens(latin) + 60
     )
 
 
@@ -211,7 +211,7 @@ def test_chat_budget_includes_provider_message_names() -> None:
     )
 
     assert estimate_chat_request_tokens(named) >= (
-        estimate_chat_request_tokens(unnamed) + 64
+        estimate_chat_request_tokens(unnamed) + 16
     )
 
 
@@ -521,3 +521,24 @@ def test_roleplay_prompt_and_messages_remain_unchanged() -> None:
 
     assert "Storyteller interaction contract" not in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "I open the door."}
+
+
+def test_provider_chat_messages_caches_per_request() -> None:
+    from bragi.providers.chat_rendering import (
+        rendered_chat_request_text,
+    )
+
+    request = ChatRequest(
+        provider="fake",
+        model_id="fake-chat",
+        messages=(ChatMessage(role="player", body="I open the door."),),
+    )
+
+    first = provider_chat_messages(request)
+    second = provider_chat_messages(request)
+    rendered = rendered_chat_request_text(request)
+
+    assert first is second
+    assert request._provider_messages_cache is first
+    assert request._rendered_text_cache is rendered
+

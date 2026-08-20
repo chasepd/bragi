@@ -10800,7 +10800,8 @@ def test_chat_turn_uses_final_only_narrator_delivery(tmp_path: Path) -> None:
             narrator_stream_callback: Callable[[str], None] | None = None,
         ) -> SimpleNamespace:
             assert body == "Light the beacon"
-            assert narrator_stream_callback is None
+            assert narrator_stream_callback is not None
+            narrator_stream_callback("The bell answers.")
             return SimpleNamespace(
                 model=_chat_model("The bell answers."),
                 has_post_turn_jobs=False,
@@ -10831,7 +10832,7 @@ def test_chat_turn_uses_final_only_narrator_delivery(tmp_path: Path) -> None:
     snapshot = state.jobs.get(job_id)
     assert snapshot is not None
     event_names = [event["event"] for event in snapshot.events]
-    assert "narrator_draft" not in event_names
+    assert "narrator_draft" in event_names
     assert event_names.index("progress") < event_names.index("runtime")
 
 
