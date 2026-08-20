@@ -25128,42 +25128,42 @@ def test_submit_player_turn_skips_planned_active_thread_change_for_locked_field(
     } == {"locked_active_thread_field"}
 
 
-def _placeholder_provider(provider_name: str):
+def _placeholder_provider(provider_name: str) -> object:
     from bragi.providers.contracts import ChatResponse, ProviderConfigStatus
 
     class _Provider:
-        async def validate_config(self):
+        async def validate_config(self) -> ProviderConfigStatus:
             return ProviderConfigStatus(
                 provider=provider_name,
                 configured=True,
                 authenticated=True,
             )
 
-        async def list_models(self):
+        async def list_models(self) -> list[object]:
             return []
 
-        async def chat(self, request):
+        async def chat(self, request: object) -> ChatResponse:
             return ChatResponse(
                 body="ok",
-                provider=request.provider,
-                model_id=request.model_id,
+                provider=provider_name,
+                model_id="placeholder",
                 token_usage={},
             )
 
-        async def generate_image(self, request):
+        async def generate_image(self, request: object) -> object:
             raise AssertionError("chat turns must not request image generation")
 
-        async def generate_structured_output(self, request):
+        async def generate_structured_output(self, request: object) -> object:
             raise AssertionError("chat turns must not request structured output")
 
-        async def generate_tool_calls(self, request):
+        async def generate_tool_calls(self, request: object) -> object:
             raise AssertionError("chat turns must not request tool calls")
 
-        async def describe_image(self, request):
+        async def describe_image(self, request: object) -> object:
             raise AssertionError("chat turns must not describe images")
 
     provider = _Provider()
-    provider.provider_name = provider_name
+    provider.provider_name = provider_name  # type: ignore[attr-defined]
     return provider
 
 
@@ -25188,7 +25188,7 @@ def test_model_context_window_lookup_is_cached_within_a_turn(
 
     chat_service = ChatService(
         repositories=repositories,
-        providers={"openrouter": _placeholder_provider("openrouter")},
+        providers={"openrouter": _placeholder_provider("openrouter")},  # type: ignore[dict-item]
         context_search_service=ScriptedContextSearch(ContextSearchResult()),
     )
     chat_service._reset_turn_static_cache()

@@ -25,6 +25,22 @@ from bragi.persistence.models import (
 from bragi.persistence.repositories import PersistenceRepositories
 
 
+def _current_chat_service_for_narration():
+    """Lookup helper that mirrors the chat service cache wiring.
+
+    Imported lazily to avoid a circular import between narration_context and
+    chat_service at module load time.
+    """
+
+    from bragi.services.chat_service import _current_chat_service
+
+    return _current_chat_service()
+
+
+_NARRATION_SNAPSHOT_CACHE_KEY = "narration_context_snapshot"
+_SAVED_NARRATION_SNAPSHOT_CACHE_KEY = "narration_context_snapshot:saved"
+
+
 @dataclass(frozen=True)
 class NarrationContextSnapshot:
     details: SaveDetailsRecord
@@ -53,6 +69,49 @@ def load_narration_context_snapshot(
     details: SaveDetailsRecord | None = None,
     include_context_sources: bool = True,
     raw_record_limit: int | None = None,
+) -> NarrationContextSnapshot | None:
+    chat_service = _current_chat_service_for_narration()
+    if chat_service is not None and details is None and raw_record_limit is not None:
+        cache_key = (
+            f"{_NARRATION_SNAPSHOT_CACHE_KEY}:{save_id}:{raw_record_limit}:"
+            f"{int(include_context_sources)}"
+        )
+        cached = chat_service._turn_static_cache.get(cache_key)
+        if cached is _SAVED_NARRATION_SNAPSHOT_CACHE_KEY:
+            return None
+        if cached is not None and isinstance(cached, NarrationContextSnapshot):
+            return cached
+        snapshot = _compute_narration_context_snapshot(
+            repositories,
+            save_id=save_id,
+            details=None,
+            include_context_sources=include_context_sources,
+            raw_record_limit=raw_record_limit,
+        )
+        if snapshot is None:
+            chat_service._turn_static_cache[cache_key] = (
+                _SAVED_NARRATION_SNAPSHOT_CACHE_KEY
+            )
+        else:
+            chat_service._turn_static_cache[cache_key] = snapshot
+        chat_service._turn_static_cache_keys.add(cache_key)
+        return snapshot
+    return _compute_narration_context_snapshot(
+        repositories,
+        save_id=save_id,
+        details=details,
+        include_context_sources=include_context_sources,
+        raw_record_limit=raw_record_limit,
+    )
+
+
+def _compute_narration_context_snapshot(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    details: SaveDetailsRecord | None,
+    include_context_sources: bool,
+    raw_record_limit: int | None,
 ) -> NarrationContextSnapshot | None:
     details = details or repositories.load_save_details(save_id)
     if details is None:
