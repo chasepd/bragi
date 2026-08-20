@@ -1472,18 +1472,28 @@ describe("frontend helpers", () => {
     expect(events).toHaveBeenCalledWith("chat_turn_delta", delta);
   });
 
-  it("does not expose provisional narrator draft job events", async () => {
+  it("exposes provisional narrator draft job events", async () => {
     const { watchJob } = await import("./api");
     const sources = installEventSourceDouble();
     const events = vi.fn();
     const stop = watchJob("job-1", vi.fn(), events, "save-1");
 
     sources[0].dispatch("narrator_draft", {
-      message: { body: "Unchecked narrator text." }
+      kind: "narrator_draft",
+      version: 1,
+      save_id: "save-1",
+      player_message_id: "player-1",
+      draft: "Unchecked narrator text."
     });
     stop();
 
-    expect(events).not.toHaveBeenCalled();
+    expect(events).toHaveBeenCalledWith("narrator_draft", {
+      kind: "narrator_draft",
+      version: 1,
+      save_id: "save-1",
+      player_message_id: "player-1",
+      draft: "Unchecked narrator text."
+    });
   });
 
   it("delivers job completion level events", async () => {
@@ -7056,6 +7066,37 @@ describe("frontend helpers", () => {
     now = 3_000;
     await act(async () => vi.advanceTimersByTimeAsync(1));
     expect(placeholder).toHaveTextContent("3s elapsed");
+  });
+
+  it("renders a provisional narrator draft in the placeholder", async () => {
+    const { Chronicle } = await import("./main");
+    const client = new QueryClient();
+
+    render(
+      <QueryClientProvider client={client}>
+        <Chronicle
+          model={runtimeModel()}
+          runJob={vi.fn()}
+          pendingMessages={[{
+            message_id: "pending-narrator-placeholder",
+            role: "narrator",
+            speaker_name: null,
+            body: "The beacon",
+            actions: [],
+            pending_kind: "narrator_placeholder",
+            pending_progress: "Writing narrator response",
+            pending_draft: "The beacon",
+            pending_started_at_ms: 0,
+          }]}
+        />
+      </QueryClientProvider>,
+    );
+
+    const draft = screen.getByRole("status", { name: "Narrator response preview" });
+    expect(draft).toHaveTextContent("The beacon");
+    expect(draft).toHaveAttribute("data-draft", "true");
+    expect(draft).toHaveTextContent("Draft preview");
+    expect(screen.queryByText("Writing narrator response")).not.toBeInTheDocument();
   });
 
   it("does not show an optimistic player artifact after the narrator response persists", async () => {

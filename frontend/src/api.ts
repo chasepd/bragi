@@ -252,6 +252,13 @@ export type ChronicleModel = {
   has_more_before?: boolean;
   oldest_message_id?: string | null;
 };
+export type NarratorDraft = {
+  kind: "narrator_draft";
+  version: 1;
+  save_id: string;
+  player_message_id: string | null;
+  draft: string;
+};
 export type ChatTurnDelta = {
   kind: "chat_turn_delta";
   version: 1;
@@ -1499,7 +1506,7 @@ export function watchJob(
     fallbackController.contact();
     finish(parsed.value);
   });
-  for (const eventName of ["progress", "completion_level", "runtime", "chat_turn_delta"]) {
+  for (const eventName of ["progress", "completion_level", "runtime", "chat_turn_delta", "narrator_draft"]) {
     events.addEventListener(eventName, (event) => {
       const parsed = parseSseJson<unknown>(event as MessageEvent, { stream: "job", eventName, jobId, saveId });
       if (!parsed.ok) {
