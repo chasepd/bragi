@@ -261,6 +261,11 @@ export function ScenarioDialog({
           setError("");
           try {
             const result = await postJson<RuntimeModel>("/api/scenarios/manual", form);
+            const createError = runtimeResultError(result);
+            if (createError) {
+              setError(createError);
+              return;
+            }
             onRuntimeChanged(result);
             client.invalidateQueries({ queryKey: ["scenarios"] });
             onScenarioListChanged?.();
@@ -785,6 +790,12 @@ function ScenarioDraftEditor({
                 interaction_mode: draft.interaction_mode ?? "roleplay",
                 action_choices_enabled: Boolean(draft.action_choices_enabled)
               });
+              const saveError = runtimeResultError(result);
+              if (saveError) {
+                setError(saveError);
+                setSaving(false);
+                return;
+              }
               onRuntimeChanged(result);
               client.invalidateQueries({ queryKey: ["scenarios"] });
               onScenarioListChanged?.();

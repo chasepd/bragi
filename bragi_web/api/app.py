@@ -3052,57 +3052,57 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             payload.scenario_types,
         )
         _raise_if_invalid_interaction_mode(payload.interaction_mode)
-        async with state.lock.async_access():
-            kwargs: dict[str, Any] = {}
-            current_user_id = _owner_user_id_for_request(state)
-            if _call_accepts_keyword(
-                state.runtime.save_scenario_draft,
-                "owner_user_id",
-            ):
-                kwargs["owner_user_id"] = current_user_id
-            if _call_accepts_keyword(
-                state.runtime.save_scenario_draft,
-                "current_user_id",
-            ):
-                kwargs["current_user_id"] = current_user_id
-            if _call_accepts_keyword(
-                state.runtime.save_scenario_draft,
-                "remember_process_active_save",
-            ):
-                kwargs["remember_process_active_save"] = not _auth_context_enabled(
-                    state
-                )
-            if _call_accepts_keyword(
-                state.runtime.save_scenario_draft,
-                "scenario_types",
-            ):
-                kwargs["scenario_types"] = payload.scenario_types
-            if _call_accepts_keyword(
-                state.runtime.save_scenario_draft,
-                "character_starters",
-            ):
-                kwargs["character_starters"] = payload.character_starters
-            if _call_accepts_keyword(
-                state.runtime.save_scenario_draft,
-                "defer_opening_action_choices",
-            ):
-                kwargs["defer_opening_action_choices"] = True
-            if _call_accepts_keyword(
-                state.runtime.save_scenario_draft,
-                "interaction_mode",
-            ):
-                kwargs["interaction_mode"] = payload.interaction_mode
-            result = state.runtime.save_scenario_draft(
-                scenario_type=payload.scenario_type,
-                sections=payload.sections,
-                action_choices_enabled=payload.action_choices_enabled,
-                save_title=payload.save_title,
-                source_metadata=payload.source_metadata,
-                **kwargs,
+        kwargs: dict[str, Any] = {}
+        current_user_id = _owner_user_id_for_request(state)
+        if _call_accepts_keyword(
+            state.runtime.save_scenario_draft,
+            "owner_user_id",
+        ):
+            kwargs["owner_user_id"] = current_user_id
+        if _call_accepts_keyword(
+            state.runtime.save_scenario_draft,
+            "current_user_id",
+        ):
+            kwargs["current_user_id"] = current_user_id
+        if _call_accepts_keyword(
+            state.runtime.save_scenario_draft,
+            "remember_process_active_save",
+        ):
+            kwargs["remember_process_active_save"] = not _auth_context_enabled(
+                state
             )
-            if inspect.isawaitable(result):
-                result = await result
-            payload_dict = _runtime_json_dict(state, result)
+        if _call_accepts_keyword(
+            state.runtime.save_scenario_draft,
+            "scenario_types",
+        ):
+            kwargs["scenario_types"] = payload.scenario_types
+        if _call_accepts_keyword(
+            state.runtime.save_scenario_draft,
+            "character_starters",
+        ):
+            kwargs["character_starters"] = payload.character_starters
+        if _call_accepts_keyword(
+            state.runtime.save_scenario_draft,
+            "defer_opening_action_choices",
+        ):
+            kwargs["defer_opening_action_choices"] = True
+        if _call_accepts_keyword(
+            state.runtime.save_scenario_draft,
+            "interaction_mode",
+        ):
+            kwargs["interaction_mode"] = payload.interaction_mode
+        result = state.runtime.save_scenario_draft(
+            scenario_type=payload.scenario_type,
+            sections=payload.sections,
+            action_choices_enabled=payload.action_choices_enabled,
+            save_title=payload.save_title,
+            source_metadata=payload.source_metadata,
+            **kwargs,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        payload_dict = _runtime_json_dict(state, result)
+        async with state.lock.async_access():
             _remember_user_active_save_from_model_result(state, payload_dict)
         _publish_runtime_changed_from_model_result(
             state,
