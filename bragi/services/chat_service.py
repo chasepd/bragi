@@ -116,10 +116,7 @@ from bragi.services.chat_history_settings import (
     chat_history_window_settings,
     narrator_planner_chat_history_window_settings,
 )
-from bragi.services.content_rating import (
-    CONTENT_RATING_UNRATED,
-    effective_content_safety_policy,
-)
+from bragi.services.content_rating import effective_content_safety_policy
 from bragi.services.content_safety_service import (
     ContentSafetyAction,
     ContentSafetyService,
@@ -611,6 +608,10 @@ PreparedAutomaticImageCallback = Callable[[dict[str, object]], None]
 PostInputContext = Callable[[], AbstractAsyncContextManager[None]]
 PostTurnWorldUpdateContext = Callable[[], AbstractAsyncContextManager[None]]
 NarratorStreamCallback = Callable[[str], None]
+# NarratorStreamCallback is called once with the final narrator body after
+# all safety/quality guards have passed. The callback is intentionally not
+# invoked with partial drafts, so disallowed content never reaches the
+# caller even when the model streams it before a guard replaces it.
 
 
 class _NoopAsyncContext:
@@ -2756,17 +2757,19 @@ class ChatService:
         )
         stream_callback = narrator_stream_callback
         buffered_streaming = False
+        streamed_any_chunk = False
+        if narrator_stream_callback is not None:
+            buffered_streaming = True
+
+            def buffer_draft(draft: str) -> None:
+                nonlocal streamed_any_chunk
+                streamed_any_chunk = True
+
+            stream_callback = buffer_draft
         phrase_denylist = effective_generated_phrase_denylist(
             self.repositories,
             save_id=save_id,
         )
-        if narrator_stream_callback is not None:
-            buffered_streaming = True
-
-            def capture_narrator_draft(_draft: str) -> None:
-                return None
-
-            stream_callback = capture_narrator_draft
         call_started = perf_counter()
         turn_progress.publish("narrator", "running", "Writing narrator response")
         try:
@@ -3277,6 +3280,7 @@ class ChatService:
         )
         if buffered_streaming and narrator_stream_callback is not None:
             narrator_stream_callback(narrator_body)
+            streamed_any_chunk = False
         _log_chat_stage(
             "chat.stage.provider_chat_finished",
             save_id=save_id,
@@ -4578,8 +4582,7 @@ class ChatService:
                 if not chunk.delta:
                     continue
                 body_parts.append(chunk.delta)
-                if request.content_rating == CONTENT_RATING_UNRATED:
-                    narrator_stream_callback("".join(body_parts))
+                narrator_stream_callback("".join(body_parts))
         except Exception as exc:
             if "".join(body_parts).strip():
                 raise _StreamingChatFailedAfterDraft(str(exc)) from exc
