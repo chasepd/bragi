@@ -15,6 +15,11 @@ from pathlib import Path
 from time import time
 from typing import Any, cast
 
+from bragi.providers.http_client import (
+    httpx_request_bytes,
+    httpx_request_json,
+    httpx_request_sse_json,
+)
 from bragi_web.auth_throttle import AuthAttemptThrottle
 from bragi_web.bragi_adapter import bragi_runtime_bindings
 from bragi_web.jobs import JobRecord, JobRegistry
@@ -656,16 +661,35 @@ def _provider_clients(
     if os.environ.get("BRAGI_WEB_FAKE_PROVIDERS") == "1":
         fake = bindings.FakeProviderClient()
         return {"fake": fake, "openrouter": fake, "venice": fake}
+    if os.environ.get("BRAGI_WEB_PROVIDER_HTTPX", "").strip() == "0":
+        return {
+            "openrouter": bindings.OpenRouterClient(
+                secret_store=secret_store,
+                retry_max_attempts=retry_max_attempts,
+                call_deadline_seconds=call_deadline_seconds,
+            ),
+            "venice": bindings.VeniceClient(
+                secret_store=secret_store,
+                retry_max_attempts=retry_max_attempts,
+                call_deadline_seconds=call_deadline_seconds,
+            ),
+        }
     return {
         "openrouter": bindings.OpenRouterClient(
             secret_store=secret_store,
             retry_max_attempts=retry_max_attempts,
             call_deadline_seconds=call_deadline_seconds,
+            transport=httpx_request_json,
+            binary_transport=httpx_request_bytes,
+            stream_transport=httpx_request_sse_json,
         ),
         "venice": bindings.VeniceClient(
             secret_store=secret_store,
             retry_max_attempts=retry_max_attempts,
             call_deadline_seconds=call_deadline_seconds,
+            transport=httpx_request_json,
+            binary_transport=httpx_request_bytes,
+            stream_transport=httpx_request_sse_json,
         ),
     }
 

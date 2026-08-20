@@ -12,10 +12,15 @@ import pytest
 
 from bragi.providers.errors import ProviderError, ProviderErrorCategory
 from bragi.providers.http_client import (
+    BinaryHttpResponse,
     JsonHttpResponse,
     _iter_sse_data,
     _safe_started_diagnostics,
+    dispatch_transport,
     ensure_success,
+    httpx_request_bytes,
+    httpx_request_json,
+    httpx_request_sse_json,
     request_bytes,
     request_json,
     request_sse_json,
@@ -637,3 +642,152 @@ def test_request_binary_suppresses_venice_http_error_body_and_keeps_safe_headers
     assert "request-secret" not in repr(fields)
     assert "private image prompt" not in repr(fields)
     assert "venice-secret" not in repr(fields)
+
+
+def test_httpx_request_json_parses_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        status_code = 200
+        text = '{"ok": true, "items": 3}'
+        headers = {"content-type": "application/json"}
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, object]] = []
+
+        async def request(self, **kwargs: object) -> FakeResponse:
+            self.requests.append(kwargs)
+            return FakeResponse()
+
+    client = FakeClient()
+    monkeypatch.setattr(
+        "bragi.providers.http_client._get_httpx_client",
+        lambda **_: client,
+    )
+
+    result = asyncio.run(
+        httpx_request_json(
+            method="POST",
+            url="https://api.example.test/chat",
+            headers={"Authorization": "Bearer token"},
+            payload={"model": "fake-chat"},
+            timeout=30.0,
+            provider="fake",
+            task="chat",
+            model="fake-chat",
+            schema_name="narrator",
+        )
+    )
+
+    assert result.status_code == 200
+    assert result.payload == {"ok": True, "items": 3}
+    assert result.headers == {"content-type": "application/json"}
+    assert client.requests[0]["method"] == "POST"
+    assert client.requests[0]["url"] == "https://api.example.test/chat"
+    assert client.requests[0]["content"] == b'{"model": "fake-chat"}'
+
+
+def test_httpx_request_bytes_caps_response_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeResponse:
+        status_code = 200
+        content = b"0123456789"
+        headers = {}
+
+    class FakeClient:
+        async def request(self, **kwargs: object) -> FakeResponse:
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "bragi.providers.http_client._get_httpx_client",
+        lambda **kwargs: FakeClient(),
+    )
+
+    result = asyncio.run(
+        httpx_request_bytes(
+            method="GET",
+            url="https://api.example.test/image",
+            headers={},
+            payload=None,
+            timeout=30.0,
+            max_response_bytes=4,
+        )
+    )
+
+    assert isinstance(result, BinaryHttpResponse)
+    assert result.body == b"0123"
+
+
+async def _collect_stream(stream: object) -> list[dict[str, object]]:
+    return [event async for event in stream]
+
+
+def test_httpx_request_sse_json_yields_parsed_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeStreamResponse:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_lines(self):
+            for line in (
+                ": keepalive",
+                "",
+                'data: {"choices":[{"delta":{"content":"The"}}]}',
+                "",
+                "data: [DONE]",
+                "",
+            ):
+                yield line
+
+    class FakeClient:
+        def stream(self, **kwargs: object) -> "FakeStreamContext":
+            return FakeStreamContext()
+
+    class FakeStreamContext:
+        async def __aenter__(self) -> FakeStreamResponse:
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "bragi.providers.http_client._get_httpx_client",
+        lambda **kwargs: FakeClient(),
+    )
+
+    events = asyncio.run(
+        _collect_stream(
+            httpx_request_sse_json(
+                method="POST",
+                url="https://api.example.test/chat",
+                headers={},
+                payload={"stream": True},
+                timeout=30.0,
+            )
+        )
+    )
+
+    assert events == [{"choices": [{"delta": {"content": "The"}}]}]
+
+
+def test_dispatch_transport_runs_sync_and_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def async_transport(**kwargs: object) -> str:
+        return f"async-{kwargs['value']}"
+
+    def sync_transport(**kwargs: object) -> str:
+        return f"sync-{kwargs['value']}"
+
+    async def run() -> tuple[str, str]:
+        async_result = await dispatch_transport(async_transport, value=1)
+        sync_result = await dispatch_transport(sync_transport, value=2)
+        return async_result, sync_result
+
+    assert asyncio.run(run()) == ("async-1", "sync-2")
