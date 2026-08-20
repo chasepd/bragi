@@ -3429,6 +3429,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "speaker_name": payload.speaker_name,
                 "active_save_id": submitted_save_id,
             }
+            narrator_drafts_enabled = _narrator_drafts_enabled(
+                state,
+                current_user_id,
+            )
             await _wait_for_background_post_turn_catchup(
                 state,
                 handle,
@@ -3447,7 +3451,14 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                             state, submitted_save_id
                         ),
                     )
+                    if narrator_drafts_enabled
+                    else None
                 )
+            if narrator_drafts_enabled and _call_accepts_keyword(
+                state.runtime.submit_player_message_for_initial_render,
+                "incremental_delivery",
+            ):
+                kwargs["incremental_delivery"] = True
             if _call_accepts_keyword(
                 state.runtime.submit_player_message_for_initial_render,
                 "current_user_id",
@@ -10069,43 +10080,77 @@ def _make_narrator_draft_emitter(
     *,
     save_id: str,
     player_message_id_fetcher: Callable[[], str | None],
+    throttle_interval: float = 0.15,
 ) -> Callable[[str], None]:
     """Build a narrator-stream callback that emits a throttled SSE draft.
 
-    The chat service invokes the callback once with the final narrator
-    body after all guards have passed. The callback pushes a
-    ``narrator_draft`` event into the job's SSE stream so the frontend can
-    render the response incrementally instead of waiting for the full
-    ``chat_turn_delta`` event.
+    The chat service invokes the callback with the running narrator body as
+    it streams and again with the final guarded body. Unvetted drafts only
+    flow when ``_narrator_drafts_enabled`` allows them (content-safety
+    rating ``unrated``); the final guarded body is always safe to emit, but
+    the committed narrator text is carried by ``chat_turn_delta``.
     """
 
     import asyncio
 
-    async def _emit(payload: dict[str, object]) -> None:
+    state: dict[str, float] = {"last_emit": 0.0}
+
+    def _emit(payload: dict[str, object]) -> None:
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            return
+        if loop.is_running():
+            try:
+                loop.create_task(_emit_sse(handle, payload))
+            except RuntimeError:
+                return
+
+    async def _emit_sse(handle: Any, payload: dict[str, object]) -> None:
         try:
             await handle.event("narrator_draft", payload)
         except Exception:
             pass
 
     def _emit_sync(draft: str) -> None:
-        player_message_id = player_message_id_fetcher()
-        payload = {
-            "kind": "narrator_draft",
-            "version": 1,
-            "save_id": save_id,
-            "player_message_id": player_message_id,
-            "draft": draft,
-        }
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
+        now = perf_counter()
+        if state["last_emit"] != 0.0 and now - state["last_emit"] < throttle_interval:
             return
-        if loop.is_running():
-            loop.create_task(_emit(payload))
-        else:
-            loop.run_until_complete(_emit(payload))
+        state["last_emit"] = now
+        player_message_id = player_message_id_fetcher()
+        _emit(
+            {
+                "kind": "narrator_draft",
+                "version": 1,
+                "save_id": save_id,
+                "player_message_id": player_message_id,
+                "draft": draft,
+            }
+        )
 
     return _emit_sync
+
+
+def _narrator_drafts_enabled(state: Any, user_id: str | None) -> bool:
+    """Gate unvetted draft streaming to saves whose rating needs no review.
+
+    A narrator stream arrives before the content-safety review runs, so it
+    can only be surfaced for content that is not subject to review in the
+    first place (an ``unrated`` policy). Child accounts and rated saves
+    keep the buffered single-shot delivery.
+    """
+
+    from bragi.content_rating_instructions import CONTENT_RATING_UNRATED
+    from bragi.services.content_rating import effective_content_safety_policy
+
+    try:
+        policy = effective_content_safety_policy(
+            state.repositories,
+            user_id=user_id,
+        )
+        return policy.rating == CONTENT_RATING_UNRATED
+    except Exception:  # noqa: BLE001 - privacy gate must fail closed
+        return False
 
 
 def _latest_player_message_id(state: Any, save_id: str) -> str | None:

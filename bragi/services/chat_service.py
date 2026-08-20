@@ -1191,6 +1191,7 @@ class ChatService:
         turn_progress_callback: TurnProgressCallback | None = None,
         post_input_context: PostInputContext | None = None,
         turn_operation: str = TURN_OPERATION_NEW_PLAYER,
+        incremental_delivery: bool = False,
     ) -> SubmittedTurn:
         turn_started = perf_counter()
         self._reset_turn_static_cache()
@@ -1282,6 +1283,7 @@ class ChatService:
                     turn_progress_callback=turn_progress_callback,
                     _turn_progress=turn_progress,
                     turn_operation=turn_operation,
+                    incremental_delivery=incremental_delivery,
                 )
         finally:
             _CURRENT_CHAT_SERVICE.reset(chat_service_token)
@@ -1664,6 +1666,7 @@ class ChatService:
         turn_progress_callback: TurnProgressCallback | None = None,
         _turn_progress: _TurnProgressPublisher | None = None,
         turn_operation: str = TURN_OPERATION_RECOVERY,
+        incremental_delivery: bool = False,
     ) -> SubmittedTurn:
         started_at = turn_started or perf_counter()
         token = cancellation_token or CancellationToken()
@@ -1713,6 +1716,7 @@ class ChatService:
                             automatic_retry_category=automatic_retry_category,
                             automatic_retry_delay_ms=automatic_retry_delay_ms,
                             turn_operation=turn_operation,
+                            incremental_delivery=incremental_delivery,
                         )
                     )
                 if attempt > 1:
@@ -1852,6 +1856,7 @@ class ChatService:
         automatic_retry_category: str | None = None,
         automatic_retry_delay_ms: int | None = None,
         turn_operation: str = TURN_OPERATION_RECOVERY,
+        incremental_delivery: bool = False,
     ) -> SubmittedTurn:
         turn_started = turn_started or perf_counter()
         preference = _chat_model_preference_for_save(
@@ -2789,11 +2794,21 @@ class ChatService:
         if narrator_stream_callback is not None:
             buffered_streaming = True
 
-            def buffer_draft(draft: str) -> None:
-                nonlocal streamed_any_chunk
-                streamed_any_chunk = True
+            if incremental_delivery:
 
-            stream_callback = buffer_draft
+                def forward_draft(draft: str) -> None:
+                    nonlocal streamed_any_chunk
+                    streamed_any_chunk = True
+                    narrator_stream_callback(draft)
+
+                stream_callback = forward_draft
+            else:
+
+                def buffer_draft(draft: str) -> None:
+                    nonlocal streamed_any_chunk
+                    streamed_any_chunk = True
+
+                stream_callback = buffer_draft
         phrase_denylist = effective_generated_phrase_denylist(
             self.repositories,
             save_id=save_id,
