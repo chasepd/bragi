@@ -185,6 +185,13 @@ class ChatRequest:
         repr=False,
     )
 
+    def __post_init__(self) -> None:
+        # Per-request caches for derived rendering. These are stored as
+        # instance attributes (not dataclass fields) so dataclasses.replace
+        # does not propagate them across derived requests.
+        object.__setattr__(self, "_provider_messages_cache", None)
+        object.__setattr__(self, "_rendered_text_cache", None)
+
 
 @dataclass(frozen=True)
 class ChatResponse:

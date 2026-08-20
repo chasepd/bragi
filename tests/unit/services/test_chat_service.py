@@ -18377,6 +18377,7 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
+        supported_parameters=["max_output_tokens"],
         context_window=16_384,
     )
     repositories.save_provider_model(
@@ -18384,6 +18385,7 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
         model_id="venice/fallback-chat",
         display_name="Venice Fallback Chat",
         capabilities=["chat", "fallback_marker"],
+        supported_parameters=["max_output_tokens"],
         context_window=65536,
     )
     repositories.set_model_preference(
@@ -18397,9 +18399,11 @@ def test_chat_fallback_rebudgets_from_untrimmed_primary_request(
         model_id="venice/fallback-chat",
     )
     repositories.set_app_setting("chat_fallback_enabled", True)
+    repositories.set_app_setting("chat_max_output_tokens_enabled", True)
+    repositories.set_app_setting("chat_max_output_tokens", 14_500)
     selected_state_text = (
         "beacon.fuse: The spare fuse is under the red lens. "
-        + "The fuse remains relevant to the active beacon repair. " * 40
+        + "The fuse remains relevant to the active beacon repair. " * 200
     )
     selected_state = (
         "[world_state:state-lens-fuse] " + selected_state_text
@@ -22186,8 +22190,11 @@ def test_submit_player_turn_final_prompt_budget_trims_recap_and_baseline(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
+        supported_parameters=["max_output_tokens"],
         context_window=16_384,
     )
+    repositories.set_app_setting("chat_max_output_tokens_enabled", True)
+    repositories.set_app_setting("chat_max_output_tokens", 14_500)
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
@@ -22328,7 +22335,7 @@ def test_final_prompt_budget_can_trim_phone_context() -> None:
             provider="fake",
             model_id="fake-chat",
             messages=(ChatMessage(role="player", body="I check my phone."),),
-            phone_context=("Phone thread: Mika " + "late message " * 1800,),
+            phone_context=("Phone thread: Mika " + "late message " * 8000,),
             max_output_tokens=1,
         ),
         model_context_window=8000,
@@ -22375,8 +22382,11 @@ def test_submit_player_turn_final_prompt_budget_trims_selected_retrieval(
         model_id="anthropic/claude-3.5-sonnet",
         display_name="Claude 3.5 Sonnet",
         capabilities=["chat"],
+        supported_parameters=["max_output_tokens"],
         context_window=16_384,
     )
+    repositories.set_app_setting("chat_max_output_tokens_enabled", True)
+    repositories.set_app_setting("chat_max_output_tokens", 14_500)
     repositories.set_model_preference(
         task="chat",
         provider="openrouter",
@@ -22392,7 +22402,7 @@ def test_submit_player_turn_final_prompt_budget_trims_selected_retrieval(
                     SelectedContextItem(
                         source_type="message",
                         source_id="message-too-large",
-                        text="Old chronicle: " + "the buried legion repeats " * 120,
+                        text="Old chronicle: " + "the buried legion repeats " * 1200,
                         relevance_note="Too verbose for the final prompt budget.",
                     ),
                 ),
@@ -22429,20 +22439,20 @@ def test_final_prompt_budget_preserves_summary_before_low_priority_retrieval() -
             messages=(ChatMessage(role="player", body="I wait by the beacon."),),
             current_scene_recap=("Scene snapshot: the beacon gallery is active.",),
             retrieved_recent_messages=(
-                "[message:old-1] Old chronicle: " + "ash signal " * 220,
-                "[message:old-2] Older chronicle: " + "brass warning " * 220,
+                "[message:old-1] Old chronicle: " + "ash signal " * 600,
+                "[message:old-2] Older chronicle: " + "brass warning " * 600,
             ),
             retrieved_observations=(
                 "[observation:obs-1] Routine ambient detail. "
-                + "wind note " * 160,
+                + "wind note " * 400,
             ),
             retrieved_memories=(
                 "[memory:mem-1] Low priority selected memory. "
-                + "lens trivia " * 180,
+                + "lens trivia " * 400,
             ),
             retrieved_state=(
                 "[world_state:state-1] Low priority selected state. "
-                + "dust color " * 180,
+                + "dust color " * 400,
             ),
             summary=(
                 "[summary:summary-latest] Mara crossed the ash bridge, promised "
@@ -22450,7 +22460,7 @@ def test_final_prompt_budget_preserves_summary_before_low_priority_retrieval() -
             ),
             max_output_tokens=1,
         ),
-        model_context_window=6000,
+        model_context_window=2000,
     )
 
     budget = request.context_breakdown["final_prompt_budget"]

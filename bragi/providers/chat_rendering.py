@@ -28,6 +28,9 @@ _STORY_DIRECTION_SUFFIX = "\nEND NON-DIEGETIC STORY DIRECTION"
 
 
 def provider_chat_messages(request: ChatRequest) -> list[dict[str, str]]:
+    cached = request._provider_messages_cache
+    if cached is not None:
+        return cached
     messages: list[dict[str, str]] = []
     system_body = chat_system_body(request)
     if system_body:
@@ -39,6 +42,7 @@ def provider_chat_messages(request: ChatRequest) -> list[dict[str, str]]:
         )
         for message in request.messages
     )
+    object.__setattr__(request, "_provider_messages_cache", messages)
     return messages
 
 
@@ -89,10 +93,15 @@ def chat_system_body(request: ChatRequest) -> str:
 
 
 def rendered_chat_request_text(request: ChatRequest) -> str:
-    return "\n\n".join(
+    cached = request._rendered_text_cache
+    if cached is not None:
+        return cached
+    rendered = "\n\n".join(
         _provider_message_estimate_text(message)
         for message in provider_chat_messages(request)
     )
+    object.__setattr__(request, "_rendered_text_cache", rendered)
+    return rendered
 
 
 def _provider_message_estimate_text(message: dict[str, str]) -> str:
