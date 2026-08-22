@@ -114,6 +114,11 @@
       "targets": [
         {
           "agent": "cursor",
+          "path": ".cursor/rules/agentsync.md",
+          "native_checksum": "ec83e8ac8a1b5830e82d162db9157c4a909faa9037f8e7a7833182425f1e74a5"
+        },
+        {
+          "agent": "cursor",
           "path": ".cursor/rules/agentsync.mdc",
           "native_checksum": "e3fc79377a28045f2ebf6b623acfad40615ebbf0e6514510d5a631a4cc27349a"
         },
@@ -125,7 +130,7 @@
       ],
       "diagnostics": [],
       "native_extensions": {},
-      "last_synced_at": "2026-08-22T16:52:43.412284384+00:00"
+      "last_synced_at": "2026-08-22T17:10:55.587153001+00:00"
     },
     {
       "resource_id": "skills:code-review",
