@@ -1,8 +1,8 @@
 import React, { useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Loader2, Plus, RefreshCw, Wand2, X } from "lucide-react";
-import { postJson } from "./api";
-import type { Job, RuntimeModel, ScenarioDraft, ScenarioWizardFlow } from "./api";
+import { api, postJson } from "./api";
+import type { Job, PersistentWorld, RuntimeModel, ScenarioDraft, ScenarioWizardFlow } from "./api";
 import {
   defaultFlows,
   defaultSecondaryScenarioType,
@@ -55,6 +55,10 @@ export function ScenarioDialog({
   runJob: RunJob;
 }) {
   const client = useQueryClient();
+  const persistentWorldsQuery = useQuery({
+    queryKey: ["persistent-worlds"],
+    queryFn: () => api<{ worlds: PersistentWorld[] }>("/api/worlds")
+  });
   const watchDialogJob = useDialogJobWatcher();
   const titleId = React.useId();
   const [mode, setMode] = useState<"manual" | "draft">(initialMode);
@@ -66,6 +70,7 @@ export function ScenarioDialog({
         ? model.scenario_draft.scenario_types
         : [model?.scenario_draft?.scenario_type ?? "full_roleplay"],
     action_choices_enabled: initialDraftPrefill?.action_choices_enabled ?? model?.scenario_draft?.action_choices_enabled ?? false,
+    persistent_world_id: "",
     interaction_mode: initialDraftPrefill?.interaction_mode ?? model?.scenario_draft?.interaction_mode ?? "roleplay",
     title: "",
     premise: "",
@@ -260,7 +265,11 @@ export function ScenarioDialog({
           setBusy(true);
           setError("");
           try {
-            const result = await postJson<RuntimeModel>("/api/scenarios/manual", form);
+            const { persistent_world_id: persistentWorldId, ...scenarioPayload } = form;
+            const result = await postJson<RuntimeModel>(
+              "/api/scenarios/manual",
+              persistentWorldId ? { ...scenarioPayload, persistent_world_id: persistentWorldId } : scenarioPayload
+            );
             const createError = runtimeResultError(result);
             if (createError) {
               setError(createError);
@@ -288,6 +297,20 @@ export function ScenarioDialog({
           onChange={setMode}
           options={modeOptions}
         />
+        <label className="field-label scenario-world-select">
+          <span>Persistent world <small>(optional)</small></span>
+          <select
+            aria-label="Persistent world"
+            value={form.persistent_world_id}
+            onChange={(event) => setForm({ ...form, persistent_world_id: event.target.value })}
+          >
+            <option value="">Standalone setting</option>
+            {persistentWorldsQuery.data?.worlds?.map((world) => (
+              <option value={world.world_id} key={world.world_id}>{world.title}</option>
+            ))}
+          </select>
+          <small>Reusable world prose is copied into each new save as a snapshot.</small>
+        </label>
         <SegmentedTabs
           label="Scenario draft flows"
           value={form.scenario_type}
@@ -363,7 +386,7 @@ export function ScenarioDialog({
                 {busy ? <Loader2 className="spin" size={15} /> : <Wand2 size={15} />} Generate
               </button>
             </div>
-            {draft ? <ScenarioDraftEditor key={draftVersion} draft={draft} flow={flow} currentUser={currentUser} runJob={runJob} onSaved={onClose} onRuntimeChanged={onRuntimeChanged} onScenarioListChanged={onScenarioListChanged} setDraft={setScenarioDraft} /> : null}
+            {draft ? <ScenarioDraftEditor key={draftVersion} draft={draft} persistentWorldId={form.persistent_world_id} flow={flow} currentUser={currentUser} runJob={runJob} onSaved={onClose} onRuntimeChanged={onRuntimeChanged} onScenarioListChanged={onScenarioListChanged} setDraft={setScenarioDraft} /> : null}
           </>
         ) : null}
         {draftProgress ? <p className="scenario-draft-status" role="status" aria-live="polite">{draftProgress}</p> : null}
@@ -446,6 +469,7 @@ function emptyScenarioFormFields(): ScenarioForm {
     scenario_type: "",
     scenario_types: [],
     action_choices_enabled: false,
+    persistent_world_id: "",
     interaction_mode: "roleplay",
     title: "",
     premise: "",
@@ -545,6 +569,7 @@ function emptyScenarioFormFields(): ScenarioForm {
 
 function ScenarioDraftEditor({
   draft,
+  persistentWorldId,
   flow,
   currentUser,
   runJob,
@@ -554,6 +579,7 @@ function ScenarioDraftEditor({
   setDraft
 }: {
   draft: ScenarioDraft;
+  persistentWorldId?: string;
   flow?: ScenarioWizardFlow;
   currentUser?: CurrentUser | null;
   runJob: RunJob;
@@ -788,7 +814,8 @@ function ScenarioDraftEditor({
                 save_title: sections.title ?? "",
                 source_metadata: Object.fromEntries(draft.source_metadata ?? []),
                 interaction_mode: draft.interaction_mode ?? "roleplay",
-                action_choices_enabled: Boolean(draft.action_choices_enabled)
+                action_choices_enabled: Boolean(draft.action_choices_enabled),
+                persistent_world_id: persistentWorldId || null
               });
               const saveError = runtimeResultError(result);
               if (saveError) {

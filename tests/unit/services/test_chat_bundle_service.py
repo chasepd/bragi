@@ -629,6 +629,42 @@ def test_export_save_writes_manifest_data_and_referenced_media(
         assert curation_state["lease_until"] is None
 
 
+def test_chat_bundle_round_trips_linked_persistent_world(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    world = repositories.create_persistent_world(
+        title="The Salt Marches",
+        sections={"cultures": "The river clans trade by oath."},
+    )
+    repositories.set_scenario_persistent_world(
+        scenario_id=save.scenario_id,
+        persistent_world_id=world.id,
+    )
+    bundle_path = tmp_path / "exports" / "salt-marches.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+
+    with zipfile.ZipFile(bundle_path) as bundle:
+        data = json.loads(bundle.read("data.json"))
+    assert data["persistent_world"]["title"] == "The Salt Marches"
+
+    imported = service.import_save(bundle_path)
+    imported_save = repositories.get_save(_imported_save_id(imported))
+    assert imported_save is not None
+    imported_scenario = repositories.get_scenario(imported_save.scenario_id)
+    assert imported_scenario is not None
+    assert imported_scenario.persistent_world_id is not None
+    imported_world = repositories.get_persistent_world(
+        imported_scenario.persistent_world_id
+    )
+    assert imported_world is not None
+    assert imported_world.title == "The Salt Marches (imported)"
+
+
 def test_export_import_preserves_pending_retry_budgets(
     repositories: PersistenceRepositories,
     tmp_path: Path,

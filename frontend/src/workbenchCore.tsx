@@ -97,6 +97,7 @@ import {
   OpenRouterRoutingTaskOverride,
   postJson,
   ProviderCard,
+  PersistentWorld,
   RuntimePerformanceReport,
   RuntimePerformanceRow,
   RuntimeSlowOperation,
@@ -128,6 +129,7 @@ import {
 } from "./api";
 
 import { BrandLockup, BrandMark } from "./brand";
+import { PersistentWorldLibrary } from "./persistentWorldLibrary";
 import "./styles.css";
 
 function scheduleClientPaintEvent(
@@ -184,6 +186,7 @@ type PanelName = "media" | "history" | "world" | "characters" | "settings";
 type WorkbenchRefreshTarget =
   | "runtime"
   | "scenarios"
+  | "worlds"
   | "world"
   | "characters"
   | "scene-presence"
@@ -340,7 +343,8 @@ function saveEventRefreshTargets(event: SaveEvent, panel: PanelName): WorkbenchR
   if (event.type === "world_data_changed") return runtimeChangedRefreshTargets(saveEventReason(event), panel);
   if (event.type === "job_changed") return [];
   if (event.type === "character_texts_changed") return ["character-texts", "character-text-thread", "chat-status"];
-  if (event.type === "scenarios_changed") return ["scenarios"];
+  if (event.type === "worlds_changed") return ["worlds", "scenarios"];
+  if (event.type === "scenarios_changed") return ["scenarios", "worlds"];
   if (event.type === "saves_changed") return ["runtime", "scenarios"];
   if (event.type === "save_deleted") return ["runtime", "scenarios", "jobs-active", "chat-status"];
   return ALL_WORKBENCH_REFRESH_TARGETS.slice();
@@ -637,7 +641,7 @@ type WorkbenchLayoutStyle = React.CSSProperties & {
   "--left-rail-width": string;
   "--right-panel-width": string;
 };
-type LibraryTab = "saves" | "scenarios";
+type LibraryTab = "saves" | "scenarios" | "worlds";
 type SortDirection = "asc" | "desc";
 type SaveSortKey = "last_opened" | "title" | "created" | "updated" | "scenario_title";
 type ScenarioSortKey = "updated" | "title" | "created" | "save_count" | "type";
@@ -1319,6 +1323,7 @@ type ScenarioForm = {
   scenario_types: string[];
   interaction_mode: "roleplay" | "storyteller";
   action_choices_enabled: boolean;
+  persistent_world_id: string;
   title: string;
   premise: string;
   player_role: string;
@@ -1413,7 +1418,7 @@ type ScenarioForm = {
   choice_style: string;
   opening_message: string;
 };
-type ScenarioFormTextField = Exclude<keyof ScenarioForm, "action_choices_enabled" | "scenario_types" | "interaction_mode">;
+type ScenarioFormTextField = Exclude<keyof ScenarioForm, "action_choices_enabled" | "persistent_world_id" | "scenario_types" | "interaction_mode">;
 type ScenarioDraftPrefill = {
   scenario_type: string;
   scenario_types: string[];
@@ -2200,7 +2205,9 @@ function normalizeLibraryControlsState(value: unknown): LibraryControlsState {
   if (!value || typeof value !== "object") return DEFAULT_LIBRARY_CONTROLS_STATE;
   const candidate = value as Partial<Record<keyof LibraryControlsState, unknown>>;
   return {
-    activeTab: candidate.activeTab === "scenarios" ? "scenarios" : "saves",
+    activeTab: candidate.activeTab === "scenarios" || candidate.activeTab === "worlds"
+      ? candidate.activeTab
+      : "saves",
     saveQuery: typeof candidate.saveQuery === "string" ? candidate.saveQuery : "",
     saveSort: isSaveSortKey(candidate.saveSort) ? candidate.saveSort : "updated",
     saveDirection: candidate.saveDirection === "asc" ? "asc" : "desc",
@@ -2997,6 +3004,9 @@ function Workbench({
       if (target === "scenarios") {
         client.invalidateQueries({ queryKey: ["scenarios"] });
         refreshScenarioLibrary();
+      }
+      if (target === "worlds") {
+        client.invalidateQueries({ queryKey: ["persistent-worlds"] });
       }
       if (target === "world") {
         client.invalidateQueries({ queryKey: saveId ? ["world", saveId] : ["world"] });
@@ -4200,6 +4210,7 @@ function LibraryControls(props: {
           scenario.title,
           scenario.premise,
           scenario.player_role,
+          scenario.persistent_world_title,
           scenarioTypesLabel(scenario.scenario_types, scenario.scenario_type),
           scenario.scenario_id
         ])
@@ -4289,6 +4300,12 @@ function LibraryControls(props: {
       label: `Scenarios (${scenarioItems.length})`,
       tabId: `${tabBaseId}-scenarios-tab`,
       panelId: `${tabBaseId}-scenarios-panel`
+    },
+    {
+      value: "worlds",
+      label: "Worlds",
+      tabId: `${tabBaseId}-worlds-tab`,
+      panelId: `${tabBaseId}-worlds-panel`
     }
   ];
   return (
@@ -4437,7 +4454,7 @@ function LibraryControls(props: {
               {saves.length && !visibleSaves.length ? <p className="empty">No saves match</p> : null}
             </div>
           </section>
-        ) : (
+        ) : libraryState.activeTab === "scenarios" ? (
           <section
             id={`${tabBaseId}-scenarios-panel`}
             className="library-panel"
@@ -4601,6 +4618,12 @@ function LibraryControls(props: {
               {scenarioItems.length && !visibleScenarios.length ? <p className="empty">No scenarios match</p> : null}
             </div>
           </section>
+        ) : (
+          <PersistentWorldLibrary
+            adminControlsAllowed={adminControlsAllowed}
+            allowImportExport={childRestrictedControlsAllowed}
+            onChanged={props.onChanged}
+          />
         )}
       </div>
       {currentRenamingSave ? (
@@ -4755,6 +4778,7 @@ function saveLibraryMeta(save: SaveListItem) {
 function scenarioLibraryMeta(scenario: Scenario) {
   const parts = [
     scenarioTypesLabel(scenario.scenario_types, scenario.scenario_type),
+    scenario.persistent_world_title ? `setting: ${scenario.persistent_world_title}` : "",
     `${scenario.save_count} ${scenario.save_count === 1 ? "save" : "saves"}`,
     scenario.updated_at ? `updated ${formatLibraryDate(scenario.updated_at)}` : ""
   ].filter(Boolean);
@@ -8454,10 +8478,17 @@ function ScenarioStructuredEditor({
 
 function ScenarioDefinitionModal({ scenario, onClose, onSaved }: { scenario: Scenario; onClose: () => void; onSaved: () => void }) {
   const definition = useQuery({ queryKey: ["scenario-definition", scenario.scenario_id], queryFn: () => api<WorldDataModel>(`/api/scenarios/${scenario.scenario_id}/definition`) });
+  const worlds = useQuery({ queryKey: ["persistent-worlds"], queryFn: () => api<{ worlds: PersistentWorld[] }>("/api/worlds") });
   const editorScenario = definition.data?.scenario ? scenarioEditorValue(definition.data.scenario) : null;
+  const [selectedWorldId, setSelectedWorldId] = useState("");
+  const [linkingWorld, setLinkingWorld] = useState(false);
+  const [linkError, setLinkError] = useState("");
   const [editorDirty, setEditorDirty] = useState(false);
   const [discardCloseOpen, setDiscardCloseOpen] = useState(false);
   const titleId = "scenario-definition-title";
+  useEffect(() => {
+    setSelectedWorldId(definition.data?.persistent_world?.world_id ?? "");
+  }, [definition.data?.persistent_world?.world_id]);
   const requestClose = () => {
     if (editorDirty) {
       setDiscardCloseOpen(true);
@@ -8476,7 +8507,36 @@ function ScenarioDefinitionModal({ scenario, onClose, onSaved }: { scenario: Sce
           <button type="button" onClick={requestClose} title="Close" aria-label="Close"><X size={16} /></button>
         </header>
         {definition.error instanceof Error ? <InlineNotice>{definition.error.message}</InlineNotice> : null}
+        {linkError ? <InlineNotice>{linkError}</InlineNotice> : null}
         {!definition.error && !editorScenario ? <p className="empty">Loading scenario definition...</p> : null}
+        <div className="scenario-world-link">
+          <label className="field-label">
+            <span>Persistent world</span>
+            <select value={selectedWorldId} disabled={linkingWorld || editorDirty} onChange={(event) => setSelectedWorldId(event.target.value)}>
+              <option value="">Standalone setting</option>
+              {worlds.data?.worlds?.map((world) => <option key={world.world_id} value={world.world_id}>{world.title}</option>)}
+            </select>
+          </label>
+          <button
+            type="button"
+            className="secondary-command compact"
+            disabled={linkingWorld || editorDirty || selectedWorldId === (definition.data?.persistent_world?.world_id ?? "")}
+            onClick={async () => {
+              setLinkError("");
+              setLinkingWorld(true);
+              try {
+                await postJson(`/api/scenarios/${scenario.scenario_id}/persistent-world`, { persistent_world_id: selectedWorldId || null });
+                onSaved();
+              } catch (error) {
+                setLinkError(error instanceof Error ? error.message : "Unable to update the persistent world.");
+              } finally {
+                setLinkingWorld(false);
+              }
+            }}
+          >
+            {linkingWorld ? <Loader2 className="spin" size={14} /> : <Save size={14} />} Apply setting
+          </button>
+        </div>
         {editorScenario ? (
           <ScenarioStructuredEditor
             scenario={editorScenario}

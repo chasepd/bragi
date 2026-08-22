@@ -46,6 +46,7 @@ from bragi.services.chat_history_settings import (
     RECENT_PLAYER_MESSAGE_WINDOW_SETTING,
     sanitize_recent_message_window,
 )
+from bragi.services.content_rating import sanitize_content_rating
 from bragi.services.director_pressure_service import (
     DIRECTOR_PRESSURE_GUIDANCE_SETTING,
     DIRECTOR_PRESSURE_STATE_KEY,
@@ -64,6 +65,7 @@ from bragi.services.model_preferences import (
     SAVE_MODEL_OVERRIDES_SETTING,
     sanitize_save_model_overrides,
 )
+from bragi.services.persistent_world_service import PersistentWorldService
 from bragi.services.post_turn_inference import (
     POST_TURN_INFERENCE_MODE_SETTING,
     sanitize_post_turn_inference_mode,
@@ -355,7 +357,7 @@ class ChatBundleService:
             self.repositories.connection.execute(
                 """
                 SELECT id, type, title, premise, player_role, interaction_mode,
-                       content_json,
+                       content_json, persistent_world_id,
                        created_at, updated_at
                 FROM scenarios
                 WHERE id = ?
@@ -372,6 +374,32 @@ class ChatBundleService:
             sort_keys=True,
             separators=(",", ":"),
         )
+        persistent_world_id = scenario_payload.get("persistent_world_id")
+        persistent_world_payload: dict[str, object] | None = None
+        if isinstance(persistent_world_id, str) and persistent_world_id:
+            persistent_world = self.repositories.get_persistent_world(
+                persistent_world_id
+            )
+            if persistent_world is None:
+                raise ValueError(
+                    f"Unknown persistent world id: {persistent_world_id}"
+                )
+            persistent_world_payload = {
+                "id": persistent_world.id,
+                "title": persistent_world.title,
+                "description": persistent_world.description,
+                "sections": _json_object(
+                    {"content_json": persistent_world.content_json},
+                    "content_json",
+                ),
+                "source_metadata": _json_object(
+                    {"source_metadata_json": persistent_world.source_metadata_json},
+                    "source_metadata_json",
+                ),
+                "content_rating": persistent_world.content_rating,
+                "created_at": persistent_world.created_at,
+                "updated_at": persistent_world.updated_at,
+            }
         data: dict[str, object] = {
             "scenario": scenario_payload,
             "save": _row_dict(save),
@@ -876,6 +904,8 @@ class ChatBundleService:
                 scenario_id=str(save["scenario_id"]),
             ),
         }
+        if persistent_world_payload is not None:
+            data["persistent_world"] = persistent_world_payload
         messages = cast(list[dict[str, object]], data["messages"])
         state_changes = cast(list[dict[str, object]], data["state_changes"])
         media_assets = cast(list[dict[str, object]], data["media_assets"])
@@ -1267,6 +1297,29 @@ class ChatBundleService:
             scenario_content,
         )
         scenario_content = _quarantine_imported_scenario_content(scenario_content)
+        persistent_world_data = _chat_bundle_persistent_world(data)
+        imported_world_id: str | None = None
+        if persistent_world_data is not None:
+            imported_world_id = self.repositories.create_persistent_world(
+                title=_unique_persistent_world_title(
+                    self.repositories,
+                    _optional_text(persistent_world_data, "title")
+                    or "Imported persistent world",
+                ),
+                description=_optional_text(persistent_world_data, "description") or "",
+                sections=_string_mapping(
+                    persistent_world_data.get("sections"),
+                    "persistent_world.sections",
+                ),
+                source_metadata={
+                    **_object_or_empty(persistent_world_data.get("source_metadata")),
+                    "origin": "bundle_import",
+                },
+                content_rating=sanitize_content_rating(
+                    persistent_world_data.get("content_rating"),
+                    default="unclassified",
+                ),
+            ).id
 
         scenario = self.repositories.create_scenario(
             type=scenario_type,
@@ -1277,6 +1330,7 @@ class ChatBundleService:
             interaction_mode=normalize_interaction_mode(
                 _optional_text(scenario_data, "interaction_mode")
             ),
+            persistent_world_id=imported_world_id,
         )
         scenario_id_map = {_text(scenario_data, "id"): scenario.id}
         save = self.repositories.create_save(
@@ -1295,6 +1349,9 @@ class ChatBundleService:
             scenario_id=scenario.id,
         )
         if not bundle_snapshot_rows:
+            PersistentWorldService(self.repositories).materialize_save_snapshot(
+                save.id
+            )
             TurnSnapshotService(self.repositories).capture_baseline_snapshot(
                 save.id,
                 reason="legacy_import_baseline",
@@ -4651,6 +4708,7 @@ def _validate_bundle_data(
     manifest_counts = _object(manifest.get("counts"), "manifest counts")
     scenario_type = _text(scenario, "type")
     scenario_content = _json_object(scenario, "content_json")
+    _chat_bundle_persistent_world(data)
     if (
         not allow_retired_scenario
         and scenario_record_is_retired(scenario_type, scenario_content)
@@ -6526,6 +6584,63 @@ def _json_object(row: dict[str, object], key: str) -> dict[str, object]:
     if not isinstance(loaded, dict):
         raise ChatBundleError(f"Expected JSON object field: {key}")
     return cast(dict[str, object], loaded)
+
+
+def _chat_bundle_persistent_world(
+    data: Mapping[str, object],
+) -> dict[str, object] | None:
+    value = data.get("persistent_world")
+    if value is None:
+        return None
+    world = _object(value, "persistent_world")
+    _text(world, "id")
+    _text(world, "title")
+    _optional_text(world, "description")
+    _string_mapping(world.get("sections"), "persistent_world.sections")
+    metadata = world.get("source_metadata")
+    if metadata is not None:
+        _object(metadata, "persistent_world.source_metadata")
+    _optional_text(world, "content_rating")
+    return world
+
+
+def _string_mapping(value: object, name: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ChatBundleError(f"Expected object: {name}")
+    result: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, str):
+            raise ChatBundleError(f"Expected text mapping: {name}")
+        if key.strip() and item.strip():
+            result[key.strip()] = item
+    return result
+
+
+def _object_or_empty(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    return _object(value, "persistent_world.source_metadata")
+
+
+def _unique_persistent_world_title(
+    repositories: PersistenceRepositories,
+    desired_title: str,
+) -> str:
+    base = desired_title.strip() or "Imported persistent world"
+    existing_titles = {
+        world.title.casefold() for world in repositories.list_persistent_worlds()
+    }
+    if base.casefold() not in existing_titles:
+        return base
+    candidate = f"{base} (imported)"
+    if candidate.casefold() not in existing_titles:
+        return candidate
+    index = 2
+    while True:
+        candidate = f"{base} (imported {index})"
+        if candidate.casefold() not in existing_titles:
+            return candidate
+        index += 1
 
 
 def _optional_json_object(

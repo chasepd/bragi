@@ -185,6 +185,19 @@ export type Scenario = {
   supported?: boolean;
   unsupported_reason?: string | null;
   interaction_mode?: InteractionMode;
+  persistent_world_id?: string | null;
+  persistent_world_title?: string | null;
+};
+export type PersistentWorld = {
+  world_id: string;
+  title: string;
+  description: string;
+  sections: Record<string, string>;
+  source_metadata: Record<string, unknown>;
+  content_rating: string;
+  scenario_count: number;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 export type ScenarioContentSection = [string, string];
 export type ScenarioCharacterStarter = {
@@ -1017,6 +1030,7 @@ export type WorldDataModel = {
   suggestion_groups?: WorldDataSuggestionGroupRow[];
   audit?: unknown[];
   error?: string | null;
+  persistent_world?: PersistentWorld | null;
   [key: string]: unknown;
 };
 export type WorldDataSuggestionRow = {
@@ -1556,6 +1570,7 @@ export function watchSave(
     "saves_changed",
     "save_deleted",
     "scenarios_changed",
+    "worlds_changed",
     "character_texts_changed",
     "world_data_changed"
   ];

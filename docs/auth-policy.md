@@ -130,6 +130,14 @@ or per user/session before using a save ID.
 | `/api/scenarios/draft/save` | Authenticated | Save drafts under current user/admin policy. |
 | `/api/scenarios/draft/character-starters/generate` | Authenticated | Generate draft character starters for the current user; child blocked. |
 | `/api/scenarios/draft/section` | Authenticated | Regenerate draft sections for the current user. |
+| `/api/worlds` | Authenticated | List persistent worlds allowed by the current account content-rating policy. |
+| `/api/worlds/{world_id}` | Authenticated | Read a persistent world allowed by the current account content-rating policy. |
+| `/api/worlds/manual` | Authenticated | Create a persistent world from reviewed setting prose. |
+| `/api/worlds/draft` | Authenticated | Generate an AI-assisted persistent-world draft subject to the account content-rating policy. |
+| `/api/worlds/draft/save` | Authenticated | Save a reviewed persistent-world draft. |
+| `/api/worlds/{world_id}/definition` | Admin-only | Edit a persistent world; linked scenarios use the edited world for future saves. |
+| `/api/worlds/{world_id}` (DELETE) | Admin-only | Delete only an unlinked persistent world. |
+| `/api/scenarios/{scenario_id}/persistent-world` | Admin-only | Link or unlink a persistent world from a scenario. |
 | `/api/chat` | Save-scoped | Submit chat only to an accessible save; child allowed for owned or assigned saves. |
 | `/api/chat/retry` | Save-scoped | Retry an interrupted player turn for an accessible save, or an interrupted timeskip when role policy allows save mutation. |
 | `/api/chat/continue` | Save-scoped | Continue narration only for an accessible Storyteller-mode save when role policy allows chat. |
@@ -207,6 +215,9 @@ or per user/session before using a save ID.
 | `/api/scenario-bundles/preview` | Authenticated | Preview scenario import only for roles allowed to import; child blocked. |
 | `/api/scenario-bundles/import/{preview_id}` | User-scoped | Import only previews created by this user/session. |
 | `/api/scenario-bundles/export/{scenario_id}` | Authenticated | Export only scenarios visible to the current role; child blocked. |
+| `/api/persistent-world-bundles/export/{world_id}` | Authenticated | Export a persistent world; child users are blocked by import/export policy. |
+| `/api/persistent-world-bundles/preview` | Authenticated | Preview persistent-world import; child users are blocked. |
+| `/api/persistent-world-bundles/import/{preview_id}` | User-scoped | Import only a persistent-world preview created by this user/session. |
 | `/api/bundles/export` | Save-scoped | Export only an accessible save; child blocked. |
 | `/api/jobs` | Authenticated | List only jobs visible to the current user. |
 | `/api/jobs/{job_id}` | User-scoped | Read only jobs created by or visible to the current user. |
