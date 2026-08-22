@@ -440,6 +440,75 @@ def test_generate_full_roleplay_draft_uses_provider_chat_and_returns_minimal_sec
     )
 
 
+def test_generate_draft_includes_selected_persistent_world_context(
+    repositories: PersistenceRepositories,
+) -> None:
+    world = repositories.create_persistent_world(
+        title="The Salt Marches",
+        description="A lowland setting shaped by salt and old rivers.",
+        sections={
+            "overview": "The marsh roads sink unless river oaths are honored.",
+            "cultures": "The river clans trade by oath.",
+            "magic_or_technology": "Salt-lanterns fail when carried by oathbreakers.",
+        },
+    )
+    provider = RecordingScenarioProvider(
+        _provider_response_sections(_full_roleplay_sections())
+    )
+    service = ScenarioService(
+        repositories=repositories,
+        provider=provider,
+        provider_name="openrouter",
+        model_id="scenario-drafter",
+    )
+
+    draft = asyncio.run(
+        service.generate_draft(
+            scenario_type=ScenarioType.FULL_ROLEPLAY,
+            seed="A courier crossing before the river dries.",
+            persistent_world_id=world.id,
+        )
+    )
+
+    assert draft.persistent_world_id == world.id
+    assert draft.persistent_world_title == "The Salt Marches"
+    for request in provider.chat_requests:
+        request_text = _request_text(request)
+        assert "Established persistent world context:" in request_text
+        assert "The Salt Marches" in request_text
+        assert "A lowland setting shaped by salt and old rivers." in request_text
+        assert "The river clans trade by oath." in request_text
+        assert "Do not contradict this persistent world" in request_text
+
+
+def test_generate_draft_without_persistent_world_keeps_prompt_clean(
+    repositories: PersistenceRepositories,
+) -> None:
+    provider = RecordingScenarioProvider(
+        _provider_response_sections(_full_roleplay_sections())
+    )
+    service = ScenarioService(
+        repositories=repositories,
+        provider=provider,
+        provider_name="openrouter",
+        model_id="scenario-drafter",
+    )
+
+    draft = asyncio.run(
+        service.generate_draft(
+            scenario_type=ScenarioType.FULL_ROLEPLAY,
+            seed="A volcanic border keep cut off by ash storms.",
+        )
+    )
+
+    assert draft.persistent_world_id is None
+    assert draft.persistent_world_title is None
+    request_text = "\n".join(
+        _request_text(request) for request in provider.chat_requests
+    )
+    assert "Established persistent world context:" not in request_text
+
+
 def test_generate_storyteller_draft_omits_player_sections_and_forbids_avatar(
     repositories: PersistenceRepositories,
 ) -> None:
@@ -567,6 +636,47 @@ def test_child_scenario_generation_uses_account_policy_and_sanitizes_output(
     assert provider.chat_requests[0].content_rating == "g"
     assert provider.chat_requests[0].fade_to_black_enabled is True
     assert len(safety_provider.structured_output_requests) == 1
+
+
+def test_regenerate_section_includes_selected_persistent_world_context(
+    repositories: PersistenceRepositories,
+) -> None:
+    world = repositories.create_persistent_world(
+        title="The Glass Meridian",
+        description="A city-world where mirrors store legal testimony.",
+        sections={
+            "factions": "The Mirror Courts license every reflective surface.",
+        },
+    )
+    provider = RecordingScenarioProvider(
+        {"locations": "Regenerated court of bright witness."}
+    )
+    service = ScenarioService(
+        repositories=repositories,
+        provider=provider,
+        provider_name="openrouter",
+        model_id="scenario-drafter",
+    )
+
+    result = asyncio.run(
+        service.regenerate_section(
+            scenario_type=ScenarioType.FULL_ROLEPLAY,
+            seed="A city court where testimony is reflected, not spoken.",
+            section_id="locations",
+            sections={
+                "title": "Glass Writ",
+                "premise": "A witness reflection has gone missing.",
+            },
+            persistent_world_id=world.id,
+        )
+    )
+
+    request_text = _request_text(provider.chat_requests[0])
+    assert result.body == "Regenerated court of bright witness."
+    assert "The Glass Meridian" in request_text
+    assert "The Mirror Courts license every reflective surface." in request_text
+    assert "Generated context so far:" in request_text
+    assert "A witness reflection has gone missing." in request_text
 
 
 def test_generated_draft_persists_section_rating_provenance(

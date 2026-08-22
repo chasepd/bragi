@@ -13432,6 +13432,7 @@ def test_scenario_draft_job_does_not_hold_global_runtime_lock(
             super().__init__()
             self.started = threading.Event()
             self.release = threading.Event()
+            self.persistent_world_ids: list[str | None] = []
 
         async def generate_scenario_draft(
             self,
@@ -13441,8 +13442,10 @@ def test_scenario_draft_job_does_not_hold_global_runtime_lock(
             seed: str,
             action_choices_enabled: bool,
             progress_callback: object,
+            persistent_world_id: str | None = None,
         ) -> dict[str, object]:
             assert scenario_types == ["full_roleplay", "dating_sim"]
+            self.persistent_world_ids.append(persistent_world_id)
             self.started.set()
             await asyncio.to_thread(self.release.wait)
             return {
@@ -13469,7 +13472,12 @@ def test_scenario_draft_job_does_not_hold_global_runtime_lock(
             }
 
     runtime = BlockingDraftRuntime()
-    state = _state_double(tmp_path, runtime)
+    state = _repository_state_double(tmp_path, runtime)
+    world = state.repositories.create_persistent_world(
+        title="The Salt Marches",
+        description="Low rivers and oath-bound roads.",
+        sections={"overview": "River oaths keep the roads above water."},
+    )
 
     with TestClient(create_app(cast(WebAppState, state))) as client:
         response = client.post(
@@ -13478,6 +13486,7 @@ def test_scenario_draft_job_does_not_hold_global_runtime_lock(
                 "scenario_type": "full_roleplay",
                 "scenario_types": ["full_roleplay", "dating_sim"],
                 "seed": "mirror duel",
+                "persistent_world_id": world.id,
             },
         )
         assert response.status_code == 200
@@ -13503,6 +13512,7 @@ def test_scenario_draft_job_does_not_hold_global_runtime_lock(
         "full_roleplay",
         "dating_sim",
     ]
+    assert runtime.persistent_world_ids == [world.id]
 
 
 def test_continuation_scenario_draft_defaults_blank_instructions(
@@ -13569,6 +13579,7 @@ def test_scenario_section_regeneration_creates_job_with_payload(
             section_id: str,
             sections: dict[str, str],
             action_choices_enabled: bool,
+            persistent_world_id: str | None = None,
         ) -> dict[str, object]:
             self.calls.append(
                 {
@@ -13578,15 +13589,20 @@ def test_scenario_section_regeneration_creates_job_with_payload(
                     "section_id": section_id,
                     "sections": sections,
                     "action_choices_enabled": action_choices_enabled,
+                    "persistent_world_id": persistent_world_id,
                 }
             )
             return {"section_id": section_id, "text": "A sharper opening."}
 
     runtime = ScenarioSectionRuntime()
+    state = _repository_state_double(tmp_path, runtime)
+    world = state.repositories.create_persistent_world(
+        title="The Salt Marches",
+        description="Low rivers and oath-bound roads.",
+        sections={"overview": "River oaths keep the roads above water."},
+    )
 
-    with TestClient(
-        create_app(cast(WebAppState, _state_double(tmp_path, runtime)))
-    ) as client:
+    with TestClient(create_app(cast(WebAppState, state))) as client:
         created = client.post(
             "/api/scenarios/draft/section",
             json={
@@ -13596,6 +13612,7 @@ def test_scenario_section_regeneration_creates_job_with_payload(
                 "section_id": "opening",
                 "sections": {"title": "Lantern Keep"},
                 "action_choices_enabled": True,
+                "persistent_world_id": world.id,
             },
         )
         assert created.status_code == 200
@@ -13612,8 +13629,153 @@ def test_scenario_section_regeneration_creates_job_with_payload(
             "section_id": "opening",
             "sections": {"title": "Lantern Keep"},
             "action_choices_enabled": True,
+            "persistent_world_id": world.id,
         }
     ]
+
+
+def test_scenario_character_starter_generation_forwards_persistent_world(
+    tmp_path: Path,
+) -> None:
+    class StarterRuntime(_RuntimeDouble):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[str | None] = []
+
+        async def generate_scenario_draft_character_starters(
+            self,
+            *,
+            scenario_type: str,
+            sections: dict[str, str],
+            character_starters: list[dict[str, object]],
+            count: int | None,
+            custom_description: str,
+            persistent_world_id: str | None = None,
+        ) -> dict[str, object]:
+            del scenario_type, sections, character_starters, count, custom_description
+            self.calls.append(persistent_world_id)
+            return _chat_model("Character starters generated.")
+
+    runtime = StarterRuntime()
+    state = _repository_state_double(tmp_path, runtime)
+    world = state.repositories.create_persistent_world(
+        title="The Salt Marches",
+        description="Low rivers and oath-bound roads.",
+        sections={"overview": "River oaths keep the roads above water."},
+    )
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        created = client.post(
+            "/api/scenarios/draft/character-starters/generate",
+            json={
+                "scenario_type": "full_roleplay",
+                "sections": {"title": "Lantern Keep"},
+                "character_starters": [],
+                "count": 1,
+                "persistent_world_id": world.id,
+            },
+        )
+        assert created.status_code == 200
+        job = _wait_for_terminal_job(client, created.json()["id"])
+
+    assert job["status"] == "succeeded"
+    assert runtime.calls == [world.id]
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/api/scenarios/draft",
+            {"scenario_type": "full_roleplay", "seed": "Invalid"},
+        ),
+        (
+            "/api/scenarios/draft/section",
+            {
+                "scenario_type": "full_roleplay",
+                "seed": "Invalid",
+                "section_id": "title",
+                "sections": {},
+            },
+        ),
+        (
+            "/api/scenarios/draft/character-starters/generate",
+            {
+                "scenario_type": "full_roleplay",
+                "sections": {"title": "Lantern Keep"},
+                "character_starters": [],
+                "count": 1,
+            },
+        ),
+    ],
+)
+def test_scenario_builder_ai_routes_reject_unknown_persistent_world(
+    tmp_path: Path,
+    path: str,
+    payload: dict[str, object],
+) -> None:
+    with TestClient(
+        create_app(
+            cast(WebAppState, _repository_state_double(tmp_path, _RuntimeDouble()))
+        )
+    ) as client:
+        response = client.post(
+            path,
+            json={**payload, "persistent_world_id": "missing-world"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Unknown persistent world id: missing-world"
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/api/scenarios/draft",
+            {"scenario_type": "full_roleplay", "seed": "Invalid"},
+        ),
+        (
+            "/api/scenarios/draft/section",
+            {
+                "scenario_type": "full_roleplay",
+                "seed": "Invalid",
+                "section_id": "title",
+                "sections": {},
+            },
+        ),
+        (
+            "/api/scenarios/draft/character-starters/generate",
+            {
+                "scenario_type": "full_roleplay",
+                "sections": {"title": "Lantern Keep"},
+                "character_starters": [],
+                "count": 1,
+            },
+        ),
+    ],
+)
+def test_scenario_builder_ai_routes_reject_persistent_world_above_rating(
+    tmp_path: Path,
+    path: str,
+    payload: dict[str, object],
+) -> None:
+    state = _repository_state_double(tmp_path, _RuntimeDouble())
+    world = state.repositories.create_persistent_world(
+        title="Adult World",
+        description="Out of range for the default content ceiling.",
+        sections={"overview": "Adult-rated setting."},
+        content_rating="adult",
+    )
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.post(
+            path,
+            json={**payload, "persistent_world_id": world.id},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Persistent world exceeds your content rating"
 
 
 def test_venice_character_routes_are_absent(tmp_path: Path) -> None:
@@ -17967,6 +18129,19 @@ def _state_double(tmp_path: Path, runtime: object | None = None) -> SimpleNamesp
         character_bundle_previews={},
         log_file_path=None,
     )
+
+
+def _repository_state_double(
+    tmp_path: Path,
+    runtime: object | None = None,
+) -> SimpleNamespace:
+    state = _state_double(tmp_path, runtime)
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    state.repositories = PersistenceRepositories(
+        sqlite3.connect(database_path, check_same_thread=False)
+    )
+    return state
 
 
 class _TrackingJobRegistry(JobRegistry):

@@ -70,7 +70,9 @@ export function ScenarioDialog({
         ? model.scenario_draft.scenario_types
         : [model?.scenario_draft?.scenario_type ?? "full_roleplay"],
     action_choices_enabled: initialDraftPrefill?.action_choices_enabled ?? model?.scenario_draft?.action_choices_enabled ?? false,
-    persistent_world_id: "",
+    persistent_world_id: initialDraftPrefill
+      ? initialDraftPrefill.persistent_world_id ?? ""
+      : model?.scenario_draft?.persistent_world_id ?? "",
     interaction_mode: initialDraftPrefill?.interaction_mode ?? model?.scenario_draft?.interaction_mode ?? "roleplay",
     title: "",
     premise: "",
@@ -172,6 +174,7 @@ export function ScenarioDialog({
   );
   const [draftVersion, setDraftVersion] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [draftSaveBusy, setDraftSaveBusy] = useState(false);
   const [error, setError] = useState("");
   const [draftProgress, setDraftProgress] = useState("");
   const flows = model?.scenario_wizard?.flows ?? defaultFlows();
@@ -185,6 +188,7 @@ export function ScenarioDialog({
   ];
   const setScenarioDraft = (nextDraft: ScenarioDraft | null, replaceEditor = false) => {
     setDraft(nextDraft);
+    if (!nextDraft) setDraftSaveBusy(false);
     if (replaceEditor) setDraftVersion((current) => current + 1);
     if (nextDraft?.scenario_type) {
       setForm((current) => ({
@@ -192,8 +196,18 @@ export function ScenarioDialog({
         scenario_type: nextDraft.scenario_type,
         scenario_types: normalizedScenarioTypes(nextDraft.scenario_type, nextDraft.scenario_types),
         action_choices_enabled: Boolean(nextDraft.action_choices_enabled),
-        interaction_mode: nextDraft.interaction_mode ?? "roleplay"
+        interaction_mode: nextDraft.interaction_mode ?? "roleplay",
+        ...("persistent_world_id" in nextDraft ? { persistent_world_id: nextDraft.persistent_world_id ?? "" } : {})
       }));
+    }
+  };
+  const setPersistentWorldId = (persistentWorldId: string) => {
+    const worldChanged = persistentWorldId !== form.persistent_world_id;
+    setForm({ ...form, persistent_world_id: persistentWorldId });
+    if (draft && worldChanged) {
+      setScenarioDraft(null, true);
+      setDraftProgress("");
+      setError("");
     }
   };
   const setPrimaryScenarioType = (scenarioType: string) => {
@@ -226,7 +240,8 @@ export function ScenarioDialog({
         scenario_types: selectedScenarioTypes,
         seed,
         interaction_mode: form.interaction_mode,
-        action_choices_enabled: form.action_choices_enabled
+        action_choices_enabled: form.action_choices_enabled,
+        persistent_world_id: form.persistent_world_id || null
       });
       watchDialogJob(
         created.id,
@@ -302,7 +317,8 @@ export function ScenarioDialog({
           <select
             aria-label="Persistent world"
             value={form.persistent_world_id}
-            onChange={(event) => setForm({ ...form, persistent_world_id: event.target.value })}
+            disabled={busy || draftSaveBusy}
+            onChange={(event) => setPersistentWorldId(event.target.value)}
           >
             <option value="">Standalone setting</option>
             {persistentWorldsQuery.data?.worlds?.map((world) => (
@@ -386,7 +402,7 @@ export function ScenarioDialog({
                 {busy ? <Loader2 className="spin" size={15} /> : <Wand2 size={15} />} Generate
               </button>
             </div>
-            {draft ? <ScenarioDraftEditor key={draftVersion} draft={draft} persistentWorldId={form.persistent_world_id} flow={flow} currentUser={currentUser} runJob={runJob} onSaved={onClose} onRuntimeChanged={onRuntimeChanged} onScenarioListChanged={onScenarioListChanged} setDraft={setScenarioDraft} /> : null}
+            {draft ? <ScenarioDraftEditor key={draftVersion} draft={draft} persistentWorldId={form.persistent_world_id} flow={flow} currentUser={currentUser} runJob={runJob} onSaved={onClose} onRuntimeChanged={onRuntimeChanged} onScenarioListChanged={onScenarioListChanged} onSavingChange={setDraftSaveBusy} setDraft={setScenarioDraft} /> : null}
           </>
         ) : null}
         {draftProgress ? <p className="scenario-draft-status" role="status" aria-live="polite">{draftProgress}</p> : null}
@@ -576,6 +592,7 @@ function ScenarioDraftEditor({
   onSaved,
   onRuntimeChanged,
   onScenarioListChanged,
+  onSavingChange,
   setDraft
 }: {
   draft: ScenarioDraft;
@@ -586,6 +603,7 @@ function ScenarioDraftEditor({
   onSaved: () => void;
   onRuntimeChanged: (model: RuntimeModel) => void;
   onScenarioListChanged?: () => void;
+  onSavingChange?: (saving: boolean) => void;
   setDraft: (draft: ScenarioDraft) => void;
 }) {
   const client = useQueryClient();
@@ -601,6 +619,10 @@ function ScenarioDraftEditor({
   const [openingImage, setOpeningImage] = useState(false);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const updateSaving = (nextSaving: boolean) => {
+    setSaving(nextSaving);
+    onSavingChange?.(nextSaving);
+  };
   const storytellerMode = draft.interaction_mode === "storyteller";
   const hiddenSectionIds = storytellerMode
     ? new Set(["player_role", "player_character_name", "player_character_profile", "choice_style"])
@@ -691,7 +713,8 @@ function ScenarioDraftEditor({
         count,
         custom_description: mode === "custom" ? description : "",
         interaction_mode: draft.interaction_mode ?? "roleplay",
-        action_choices_enabled: Boolean(draft.action_choices_enabled)
+        action_choices_enabled: Boolean(draft.action_choices_enabled),
+        persistent_world_id: persistentWorldId || null
       });
       watchStarterJob(created.id, (done) => {
         if (!["succeeded", "failed", "cancelled"].includes(done.status)) return;
@@ -745,7 +768,8 @@ function ScenarioDraftEditor({
                         section_id: sectionId,
                         sections,
                         interaction_mode: draft.interaction_mode ?? "roleplay",
-                        action_choices_enabled: Boolean(draft.action_choices_enabled)
+                        action_choices_enabled: Boolean(draft.action_choices_enabled),
+                        persistent_world_id: persistentWorldId || null
                       });
                       watchSectionJob(created.id, (done) => {
                         if (done.status === "succeeded") {
@@ -803,7 +827,7 @@ function ScenarioDraftEditor({
               setError(starterPayload.error);
               return;
             }
-            setSaving(true);
+            updateSaving(true);
             setError("");
             try {
               const result = await postJson<RuntimeModel>("/api/scenarios/draft/save", {
@@ -820,7 +844,7 @@ function ScenarioDraftEditor({
               const saveError = runtimeResultError(result);
               if (saveError) {
                 setError(saveError);
-                setSaving(false);
+                updateSaving(false);
                 return;
               }
               onRuntimeChanged(result);
@@ -830,10 +854,11 @@ function ScenarioDraftEditor({
               if (initialMediaAllowed && openingImage && firstNarrator) {
                 runJob(await postJson<Job>("/api/media/initial", { message_id: firstNarrator.message_id, save_id: result.active_save_id }));
               }
+              updateSaving(false);
               onSaved();
             } catch (failure) {
               setError(failure instanceof Error ? failure.message : "Could not save draft");
-              setSaving(false);
+              updateSaving(false);
             }
           }}
         >

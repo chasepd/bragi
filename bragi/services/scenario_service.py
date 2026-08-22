@@ -9,8 +9,12 @@ from time import perf_counter
 from types import MappingProxyType
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
-from bragi.content_rating_instructions import maximum_content_rating
+from bragi.content_rating_instructions import (
+    content_rating_exceeds,
+    maximum_content_rating,
+)
 from bragi.interaction_mode import InteractionMode, normalize_interaction_mode
+from bragi.persistence.models import PersistentWorldRecord
 from bragi.persistence.repositories import PersistenceRepositories
 from bragi.providers.contracts import (
     ChatMessage,
@@ -35,6 +39,7 @@ from bragi.services.job_lifecycle import JobLifecycleService
 from bragi.services.model_preferences import (
     scenario_generation_section_model_preference,
 )
+from bragi.services.persistent_world_service import persistent_world_context_text
 from bragi.services.provider_fallbacks import chat_with_fallback
 from bragi.services.scenario_content_rating import (
     metadata_with_scenario_content_ratings,
@@ -931,6 +936,8 @@ class ScenarioDraft:
     regeneration_seed: str = ""
     action_choices_enabled: bool = False
     character_starters: tuple[ScenarioCharacterStarter, ...] = ()
+    persistent_world_id: str | None = None
+    persistent_world_title: str | None = None
 
     def __post_init__(self) -> None:
         normalized_type = ScenarioType(self.type)
@@ -959,6 +966,20 @@ class ScenarioDraft:
             self,
             "character_starters",
             tuple(self.character_starters),
+        )
+        object.__setattr__(
+            self,
+            "persistent_world_id",
+            self.persistent_world_id.strip() if self.persistent_world_id else None,
+        )
+        object.__setattr__(
+            self,
+            "persistent_world_title",
+            (
+                self.persistent_world_title.strip()
+                if self.persistent_world_title
+                else None
+            ),
         )
 
     @property
@@ -1019,6 +1040,13 @@ class ScenarioSectionGenerationResult:
     minimum_rating: str
 
 
+@dataclass(frozen=True)
+class ScenarioPersistentWorldContext:
+    world_id: str
+    title: str
+    prompt_text: str
+
+
 class ScenarioService:
     def __init__(
         self,
@@ -1051,6 +1079,7 @@ class ScenarioService:
         seed: str,
         interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
         action_choices_enabled: bool = False,
+        persistent_world_id: str | None = None,
         section_ids: tuple[str, ...] | None = None,
         metadata: Mapping[str, object] | None = None,
         progress_callback: ScenarioGenerationProgressCallback | None = None,
@@ -1083,6 +1112,9 @@ class ScenarioService:
             resolved_section_ids,
             scenario_types=normalized_genres,
         )
+        persistent_world_context = self._resolve_persistent_world_context(
+            persistent_world_id
+        )
         job = self.jobs.create_running(
             type="scenario_generation",
             payload={
@@ -1091,6 +1123,11 @@ class ScenarioService:
                 "seed_chars": len(seed),
                 "provider": self.provider_name,
                 "model": self.model_id,
+                "persistent_world_id": (
+                    persistent_world_context.world_id
+                    if persistent_world_context is not None
+                    else None
+                ),
                 "section_model_overrides": self._section_model_override_payload(
                     resolved_section_ids
                 ),
@@ -1131,6 +1168,7 @@ class ScenarioService:
                     seed=seed,
                     section_id=section_id,
                     sections=sections,
+                    persistent_world_context=persistent_world_context,
                 )
                 section_value = section_result.body
                 sections[section_id] = section_value
@@ -1204,6 +1242,16 @@ class ScenarioService:
             regeneration_seed=seed,
             action_choices_enabled=action_choices_enabled,
             character_starters=(),
+            persistent_world_id=(
+                persistent_world_context.world_id
+                if persistent_world_context is not None
+                else None
+            ),
+            persistent_world_title=(
+                persistent_world_context.title
+                if persistent_world_context is not None
+                else None
+            ),
         )
 
     async def regenerate_section(
@@ -1216,6 +1264,7 @@ class ScenarioService:
         sections: Mapping[str, str],
         interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
         action_choices_enabled: bool = False,
+        persistent_world_id: str | None = None,
     ) -> ScenarioSectionGenerationResult:
         normalized_interaction_mode = normalize_interaction_mode(interaction_mode)
         normalized_type, normalized_genres, action_choices_enabled = (
@@ -1232,6 +1281,9 @@ class ScenarioService:
             scenario_types=normalized_genres,
         ):
             raise ValueError(f"Unknown scenario section: {section_id}")
+        persistent_world_context = self._resolve_persistent_world_context(
+            persistent_world_id
+        )
         provider_name, model_id = self._effective_section_model(section_id)
         job = self.jobs.create_running(
             type="scenario_section_generation",
@@ -1242,6 +1294,11 @@ class ScenarioService:
                 "seed_chars": len(seed),
                 "provider": provider_name,
                 "model": model_id,
+                "persistent_world_id": (
+                    persistent_world_context.world_id
+                    if persistent_world_context is not None
+                    else None
+                ),
                 "default_provider": self.provider_name,
                 "default_model": self.model_id,
             },
@@ -1260,6 +1317,7 @@ class ScenarioService:
                     for key, value in sections.items()
                     if key != section_id
                 },
+                persistent_world_context=persistent_world_context,
             )
         except Exception as exc:
             self.jobs.fail(
@@ -1293,6 +1351,7 @@ class ScenarioService:
         seed: str,
         section_id: str,
         sections: Mapping[str, str],
+        persistent_world_context: ScenarioPersistentWorldContext | None = None,
     ) -> ScenarioSectionGenerationResult:
         started_at = perf_counter()
         provider_name, model_id = self._effective_section_model(section_id)
@@ -1325,6 +1384,11 @@ class ScenarioService:
                         section_id=section_id,
                         seed=seed,
                         sections=sections,
+                        persistent_world_context=(
+                            persistent_world_context.prompt_text
+                            if persistent_world_context is not None
+                            else ""
+                        ),
                     ),
                 ),
             ),
@@ -1501,6 +1565,8 @@ class ScenarioService:
             regeneration_seed=draft.regeneration_seed,
             action_choices_enabled=draft.action_choices_enabled,
             character_starters=draft.character_starters,
+            persistent_world_id=draft.persistent_world_id,
+            persistent_world_title=draft.persistent_world_title,
         )
 
     def save_draft(self, draft: ScenarioDraft) -> str:
@@ -1539,6 +1605,7 @@ class ScenarioService:
                 content=content,
                 starters=draft.character_starters,
             ),
+            persistent_world_id=draft.persistent_world_id,
         )
         log_event(
             "scenario.saved",
@@ -1548,6 +1615,27 @@ class ScenarioService:
             section_count=len(sections),
         )
         return scenario.id
+
+    def _resolve_persistent_world_context(
+        self,
+        persistent_world_id: str | None,
+    ) -> ScenarioPersistentWorldContext | None:
+        world_id = persistent_world_id.strip() if persistent_world_id else ""
+        if not world_id:
+            return None
+        world = self.repositories.get_persistent_world(world_id)
+        if world is None:
+            raise ValueError(f"Unknown persistent world id: {world_id}")
+        content_safety = effective_content_safety_policy(
+            self.repositories,
+            user_id=self.current_user_id,
+        )
+        if content_rating_exceeds(
+            minimum_rating=world.content_rating,
+            allowed_rating=content_safety.rating,
+        ):
+            raise ValueError("Persistent world exceeds your content rating")
+        return _scenario_persistent_world_context(world)
 
 def _generation_instruction(
     scenario_type: ScenarioType,
@@ -1943,6 +2031,16 @@ def _name_dedup_retry_prompt(
     )
 
 
+def _scenario_persistent_world_context(
+    world: PersistentWorldRecord,
+) -> ScenarioPersistentWorldContext:
+    return ScenarioPersistentWorldContext(
+        world_id=world.id,
+        title=world.title,
+        prompt_text=persistent_world_context_text(world),
+    )
+
+
 def _section_generation_prompt(
     *,
     scenario_type: ScenarioType,
@@ -1951,6 +2049,7 @@ def _section_generation_prompt(
     section_id: str,
     seed: str,
     sections: Mapping[str, str],
+    persistent_world_context: str = "",
 ) -> str:
     context = _generated_context(sections)
     guidance = _section_guidance(section_id)
@@ -1969,8 +2068,16 @@ def _section_generation_prompt(
         f"Action choices: {'enabled' if action_choices_enabled else 'disabled'}\n"
         f"Requested field: {_section_label(section_id)}\n"
         f"Field guidance: {guidance}\n"
-        f"{context}"
     ]
+    world_context = persistent_world_context.strip()
+    if world_context:
+        parts.append(
+            f"{world_context}\n"
+            "Do not contradict this persistent world. Add only scenario-specific "
+            "details that are compatible with it, and leave uncertain world "
+            "facts as useful blank space when needed."
+        )
+    parts.append(context)
     if name_context:
         parts.append(name_context)
     parts.append("Return the complete value for this field only.")

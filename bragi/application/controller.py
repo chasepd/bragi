@@ -54,6 +54,7 @@ from bragi.persistence.models import (
     MemoryRecord,
     MessageRecord,
     ModelPreferenceRecord,
+    PersistentWorldRecord,
     SaveRecord,
     SummaryRecord,
     WorldStateRecord,
@@ -196,6 +197,7 @@ from bragi.services.model_preferences import (
     roleplay_model_preference_with_fallbacks,
     scenario_generation_model_preference,
 )
+from bragi.services.persistent_world_service import persistent_world_context_text
 from bragi.services.prompt_inspection import PromptInspectionStore
 from bragi.services.responsive_turn_pipeline import (
     TURN_OPERATION_EDIT,
@@ -425,6 +427,8 @@ class ScenarioDraftModel:
     scenario_types: tuple[str, ...] = ()
     character_starters: tuple[dict[str, object], ...] = ()
     interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
+    persistent_world_id: str | None = None
+    persistent_world_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1171,6 +1175,7 @@ class BragiRuntime:
         seed: str,
         interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
         action_choices_enabled: bool = False,
+        persistent_world_id: str | None = None,
         progress_callback: ScenarioDraftProgressCallback | None = None,
         current_user_id: str | None = None,
     ) -> RuntimeModel:
@@ -1225,6 +1230,7 @@ class BragiRuntime:
                 seed=text,
                 interaction_mode=interaction_mode,
                 action_choices_enabled=action_choices_enabled,
+                persistent_world_id=persistent_world_id,
                 progress_callback=notify_progress,
             )
         except Exception as exc:
@@ -1340,6 +1346,7 @@ class BragiRuntime:
         sections: dict[str, str],
         interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
         action_choices_enabled: bool = False,
+        persistent_world_id: str | None = None,
         current_user_id: str | None = None,
     ) -> RuntimeModel:
         text = seed.strip()
@@ -1358,6 +1365,11 @@ class BragiRuntime:
                 error=f"Scenario provider is unavailable: {preference.provider}",
             )
         try:
+            persistent_world = _resolve_persistent_world_for_generation(
+                repositories=self.repositories,
+                persistent_world_id=persistent_world_id,
+                current_user_id=current_user_id,
+            )
             section_result = await ScenarioService(
                 repositories=self.repositories,
                 provider=self.providers[preference.provider],
@@ -1373,6 +1385,9 @@ class BragiRuntime:
                 sections=sections,
                 interaction_mode=interaction_mode,
                 action_choices_enabled=action_choices_enabled,
+                persistent_world_id=(
+                    persistent_world.id if persistent_world is not None else None
+                ),
             )
         except Exception as exc:
             log_error_event(
@@ -1409,6 +1424,12 @@ class BragiRuntime:
             ),
             regeneration_seed=text,
             action_choices_enabled=normalized_action_choices_enabled,
+            persistent_world_id=(
+                persistent_world.id if persistent_world is not None else None
+            ),
+            persistent_world_title=(
+                persistent_world.title if persistent_world is not None else None
+            ),
         )
         log_event(
             "runtime.scenario_section_regenerated",
@@ -1430,6 +1451,7 @@ class BragiRuntime:
         count: int | None = None,
         custom_description: str = "",
         action_choices_enabled: bool = False,
+        persistent_world_id: str | None = None,
         current_user_id: str | None = None,
     ) -> RuntimeModel:
         try:
@@ -1505,14 +1527,25 @@ class BragiRuntime:
                     existing_starters
                 ),
             )
+            persistent_world = _resolve_persistent_world_for_generation(
+                repositories=self.repositories,
+                persistent_world_id=persistent_world_id,
+                current_user_id=current_user_id,
+            )
+            scenario_context = scenario_context_text(
+                scenario_type=starter_type,
+                content=normalized_sections,
+            )
+            if persistent_world is not None:
+                scenario_context = _scenario_context_with_persistent_world(
+                    persistent_world,
+                    scenario_context,
+                )
             generated_starters = await structured_completer.generate_starters(
                 CharacterStarterGenerationRequest(
                     scenario_type=starter_type,
                     scenario_types=tuple(genre.value for genre in draft_genres),
-                    scenario_context=scenario_context_text(
-                        scenario_type=starter_type,
-                        content=normalized_sections,
-                    ),
+                    scenario_context=scenario_context,
                     content=normalized_sections,
                     existing_starters=existing_starters,
                     count=requested_count,
@@ -1545,6 +1578,12 @@ class BragiRuntime:
                 ),
                 action_choices_enabled=normalized_action_choices_enabled,
                 character_starters=(*existing_starters, *generated_starters),
+                persistent_world_id=(
+                    persistent_world.id if persistent_world is not None else None
+                ),
+                persistent_world_title=(
+                    persistent_world.title if persistent_world is not None else None
+                ),
             )
             log_event(
                 "runtime.scenario_draft_character_starters_generated",
@@ -3580,6 +3619,8 @@ class BragiRuntime:
                     scenario_character_starter_to_json(starter)
                     for starter in draft.character_starters
                 ),
+                persistent_world_id=draft.persistent_world_id,
+                persistent_world_title=draft.persistent_world_title,
             ),
             model_indicator=base.model_indicator,
             status=base.status,
@@ -7288,6 +7329,42 @@ def _content_with_scenario_genres(
             scenario_type.value for scenario_type in scenario_types
         ]
     return normalized
+
+
+def _resolve_persistent_world_for_generation(
+    *,
+    repositories: PersistenceRepositories,
+    persistent_world_id: str | None,
+    current_user_id: str | None,
+) -> PersistentWorldRecord | None:
+    world_id = persistent_world_id.strip() if persistent_world_id else ""
+    if not world_id:
+        return None
+    world = repositories.get_persistent_world(world_id)
+    if world is None:
+        raise ValueError(f"Unknown persistent world id: {world_id}")
+    allowed_rating = effective_content_safety_policy(
+        repositories,
+        user_id=current_user_id,
+    ).rating
+    if content_rating_exceeds(
+        minimum_rating=world.content_rating,
+        allowed_rating=allowed_rating,
+    ):
+        raise ValueError("Persistent world exceeds your content rating")
+    return world
+
+
+def _scenario_context_with_persistent_world(
+    world: PersistentWorldRecord,
+    scenario_context: str,
+) -> str:
+    return (
+        f"{persistent_world_context_text(world)}\n"
+        "Do not contradict this persistent world. Add only scenario-specific "
+        "character details that are compatible with it.\n\n"
+        f"{scenario_context}"
+    )
 
 
 def _scenario_source_metadata(content_json: str) -> dict[str, object]:

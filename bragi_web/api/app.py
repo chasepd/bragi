@@ -406,6 +406,7 @@ class ScenarioDraftCharacterStarterGenerationRequest(BaseModel):
     custom_description: str = ""
     action_choices_enabled: bool = False
     interaction_mode: str = "roleplay"
+    persistent_world_id: str | None = None
 
 
 class RegenerateScenarioSectionRequest(BaseModel):
@@ -416,6 +417,7 @@ class RegenerateScenarioSectionRequest(BaseModel):
     sections: dict[str, str] = Field(default_factory=dict)
     action_choices_enabled: bool = False
     interaction_mode: str = "roleplay"
+    persistent_world_id: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -3271,6 +3273,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             payload.scenario_types,
         )
         _raise_if_invalid_interaction_mode(payload.interaction_mode)
+        _raise_unless_persistent_world_allowed(
+            state,
+            payload.persistent_world_id,
+        )
         async with state.lock.async_access():
             current_user_id = _owner_user_id_for_request(state)
 
@@ -3294,6 +3300,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "interaction_mode",
             ):
                 kwargs["interaction_mode"] = payload.interaction_mode
+            if _call_accepts_keyword(
+                state.runtime.generate_scenario_draft,
+                "persistent_world_id",
+            ):
+                kwargs["persistent_world_id"] = payload.persistent_world_id
             return await state.runtime.generate_scenario_draft(
                 scenario_type=payload.scenario_type,
                 seed=payload.seed,
@@ -3468,6 +3479,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     detail="Character starter generation is not allowed",
                 )
             current_user_id = current_user.id if current_user is not None else None
+        _raise_unless_persistent_world_allowed(
+            state,
+            payload.persistent_world_id,
+        )
         _raise_if_starter_generation_payload_too_large(payload)
         _raise_if_starter_generation_request_invalid(payload)
 
@@ -3494,6 +3509,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "interaction_mode",
             ):
                 kwargs["interaction_mode"] = payload.interaction_mode
+            if _call_accepts_keyword(
+                state.runtime.generate_scenario_draft_character_starters,
+                "persistent_world_id",
+            ):
+                kwargs["persistent_world_id"] = payload.persistent_world_id
             return await state.runtime.generate_scenario_draft_character_starters(
                 scenario_type=payload.scenario_type,
                 sections=payload.sections,
@@ -3520,6 +3540,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             payload.scenario_types,
         )
         _raise_if_invalid_interaction_mode(payload.interaction_mode)
+        _raise_unless_persistent_world_allowed(
+            state,
+            payload.persistent_world_id,
+        )
         async with state.lock.async_access():
             current_user_id = _owner_user_id_for_request(state)
 
@@ -3541,6 +3565,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "interaction_mode",
             ):
                 kwargs["interaction_mode"] = payload.interaction_mode
+            if _call_accepts_keyword(
+                state.runtime.regenerate_scenario_section,
+                "persistent_world_id",
+            ):
+                kwargs["persistent_world_id"] = payload.persistent_world_id
             return await state.runtime.regenerate_scenario_section(
                 scenario_type=payload.scenario_type,
                 seed=payload.seed,
