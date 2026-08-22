@@ -2626,6 +2626,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             _raise_unless_save_action_allowed(state, save_id, "read")
             _touch_save_last_opened_if_possible(state, save_id)
             _remember_user_active_save(state, save_id)
+            _remember_process_active_save(state, save_id)
             return _runtime_json_dict(
                 state,
                 _build_runtime_model_for_save(
@@ -7353,6 +7354,16 @@ def _remember_user_active_save(
     if not state.repositories.user_can_access_save(user, save_id):
         return
     state.repositories.set_user_active_save_id(user_id=user.id, save_id=save_id)
+
+
+def _remember_process_active_save(
+    state: WebAppState,
+    save_id: str,
+) -> None:
+    if _auth_context_enabled(state):
+        return
+    if hasattr(state.runtime, "active_save_id"):
+        state.runtime.active_save_id = save_id
 
 
 def _touch_save_last_opened_if_possible(state: WebAppState, save_id: str) -> None:

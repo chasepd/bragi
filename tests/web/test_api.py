@@ -5457,6 +5457,24 @@ def test_save_scoped_write_rejects_missing_save_id_after_presentation_load(
     assert cleanup.json()["detail"] == _SAVE_ID_REQUIRED_DETAIL
 
 
+def test_local_save_load_updates_unscoped_runtime_selection_after_fork(
+    tmp_path: Path,
+) -> None:
+    runtime = _RuntimeDouble()
+    runtime.active_save_id = "fork-1"
+    state = _state_double(tmp_path, runtime)
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        loaded = client.post("/api/saves/save-1/load")
+        unscoped = client.get("/api/runtime/shell")
+
+    assert loaded.status_code == 200
+    assert loaded.json()["active_save_id"] == "save-1"
+    assert runtime.load_save_calls == []
+    assert unscoped.status_code == 200
+    assert unscoped.json()["active_save_id"] == "save-1"
+
+
 def test_settings_do_not_return_api_key_values(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
