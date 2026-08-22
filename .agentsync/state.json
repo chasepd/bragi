@@ -110,22 +110,22 @@
       "source_paths": [
         "AGENTS.md"
       ],
-      "source_checksum": "cb49919c5647becadcc7c6cf3d7d268f9bd676dd347c3ea41873db4645dc5188",
+      "source_checksum": "4023ac4c8776bc07d1f2823fc5be59064da6dca2fb0db06eea399013e192d97e",
       "targets": [
         {
           "agent": "cursor",
-          "path": ".cursor/rules/agentsync.md",
-          "native_checksum": "40052f8afe53c7e0c5c5261c5d3fbc92fde6557a8853600f8ab3e70ca2df0c12"
+          "path": ".cursor/rules/agentsync.mdc",
+          "native_checksum": "e3fc79377a28045f2ebf6b623acfad40615ebbf0e6514510d5a631a4cc27349a"
         },
         {
           "agent": "claude",
           "path": "CLAUDE.md",
-          "native_checksum": "40052f8afe53c7e0c5c5261c5d3fbc92fde6557a8853600f8ab3e70ca2df0c12"
+          "native_checksum": "ec83e8ac8a1b5830e82d162db9157c4a909faa9037f8e7a7833182425f1e74a5"
         }
       ],
       "diagnostics": [],
       "native_extensions": {},
-      "last_synced_at": "2026-07-28T21:58:55.860410363+00:00"
+      "last_synced_at": "2026-08-22T16:52:43.412284384+00:00"
     },
     {
       "resource_id": "skills:code-review",

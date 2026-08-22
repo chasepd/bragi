@@ -33,6 +33,9 @@ pip-delete-this-directory.txt
 # AgentSync temporary backups; validation rejects these under agent config paths.
 *.bak
 
+# Agent worktrees
+.worktrees/
+
 # Unit test / coverage reports
 htmlcov/
 .tox/

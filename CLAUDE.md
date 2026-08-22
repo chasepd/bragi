@@ -14,8 +14,9 @@ Read these first:
 
 ## Required Workflow
 
-- Before making repository changes, fetch `origin` and create a dedicated task
-  worktree and branch from `origin/main`. Always work in that task worktree;
+- Before making repository changes, fetch `origin` from the primary checkout,
+  then create a dedicated task worktree and branch from `origin/main` under the
+  primary checkout's `.worktrees/` directory. Always work in that task worktree;
   do not make agent-owned changes in the primary checkout.
 - When work is completed, open a PR into `main` unless the user explicitly says
   not to.
@@ -29,8 +30,9 @@ Read these first:
   to self-review code after an agent finishes code changes and before opening a PR.
 - Keep agent worktrees isolated: do not edit the same checkout from multiple
   agents at once, and do not share one worktree across unrelated tasks.
-- Prefer a task-specific sibling directory such as `../bragi-issue-52`; `/tmp`
-  is also acceptable when it makes hook or tool path handling cleaner.
+- Use a task-specific worktree directory under the primary checkout's
+  `.worktrees/`, such as `.worktrees/issue-52` or
+  `.worktrees/<short-task-name>`.
 - Codex hooks allow patch paths that resolve inside any registered worktree for
   this repository, including absolute and parent-relative paths. Paths outside
   those worktrees remain blocked.
