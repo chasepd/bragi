@@ -8,7 +8,7 @@ write path below has a matching preview command.
 
 | Resource type | Source of truth | Target policy |
 | --- | --- | --- |
-| Rules/context | `AGENTS.md` (Codex/`agents-md`) | Generate `CLAUDE.md` and `.cursor/rules/agentsync.md`. OpenCode reads `AGENTS.md` directly. |
+| Rules/context | `AGENTS.md` (Codex/`agents-md`) | Generate `CLAUDE.md` and `.cursor/rules/agentsync.mdc`. OpenCode reads `AGENTS.md` directly. |
 | Skills | `.codex/skills/` | Generate Claude, Cursor, and OpenCode skill copies from Codex skills. |
 | Subagents | None | Disabled until Bragi has portable subagents to sync. |
 | Hooks | `.codex/hooks.json` and `.codex/hooks/` | Generate `.claude/settings.json`, `.cursor/hooks.json`, and `.opencode/plugins/agentsync-hooks.js`. |
