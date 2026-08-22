@@ -376,6 +376,7 @@ class ManualScenarioInput:
     save_title: str = ""
     loss_conditions: tuple[tuple[str, str], ...] = ()
     scenario_types: tuple[str, ...] = ()
+    persistent_world_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -410,6 +411,8 @@ class SavedScenarioModel:
     supported: bool = True
     unsupported_reason: str | None = None
     interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
+    persistent_world_id: str | None = None
+    persistent_world_title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1579,6 +1582,7 @@ class BragiRuntime:
         remember_process_active_save: bool = True,
         current_user_id: str | None = None,
         defer_opening_action_choices: bool = False,
+        persistent_world_id: str | None = None,
     ) -> RuntimeModel:
         try:
             source_metadata = _scenario_source_metadata_without_loss_conditions(
@@ -1657,6 +1661,7 @@ class BragiRuntime:
                 player_role=sections_for_persist.get("player_role", ""),
                 interaction_mode=draft.interaction_mode,
                 content=scenario_content,
+                persistent_world_id=persistent_world_id,
             )
             scenario_id = scenario.id
             save = SaveService(self.repositories).create_save(
@@ -1959,6 +1964,7 @@ class BragiRuntime:
             player_role=player_role,
             content=content,
             interaction_mode=interaction_mode,
+            persistent_world_id=scenario.persistent_world_id,
         )
         save = SaveService(self.repositories).create_save(
             scenario_id=record.id,
@@ -2119,6 +2125,16 @@ class BragiRuntime:
                 allowed_rating=allowed_rating,
             ):
                 continue
+            persistent_world = (
+                self.repositories.get_persistent_world(scenario.persistent_world_id)
+                if scenario.persistent_world_id is not None
+                else None
+            )
+            if persistent_world is not None and content_rating_exceeds(
+                minimum_rating=persistent_world.content_rating,
+                allowed_rating=allowed_rating,
+            ):
+                continue
             content = _scenario_content(scenario.content_json)
             supported = not scenario_record_is_retired(scenario.type, content)
             scenario_type, scenario_types = _saved_scenario_type_values(
@@ -2146,6 +2162,10 @@ class BragiRuntime:
                         None if supported else RETIRED_SCENARIO_REASON
                     ),
                     interaction_mode=scenario.interaction_mode,
+                    persistent_world_id=scenario.persistent_world_id,
+                    persistent_world_title=(
+                        persistent_world.title if persistent_world is not None else None
+                    ),
                 )
             )
         return tuple(scenarios)

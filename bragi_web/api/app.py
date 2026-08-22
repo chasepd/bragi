@@ -138,6 +138,7 @@ if TYPE_CHECKING:
         CharacterRegistryService,
     )
     from bragi.services.content_rating import ContentSafetyPolicy
+    from bragi.services.persistent_world_service import PersistentWorldService
     from bragi.services.world_data_service import (
         MemoryEdit,
         ScenarioEdit,
@@ -177,6 +178,7 @@ else:
     WorldDataSuggestionRow = lazy_bragi_api_symbol("WorldDataSuggestionRow")
     WorldDataSummaryRow = lazy_bragi_api_symbol("WorldDataSummaryRow")
     WorldDataThreadRow = lazy_bragi_api_symbol("WorldDataThreadRow")
+    PersistentWorldService = lazy_bragi_api_symbol("PersistentWorldService")
     ManualScenarioInput = lazy_bragi_api_symbol("ManualScenarioInput")
 
 _UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -222,6 +224,8 @@ SCENARIO_BUNDLE_PREVIEW_TTL_SECONDS = BUNDLE_PREVIEW_TTL_SECONDS
 SCENARIO_BUNDLE_PREVIEW_MAX_COUNT = BUNDLE_PREVIEW_MAX_COUNT
 CHARACTER_BUNDLE_PREVIEW_TTL_SECONDS = BUNDLE_PREVIEW_TTL_SECONDS
 CHARACTER_BUNDLE_PREVIEW_MAX_COUNT = BUNDLE_PREVIEW_MAX_COUNT
+PERSISTENT_WORLD_BUNDLE_PREVIEW_TTL_SECONDS = BUNDLE_PREVIEW_TTL_SECONDS
+PERSISTENT_WORLD_BUNDLE_PREVIEW_MAX_COUNT = BUNDLE_PREVIEW_MAX_COUNT
 _CHAT_TURN_CANCELLED_ERROR = "Chat turn cancelled"
 _CHAT_JOB_TYPES = frozenset(
     {
@@ -353,6 +357,7 @@ class ScenarioDraftRequest(BaseModel):
     seed: str = ""
     action_choices_enabled: bool = False
     interaction_mode: str = "roleplay"
+    persistent_world_id: str | None = None
 
 
 class SaveScenarioDraftRequest(BaseModel):
@@ -364,6 +369,30 @@ class SaveScenarioDraftRequest(BaseModel):
     save_title: str = ""
     source_metadata: dict[str, object] | None = None
     interaction_mode: str = "roleplay"
+    persistent_world_id: str | None = None
+
+
+class PersistentWorldRequest(BaseModel):
+    title: str = ""
+    description: str = ""
+    sections: dict[str, str] = Field(default_factory=dict)
+    source_metadata: dict[str, object] | None = None
+    content_rating: str = "pg-13"
+
+
+class PersistentWorldDraftRequest(BaseModel):
+    seed: str = ""
+    title: str = ""
+    description: str = ""
+    section_ids: list[str] | None = None
+
+
+class PersistentWorldDraftSaveRequest(PersistentWorldRequest):
+    pass
+
+
+class ScenarioPersistentWorldRequest(BaseModel):
+    persistent_world_id: str | None = None
 
 
 class ScenarioDraftCharacterStarterGenerationRequest(BaseModel):
@@ -721,6 +750,7 @@ def _request_body_limit_bytes(scope: Scope, *, default_limit: int) -> int:
         "/api/bundles/preview",
         "/api/character-bundles/preview",
         "/api/scenario-bundles/preview",
+        "/api/persistent-world-bundles/preview",
     }
     if path in bundle_paths:
         return BUNDLE_UPLOAD_MAX_BYTES + MULTIPART_REQUEST_OVERHEAD_BYTES
@@ -2694,6 +2724,192 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "scenarios": to_jsonable(list_saved_scenarios(**kwargs)),
             }
 
+    @app.get("/api/worlds")
+    def list_persistent_worlds(state: StateDep) -> dict[str, Any]:
+        with state.lock:
+            service = PersistentWorldService(
+                state.repositories,
+                current_user_id=_owner_user_id_for_request(state),
+            )
+            return {
+                "worlds": service.list_worlds(
+                    allowed_content_rating=_content_safety_policy_for_request(
+                        state
+                    ).rating
+                )
+            }
+
+    @app.get("/api/worlds/{world_id}")
+    def get_persistent_world(world_id: str, state: StateDep) -> dict[str, Any]:
+        try:
+            with state.lock:
+                return PersistentWorldService(
+                    state.repositories,
+                    current_user_id=_owner_user_id_for_request(state),
+                ).get_world(
+                    world_id,
+                    allowed_content_rating=_content_safety_policy_for_request(
+                        state
+                    ).rating,
+                )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/worlds/manual")
+    def create_persistent_world(
+        payload: PersistentWorldRequest,
+        state: StateDep,
+    ) -> dict[str, Any]:
+        try:
+            with state.lock:
+                _raise_unless_persistent_world_rating_allowed(
+                    state,
+                    payload.content_rating,
+                )
+                world = PersistentWorldService(
+                    state.repositories,
+                    current_user_id=_owner_user_id_for_request(state),
+                ).create_world(
+                    title=payload.title,
+                    description=payload.description,
+                    sections=payload.sections,
+                    source_metadata=payload.source_metadata,
+                    content_rating=payload.content_rating,
+                )
+                result = PersistentWorldService(state.repositories).get_world(world.id)
+            _publish_save_event(
+                state,
+                None,
+                "worlds_changed",
+                {"reason": "persistent_world_created"},
+            )
+            return result
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/worlds/{world_id}/definition")
+    def update_persistent_world(
+        world_id: str,
+        payload: PersistentWorldRequest,
+        state: StateDep,
+    ) -> dict[str, Any]:
+        _require_admin_user()
+        try:
+            with state.lock:
+                _raise_unless_persistent_world_rating_allowed(
+                    state,
+                    payload.content_rating,
+                )
+                service = PersistentWorldService(state.repositories)
+                service.update_world(
+                    world_id=world_id,
+                    title=payload.title,
+                    description=payload.description,
+                    sections=payload.sections,
+                    source_metadata=payload.source_metadata,
+                    content_rating=payload.content_rating,
+                )
+                result = service.get_world(world_id)
+            _publish_save_event(
+                state,
+                None,
+                "worlds_changed",
+                {"reason": "persistent_world_updated"},
+            )
+            return result
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/worlds/{world_id}")
+    def delete_persistent_world(world_id: str, state: StateDep) -> dict[str, Any]:
+        _require_admin_user()
+        try:
+            with state.lock:
+                deleted = PersistentWorldService(state.repositories).delete_world(
+                    world_id
+                )
+            _publish_save_event(
+                state,
+                None,
+                "worlds_changed",
+                {"reason": "persistent_world_deleted"},
+            )
+            return {"deleted": deleted, "world_id": world_id}
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/worlds/draft")
+    async def generate_persistent_world_draft(
+        payload: PersistentWorldDraftRequest,
+        state: StateDep,
+    ) -> dict[str, Any]:
+        from bragi.services.model_preferences import (
+            scenario_generation_model_preference,
+        )
+
+        current_user_id = _owner_user_id_for_request(state)
+        preference = scenario_generation_model_preference(state.repositories)
+        if preference is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No scenario generation model preference configured",
+            )
+        provider = state.providers.get(preference.provider)
+        if provider is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Scenario provider is unavailable: {preference.provider}",
+            )
+        try:
+            draft = await PersistentWorldService(
+                state.repositories,
+                current_user_id=current_user_id,
+            ).generate_draft(
+                seed=payload.seed,
+                title=payload.title,
+                description=payload.description,
+                provider=provider,
+                provider_name=preference.provider,
+                model_id=preference.model_id,
+                providers=state.providers,
+                section_ids=payload.section_ids,
+            )
+            return {"draft": to_jsonable(draft)}
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/worlds/draft/save")
+    def save_persistent_world_draft(
+        payload: PersistentWorldDraftSaveRequest,
+        state: StateDep,
+    ) -> dict[str, Any]:
+        try:
+            with state.lock:
+                _raise_unless_persistent_world_rating_allowed(
+                    state,
+                    payload.content_rating,
+                )
+                world = PersistentWorldService(
+                    state.repositories,
+                    current_user_id=_owner_user_id_for_request(state),
+                ).create_world(
+                    title=payload.title,
+                    description=payload.description,
+                    sections=payload.sections,
+                    source_metadata=payload.source_metadata,
+                    content_rating=payload.content_rating,
+                )
+                result = PersistentWorldService(state.repositories).get_world(world.id)
+            _publish_save_event(
+                state,
+                None,
+                "worlds_changed",
+                {"reason": "persistent_world_created"},
+            )
+            return result
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/scenarios/{scenario_id}/definition")
     def get_scenario_definition(
         scenario_id: str,
@@ -2701,7 +2917,12 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         with state.lock:
             _raise_unless_scenario_supported(state, scenario_id)
-            return _json_dict(
+            scenario = state.repositories.get_scenario(scenario_id)
+            _raise_unless_persistent_world_allowed(
+                state,
+                scenario.persistent_world_id if scenario is not None else None,
+            )
+            payload = _json_dict(
                 WorldDataService(
                     state.repositories,
                     allowed_content_rating=_content_safety_policy_for_request(
@@ -2709,6 +2930,17 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     ).rating,
                 ).build_scenario_definition_model(scenario_id)
             )
+            payload["persistent_world"] = (
+                PersistentWorldService(state.repositories).get_world(
+                    scenario.persistent_world_id,
+                    allowed_content_rating=_content_safety_policy_for_request(
+                        state
+                    ).rating,
+                )
+                if scenario is not None and scenario.persistent_world_id is not None
+                else None
+            )
+            return payload
 
     @app.post("/api/scenarios/{scenario_id}/definition")
     async def update_scenario_definition(
@@ -2724,6 +2956,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 scenario = state.repositories.get_scenario(scenario_id)
                 if scenario is None:
                     raise ValueError(f"Unknown scenario id: {scenario_id}")
+                _raise_unless_persistent_world_allowed(
+                    state,
+                    scenario.persistent_world_id,
+                )
                 actor_user_id = _owner_user_id_for_request(state)
                 edit = await _review_scenario_edit_for_request(
                     state,
@@ -2732,7 +2968,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     roleplay_type=scenario.type,
                     current_user_id=actor_user_id,
                 )
-                return _json_dict(
+                result = _json_dict(
                     WorldDataService(
                         state.repositories,
                         allowed_content_rating=(
@@ -2740,6 +2976,61 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                         ),
                     ).apply_scenario_definition_edit(scenario_id, edit)
                 )
+                refreshed = state.repositories.get_scenario(scenario_id)
+                result["persistent_world"] = (
+                    PersistentWorldService(state.repositories).get_world(
+                        refreshed.persistent_world_id,
+                        allowed_content_rating=_content_safety_policy_for_request(
+                            state
+                        ).rating,
+                    )
+                    if refreshed is not None
+                    and refreshed.persistent_world_id is not None
+                    else None
+                )
+                return result
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/scenarios/{scenario_id}/persistent-world")
+    def link_scenario_persistent_world(
+        scenario_id: str,
+        payload: ScenarioPersistentWorldRequest,
+        state: StateDep,
+    ) -> dict[str, Any]:
+        _require_admin_user()
+        try:
+            with state.lock:
+                _raise_unless_scenario_supported(state, scenario_id)
+                _raise_unless_persistent_world_allowed(
+                    state,
+                    payload.persistent_world_id,
+                )
+                scenario = PersistentWorldService(state.repositories).link_scenario(
+                    scenario_id=scenario_id,
+                    world_id=payload.persistent_world_id,
+                )
+                world = (
+                    PersistentWorldService(state.repositories).get_world(
+                        scenario.persistent_world_id,
+                        allowed_content_rating=_content_safety_policy_for_request(
+                            state
+                        ).rating,
+                    )
+                    if scenario.persistent_world_id is not None
+                    else None
+                )
+                result = {
+                    "scenario_id": scenario.id,
+                    "persistent_world": world,
+                }
+            _publish_save_event(
+                state,
+                None,
+                "scenarios_changed",
+                {"reason": "persistent_world_linked"},
+            )
+            return result
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -2863,6 +3154,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             payload.get("scenario_types"),
         )
         _raise_if_invalid_interaction_mode(payload.get("interaction_mode"))
+        _raise_unless_persistent_world_allowed(
+            state,
+            payload.get("persistent_world_id"),
+        )
         try:
             scenario = ManualScenarioInput(**payload)
         except TypeError as exc:
@@ -2908,6 +3203,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         with state.lock:
             _raise_unless_scenario_supported(state, scenario_id)
+            scenario = state.repositories.get_scenario(scenario_id)
+            _raise_unless_persistent_world_allowed(
+                state,
+                scenario.persistent_world_id if scenario is not None else None,
+            )
             kwargs: dict[str, Any] = {}
             current_user_id = _owner_user_id_for_request(state)
             if _call_accepts_keyword(
@@ -3052,6 +3352,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             payload.scenario_types,
         )
         _raise_if_invalid_interaction_mode(payload.interaction_mode)
+        _raise_unless_persistent_world_allowed(
+            state,
+            payload.persistent_world_id,
+        )
         kwargs: dict[str, Any] = {}
         current_user_id = _owner_user_id_for_request(state)
         if _call_accepts_keyword(
@@ -3091,6 +3395,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             "interaction_mode",
         ):
             kwargs["interaction_mode"] = payload.interaction_mode
+        if _call_accepts_keyword(
+            state.runtime.save_scenario_draft,
+            "persistent_world_id",
+        ):
+            kwargs["persistent_world_id"] = payload.persistent_world_id
         result = state.runtime.save_scenario_draft(
             scenario_type=payload.scenario_type,
             sections=payload.sections,
@@ -6122,6 +6431,110 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             "preview": await _review_bundle_preview_for_request(state, preview),
         }
 
+    @app.get("/api/persistent-world-bundles/export/{world_id}")
+    def export_persistent_world_bundle(
+        world_id: str,
+        state: StateDep,
+    ) -> FileResponse:
+        _raise_unless_import_export_allowed(state)
+        from bragi.services.persistent_world_bundle_service import (
+            PersistentWorldBundleService,
+        )
+
+        bundle_path = (
+            state.paths.temp_dir
+            / f"bragi-persistent-world-{uuid4().hex}.bragi-world"
+        )
+        try:
+            with state.lock:
+                _raise_unless_persistent_world_allowed(state, world_id)
+                PersistentWorldBundleService(
+                    repositories=state.repositories,
+                ).export_world(world_id, bundle_path)
+            return FileResponse(
+                bundle_path,
+                media_type="application/octet-stream",
+                filename=bundle_path.name,
+                background=BackgroundTask(_unlink_file, bundle_path),
+            )
+        except ValueError as exc:
+            bundle_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            bundle_path.unlink(missing_ok=True)
+            raise
+
+    @app.post("/api/persistent-world-bundles/preview")
+    async def preview_persistent_world_bundle(
+        file: Annotated[UploadFile, File()],
+        state: StateDep,
+    ) -> dict[str, Any]:
+        from bragi.services.persistent_world_bundle_service import (
+            PersistentWorldBundleService,
+        )
+
+        async with state.lock.async_access():
+            _raise_unless_import_export_allowed(state)
+            _prune_persistent_world_bundle_previews(state)
+        try:
+            bundle_path = await _store_upload(file, state.paths.temp_dir)
+        except _BundleUploadTooLarge as exc:
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
+        preview_id = uuid4().hex
+        try:
+            async with state.lock.async_access():
+                preview = PersistentWorldBundleService(
+                    repositories=state.repositories,
+                ).preview_import(bundle_path)
+        except Exception as exc:
+            bundle_path.unlink(missing_ok=True)
+            detail = str(exc) or exc.__class__.__name__
+            raise HTTPException(status_code=400, detail=detail) from exc
+        async with state.lock.async_access():
+            state.persistent_world_bundle_previews[preview_id] = BundlePreviewState(
+                bundle_path=bundle_path,
+                owner_user_id=_owner_user_id_for_request(state),
+            )
+            _prune_persistent_world_bundle_previews(state)
+        return {"preview_id": preview_id, "preview": to_jsonable(preview)}
+
+    @app.post("/api/persistent-world-bundles/import/{preview_id}")
+    def import_persistent_world_bundle(
+        preview_id: str,
+        state: StateDep,
+    ) -> dict[str, Any]:
+        from bragi.services.persistent_world_bundle_service import (
+            PersistentWorldBundleService,
+        )
+
+        with state.lock:
+            _raise_unless_import_export_allowed(state)
+            _prune_persistent_world_bundle_previews(state)
+            preview = _require_owned_bundle_preview(
+                state,
+                state.persistent_world_bundle_previews,
+                preview_id,
+                detail="Unknown persistent world bundle preview",
+            )
+            state.persistent_world_bundle_previews.pop(preview_id, None)
+        try:
+            with state.lock:
+                imported = PersistentWorldBundleService(
+                    repositories=state.repositories,
+                ).import_world(preview.bundle_path)
+            _publish_save_event(
+                state,
+                None,
+                "worlds_changed",
+                {"reason": "persistent_world_imported"},
+            )
+            return {"world": to_jsonable(imported)}
+        except Exception as exc:
+            detail = str(exc) or exc.__class__.__name__
+            raise HTTPException(status_code=400, detail=detail) from exc
+        finally:
+            preview.bundle_path.unlink(missing_ok=True)
+
     @app.post("/api/scenario-bundles/import/{preview_id}")
     def import_scenario_bundle(
         preview_id: str,
@@ -6168,6 +6581,16 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         )
         try:
             with state.lock:
+                get_scenario = getattr(state.repositories, "get_scenario", None)
+                scenario = (
+                    get_scenario(scenario_id)
+                    if callable(get_scenario)
+                    else None
+                )
+                _raise_unless_persistent_world_allowed(
+                    state,
+                    scenario.persistent_world_id if scenario is not None else None,
+                )
                 model = state.runtime.export_saved_scenario(scenario_id, bundle_path)
             error = _runtime_model_error(model)
             if error:
@@ -6201,6 +6624,18 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                         detail=_SAVE_ID_REQUIRED_DETAIL,
                     )
                 _raise_unless_save_action_allowed(state, resolved_save_id, "export")
+                get_save = getattr(state.repositories, "get_save", None)
+                save = get_save(resolved_save_id) if callable(get_save) else None
+                get_scenario = getattr(state.repositories, "get_scenario", None)
+                scenario = (
+                    get_scenario(save.scenario_id)
+                    if save is not None and callable(get_scenario)
+                    else None
+                )
+                _raise_unless_persistent_world_allowed(
+                    state,
+                    scenario.persistent_world_id if scenario is not None else None,
+                )
                 kwargs: dict[str, Any] = {}
                 if _call_accepts_keyword(
                     state.runtime.export_active_save,
@@ -6548,6 +6983,58 @@ def _content_safety_policy_for_request(
         state.repositories,
         user_id=user.id if user is not None else None,
     )
+
+
+def _raise_unless_persistent_world_allowed(
+    state: WebAppState,
+    world_id: object,
+) -> None:
+    if world_id is None or world_id == "":
+        return
+    if not isinstance(world_id, str):
+        raise HTTPException(
+            status_code=400,
+            detail="persistent_world_id must be a string or null",
+        )
+    get_world = getattr(state.repositories, "get_persistent_world", None)
+    if not callable(get_world):
+        return
+    world = get_world(world_id)
+    if world is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown persistent world id: {world_id}",
+        )
+    from bragi.content_rating_instructions import content_rating_exceeds
+
+    allowed_rating = _content_safety_policy_for_request(state).rating
+    if content_rating_exceeds(
+        minimum_rating=world.content_rating,
+        allowed_rating=allowed_rating,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Persistent world exceeds your content rating",
+        )
+
+
+def _raise_unless_persistent_world_rating_allowed(
+    state: WebAppState,
+    content_rating: object,
+) -> None:
+    from bragi.content_rating_instructions import content_rating_exceeds
+    from bragi.services.content_rating import sanitize_content_rating
+
+    normalized_rating = sanitize_content_rating(content_rating)
+    allowed_rating = _content_safety_policy_for_request(state).rating
+    if content_rating_exceeds(
+        minimum_rating=normalized_rating,
+        allowed_rating=allowed_rating,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Persistent world content rating exceeds your account policy",
+        )
 
 
 def _raise_unless_unrated_reference_upload(state: WebAppState) -> None:
@@ -11488,6 +11975,8 @@ def _upload_suffix(filename: str | None) -> str:
         return ".bragi-scenario"
     if filename and filename.endswith(".bragi-character"):
         return ".bragi-character"
+    if filename and filename.endswith(".bragi-world"):
+        return ".bragi-world"
     return ".upload"
 
 
@@ -11543,9 +12032,35 @@ def _prune_character_bundle_previews(state: WebAppState) -> None:
     _prune_retained_bundle_preview_bytes(state)
 
 
+def _prune_persistent_world_bundle_previews(state: WebAppState) -> None:
+    now = time()
+    for preview_id, preview in list(
+        state.persistent_world_bundle_previews.items()
+    ):
+        if now - preview.created_at > PERSISTENT_WORLD_BUNDLE_PREVIEW_TTL_SECONDS:
+            _discard_persistent_world_bundle_preview(state, preview_id, preview)
+    excess_count = (
+        len(state.persistent_world_bundle_previews)
+        - PERSISTENT_WORLD_BUNDLE_PREVIEW_MAX_COUNT
+    )
+    if excess_count > 0:
+        oldest = sorted(
+            state.persistent_world_bundle_previews.items(),
+            key=lambda item: item[1].created_at,
+        )
+        for preview_id, preview in oldest[:excess_count]:
+            _discard_persistent_world_bundle_preview(state, preview_id, preview)
+    _prune_retained_bundle_preview_bytes(state)
+
+
 def _prune_retained_bundle_preview_bytes(state: WebAppState) -> None:
     if BUNDLE_PREVIEW_MAX_RETAINED_BYTES <= 0:
         return
+    persistent_world_previews = getattr(
+        state,
+        "persistent_world_bundle_previews",
+        {},
+    )
     previews = [
         ("chat", preview_id, preview)
         for preview_id, preview in state.bundle_previews.items()
@@ -11555,6 +12070,9 @@ def _prune_retained_bundle_preview_bytes(state: WebAppState) -> None:
     ] + [
         ("character", preview_id, preview)
         for preview_id, preview in state.character_bundle_previews.items()
+    ] + [
+        ("persistent_world", preview_id, preview)
+        for preview_id, preview in persistent_world_previews.items()
     ]
     total = sum(_bundle_preview_byte_count(preview) for _kind, _id, preview in previews)
     remaining = len(previews)
@@ -11570,8 +12088,10 @@ def _prune_retained_bundle_preview_bytes(state: WebAppState) -> None:
             _discard_bundle_preview(state, preview_id, preview)
         elif kind == "scenario":
             _discard_scenario_bundle_preview(state, preview_id, preview)
-        else:
+        elif kind == "character":
             _discard_character_bundle_preview(state, preview_id, preview)
+        else:
+            _discard_persistent_world_bundle_preview(state, preview_id, preview)
 
 
 def _bundle_preview_byte_count(preview: BundlePreviewState) -> int:
@@ -11605,6 +12125,15 @@ def _discard_character_bundle_preview(
     preview: BundlePreviewState,
 ) -> None:
     state.character_bundle_previews.pop(preview_id, None)
+    preview.bundle_path.unlink(missing_ok=True)
+
+
+def _discard_persistent_world_bundle_preview(
+    state: WebAppState,
+    preview_id: str,
+    preview: BundlePreviewState,
+) -> None:
+    state.persistent_world_bundle_previews.pop(preview_id, None)
     preview.bundle_path.unlink(missing_ok=True)
 
 

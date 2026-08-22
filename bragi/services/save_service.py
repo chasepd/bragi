@@ -11,6 +11,7 @@ from bragi.services.dating_route_profile_service import (
     enqueue_dating_route_profile_enrichment,
 )
 from bragi.services.dating_route_service import DatingRouteService
+from bragi.services.persistent_world_service import PersistentWorldService
 from bragi.services.turn_snapshot_service import TurnSnapshotService
 
 
@@ -36,6 +37,7 @@ class SaveService:
             scenario_id=scenario_id,
             title_chars=len(title),
         )
+        PersistentWorldService(self.repositories).materialize_save_snapshot(record.id)
         TurnSnapshotService(self.repositories).capture_baseline_snapshot(
             record.id,
             reason="save_created",

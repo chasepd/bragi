@@ -21,6 +21,7 @@ from bragi.persistence.repositories import PersistenceRepositories
 from bragi.private_files import write_private_bytes
 from bragi.redaction import redact_log_value, redact_text
 from bragi.services.action_choice_flags import normalize_legacy_action_choice_scenario
+from bragi.services.content_rating import sanitize_content_rating
 from bragi.services.media_service import (
     _assert_scenario_starter_reference_path,
     _assert_uploaded_image_size,
@@ -41,8 +42,8 @@ from bragi.services.scenario_service import (
 from bragi.zip_safety import ZipSafetyError, validate_zip_directory
 
 SCENARIO_BUNDLE_FORMAT = "bragi-scenario-bundle"
-SCENARIO_BUNDLE_VERSION = 2
-SUPPORTED_SCENARIO_BUNDLE_VERSIONS = frozenset({1, SCENARIO_BUNDLE_VERSION})
+SCENARIO_BUNDLE_VERSION = 3
+SUPPORTED_SCENARIO_BUNDLE_VERSIONS = frozenset({1, 2, SCENARIO_BUNDLE_VERSION})
 MANIFEST_NAME = "manifest.json"
 DATA_NAME = "data.json"
 MEDIA_PREFIX = "media/"
@@ -105,7 +106,7 @@ class ScenarioBundleService:
             self.repositories.connection.execute(
                 """
                 SELECT id, type, title, premise, player_role, interaction_mode,
-                       content_json,
+                       content_json, persistent_world_id,
                        created_at, updated_at
                 FROM scenarios
                 WHERE id = ?
@@ -177,6 +178,14 @@ class ScenarioBundleService:
             }
         )
         data: dict[str, object] = {"scenario": scenario_payload}
+        persistent_world_id = _optional_text_value(row["persistent_world_id"])
+        if persistent_world_id is not None:
+            world = self.repositories.get_persistent_world(persistent_world_id)
+            if world is None:
+                raise ScenarioBundleError(
+                    f"Unknown persistent world id: {persistent_world_id}"
+                )
+            data["persistent_world"] = _persistent_world_payload(world)
         media_members = _attach_bundle_media_members(
             data=data,
             media_dir=self.media_dir,
@@ -235,8 +244,15 @@ class ScenarioBundleService:
         if compiled_canon is not None:
             content["_canon_claims"] = compiled_canon
         content = _quarantine_imported_scenario_content(content)
+        persistent_world_data = _imported_persistent_world(data)
+        imported_world_id: str | None = None
         materialized_paths: list[str] = []
         try:
+            if persistent_world_data is not None:
+                imported_world_id = _import_persistent_world(
+                    self.repositories,
+                    persistent_world_data,
+                )
             content = _materialize_bundle_media_members(
                 bundle_path=bundle_path,
                 content=content,
@@ -252,8 +268,11 @@ class ScenarioBundleService:
                 interaction_mode=normalize_interaction_mode(
                     _optional_text_value(scenario.get("interaction_mode"))
                 ),
+                persistent_world_id=imported_world_id,
             )
         except Exception:
+            if imported_world_id is not None:
+                self.repositories.delete_persistent_world(imported_world_id)
             if self.media_dir is not None:
                 for relative_path in reversed(materialized_paths):
                     _unlink_media_file(self.media_dir, relative_path)
@@ -403,6 +422,74 @@ def _validate_bundle_data(
     content = _object(scenario.get("content"), "scenario content")
     if scenario_record_is_retired(scenario_type, content):
         raise ScenarioBundleError(RETIRED_SCENARIO_REASON)
+    persistent_world = data.get("persistent_world")
+    if persistent_world is not None:
+        _validate_persistent_world_payload(persistent_world)
+
+
+def _validate_persistent_world_payload(value: object) -> dict[str, object]:
+    world = _object(value, "persistent world")
+    _text(world, "id")
+    _text(world, "title")
+    _optional_text(world, "description")
+    _string_mapping(world.get("sections"), "sections")
+    source_metadata = world.get("source_metadata")
+    if source_metadata is not None:
+        _object(source_metadata, "source_metadata")
+    _optional_text(world, "content_rating")
+    return world
+
+
+def _persistent_world_payload(world: Any) -> dict[str, object]:
+    return _redacted_mapping(
+        {
+            "id": _text_value(world.id),
+            "title": _redacted_text(world.title),
+            "description": _redacted_text(world.description),
+            "sections": _redacted_mapping(
+                {
+                    str(key): _redacted_text(value)
+                    for key, value in _world_sections(world).items()
+                }
+            ),
+            "source_metadata": _redacted_mapping(
+                _json_object_from_text(
+                    world.source_metadata_json,
+                    "source_metadata_json",
+                )
+            ),
+            "content_rating": _text_value(world.content_rating),
+            "created_at": _optional_text_value(world.created_at),
+            "updated_at": _optional_text_value(world.updated_at),
+        }
+    )
+
+
+def _imported_persistent_world(data: dict[str, object]) -> dict[str, object] | None:
+    value = data.get("persistent_world")
+    if value is None:
+        return None
+    return _validate_persistent_world_payload(value)
+
+
+def _import_persistent_world(
+    repositories: PersistenceRepositories,
+    world: dict[str, object],
+) -> str:
+    title = _text(world, "title").strip() or "Imported persistent world"
+    return repositories.create_persistent_world(
+        title=_unique_persistent_world_title(repositories, title),
+        description=_optional_text(world, "description") or "",
+        sections=_string_mapping(world.get("sections"), "sections"),
+        source_metadata={
+            **_object_or_empty(world.get("source_metadata")),
+            "origin": "bundle_import",
+        },
+        content_rating=sanitize_content_rating(
+            world.get("content_rating"),
+            default="unclassified",
+        ),
+    ).id
 
 
 def _attach_bundle_media_members(
@@ -756,6 +843,55 @@ def _unique_scenario_title(
         if candidate.casefold() not in existing_titles:
             return candidate
         index += 1
+
+
+def _unique_persistent_world_title(
+    repositories: PersistenceRepositories,
+    desired_title: str,
+) -> str:
+    base = desired_title.strip() or "Imported persistent world"
+    existing_titles = {
+        world.title.casefold() for world in repositories.list_persistent_worlds()
+    }
+    if base.casefold() not in existing_titles:
+        return base
+    candidate = f"{base} (imported)"
+    if candidate.casefold() not in existing_titles:
+        return candidate
+    index = 2
+    while True:
+        candidate = f"{base} (imported {index})"
+        if candidate.casefold() not in existing_titles:
+            return candidate
+        index += 1
+
+
+def _world_sections(world: Any) -> dict[str, object]:
+    try:
+        loaded = json.loads(world.content_json)
+    except json.JSONDecodeError as exc:
+        raise ScenarioBundleError("Invalid persistent world content") from exc
+    if not isinstance(loaded, dict):
+        raise ScenarioBundleError("Persistent world sections must be an object")
+    return cast(dict[str, object], loaded)
+
+
+def _string_mapping(value: object, name: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ScenarioBundleError(f"Expected object: {name}")
+    normalized: dict[str, str] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, str):
+            raise ScenarioBundleError(f"Expected text mapping: {name}")
+        if key.strip() and item.strip():
+            normalized[key.strip()] = item
+    return normalized
+
+
+def _object_or_empty(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    return _object(value, "source_metadata")
 
 
 def _json_object_from_bytes(payload: bytes, name: str) -> dict[str, object]:

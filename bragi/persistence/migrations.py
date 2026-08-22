@@ -23,7 +23,7 @@ from bragi.text_search import (
     unicode_word_terms,
 )
 
-CURRENT_SCHEMA_VERSION = 84
+CURRENT_SCHEMA_VERSION = 85
 _MAX_CONTEXT_SOURCE_SEARCH_TEXT_CHARS = 65_536
 _MAX_CONTEXT_SOURCE_INDEX_TERMS = 512
 _MAX_CONTEXT_SOURCE_INDEX_IDENTIFIERS = 32_768
@@ -94,6 +94,17 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS persistent_worlds (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    content_json TEXT NOT NULL,
+    source_metadata_json TEXT NOT NULL DEFAULT '{}',
+    content_rating TEXT NOT NULL DEFAULT 'pg-13',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS scenarios (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL,
@@ -102,9 +113,13 @@ CREATE TABLE IF NOT EXISTS scenarios (
     player_role TEXT NOT NULL DEFAULT '',
     interaction_mode TEXT NOT NULL DEFAULT 'roleplay',
     content_json TEXT NOT NULL,
+    persistent_world_id TEXT REFERENCES persistent_worlds(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_scenarios_persistent_world_id
+ON scenarios(persistent_world_id);
 
 CREATE TABLE IF NOT EXISTS saves (
     id TEXT PRIMARY KEY,
@@ -775,7 +790,10 @@ def migrate_database(database_path: Path | str) -> None:
             _initialize_baseline_schema(connection)
             return
         if current < CURRENT_SCHEMA_VERSION:
-            if current == 83:
+            if current == 84:
+                _migrate_schema_84_to_85(connection)
+                current = CURRENT_SCHEMA_VERSION
+            elif current == 83:
                 _migrate_schema_83_to_84(connection)
                 current = CURRENT_SCHEMA_VERSION
             elif current == 82:
@@ -1022,6 +1040,10 @@ def migrate_database(database_path: Path | str) -> None:
             _migrate_schema_81_to_82(connection)
         if not _schema_migration_applied(connection, 83):
             _migrate_schema_82_to_83(connection)
+        if not _schema_migration_applied(connection, 84):
+            _migrate_schema_83_to_84(connection)
+        if not _schema_migration_applied(connection, 85):
+            _migrate_schema_84_to_85(connection)
         _ensure_runtime_telemetry_schema(connection)
         _ensure_context_update_suggestion_review_schema(connection)
         _ensure_context_observation_curation_schema(connection)
@@ -2646,6 +2668,37 @@ def _migrate_schema_82_to_83(connection: sqlite3.Connection) -> None:
 def _migrate_schema_83_to_84(connection: sqlite3.Connection) -> None:
     _ensure_incremental_turn_snapshot_schema(connection)
     connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (84)")
+
+
+def _migrate_schema_84_to_85(connection: sqlite3.Connection) -> None:
+    _execute_schema_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS persistent_worlds (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            content_json TEXT NOT NULL,
+            source_metadata_json TEXT NOT NULL DEFAULT '{}',
+            content_rating TEXT NOT NULL DEFAULT 'pg-13',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+    )
+    _add_column_if_missing(
+        connection,
+        "scenarios",
+        "persistent_world_id",
+        "TEXT REFERENCES persistent_worlds(id) ON DELETE SET NULL",
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_scenarios_persistent_world_id
+        ON scenarios(persistent_world_id)
+        """
+    )
+    connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES (85)")
 
 
 def _ensure_post_turn_outbox_schema(connection: sqlite3.Connection) -> None:

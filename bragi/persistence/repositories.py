@@ -65,6 +65,7 @@ from bragi.persistence.models import (
     MessageScenePresenceRecord,
     MessageVisibilityRecord,
     ModelPreferenceRecord,
+    PersistentWorldRecord,
     PostTurnOutboxRecord,
     ProviderCatalogEntryRecord,
     ProviderConfigRecord,
@@ -633,6 +634,171 @@ class PersistenceRepositories:
         self.commit()
         return cursor.rowcount
 
+    def create_persistent_world(
+        self,
+        *,
+        title: str,
+        description: str = "",
+        sections: Mapping[str, object],
+        source_metadata: Mapping[str, object] | None = None,
+        content_rating: str = "pg-13",
+        world_id: str | None = None,
+    ) -> PersistentWorldRecord:
+        record = PersistentWorldRecord(
+            id=world_id or _new_id(),
+            title=title,
+            description=description,
+            content_json=_dump_json(dict(sections)),
+            source_metadata_json=_dump_json(dict(source_metadata or {})),
+            content_rating=content_rating,
+        )
+        self.connection.execute(
+            """
+            INSERT INTO persistent_worlds(
+                id, title, description, content_json, source_metadata_json,
+                content_rating
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.id,
+                record.title,
+                record.description,
+                record.content_json,
+                record.source_metadata_json,
+                record.content_rating,
+            ),
+        )
+        self.commit()
+        created = self.get_persistent_world(record.id)
+        if created is None:
+            raise ValueError(f"Unknown persistent world id: {record.id}")
+        return created
+
+    def get_persistent_world(self, world_id: str) -> PersistentWorldRecord | None:
+        row = self._fetch_one(
+            """
+            SELECT id, title, description, content_json, source_metadata_json,
+                   content_rating, created_at, updated_at
+            FROM persistent_worlds
+            WHERE id = ?
+            """,
+            (world_id,),
+        )
+        return _persistent_world_from_row(row) if row else None
+
+    def list_persistent_worlds(self) -> list[PersistentWorldRecord]:
+        rows = self._fetch_all(
+            """
+            SELECT id, title, description, content_json, source_metadata_json,
+                   content_rating, created_at, updated_at
+            FROM persistent_worlds
+            ORDER BY
+                julianday(updated_at) DESC,
+                julianday(created_at) DESC,
+                rowid DESC
+            """,
+            (),
+        )
+        return [_persistent_world_from_row(row) for row in rows]
+
+    def update_persistent_world(
+        self,
+        *,
+        world_id: str,
+        title: str,
+        description: str,
+        sections: Mapping[str, object],
+        source_metadata: Mapping[str, object] | None = None,
+        content_rating: str | None = None,
+    ) -> PersistentWorldRecord:
+        existing = self.get_persistent_world(world_id)
+        if existing is None:
+            raise ValueError(f"Unknown persistent world id: {world_id}")
+        self.connection.execute(
+            """
+            UPDATE persistent_worlds
+            SET title = ?, description = ?, content_json = ?,
+                source_metadata_json = ?,
+                content_rating = COALESCE(?, content_rating),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                title,
+                description,
+                _dump_json(dict(sections)),
+                _dump_json(
+                    dict(source_metadata)
+                    if source_metadata is not None
+                    else json.loads(existing.source_metadata_json)
+                ),
+                content_rating,
+                world_id,
+            ),
+        )
+        self.commit()
+        updated = self.get_persistent_world(world_id)
+        if updated is None:
+            raise ValueError(f"Unknown persistent world id: {world_id}")
+        return updated
+
+    def delete_persistent_world(self, world_id: str) -> bool:
+        if self.count_scenarios_for_persistent_world(world_id) > 0:
+            raise ValueError("Cannot delete a persistent world linked to scenarios")
+        cursor = self.connection.execute(
+            "DELETE FROM persistent_worlds WHERE id = ?",
+            (world_id,),
+        )
+        self.commit()
+        return cursor.rowcount > 0
+
+    def count_scenarios_for_persistent_world(self, world_id: str) -> int:
+        row = self._fetch_one(
+            "SELECT COUNT(*) AS count FROM scenarios WHERE persistent_world_id = ?",
+            (world_id,),
+        )
+        return int(row["count"]) if row else 0
+
+    def count_scenarios_by_persistent_world(self) -> dict[str, int]:
+        rows = self._fetch_all(
+            """
+            SELECT persistent_world_id, COUNT(*) AS count
+            FROM scenarios
+            WHERE persistent_world_id IS NOT NULL
+            GROUP BY persistent_world_id
+            """,
+            (),
+        )
+        return {str(row["persistent_world_id"]): int(row["count"]) for row in rows}
+
+    def set_scenario_persistent_world(
+        self,
+        *,
+        scenario_id: str,
+        persistent_world_id: str | None,
+    ) -> ScenarioRecord:
+        if self.get_scenario(scenario_id) is None:
+            raise ValueError(f"Unknown scenario id: {scenario_id}")
+        if (
+            persistent_world_id is not None
+            and self.get_persistent_world(persistent_world_id) is None
+        ):
+            raise ValueError(f"Unknown persistent world id: {persistent_world_id}")
+        self.connection.execute(
+            """
+            UPDATE scenarios
+            SET persistent_world_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (persistent_world_id, scenario_id),
+        )
+        self.commit()
+        scenario = self.get_scenario(scenario_id)
+        if scenario is None:
+            raise ValueError(f"Unknown scenario id: {scenario_id}")
+        return scenario
+
     def create_scenario(
         self,
         *,
@@ -643,7 +809,13 @@ class PersistenceRepositories:
         content: dict[str, object],
         scenario_id: str | None = None,
         interaction_mode: InteractionMode | str = InteractionMode.ROLEPLAY,
+        persistent_world_id: str | None = None,
     ) -> ScenarioRecord:
+        if (
+            persistent_world_id is not None
+            and self.get_persistent_world(persistent_world_id) is None
+        ):
+            raise ValueError(f"Unknown persistent world id: {persistent_world_id}")
         normalized_interaction_mode = normalize_interaction_mode(interaction_mode)
         record = ScenarioRecord(
             id=scenario_id or _new_id(),
@@ -653,13 +825,15 @@ class PersistenceRepositories:
             player_role=player_role,
             content_json=_dump_json(content),
             interaction_mode=normalized_interaction_mode,
+            persistent_world_id=persistent_world_id,
         )
         self.connection.execute(
             """
             INSERT INTO scenarios(
-                id, type, title, premise, player_role, interaction_mode, content_json
+                id, type, title, premise, player_role, interaction_mode, content_json,
+                persistent_world_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.id,
@@ -669,6 +843,7 @@ class PersistenceRepositories:
                 record.player_role,
                 record.interaction_mode.value,
                 record.content_json,
+                record.persistent_world_id,
             ),
         )
         self.commit()
@@ -922,7 +1097,7 @@ class PersistenceRepositories:
         row = self._fetch_one(
             """
             SELECT id, type, title, premise, player_role, interaction_mode,
-                   content_json,
+                   content_json, persistent_world_id,
                    created_at, updated_at
             FROM scenarios
             WHERE id = ?
@@ -935,7 +1110,7 @@ class PersistenceRepositories:
         rows = self._fetch_all(
             """
             SELECT id, type, title, premise, player_role, interaction_mode,
-                   content_json,
+                   content_json, persistent_world_id,
                    created_at, updated_at
             FROM scenarios
             ORDER BY
@@ -1287,7 +1462,8 @@ class PersistenceRepositories:
         if save_row is not None:
             scenario_row = self._fetch_one(
                 """
-                SELECT id, type, title, premise, player_role, content_json, updated_at
+                SELECT id, type, title, premise, player_role, content_json,
+                       persistent_world_id, updated_at
                 FROM scenarios
                 WHERE id = ?
                 """,
@@ -1326,6 +1502,7 @@ class PersistenceRepositories:
                     "premise_hash": _text_digest(scenario_row["premise"]),
                     "player_role_hash": _text_digest(scenario_row["player_role"]),
                     "content_hash": _text_digest(scenario_row["content_json"]),
+                    "persistent_world_id": scenario_row["persistent_world_id"],
                     "updated_at": scenario_row["updated_at"],
                 }
             ),
@@ -1677,6 +1854,8 @@ class PersistenceRepositories:
             content_json=update.content_json,
             created_at=base_scenario.created_at,
             updated_at=base_scenario.updated_at,
+            interaction_mode=base_scenario.interaction_mode,
+            persistent_world_id=base_scenario.persistent_world_id,
         )
 
     def add_loss_condition(
@@ -15705,6 +15884,11 @@ def _scenario_from_row(row: sqlite3.Row) -> ScenarioRecord:
         values.get("interaction_mode")
     )
     return ScenarioRecord(**values)
+
+
+def _persistent_world_from_row(row: sqlite3.Row) -> PersistentWorldRecord:
+    values = dict(row)
+    return PersistentWorldRecord(**values)
 
 
 def _row_value(row: sqlite3.Row, key: str) -> str | None:

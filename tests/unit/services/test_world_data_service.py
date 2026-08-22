@@ -2903,6 +2903,10 @@ def test_world_data_service_forks_shared_scenario_before_applying_save_edits(
     monkeypatch: MonkeyPatch,
 ) -> None:
     world_data = _import_world_data_service_without_gtk(monkeypatch)
+    persistent_world = repositories.create_persistent_world(
+        title="The Ash Coast",
+        sections={"overview": "A coast of storm-bound keeps."},
+    )
     scenario = repositories.create_scenario(
         type="full_roleplay",
         title="Shared Keep",
@@ -2918,6 +2922,7 @@ def test_world_data_service_forks_shared_scenario_before_applying_save_edits(
                 "generation_prompt": "A shared keep in an ash storm.",
             },
         },
+        persistent_world_id=persistent_world.id,
     )
     edited_save = repositories.create_save(
         scenario_id=scenario.id,
@@ -2961,6 +2966,7 @@ def test_world_data_service_forks_shared_scenario_before_applying_save_edits(
     assert untouched_scenario is not None
     assert original_scenario is not None
     assert result_scenario is not None
+    assert edited_scenario.persistent_world_id == persistent_world.id
     assert result_scenario.player_character_name == "Mara Voss"
     assert result_scenario.content_sections == (
         ("opening_message", "The beacon lens turns red."),

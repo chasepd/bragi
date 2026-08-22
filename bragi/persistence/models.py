@@ -19,6 +19,19 @@ class ScenarioRecord:
     created_at: str | None = None
     updated_at: str | None = None
     interaction_mode: InteractionMode = InteractionMode.ROLEPLAY
+    persistent_world_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PersistentWorldRecord:
+    id: str
+    title: str
+    description: str
+    content_json: str
+    source_metadata_json: str = "{}"
+    content_rating: str = "pg-13"
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True)

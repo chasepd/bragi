@@ -33,6 +33,17 @@ from bragi.services.diagnostics_service import (
     ProviderDiagnostic,
 )
 from bragi.services.media_service import MediaService
+from bragi.services.persistent_world_bundle_service import (
+    ImportedPersistentWorldBundle,
+    PersistentWorldBundleError,
+    PersistentWorldBundleManifest,
+    PersistentWorldBundlePreview,
+    PersistentWorldBundleService,
+)
+from bragi.services.persistent_world_service import (
+    PersistentWorldDraft,
+    PersistentWorldService,
+)
 from bragi.services.save_service import SaveService
 from bragi.services.scenario_bundle_service import (
     ImportedScenarioBundle,
@@ -114,8 +125,15 @@ __all__ = [
     "ImportedChatBundle",
     "LinuxSecretStore",
     "MediaService",
+    "ImportedPersistentWorldBundle",
+    "PersistentWorldBundleError",
+    "PersistentWorldBundleManifest",
+    "PersistentWorldBundlePreview",
+    "PersistentWorldBundleService",
     "MemoryEdit",
     "PendingMessageEstimate",
+    "PersistentWorldDraft",
+    "PersistentWorldService",
     "ProviderDiagnostic",
     "SaveService",
     "ScenarioDraft",

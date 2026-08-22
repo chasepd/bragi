@@ -15,11 +15,6 @@ from pathlib import Path
 from time import time
 from typing import Any, cast
 
-from bragi.providers.http_client import (
-    httpx_request_bytes,
-    httpx_request_json,
-    httpx_request_sse_json,
-)
 from bragi_web.auth_throttle import AuthAttemptThrottle
 from bragi_web.bragi_adapter import bragi_runtime_bindings
 from bragi_web.jobs import JobRecord, JobRegistry
@@ -413,6 +408,9 @@ class WebAppState:
     character_bundle_previews: dict[str, BundlePreviewState] = field(
         default_factory=dict
     )
+    persistent_world_bundle_previews: dict[str, BundlePreviewState] = field(
+        default_factory=dict
+    )
     auth_attempts: AuthAttemptThrottle = field(default_factory=AuthAttemptThrottle)
     log_file_path: Path | None = None
     auth_required: bool = True
@@ -674,6 +672,12 @@ def _provider_clients(
                 call_deadline_seconds=call_deadline_seconds,
             ),
         }
+    from bragi.providers.http_client import (
+        httpx_request_bytes,
+        httpx_request_json,
+        httpx_request_sse_json,
+    )
+
     return {
         "openrouter": bindings.OpenRouterClient(
             secret_store=secret_store,

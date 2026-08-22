@@ -48,7 +48,7 @@ def test_export_scenario_writes_manifest_and_definition_only(
 
     manifest = service.export_scenario(scenario.id, bundle_path)
 
-    assert manifest.bundle_version == 2
+    assert manifest.bundle_version == 3
     assert manifest.title == "Ashfall Keep"
     assert manifest.scenario_type == "full_roleplay"
 
@@ -56,7 +56,7 @@ def test_export_scenario_writes_manifest_and_definition_only(
         assert set(bundle.namelist()) == {"manifest.json", "data.json"}
         manifest_payload = json.loads(bundle.read("manifest.json"))
         assert manifest_payload["format"] == "bragi-scenario-bundle"
-        assert manifest_payload["bundle_version"] == 2
+        assert manifest_payload["bundle_version"] == 3
         assert manifest_payload["scenario"]["id"] == SCENARIO_ID
         assert manifest_payload["scenario"]["title"] == "Ashfall Keep"
         assert manifest_payload["scenario"]["type"] == "full_roleplay"
@@ -99,6 +99,42 @@ def test_preview_import_reads_scenario_manifest_without_mutating_database(
     assert preview.title == "Ashfall Keep"
     assert preview.scenario_type == "full_roleplay"
     assert len(repositories.list_scenarios()) == 1
+
+
+def test_scenario_bundle_round_trips_linked_persistent_world(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    world = repositories.create_persistent_world(
+        title="The Salt Marches",
+        sections={"cultures": "The river clans trade by oath."},
+    )
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Salt at Dusk",
+        premise="A courier arrives at the river gate.",
+        player_role="River courier",
+        content={"opening_message": "The last ferry waits."},
+        persistent_world_id=world.id,
+    )
+    service = _scenario_bundle_service(repositories)
+    bundle_path = tmp_path / "salt-at-dusk.bragi-scenario"
+
+    service.export_scenario(scenario.id, bundle_path)
+
+    with zipfile.ZipFile(bundle_path) as bundle:
+        data = json.loads(bundle.read("data.json"))
+    assert data["persistent_world"]["title"] == "The Salt Marches"
+
+    imported = service.import_scenario(bundle_path)
+    imported_scenario = repositories.get_scenario(imported.scenario_id)
+    assert imported_scenario is not None
+    assert imported_scenario.persistent_world_id is not None
+    imported_world = repositories.get_persistent_world(
+        imported_scenario.persistent_world_id
+    )
+    assert imported_world is not None
+    assert imported_world.title == "The Salt Marches (imported)"
 
 
 def test_import_scenario_creates_new_id_and_unique_duplicate_title(

@@ -3821,6 +3821,67 @@ def test_scenarios_api_exposes_library_metadata(
     assert scenario["unsupported_reason"] is None
 
 
+def test_persistent_world_api_links_scenarios_and_snapshots_setting_prose(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BRAGI_WEB_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("BRAGI_WEB_FAKE_PROVIDERS", "1")
+    app = create_app()
+    state = cast(WebAppState, app.state.bragi)
+
+    with TestClient(app) as client:
+        created_world = client.post(
+            "/api/worlds/manual",
+            json={
+                "title": "The Salt Marches",
+                "description": "A setting of rivers and old oaths.",
+                "sections": {"cultures": "The river clans trade by oath."},
+            },
+        )
+        assert created_world.status_code == 200
+        world_id = created_world.json()["world_id"]
+        created_scenario = client.post(
+            "/api/scenarios/manual",
+            json={
+                "scenario_type": "full_roleplay",
+                "title": "Salt at Dusk",
+                "premise": "A courier arrives at the river gate.",
+                "player_role": "River courier",
+                "persistent_world_id": world_id,
+            },
+        )
+        assert created_scenario.status_code == 200
+        save_id = created_scenario.json()["active_save_id"]
+        listed_worlds = client.get("/api/worlds")
+        listed_scenarios = client.get("/api/scenarios")
+        updated_world = client.post(
+            f"/api/worlds/{world_id}/definition",
+            json={
+                "title": "The Salt Marches",
+                "description": "Updated setting prose.",
+                "sections": {
+                    "cultures": "The river clans answer to a crowned admiral."
+                },
+            },
+        )
+
+    assert listed_worlds.status_code == 200
+    assert listed_worlds.json()["worlds"][0]["scenario_count"] == 1
+    assert listed_scenarios.status_code == 200
+    assert listed_scenarios.json()["scenarios"][0]["persistent_world_id"] == world_id
+    assert listed_scenarios.json()["scenarios"][0]["persistent_world_title"] == (
+        "The Salt Marches"
+    )
+    assert updated_world.status_code == 200
+    assert updated_world.json()["description"] == "Updated setting prose."
+    details = state.repositories.load_save_details(save_id)
+    assert details is not None
+    assert json.loads(details.scenario.content_json)[
+        "persistent_world__cultures"
+    ] == "The river clans trade by oath."
+
+
 def test_scenarios_api_tolerates_legacy_scenario_type(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,

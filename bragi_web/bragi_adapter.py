@@ -70,6 +70,7 @@ class BragiApiBindings:
     WorldDataSuggestionRow: Any
     WorldDataSummaryRow: Any
     WorldDataThreadRow: Any
+    PersistentWorldService: Any
     ManualScenarioInput: Any
 
 
@@ -174,6 +175,7 @@ def bragi_runtime_bindings() -> BragiRuntimeBindings:
 def bragi_api_bindings() -> BragiApiBindings:
     character_registry = _module("bragi.services.character_registry_service")
     world_data = _module("bragi.services.world_data_service")
+    persistent_world = _module("bragi.services.persistent_world_service")
     runtime = _module("bragi.application.controller")
     return BragiApiBindings(
         CharacterRegistryEdits=_required(
@@ -208,6 +210,10 @@ def bragi_api_bindings() -> BragiApiBindings:
         WorldDataSuggestionRow=_required(world_data, "WorldDataSuggestionRow"),
         WorldDataSummaryRow=_required(world_data, "WorldDataSummaryRow"),
         WorldDataThreadRow=_required(world_data, "WorldDataThreadRow"),
+        PersistentWorldService=_required(
+            persistent_world,
+            "PersistentWorldService",
+        ),
         ManualScenarioInput=_required(runtime, "ManualScenarioInput"),
     )
 

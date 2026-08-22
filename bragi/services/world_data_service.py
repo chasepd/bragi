@@ -43,6 +43,7 @@ from bragi.services.character_profile_completion import (
     normalize_scenario_character_starters,
     scenario_character_starter_to_json,
 )
+from bragi.services.persistent_world_service import PERSISTENT_WORLD_CONTENT_PREFIX
 from bragi.services.scenario_canon import CANON_CONTENT_KEY
 from bragi.services.scenario_content_rating import (
     metadata_with_scenario_content_ratings,
@@ -1377,6 +1378,7 @@ def _scenario_id_for_single_save_edit(
     content: dict[str, object],
 ) -> str:
     if repositories.count_saves_for_scenario(scenario.scenario_id) > 1:
+        source_scenario = repositories.get_scenario(scenario.scenario_id)
         forked = repositories.create_scenario(
             type=scenario.scenario_type,
             title=title,
@@ -1384,6 +1386,11 @@ def _scenario_id_for_single_save_edit(
             player_role=player_role,
             content=content,
             interaction_mode=scenario.interaction_mode,
+            persistent_world_id=(
+                source_scenario.persistent_world_id
+                if source_scenario is not None
+                else None
+            ),
         )
         repositories.update_save_scenario(
             save_id=save_id,
@@ -1439,7 +1446,10 @@ def _scenario_model_from_record(
         content_sections=tuple(
             (key, _section_text(value))
             for key, value in scenario_content
-            if key not in _SCENARIO_NON_SECTION_CONTENT_KEYS
+            if (
+                key not in _SCENARIO_NON_SECTION_CONTENT_KEYS
+                and not key.startswith(PERSISTENT_WORLD_CONTENT_PREFIX)
+            )
         ),
         generation_prompt=_scenario_generation_prompt(scenario_content),
         character_starters=_scenario_character_starters(scenario_content),
