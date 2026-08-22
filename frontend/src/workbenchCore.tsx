@@ -1425,6 +1425,7 @@ type ScenarioDraftPrefill = {
   action_choices_enabled: boolean;
   seed: string;
   interaction_mode?: "roleplay" | "storyteller";
+  persistent_world_id?: string | null;
 };
 const MANUAL_BASE_SECTION_IDS = new Set(["title", "premise", "player_character_name", "player_role", "opening_message"]);
 const MANUAL_SCENARIO_TEXTAREA_FIELDS = new Set([
@@ -3230,6 +3231,9 @@ function Workbench({
     const prompt = definition.scenario?.generation_prompt?.trim();
     if (!prompt) throw new Error("Scenario does not have a saved AI prompt.");
     const scenarioType = definition.scenario?.scenario_type || scenario.scenario_type;
+    const persistentWorldId = Object.prototype.hasOwnProperty.call(definition, "persistent_world")
+      ? definition.persistent_world?.world_id ?? null
+      : scenario.persistent_world_id ?? null;
     setDraftPrefill({
       scenario_type: scenarioType,
       scenario_types: normalizedScenarioTypes(scenarioType, scenario.scenario_types),
@@ -3237,6 +3241,7 @@ function Workbench({
       interaction_mode: definition.scenario?.interaction_mode
         ?? scenario.interaction_mode
         ?? "roleplay",
+      persistent_world_id: persistentWorldId,
       seed: prompt
     });
     setDraftInitialMode("draft");

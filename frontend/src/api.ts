@@ -351,6 +351,8 @@ export type ScenarioDraft = {
   action_choices_enabled?: boolean;
   character_starters?: ScenarioCharacterStarter[];
   interaction_mode?: InteractionMode;
+  persistent_world_id?: string | null;
+  persistent_world_title?: string | null;
 };
 export type ScenarioWizard = {
   flows: ScenarioWizardFlow[];

@@ -2745,6 +2745,47 @@ def test_generate_scenario_draft_uses_scenario_preference_or_chat_fallback_witho
     assert _status_text(model) == "Scenario draft generated"
 
 
+def test_generate_scenario_draft_includes_persistent_world_context(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    repositories.set_model_preference(
+        task="scenario_generation",
+        provider="fake",
+        model_id="fake-scenario",
+    )
+    world = repositories.create_persistent_world(
+        title="The Salt Marches",
+        description="A lowland setting shaped by salt and old rivers.",
+        sections={
+            "overview": "The marsh roads sink unless river oaths are honored.",
+            "cultures": "The river clans trade by oath.",
+        },
+    )
+    provider = RuntimeFakeProvider()
+    controller = _runtime_controller(runtime, repositories, tmp_path, provider=provider)
+
+    model = asyncio.run(
+        controller.generate_scenario_draft(
+            scenario_type="full_roleplay",
+            seed="A courier crossing before the river dries.",
+            persistent_world_id=world.id,
+        )
+    )
+
+    assert _error_text(model) == ""
+    assert all(
+        "The Salt Marches" in request.messages[-1].body
+        and "The river clans trade by oath." in request.messages[-1].body
+        for request in provider.chat_requests
+    )
+    draft = _value(model, "scenario_draft")
+    assert _value(draft, "persistent_world_id") == world.id
+    assert _value(draft, "persistent_world_title") == "The Salt Marches"
+
+
 def test_generate_scenario_draft_uses_section_model_override(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -3028,6 +3069,13 @@ def test_generate_scenario_draft_character_starters_appends_structured_results(
             }
         ]
     )
+    world = repositories.create_persistent_world(
+        title="The Glass Meridian",
+        description="A city-world where mirrors store legal testimony.",
+        sections={
+            "factions": "The Mirror Courts license every reflective surface.",
+        },
+    )
     controller = _runtime_controller(runtime, repositories, tmp_path, provider=provider)
 
     model = asyncio.run(
@@ -3041,6 +3089,7 @@ def test_generate_scenario_draft_character_starters_appends_structured_results(
                 }
             ],
             count=1,
+            persistent_world_id=world.id,
         )
     )
 
@@ -3055,9 +3104,13 @@ def test_generate_scenario_draft_character_starters_appends_structured_results(
     assert request.model_id == "fake-structured"
     assert "Create exactly 1 new character starters" in request.messages[0].body
     request_body = request.messages[1].body
+    assert "The Glass Meridian" in request_body
+    assert "The Mirror Courts license every reflective surface." in request_body
     assert "Ren Takahashi" in request_body
     assert "Mika Arai" in request_body
     assert "Ordinary contemporary name candidates" in request_body
+    assert _value(draft, "persistent_world_id") == world.id
+    assert _value(draft, "persistent_world_title") == "The Glass Meridian"
 
 
 def test_generate_scenario_draft_character_starters_reviews_generated_content(
@@ -3184,6 +3237,11 @@ def test_regenerate_scenario_section_preserves_other_draft_sections(
     )
     provider = RuntimeFakeProvider()
     provider.scenario_sections["locations"] = "Regenerated lighthouse cavern."
+    world = repositories.create_persistent_world(
+        title="The Bell Coast",
+        description="A coast where bells mark jurisdiction.",
+        sections={"overview": "Harbor bells are legal boundaries."},
+    )
     controller = _runtime_controller(runtime, repositories, tmp_path, provider=provider)
     sections = {
         "title": "Reviewed Glass Harbor",
@@ -3204,6 +3262,7 @@ def test_regenerate_scenario_section_preserves_other_draft_sections(
             seed="A harbor that keeps old promises.",
             section_id="locations",
             sections=sections,
+            persistent_world_id=world.id,
         )
     )
 
@@ -3211,9 +3270,13 @@ def test_regenerate_scenario_section_preserves_other_draft_sections(
     request = provider.chat_requests[0]
     assert request.model_id == "fake-chat"
     assert _requested_scenario_section(request.messages[-1].body) == "locations"
+    assert "The Bell Coast" in request.messages[-1].body
+    assert "Harbor bells are legal boundaries." in request.messages[-1].body
 
     draft = _value(model, "scenario_draft")
     assert _value(draft, "scenario_type") == "full_roleplay"
+    assert _value(draft, "persistent_world_id") == world.id
+    assert _value(draft, "persistent_world_title") == "The Bell Coast"
     updated_sections = dict(_value(draft, "sections"))
     assert updated_sections == {
         **sections,

@@ -14378,12 +14378,137 @@ describe("frontend helpers", () => {
     });
   });
 
+  it("clears an AI draft when the persistent world changes and sends the selected world", async () => {
+    const sources = installEventSourceDouble();
+    const oldDraft: ScenarioDraft = {
+      scenario_type: "full_roleplay",
+      regeneration_seed: "old seed",
+      source_metadata: [],
+      sections: [["title", "Old Draft"]]
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => {
+        if (path === "/api/worlds") {
+          return {
+            worlds: [
+              {
+                world_id: "world-salt",
+                title: "The Salt Marches",
+                description: "",
+                sections: {},
+                source_metadata: {},
+                content_rating: "pg-13",
+                scenario_count: 0
+              }
+            ]
+          };
+        }
+        if (path === "/api/scenarios/draft") {
+          return { id: "job-draft", type: "scenario_draft", status: "queued", result: null, error: null };
+        }
+        return {};
+      }
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel({ scenario_draft: oldDraft })} initialMode="draft" onClose={vi.fn()} onRuntimeChanged={vi.fn()} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    expect(screen.getByDisplayValue("Old Draft")).toBeInTheDocument();
+    const worldSelect = await screen.findByLabelText("Persistent world");
+    await screen.findByRole("option", { name: "The Salt Marches" });
+    await userEvent.selectOptions(worldSelect, "world-salt");
+
+    expect(screen.queryByDisplayValue("Old Draft")).not.toBeInTheDocument();
+    await userEvent.type(
+      screen.getByPlaceholderText(
+        "Describe the genre, premise, player role, tone, and visible opening narration. Leave room for the world to emerge in play.",
+      ),
+      "new idea",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Generate" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/scenarios/draft", expect.anything()));
+    const draftCall = fetchMock.mock.calls.find(([path]) => path === "/api/scenarios/draft");
+    expect(JSON.parse(String(draftCall?.[1].body))).toMatchObject({
+      scenario_type: "full_roleplay",
+      seed: "new idea",
+      persistent_world_id: "world-salt"
+    });
+    expect(worldSelect).toBeDisabled();
+    expect(sources).toHaveLength(1);
+  });
+
+  it("locks the persistent world selector while saving an AI draft", async () => {
+    let resolveSave!: (response: { ok: boolean; json: () => Promise<RuntimeModel> }) => void;
+    const savePromise = new Promise<{ ok: boolean; json: () => Promise<RuntimeModel> }>((resolve) => {
+      resolveSave = resolve;
+    });
+    const draft: ScenarioDraft = {
+      scenario_type: "full_roleplay",
+      regeneration_seed: "fog seed",
+      source_metadata: [],
+      persistent_world_id: "world-salt",
+      sections: [["title", "Fog Gate"]]
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => {
+      if (path === "/api/worlds") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            worlds: [
+              {
+                world_id: "world-salt",
+                title: "The Salt Marches",
+                description: "",
+                sections: {},
+                source_metadata: {},
+                content_rating: "pg-13",
+                scenario_count: 0
+              }
+            ]
+          })
+        });
+      }
+      if (path === "/api/scenarios/draft/save") return savePromise;
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onSaved = vi.fn();
+    const { ScenarioDialog } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <ScenarioDialog model={runtimeModel({ scenario_draft: draft })} initialMode="draft" onClose={onSaved} onRuntimeChanged={vi.fn()} runJob={vi.fn()} />
+      </QueryClientProvider>
+    );
+
+    const worldSelect = screen.getByLabelText("Persistent world");
+    await userEvent.click(screen.getByRole("button", { name: /save draft/i }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/scenarios/draft/save", expect.anything()));
+
+    expect(worldSelect).toBeDisabled();
+
+    await act(async () => {
+      resolveSave({ ok: true, json: async () => runtimeModel() });
+      await savePromise;
+    });
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    expect(worldSelect).toBeEnabled();
+  });
+
   it("prefills the AI draft seed from a reusable scenario prompt", async () => {
     const { ScenarioDialog } = await import("./main");
     const staleDraft: ScenarioDraft = {
       scenario_type: "full_roleplay",
       regeneration_seed: "old seed",
       source_metadata: [],
+      persistent_world_id: "world-old",
       sections: [["title", "Old Draft"]]
     };
 
@@ -14408,6 +14533,7 @@ describe("frontend helpers", () => {
     expect(screen.getByRole("textbox", { name: "Scenario seed" })).toHaveValue(
       "A bell tower that only answers at low tide.",
     );
+    expect(screen.getByLabelText("Persistent world")).toHaveValue("");
     expect(screen.queryByDisplayValue("Old Draft")).not.toBeInTheDocument();
   });
 
@@ -14573,6 +14699,7 @@ describe("frontend helpers", () => {
     const sources = installEventSourceDouble();
     const draft: ScenarioDraft = {
       scenario_type: "full_roleplay",
+      persistent_world_id: "world-salt",
       regeneration_seed: "fog seed",
       source_metadata: [],
       sections: [
@@ -14582,9 +14709,27 @@ describe("frontend helpers", () => {
     };
     const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
       ok: true,
-      json: async () => path === "/api/scenarios/draft/section"
-        ? { id: "job-section", type: "scenario_section", status: "queued", result: null, error: null }
-        : {}
+      json: async () => {
+        if (path === "/api/worlds") {
+          return {
+            worlds: [
+              {
+                world_id: "world-salt",
+                title: "The Salt Marches",
+                description: "",
+                sections: {},
+                source_metadata: {},
+                content_rating: "pg-13",
+                scenario_count: 0
+              }
+            ]
+          };
+        }
+        if (path === "/api/scenarios/draft/section") {
+          return { id: "job-section", type: "scenario_section", status: "queued", result: null, error: null };
+        }
+        return {};
+      }
     }));
     vi.stubGlobal("fetch", fetchMock);
     const { ScenarioDialog } = await import("./main");
@@ -14608,6 +14753,7 @@ describe("frontend helpers", () => {
       section_id: "premise",
       interaction_mode: "roleplay",
       action_choices_enabled: false,
+      persistent_world_id: "world-salt",
       sections: {
         title: "Fog Gate",
         premise: "Old premise"
@@ -14640,6 +14786,7 @@ describe("frontend helpers", () => {
       scenario_type: "full_roleplay",
       scenario_types: ["full_roleplay", "investigation_mystery"],
       action_choices_enabled: true,
+      persistent_world_id: "world-salt",
       regeneration_seed: "fog seed",
       source_metadata: [],
       sections: [
@@ -14696,6 +14843,21 @@ describe("frontend helpers", () => {
     const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
       ok: true,
       json: async () => {
+        if (path === "/api/worlds") {
+          return {
+            worlds: [
+              {
+                world_id: "world-salt",
+                title: "The Salt Marches",
+                description: "",
+                sections: {},
+                source_metadata: {},
+                content_rating: "pg-13",
+                scenario_count: 0
+              }
+            ]
+          };
+        }
         if (path === "/api/scenarios/draft/character-starters/generate") {
           return { id: "job-starters", type: "scenario_character_starters", status: "queued", result: null, error: null };
         }
@@ -14741,7 +14903,8 @@ describe("frontend helpers", () => {
         })
       ],
       count: 1,
-      custom_description: ""
+      custom_description: "",
+      persistent_world_id: "world-salt"
     });
 
     fireEvent.change(screen.getByLabelText("Premise"), {
@@ -14774,6 +14937,7 @@ describe("frontend helpers", () => {
         title: "Fog Gate",
         premise: "Edited while starter generation runs"
       },
+      persistent_world_id: "world-salt",
       character_starters: [
         expect.objectContaining({
           name: "Mara Voss",
@@ -17671,10 +17835,21 @@ describe("frontend helpers", () => {
       save_count: 0,
       has_generation_prompt: true,
       action_choices_enabled: false,
-      interaction_mode: "storyteller"
+      interaction_mode: "storyteller",
+      persistent_world_id: "world-fog",
+      persistent_world_title: "The Fog Meridian"
     });
     const definitionPayload = {
       active_save_id: null,
+      persistent_world: {
+        world_id: "world-fog",
+        title: "The Fog Meridian",
+        description: "",
+        sections: {},
+        source_metadata: {},
+        content_rating: "pg-13",
+        scenario_count: 1
+      },
       scenario: {
         scenario_id: "scenario-1",
         scenario_type: "full_roleplay",
@@ -17696,6 +17871,21 @@ describe("frontend helpers", () => {
       json: async () => {
         if (path.startsWith("/api/runtime")) return model;
         if (path === "/api/scenarios") return { scenarios: [scenario] };
+        if (path === "/api/worlds") {
+          return {
+            worlds: [
+              {
+                world_id: "world-fog",
+                title: "The Fog Meridian",
+                description: "",
+                sections: {},
+                source_metadata: {},
+                content_rating: "pg-13",
+                scenario_count: 1
+              }
+            ]
+          };
+        }
         if (path.startsWith("/api/jobs?status=active")) return { jobs: [] };
         if (path === "/api/settings/shell") return { pending_jobs_display_mode: "compact" };
         if (isSettingsReadPath(path)) return modelSettingsPayload();
@@ -17729,6 +17919,86 @@ describe("frontend helpers", () => {
       "true"
     );
     expect(screen.queryByLabelText("Action choices")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Persistent world")).toHaveValue("world-fog");
+  });
+
+  it("does not reuse a stale scenario-list world when the definition is standalone", async () => {
+    const model = runtimeModel({
+      saves: [{ save_id: "save-1", title: "Lantern Run", active: true }]
+    });
+    const scenario = scenarioFixture({
+      scenario_id: "scenario-1",
+      scenario_type: "full_roleplay",
+      title: "Fog Gate",
+      premise: "A gate in the fog.",
+      player_role: "Keeper",
+      save_count: 0,
+      has_generation_prompt: true,
+      persistent_world_id: "world-stale",
+      persistent_world_title: "Stale World"
+    });
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => {
+        if (path.startsWith("/api/runtime")) return model;
+        if (path === "/api/scenarios") return { scenarios: [scenario] };
+        if (path === "/api/worlds") {
+          return {
+            worlds: [
+              {
+                world_id: "world-stale",
+                title: "Stale World",
+                description: "",
+                sections: {},
+                source_metadata: {},
+                content_rating: "pg-13",
+                scenario_count: 1
+              }
+            ]
+          };
+        }
+        if (path.startsWith("/api/jobs?status=active")) return { jobs: [] };
+        if (path === "/api/settings/shell") return { pending_jobs_display_mode: "compact" };
+        if (isSettingsReadPath(path)) return modelSettingsPayload();
+        if (path.startsWith("/api/chat/submission-status")) {
+          return { save_id: "save-1", can_submit: true, reason: null, blocking_job_id: null, blocking_job_status: null };
+        }
+        if (path === "/api/scenarios/scenario-1/definition") {
+          return {
+            active_save_id: null,
+            persistent_world: null,
+            scenario: {
+              scenario_id: "scenario-1",
+              scenario_type: "full_roleplay",
+              title: "Fog Gate",
+              premise: "A gate in the fog.",
+              player_role: "Keeper",
+              generation_prompt: "A standalone fog gate.",
+              content_sections: [],
+              character_starters: []
+            }
+          };
+        }
+        return {};
+      }
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(await screen.findByRole("tab", { name: /Scenarios/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Reuse prompt for Fog Gate" }));
+
+    expect(await screen.findByRole("dialog", { name: "New scenario" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Scenario seed" })).toHaveValue(
+      "A standalone fog gate.",
+    );
+    expect(screen.getByLabelText("Persistent world")).toHaveValue("");
   });
 
   it("imports and exports reusable scenario bundles from the scenario library", async () => {

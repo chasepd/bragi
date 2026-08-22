@@ -406,6 +406,40 @@ def world_sections(world: PersistentWorldRecord) -> dict[str, str]:
     return normalize_world_sections(_json_object(world.content_json))
 
 
+def persistent_world_context_text(world: PersistentWorldRecord) -> str:
+    lines = [
+        "Established persistent world context:",
+        f"Title: {world.title.strip()}",
+    ]
+    description = world.description.strip()
+    if description:
+        lines.append(f"Description: {description}")
+    sections = world_sections(world)
+    ordered_ids = [
+        section_id
+        for section_id, _label, _prompt in WORLD_SECTION_DEFINITIONS
+        if section_id in sections
+    ]
+    ordered_id_set = set(ordered_ids)
+    ordered_ids.extend(
+        section_id
+        for section_id in sorted(sections)
+        if section_id not in ordered_id_set
+    )
+    for section_id in ordered_ids:
+        label = _persistent_world_section_label(section_id)
+        lines.append(f"{label}: {sections[section_id]}")
+    return "\n".join(lines)
+
+
+def _persistent_world_section_label(section_id: str) -> str:
+    try:
+        label, _prompt = _section_definition(section_id)
+    except ValueError:
+        return section_id.replace("_", " ").title()
+    return label
+
+
 def _section_definition(section_id: str) -> tuple[str, str]:
     for candidate_id, label, prompt in WORLD_SECTION_DEFINITIONS:
         if candidate_id == section_id:
