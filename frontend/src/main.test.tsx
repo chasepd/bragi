@@ -8719,6 +8719,146 @@ describe("frontend helpers", () => {
     expect(await screen.findByText("The direct result arrives.")).toBeInTheDocument();
   });
 
+  it("unblocks a completed chat when its job watcher misses the terminal event", async () => {
+    const sources = installEventSourceDouble();
+    const createdJob: Job = {
+      id: "job-terminal-missed",
+      type: "chat_turn",
+      save_id: "save-1",
+      status: "running",
+      result: null,
+      error: null,
+      created_at: 1
+    };
+    const nextJob: Job = {
+      ...createdJob,
+      id: "job-after-terminal",
+    };
+    const initialModel = runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "opening", role: "narrator", speaker_name: null, body: "The beacon waits.", actions: [] }
+        ]
+      }
+    });
+    const completedModel = runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "opening", role: "narrator", speaker_name: null, body: "The beacon waits.", actions: [] },
+          { message_id: "player-1", role: "player", speaker_name: "Keeper", body: "Light the beacon.", actions: [] },
+          { message_id: "narrator-1", role: "narrator", speaker_name: null, body: "The bell answers.", actions: [] }
+        ]
+      }
+    });
+    let model = initialModel;
+    const baseFetch = workbenchFetch([], initialModel);
+    let chatRequests = 0;
+    let runtimeRequests = 0;
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/chat") {
+        const job = chatRequests === 0 ? createdJob : nextJob;
+        chatRequests += 1;
+        return Promise.resolve({ ok: true, json: async () => job });
+      }
+      if (path.startsWith("/api/runtime")) {
+        runtimeRequests += 1;
+        return Promise.resolve({ ok: true, json: async () => model });
+      }
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    const textarea = await screen.findByRole("textbox", { name: "Message" });
+    await userEvent.type(textarea, "Light the beacon.");
+    fireEvent.submit(textarea.closest("form") as HTMLFormElement);
+    const jobSource = await waitFor(() => {
+      const source = sources.find((source) => (
+        source.url === "/api/jobs/job-terminal-missed/events?save_id=save-1"
+      ));
+      expect(source).toBeTruthy();
+      return source!;
+    });
+    const saveSource = sources.find((source) => source.url === "/api/saves/save-1/events");
+    expect(saveSource).toBeTruthy();
+
+    model = completedModel;
+    act(() => {
+      saveSource?.dispatch("runtime_changed", {
+        event_id: 1,
+        save_id: "save-1",
+        type: "runtime_changed",
+        payload: { reason: "chat" }
+      });
+    });
+    expect(await screen.findByText("The bell answers.")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Narrator response progress" })).toBeInTheDocument();
+
+    act(() => {
+      saveSource?.dispatch("job_changed", {
+        event_id: 2,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: { job: { ...createdJob, status: "succeeded" } }
+      });
+    });
+
+    await waitFor(() => expect(
+      screen.queryByRole("status", { name: "Narrator response progress" })
+    ).not.toBeInTheDocument());
+    expect(jobSource.closed).toBe(true);
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    });
+
+    const nextTextarea = screen.getByRole("textbox", { name: "Message" });
+    expect(nextTextarea).toBeEnabled();
+    await userEvent.type(nextTextarea, "Tend the flame.");
+    fireEvent.submit(nextTextarea.closest("form") as HTMLFormElement);
+    expect(await screen.findByText("Tend the flame.")).toBeInTheDocument();
+    const runtimeRequestsBeforeDuplicateTerminal = runtimeRequests;
+
+    act(() => {
+      saveSource?.dispatch("job_changed", {
+        event_id: 3,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: { job: { ...createdJob, status: "succeeded" } }
+      });
+    });
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    });
+
+    expect(screen.getByText("Tend the flame.")).toBeInTheDocument();
+    expect(runtimeRequests).toBe(runtimeRequestsBeforeDuplicateTerminal);
+    act(() => {
+      jobSource.dispatch("runtime", initialModel);
+      jobSource.dispatch("chat_turn_delta", {
+        kind: "chat_turn_delta",
+        version: 1,
+        save_id: "save-1",
+        messages: [
+          { message_id: "late-narrator", role: "narrator", speaker_name: null, body: "Late old response.", actions: [] }
+        ]
+      });
+      jobSource.dispatch("done", {
+        ...createdJob,
+        status: "succeeded",
+        result: initialModel,
+      });
+    });
+
+    expect(screen.getByText("Tend the flame.")).toBeInTheDocument();
+    expect(screen.queryByText("Late old response.")).not.toBeInTheDocument();
+  });
+
   it("starts a switched save with fresh chronicle scroll state at the latest message", async () => {
     installEventSourceDouble();
     vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(1200);
