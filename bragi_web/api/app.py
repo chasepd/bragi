@@ -6855,6 +6855,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         request: Request,
         state: StateDep,
         save_id: str | None = None,
+        after_event_id: int | None = None,
     ) -> StreamingResponse:
         try:
             async with state.lock.async_access():
@@ -6863,14 +6864,24 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             observe("web.sse.unknown_job", level="error", job_id=job_id)
             raise
         observe("web.sse.opened", job_id=job_id, job_type=record.type)
+        latest_event_id = record.event_offset + len(record.events)
+        header_event_id = request.headers.get("last-event-id")
+        last_event_id = (
+            _save_event_cursor_from_header(
+                header_event_id,
+                latest_event_id=latest_event_id,
+            )
+            if header_event_id is not None
+            else _event_cursor_from_query(
+                after_event_id,
+                latest_event_id=latest_event_id,
+            )
+        )
         return StreamingResponse(
             _event_stream(
                 state,
                 job_id,
-                last_event_id=_save_event_cursor_from_header(
-                    request.headers.get("last-event-id"),
-                    latest_event_id=record.event_offset + len(record.events),
-                ),
+                last_event_id=last_event_id,
                 current_user=_current_request_user(),
                 current_user_role=_current_request_role(state),
             ),
@@ -11862,6 +11873,16 @@ def _save_event_cursor_from_header(
     if event_id < 0 or event_id > latest_event_id:
         return 0
     return event_id
+
+
+def _event_cursor_from_query(
+    value: int | None,
+    *,
+    latest_event_id: int,
+) -> int:
+    if value is None or value < 0 or value > latest_event_id:
+        return 0
+    return value
 
 
 async def _save_event_stream(

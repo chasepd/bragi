@@ -565,6 +565,7 @@ def _save_event_job_summary(record: JobRecord) -> dict[str, object]:
         "created_at": record.created_at,
         "updated_at": record.updated_at,
         "latest_progress": latest_progress,
+        "event_cursor": record.event_offset + len(record.events),
     }
 
 

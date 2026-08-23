@@ -8522,6 +8522,203 @@ describe("frontend helpers", () => {
     expect(screen.queryByText("Late Save A done.")).not.toBeInTheDocument();
   });
 
+  it("keeps a loaded save authoritative while recovering an active job", async () => {
+    const sources = installEventSourceDouble();
+    let model = runtimeModel({
+      saves: [
+        { save_id: "save-1", title: "Lantern Keep", active: true },
+        { save_id: "save-2", title: "Signal Tower", active: false }
+      ],
+      chronicle: {
+        messages: [
+          { message_id: "save-1-message", role: "narrator", speaker_name: null, body: "Save A text.", actions: [] }
+        ]
+      }
+    });
+    const saveTwoMessages = Array.from({ length: 100 }, (_, index) => ({
+      message_id: `save-2-message-${index + 1}`,
+      role: "narrator" as const,
+      speaker_name: null,
+      body: `Save B text ${index + 1}.`,
+      actions: []
+    }));
+    const saveTwo = runtimeModel({
+      active_save_id: "save-2",
+      active_save_title: "Signal Tower",
+      saves: [
+        { save_id: "save-1", title: "Lantern Keep", active: false },
+        { save_id: "save-2", title: "Signal Tower", active: true }
+      ],
+      chronicle: { messages: saveTwoMessages }
+    });
+    const staleSaveTwo = runtimeModel({
+      ...saveTwo,
+      chronicle: { messages: saveTwoMessages.slice(0, 96) }
+    });
+    let activeJobs: Job[] = [{
+      id: "job-save-2",
+      type: "chat_turn",
+      save_id: "save-2",
+      status: "running",
+      result: null,
+      error: null,
+      created_at: 1,
+      latest_progress: { label: "Finishing the recovered turn" },
+      event_cursor: 7
+    }];
+    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
+      ok: true,
+      json: async () => {
+        if (path.startsWith("/api/runtime")) return model;
+        if (path === "/api/scenarios") return { scenarios: [] };
+        if (path.startsWith("/api/jobs?status=active")) return { jobs: activeJobs };
+        if (path === "/api/settings") return modelSettingsPayload();
+        if (path.startsWith("/api/chat/submission-status")) return {
+          save_id: model.active_save_id,
+          can_submit: true,
+          reason: null,
+          blocking_job_id: null,
+          blocking_job_status: null
+        };
+        if (path === "/api/saves/save-2/load") {
+          model = saveTwo;
+          return saveTwo;
+        }
+        return {};
+      }
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(screen.getByText("Save A text.")).toBeInTheDocument());
+    await userEvent.click(await screen.findByRole("button", { name: "Load Signal Tower" }));
+
+    await waitFor(() => expect(screen.getByText("Save B text 100.")).toBeInTheDocument());
+    expect(await screen.findByLabelText("Pending jobs")).toHaveTextContent("Finishing the recovered turn");
+    const jobSource = await waitFor(() => {
+      const source = sources.find((item) => item.url.startsWith("/api/jobs/job-save-2/events"));
+      expect(source).toBeTruthy();
+      return source!;
+    });
+    expect(jobSource.url).toContain("save_id=save-2");
+    expect(jobSource.url).toContain("after_event_id=7");
+
+    act(() => {
+      jobSource.dispatch("runtime", runtimeModel({
+        active_save_id: "save-1",
+        active_save_title: "Lantern Keep",
+        chronicle: {
+          messages: [
+            { message_id: "wrong-save", role: "narrator", speaker_name: null, body: "Wrong save event.", actions: [] }
+          ]
+        }
+      }));
+      jobSource.dispatch("chat_turn_delta", {
+        kind: "chat_turn_delta",
+        version: 1,
+        save_id: "save-2",
+        messages: [
+          { message_id: "save-2-message-101", role: "narrator", speaker_name: null, body: "Save B live text 101.", actions: [] }
+        ]
+      });
+    });
+
+    expect(screen.getByText("Save B text 100.")).toBeInTheDocument();
+    expect(screen.queryByText("Wrong save event.")).not.toBeInTheDocument();
+    expect(await screen.findByText("Save B live text 101.")).toBeInTheDocument();
+
+    activeJobs = [];
+    act(() => {
+      jobSource.dispatch("done", {
+        id: "job-save-2",
+        type: "chat_turn",
+        save_id: "save-2",
+        status: "succeeded",
+        result: staleSaveTwo,
+        error: null
+      });
+    });
+
+    expect(screen.getByText("Save B text 100.")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByLabelText("Pending jobs")).not.toBeInTheDocument());
+  });
+
+  it("keeps direct job result handling when the active-jobs query later discovers it", async () => {
+    const sources = installEventSourceDouble();
+    const createdJob: Job = {
+      id: "job-direct",
+      type: "chat_turn",
+      save_id: "save-1",
+      status: "running",
+      result: null,
+      error: null,
+      created_at: 1
+    };
+    const initialModel = runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "opening", role: "narrator", speaker_name: null, body: "The beacon waits.", actions: [] }
+        ]
+      }
+    });
+    const completedModel = runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "direct-result", role: "narrator", speaker_name: null, body: "The direct result arrives.", actions: [] }
+        ]
+      }
+    });
+    const baseFetch = workbenchFetch([], initialModel);
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/chat") {
+        return Promise.resolve({ ok: true, json: async () => createdJob });
+      }
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    const textarea = await screen.findByRole("textbox", { name: "Message" });
+    await userEvent.type(textarea, "Light the beacon.");
+    fireEvent.submit(textarea.closest("form") as HTMLFormElement);
+    const jobSource = await waitFor(() => {
+      const source = sources.find((item) => item.url === "/api/jobs/job-direct/events?save_id=save-1");
+      expect(source).toBeTruthy();
+      return source!;
+    });
+    const saveSource = sources.find((item) => item.url === "/api/saves/save-1/events");
+    expect(saveSource).toBeTruthy();
+
+    act(() => {
+      saveSource?.dispatch("job_changed", {
+        event_id: 1,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: { job: { ...createdJob, event_cursor: 2 } }
+      });
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    act(() => {
+      jobSource.dispatch("done", { ...createdJob, status: "succeeded", result: completedModel });
+    });
+
+    expect(await screen.findByText("The direct result arrives.")).toBeInTheDocument();
+  });
+
   it("starts a switched save with fresh chronicle scroll state at the latest message", async () => {
     installEventSourceDouble();
     vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(1200);
@@ -16826,7 +17023,8 @@ describe("frontend helpers", () => {
       save_id: "save-1",
       status: "queued",
       result: null,
-      error: null
+      error: null,
+      event_cursor: 4
     } satisfies Job;
     const initialModel = runtimeModel({
       saves: [
@@ -16854,10 +17052,10 @@ describe("frontend helpers", () => {
     );
 
     await waitFor(() => expect(
-      sources.some((source) => source.url === "/api/jobs/job-opening-choices/events?save_id=save-1")
+      sources.some((source) => source.url === "/api/jobs/job-opening-choices/events?save_id=save-1&after_event_id=4")
     ).toBe(true));
     const jobSource = sources.find(
-      (source) => source.url === "/api/jobs/job-opening-choices/events?save_id=save-1"
+      (source) => source.url === "/api/jobs/job-opening-choices/events?save_id=save-1&after_event_id=4"
     );
     act(() => {
       client.setQueriesData<RuntimeModel>(
@@ -16872,14 +17070,16 @@ describe("frontend helpers", () => {
       );
     });
     expect(jobSource?.closed).toBe(false);
+    const completedModel = runtimeModel({
+      ...initialModel,
+      action_choices: cyoaActionChoices()
+    });
     act(() => {
+      jobSource?.dispatch("runtime", completedModel);
       jobSource?.dispatch("done", {
         ...generationJob,
         status: "succeeded",
-        result: runtimeModel({
-          ...initialModel,
-          action_choices: cyoaActionChoices()
-        })
+        result: initialModel
       });
     });
 
