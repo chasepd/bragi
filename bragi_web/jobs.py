@@ -879,6 +879,7 @@ def job_summary(record: JobRecord) -> dict[str, Any]:
         "created_at": record.created_at,
         "updated_at": record.updated_at,
         "latest_progress": _latest_progress_event(record),
+        "event_cursor": record.event_offset + len(record.events),
     }
 
 

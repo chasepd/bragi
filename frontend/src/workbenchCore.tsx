@@ -243,6 +243,8 @@ type SettingsSummaryModel = {
 type RunJobOptions = {
   applyResult?: boolean;
   clearPendingMessages?: boolean;
+  resumeFromEventCursor?: number;
+  recovered?: boolean;
   paintStartedAtMs?: number;
   onSucceeded?: (result: unknown) => void;
   onFailed?: (error: string, job: Job) => void;
@@ -379,6 +381,7 @@ function jobFromSaveEvent(event: SaveEvent): Job | null {
     created_at: typeof record.created_at === "number" ? record.created_at : undefined,
     updated_at: typeof record.updated_at === "number" ? record.updated_at : undefined,
     latest_progress: record.latest_progress ?? null,
+    event_cursor: typeof record.event_cursor === "number" ? record.event_cursor : undefined,
   };
 }
 
@@ -2705,6 +2708,24 @@ function jobBelongsToActiveSave(job: Job, activeSaveId: string | null) {
   return job.save_id === undefined || job.save_id === null || job.save_id === activeSaveId;
 }
 
+function runtimeEventBelongsToWatchedJob(
+  runtime: RuntimeModel,
+  job: Job,
+  activeSaveId: string | null,
+) {
+  return runtime.active_save_id === activeSaveId
+    && (job.save_id === undefined || job.save_id === null || runtime.active_save_id === job.save_id);
+}
+
+function chatTurnDeltaBelongsToWatchedJob(
+  delta: ChatTurnDelta,
+  job: Job,
+  activeSaveId: string | null,
+) {
+  return delta.save_id === activeSaveId
+    && (job.save_id === undefined || job.save_id === null || delta.save_id === job.save_id);
+}
+
 function worldTimeLabel(worldTime: RuntimeWorldTime | null | undefined): string {
   const display = worldTime?.display?.trim();
   if (display) return display;
@@ -3338,7 +3359,22 @@ function Workbench({
   }, [onLayoutPointerMove, resizingSide, stopLayoutResize]);
 
   const runJob = useCallback<RunJob>((created, requestedOptions) => {
+    if (!jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
+      delete jobRunOptionsRef.current[created.id];
+      return () => undefined;
+    }
     const priorOptions = jobRunOptionsRef.current[created.id];
+    if (jobWatchers.current[created.id]) {
+      if (requestedOptions && !requestedOptions.recovered) {
+        jobRunOptionsRef.current[created.id] = {
+          ...priorOptions,
+          ...requestedOptions,
+          applyResult: requestedOptions.applyResult ?? true,
+          recovered: false,
+        };
+      }
+      return jobWatchers.current[created.id];
+    }
     const options = requestedOptions
       ? { ...priorOptions, ...requestedOptions }
       : priorOptions ?? { applyResult: true };
@@ -3363,11 +3399,6 @@ function Workbench({
         startedAtMs: activeOptions.paintStartedAtMs,
       });
     };
-    if (!jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
-      delete jobRunOptionsRef.current[created.id];
-      return () => undefined;
-    }
-    if (jobWatchers.current[created.id]) return jobWatchers.current[created.id];
     if (created.status !== "queued" && created.status !== "running") {
       const activeOptions = currentOptions();
       if (created.status === "succeeded") {
@@ -3482,13 +3513,21 @@ function Workbench({
         if (done.type === "model_refresh") client.invalidateQueries({ queryKey: ["settings"] });
       },
       (name, data) => {
-        if (name === "runtime" && isRuntimeModel(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
+        if (
+          name === "runtime"
+          && isRuntimeModel(data)
+          && runtimeEventBelongsToWatchedJob(data, created, activeSaveIdRef.current)
+        ) {
           setPendingMessage(null);
           applyRuntimeModel(data);
           requestNarratorPaint(data);
           client.invalidateQueries({ queryKey: ["chat", "submission-status", data.active_save_id ?? activeSaveIdRef.current] });
         }
-        if (name === "chat_turn_delta" && isChatTurnDelta(data) && jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
+        if (
+          name === "chat_turn_delta"
+          && isChatTurnDelta(data)
+          && chatTurnDeltaBelongsToWatchedJob(data, created, activeSaveIdRef.current)
+        ) {
           setPendingMessage(null);
           setNarratorDrafts((current) => {
             if (!(created.id in current)) return current;
@@ -3538,7 +3577,8 @@ function Workbench({
           });
         }
       },
-      created.save_id ?? null
+      created.save_id ?? null,
+      currentOptions().resumeFromEventCursor
     );
     jobWatchers.current[created.id] = stop;
     return stop;
@@ -3579,11 +3619,12 @@ function Workbench({
 
   useEffect(() => {
     for (const active of activeJobs.data?.jobs ?? []) {
-      if (["character_text_send", "character_text_message_edit", "character_text_edit", "character_text_delete"].includes(active.type)) {
-        runJob(active, { applyResult: false, clearPendingMessages: false });
-        continue;
-      }
-      runJob(active);
+      runJob(active, {
+        applyResult: false,
+        clearPendingMessages: false,
+        resumeFromEventCursor: active.event_cursor,
+        recovered: true,
+      });
     }
   }, [activeJobs.data?.jobs, runJob]);
 
@@ -3595,10 +3636,16 @@ function Workbench({
     ) {
       return;
     }
-    runJob(openingActionChoiceJob);
+    runJob(openingActionChoiceJob, {
+      applyResult: false,
+      clearPendingMessages: false,
+      resumeFromEventCursor: openingActionChoiceJob.event_cursor,
+      recovered: true,
+    });
   }, [
     openingActionChoiceJob?.id,
     openingActionChoiceJob?.status,
+    openingActionChoiceJob?.event_cursor,
     runJob
   ]);
 

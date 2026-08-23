@@ -69,6 +69,7 @@ from bragi_web.jobs import (
     JobRegistry,
     JobRegistryFullError,
     JobRegistryLimits,
+    job_summary,
 )
 from bragi_web.observability import clear_recent_events, recent_events
 from bragi_web.runtime import (
@@ -7143,6 +7144,20 @@ def test_job_event_stream_resumes_after_last_event_id(tmp_path: Path) -> None:
     asyncio.run(run_test())
 
 
+def test_job_summary_includes_current_event_cursor() -> None:
+    record = JobRecord(
+        id="job-cursor",
+        type="chat_turn",
+        event_offset=4,
+        events=[
+            {"event": "progress", "payload": {"step": 5}},
+            {"event": "progress", "payload": {"step": 6}},
+        ],
+    )
+
+    assert job_summary(record)["event_cursor"] == 6
+
+
 def test_job_event_stream_emits_heartbeat_while_idle(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
@@ -7585,6 +7600,81 @@ def test_event_stream_routes_disable_buffering_and_job_route_resumes(
         assert response.status_code == 200
         assert response.headers["cache-control"] == "no-cache"
         assert response.headers["x-accel-buffering"] == "no"
+
+
+def test_job_events_route_starts_after_initial_event_cursor(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = _state_double(tmp_path)
+    running = JobRecord(
+        id="job-cursor",
+        type="chat_turn",
+        status="running",
+        events=[
+            {"event": "progress", "payload": {"step": step}}
+            for step in range(1, 4)
+        ],
+    )
+    state.jobs._jobs = {running.id: running}  # noqa: SLF001 - controlled fixture
+    seen: list[int] = []
+
+    async def stream_double(
+        _stream_state: WebAppState,
+        _job_id: str,
+        last_event_id: int = 0,
+        **_kwargs: object,
+    ) -> AsyncGenerator[str, None]:
+        seen.append(last_event_id)
+        yield "event: done\ndata: {}\n\n"
+
+    monkeypatch.setattr(api_app, "_event_stream", stream_double)
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.get("/api/jobs/job-cursor/events?after_event_id=2")
+        reconnect = client.get(
+            "/api/jobs/job-cursor/events?after_event_id=2",
+            headers={"Last-Event-ID": "3"},
+        )
+
+    assert response.status_code == 200
+    assert reconnect.status_code == 200
+    assert seen == [2, 3]
+
+
+def test_job_event_stream_skips_prior_events_and_emits_later_terminal_events(
+    tmp_path: Path,
+) -> None:
+    async def run_test() -> None:
+        state = _state_double(tmp_path)
+        succeeded = JobRecord(
+            id="job-future",
+            type="chat_turn",
+            status="succeeded",
+            events=[
+                {"event": "runtime", "payload": {"message": 96}},
+                {"event": "progress", "payload": {"step": 97}},
+                {"event": "status", "payload": {"status": "succeeded"}},
+            ],
+        )
+        state.jobs._jobs = {succeeded.id: succeeded}  # noqa: SLF001 - controlled fixture
+
+        chunks = [
+            chunk
+            async for chunk in api_app._event_stream(  # noqa: SLF001
+                cast(WebAppState, state),
+                succeeded.id,
+                last_event_id=2,
+            )
+        ]
+
+        assert any("id: 3" in chunk and '"succeeded"' in chunk for chunk in chunks)
+        event_chunks = [chunk for chunk in chunks if "event: done" not in chunk]
+        assert '"message": 96' not in repr(event_chunks)
+        assert '"step": 97' not in repr(event_chunks)
+        assert any("event: done" in chunk for chunk in chunks)
+
+    asyncio.run(run_test())
 
 
 def test_save_event_last_event_id_header_parser_falls_back_safely() -> None:

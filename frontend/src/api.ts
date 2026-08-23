@@ -965,6 +965,7 @@ export type Job = {
   created_at?: number;
   updated_at?: number;
   latest_progress?: unknown | null;
+  event_cursor?: number;
 };
 export type PostTurnCatchupStatus = "waiting" | "succeeded" | "failed" | "retry_pending" | "cancelled";
 export type PostTurnCatchupProgress = {
@@ -1309,8 +1310,16 @@ function setHeader(headers: Record<string, string>, name: string, value: string)
   headers[name] = value;
 }
 
-function jobApiPath(jobId: string, saveId: string | null | undefined, suffix = "") {
-  const query = saveId ? `?save_id=${encodeURIComponent(saveId)}` : "";
+function jobApiPath(
+  jobId: string,
+  saveId: string | null | undefined,
+  suffix = "",
+  afterEventId?: number
+) {
+  const params = new URLSearchParams();
+  if (saveId) params.set("save_id", saveId);
+  if (afterEventId !== undefined) params.set("after_event_id", String(afterEventId));
+  const query = params.toString() ? `?${params.toString()}` : "";
   return `/api/jobs/${encodeURIComponent(jobId)}${suffix}${query}`;
 }
 
@@ -1440,7 +1449,8 @@ export function watchJob(
   jobId: string,
   onUpdate: (job: Job) => void,
   onEvent?: (name: string, data: unknown) => void,
-  saveId?: string | null
+  saveId?: string | null,
+  afterEventId?: number
 ) {
   let closed = false;
   let events: EventSource | undefined;
@@ -1510,7 +1520,7 @@ export function watchJob(
     fallbackController.fail();
     return closeWatcher;
   }
-  events = new EventSource(jobApiPath(jobId, saveId, "/events"));
+  events = new EventSource(jobApiPath(jobId, saveId, "/events", afterEventId));
   events.onopen = fallbackController.contact;
   events.addEventListener("heartbeat", fallbackController.contact);
   events.addEventListener("done", (event) => {
