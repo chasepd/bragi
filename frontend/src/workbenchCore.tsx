@@ -3118,6 +3118,7 @@ function Workbench({
       const currentJobs = client.getQueryData<{ jobs: Job[] }>(queryKey)?.jobs ?? [];
       const existing = currentJobs.find((job) => job.id === changedJob.id);
       const terminal = ["succeeded", "failed", "cancelled"].includes(changedJob.status);
+      let stoppedWatcher = false;
       void client.cancelQueries({ queryKey, exact: true });
       client.setQueryData<{ jobs: Job[] }>(queryKey, (current) => {
         const jobs = current?.jobs ?? [];
@@ -3131,6 +3132,29 @@ function Workbench({
             : [...jobs, changedJob],
         };
       });
+      if (terminal) {
+        stoppedWatcher = Object.prototype.hasOwnProperty.call(jobWatchers.current, changedJob.id);
+        if (stoppedWatcher) jobWatchers.current[changedJob.id]();
+        delete jobWatchers.current[changedJob.id];
+        delete jobRunOptionsRef.current[changedJob.id];
+        setTrackedJobs((current) => {
+          if (!(changedJob.id in current)) return current;
+          const next = { ...current };
+          delete next[changedJob.id];
+          return next;
+        });
+        setNarratorDrafts((current) => {
+          if (!(changedJob.id in current)) return current;
+          const next = { ...current };
+          delete next[changedJob.id];
+          return next;
+        });
+        if (stoppedWatcher && isChatJobType(changedJob.type)) {
+          setPendingMessage((current) => (
+            current?.pending_save_id === saveId ? null : current
+          ));
+        }
+      }
       if (!terminal) {
         setTrackedJobs((current) => {
           const tracked = current[changedJob.id];
@@ -3142,7 +3166,12 @@ function Workbench({
         });
       }
       if (terminal || (!existing && isChatJobType(changedJob.type))) {
-        queueWorkbenchRefresh(saveId, ["jobs-active", "chat-status"]);
+        queueWorkbenchRefresh(
+          saveId,
+          terminal && stoppedWatcher && isChatJobType(changedJob.type)
+            ? ["runtime", "jobs-active", "chat-status"]
+            : ["jobs-active", "chat-status"],
+        );
       }
       if (terminal && mediaChangingJob(changedJob)) {
         queueWorkbenchRefresh(saveId, ["media"]);
@@ -3513,6 +3542,7 @@ function Workbench({
         if (done.type === "model_refresh") client.invalidateQueries({ queryKey: ["settings"] });
       },
       (name, data) => {
+        if (jobWatchers.current[created.id] !== stop) return;
         if (
           name === "runtime"
           && isRuntimeModel(data)
