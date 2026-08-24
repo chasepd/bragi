@@ -32,6 +32,8 @@ from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_SETTING,
     PLAN_FIRST_NARRATOR_DEFAULT,
     PLAN_FIRST_NARRATOR_SETTING,
+    RESPONSE_CHECKING_ENABLED_SETTING,
+    response_checking_enabled,
 )
 from bragi.services.character_action_planning_service import (
     CHARACTER_ACTION_PLANNING_ENABLED_DEFAULT,
@@ -610,6 +612,7 @@ class SettingsModel:
     character_text_proactive_random_cooldown: NumberControl | None
     post_turn_inference_mode: ChoiceControl | None
     npc_knowledge_audit_mode: ChoiceControl | None
+    response_checking: ToggleControl | None
     generated_text_script_guard_mode: ChoiceControl | None
     generated_phrase_denylist: TextControl | None
     save_generated_phrase_denylist: TextControl | None
@@ -696,6 +699,7 @@ class SaveSettingsModel:
     character_text_proactive_random_cooldown: NumberControl | None
     post_turn_inference_mode: ChoiceControl | None
     npc_knowledge_audit_mode: ChoiceControl | None
+    response_checking: ToggleControl | None
     generated_text_script_guard_mode: ChoiceControl | None
     generated_phrase_denylist: TextControl | None
     save_generated_phrase_denylist: TextControl | None
@@ -901,6 +905,7 @@ def build_save_settings_model(
         ),
         post_turn_inference_mode=settings.post_turn_inference_mode,
         npc_knowledge_audit_mode=settings.npc_knowledge_audit_mode,
+        response_checking=settings.response_checking,
         generated_text_script_guard_mode=settings.generated_text_script_guard_mode,
         generated_phrase_denylist=settings.generated_phrase_denylist,
         save_generated_phrase_denylist=settings.save_generated_phrase_denylist,
@@ -1266,6 +1271,15 @@ def _build_settings_model(
                 save_id=active_save_id,
             ),
             options=NPC_KNOWLEDGE_AUDIT_MODE_OPTIONS,
+        )
+        if save_controls_visible
+        else None,
+        response_checking=ToggleControl(
+            setting_key=RESPONSE_CHECKING_ENABLED_SETTING,
+            enabled=response_checking_enabled(
+                repositories,
+                save_id=active_save_id,
+            ),
         )
         if save_controls_visible
         else None,

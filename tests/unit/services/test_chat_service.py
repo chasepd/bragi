@@ -64,6 +64,7 @@ from bragi.services import chat_service as chat_service_module
 from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_SETTING,
     PLAN_FIRST_NARRATOR_SETTING,
+    RESPONSE_CHECKING_ENABLED_SETTING,
     RESPONSE_VERIFICATION_MODE_RETRY_ONCE,
     RESPONSE_VERIFICATION_MODE_SETTING,
     CurationResult,
@@ -4611,6 +4612,78 @@ def test_submit_player_turn_retries_typed_narrator_quality_finding(
             "context_quote": "The gate remains sealed.",
         }
     ]
+
+
+def test_submit_player_turn_skips_response_checkers_when_disabled_for_save(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"starting_scene": "The beacon gutters in the tower."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_app_setting(AGENTIC_CONTEXT_PIPELINE_SETTING, True)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=RESPONSE_CHECKING_ENABLED_SETTING,
+        value=False,
+    )
+    repositories.set_model_preference(
+        task="chat",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    provider = SequenceChatProvider("fake", ("Mara steps through the sealed gate.",))
+    spec = NarratorMessageSpec(
+        intent="Resolve Mara's attempt to cross the gate.",
+        thesis="The sealed gate blocks the crossing.",
+        must_say=(),
+        avoid=(),
+        tone="tense and grounded",
+        uncertainties=(),
+        evidence_source_ids=("scene:gate",),
+    )
+    verifier = ScriptedNarratorVerifier(
+        NarratorVerificationResult(
+            passed=True,
+            quality_findings=(
+                NarratorQualityFinding(
+                    category="spatial_continuity",
+                    reason="The supplied scene says the gate is sealed.",
+                    narrator_quote="Mara steps through the sealed gate.",
+                    context_quote="The gate remains sealed.",
+                ),
+            ),
+        )
+    )
+    service = ChatService(
+        repositories=repositories,
+        providers={"fake": provider},
+        context_search_service=ScriptedContextSearch(ContextSearchResult()),
+        narrator_planner=ScriptedNarratorPlanner(spec),
+        narrator_verifier=verifier,
+    )
+
+    result = asyncio.run(
+        service.submit_player_turn(
+            save_id=save.id,
+            body="I try to walk through the sealed gate.",
+            speaker_name="Mara",
+            run_post_turn_jobs=False,
+        )
+    )
+
+    assert verifier.calls == []
+    assert result.narrator_message.body == "Mara steps through the sealed gate."
+    job_result = _chat_completion_jobs(repositories, save.id)[-1]["result"]
+    assert job_result["narrator_verifier_skipped"] == "save_disabled"
+    assert job_result["npc_knowledge_audit"]["skipped_reason"] == (
+        "response_checking_disabled"
+    )
 
 
 def test_narrator_quality_retry_feedback_includes_every_typed_finding() -> None:

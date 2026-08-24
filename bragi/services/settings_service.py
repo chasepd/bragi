@@ -45,6 +45,7 @@ from bragi.retry_policy import (
 from bragi.services.agentic_context import (
     PLAN_FIRST_NARRATOR_DEFAULT,
     PLAN_FIRST_NARRATOR_SETTING,
+    RESPONSE_CHECKING_ENABLED_SETTING,
 )
 from bragi.services.character_action_planning_service import (
     CHARACTER_ACTION_PLANNING_ENABLED_DEFAULT,
@@ -751,6 +752,8 @@ class SettingsService:
             value = sanitize_content_rating(value)
         elif key == FADE_TO_BLACK_ENABLED_SETTING and not isinstance(value, bool):
             raise ValueError("Fade to black setting must be boolean")
+        elif key == RESPONSE_CHECKING_ENABLED_SETTING and not isinstance(value, bool):
+            raise ValueError("Response checking setting must be boolean")
         elif key == SCRIPT_GUARD_MODE_SETTING:
             value = sanitize_script_guard_mode(value)
         elif key in {

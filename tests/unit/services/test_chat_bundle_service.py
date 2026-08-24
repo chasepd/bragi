@@ -20,6 +20,7 @@ from bragi.persistence.repositories import (
     canonical_claim_fingerprint,
 )
 from bragi.services import chat_bundle_service as chat_bundle_module
+from bragi.services.agentic_context import RESPONSE_CHECKING_ENABLED_SETTING
 from bragi.services.chat_bundle_service import (
     _coalesce_import_context_sources,
     _coalesce_import_entity_links,
@@ -538,6 +539,12 @@ def test_export_save_writes_manifest_data_and_referenced_media(
 ) -> None:
     media_dir = tmp_path / "media"
     save = _seed_bundle_save(repositories, media_dir)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=RESPONSE_CHECKING_ENABLED_SETTING,
+        value=False,
+    )
     _replace_seed_scenario_update_content(
         repositories,
         _legacy_character_list_update_content(),
@@ -600,6 +607,11 @@ def test_export_save_writes_manifest_data_and_referenced_media(
             },
             {
                 "scope": "save",
+                "key": RESPONSE_CHECKING_ENABLED_SETTING,
+                "value_json": "false",
+            },
+            {
+                "scope": "save",
                 "key": SCENARIO_EVOLUTION_TURN_INTERVAL_SETTING,
                 "value_json": "3",
             },
@@ -627,6 +639,13 @@ def test_export_save_writes_manifest_data_and_referenced_media(
         assert curation_state["terminal_outcome"] == "accepted"
         assert curation_state["lease_token"] is None
         assert curation_state["lease_until"] is None
+
+    imported = service.import_save(bundle_path)
+    assert repositories.get_scoped_setting(
+        scope="save",
+        scope_id=_imported_save_id(imported),
+        key=RESPONSE_CHECKING_ENABLED_SETTING,
+    ) is False
 
 
 def test_chat_bundle_round_trips_linked_persistent_world(
