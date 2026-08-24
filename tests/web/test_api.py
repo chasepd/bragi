@@ -1639,6 +1639,9 @@ def test_child_role_can_read_chat_and_generate_media_but_cannot_mutate_save(
             save_id=assigned_save.id,
         )
         exported = client.get(f"/api/bundles/export?save_id={assigned_save.id}")
+        story_log = client.get(
+            f"/api/story-logs/export?save_id={assigned_save.id}"
+        )
         guidance = client.post(
             "/api/runtime/custom-instructions",
             json={
@@ -1740,6 +1743,7 @@ def test_child_role_can_read_chat_and_generate_media_but_cannot_mutate_save(
     assert reference_regeneration.status_code == 403
     for response in (
         exported,
+        story_log,
         guidance,
         presence_edit,
         suggestion_review,
@@ -19606,3 +19610,107 @@ def test_bundle_export_deletes_temp_file_after_success_error_and_exception(
             assert response.json()["detail"] == detail
         assert runtime.export_path is not None
         assert not runtime.export_path.exists()
+
+
+def test_story_log_export_returns_visible_chronicle_messages_as_plain_text(
+    tmp_path: Path,
+) -> None:
+    state = _repository_state_double(tmp_path)
+    scenario = state.repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower at the edge of a storm sea.",
+        player_role="Keeper",
+        content={},
+    )
+    save = state.repositories.create_save(
+        scenario_id=scenario.id,
+        title="Lantern Run",
+    )
+    state.repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I climb the beacon stairs.",
+    )
+    state.repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name=api_app.STORY_CONTINUATION_SPEAKER_NAME,
+        body=api_app.STORY_CONTINUATION_DIRECTION,
+    )
+    state.repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The wind tears at the lantern room.",
+    )
+    state.repositories.append_message(
+        save_id=save.id,
+        role="system",
+        speaker_name="Timeskip",
+        body="Three nights pass beneath the storm.",
+    )
+    deleted = state.repositories.append_message(
+        save_id=save.id,
+        role="system",
+        speaker_name=None,
+        body="Deleted system message.",
+    )
+    state.repositories.archive_message(deleted.id)
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.get(f"/api/story-logs/export?save_id={save.id}")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/plain; charset=utf-8"
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="bragi-story-log.txt"'
+    )
+    assert response.content == (
+        b"Mara:\nI climb the beacon stairs.\n\n"
+        b"Narrator:\nThe wind tears at the lantern room.\n\n"
+        b"Timeskip:\nThree nights pass beneath the storm.\n"
+    )
+    assert api_app.STORY_CONTINUATION_DIRECTION.encode() not in response.content
+    assert b"Deleted system message." not in response.content
+
+
+def test_story_log_export_requires_access_to_the_requested_save(
+    tmp_path: Path,
+) -> None:
+    state = _auth_state(tmp_path)
+    state.auth_service().create_user(
+        username="Mira",
+        password="correct horse",
+        role="user",
+    )
+    rook = state.auth_service().create_user(
+        username="Rook",
+        password="correct horse",
+        role="user",
+    )
+    rook_save = _create_auth_save(
+        state.repositories,
+        title="Rook's Chronicle",
+        owner_user_id=rook.id,
+    )
+    state.repositories.append_message(
+        save_id=rook_save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Private chronicle text.",
+    )
+
+    with TestClient(
+        create_app(cast(WebAppState, state)),
+        authenticate=False,
+    ) as client:
+        assert client.post(
+            "/api/auth/login",
+            json={"username": "Mira", "password": "correct horse"},
+        ).status_code == 200
+        response = client.get(f"/api/story-logs/export?save_id={rook_save.id}")
+
+    assert response.status_code == 404
+    assert b"Private chronicle text." not in response.content

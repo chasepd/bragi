@@ -18530,6 +18530,9 @@ describe("frontend helpers", () => {
     await userEvent.click(screen.getByRole("button", { name: "Export active save" }));
     expect(openMock).toHaveBeenCalledWith("/api/bundles/export?save_id=save-1", "_blank", "noopener,noreferrer");
 
+    await userEvent.click(screen.getByRole("button", { name: "Export story log" }));
+    expect(openMock).toHaveBeenCalledWith("/api/story-logs/export?save_id=save-1", "_blank", "noopener,noreferrer");
+
     const file = new File(["save"], "save.bragi-chat", { type: "application/octet-stream" });
     await userEvent.upload(screen.getByLabelText("Save bundle file"), file);
     expect(await screen.findByRole("dialog", { name: "Import save bundle?" })).toBeInTheDocument();

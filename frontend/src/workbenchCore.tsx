@@ -7667,6 +7667,9 @@ function SaveBundleControls({
   const exportPath = activeSaveId
     ? `/api/bundles/export?save_id=${encodeURIComponent(activeSaveId)}`
     : "/api/bundles/export";
+  const storyLogPath = activeSaveId
+    ? `/api/story-logs/export?save_id=${encodeURIComponent(activeSaveId)}`
+    : "/api/story-logs/export";
   return (
     <div className="command-row save-bundle-actions">
       <button
@@ -7676,6 +7679,14 @@ function SaveBundleControls({
         onClick={() => openDownloadInNewTab(exportPath)}
       >
         <Download size={14} /> Export
+      </button>
+      <button
+        title="Export active save story log"
+        aria-label="Export story log"
+        disabled={!hasActiveSave}
+        onClick={() => openDownloadInNewTab(storyLogPath)}
+      >
+        <FileText size={14} /> Story log
       </button>
       <SaveBundleUpload onImported={onImported} />
     </div>

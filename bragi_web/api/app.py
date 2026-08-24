@@ -11,7 +11,7 @@ import os
 import secrets
 import socket
 import sqlite3
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass, replace
@@ -55,6 +55,7 @@ from bragi_common.media_mime import safe_served_media_mime_type
 from bragi_common.story_continuation import (
     STORY_CONTINUATION_DIRECTION,
     STORY_CONTINUATION_SPEAKER_NAME,
+    is_story_continuation_message,
 )
 from bragi_web.auth_throttle import AuthAttemptThrottle
 from bragi_web.bragi_adapter import (
@@ -6700,6 +6701,40 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             bundle_path.unlink(missing_ok=True)
             raise
 
+    @app.get("/api/story-logs/export")
+    def export_story_log(
+        state: StateDep,
+        save_id: str | None = None,
+    ) -> StreamingResponse:
+        with state.lock:
+            resolved_save_id = _resolve_runtime_save_id(state, save_id)
+            if resolved_save_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=_SAVE_ID_REQUIRED_DETAIL,
+                )
+            _raise_unless_save_action_allowed(state, resolved_save_id, "export")
+            get_save = getattr(state.repositories, "get_save", None)
+            save = get_save(resolved_save_id) if callable(get_save) else None
+            get_scenario = getattr(state.repositories, "get_scenario", None)
+            scenario = (
+                get_scenario(save.scenario_id)
+                if save is not None and callable(get_scenario)
+                else None
+            )
+            _raise_unless_persistent_world_allowed(
+                state,
+                scenario.persistent_world_id if scenario is not None else None,
+            )
+            messages = state.repositories.list_messages(resolved_save_id)
+        return StreamingResponse(
+            iter((_story_log_text(messages),)),
+            media_type="text/plain",
+            headers={
+                "Content-Disposition": 'attachment; filename="bragi-story-log.txt"'
+            },
+        )
+
     @app.get("/api/jobs")
     def list_jobs(
         state: StateDep,
@@ -7499,6 +7534,26 @@ def _raise_unless_import_export_allowed(state: WebAppState) -> None:
     user = _save_access_user(state)
     if user is not None and user.role == "child":
         raise HTTPException(status_code=403, detail="Import/export is not allowed")
+
+
+def _story_log_text(messages: Iterable[object]) -> str:
+    entries = [
+        f"{_story_log_speaker_label(message)}:\n{getattr(message, 'body', '')}"
+        for message in messages
+        if not is_story_continuation_message(message)
+    ]
+    return "\n\n".join(entries) + ("\n" if entries else "")
+
+
+def _story_log_speaker_label(message: object) -> str:
+    role = getattr(message, "role", "")
+    speaker_name = getattr(message, "speaker_name", None)
+    if isinstance(speaker_name, str) and speaker_name.strip():
+        return speaker_name.strip()
+    return {"player": "Player", "narrator": "Narrator", "system": "System"}.get(
+        role,
+        "Message",
+    )
 
 
 def _raise_if_retired_scenario_request(
