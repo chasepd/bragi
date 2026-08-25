@@ -19,6 +19,7 @@ from bragi.retry_policy import PROVIDER_CALL_DEADLINE_SETTING, RETRY_COUNT_SETTI
 from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_SETTING,
     PLAN_FIRST_NARRATOR_SETTING,
+    RESPONSE_CHECKING_ENABLED_SETTING,
 )
 from bragi.services.character_action_planning_service import (
     CHARACTER_ACTION_PLANNING_ENABLED_SETTING,
@@ -2707,6 +2708,12 @@ def test_settings_model_exposes_summarization_and_image_controls(
         NPC_KNOWLEDGE_AUDIT_MODE_SOFT_FAIL,
         NPC_KNOWLEDGE_AUDIT_MODE_HARD_FAIL,
     ]
+
+    response_checking = _value(model, "response_checking")
+    assert _value(response_checking, "setting_key") == (
+        RESPONSE_CHECKING_ENABLED_SETTING
+    )
+    assert _value(response_checking, "enabled") is True
 
     generated_phrase_denylist = _value(model, "generated_phrase_denylist")
     assert _value(generated_phrase_denylist, "setting_key") == (

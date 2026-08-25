@@ -66,6 +66,8 @@ AGENTIC_CONTEXT_PIPELINE_DEFAULT = True
 AGENTIC_CONTEXT_PIPELINE_SETTING = "agentic_context_pipeline_enabled"
 PLAN_FIRST_NARRATOR_DEFAULT = True
 PLAN_FIRST_NARRATOR_SETTING = "plan_first_narrator_enabled"
+RESPONSE_CHECKING_ENABLED_DEFAULT = True
+RESPONSE_CHECKING_ENABLED_SETTING = "response_checking_enabled"
 RESPONSE_VERIFICATION_MODE_SETTING = "response_verification_mode"
 NARRATOR_QUALITY_FINDING_CATEGORIES = (
     "spatial_continuity",
@@ -1898,6 +1900,20 @@ def plan_first_narrator_enabled(
     if value is None:
         return PLAN_FIRST_NARRATOR_DEFAULT
     return bool(value)
+
+
+def response_checking_enabled(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str | None = None,
+) -> bool:
+    value = repositories.get_effective_setting(
+        RESPONSE_CHECKING_ENABLED_SETTING,
+        save_id=save_id,
+    )
+    if value is None:
+        return RESPONSE_CHECKING_ENABLED_DEFAULT
+    return value if isinstance(value, bool) else RESPONSE_CHECKING_ENABLED_DEFAULT
 
 
 def response_verification_mode(

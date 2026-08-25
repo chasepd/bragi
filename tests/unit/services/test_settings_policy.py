@@ -1,4 +1,5 @@
 from bragi.retry_policy import PROVIDER_CALL_DEADLINE_SETTING, RETRY_COUNT_SETTING
+from bragi.services.agentic_context import RESPONSE_CHECKING_ENABLED_SETTING
 from bragi.services.character_text_service import (
     CHARACTER_TEXT_PROACTIVE_RANDOM_CHANCE_SETTING,
     CHARACTER_TEXT_PROACTIVE_RANDOM_COOLDOWN_SETTING,
@@ -116,3 +117,14 @@ def test_turn_responsiveness_mode_is_save_scoped_for_adults_only() -> None:
     assert role_can_write_scoped_setting("admin", TURN_RESPONSIVENESS_MODE_SETTING)
     assert role_can_write_scoped_setting("user", TURN_RESPONSIVENESS_MODE_SETTING)
     assert not role_can_write_scoped_setting("child", TURN_RESPONSIVENESS_MODE_SETTING)
+
+
+def test_response_checking_is_save_scoped_for_adults_only() -> None:
+    policy = scoped_setting_policy(RESPONSE_CHECKING_ENABLED_SETTING)
+
+    assert policy.scope == "save"
+    assert policy.admin_only is False
+    assert policy.child_allowed is False
+    assert role_can_write_scoped_setting("admin", RESPONSE_CHECKING_ENABLED_SETTING)
+    assert role_can_write_scoped_setting("user", RESPONSE_CHECKING_ENABLED_SETTING)
+    assert not role_can_write_scoped_setting("child", RESPONSE_CHECKING_ENABLED_SETTING)

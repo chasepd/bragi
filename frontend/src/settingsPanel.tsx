@@ -2573,6 +2573,10 @@ function SaveSettingsControls({
         </section>
       ) : null}
       <section className="settings-subsection">
+        <h3>Response Checking</h3>
+        {settings.response_checking ? <ToggleSetting control={settings.response_checking} disabled={saveDisabled} updateLocal={updateLocal} /> : null}
+      </section>
+      <section className="settings-subsection">
         <h3>Media Automation</h3>
         {settings.automatic_image_generation ? <ToggleSetting control={settings.automatic_image_generation} disabled={saveDisabled} updateLocal={updateLocal} /> : null}
         {settings.automatic_media_mode ? <ChoiceSetting control={settings.automatic_media_mode} disabled={saveDisabled} updateLocal={updateLocal} /> : null}

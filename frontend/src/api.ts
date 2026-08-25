@@ -476,6 +476,7 @@ export type SettingsModel = {
   character_text_proactive_random_cooldown?: NumberControl;
   post_turn_inference_mode?: ChoiceControl;
   npc_knowledge_audit_mode?: ChoiceControl;
+  response_checking?: ToggleControl;
   generated_text_script_guard_mode?: ChoiceControl;
   generated_phrase_denylist?: TextControl;
   save_generated_phrase_denylist?: TextControl;

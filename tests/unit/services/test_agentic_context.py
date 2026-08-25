@@ -28,6 +28,7 @@ from bragi.services import agentic_context as agentic_context_module
 from bragi.services.agentic_context import (
     AGENTIC_CONTEXT_PIPELINE_SETTING,
     PLAN_FIRST_NARRATOR_SETTING,
+    RESPONSE_CHECKING_ENABLED_SETTING,
     RESPONSE_VERIFICATION_MODE_DIAGNOSTIC,
     RESPONSE_VERIFICATION_MODE_RETRY,
     RESPONSE_VERIFICATION_MODE_RETRY_ONCE,
@@ -52,6 +53,7 @@ from bragi.services.agentic_context import (
     format_narrator_message_spec,
     narration_evidence_source_ids,
     plan_first_narrator_enabled,
+    response_checking_enabled,
     response_verification_mode,
 )
 from bragi.services.npc_knowledge_audit_service import NpcKnowledgeLeak
@@ -172,6 +174,20 @@ def test_response_verification_retries_by_default(
         response_verification_mode(repositories, save_id=save.id)
         == RESPONSE_VERIFICATION_MODE_RETRY
     )
+
+
+def test_response_checking_can_be_disabled_per_save(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _seed_save(repositories)
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save.id,
+        key=RESPONSE_CHECKING_ENABLED_SETTING,
+        value=False,
+    )
+
+    assert response_checking_enabled(repositories, save_id=save.id) is False
 
 
 def test_response_verification_preserves_diagnostic_opt_out(

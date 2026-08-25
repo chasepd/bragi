@@ -20638,6 +20638,7 @@ describe("frontend helpers", () => {
       character_action_planning: { setting_key: "character_action_planning_enabled", enabled: true },
       character_action_planning_max_concurrency: { setting_key: "character_action_planning_max_concurrency", value: 20, minimum: 1, maximum: 20, step: 1 },
       npc_knowledge_audit_mode: { setting_key: "npc_knowledge_audit_mode", selected: "soft_fail", options: ["soft_fail", "hard_fail"] },
+      response_checking: { setting_key: "response_checking_enabled", enabled: true },
       generated_phrase_denylist: { setting_key: "generated_phrase_denylist", value: "That's not nothing" },
       save_generated_phrase_denylist: { setting_key: "save_generated_phrase_denylist", value: "save-only phrase" },
       chat_fallback: { setting_key: "chat_fallback_enabled", enabled: false },
@@ -20759,6 +20760,20 @@ describe("frontend helpers", () => {
     expect(auditMode.closest("label")).toHaveAttribute("title", expect.stringContaining("audit findings"));
     expect(within(auditMode).getByRole("option", { name: "Soft fail" })).toBeInTheDocument();
     expect(within(auditMode).getByRole("option", { name: "Hard fail" })).toBeInTheDocument();
+    const responseChecking = screen.getByLabelText("Response Checking");
+    expect(responseChecking.closest("label")).toHaveAttribute("title", expect.stringContaining("narrator verification"));
+    await userEvent.click(responseChecking);
+    await waitFor(() => expect(fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .some(([, options]) => JSON.parse(String(options.body)).key === "response_checking_enabled")).toBe(true));
+    const responseCheckingCall = fetchMock.mock.calls
+      .filter(([path]) => path === "/api/settings/scoped")
+      .find(([, options]) => JSON.parse(String(options.body)).key === "response_checking_enabled");
+    expect(JSON.parse(String(responseCheckingCall?.[1].body))).toEqual({
+      key: "response_checking_enabled",
+      value: false,
+      save_id: "save-1"
+    });
     const globalPhraseDenylist = screen.getByRole("textbox", { name: "Global Phrase Denylist" });
     expect(globalPhraseDenylist).toHaveValue("That's not nothing");
     const savePhraseDenylist = screen.getByRole("textbox", { name: "Save Phrase Denylist" });

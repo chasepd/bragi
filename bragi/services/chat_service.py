@@ -91,6 +91,7 @@ from bragi.services.agentic_context import (
     format_narrator_message_spec,
     narration_evidence_source_ids,
     plan_first_narrator_enabled,
+    response_checking_enabled,
     response_verification_mode,
 )
 from bragi.services.character_action_planning_service import (
@@ -3033,8 +3034,23 @@ class ChatService:
             )
             raise ValueError(error)
         turn_progress.publish("narrator", "succeeded", "Narrator response ready")
-        turn_progress.publish("response_checks", "running", "Checking response")
-        if context_result.responsive_fast_path_used:
+        checking_enabled = response_checking_enabled(
+            self.repositories,
+            save_id=save_id,
+        )
+        turn_progress.publish(
+            "response_checks",
+            "running",
+            "Checking response" if checking_enabled else "Response checking disabled",
+        )
+        if not checking_enabled:
+            verification_diagnostics = _NarratorVerificationTurnResult(
+                diagnostics={
+                    "response_checking_enabled": False,
+                    "narrator_verifier_skipped": "save_disabled",
+                }
+            )
+        elif context_result.responsive_fast_path_used:
             verification_diagnostics = _NarratorVerificationTurnResult(
                 diagnostics={
                     "narrator_verifier_skipped": "responsive_fast_path",
@@ -3060,7 +3076,19 @@ class ChatService:
             completion = verification_diagnostics.retry_completion
             response = verification_diagnostics.retry_response or response
             narrator_body = verification_diagnostics.retry_body or narrator_body
-        if context_result.responsive_fast_path_used:
+        if not checking_enabled:
+            audit_result = _NpcKnowledgeAuditTurnResult(
+                completion=completion,
+                response=response,
+                narrator_body=narrator_body,
+                diagnostics={
+                    "npc_knowledge_audit": {
+                        "enabled": False,
+                        "skipped_reason": "response_checking_disabled",
+                    }
+                },
+            )
+        elif context_result.responsive_fast_path_used:
             audit_result = _NpcKnowledgeAuditTurnResult(
                 completion=completion,
                 response=response,
@@ -3319,7 +3347,9 @@ class ChatService:
         turn_progress.publish(
             "response_checks",
             "succeeded",
-            "Response checks complete",
+            "Response checks complete"
+            if checking_enabled
+            else "Response checking disabled",
         )
         if buffered_streaming and narrator_stream_callback is not None:
             narrator_stream_callback(narrator_body)
