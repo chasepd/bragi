@@ -77,6 +77,7 @@ from bragi_web.jobs import (
     JobRegistryExclusiveKeyError,
     JobRegistryFullError,
     JobWorker,
+    PublicJobError,
     job_event_payload,
     job_summary,
 )
@@ -108,6 +109,8 @@ _MEDIA_CACHE_CONTROL = "private, max-age=31536000, immutable"
 _STATIC_CACHE_CONTROL = "public, max-age=86400"
 _SPA_CACHE_CONTROL = "no-cache"
 _SSE_HEARTBEAT_SECONDS = 15.0
+_SAVE_EXPORT_FILE_TTL_SECONDS = 60 * 60
+_SAVE_EXPORT_FILE_PREFIX = "bragi-export-"
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 _COMPRESSIBLE_STATIC_SUFFIXES = frozenset({".css", ".js"})
 _DIAGNOSTIC_CATEGORIES = frozenset(
@@ -490,6 +493,11 @@ class ContinueStoryRequest(BaseModel):
 
 class SaveScopedRequest(BaseModel):
     save_id: str | None = None
+
+
+class BundleExportRequest(BaseModel):
+    save_id: str | None = None
+    include_revision_history: bool = False
 
 
 class WorldTimeUpdateRequest(SaveScopedRequest):
@@ -6639,67 +6647,131 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             bundle_path.unlink(missing_ok=True)
             raise
 
-    @app.get("/api/bundles/export")
-    def export_bundle(
+    @app.post("/api/bundles/export")
+    async def start_bundle_export(
+        payload: BundleExportRequest,
         state: StateDep,
-        include_revision_history: bool = False,
-        save_id: str | None = None,
-    ) -> FileResponse:
-        bundle_path = state.paths.temp_dir / f"bragi-export-{uuid4().hex}.bragi-chat"
-        try:
-            with state.lock:
-                resolved_save_id = _resolve_runtime_save_id(state, save_id)
-                if resolved_save_id is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=_SAVE_ID_REQUIRED_DETAIL,
-                    )
-                _raise_unless_save_action_allowed(state, resolved_save_id, "export")
-                get_save = getattr(state.repositories, "get_save", None)
-                save = get_save(resolved_save_id) if callable(get_save) else None
-                get_scenario = getattr(state.repositories, "get_scenario", None)
-                scenario = (
-                    get_scenario(save.scenario_id)
-                    if save is not None and callable(get_scenario)
-                    else None
+    ) -> dict[str, Any]:
+        _prune_save_export_files(state)
+        async with state.lock.async_access():
+            _raise_unless_import_export_allowed(state)
+            resolved_save_id = _resolve_runtime_save_id(state, payload.save_id)
+            if resolved_save_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=_SAVE_ID_REQUIRED_DETAIL,
                 )
-                _raise_unless_persistent_world_allowed(
-                    state,
-                    scenario.persistent_world_id if scenario is not None else None,
-                )
-                kwargs: dict[str, Any] = {}
-                if _call_accepts_keyword(
-                    state.runtime.export_active_save,
-                    "active_save_id",
-                ):
-                    kwargs["active_save_id"] = resolved_save_id
-                if _call_accepts_keyword(
-                    state.runtime.export_active_save,
-                    "include_message_revisions",
-                ):
-                    kwargs["include_message_revisions"] = include_revision_history
-                if kwargs:
-                    model = state.runtime.export_active_save(
-                        bundle_path,
-                        **kwargs,
-                    )
-                else:
-                    model = state.runtime.export_active_save(bundle_path)
-            error = _runtime_model_error(model)
-            if error:
-                raise HTTPException(status_code=400, detail=error)
-            return FileResponse(
-                bundle_path,
-                media_type="application/octet-stream",
-                filename=bundle_path.name,
-                background=BackgroundTask(_unlink_file, bundle_path),
+            _raise_unless_save_action_allowed(state, resolved_save_id, "export")
+            get_save = getattr(state.repositories, "get_save", None)
+            save = get_save(resolved_save_id) if callable(get_save) else None
+            get_scenario = getattr(state.repositories, "get_scenario", None)
+            scenario = (
+                get_scenario(save.scenario_id)
+                if save is not None and callable(get_scenario)
+                else None
             )
-        except HTTPException:
-            bundle_path.unlink(missing_ok=True)
-            raise
+            _raise_unless_persistent_world_allowed(
+                state,
+                scenario.persistent_world_id if scenario is not None else None,
+            )
+
+        job_id = uuid4().hex
+        bundle_path = _save_export_bundle_path(state, job_id)
+
+        def export_sync() -> object:
+            kwargs: dict[str, Any] = {}
+            if _call_accepts_keyword(
+                state.runtime.export_active_save,
+                "active_save_id",
+            ):
+                kwargs["active_save_id"] = resolved_save_id
+            if _call_accepts_keyword(
+                state.runtime.export_active_save,
+                "include_message_revisions",
+            ):
+                kwargs["include_message_revisions"] = (
+                    payload.include_revision_history
+                )
+            if kwargs:
+                return state.runtime.export_active_save(bundle_path, **kwargs)
+            return state.runtime.export_active_save(bundle_path)
+
+        async def worker(handle: JobHandle) -> dict[str, object]:
+            await handle.event("progress", {"label": "Preparing save export"})
+            export_task = asyncio.create_task(asyncio.to_thread(export_sync))
+            try:
+                model = await asyncio.shield(export_task)
+                error = _runtime_model_error(model)
+                if error:
+                    raise PublicJobError(error)
+                if not bundle_path.is_file():
+                    raise PublicJobError("Save export did not produce a bundle")
+                await handle.event("progress", {"label": "Save export ready"})
+                return {
+                    "kind": "chat_bundle_export",
+                    "filename": bundle_path.name,
+                    "download_url": (
+                        f"/api/bundles/export/{job_id}/download"
+                        f"?save_id={resolved_save_id}"
+                    ),
+                }
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.shield(export_task)
+                finally:
+                    bundle_path.unlink(missing_ok=True)
+                raise
+            except Exception:
+                bundle_path.unlink(missing_ok=True)
+                raise
+
+        try:
+            return await _create_job_summary(
+                state,
+                "chat_bundle_export",
+                worker,
+                save_id=resolved_save_id,
+                exclusive_key=f"chat_bundle_export:{resolved_save_id}",
+                job_id=job_id,
+            )
         except Exception:
             bundle_path.unlink(missing_ok=True)
             raise
+
+    @app.get("/api/bundles/export/{job_id}/download")
+    def download_bundle_export(
+        job_id: str,
+        state: StateDep,
+        save_id: str | None = None,
+    ) -> FileResponse:
+        _prune_save_export_files(state)
+        with state.lock:
+            _raise_unless_import_export_allowed(state)
+            record = _job_for_save_or_404(state, job_id, save_id)
+            if record.type != "chat_bundle_export":
+                raise HTTPException(status_code=404, detail="Unknown job")
+            if record.status in ACTIVE_JOB_STATUSES:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Save export is not ready",
+                )
+            if record.status != "succeeded":
+                raise HTTPException(
+                    status_code=400,
+                    detail=(job_summary(record).get("error") or "Save export failed"),
+                )
+            bundle_path = _save_export_bundle_path(state, job_id)
+            if not bundle_path.is_file():
+                raise HTTPException(
+                    status_code=404,
+                    detail="Save export is no longer available",
+                )
+        return FileResponse(
+            bundle_path,
+            media_type="application/octet-stream",
+            filename=bundle_path.name,
+            background=BackgroundTask(_unlink_file, bundle_path),
+        )
 
     @app.get("/api/story-logs/export")
     def export_story_log(
@@ -9872,6 +9944,7 @@ async def _create_job_summary(
     exclusive_key: str | None = None,
     operation_queue_key: str | None = None,
     lock_runtime: bool | None = None,
+    job_id: str | None = None,
 ) -> dict[str, Any]:
     should_lock_runtime = lock_runtime if lock_runtime is not None else save_id is None
     guarded_worker = (
@@ -9887,6 +9960,7 @@ async def _create_job_summary(
                 creator_user_id=_owner_user_id_for_request(state),
                 exclusive_key=exclusive_key,
                 operation_queue_key=operation_queue_key,
+                job_id=job_id,
             ),
         )
     except JobRegistryExclusiveKeyError as exc:
@@ -12167,6 +12241,33 @@ def _prune_persistent_world_bundle_previews(state: WebAppState) -> None:
         for preview_id, preview in oldest[:excess_count]:
             _discard_persistent_world_bundle_preview(state, preview_id, preview)
     _prune_retained_bundle_preview_bytes(state)
+
+
+def _save_export_bundle_path(state: WebAppState, job_id: str) -> Path:
+    try:
+        normalized_job_id = UUID(job_id).hex
+    except (AttributeError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail="Unknown job") from exc
+    return (
+        state.paths.temp_dir
+        / f"{_SAVE_EXPORT_FILE_PREFIX}{normalized_job_id}.bragi-chat"
+    )
+
+
+def _prune_save_export_files(state: WebAppState) -> None:
+    temp_dir = state.paths.temp_dir
+    cutoff = time() - _SAVE_EXPORT_FILE_TTL_SECONDS
+    patterns = (
+        f"{_SAVE_EXPORT_FILE_PREFIX}*.bragi-chat",
+        f".{_SAVE_EXPORT_FILE_PREFIX}*.bragi-chat.*.tmp",
+    )
+    for pattern in patterns:
+        for path in temp_dir.glob(pattern):
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                continue
 
 
 def _prune_retained_bundle_preview_bytes(state: WebAppState) -> None:

@@ -73,6 +73,7 @@ import {
   ChatTurnDelta,
   ChatHistoryMessage,
   ChatHistoryModel,
+  ChatBundleExportResult,
   ChronicleModel,
   ChronicleMessage,
   deleteJson,
@@ -248,6 +249,9 @@ type RunJobOptions = {
   paintStartedAtMs?: number;
   onSucceeded?: (result: unknown) => void;
   onFailed?: (error: string, job: Job) => void;
+  onFinished?: (job: Job) => void;
+  allowCrossSaveCompletion?: boolean;
+  allowInactiveSave?: boolean;
 };
 type RunJob = (job: Job, options?: RunJobOptions) => () => void;
 type JobActionRequest = {
@@ -1203,6 +1207,28 @@ const THREAD_LOCK_FIELDS = [
 
 function openDownloadInNewTab(url: string) {
   window.open(url, "_blank", "noopener,noreferrer");
+}
+
+function reserveDownloadWindow(): Window | null {
+  const downloadWindow = window.open("about:blank", "_blank");
+  if (downloadWindow) downloadWindow.opener = null;
+  return downloadWindow;
+}
+
+function triggerReservedDownload(url: string, downloadWindow: Window | null) {
+  if (downloadWindow && !downloadWindow.closed) {
+    downloadWindow.location.href = url;
+    return;
+  }
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "";
+  link.rel = "noopener noreferrer";
+  link.click();
+}
+
+function closeReservedDownloadWindow(downloadWindow: Window | null) {
+  if (downloadWindow && !downloadWindow.closed) downloadWindow.close();
 }
 
 const SCENARIO_CORE_SECTION_IDS = new Set(["title", "premise", "setup_line", "starting_scene", "player_character_name", "player_role", "character_starters"]);
@@ -3390,7 +3416,10 @@ function Workbench({
   }, [onLayoutPointerMove, resizingSide, stopLayoutResize]);
 
   const runJob = useCallback<RunJob>((created, requestedOptions) => {
-    if (!jobBelongsToActiveSave(created, activeSaveIdRef.current)) {
+    if (
+      !jobBelongsToActiveSave(created, activeSaveIdRef.current)
+      && requestedOptions?.allowInactiveSave !== true
+    ) {
       delete jobRunOptionsRef.current[created.id];
       return () => undefined;
     }
@@ -3439,6 +3468,7 @@ function Workbench({
       if (created.status === "failed") {
         activeOptions.onFailed?.(created.error || "Background job failed.", created);
       }
+      activeOptions.onFinished?.(created);
       if (activeOptions.clearPendingMessages !== false) setPendingMessage(null);
       delete jobRunOptionsRef.current[created.id];
       refreshWorkbench(
@@ -3488,7 +3518,12 @@ function Workbench({
         if (appliesToCurrentSave && done.status === "succeeded") {
           applyCharacterTextJobResult(client, done.result, done.save_id ?? activeSaveIdRef.current);
         }
-        if (appliesToCurrentSave && done.status === "succeeded") activeOptions.onSucceeded?.(done.result);
+        const canCompleteAcrossSaves = (
+          appliesToCurrentSave || activeOptions.allowCrossSaveCompletion === true
+        );
+        if (canCompleteAcrossSaves && done.status === "succeeded") {
+          activeOptions.onSucceeded?.(done.result);
+        }
         const isActionChoiceJob = (
           done.type === "action_choice_generate"
           || done.type === "action_choice_regenerate"
@@ -3518,13 +3553,14 @@ function Workbench({
               : current
           );
         }
-        if (appliesToCurrentSave && done.status === "failed") {
+        if (canCompleteAcrossSaves && done.status === "failed") {
           const error = done.error || "Background job failed.";
-          if (isActionChoiceJob) {
+          if (appliesToCurrentSave && isActionChoiceJob) {
             appliedRuntimeResult = true;
           }
           activeOptions.onFailed?.(error, done);
         }
+        if (canCompleteAcrossSaves) activeOptions.onFinished?.(done);
         if (appliesToCurrentSave) {
           if (activeOptions.clearPendingMessages !== false) {
             setPendingMessage(null);
@@ -3685,7 +3721,10 @@ function Workbench({
     setTrackedJobs((current) => {
       const next: Record<string, TrackedJob> = {};
       for (const [jobId, tracked] of Object.entries(current)) {
-        if (jobBelongsToActiveSave(tracked.job, activeSaveId)) {
+        if (
+          jobBelongsToActiveSave(tracked.job, activeSaveId)
+          || jobRunOptionsRef.current[jobId]?.allowCrossSaveCompletion === true
+        ) {
           next[jobId] = tracked;
           continue;
         }
@@ -3842,6 +3881,7 @@ function Workbench({
             setPanel={setPanel}
             compactLibrary={isStackedDesktopWorkbench}
             onOpenLibrary={() => setMobileSheet("library")}
+            runJob={runJob}
           />
           {!isStackedWorkbench ? (
             <WorkbenchResizeHandle
@@ -4037,6 +4077,7 @@ function Workbench({
             onContinuationDraft={startContinuationDraft}
             onReuseScenarioPrompt={reuseScenarioPrompt}
             onAfterAction={closeMobileSheet}
+            runJob={runJob}
           />
         </MobileSheet>
       ) : null}
@@ -4121,6 +4162,7 @@ function LeftRail(props: {
   setPanel: (panel: PanelName) => void;
   compactLibrary?: boolean;
   onOpenLibrary?: () => void;
+  runJob?: RunJob;
 }) {
   return (
     <aside className={`left-rail ${props.compactLibrary ? "compact-library-rail" : ""}`}>
@@ -4151,6 +4193,7 @@ function LeftRail(props: {
           onNew={props.onNew}
           onContinuationDraft={props.onContinuationDraft}
           onReuseScenarioPrompt={props.onReuseScenarioPrompt}
+          runJob={props.runJob}
         />
       )}
       <PanelNav activePanel={props.activePanel} setPanel={props.setPanel} />
@@ -4171,6 +4214,7 @@ function LibraryControls(props: {
   onContinuationDraft?: (chapterStartInstructions: string) => Promise<void>;
   onReuseScenarioPrompt?: (scenario: Scenario) => Promise<void>;
   onAfterAction?: () => void;
+  runJob?: RunJob;
 }) {
   const [confirm, setConfirm] = useState<{ kind: "save" | "scenario"; id: string; title: string } | null>(null);
   const [renamingSave, setRenamingSave] = useState<SaveListItem | null>(null);
@@ -4179,6 +4223,7 @@ function LibraryControls(props: {
   const [chapterDialogOpen, setChapterDialogOpen] = useState(false);
   const [scenarioReuseError, setScenarioReuseError] = useState("");
   const [reusingScenarioId, setReusingScenarioId] = useState("");
+  const [saveExportStates, setSaveExportStates] = useState<Record<string, string>>({});
   const libraryUserId = props.currentUser?.id ?? null;
   const [scopedLibraryState, setScopedLibraryState] = useState<ScopedLibraryControlsState>(() => ({
     userId: libraryUserId,
@@ -4431,6 +4476,7 @@ function LibraryControls(props: {
                   props.onChanged();
                   props.onAfterAction?.();
                 }}
+                runJob={props.runJob}
               />
             ) : null}
             <button
@@ -4523,14 +4569,86 @@ function LibraryControls(props: {
                           <TouchActionContents icon={<Edit3 size={14} />} label="Rename" />
                         </button>
                       ) : (
-                        <button type="button" className={touchActionClassName()} title="Export save bundle" aria-label={`Export ${save.title}`} onClick={() => openDownloadInNewTab(`/api/bundles/export?save_id=${encodeURIComponent(save.save_id)}`)}>
-                          <TouchActionContents icon={<Download size={14} />} label="Export" />
+                        <button
+                          type="button"
+                          className={touchActionClassName()}
+                          title="Export save bundle"
+                          aria-label={`Export ${save.title}`}
+                          disabled={!props.runJob || saveExportStates[save.save_id] === "pending"}
+                          onClick={() => {
+                            if (!props.runJob) return;
+                            if (saveExportStates[save.save_id] === "pending") return;
+                            const downloadWindow = reserveDownloadWindow();
+                            setSaveExportStates((current) => ({
+                              ...current,
+                              [save.save_id]: "pending"
+                            }));
+                            void postJson<Job>("/api/bundles/export", {
+                              save_id: save.save_id,
+                              include_revision_history: false
+                            }).then((job) => {
+                              props.runJob?.(job, {
+                                allowInactiveSave: true,
+                                allowCrossSaveCompletion: true,
+                                onSucceeded: (result) => {
+                                  const downloadUrl = (
+                                    result as { download_url?: unknown }
+                                  ).download_url;
+                                  if (typeof downloadUrl === "string") {
+                                    triggerReservedDownload(downloadUrl, downloadWindow);
+                                    setSaveExportStates((current) => {
+                                      const next = { ...current };
+                                      delete next[save.save_id];
+                                      return next;
+                                    });
+                                  } else {
+                                    closeReservedDownloadWindow(downloadWindow);
+                                    setSaveExportStates((current) => ({
+                                      ...current,
+                                      [save.save_id]: "Save export completed without a download."
+                                    }));
+                                  }
+                                },
+                                onFailed: (error) => {
+                                  closeReservedDownloadWindow(downloadWindow);
+                                  setSaveExportStates((current) => ({
+                                    ...current,
+                                    [save.save_id]: error
+                                  }));
+                                },
+                                onFinished: (finished) => {
+                                  if (finished.status !== "cancelled") return;
+                                  closeReservedDownloadWindow(downloadWindow);
+                                  setSaveExportStates((current) => ({
+                                    ...current,
+                                    [save.save_id]: "Save export cancelled."
+                                  }));
+                                }
+                              });
+                            }, (failure) => {
+                              closeReservedDownloadWindow(downloadWindow);
+                              setSaveExportStates((current) => ({
+                                ...current,
+                                [save.save_id]: failure instanceof Error
+                                  ? failure.message
+                                  : "Could not start save export"
+                              }));
+                            });
+                          }}
+                        >
+                          <TouchActionContents
+                            icon={<Download size={14} />}
+                            label={saveExportStates[save.save_id] === "pending" ? "Exporting..." : "Export"}
+                          />
                         </button>
                       )}
                       <button type="button" className={touchActionClassName("destructive-action")} title="Delete save" aria-label={`Delete ${save.title}`} onClick={() => setConfirm({ kind: "save", id: save.save_id, title: save.title })}>
                         <TouchActionContents icon={<Trash2 size={14} />} label="Delete" />
                       </button>
                     </div>
+                  ) : null}
+                  {saveExportStates[save.save_id] && saveExportStates[save.save_id] !== "pending" ? (
+                    <small role="alert">{saveExportStates[save.save_id]}</small>
                   ) : null}
                 </div>
               ))}
@@ -7660,27 +7778,71 @@ function initialMediaDraftLabel(_scenarioType: string) {
 function SaveBundleControls({
   hasActiveSave,
   activeSaveId,
-  onImported
+  onImported,
+  runJob
 }: {
   hasActiveSave: boolean;
   activeSaveId: string | null;
   onImported: (saveId: string | null) => void;
+  runJob?: RunJob;
 }) {
-  const exportPath = activeSaveId
-    ? `/api/bundles/export?save_id=${encodeURIComponent(activeSaveId)}`
-    : "/api/bundles/export";
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
   const storyLogPath = activeSaveId
     ? `/api/story-logs/export?save_id=${encodeURIComponent(activeSaveId)}`
     : "/api/story-logs/export";
+  const startExport = async () => {
+    if (!runJob || !hasActiveSave || !activeSaveId || exporting) return;
+    const downloadWindow = reserveDownloadWindow();
+    setExporting(true);
+    setExportError("");
+    try {
+      const created = await postJson<Job>("/api/bundles/export", {
+        save_id: activeSaveId,
+        include_revision_history: false
+      });
+      runJob(created, {
+        allowInactiveSave: true,
+        allowCrossSaveCompletion: true,
+        onSucceeded: (result) => {
+          const exportResult = result as Partial<ChatBundleExportResult>;
+          if (
+            exportResult.kind !== "chat_bundle_export"
+            || typeof exportResult.download_url !== "string"
+          ) {
+            closeReservedDownloadWindow(downloadWindow);
+            setExportError("Save export completed without a download.");
+            return;
+          }
+          triggerReservedDownload(exportResult.download_url, downloadWindow);
+        },
+        onFailed: (error) => {
+          closeReservedDownloadWindow(downloadWindow);
+          setExportError(error);
+        },
+        onFinished: (job) => {
+          if (job.status === "cancelled") {
+            closeReservedDownloadWindow(downloadWindow);
+            setExportError("Save export cancelled.");
+          }
+          setExporting(false);
+        }
+      });
+    } catch (failure) {
+      closeReservedDownloadWindow(downloadWindow);
+      setExporting(false);
+      setExportError(failure instanceof Error ? failure.message : "Could not start save export");
+    }
+  };
   return (
     <div className="command-row save-bundle-actions">
       <button
         title="Export active save bundle"
         aria-label="Export active save"
-        disabled={!hasActiveSave}
-        onClick={() => openDownloadInNewTab(exportPath)}
+        disabled={!hasActiveSave || !runJob || exporting}
+        onClick={() => void startExport()}
       >
-        <Download size={14} /> Export
+        <Download size={14} /> {exporting ? "Exporting..." : "Export"}
       </button>
       <button
         title="Export active save story log"
@@ -7691,6 +7853,7 @@ function SaveBundleControls({
         <FileText size={14} /> Story log
       </button>
       <SaveBundleUpload onImported={onImported} />
+      {exportError ? <InlineNotice>{exportError}</InlineNotice> : null}
     </div>
   );
 }
@@ -10063,6 +10226,7 @@ function compactJobGroups(jobs: TrackedJob[]): { label: string; count: number }[
 function jobTypeLabel(type: string) {
   const labels: Record<string, string> = {
     chat_turn: "Chat turn",
+    chat_bundle_export: "Exporting save",
     look_around: "Looking around",
     chat_regenerate: "Regenerating message",
     action_choice_regenerate: "Regenerating options",

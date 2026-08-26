@@ -968,6 +968,11 @@ export type Job = {
   latest_progress?: unknown | null;
   event_cursor?: number;
 };
+export type ChatBundleExportResult = {
+  kind: "chat_bundle_export";
+  filename: string;
+  download_url: string;
+};
 export type PostTurnCatchupStatus = "waiting" | "succeeded" | "failed" | "retry_pending" | "cancelled";
 export type PostTurnCatchupProgress = {
   kind: "post_turn_catchup";

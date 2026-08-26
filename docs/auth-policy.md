@@ -218,7 +218,9 @@ or per user/session before using a save ID.
 | `/api/persistent-world-bundles/export/{world_id}` | Authenticated | Export a persistent world; child users are blocked by import/export policy. |
 | `/api/persistent-world-bundles/preview` | Authenticated | Preview persistent-world import; child users are blocked. |
 | `/api/persistent-world-bundles/import/{preview_id}` | User-scoped | Import only a persistent-world preview created by this user/session. |
-| `/api/bundles/export` | Save-scoped | Export only an accessible save; child blocked. |
+| `POST /api/bundles/export` | Save-scoped | Queue an export only for an accessible save; child blocked. |
+| `GET /api/bundles/export/{job_id}/download` | Save-scoped | Download only a completed export job for an accessible save; child blocked. |
+| `/api/story-logs/export` | Save-scoped | Export only the story log for an accessible save; child blocked. |
 | `/api/jobs` | Authenticated | List only jobs visible to the current user. |
 | `/api/jobs/{job_id}` | User-scoped | Read only jobs created by or visible to the current user. |
 | `/api/jobs/{job_id}/cancel` | User-scoped | Cancel only jobs created by or visible to the current user; child can cancel only jobs they created. |

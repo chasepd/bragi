@@ -5,6 +5,7 @@ import asyncio
 import gzip
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -1638,7 +1639,10 @@ def test_child_role_can_read_chat_and_generate_media_but_cannot_mutate_save(
             submitted.json()["id"],
             save_id=assigned_save.id,
         )
-        exported = client.get(f"/api/bundles/export?save_id={assigned_save.id}")
+        exported = client.post(
+            "/api/bundles/export",
+            json={"save_id": assigned_save.id},
+        )
         story_log = client.get(
             f"/api/story-logs/export?save_id={assigned_save.id}"
         )
@@ -4061,7 +4065,7 @@ def test_retired_character_interaction_records_are_recovery_only(
             ]
         )
         state.auth_required = True
-        save_export = client.get(f"/api/bundles/export?save_id={save.id}")
+        save_export = _export_bundle_download(client, save.id)
         save_delete = client.delete(f"/api/saves/{save.id}")
         scenario_export = client.get(
             f"/api/scenario-bundles/export/{scenario.id}"
@@ -16573,6 +16577,24 @@ def _wait_for_terminal_job(
     return job
 
 
+def _export_bundle_download(
+    client: FastAPITestClient,
+    save_id: str | None = None,
+) -> Any:
+    started = client.post(
+        "/api/bundles/export",
+        json={"save_id": save_id, "include_revision_history": False},
+    )
+    assert started.status_code == 200, started.text
+    job_id = started.json()["id"]
+    job = _wait_for_terminal_job(client, job_id, save_id=save_id)
+    assert job["status"] == "succeeded", job
+    return client.get(
+        f"/api/bundles/export/{job_id}/download"
+        + (f"?save_id={save_id}" if save_id is not None else "")
+    )
+
+
 def _enter_runtime_lock(lock: RuntimeAccessLock, entered: threading.Event) -> None:
     with lock:
         entered.set()
@@ -18807,7 +18829,7 @@ def test_bundle_api_round_trip_preserves_runtime_graph_and_media(
             source_message_id=source_message_id,
         )
 
-        exported = client.get("/api/bundles/export")
+        exported = _export_bundle_download(client, original_save_id)
         assert exported.status_code == 200
         assert exported.content
         previewed = client.post(
@@ -19560,7 +19582,7 @@ def test_bundle_import_runtime_error_returns_400_and_cleans_preview(
     assert state.bundle_previews == {}
 
 
-def test_bundle_export_deletes_temp_file_after_success_error_and_exception(
+def test_bundle_export_job_downloads_and_cleans_up_success_error_and_exception(
     tmp_path: Path,
 ) -> None:
     class ExportRuntimeBase(_RuntimeDouble):
@@ -19587,29 +19609,238 @@ def test_bundle_export_deletes_temp_file_after_success_error_and_exception(
             bundle_path.write_bytes(b"partial")
             raise RuntimeError("export crashed")
 
-    cases: list[tuple[ExportRuntimeBase, bool, int, bytes | None, str | None]] = [
-        (ExportRuntime(), True, 200, b"bundle", None),
-        (ExportErrorRuntime(), True, 400, None, "No active save"),
-        (ExplodingExportRuntime(), False, 500, None, None),
+    cases: list[tuple[ExportRuntimeBase, bytes | None, str | None]] = [
+        (ExportRuntime(), b"bundle", None),
+        (ExportErrorRuntime(), None, "No active save"),
+        (ExplodingExportRuntime(), None, None),
     ]
-    for index, (runtime, raise_server_exceptions, status_code, content, detail) in (
+    for index, (runtime, content, detail) in (
         enumerate(cases)
     ):
         case_path = tmp_path / f"case-{index}"
         case_path.mkdir()
+        state = _state_double(case_path, runtime)
         with TestClient(
-            create_app(cast(WebAppState, _state_double(case_path, runtime))),
-            raise_server_exceptions=raise_server_exceptions,
+            create_app(cast(WebAppState, state)),
         ) as client:
-            response = client.get("/api/bundles/export")
-
-        assert response.status_code == status_code
-        if content is not None:
-            assert response.content == content
-        if detail is not None:
-            assert response.json()["detail"] == detail
+            started = client.post(
+                "/api/bundles/export",
+                json={"save_id": "save-1", "include_revision_history": False},
+            )
+            assert started.status_code == 200
+            assert started.json()["type"] == "chat_bundle_export"
+            job = _wait_for_terminal_job(
+                client,
+                started.json()["id"],
+                save_id="save-1",
+            )
+            assert job["status"] == ("succeeded" if content is not None else "failed")
+            assert runtime.export_path is not None
+            if content is not None:
+                assert job["latest_progress"] == {"label": "Save export ready"}
+                record = state.jobs.get(started.json()["id"])
+                assert record is not None
+                assert [
+                    event["payload"]
+                    for event in record.events
+                    if event["event"] == "progress"
+                ] == [
+                    {"label": "Preparing save export"},
+                    {"label": "Save export ready"},
+                ]
+                denied = client.get(
+                    f"/api/bundles/export/{started.json()['id']}/download"
+                    "?save_id=other-save"
+                )
+                assert denied.status_code == 404
+                assert runtime.export_path.exists()
+                response = client.get(
+                    f"/api/bundles/export/{started.json()['id']}/download"
+                    "?save_id=save-1"
+                )
+                assert response.status_code == 200
+                assert response.content == content
+            else:
+                if detail is not None:
+                    assert job["error"] == detail
+                response = client.get(
+                    f"/api/bundles/export/{started.json()['id']}/download"
+                    "?save_id=save-1"
+                )
+                assert response.status_code == 400
+                if detail is not None:
+                    assert response.json()["detail"] == detail
         assert runtime.export_path is not None
         assert not runtime.export_path.exists()
+
+
+def test_bundle_export_rejects_duplicate_active_export(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingExportRuntime(_RuntimeDouble):
+        def export_active_save(self, bundle_path: Path) -> SimpleNamespace:
+            self.export_path = bundle_path
+            started.set()
+            assert release.wait(timeout=5)
+            bundle_path.write_bytes(b"bundle")
+            return SimpleNamespace(error=None)
+
+    runtime = BlockingExportRuntime()
+    state = _state_double(tmp_path, runtime)
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        first = client.post("/api/bundles/export", json={"save_id": "save-1"})
+        assert first.status_code == 200
+        assert started.wait(timeout=5)
+        second = client.post("/api/bundles/export", json={"save_id": "save-1"})
+        assert second.status_code == 429
+        release.set()
+        finished = _wait_for_terminal_job(
+            client,
+            first.json()["id"],
+            save_id="save-1",
+        )
+    assert finished["status"] == "succeeded"
+
+
+def test_bundle_export_does_not_hold_runtime_lock_while_running(
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingExportRuntime(_RuntimeDouble):
+        def export_active_save(self, bundle_path: Path) -> SimpleNamespace:
+            started.set()
+            assert release.wait(timeout=5)
+            bundle_path.write_bytes(b"bundle")
+            return SimpleNamespace(error=None)
+
+    runtime = BlockingExportRuntime()
+    state = _state_double(tmp_path, runtime)
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        first = client.post("/api/bundles/export", json={"save_id": "save-1"})
+        assert first.status_code == 200
+        assert started.wait(timeout=5)
+        runtime_response = client.get("/api/runtime?save_id=save-1")
+        assert runtime_response.status_code == 200
+        release.set()
+        finished = _wait_for_terminal_job(
+            client,
+            first.json()["id"],
+            save_id="save-1",
+        )
+    assert finished["status"] == "succeeded"
+
+
+def test_bundle_export_cancellation_removes_partial_file(tmp_path: Path) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingExportRuntime(_RuntimeDouble):
+        def export_active_save(self, bundle_path: Path) -> SimpleNamespace:
+            self.export_path = bundle_path
+            bundle_path.write_bytes(b"partial")
+            started.set()
+            assert release.wait(timeout=5)
+            return SimpleNamespace(error=None)
+
+    runtime = BlockingExportRuntime()
+    state = _state_double(tmp_path, runtime)
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        first = client.post("/api/bundles/export", json={"save_id": "save-1"})
+        assert first.status_code == 200
+        assert started.wait(timeout=5)
+        cancelled = client.post(
+            f"/api/jobs/{first.json()['id']}/cancel?save_id=save-1"
+        )
+        assert cancelled.status_code == 200
+        release.set()
+        finished = _wait_for_terminal_job(
+            client,
+            first.json()["id"],
+            save_id="save-1",
+        )
+    assert finished["status"] == "cancelled"
+    assert runtime.export_path is not None
+    assert not runtime.export_path.exists()
+
+
+def test_bundle_export_prunes_stale_files(tmp_path: Path) -> None:
+    state = _state_double(tmp_path)
+    stale = state.paths.temp_dir / f"bragi-export-{uuid4().hex}.bragi-chat"
+    stale.write_bytes(b"stale")
+    old = time.time() - (api_app._SAVE_EXPORT_FILE_TTL_SECONDS + 1)  # noqa: SLF001
+    os.utime(stale, (old, old))
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.get("/api/bundles/export/not-a-job/download")
+
+    assert response.status_code == 404
+    assert not stale.exists()
+
+
+def test_bundle_export_download_enforces_save_access(tmp_path: Path) -> None:
+    class ExportRuntime(_RuntimeDouble):
+        def export_active_save(self, bundle_path: Path) -> SimpleNamespace:
+            bundle_path.write_bytes(b"private bundle")
+            return SimpleNamespace(error=None)
+
+    state = _auth_state(tmp_path, ExportRuntime())
+    mira = state.auth_service().create_user(
+        username="Mira",
+        password="correct horse",
+        role="user",
+    )
+    state.auth_service().create_user(
+        username="Rook",
+        password="correct horse",
+        role="user",
+    )
+    save = _create_auth_save(
+        state.repositories,
+        title="Mira Save",
+        owner_user_id=mira.id,
+    )
+    app = create_app(cast(WebAppState, state))
+    with TestClient(app, authenticate=False) as mira_client:
+        assert mira_client.post(
+            "/api/auth/login",
+            json={"username": "Mira", "password": "correct horse"},
+        ).status_code == 200
+        started = mira_client.post(
+            "/api/bundles/export",
+            json={"save_id": save.id},
+        )
+        assert started.status_code == 200
+        job = _wait_for_terminal_job(
+            mira_client,
+            started.json()["id"],
+            save_id=save.id,
+        )
+        assert job["status"] == "succeeded"
+        job_id = started.json()["id"]
+
+    with TestClient(app, authenticate=False) as rook_client:
+        assert rook_client.post(
+            "/api/auth/login",
+            json={"username": "Rook", "password": "correct horse"},
+        ).status_code == 200
+        denied = rook_client.get(
+            f"/api/bundles/export/{job_id}/download?save_id={save.id}"
+        )
+        assert denied.status_code == 404
+
+    with TestClient(app, authenticate=False) as mira_client:
+        assert mira_client.post(
+            "/api/auth/login",
+            json={"username": "Mira", "password": "correct horse"},
+        ).status_code == 200
+        downloaded = mira_client.get(
+            f"/api/bundles/export/{job_id}/download?save_id={save.id}"
+        )
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"private bundle"
 
 
 def test_story_log_export_returns_visible_chronicle_messages_as_plain_text(
