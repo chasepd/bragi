@@ -18485,13 +18485,13 @@ describe("frontend helpers", () => {
 
   it("imports and exports active save bundles from the saves section", async () => {
     const openMock = vi.fn();
-    const downloadWindow = {
-      closed: false,
-      location: { href: "" },
-      opener: null
-    } as unknown as Window;
-    openMock.mockReturnValue(downloadWindow);
     vi.stubGlobal("open", openMock);
+    let downloadHref = "";
+    let downloadFilename = "";
+    const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      downloadHref = this.getAttribute("href") ?? "";
+      downloadFilename = this.download;
+    });
     const runJob = vi.fn((job: Job, options?: {
       onSucceeded?: (result: unknown) => void;
       onFinished?: (job: Job) => void;
@@ -18557,7 +18557,8 @@ describe("frontend helpers", () => {
       />
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "Export active save" }));
+    const exportButton = screen.getByRole("button", { name: "Export active save" });
+    await userEvent.click(exportButton);
     expect(fetchMock).toHaveBeenCalledWith("/api/bundles/export", expect.objectContaining({
       method: "POST",
       body: JSON.stringify({ save_id: "save-1", include_revision_history: false })
@@ -18567,8 +18568,11 @@ describe("frontend helpers", () => {
       allowInactiveSave: true,
       allowCrossSaveCompletion: true
     }));
-    expect(openMock).toHaveBeenCalledWith("about:blank", "_blank");
-    expect(downloadWindow.location.href).toBe("/api/bundles/export/job-1/download?save_id=save-1");
+    expect(openMock).not.toHaveBeenCalled();
+    expect(downloadClick).toHaveBeenCalledTimes(1);
+    expect(downloadHref).toBe("/api/bundles/export/job-1/download?save_id=save-1");
+    expect(downloadFilename).toBe("bragi-export.bragi-chat");
+    expect(exportButton).toBeEnabled();
 
     await userEvent.click(screen.getByRole("button", { name: "Export story log" }));
     expect(openMock).toHaveBeenCalledWith("/api/story-logs/export?save_id=save-1", "_blank", "noopener,noreferrer");

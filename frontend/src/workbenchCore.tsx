@@ -1209,26 +1209,18 @@ function openDownloadInNewTab(url: string) {
   window.open(url, "_blank", "noopener,noreferrer");
 }
 
-function reserveDownloadWindow(): Window | null {
-  const downloadWindow = window.open("about:blank", "_blank");
-  if (downloadWindow) downloadWindow.opener = null;
-  return downloadWindow;
-}
-
-function triggerReservedDownload(url: string, downloadWindow: Window | null) {
-  if (downloadWindow && !downloadWindow.closed) {
-    downloadWindow.location.href = url;
-    return;
-  }
+function triggerBrowserDownload(url: string, filename: string) {
   const link = document.createElement("a");
   link.href = url;
-  link.download = "";
+  link.download = filename;
   link.rel = "noopener noreferrer";
-  link.click();
-}
-
-function closeReservedDownloadWindow(downloadWindow: Window | null) {
-  if (downloadWindow && !downloadWindow.closed) downloadWindow.close();
+  link.hidden = true;
+  document.body.appendChild(link);
+  try {
+    link.click();
+  } finally {
+    link.remove();
+  }
 }
 
 const SCENARIO_CORE_SECTION_IDS = new Set(["title", "premise", "setup_line", "starting_scene", "player_character_name", "player_role", "character_starters"]);
@@ -4578,7 +4570,6 @@ function LibraryControls(props: {
                           onClick={() => {
                             if (!props.runJob) return;
                             if (saveExportStates[save.save_id] === "pending") return;
-                            const downloadWindow = reserveDownloadWindow();
                             setSaveExportStates((current) => ({
                               ...current,
                               [save.save_id]: "pending"
@@ -4591,18 +4582,30 @@ function LibraryControls(props: {
                                 allowInactiveSave: true,
                                 allowCrossSaveCompletion: true,
                                 onSucceeded: (result) => {
-                                  const downloadUrl = (
-                                    result as { download_url?: unknown }
-                                  ).download_url;
-                                  if (typeof downloadUrl === "string") {
-                                    triggerReservedDownload(downloadUrl, downloadWindow);
+                                  const exportResult = result as Partial<ChatBundleExportResult>;
+                                  if (
+                                    exportResult.kind === "chat_bundle_export"
+                                    && typeof exportResult.download_url === "string"
+                                    && typeof exportResult.filename === "string"
+                                  ) {
+                                    try {
+                                      triggerBrowserDownload(
+                                        exportResult.download_url,
+                                        exportResult.filename,
+                                      );
+                                    } catch {
+                                      setSaveExportStates((current) => ({
+                                        ...current,
+                                        [save.save_id]: "Save export is ready, but the browser blocked the download."
+                                      }));
+                                      return;
+                                    }
                                     setSaveExportStates((current) => {
                                       const next = { ...current };
                                       delete next[save.save_id];
                                       return next;
                                     });
                                   } else {
-                                    closeReservedDownloadWindow(downloadWindow);
                                     setSaveExportStates((current) => ({
                                       ...current,
                                       [save.save_id]: "Save export completed without a download."
@@ -4610,7 +4613,6 @@ function LibraryControls(props: {
                                   }
                                 },
                                 onFailed: (error) => {
-                                  closeReservedDownloadWindow(downloadWindow);
                                   setSaveExportStates((current) => ({
                                     ...current,
                                     [save.save_id]: error
@@ -4618,7 +4620,6 @@ function LibraryControls(props: {
                                 },
                                 onFinished: (finished) => {
                                   if (finished.status !== "cancelled") return;
-                                  closeReservedDownloadWindow(downloadWindow);
                                   setSaveExportStates((current) => ({
                                     ...current,
                                     [save.save_id]: "Save export cancelled."
@@ -4626,7 +4627,6 @@ function LibraryControls(props: {
                                 }
                               });
                             }, (failure) => {
-                              closeReservedDownloadWindow(downloadWindow);
                               setSaveExportStates((current) => ({
                                 ...current,
                                 [save.save_id]: failure instanceof Error
@@ -7793,7 +7793,6 @@ function SaveBundleControls({
     : "/api/story-logs/export";
   const startExport = async () => {
     if (!runJob || !hasActiveSave || !activeSaveId || exporting) return;
-    const downloadWindow = reserveDownloadWindow();
     setExporting(true);
     setExportError("");
     try {
@@ -7809,27 +7808,28 @@ function SaveBundleControls({
           if (
             exportResult.kind !== "chat_bundle_export"
             || typeof exportResult.download_url !== "string"
+            || typeof exportResult.filename !== "string"
           ) {
-            closeReservedDownloadWindow(downloadWindow);
             setExportError("Save export completed without a download.");
             return;
           }
-          triggerReservedDownload(exportResult.download_url, downloadWindow);
+          try {
+            triggerBrowserDownload(exportResult.download_url, exportResult.filename);
+          } catch {
+            setExportError("Save export is ready, but the browser blocked the download.");
+          }
         },
         onFailed: (error) => {
-          closeReservedDownloadWindow(downloadWindow);
           setExportError(error);
         },
         onFinished: (job) => {
           if (job.status === "cancelled") {
-            closeReservedDownloadWindow(downloadWindow);
             setExportError("Save export cancelled.");
           }
           setExporting(false);
         }
       });
     } catch (failure) {
-      closeReservedDownloadWindow(downloadWindow);
       setExporting(false);
       setExportError(failure instanceof Error ? failure.message : "Could not start save export");
     }
