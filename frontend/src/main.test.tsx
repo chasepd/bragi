@@ -18591,6 +18591,10 @@ describe("frontend helpers", () => {
 
   it("prevents duplicate save exports and displays terminal export errors", async () => {
     let resolveExport: ((response: unknown) => void) | undefined;
+    let jobOptions: {
+      onFailed?: (error: string, job: Job) => void;
+      onFinished?: (job: Job) => void;
+    } | undefined;
     const exportJob: Job = {
       id: "job-oversized",
       type: "chat_bundle_export",
@@ -18612,9 +18616,7 @@ describe("frontend helpers", () => {
       onFailed?: (error: string, job: Job) => void;
       onFinished?: (job: Job) => void;
     }) => {
-      const failed = { ...exportJob, status: "failed" as const, error: "Export is too large" };
-      options?.onFailed?.("Export is too large", failed);
-      options?.onFinished?.(failed);
+      jobOptions = options;
       return vi.fn();
     });
     const { LeftRail } = await import("./main");
@@ -18644,8 +18646,181 @@ describe("frontend helpers", () => {
       ok: true,
       json: async () => exportJob
     });
+    await waitFor(() => expect(runJob).toHaveBeenCalledTimes(1));
+    expect(exportButton).toBeDisabled();
+    await userEvent.click(exportButton);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/bundles/export")).toHaveLength(1);
+
+    const failed = { ...exportJob, status: "failed" as const, error: "Export is too large" };
+    act(() => {
+      jobOptions?.onFailed?.("Export is too large", failed);
+      jobOptions?.onFinished?.(failed);
+    });
     expect(await screen.findByText("Export is too large")).toBeInTheDocument();
     expect(exportButton).not.toBeDisabled();
+  });
+
+  it("restores active save export controls after blocked downloads and cancellation", async () => {
+    const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {
+      throw new Error("download blocked");
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        id: "job-export",
+        type: "chat_bundle_export",
+        save_id: "save-1",
+        status: "queued",
+        result: null,
+        error: null
+      } satisfies Job)
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    let runCount = 0;
+    const runJob = vi.fn((job: Job, options?: {
+      onSucceeded?: (result: unknown) => void;
+      onFinished?: (job: Job) => void;
+    }) => {
+      runCount += 1;
+      if (runCount === 1) {
+        options?.onSucceeded?.({
+          kind: "chat_bundle_export",
+          filename: "bragi-export.bragi-chat",
+          download_url: "/api/bundles/export/job-export/download?save_id=save-1"
+        });
+        options?.onFinished?.({ ...job, status: "succeeded" });
+      } else {
+        options?.onFinished?.({ ...job, status: "cancelled" });
+      }
+      return vi.fn();
+    });
+    const { LeftRail } = await import("./main");
+
+    render(
+      <LeftRail
+        model={runtimeModel({ saves: [{ save_id: "save-1", title: "Lantern Run", active: true }] })}
+        scenarios={[]}
+        onChanged={vi.fn()}
+        onSelectSave={vi.fn()}
+        pendingSaveId={null}
+        saveSelectionError=""
+        onNew={vi.fn()}
+        activePanel="media"
+        setPanel={vi.fn()}
+        runJob={runJob}
+      />
+    );
+
+    const exportButton = screen.getByRole("button", { name: "Export active save" });
+    await userEvent.click(exportButton);
+    expect(await screen.findByText("Save export is ready, but the browser blocked the download.")).toBeInTheDocument();
+    expect(downloadClick).toHaveBeenCalledTimes(1);
+    expect(exportButton).toBeEnabled();
+
+    await userEvent.click(exportButton);
+    expect(await screen.findByText("Save export cancelled.")).toBeInTheDocument();
+    expect(exportButton).toBeEnabled();
+  });
+
+  it("exports unsupported legacy saves without popups and restores every terminal state", async () => {
+    const openMock = vi.fn();
+    vi.stubGlobal("open", openMock);
+    let downloadHref = "";
+    let downloadFilename = "";
+    const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      downloadHref = this.getAttribute("href") ?? "";
+      downloadFilename = this.download;
+    });
+    const exportJob: Job = {
+      id: "job-retired-export",
+      type: "chat_bundle_export",
+      save_id: "save-retired",
+      status: "queued",
+      result: null,
+      error: null
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => exportJob
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    let jobOptions: {
+      onSucceeded?: (result: unknown) => void;
+      onFinished?: (job: Job) => void;
+    } | undefined;
+    const runJob = vi.fn((_job: Job, options?: typeof jobOptions) => {
+      jobOptions = options;
+      return vi.fn();
+    });
+    const { LeftRail } = await import("./main");
+
+    render(
+      <LeftRail
+        model={runtimeModel({
+          active_save_id: "save-retired",
+          saves: [{
+            save_id: "save-retired",
+            title: "Retired Chronicle",
+            active: true,
+            supported: false,
+            unsupported_reason: "Retired scenario type."
+          }]
+        })}
+        scenarios={[]}
+        currentUser={{ id: "admin-1", username: "Mira", role: "admin", status: "active" }}
+        onChanged={vi.fn()}
+        onSelectSave={vi.fn()}
+        pendingSaveId={null}
+        saveSelectionError=""
+        onNew={vi.fn()}
+        activePanel="media"
+        setPanel={vi.fn()}
+        runJob={runJob}
+      />
+    );
+
+    const exportButton = screen.getByRole("button", { name: "Export Retired Chronicle" });
+    await userEvent.click(exportButton);
+    await waitFor(() => expect(runJob).toHaveBeenCalledTimes(1));
+    expect(exportButton).toBeDisabled();
+    await userEvent.click(exportButton);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/bundles/export")).toHaveLength(1);
+
+    act(() => {
+      jobOptions?.onSucceeded?.({
+        kind: "chat_bundle_export",
+        filename: "retired.bragi-chat",
+        download_url: "/api/bundles/export/job-retired-export/download?save_id=save-retired"
+      });
+      jobOptions?.onFinished?.({ ...exportJob, status: "succeeded" });
+    });
+    expect(openMock).not.toHaveBeenCalled();
+    expect(downloadClick).toHaveBeenCalledTimes(1);
+    expect(downloadHref).toBe("/api/bundles/export/job-retired-export/download?save_id=save-retired");
+    expect(downloadFilename).toBe("retired.bragi-chat");
+    expect(exportButton).toBeEnabled();
+
+    await userEvent.click(exportButton);
+    await waitFor(() => expect(runJob).toHaveBeenCalledTimes(2));
+    act(() => jobOptions?.onFinished?.({ ...exportJob, status: "cancelled" }));
+    expect(await screen.findByText("Save export cancelled.")).toBeInTheDocument();
+    expect(exportButton).toBeEnabled();
+
+    downloadClick.mockImplementation(() => {
+      throw new Error("download blocked");
+    });
+    await userEvent.click(exportButton);
+    await waitFor(() => expect(runJob).toHaveBeenCalledTimes(3));
+    act(() => {
+      jobOptions?.onSucceeded?.({
+        kind: "chat_bundle_export",
+        filename: "retired.bragi-chat",
+        download_url: "/api/bundles/export/job-retired-export/download?save_id=save-retired"
+      });
+      jobOptions?.onFinished?.({ ...exportJob, status: "succeeded" });
+    });
+    expect(await screen.findByText("Save export is ready, but the browser blocked the download.")).toBeInTheDocument();
+    expect(exportButton).toBeEnabled();
   });
 
   it("renders the character panel read-only for child users", async () => {
