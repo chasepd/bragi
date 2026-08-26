@@ -35,12 +35,12 @@ class FakeRepositories:
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (None, TURN_RESPONSIVENESS_MODE_QUALITY),
+        (None, TURN_RESPONSIVENESS_MODE_RESPONSIVE),
         ("quality", TURN_RESPONSIVENESS_MODE_QUALITY),
         ("responsive", TURN_RESPONSIVENESS_MODE_RESPONSIVE),
-        (" RESPONSIVE ", TURN_RESPONSIVENESS_MODE_QUALITY),
-        ("fast", TURN_RESPONSIVENESS_MODE_QUALITY),
-        (True, TURN_RESPONSIVENESS_MODE_QUALITY),
+        (" RESPONSIVE ", TURN_RESPONSIVENESS_MODE_RESPONSIVE),
+        ("fast", TURN_RESPONSIVENESS_MODE_RESPONSIVE),
+        (True, TURN_RESPONSIVENESS_MODE_RESPONSIVE),
     ],
 )
 def test_turn_responsiveness_mode_is_strictly_sanitized(
@@ -55,8 +55,8 @@ def test_turn_responsiveness_mode_is_strictly_sanitized(
     [
         (
             None,
-            TURN_RESPONSIVENESS_MODE_QUALITY,
-            RetryExecutionClass.QUALITY_FOREGROUND,
+            TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+            RetryExecutionClass.RESPONSIVE_FOREGROUND,
         ),
         (
             TURN_RESPONSIVENESS_MODE_RESPONSIVE,
@@ -65,8 +65,8 @@ def test_turn_responsiveness_mode_is_strictly_sanitized(
         ),
         (
             "invalid",
-            TURN_RESPONSIVENESS_MODE_QUALITY,
-            RetryExecutionClass.QUALITY_FOREGROUND,
+            TURN_RESPONSIVENESS_MODE_RESPONSIVE,
+            RetryExecutionClass.RESPONSIVE_FOREGROUND,
         ),
     ],
 )

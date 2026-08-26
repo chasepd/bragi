@@ -54,7 +54,7 @@ def test_timing_summary_suppresses_estimate_until_five_matching_turns(
 
     summary = ChatTimingService(repositories).summary(save_id)
 
-    assert summary.mode == "quality"
+    assert summary.mode == "responsive"
     assert summary.provider == "fake"
     assert summary.model == "fake-chat"
     assert summary.sample_count == 4
@@ -79,7 +79,7 @@ def test_timing_summary_uses_latest_thirty_matching_successes_and_nearest_rank(
         "save_id": save_id,
         "provider": "fake",
         "model": "fake-chat",
-        "mode": "quality",
+        "mode": "responsive",
         "limit": 30,
     }]
     assert summary.sample_count == 7

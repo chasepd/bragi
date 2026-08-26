@@ -19,14 +19,14 @@ TURN_RESPONSIVENESS_MODE_OPTIONS = (
     TURN_RESPONSIVENESS_MODE_QUALITY,
     TURN_RESPONSIVENESS_MODE_RESPONSIVE,
 )
-DEFAULT_TURN_RESPONSIVENESS_MODE = TURN_RESPONSIVENESS_MODE_QUALITY
+DEFAULT_TURN_RESPONSIVENESS_MODE = TURN_RESPONSIVENESS_MODE_RESPONSIVE
 
 RESPONSIVE_STRUCTURED_HELPER_MAX_OUTPUT_TOKENS = 2_048
 RESPONSIVE_PLANNER_MESSAGE_WINDOW = 8
 
 
 def sanitize_turn_responsiveness_mode(value: object) -> str:
-    """Return a supported mode, preserving quality as the safe default."""
+    """Return a supported mode, preserving Responsive as the default."""
 
     if value in TURN_RESPONSIVENESS_MODE_OPTIONS:
         return str(value)
@@ -45,7 +45,7 @@ def turn_responsiveness_mode(
                 save_id=save_id,
             )
         )
-    except Exception:  # noqa: BLE001 - storage failures retain quality behavior
+    except Exception:  # noqa: BLE001 - storage failures retain the default behavior
         return DEFAULT_TURN_RESPONSIVENESS_MODE
 
 

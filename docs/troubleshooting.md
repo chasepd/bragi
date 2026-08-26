@@ -20,10 +20,10 @@ performance.
 - Check Event Stream for repeated `web.request.completed` rows with long
   durations on the same route.
 - For an adult or administrator-operated save, use Save settings > Turn
-  Responsiveness Mode to compare the default `quality` pipeline with the
-  bounded `responsive` pipeline. Responsive mode keeps all mandatory safety and
-  continuity checks; turns that are not eligible for its fast or combined path
-  use the standard helper route under the responsive retry budget.
+  Responsiveness Mode to compare the default bounded `responsive` pipeline with
+  the full-helper `quality` pipeline. Responsive mode keeps all mandatory safety
+  and continuity checks; turns that are not eligible for its fast or combined
+  path use the standard helper route under the responsive retry budget.
 
 ## Measuring Turn Responsiveness Safely
 

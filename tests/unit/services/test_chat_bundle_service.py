@@ -45,7 +45,6 @@ from bragi.services.scenario_evolution_policy import (
     scenario_template_evolution_turn_interval_setting_key,
 )
 from bragi.services.turn_responsiveness import (
-    TURN_RESPONSIVENESS_MODE_QUALITY,
     TURN_RESPONSIVENESS_MODE_RESPONSIVE,
     TURN_RESPONSIVENESS_MODE_SETTING,
 )
@@ -4277,7 +4276,7 @@ def test_export_import_preserves_and_sanitizes_turn_responsiveness_mode(
         scope="save",
         scope_id=_imported_save_id(repaired),
         key=TURN_RESPONSIVENESS_MODE_SETTING,
-    ) == TURN_RESPONSIVENESS_MODE_QUALITY
+    ) == TURN_RESPONSIVENESS_MODE_RESPONSIVE
 
 
 def test_export_omits_message_revision_history_by_default(
