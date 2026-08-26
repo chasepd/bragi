@@ -18486,12 +18486,6 @@ describe("frontend helpers", () => {
   it("imports and exports active save bundles from the saves section", async () => {
     const openMock = vi.fn();
     vi.stubGlobal("open", openMock);
-    let downloadHref = "";
-    let downloadFilename = "";
-    const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
-      downloadHref = this.getAttribute("href") ?? "";
-      downloadFilename = this.download;
-    });
     const runJob = vi.fn((job: Job, options?: {
       onSucceeded?: (result: unknown) => void;
       onFinished?: (job: Job) => void;
@@ -18569,10 +18563,10 @@ describe("frontend helpers", () => {
       allowCrossSaveCompletion: true
     }));
     expect(openMock).not.toHaveBeenCalled();
-    expect(downloadClick).toHaveBeenCalledTimes(1);
-    expect(downloadHref).toBe("/api/bundles/export/job-1/download?save_id=save-1");
-    expect(downloadFilename).toBe("bragi-export.bragi-chat");
-    expect(exportButton).toBeEnabled();
+    const downloadLink = screen.getByRole("link", { name: "Download completed save export" });
+    expect(downloadLink).toHaveAttribute("href", "/api/bundles/export/job-1/download?save_id=save-1");
+    expect(downloadLink).toHaveAttribute("download", "bragi-export.bragi-chat");
+    expect(screen.getByText("Save export ready.")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Export story log" }));
     expect(openMock).toHaveBeenCalledWith("/api/story-logs/export?save_id=save-1", "_blank", "noopener,noreferrer");
@@ -18660,10 +18654,7 @@ describe("frontend helpers", () => {
     expect(exportButton).not.toBeDisabled();
   });
 
-  it("restores active save export controls after blocked downloads and cancellation", async () => {
-    const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {
-      throw new Error("download blocked");
-    });
+  it("restores active save export controls after download, cancellation, and malformed completion", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -18716,28 +18707,23 @@ describe("frontend helpers", () => {
 
     const exportButton = screen.getByRole("button", { name: "Export active save" });
     await userEvent.click(exportButton);
-    expect(await screen.findByText("Save export is ready, but the download could not be started.")).toBeInTheDocument();
-    expect(downloadClick).toHaveBeenCalledTimes(1);
-    expect(exportButton).toBeEnabled();
+    const downloadLink = await screen.findByRole("link", { name: "Download completed save export" });
+    downloadLink.addEventListener("click", (event) => event.preventDefault(), { once: true });
+    await userEvent.click(downloadLink);
 
-    await userEvent.click(exportButton);
+    const nextExportButton = screen.getByRole("button", { name: "Export active save" });
+    await userEvent.click(nextExportButton);
     expect(await screen.findByText("Save export cancelled.")).toBeInTheDocument();
-    expect(exportButton).toBeEnabled();
+    expect(nextExportButton).toBeEnabled();
 
-    await userEvent.click(exportButton);
+    await userEvent.click(nextExportButton);
     expect(await screen.findByText("Save export completed without a download.")).toBeInTheDocument();
-    expect(exportButton).toBeEnabled();
+    expect(nextExportButton).toBeEnabled();
   });
 
   it("exports unsupported legacy saves without popups and restores every terminal state", async () => {
     const openMock = vi.fn();
     vi.stubGlobal("open", openMock);
-    let downloadHref = "";
-    let downloadFilename = "";
-    const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
-      downloadHref = this.getAttribute("href") ?? "";
-      downloadFilename = this.download;
-    });
     const exportJob: Job = {
       id: "job-retired-export",
       type: "chat_bundle_export",
@@ -18804,51 +18790,38 @@ describe("frontend helpers", () => {
       jobOptions?.onFinished?.({ ...exportJob, status: "succeeded" });
     });
     expect(openMock).not.toHaveBeenCalled();
-    expect(downloadClick).toHaveBeenCalledTimes(1);
-    expect(downloadHref).toBe("/api/bundles/export/job-retired-export/download?save_id=save-retired");
-    expect(downloadFilename).toBe("retired.bragi-chat");
-    expect(exportButton).toBeEnabled();
+    const downloadLink = screen.getByRole("link", { name: "Download Retired Chronicle export" });
+    expect(downloadLink).toHaveAttribute("href", "/api/bundles/export/job-retired-export/download?save_id=save-retired");
+    expect(downloadLink).toHaveAttribute("download", "retired.bragi-chat");
+    expect(screen.getByText("Save export ready.")).toBeInTheDocument();
+    downloadLink.addEventListener("click", (event) => event.preventDefault(), { once: true });
+    await userEvent.click(downloadLink);
 
-    await userEvent.click(exportButton);
+    const nextExportButton = screen.getByRole("button", { name: "Export Retired Chronicle" });
+    await userEvent.click(nextExportButton);
     await waitFor(() => expect(runJob).toHaveBeenCalledTimes(2));
     act(() => jobOptions?.onFinished?.({ ...exportJob, status: "cancelled" }));
     expect(await screen.findByText("Save export cancelled.")).toBeInTheDocument();
-    expect(exportButton).toBeEnabled();
+    expect(nextExportButton).toBeEnabled();
 
-    downloadClick.mockImplementation(() => {
-      throw new Error("download blocked");
-    });
-    await userEvent.click(exportButton);
+    await userEvent.click(nextExportButton);
     await waitFor(() => expect(runJob).toHaveBeenCalledTimes(3));
-    act(() => {
-      jobOptions?.onSucceeded?.({
-        kind: "chat_bundle_export",
-        filename: "retired.bragi-chat",
-        download_url: "/api/bundles/export/job-retired-export/download?save_id=save-retired"
-      });
-      jobOptions?.onFinished?.({ ...exportJob, status: "succeeded" });
-    });
-    expect(await screen.findByText("Save export is ready, but the download could not be started.")).toBeInTheDocument();
-    expect(exportButton).toBeEnabled();
-
-    await userEvent.click(exportButton);
-    await waitFor(() => expect(runJob).toHaveBeenCalledTimes(4));
     const failed = { ...exportJob, status: "failed" as const, error: "Legacy export failed." };
     act(() => {
       jobOptions?.onFailed?.("Legacy export failed.", failed);
       jobOptions?.onFinished?.(failed);
     });
     expect(await screen.findByText("Legacy export failed.")).toBeInTheDocument();
-    expect(exportButton).toBeEnabled();
+    expect(nextExportButton).toBeEnabled();
 
-    await userEvent.click(exportButton);
-    await waitFor(() => expect(runJob).toHaveBeenCalledTimes(5));
+    await userEvent.click(nextExportButton);
+    await waitFor(() => expect(runJob).toHaveBeenCalledTimes(4));
     act(() => {
       jobOptions?.onSucceeded?.(null);
       jobOptions?.onFinished?.({ ...exportJob, status: "succeeded" });
     });
     expect(await screen.findByText("Save export completed without a download.")).toBeInTheDocument();
-    expect(exportButton).toBeEnabled();
+    expect(nextExportButton).toBeEnabled();
   });
 
   it("renders the character panel read-only for child users", async () => {

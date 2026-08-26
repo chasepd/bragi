@@ -1209,20 +1209,6 @@ function openDownloadInNewTab(url: string) {
   window.open(url, "_blank", "noopener,noreferrer");
 }
 
-function triggerBrowserDownload(url: string, filename: string) {
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.rel = "noopener noreferrer";
-  link.hidden = true;
-  document.body.appendChild(link);
-  try {
-    link.click();
-  } finally {
-    link.remove();
-  }
-}
-
 function isChatBundleExportResult(result: unknown): result is ChatBundleExportResult {
   if (!result || typeof result !== "object") return false;
   const candidate = result as Partial<ChatBundleExportResult>;
@@ -4225,7 +4211,7 @@ function LibraryControls(props: {
   const [chapterDialogOpen, setChapterDialogOpen] = useState(false);
   const [scenarioReuseError, setScenarioReuseError] = useState("");
   const [reusingScenarioId, setReusingScenarioId] = useState("");
-  const [saveExportStates, setSaveExportStates] = useState<Record<string, string>>({});
+  const [saveExportStates, setSaveExportStates] = useState<Record<string, string | ChatBundleExportResult>>({});
   const libraryUserId = props.currentUser?.id ?? null;
   const [scopedLibraryState, setScopedLibraryState] = useState<ScopedLibraryControlsState>(() => ({
     userId: libraryUserId,
@@ -4545,7 +4531,10 @@ function LibraryControls(props: {
               <p className="library-result-count" aria-live="polite">{visibleSaves.length} of {saves.length} saves</p>
             </div>
             <div className="stack-list library-list">
-              {visibleSaves.map((save) => (
+              {visibleSaves.map((save) => {
+                const exportState = saveExportStates[save.save_id];
+                const exportDownload = isChatBundleExportResult(exportState) ? exportState : null;
+                return (
                 <div className={`library-row ${save.active ? "active" : ""}`} key={save.save_id}>
                   <button
                     className="library-row-main"
@@ -4571,6 +4560,25 @@ function LibraryControls(props: {
                         <button type="button" className={touchActionClassName()} title="Rename save" aria-label={`Rename ${save.title}`} onClick={() => setRenamingSave(save)}>
                           <TouchActionContents icon={<Edit3 size={14} />} label="Rename" />
                         </button>
+                      ) : exportDownload ? (
+                        <a
+                          className={touchActionClassName("download-link")}
+                          href={exportDownload.download_url}
+                          download={exportDownload.filename}
+                          title="Download save bundle"
+                          aria-label={`Download ${save.title} export`}
+                          onClick={() => {
+                            window.setTimeout(() => {
+                              setSaveExportStates((current) => {
+                                const next = { ...current };
+                                delete next[save.save_id];
+                                return next;
+                              });
+                            }, 0);
+                          }}
+                        >
+                          <TouchActionContents icon={<Download size={14} />} label="Download" />
+                        </a>
                       ) : (
                         <button
                           type="button"
@@ -4594,23 +4602,10 @@ function LibraryControls(props: {
                                 allowCrossSaveCompletion: true,
                                 onSucceeded: (result) => {
                                   if (isChatBundleExportResult(result)) {
-                                    try {
-                                      triggerBrowserDownload(
-                                        result.download_url,
-                                        result.filename,
-                                      );
-                                    } catch {
-                                      setSaveExportStates((current) => ({
-                                        ...current,
-                                        [save.save_id]: "Save export is ready, but the download could not be started."
-                                      }));
-                                      return;
-                                    }
-                                    setSaveExportStates((current) => {
-                                      const next = { ...current };
-                                      delete next[save.save_id];
-                                      return next;
-                                    });
+                                    setSaveExportStates((current) => ({
+                                      ...current,
+                                      [save.save_id]: result
+                                    }));
                                   } else {
                                     setSaveExportStates((current) => ({
                                       ...current,
@@ -4644,7 +4639,7 @@ function LibraryControls(props: {
                         >
                           <TouchActionContents
                             icon={<Download size={14} />}
-                            label={saveExportStates[save.save_id] === "pending" ? "Exporting..." : "Export"}
+                            label={exportState === "pending" ? "Exporting..." : "Export"}
                           />
                         </button>
                       )}
@@ -4653,11 +4648,18 @@ function LibraryControls(props: {
                       </button>
                     </div>
                   ) : null}
-                  {saveExportStates[save.save_id] && saveExportStates[save.save_id] !== "pending" ? (
-                    <small role="alert">{saveExportStates[save.save_id]}</small>
+                  {exportDownload ? (
+                    <small role="status">Save export ready.</small>
+                  ) : typeof exportState === "string" && exportState !== "pending" ? (
+                    <small
+                      role="alert"
+                    >
+                      {exportState}
+                    </small>
                   ) : null}
                 </div>
-              ))}
+                );
+              })}
               {!saves.length ? <p className="empty">No saves yet</p> : null}
               {saves.length && !visibleSaves.length ? <p className="empty">No saves match</p> : null}
             </div>
@@ -7796,6 +7798,7 @@ function SaveBundleControls({
 }) {
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState("");
+  const [exportDownload, setExportDownload] = useState<ChatBundleExportResult | null>(null);
   const storyLogPath = activeSaveId
     ? `/api/story-logs/export?save_id=${encodeURIComponent(activeSaveId)}`
     : "/api/story-logs/export";
@@ -7803,6 +7806,7 @@ function SaveBundleControls({
     if (!runJob || !hasActiveSave || !exportEnabled || !activeSaveId || exporting) return;
     setExporting(true);
     setExportError("");
+    setExportDownload(null);
     try {
       const created = await postJson<Job>("/api/bundles/export", {
         save_id: activeSaveId,
@@ -7816,11 +7820,7 @@ function SaveBundleControls({
             setExportError("Save export completed without a download.");
             return;
           }
-          try {
-            triggerBrowserDownload(result.download_url, result.filename);
-          } catch {
-            setExportError("Save export is ready, but the download could not be started.");
-          }
+          setExportDownload(result);
         },
         onFailed: (error) => {
           setExportError(error);
@@ -7839,14 +7839,29 @@ function SaveBundleControls({
   };
   return (
     <div className="command-row save-bundle-actions">
-      <button
-        title="Export active save bundle"
-        aria-label="Export active save"
-        disabled={!hasActiveSave || !exportEnabled || !runJob || exporting}
-        onClick={() => void startExport()}
-      >
-        <Download size={14} /> {exporting ? "Exporting..." : "Export"}
-      </button>
+      {exportDownload ? (
+        <a
+          className="download-link"
+          href={exportDownload.download_url}
+          download={exportDownload.filename}
+          title="Download completed save export"
+          aria-label="Download completed save export"
+          onClick={() => {
+            window.setTimeout(() => setExportDownload(null), 0);
+          }}
+        >
+          <Download size={14} /> Download
+        </a>
+      ) : (
+        <button
+          title="Export active save bundle"
+          aria-label="Export active save"
+          disabled={!hasActiveSave || !exportEnabled || !runJob || exporting}
+          onClick={() => void startExport()}
+        >
+          <Download size={14} /> {exporting ? "Exporting..." : "Export"}
+        </button>
+      )}
       <button
         title="Export active save story log"
         aria-label="Export story log"
@@ -7856,6 +7871,7 @@ function SaveBundleControls({
         <FileText size={14} /> Story log
       </button>
       <SaveBundleUpload onImported={onImported} />
+      {exportDownload ? <InlineNotice className="save-export-ready" polite>Save export ready.</InlineNotice> : null}
       {exportError ? <InlineNotice>{exportError}</InlineNotice> : null}
     </div>
   );
