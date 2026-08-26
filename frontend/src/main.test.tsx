@@ -12005,6 +12005,7 @@ describe("frontend helpers", () => {
         onNew={vi.fn()}
         onContinuationDraft={onContinuationDraft}
         onReuseScenarioPrompt={onReuseScenarioPrompt}
+        runJob={vi.fn(() => vi.fn())}
         activePanel="media"
         setPanel={vi.fn()}
       />
@@ -18484,10 +18485,38 @@ describe("frontend helpers", () => {
 
   it("imports and exports active save bundles from the saves section", async () => {
     const openMock = vi.fn();
+    const downloadWindow = {
+      closed: false,
+      location: { href: "" },
+      opener: null
+    } as unknown as Window;
+    openMock.mockReturnValue(downloadWindow);
     vi.stubGlobal("open", openMock);
+    const runJob = vi.fn((job: Job, options?: {
+      onSucceeded?: (result: unknown) => void;
+      onFinished?: (job: Job) => void;
+    }) => {
+      options?.onSucceeded?.({
+        kind: "chat_bundle_export",
+        filename: "bragi-export.bragi-chat",
+        download_url: "/api/bundles/export/job-1/download?save_id=save-1"
+      });
+      options?.onFinished?.({ ...job, status: "succeeded" });
+      return vi.fn();
+    });
     const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
       ok: true,
       json: async () => {
+        if (path === "/api/bundles/export") {
+          return {
+            id: "job-1",
+            type: "chat_bundle_export",
+            save_id: "save-1",
+            status: "queued",
+            result: null,
+            error: null
+          } satisfies Job;
+        }
         if (path === "/api/bundles/preview") {
           return {
             preview_id: "preview-save-1",
@@ -18524,11 +18553,22 @@ describe("frontend helpers", () => {
         onNew={vi.fn()}
         activePanel="media"
         setPanel={vi.fn()}
+        runJob={runJob}
       />
     );
 
     await userEvent.click(screen.getByRole("button", { name: "Export active save" }));
-    expect(openMock).toHaveBeenCalledWith("/api/bundles/export?save_id=save-1", "_blank", "noopener,noreferrer");
+    expect(fetchMock).toHaveBeenCalledWith("/api/bundles/export", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify({ save_id: "save-1", include_revision_history: false })
+    }));
+    expect(runJob).toHaveBeenCalledWith(expect.objectContaining({ type: "chat_bundle_export" }), expect.anything());
+    expect(runJob.mock.calls[0][1]).toEqual(expect.objectContaining({
+      allowInactiveSave: true,
+      allowCrossSaveCompletion: true
+    }));
+    expect(openMock).toHaveBeenCalledWith("about:blank", "_blank");
+    expect(downloadWindow.location.href).toBe("/api/bundles/export/job-1/download?save_id=save-1");
 
     await userEvent.click(screen.getByRole("button", { name: "Export story log" }));
     expect(openMock).toHaveBeenCalledWith("/api/story-logs/export?save_id=save-1", "_blank", "noopener,noreferrer");
@@ -18543,6 +18583,65 @@ describe("frontend helpers", () => {
     expect(onChanged).toHaveBeenCalled();
     expect(onSelectSave).toHaveBeenCalledWith("save-imported");
     expect(fetchMock.mock.calls.some(([path]) => String(path).startsWith("/api/sync/"))).toBe(false);
+  });
+
+  it("prevents duplicate save exports and displays terminal export errors", async () => {
+    let resolveExport: ((response: unknown) => void) | undefined;
+    const exportJob: Job = {
+      id: "job-oversized",
+      type: "chat_bundle_export",
+      save_id: "save-1",
+      status: "queued",
+      result: null,
+      error: null
+    };
+    const fetchMock = vi.fn().mockImplementation((path: string) => {
+      if (path === "/api/bundles/export") {
+        return new Promise((resolve) => {
+          resolveExport = resolve;
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const runJob = vi.fn((_job: Job, options?: {
+      onFailed?: (error: string, job: Job) => void;
+      onFinished?: (job: Job) => void;
+    }) => {
+      const failed = { ...exportJob, status: "failed" as const, error: "Export is too large" };
+      options?.onFailed?.("Export is too large", failed);
+      options?.onFinished?.(failed);
+      return vi.fn();
+    });
+    const { LeftRail } = await import("./main");
+
+    render(
+      <LeftRail
+        model={runtimeModel({ saves: [{ save_id: "save-1", title: "Lantern Run", active: true }] })}
+        scenarios={[]}
+        onChanged={vi.fn()}
+        onSelectSave={vi.fn()}
+        pendingSaveId={null}
+        saveSelectionError=""
+        onNew={vi.fn()}
+        activePanel="media"
+        setPanel={vi.fn()}
+        runJob={runJob}
+      />
+    );
+
+    const exportButton = screen.getByRole("button", { name: "Export active save" });
+    await userEvent.click(exportButton);
+    expect(exportButton).toBeDisabled();
+    await userEvent.click(exportButton);
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/bundles/export")).toHaveLength(1);
+
+    resolveExport?.({
+      ok: true,
+      json: async () => exportJob
+    });
+    expect(await screen.findByText("Export is too large")).toBeInTheDocument();
+    expect(exportButton).not.toBeDisabled();
   });
 
   it("renders the character panel read-only for child users", async () => {

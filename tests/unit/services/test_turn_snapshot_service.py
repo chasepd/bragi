@@ -148,7 +148,7 @@ def test_snapshot_object_decode_rejects_json_node_bomb(
         payload=payload,
     )
 
-    with pytest.raises(ValueError, match="Invalid snapshot object payload"):
+    with pytest.raises(ValueError, match="too many values"):
         turn_snapshot_module._decode_exported_snapshot_object(
             {
                 "object_hash": object_hash,
@@ -341,7 +341,7 @@ def test_snapshot_validation_bounds_aggregate_json_nodes(
         created_at=None,
     )
 
-    with pytest.raises(ValueError, match="Invalid snapshot object payload"):
+    with pytest.raises(ValueError, match="too many values"):
         turn_snapshot_module._validate_exported_snapshot_rows(
             [{"id": "snapshot-one", "root_manifest_hash": manifest_hash}],
             objects.values(),
@@ -418,7 +418,7 @@ def test_snapshot_validation_bounds_nested_json_string_nodes(
         created_at=None,
     )
 
-    with pytest.raises(ValueError, match="Invalid snapshot nested JSON"):
+    with pytest.raises(ValueError, match="too many values"):
         turn_snapshot_module._validate_exported_snapshot_rows(
             [{"id": "snapshot-one", "root_manifest_hash": manifest_hash}],
             objects.values(),
@@ -4790,6 +4790,80 @@ def test_export_import_preserves_snapshot_backed_fork(
     assert fork_content["character_starters"][0]["reference_image"][
         "content_rating"
     ] == "unclassified"
+
+    imported_snapshots = service._snapshots_for_save(imported.save_id)  # noqa: SLF001
+    imported_first_snapshot = next(
+        snapshot
+        for snapshot in imported_snapshots
+        if snapshot.message_id == imported_first.id
+    )
+    service.restore_save_to_snapshot(
+        save_id=imported.save_id,
+        snapshot_id=imported_first_snapshot.id,
+    )
+    assert [
+        message.body for message in repositories.list_messages(imported.save_id)
+    ] == ["I set the lens red."]
+    assert repositories.list_world_state(imported.save_id)[0].value == {"color": "red"}
+
+
+def test_snapshot_export_keeps_latest_active_checkpoints_and_rewires_parents(
+    repositories: PersistenceRepositories,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    baseline = service.capture_baseline_snapshot(save.id)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I tune the lens.",
+    )
+    first = service.capture_message_snapshot(save_id=save.id, message_id=message.id)
+    repositories.upsert_world_state(
+        save_id=save.id,
+        key="lens",
+        value={"color": "blue"},
+        source_message_id=message.id,
+    )
+    latest = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=message.id,
+    )
+    deleted = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I discard this branch.",
+    )
+    deleted_snapshot = service.capture_message_snapshot(
+        save_id=save.id,
+        message_id=deleted.id,
+    )
+    repositories.connection.execute(
+        "UPDATE messages SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (deleted.id,),
+    )
+    repositories.commit()
+
+    snapshot_rows, _objects = service.export_snapshot_rows(
+        save_id=save.id,
+        active_message_ids=(message.id,),
+    )
+
+    assert [row["id"] for row in snapshot_rows] == [baseline.id, latest.id]
+    assert first.id not in {row["id"] for row in snapshot_rows}
+    assert deleted_snapshot.id not in {row["id"] for row in snapshot_rows}
+    assert snapshot_rows[1]["parent_snapshot_id"] == baseline.id
+
+    stored_ids = {
+        row["id"]
+        for row in repositories.connection.execute(
+            "SELECT id FROM save_turn_snapshots WHERE save_id = ?",
+            (save.id,),
+        ).fetchall()
+    }
+    assert {baseline.id, first.id, latest.id, deleted_snapshot.id} <= stored_ids
 
 
 def test_export_import_preserves_snapshot_only_media_for_fork(

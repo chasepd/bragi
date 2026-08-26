@@ -10,7 +10,7 @@ import shutil
 import sqlite3
 import zlib
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -3001,10 +3001,11 @@ class TurnSnapshotService:
                 max_depth=_MAX_SNAPSHOT_OBJECT_JSON_DEPTH,
             )
             value = json.loads(payload.decode("utf-8"))
+        except JsonSafetyError as exc:
+            raise ValueError(f"Snapshot JSON resource limit exceeded: {exc}") from exc
         except (
             UnicodeDecodeError,
             json.JSONDecodeError,
-            JsonSafetyError,
             zlib.error,
         ) as exc:
             raise ValueError(f"Invalid snapshot object payload: {object_hash}") from exc
@@ -3336,11 +3337,47 @@ class TurnSnapshotService:
             """,
             (save_id, save_id),
         ).fetchall()
-        return tuple(
+        all_rows = self.repositories.connection.execute(
+            """
+            SELECT id, save_id, message_id, parent_snapshot_id,
+                   root_manifest_hash, context_revision, reason, created_at
+            FROM save_turn_snapshots
+            WHERE save_id = ?
+            ORDER BY rowid
+            """,
+            (save_id,),
+        ).fetchall()
+        eligible = [
             snapshot
             for snapshot in (_snapshot_record_from_row(row) for row in rows)
             if snapshot.message_id is None or snapshot.message_id in message_ids
-        )
+        ]
+        latest_by_message: dict[str | None, TurnSnapshotRecord] = {}
+        for snapshot in eligible:
+            latest_by_message[snapshot.message_id] = snapshot
+        retained_ids = {snapshot.id for snapshot in latest_by_message.values()}
+        by_id = {
+            snapshot.id: snapshot
+            for snapshot in (_snapshot_record_from_row(row) for row in all_rows)
+        }
+        retained: list[TurnSnapshotRecord] = []
+        for snapshot in eligible:
+            if snapshot.id not in retained_ids:
+                continue
+            parent_id = snapshot.parent_snapshot_id
+            visited: set[str] = set()
+            while parent_id is not None and parent_id not in retained_ids:
+                if parent_id in visited:
+                    parent_id = None
+                    break
+                visited.add(parent_id)
+                parent = by_id.get(parent_id)
+                if parent is None:
+                    parent_id = None
+                    break
+                parent_id = parent.parent_snapshot_id
+            retained.append(replace(snapshot, parent_snapshot_id=parent_id))
+        return tuple(retained)
 
     def _import_remapped_snapshots(
         self,
@@ -6169,11 +6206,12 @@ def _decode_exported_snapshot_object_with_node_count(
             max_depth=_MAX_SNAPSHOT_OBJECT_JSON_DEPTH,
         )
         value = json.loads(payload.decode("utf-8"))
+    except JsonSafetyError as exc:
+        raise ValueError(f"Snapshot JSON resource limit exceeded: {exc}") from exc
     except (
         binascii.Error,
         UnicodeDecodeError,
         json.JSONDecodeError,
-        JsonSafetyError,
         zlib.error,
     ) as exc:
         raise ValueError(f"Invalid snapshot object payload: {object_hash}") from exc
@@ -6392,7 +6430,8 @@ def _validate_snapshot_nested_json_columns(
             )
         except JsonSafetyError as exc:
             raise ValueError(
-                f"Invalid snapshot nested JSON: {table_name}.{column}"
+                "Snapshot JSON resource limit exceeded: "
+                f"{table_name}.{column}: {exc}"
             ) from exc
         json_node_budget[0] -= node_count
         validated_nested_json.add(budget_key)

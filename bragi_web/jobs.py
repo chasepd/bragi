@@ -34,6 +34,7 @@ _TURN_COMPLETION_LEVEL_ORDER = {
 }
 PUBLIC_JOB_FAILURE_ERROR = "Background job failed. Check diagnostics for details."
 _PUBLIC_PROVIDER_FAILURE_PREFIX = "Provider request failed"
+_PUBLIC_JOB_ERROR_PREFIX = "Public job error: "
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,10 @@ class JobRegistryExclusiveKeyError(JobRegistryFullError):
         self.max_active_jobs = 0
         self.exclusive_key = exclusive_key
         self.blocking_job_id = blocking_job_id
+
+
+class PublicJobError(RuntimeError):
+    """A worker failure whose sanitized message is safe to show to the user."""
 
 
 @dataclass
@@ -924,6 +929,8 @@ def _safe_web_job_result(result: object) -> dict[str, object]:
 
 
 def _public_job_error_for_exception(exc: Exception) -> str:
+    if isinstance(exc, PublicJobError):
+        return f"{_PUBLIC_JOB_ERROR_PREFIX}{exc}"
     provider_details = _provider_error_details(exc)
     if provider_details is not None:
         details = [provider_details["category"]]
@@ -943,6 +950,8 @@ def _public_job_error_for_record(record: JobRecord) -> str | None:
     error = record.error
     if error is None:
         return None
+    if error.startswith(_PUBLIC_JOB_ERROR_PREFIX):
+        return error.removeprefix(_PUBLIC_JOB_ERROR_PREFIX)
     if error == PUBLIC_JOB_FAILURE_ERROR or _is_public_provider_failure_error(error):
         return error
     return PUBLIC_JOB_FAILURE_ERROR
