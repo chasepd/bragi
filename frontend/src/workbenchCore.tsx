@@ -1223,6 +1223,16 @@ function triggerBrowserDownload(url: string, filename: string) {
   }
 }
 
+function isChatBundleExportResult(result: unknown): result is ChatBundleExportResult {
+  if (!result || typeof result !== "object") return false;
+  const candidate = result as Partial<ChatBundleExportResult>;
+  return (
+    candidate.kind === "chat_bundle_export"
+    && typeof candidate.download_url === "string"
+    && typeof candidate.filename === "string"
+  );
+}
+
 const SCENARIO_CORE_SECTION_IDS = new Set(["title", "premise", "setup_line", "starting_scene", "player_character_name", "player_role", "character_starters"]);
 const FULL_ROLEPLAY_SCENARIO_SECTION_GROUPS: ScenarioSectionGroup[] = [
   { label: "World", section_ids: ["worldbuilding", "lore", "locations", "factions"] },
@@ -4459,6 +4469,7 @@ function LibraryControls(props: {
             {childRestrictedControlsAllowed ? (
               <SaveBundleControls
                 hasActiveSave={Boolean(props.model?.active_save_id)}
+                exportEnabled={activeSaveSupported}
                 activeSaveId={props.model?.active_save_id ?? null}
                 onImported={(saveId) => {
                   if (saveId) {
@@ -4582,21 +4593,16 @@ function LibraryControls(props: {
                                 allowInactiveSave: true,
                                 allowCrossSaveCompletion: true,
                                 onSucceeded: (result) => {
-                                  const exportResult = result as Partial<ChatBundleExportResult>;
-                                  if (
-                                    exportResult.kind === "chat_bundle_export"
-                                    && typeof exportResult.download_url === "string"
-                                    && typeof exportResult.filename === "string"
-                                  ) {
+                                  if (isChatBundleExportResult(result)) {
                                     try {
                                       triggerBrowserDownload(
-                                        exportResult.download_url,
-                                        exportResult.filename,
+                                        result.download_url,
+                                        result.filename,
                                       );
                                     } catch {
                                       setSaveExportStates((current) => ({
                                         ...current,
-                                        [save.save_id]: "Save export is ready, but the browser blocked the download."
+                                        [save.save_id]: "Save export is ready, but the download could not be started."
                                       }));
                                       return;
                                     }
@@ -7777,11 +7783,13 @@ function initialMediaDraftLabel(_scenarioType: string) {
 
 function SaveBundleControls({
   hasActiveSave,
+  exportEnabled,
   activeSaveId,
   onImported,
   runJob
 }: {
   hasActiveSave: boolean;
+  exportEnabled: boolean;
   activeSaveId: string | null;
   onImported: (saveId: string | null) => void;
   runJob?: RunJob;
@@ -7792,7 +7800,7 @@ function SaveBundleControls({
     ? `/api/story-logs/export?save_id=${encodeURIComponent(activeSaveId)}`
     : "/api/story-logs/export";
   const startExport = async () => {
-    if (!runJob || !hasActiveSave || !activeSaveId || exporting) return;
+    if (!runJob || !hasActiveSave || !exportEnabled || !activeSaveId || exporting) return;
     setExporting(true);
     setExportError("");
     try {
@@ -7804,19 +7812,14 @@ function SaveBundleControls({
         allowInactiveSave: true,
         allowCrossSaveCompletion: true,
         onSucceeded: (result) => {
-          const exportResult = result as Partial<ChatBundleExportResult>;
-          if (
-            exportResult.kind !== "chat_bundle_export"
-            || typeof exportResult.download_url !== "string"
-            || typeof exportResult.filename !== "string"
-          ) {
+          if (!isChatBundleExportResult(result)) {
             setExportError("Save export completed without a download.");
             return;
           }
           try {
-            triggerBrowserDownload(exportResult.download_url, exportResult.filename);
+            triggerBrowserDownload(result.download_url, result.filename);
           } catch {
-            setExportError("Save export is ready, but the browser blocked the download.");
+            setExportError("Save export is ready, but the download could not be started.");
           }
         },
         onFailed: (error) => {
@@ -7839,7 +7842,7 @@ function SaveBundleControls({
       <button
         title="Export active save bundle"
         aria-label="Export active save"
-        disabled={!hasActiveSave || !runJob || exporting}
+        disabled={!hasActiveSave || !exportEnabled || !runJob || exporting}
         onClick={() => void startExport()}
       >
         <Download size={14} /> {exporting ? "Exporting..." : "Export"}

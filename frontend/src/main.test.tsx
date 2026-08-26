@@ -18689,8 +18689,11 @@ describe("frontend helpers", () => {
           download_url: "/api/bundles/export/job-export/download?save_id=save-1"
         });
         options?.onFinished?.({ ...job, status: "succeeded" });
-      } else {
+      } else if (runCount === 2) {
         options?.onFinished?.({ ...job, status: "cancelled" });
+      } else {
+        options?.onSucceeded?.(null);
+        options?.onFinished?.({ ...job, status: "succeeded" });
       }
       return vi.fn();
     });
@@ -18713,12 +18716,16 @@ describe("frontend helpers", () => {
 
     const exportButton = screen.getByRole("button", { name: "Export active save" });
     await userEvent.click(exportButton);
-    expect(await screen.findByText("Save export is ready, but the browser blocked the download.")).toBeInTheDocument();
+    expect(await screen.findByText("Save export is ready, but the download could not be started.")).toBeInTheDocument();
     expect(downloadClick).toHaveBeenCalledTimes(1);
     expect(exportButton).toBeEnabled();
 
     await userEvent.click(exportButton);
     expect(await screen.findByText("Save export cancelled.")).toBeInTheDocument();
+    expect(exportButton).toBeEnabled();
+
+    await userEvent.click(exportButton);
+    expect(await screen.findByText("Save export completed without a download.")).toBeInTheDocument();
     expect(exportButton).toBeEnabled();
   });
 
@@ -18746,6 +18753,7 @@ describe("frontend helpers", () => {
     vi.stubGlobal("fetch", fetchMock);
     let jobOptions: {
       onSucceeded?: (result: unknown) => void;
+      onFailed?: (error: string, job: Job) => void;
       onFinished?: (job: Job) => void;
     } | undefined;
     const runJob = vi.fn((_job: Job, options?: typeof jobOptions) => {
@@ -18780,6 +18788,7 @@ describe("frontend helpers", () => {
     );
 
     const exportButton = screen.getByRole("button", { name: "Export Retired Chronicle" });
+    expect(screen.getByRole("button", { name: "Export active save" })).toBeDisabled();
     await userEvent.click(exportButton);
     await waitFor(() => expect(runJob).toHaveBeenCalledTimes(1));
     expect(exportButton).toBeDisabled();
@@ -18819,7 +18828,26 @@ describe("frontend helpers", () => {
       });
       jobOptions?.onFinished?.({ ...exportJob, status: "succeeded" });
     });
-    expect(await screen.findByText("Save export is ready, but the browser blocked the download.")).toBeInTheDocument();
+    expect(await screen.findByText("Save export is ready, but the download could not be started.")).toBeInTheDocument();
+    expect(exportButton).toBeEnabled();
+
+    await userEvent.click(exportButton);
+    await waitFor(() => expect(runJob).toHaveBeenCalledTimes(4));
+    const failed = { ...exportJob, status: "failed" as const, error: "Legacy export failed." };
+    act(() => {
+      jobOptions?.onFailed?.("Legacy export failed.", failed);
+      jobOptions?.onFinished?.(failed);
+    });
+    expect(await screen.findByText("Legacy export failed.")).toBeInTheDocument();
+    expect(exportButton).toBeEnabled();
+
+    await userEvent.click(exportButton);
+    await waitFor(() => expect(runJob).toHaveBeenCalledTimes(5));
+    act(() => {
+      jobOptions?.onSucceeded?.(null);
+      jobOptions?.onFinished?.({ ...exportJob, status: "succeeded" });
+    });
+    expect(await screen.findByText("Save export completed without a download.")).toBeInTheDocument();
     expect(exportButton).toBeEnabled();
   });
 
