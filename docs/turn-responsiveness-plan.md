@@ -8,8 +8,8 @@ without depending on chat context.
 
 ## Locked Decisions
 
-- Existing quality behavior remains the default.
-- Add an opt-in, save-scoped `responsive` mode.
+- Responsive behavior is the default for missing or invalid save settings.
+- Keep `quality` as an explicit, save-scoped alternative.
 - Responsive mode may skip or combine quality helpers only when deterministic
   eligibility checks say the local context is sufficient.
 - Content-rating safety, phrase and script guards, authentication, and
@@ -45,7 +45,7 @@ log before implementation.
 ### Settings
 
 - `turn_responsiveness_mode`: portable save setting with `quality` and
-  `responsive` values. Missing or invalid values resolve to `quality`.
+  `responsive` values. Missing or invalid values resolve to `responsive`.
 - `provider_call_deadline_seconds`: existing global admin setting, made writable
   through the supported settings API and UI.
 
@@ -390,6 +390,8 @@ For every program PR:
 
 ## Decision And Change Log
 
+- 2026-08-26: Default new and unspecified turn settings to responsive while
+  preserving explicit quality selections per save.
 - 2026-08-12: Preserve quality behavior as the default and add responsive mode
   per save.
 - 2026-08-12: Responsive mode uses adaptive helpers rather than routing-only or

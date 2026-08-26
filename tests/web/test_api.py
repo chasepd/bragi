@@ -7845,7 +7845,7 @@ def test_chat_timing_summary_returns_authenticated_model_scoped_aggregate(
     assert unauthorized.status_code == 401
     assert response.status_code == 200
     assert response.json() == {
-        "mode": "quality",
+        "mode": "responsive",
         "provider": "fake",
         "model": "fake-chat",
         "sample_count": 5,
@@ -10224,7 +10224,7 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
     assert result["save"]["save_id"] == save.id
     persisted = repositories.get_persisted_job(job_id)
     assert persisted is not None
-    assert persisted.payload["turn_responsiveness_mode"] == "quality"
+    assert persisted.payload["turn_responsiveness_mode"] == "responsive"
     assert persisted.payload["narrator_provider"] == "fake"
     assert persisted.payload["narrator_model"] == "fake-chat"
     route_step = next(
@@ -10243,7 +10243,7 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
     )
     assert stratum_step.provider == "fake"
     assert stratum_step.model == "fake-chat"
-    assert stratum_step.metadata == {"turn_responsiveness_mode": "quality"}
+    assert stratum_step.metadata == {"turn_responsiveness_mode": "responsive"}
 
 
 def test_chat_turn_records_execution_stratum_after_preflight_settings_change(
@@ -10349,7 +10349,7 @@ def test_chat_turn_records_execution_stratum_after_preflight_settings_change(
         job_id = created.json()["id"]
         created_job = repositories.get_persisted_job(job_id)
         assert created_job is not None
-        assert created_job.payload["turn_responsiveness_mode"] == "quality"
+        assert created_job.payload["turn_responsiveness_mode"] == "responsive"
         assert created_job.payload["narrator_model"] == "fake-chat"
 
         repositories.set_scoped_setting(

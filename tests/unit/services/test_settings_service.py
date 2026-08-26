@@ -73,7 +73,6 @@ from bragi.services.text_script_policy import (
     SCRIPT_GUARD_MODE_SETTING,
 )
 from bragi.services.turn_responsiveness import (
-    TURN_RESPONSIVENESS_MODE_QUALITY,
     TURN_RESPONSIVENESS_MODE_RESPONSIVE,
     TURN_RESPONSIVENESS_MODE_SETTING,
 )
@@ -1643,7 +1642,7 @@ def test_settings_service_sanitizes_save_turn_responsiveness_mode(
     assert service.get_local_setting(
         TURN_RESPONSIVENESS_MODE_SETTING,
         save_id=save.id,
-    ) == TURN_RESPONSIVENESS_MODE_QUALITY
+    ) == TURN_RESPONSIVENESS_MODE_RESPONSIVE
 
     service.set_local_setting(
         TURN_RESPONSIVENESS_MODE_SETTING,
@@ -1663,7 +1662,7 @@ def test_settings_service_sanitizes_save_turn_responsiveness_mode(
     assert service.get_local_setting(
         TURN_RESPONSIVENESS_MODE_SETTING,
         save_id=save.id,
-    ) == TURN_RESPONSIVENESS_MODE_QUALITY
+    ) == TURN_RESPONSIVENESS_MODE_RESPONSIVE
 
 def test_settings_service_resolves_user_scoped_settings_before_global_defaults(
     repositories: PersistenceRepositories,
