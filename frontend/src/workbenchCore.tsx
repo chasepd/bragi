@@ -254,6 +254,18 @@ type RunJobOptions = {
   allowInactiveSave?: boolean;
 };
 type RunJob = (job: Job, options?: RunJobOptions) => () => void;
+type SaveExportState = string | ChatBundleExportResult;
+type SaveExportStates = Record<string, SaveExportState>;
+type SetSaveExportStates = React.Dispatch<React.SetStateAction<SaveExportStates>>;
+type SaveExports = [SaveExportStates, SetSaveExportStates];
+function setSaveExportState(setStates: SetSaveExportStates, saveId: string, state?: SaveExportState) {
+  setStates((current) => {
+    if (state !== undefined) return { ...current, [saveId]: state };
+    const next = { ...current };
+    delete next[saveId];
+    return next;
+  });
+}
 type JobActionRequest = {
   key: string;
   path: string;
@@ -2923,6 +2935,7 @@ function Workbench({
   const [trackedJobs, setTrackedJobs] = useState<Record<string, TrackedJob>>({});
   const [narratorDrafts, setNarratorDrafts] = useState<Record<string, NarratorDraft>>({});
   const [scenarioRefreshVersion, setScenarioRefreshVersion] = useState(0);
+  const saveExports = useState<SaveExportStates>({});
   const jobWatchers = useRef<Record<string, () => void>>({});
   const jobRunOptionsRef = useRef<Record<string, RunJobOptions>>({});
   const queuedRefreshesRef = useRef<Map<string, QueuedWorkbenchRefresh>>(new Map());
@@ -3870,6 +3883,7 @@ function Workbench({
             compactLibrary={isStackedDesktopWorkbench}
             onOpenLibrary={() => setMobileSheet("library")}
             runJob={runJob}
+            saveExports={saveExports}
           />
           {!isStackedWorkbench ? (
             <WorkbenchResizeHandle
@@ -4066,6 +4080,7 @@ function Workbench({
             onReuseScenarioPrompt={reuseScenarioPrompt}
             onAfterAction={closeMobileSheet}
             runJob={runJob}
+            saveExports={saveExports}
           />
         </MobileSheet>
       ) : null}
@@ -4151,6 +4166,7 @@ function LeftRail(props: {
   compactLibrary?: boolean;
   onOpenLibrary?: () => void;
   runJob?: RunJob;
+  saveExports?: SaveExports;
 }) {
   return (
     <aside className={`left-rail ${props.compactLibrary ? "compact-library-rail" : ""}`}>
@@ -4182,6 +4198,7 @@ function LeftRail(props: {
           onContinuationDraft={props.onContinuationDraft}
           onReuseScenarioPrompt={props.onReuseScenarioPrompt}
           runJob={props.runJob}
+          saveExports={props.saveExports}
         />
       )}
       <PanelNav activePanel={props.activePanel} setPanel={props.setPanel} />
@@ -4203,6 +4220,7 @@ function LibraryControls(props: {
   onReuseScenarioPrompt?: (scenario: Scenario) => Promise<void>;
   onAfterAction?: () => void;
   runJob?: RunJob;
+  saveExports?: SaveExports;
 }) {
   const [confirm, setConfirm] = useState<{ kind: "save" | "scenario"; id: string; title: string } | null>(null);
   const [renamingSave, setRenamingSave] = useState<SaveListItem | null>(null);
@@ -4211,7 +4229,8 @@ function LibraryControls(props: {
   const [chapterDialogOpen, setChapterDialogOpen] = useState(false);
   const [scenarioReuseError, setScenarioReuseError] = useState("");
   const [reusingScenarioId, setReusingScenarioId] = useState("");
-  const [saveExportStates, setSaveExportStates] = useState<Record<string, string | ChatBundleExportResult>>({});
+  const localSaveExports = useState<SaveExportStates>({});
+  const [saveExportStates, setSaveExportStates] = props.saveExports ?? localSaveExports;
   const libraryUserId = props.currentUser?.id ?? null;
   const [scopedLibraryState, setScopedLibraryState] = useState<ScopedLibraryControlsState>(() => ({
     userId: libraryUserId,
@@ -4466,6 +4485,7 @@ function LibraryControls(props: {
                   props.onAfterAction?.();
                 }}
                 runJob={props.runJob}
+                saveExports={[saveExportStates, setSaveExportStates]}
               />
             ) : null}
             <button
@@ -4556,11 +4576,7 @@ function LibraryControls(props: {
                   </button>
                   {childRestrictedControlsAllowed ? (
                     <div className="row-tools library-row-tools">
-                      {save.supported !== false ? (
-                        <button type="button" className={touchActionClassName()} title="Rename save" aria-label={`Rename ${save.title}`} onClick={() => setRenamingSave(save)}>
-                          <TouchActionContents icon={<Edit3 size={14} />} label="Rename" />
-                        </button>
-                      ) : exportDownload ? (
+                      {exportDownload && (save.supported === false || save.save_id !== props.model?.active_save_id) ? (
                         <a
                           className={touchActionClassName("download-link")}
                           href={exportDownload.download_url}
@@ -4569,16 +4585,16 @@ function LibraryControls(props: {
                           aria-label={`Download ${save.title} export`}
                           onClick={() => {
                             window.setTimeout(() => {
-                              setSaveExportStates((current) => {
-                                const next = { ...current };
-                                delete next[save.save_id];
-                                return next;
-                              });
+                              setSaveExportState(setSaveExportStates, save.save_id);
                             }, 0);
                           }}
                         >
                           <TouchActionContents icon={<Download size={14} />} label="Download" />
                         </a>
+                      ) : save.supported !== false ? (
+                        <button type="button" className={touchActionClassName()} title="Rename save" aria-label={`Rename ${save.title}`} onClick={() => setRenamingSave(save)}>
+                          <TouchActionContents icon={<Edit3 size={14} />} label="Rename" />
+                        </button>
                       ) : (
                         <button
                           type="button"
@@ -4589,10 +4605,7 @@ function LibraryControls(props: {
                           onClick={() => {
                             if (!props.runJob) return;
                             if (saveExportStates[save.save_id] === "pending") return;
-                            setSaveExportStates((current) => ({
-                              ...current,
-                              [save.save_id]: "pending"
-                            }));
+                            setSaveExportState(setSaveExportStates, save.save_id, "pending");
                             void postJson<Job>("/api/bundles/export", {
                               save_id: save.save_id,
                               include_revision_history: false
@@ -4602,38 +4615,25 @@ function LibraryControls(props: {
                                 allowCrossSaveCompletion: true,
                                 onSucceeded: (result) => {
                                   if (isChatBundleExportResult(result)) {
-                                    setSaveExportStates((current) => ({
-                                      ...current,
-                                      [save.save_id]: result
-                                    }));
+                                    setSaveExportState(setSaveExportStates, save.save_id, result);
                                   } else {
-                                    setSaveExportStates((current) => ({
-                                      ...current,
-                                      [save.save_id]: "Save export completed without a download."
-                                    }));
+                                    setSaveExportState(setSaveExportStates, save.save_id, "Save export completed without a download.");
                                   }
                                 },
                                 onFailed: (error) => {
-                                  setSaveExportStates((current) => ({
-                                    ...current,
-                                    [save.save_id]: error
-                                  }));
+                                  setSaveExportState(setSaveExportStates, save.save_id, error);
                                 },
                                 onFinished: (finished) => {
                                   if (finished.status !== "cancelled") return;
-                                  setSaveExportStates((current) => ({
-                                    ...current,
-                                    [save.save_id]: "Save export cancelled."
-                                  }));
+                                  setSaveExportState(setSaveExportStates, save.save_id, "Save export cancelled.");
                                 }
                               });
                             }, (failure) => {
-                              setSaveExportStates((current) => ({
-                                ...current,
-                                [save.save_id]: failure instanceof Error
-                                  ? failure.message
-                                  : "Could not start save export"
-                              }));
+                              setSaveExportState(
+                                setSaveExportStates,
+                                save.save_id,
+                                failure instanceof Error ? failure.message : "Could not start save export"
+                              );
                             });
                           }}
                         >
@@ -4648,9 +4648,11 @@ function LibraryControls(props: {
                       </button>
                     </div>
                   ) : null}
-                  {exportDownload ? (
+                  {exportDownload && (save.supported === false || save.save_id !== props.model?.active_save_id) ? (
                     <small role="status">Save export ready.</small>
-                  ) : typeof exportState === "string" && exportState !== "pending" ? (
+                  ) : typeof exportState === "string"
+                    && exportState !== "pending"
+                    && (save.supported === false || save.save_id !== props.model?.active_save_id) ? (
                     <small
                       role="alert"
                     >
@@ -7788,25 +7790,29 @@ function SaveBundleControls({
   exportEnabled,
   activeSaveId,
   onImported,
-  runJob
+  runJob,
+  saveExports
 }: {
   hasActiveSave: boolean;
   exportEnabled: boolean;
   activeSaveId: string | null;
   onImported: (saveId: string | null) => void;
   runJob?: RunJob;
+  saveExports: SaveExports;
 }) {
-  const [exporting, setExporting] = useState(false);
-  const [exportError, setExportError] = useState("");
-  const [exportDownload, setExportDownload] = useState<ChatBundleExportResult | null>(null);
+  const [saveExportStates, setSaveExportStates] = saveExports;
+  const exportState = activeSaveId ? saveExportStates[activeSaveId] : undefined;
+  const exporting = exportEnabled && exportState === "pending";
+  const exportDownload = exportEnabled && isChatBundleExportResult(exportState) ? exportState : null;
+  const exportError = exportEnabled && typeof exportState === "string" && exportState !== "pending"
+    ? exportState
+    : "";
   const storyLogPath = activeSaveId
     ? `/api/story-logs/export?save_id=${encodeURIComponent(activeSaveId)}`
     : "/api/story-logs/export";
   const startExport = async () => {
     if (!runJob || !hasActiveSave || !exportEnabled || !activeSaveId || exporting) return;
-    setExporting(true);
-    setExportError("");
-    setExportDownload(null);
+    setSaveExportState(setSaveExportStates, activeSaveId, "pending");
     try {
       const created = await postJson<Job>("/api/bundles/export", {
         save_id: activeSaveId,
@@ -7817,24 +7823,26 @@ function SaveBundleControls({
         allowCrossSaveCompletion: true,
         onSucceeded: (result) => {
           if (!isChatBundleExportResult(result)) {
-            setExportError("Save export completed without a download.");
+            setSaveExportState(setSaveExportStates, activeSaveId, "Save export completed without a download.");
             return;
           }
-          setExportDownload(result);
+          setSaveExportState(setSaveExportStates, activeSaveId, result);
         },
         onFailed: (error) => {
-          setExportError(error);
+          setSaveExportState(setSaveExportStates, activeSaveId, error);
         },
         onFinished: (job) => {
           if (job.status === "cancelled") {
-            setExportError("Save export cancelled.");
+            setSaveExportState(setSaveExportStates, activeSaveId, "Save export cancelled.");
           }
-          setExporting(false);
         }
       });
     } catch (failure) {
-      setExporting(false);
-      setExportError(failure instanceof Error ? failure.message : "Could not start save export");
+      setSaveExportState(
+        setSaveExportStates,
+        activeSaveId,
+        failure instanceof Error ? failure.message : "Could not start save export"
+      );
     }
   };
   return (
@@ -7847,7 +7855,9 @@ function SaveBundleControls({
           title="Download completed save export"
           aria-label="Download completed save export"
           onClick={() => {
-            window.setTimeout(() => setExportDownload(null), 0);
+            window.setTimeout(() => {
+              if (activeSaveId) setSaveExportState(setSaveExportStates, activeSaveId);
+            }, 0);
           }}
         >
           <Download size={14} /> Download

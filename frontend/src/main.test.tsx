@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import type { CharacterTextContact, CharacterTextMessage, CharacterTextThread, CharacterTextsModel, ChatSubmissionStatus, ChatTurnDelta, CharacterRegistryModel, DiagnosticsModel, Job, ModelOption, RuntimeModel, Scenario, ScenarioContentSection, ScenarioDraft, SettingsModel, TaskModelSelector, WorldDataModel } from "./api";
+import type { CharacterTextContact, CharacterTextMessage, CharacterTextThread, CharacterTextsModel, ChatBundleExportResult, ChatSubmissionStatus, ChatTurnDelta, CharacterRegistryModel, DiagnosticsModel, Job, ModelOption, RuntimeModel, Scenario, ScenarioContentSection, ScenarioDraft, SettingsModel, TaskModelSelector, WorldDataModel } from "./api";
 
 const EXPECTED_IMAGE_STYLE_PRESETS = [
   "none",
@@ -18652,6 +18652,136 @@ describe("frontend helpers", () => {
     });
     expect(await screen.findByText("Export is too large")).toBeInTheDocument();
     expect(exportButton).not.toBeDisabled();
+  });
+
+  it("keeps a completed save export available across library navigation", async () => {
+    const exportJob: Job = {
+      id: "job-navigation-export",
+      type: "chat_bundle_export",
+      save_id: "save-1",
+      status: "queued",
+      result: null,
+      error: null
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => exportJob
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    let jobOptions: {
+      onSucceeded?: (result: unknown) => void;
+      onFinished?: (job: Job) => void;
+    } | undefined;
+    const runJob = vi.fn((_job: Job, options?: typeof jobOptions) => {
+      jobOptions = options;
+      return vi.fn();
+    });
+    const { LeftRail } = await import("./main");
+
+    render(
+      <LeftRail
+        model={runtimeModel({ saves: [{ save_id: "save-1", title: "Lantern Run", active: true }] })}
+        scenarios={[]}
+        onChanged={vi.fn()}
+        onSelectSave={vi.fn()}
+        pendingSaveId={null}
+        saveSelectionError=""
+        onNew={vi.fn()}
+        activePanel="media"
+        setPanel={vi.fn()}
+        runJob={runJob}
+      />
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Export active save" }));
+    await waitFor(() => expect(runJob).toHaveBeenCalledTimes(1));
+    await userEvent.click(screen.getByRole("tab", { name: "Scenarios (0)" }));
+
+    act(() => {
+      jobOptions?.onSucceeded?.({
+        kind: "chat_bundle_export",
+        filename: "navigation.bragi-chat",
+        download_url: "/api/bundles/export/job-navigation-export/download?save_id=save-1"
+      });
+      jobOptions?.onFinished?.({ ...exportJob, status: "succeeded" });
+    });
+
+    await userEvent.click(screen.getByRole("tab", { name: "Saves (1)" }));
+    expect(screen.getByRole("link", { name: "Download completed save export" })).toHaveAttribute(
+      "download",
+      "navigation.bragi-chat"
+    );
+  });
+
+  it("keeps a completed save export available after the library unmounts", async () => {
+    const exportJob: Job = {
+      id: "job-mobile-export",
+      type: "chat_bundle_export",
+      save_id: "save-1",
+      status: "queued",
+      result: null,
+      error: null
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => exportJob
+    }));
+    let jobOptions: {
+      onSucceeded?: (result: unknown) => void;
+      onFinished?: (job: Job) => void;
+    } | undefined;
+    const runJob = vi.fn((_job: Job, options?: typeof jobOptions) => {
+      jobOptions = options;
+      return vi.fn();
+    });
+    const { LeftRail } = await import("./main");
+
+    function Harness() {
+      const [libraryOpen, setLibraryOpen] = React.useState(true);
+      const saveExports = React.useState<Record<string, string | ChatBundleExportResult>>({});
+      return (
+        <>
+          <button type="button" onClick={() => setLibraryOpen((open) => !open)}>
+            {libraryOpen ? "Close library" : "Open library"}
+          </button>
+          {libraryOpen ? (
+            <LeftRail
+              model={runtimeModel({ saves: [{ save_id: "save-1", title: "Lantern Run", active: true }] })}
+              scenarios={[]}
+              onChanged={vi.fn()}
+              onSelectSave={vi.fn()}
+              pendingSaveId={null}
+              saveSelectionError=""
+              onNew={vi.fn()}
+              activePanel="media"
+              setPanel={vi.fn()}
+              runJob={runJob}
+              saveExports={saveExports}
+            />
+          ) : null}
+        </>
+      );
+    }
+
+    render(<Harness />);
+    await userEvent.click(screen.getByRole("button", { name: "Export active save" }));
+    await waitFor(() => expect(runJob).toHaveBeenCalledTimes(1));
+    await userEvent.click(screen.getByRole("button", { name: "Close library" }));
+
+    act(() => {
+      jobOptions?.onSucceeded?.({
+        kind: "chat_bundle_export",
+        filename: "mobile.bragi-chat",
+        download_url: "/api/bundles/export/job-mobile-export/download?save_id=save-1"
+      });
+      jobOptions?.onFinished?.({ ...exportJob, status: "succeeded" });
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Open library" }));
+    expect(screen.getByRole("link", { name: "Download completed save export" })).toHaveAttribute(
+      "download",
+      "mobile.bragi-chat"
+    );
   });
 
   it("restores active save export controls after download, cancellation, and malformed completion", async () => {
