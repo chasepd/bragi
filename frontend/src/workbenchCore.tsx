@@ -1209,26 +1209,28 @@ function openDownloadInNewTab(url: string) {
   window.open(url, "_blank", "noopener,noreferrer");
 }
 
-function reserveDownloadWindow(): Window | null {
-  const downloadWindow = window.open("about:blank", "_blank");
-  if (downloadWindow) downloadWindow.opener = null;
-  return downloadWindow;
-}
-
-function triggerReservedDownload(url: string, downloadWindow: Window | null) {
-  if (downloadWindow && !downloadWindow.closed) {
-    downloadWindow.location.href = url;
-    return;
-  }
+function triggerBrowserDownload(url: string, filename: string) {
   const link = document.createElement("a");
   link.href = url;
-  link.download = "";
+  link.download = filename;
   link.rel = "noopener noreferrer";
-  link.click();
+  link.hidden = true;
+  document.body.appendChild(link);
+  try {
+    link.click();
+  } finally {
+    link.remove();
+  }
 }
 
-function closeReservedDownloadWindow(downloadWindow: Window | null) {
-  if (downloadWindow && !downloadWindow.closed) downloadWindow.close();
+function isChatBundleExportResult(result: unknown): result is ChatBundleExportResult {
+  if (!result || typeof result !== "object") return false;
+  const candidate = result as Partial<ChatBundleExportResult>;
+  return (
+    candidate.kind === "chat_bundle_export"
+    && typeof candidate.download_url === "string"
+    && typeof candidate.filename === "string"
+  );
 }
 
 const SCENARIO_CORE_SECTION_IDS = new Set(["title", "premise", "setup_line", "starting_scene", "player_character_name", "player_role", "character_starters"]);
@@ -4467,6 +4469,7 @@ function LibraryControls(props: {
             {childRestrictedControlsAllowed ? (
               <SaveBundleControls
                 hasActiveSave={Boolean(props.model?.active_save_id)}
+                exportEnabled={activeSaveSupported}
                 activeSaveId={props.model?.active_save_id ?? null}
                 onImported={(saveId) => {
                   if (saveId) {
@@ -4578,7 +4581,6 @@ function LibraryControls(props: {
                           onClick={() => {
                             if (!props.runJob) return;
                             if (saveExportStates[save.save_id] === "pending") return;
-                            const downloadWindow = reserveDownloadWindow();
                             setSaveExportStates((current) => ({
                               ...current,
                               [save.save_id]: "pending"
@@ -4591,18 +4593,25 @@ function LibraryControls(props: {
                                 allowInactiveSave: true,
                                 allowCrossSaveCompletion: true,
                                 onSucceeded: (result) => {
-                                  const downloadUrl = (
-                                    result as { download_url?: unknown }
-                                  ).download_url;
-                                  if (typeof downloadUrl === "string") {
-                                    triggerReservedDownload(downloadUrl, downloadWindow);
+                                  if (isChatBundleExportResult(result)) {
+                                    try {
+                                      triggerBrowserDownload(
+                                        result.download_url,
+                                        result.filename,
+                                      );
+                                    } catch {
+                                      setSaveExportStates((current) => ({
+                                        ...current,
+                                        [save.save_id]: "Save export is ready, but the download could not be started."
+                                      }));
+                                      return;
+                                    }
                                     setSaveExportStates((current) => {
                                       const next = { ...current };
                                       delete next[save.save_id];
                                       return next;
                                     });
                                   } else {
-                                    closeReservedDownloadWindow(downloadWindow);
                                     setSaveExportStates((current) => ({
                                       ...current,
                                       [save.save_id]: "Save export completed without a download."
@@ -4610,7 +4619,6 @@ function LibraryControls(props: {
                                   }
                                 },
                                 onFailed: (error) => {
-                                  closeReservedDownloadWindow(downloadWindow);
                                   setSaveExportStates((current) => ({
                                     ...current,
                                     [save.save_id]: error
@@ -4618,7 +4626,6 @@ function LibraryControls(props: {
                                 },
                                 onFinished: (finished) => {
                                   if (finished.status !== "cancelled") return;
-                                  closeReservedDownloadWindow(downloadWindow);
                                   setSaveExportStates((current) => ({
                                     ...current,
                                     [save.save_id]: "Save export cancelled."
@@ -4626,7 +4633,6 @@ function LibraryControls(props: {
                                 }
                               });
                             }, (failure) => {
-                              closeReservedDownloadWindow(downloadWindow);
                               setSaveExportStates((current) => ({
                                 ...current,
                                 [save.save_id]: failure instanceof Error
@@ -7777,11 +7783,13 @@ function initialMediaDraftLabel(_scenarioType: string) {
 
 function SaveBundleControls({
   hasActiveSave,
+  exportEnabled,
   activeSaveId,
   onImported,
   runJob
 }: {
   hasActiveSave: boolean;
+  exportEnabled: boolean;
   activeSaveId: string | null;
   onImported: (saveId: string | null) => void;
   runJob?: RunJob;
@@ -7792,8 +7800,7 @@ function SaveBundleControls({
     ? `/api/story-logs/export?save_id=${encodeURIComponent(activeSaveId)}`
     : "/api/story-logs/export";
   const startExport = async () => {
-    if (!runJob || !hasActiveSave || !activeSaveId || exporting) return;
-    const downloadWindow = reserveDownloadWindow();
+    if (!runJob || !hasActiveSave || !exportEnabled || !activeSaveId || exporting) return;
     setExporting(true);
     setExportError("");
     try {
@@ -7805,31 +7812,27 @@ function SaveBundleControls({
         allowInactiveSave: true,
         allowCrossSaveCompletion: true,
         onSucceeded: (result) => {
-          const exportResult = result as Partial<ChatBundleExportResult>;
-          if (
-            exportResult.kind !== "chat_bundle_export"
-            || typeof exportResult.download_url !== "string"
-          ) {
-            closeReservedDownloadWindow(downloadWindow);
+          if (!isChatBundleExportResult(result)) {
             setExportError("Save export completed without a download.");
             return;
           }
-          triggerReservedDownload(exportResult.download_url, downloadWindow);
+          try {
+            triggerBrowserDownload(result.download_url, result.filename);
+          } catch {
+            setExportError("Save export is ready, but the download could not be started.");
+          }
         },
         onFailed: (error) => {
-          closeReservedDownloadWindow(downloadWindow);
           setExportError(error);
         },
         onFinished: (job) => {
           if (job.status === "cancelled") {
-            closeReservedDownloadWindow(downloadWindow);
             setExportError("Save export cancelled.");
           }
           setExporting(false);
         }
       });
     } catch (failure) {
-      closeReservedDownloadWindow(downloadWindow);
       setExporting(false);
       setExportError(failure instanceof Error ? failure.message : "Could not start save export");
     }
@@ -7839,7 +7842,7 @@ function SaveBundleControls({
       <button
         title="Export active save bundle"
         aria-label="Export active save"
-        disabled={!hasActiveSave || !runJob || exporting}
+        disabled={!hasActiveSave || !exportEnabled || !runJob || exporting}
         onClick={() => void startExport()}
       >
         <Download size={14} /> {exporting ? "Exporting..." : "Export"}
