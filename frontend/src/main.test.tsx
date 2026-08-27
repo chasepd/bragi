@@ -18893,8 +18893,9 @@ describe("frontend helpers", () => {
     vi.stubGlobal("fetch", fetchMock);
     const { Workbench } = await import("./main");
 
+    const client = new QueryClient();
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <QueryClientProvider client={client}>
         <Workbench />
       </QueryClientProvider>
     );
@@ -18906,6 +18907,13 @@ describe("frontend helpers", () => {
     );
     expect(downloadLink).toHaveAttribute("download", "recovered.bragi-chat");
     expect(screen.getByText("Save export ready.")).toBeInTheDocument();
+
+    downloadLink.addEventListener("click", (event) => event.preventDefault(), { once: true });
+    await userEvent.click(downloadLink);
+    expect(client.getQueryData(["export-ready", "save-1"])).toEqual({
+      active: false,
+      export: null
+    });
   });
 
   it("keeps polling through the export completion persistence window", async () => {

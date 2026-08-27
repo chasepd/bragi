@@ -6572,21 +6572,43 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     detail=_SAVE_ID_REQUIRED_DETAIL,
                 )
             _raise_unless_save_action_allowed(state, resolved_save_id, "export")
-            if any(
-                record.type == "chat_bundle_export"
-                for record in state.jobs.list_active(save_id=resolved_save_id)
-            ):
-                return {"active": True, "export": None}
+            live_export = next(
+                (
+                    record
+                    for record in state.jobs.list_for_save(resolved_save_id)
+                    if record.type == "chat_bundle_export"
+                ),
+                None,
+            )
+            if live_export is not None:
+                if live_export.status in ACTIVE_JOB_STATUSES:
+                    return {"active": True, "export": None}
+                if live_export.status == "succeeded":
+                    bundle_path = _save_export_bundle_path(state, live_export.id)
+                    if bundle_path.is_file():
+                        return {
+                            "active": False,
+                            "export": _save_export_download_result(
+                                live_export.id,
+                                resolved_save_id,
+                                bundle_path,
+                            ),
+                        }
+                return {"active": False, "export": None}
             records = state.repositories.list_recent_jobs(
                 save_id=resolved_save_id,
                 types=("chat_bundle_export",),
-                statuses=("succeeded",),
+                statuses=tuple(sorted(ACTIVE_JOB_STATUSES | TERMINAL_JOB_STATUSES)),
                 seconds=_SAVE_EXPORT_FILE_TTL_SECONDS,
                 limit=10,
             )
             for record in records:
                 if not _request_user_can_access_job(state, record):
                     continue
+                if record.status in ACTIVE_JOB_STATUSES:
+                    return {"active": True, "export": None}
+                if record.status != "succeeded":
+                    return {"active": False, "export": None}
                 bundle_path = _save_export_bundle_path(state, record.id)
                 if bundle_path.is_file():
                     return {
@@ -6597,6 +6619,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                             bundle_path,
                         )
                     }
+                return {"active": False, "export": None}
         return {"active": False, "export": None}
 
     @app.get("/api/bundles/export/{job_id}/download")

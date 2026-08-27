@@ -211,6 +211,19 @@ class JobRegistry:
             record = self._active_exclusive_job_locked(exclusive_key)
             return self._snapshot_locked(record) if record is not None else None
 
+    def list_for_save(self, save_id: str) -> list[JobRecord]:
+        with self._condition:
+            self._prune_completed_locked(time())
+            return sorted(
+                (
+                    self._snapshot_locked(record)
+                    for record in self._jobs.values()
+                    if record.save_id == save_id
+                ),
+                key=lambda record: record.created_at,
+                reverse=True,
+            )
+
     async def cancel(self, job_id: str) -> bool:
         queued_cancel: tuple[
             JobRecord,

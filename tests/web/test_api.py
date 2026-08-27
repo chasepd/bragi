@@ -20113,6 +20113,66 @@ def test_bundle_export_ready_recovers_download_after_registry_loss(
         assert failed_download.json()["detail"] == "Export could not be prepared"
 
 
+def test_bundle_export_ready_prefers_newer_live_success_over_older_persisted(
+    tmp_path: Path,
+) -> None:
+    class ExportRuntime(_RuntimeDouble):
+        def export_active_save(self, bundle_path: Path) -> SimpleNamespace:
+            bundle_path.write_bytes(bundle_path.name.encode())
+            return SimpleNamespace(error=None)
+
+    state = _repository_state_double(tmp_path, ExportRuntime())
+    scenario = state.repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A mountain beacon is going dark.",
+        player_role="Keeper",
+        content={"opening_message": "The beacon snaps awake."},
+    )
+    state.repositories.create_save(
+        scenario_id=scenario.id,
+        title="Lantern Keep",
+        save_id="save-1",
+    )
+    state.jobs._repositories = state.repositories  # noqa: SLF001 - production wiring
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        older = client.post(
+            "/api/bundles/export",
+            json={"save_id": "save-1"},
+        )
+        assert older.status_code == 200
+        assert _wait_for_terminal_job(
+            client,
+            older.json()["id"],
+            save_id="save-1",
+        )["status"] == "succeeded"
+
+        newer = client.post(
+            "/api/bundles/export",
+            json={"save_id": "save-1"},
+        )
+        assert newer.status_code == 200
+        newer_job_id = newer.json()["id"]
+        assert _wait_for_terminal_job(
+            client,
+            newer_job_id,
+            save_id="save-1",
+        )["status"] == "succeeded"
+        state.repositories.connection.execute(
+            "UPDATE jobs SET status = 'running' WHERE id = ?",
+            (newer_job_id,),
+        )
+        state.repositories.commit()
+
+        ready = client.get("/api/bundles/export/ready?save_id=save-1")
+
+    assert ready.status_code == 200
+    assert ready.json()["export"]["download_url"] == (
+        f"/api/bundles/export/{newer_job_id}/download?save_id=save-1"
+    )
+
+
 def test_bundle_export_rejects_duplicate_active_export(tmp_path: Path) -> None:
     started = threading.Event()
     release = threading.Event()

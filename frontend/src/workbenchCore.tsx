@@ -257,7 +257,8 @@ type RunJob = (job: Job, options?: RunJobOptions) => () => void;
 type SaveExportState = string | ChatBundleExportResult;
 type SaveExportStates = Record<string, SaveExportState>;
 type SetSaveExportStates = React.Dispatch<React.SetStateAction<SaveExportStates>>;
-type SaveExports = [SaveExportStates, SetSaveExportStates];
+type ClearSaveExportRecovery = (saveId: string) => void;
+type SaveExports = [SaveExportStates, SetSaveExportStates, ClearSaveExportRecovery?];
 const SAVE_EXPORT_RECOVERY_WINDOW_MS = 15_000;
 function setSaveExportState(setStates: SetSaveExportStates, saveId: string, state?: SaveExportState) {
   setStates((current) => {
@@ -3057,15 +3058,25 @@ function Workbench({
     ) ? 3_000 : false,
     retry: false,
   });
+  const clearSaveExportRecovery = useCallback((saveId: string) => {
+    client.setQueryData(["export-ready", saveId], { active: false, export: null });
+  }, [client]);
   useEffect(() => {
-    const recovered = readySaveExport.data?.export;
-    if (!activeSaveId || !isChatBundleExportResult(recovered)) return;
+    const ready = readySaveExport.data;
+    if (!activeSaveId || !ready) return;
+    const recovered = ready.export;
     setSaveExportStates((current) => {
       const existing = current[activeSaveId];
+      if (!isChatBundleExportResult(recovered)) {
+        if (ready.active || !isChatBundleExportResult(existing)) return current;
+        const next = { ...current };
+        delete next[activeSaveId];
+        return next;
+      }
       if (existing !== undefined && existing !== "pending") return current;
       return { ...current, [activeSaveId]: recovered };
     });
-  }, [activeSaveId, readySaveExport.data?.export]);
+  }, [activeSaveId, readySaveExport.data]);
   const chatSubmissionStatus = useQuery({
     queryKey: ["chat", "submission-status", activeSaveId],
     queryFn: ({ signal }) => apiRead<ChatSubmissionStatus>(chatSubmissionStatusPath(activeSaveId), signal),
@@ -3957,7 +3968,7 @@ function Workbench({
             compactLibrary={isStackedDesktopWorkbench}
             onOpenLibrary={() => setMobileSheet("library")}
             runJob={runJob}
-            saveExports={[saveExportStates, setSaveExportStates]}
+            saveExports={[saveExportStates, setSaveExportStates, clearSaveExportRecovery]}
           />
           {!isStackedWorkbench ? (
             <WorkbenchResizeHandle
@@ -4154,7 +4165,7 @@ function Workbench({
             onReuseScenarioPrompt={reuseScenarioPrompt}
             onAfterAction={closeMobileSheet}
             runJob={runJob}
-            saveExports={[saveExportStates, setSaveExportStates]}
+            saveExports={[saveExportStates, setSaveExportStates, clearSaveExportRecovery]}
           />
         </MobileSheet>
       ) : null}
@@ -4306,6 +4317,7 @@ function LibraryControls(props: {
   const [reusingScenarioId, setReusingScenarioId] = useState("");
   const localSaveExports = useState<SaveExportStates>({});
   const [saveExportStates, setSaveExportStates] = props.saveExports ?? localSaveExports;
+  const clearSaveExportRecovery = props.saveExports?.[2];
   const libraryUserId = props.currentUser?.id ?? null;
   const [scopedLibraryState, setScopedLibraryState] = useState<ScopedLibraryControlsState>(() => ({
     userId: libraryUserId,
@@ -4560,7 +4572,7 @@ function LibraryControls(props: {
                   props.onAfterAction?.();
                 }}
                 runJob={props.runJob}
-                saveExports={[saveExportStates, setSaveExportStates]}
+                saveExports={[saveExportStates, setSaveExportStates, clearSaveExportRecovery]}
               />
             ) : null}
             <button
@@ -7871,7 +7883,7 @@ function SaveBundleControls({
   runJob?: RunJob;
   saveExports: SaveExports;
 }) {
-  const [saveExportStates, setSaveExportStates] = saveExports;
+  const [saveExportStates, setSaveExportStates, clearSaveExportRecovery] = saveExports;
   const exportState = activeSaveId ? saveExportStates[activeSaveId] : undefined;
   const exporting = exportEnabled && exportState === "pending";
   const exportDownload = exportEnabled && isChatBundleExportResult(exportState) ? exportState : null;
@@ -7883,6 +7895,7 @@ function SaveBundleControls({
     : "/api/story-logs/export";
   const startExport = async () => {
     if (!runJob || !hasActiveSave || !exportEnabled || !activeSaveId || exporting) return;
+    clearSaveExportRecovery?.(activeSaveId);
     setSaveExportState(setSaveExportStates, activeSaveId, "pending");
     try {
       const created = await postJson<Job>("/api/bundles/export", {
@@ -7926,6 +7939,7 @@ function SaveBundleControls({
           title="Download completed save export"
           aria-label="Download completed save export"
           onClick={() => {
+            if (activeSaveId) clearSaveExportRecovery?.(activeSaveId);
             window.setTimeout(() => {
               if (activeSaveId) setSaveExportState(setSaveExportStates, activeSaveId);
             }, 0);
