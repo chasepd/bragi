@@ -20034,6 +20034,59 @@ def test_bundle_export_job_downloads_and_cleans_up_success_error_and_exception(
         assert not runtime.export_path.exists()
 
 
+def test_bundle_export_ready_recovers_download_after_registry_loss(
+    tmp_path: Path,
+) -> None:
+    class ExportRuntime(_RuntimeDouble):
+        def export_active_save(self, bundle_path: Path) -> SimpleNamespace:
+            bundle_path.write_bytes(b"recovered bundle")
+            return SimpleNamespace(error=None)
+
+    state = _repository_state_double(tmp_path, ExportRuntime())
+    scenario = state.repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A mountain beacon is going dark.",
+        player_role="Keeper",
+        content={"opening_message": "The beacon snaps awake."},
+    )
+    state.repositories.create_save(
+        scenario_id=scenario.id,
+        title="Lantern Keep",
+        save_id="save-1",
+    )
+    state.jobs._repositories = state.repositories  # noqa: SLF001 - production wiring
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        started = client.post("/api/bundles/export", json={"save_id": "save-1"})
+        assert started.status_code == 200
+        job_id = started.json()["id"]
+        finished = _wait_for_terminal_job(client, job_id, save_id="save-1")
+        assert finished["status"] == "succeeded"
+
+        state.jobs._jobs.clear()  # noqa: SLF001 - simulate server/page recovery
+        ready = client.get("/api/bundles/export/ready?save_id=save-1")
+        assert ready.status_code == 200
+        assert ready.json() == {
+            "export": {
+                "kind": "chat_bundle_export",
+                "filename": f"bragi-export-{job_id}.bragi-chat",
+                "download_url": (
+                    f"/api/bundles/export/{job_id}/download?save_id=save-1"
+                ),
+            }
+        }
+
+        downloaded = client.get(
+            f"/api/bundles/export/{job_id}/download?save_id=save-1"
+        )
+        assert downloaded.status_code == 200
+        assert downloaded.content == b"recovered bundle"
+        assert client.get(
+            "/api/bundles/export/ready?save_id=save-1"
+        ).json() == {"export": None}
+
+
 def test_bundle_export_rejects_duplicate_active_export(tmp_path: Path) -> None:
     started = threading.Event()
     release = threading.Event()
@@ -20147,6 +20200,7 @@ def test_bundle_export_download_enforces_save_access(tmp_path: Path) -> None:
             return SimpleNamespace(error=None)
 
     state = _auth_state(tmp_path, ExportRuntime())
+    state.jobs._repositories = state.repositories  # noqa: SLF001 - production wiring
     mira = state.auth_service().create_user(
         username="Mira",
         password="correct horse",
@@ -20186,6 +20240,10 @@ def test_bundle_export_download_enforces_save_access(tmp_path: Path) -> None:
             "/api/auth/login",
             json={"username": "Rook", "password": "correct horse"},
         ).status_code == 200
+        ready_denied = rook_client.get(
+            f"/api/bundles/export/ready?save_id={save.id}"
+        )
+        assert ready_denied.status_code == 404
         denied = rook_client.get(
             f"/api/bundles/export/{job_id}/download?save_id={save.id}"
         )
@@ -20196,6 +20254,13 @@ def test_bundle_export_download_enforces_save_access(tmp_path: Path) -> None:
             "/api/auth/login",
             json={"username": "Mira", "password": "correct horse"},
         ).status_code == 200
+        ready = mira_client.get(
+            f"/api/bundles/export/ready?save_id={save.id}"
+        )
+        assert ready.status_code == 200
+        assert ready.json()["export"]["download_url"] == (
+            f"/api/bundles/export/{job_id}/download?save_id={save.id}"
+        )
         downloaded = mira_client.get(
             f"/api/bundles/export/{job_id}/download?save_id={save.id}"
         )

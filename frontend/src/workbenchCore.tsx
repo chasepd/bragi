@@ -2953,7 +2953,7 @@ function Workbench({
   const [trackedJobs, setTrackedJobs] = useState<Record<string, TrackedJob>>({});
   const [narratorDrafts, setNarratorDrafts] = useState<Record<string, NarratorDraft>>({});
   const [scenarioRefreshVersion, setScenarioRefreshVersion] = useState(0);
-  const saveExports = useState<SaveExportStates>({});
+  const [saveExportStates, setSaveExportStates] = useState<SaveExportStates>({});
   const jobWatchers = useRef<Record<string, () => void>>({});
   const jobRunOptionsRef = useRef<Record<string, RunJobOptions>>({});
   const queuedRefreshesRef = useRef<Map<string, QueuedWorkbenchRefresh>>(new Map());
@@ -3021,6 +3021,32 @@ function Workbench({
     enabled: Boolean(model),
     retry: false
   });
+  const readySaveExport = useQuery({
+    queryKey: ["export-ready", activeSaveId],
+    queryFn: ({ signal }) => apiRead<{ export: ChatBundleExportResult | null }>(
+      `/api/bundles/export/ready?save_id=${encodeURIComponent(activeSaveId!)}`,
+      signal,
+    ),
+    enabled: Boolean(
+      model
+      && activeSaveId
+      && canUseChildRestrictedControls(currentUser)
+    ),
+    refetchInterval: (
+      saveExportStates[activeSaveId ?? ""] === "pending"
+      || activeJobs.data?.jobs?.some((job) => job.type === "chat_bundle_export")
+    ) ? 3_000 : false,
+    retry: false,
+  });
+  useEffect(() => {
+    const recovered = readySaveExport.data?.export;
+    if (!activeSaveId || !isChatBundleExportResult(recovered)) return;
+    setSaveExportStates((current) => {
+      const existing = current[activeSaveId];
+      if (existing !== undefined && existing !== "pending") return current;
+      return { ...current, [activeSaveId]: recovered };
+    });
+  }, [activeSaveId, readySaveExport.data?.export]);
   const chatSubmissionStatus = useQuery({
     queryKey: ["chat", "submission-status", activeSaveId],
     queryFn: ({ signal }) => apiRead<ChatSubmissionStatus>(chatSubmissionStatusPath(activeSaveId), signal),
@@ -3912,7 +3938,7 @@ function Workbench({
             compactLibrary={isStackedDesktopWorkbench}
             onOpenLibrary={() => setMobileSheet("library")}
             runJob={runJob}
-            saveExports={saveExports}
+            saveExports={[saveExportStates, setSaveExportStates]}
           />
           {!isStackedWorkbench ? (
             <WorkbenchResizeHandle
@@ -4109,7 +4135,7 @@ function Workbench({
             onReuseScenarioPrompt={reuseScenarioPrompt}
             onAfterAction={closeMobileSheet}
             runJob={runJob}
-            saveExports={saveExports}
+            saveExports={[saveExportStates, setSaveExportStates]}
           />
         </MobileSheet>
       ) : null}

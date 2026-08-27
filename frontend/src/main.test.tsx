@@ -18867,6 +18867,46 @@ describe("frontend helpers", () => {
     expect(screen.getByRole("button", { name: "Settings" })).toBeInTheDocument();
   });
 
+  it("recovers a completed save export after a full page reload", async () => {
+    installEventSourceDouble();
+    stubWorkbenchMedia(false);
+    const model = runtimeModel({
+      saves: [{ save_id: "save-1", title: "Lantern Keep", active: true }]
+    });
+    const baseFetch = workbenchFetch([], model);
+    const fetchMock = vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/api/bundles/export/ready?save_id=save-1") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            export: {
+              kind: "chat_bundle_export",
+              filename: "recovered.bragi-chat",
+              download_url: "/api/bundles/export/job-recovered/download?save_id=save-1"
+            }
+          })
+        });
+      }
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    const downloadLink = await screen.findByRole("link", { name: "Download completed save export" });
+    expect(downloadLink).toHaveAttribute(
+      "href",
+      "/api/bundles/export/job-recovered/download?save_id=save-1"
+    );
+    expect(downloadLink).toHaveAttribute("download", "recovered.bragi-chat");
+    expect(screen.getByText("Save export ready.")).toBeInTheDocument();
+  });
+
   it("imports and exports active save bundles from the saves section", async () => {
     const openMock = vi.fn();
     vi.stubGlobal("open", openMock);

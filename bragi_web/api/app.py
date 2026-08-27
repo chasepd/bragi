@@ -6528,14 +6528,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 if not bundle_path.is_file():
                     raise PublicJobError("Save export did not produce a bundle")
                 await handle.event("progress", {"label": "Save export ready"})
-                return {
-                    "kind": "chat_bundle_export",
-                    "filename": bundle_path.name,
-                    "download_url": (
-                        f"/api/bundles/export/{job_id}/download"
-                        f"?save_id={resolved_save_id}"
-                    ),
-                }
+                return _save_export_download_result(
+                    job_id,
+                    resolved_save_id,
+                    bundle_path,
+                )
             except asyncio.CancelledError:
                 try:
                     await asyncio.shield(export_task)
@@ -6559,6 +6556,47 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             bundle_path.unlink(missing_ok=True)
             raise
 
+    @app.get("/api/bundles/export/ready")
+    def get_ready_bundle_export(
+        state: StateDep,
+        save_id: str | None = None,
+    ) -> dict[str, object]:
+        _prune_save_export_files(state)
+        with state.lock:
+            _raise_unless_import_export_allowed(state)
+            resolved_save_id = _resolve_runtime_save_id(state, save_id)
+            if resolved_save_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=_SAVE_ID_REQUIRED_DETAIL,
+                )
+            _raise_unless_save_action_allowed(state, resolved_save_id, "export")
+            if any(
+                record.type == "chat_bundle_export"
+                for record in state.jobs.list_active(save_id=resolved_save_id)
+            ):
+                return {"export": None}
+            records = state.repositories.list_recent_jobs(
+                save_id=resolved_save_id,
+                types=("chat_bundle_export",),
+                statuses=("succeeded",),
+                seconds=_SAVE_EXPORT_FILE_TTL_SECONDS,
+                limit=10,
+            )
+            for record in records:
+                if not _request_user_can_access_job(state, record):
+                    continue
+                bundle_path = _save_export_bundle_path(state, record.id)
+                if bundle_path.is_file():
+                    return {
+                        "export": _save_export_download_result(
+                            record.id,
+                            resolved_save_id,
+                            bundle_path,
+                        )
+                    }
+        return {"export": None}
+
     @app.get("/api/bundles/export/{job_id}/download")
     def download_bundle_export(
         job_id: str,
@@ -6568,7 +6606,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         _prune_save_export_files(state)
         with state.lock:
             _raise_unless_import_export_allowed(state)
-            record = _job_for_save_or_404(state, job_id, save_id)
+            record = (
+                _job_for_save_or_404(state, job_id, save_id)
+                if state.jobs.get(job_id) is not None
+                else _persisted_job_for_save_or_404(state, job_id, save_id)
+            )
             if record.type != "chat_bundle_export":
                 raise HTTPException(status_code=404, detail="Unknown job")
             if record.status in ACTIVE_JOB_STATUSES:
@@ -9393,7 +9435,10 @@ def _persisted_job_for_save_or_404(
     job_id: str,
     requested_save_id: str | None,
 ) -> Any:
-    record = state.repositories.get_persisted_job(job_id)
+    get_persisted_job = getattr(state.repositories, "get_persisted_job", None)
+    if not callable(get_persisted_job):
+        raise HTTPException(status_code=404, detail="Unknown job")
+    record = get_persisted_job(job_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Unknown job")
     if record.save_id is None:
@@ -12114,6 +12159,20 @@ def _save_export_bundle_path(state: WebAppState, job_id: str) -> Path:
         state.paths.temp_dir
         / f"{_SAVE_EXPORT_FILE_PREFIX}{normalized_job_id}.bragi-chat"
     )
+
+
+def _save_export_download_result(
+    job_id: str,
+    save_id: str,
+    bundle_path: Path,
+) -> dict[str, object]:
+    return {
+        "kind": "chat_bundle_export",
+        "filename": bundle_path.name,
+        "download_url": (
+            f"/api/bundles/export/{job_id}/download?save_id={save_id}"
+        ),
+    }
 
 
 def _prune_save_export_files(state: WebAppState) -> None:
