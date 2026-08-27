@@ -18879,6 +18879,7 @@ describe("frontend helpers", () => {
         return Promise.resolve({
           ok: true,
           json: async () => ({
+            active: false,
             export: {
               kind: "chat_bundle_export",
               filename: "recovered.bragi-chat",
@@ -18922,6 +18923,7 @@ describe("frontend helpers", () => {
         return Promise.resolve({
           ok: true,
           json: async () => ({
+            active: false,
             export: readyCalls === 1 ? null : {
               kind: "chat_bundle_export",
               filename: "persisted.bragi-chat",
@@ -18950,6 +18952,52 @@ describe("frontend helpers", () => {
       "download",
       "persisted.bragi-chat"
     );
+  });
+
+  it("stops export recovery polling when cached active state is stale", async () => {
+    vi.useFakeTimers();
+    installEventSourceDouble();
+    stubWorkbenchMedia(false);
+    const model = runtimeModel({
+      saves: [{ save_id: "save-1", title: "Lantern Keep", active: true }]
+    });
+    const staleExport = {
+      id: "job-stale-export",
+      type: "chat_bundle_export",
+      save_id: "save-1",
+      status: "running",
+      result: null,
+      error: null,
+      created_at: 1
+    } satisfies Job;
+    const baseFetch = workbenchFetch([staleExport], model);
+    let readyCalls = 0;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/api/bundles/export/ready?save_id=save-1") {
+        readyCalls += 1;
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ active: false, export: null })
+        });
+      }
+      return baseFetch(path, init);
+    }));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(readyCalls).toBe(1);
+    await act(async () => vi.advanceTimersByTimeAsync(15_000));
+    const callsAtDeadline = readyCalls;
+
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+
+    expect(callsAtDeadline).toBeGreaterThan(1);
+    expect(readyCalls).toBe(callsAtDeadline);
   });
 
   it("imports and exports active save bundles from the saves section", async () => {

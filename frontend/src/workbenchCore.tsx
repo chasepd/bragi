@@ -3005,6 +3005,11 @@ function Workbench({
   useEffect(() => {
     saveExportRecoveryDeadlineRef.current = Date.now() + SAVE_EXPORT_RECOVERY_WINDOW_MS;
   }, [activeSaveId]);
+  useEffect(() => {
+    if (activeSaveId && saveExportStates[activeSaveId] === "pending") {
+      saveExportRecoveryDeadlineRef.current = Date.now() + SAVE_EXPORT_RECOVERY_WINDOW_MS;
+    }
+  }, [activeSaveId, saveExportStates]);
   const activeSave = model?.saves?.find((save) => save.save_id === activeSaveId);
   const activeSaveSupported = activeSave?.supported !== false;
   useEffect(() => {
@@ -3028,22 +3033,27 @@ function Workbench({
   });
   const readySaveExport = useQuery({
     queryKey: ["export-ready", activeSaveId],
-    queryFn: ({ signal }) => apiRead<{ export: ChatBundleExportResult | null }>(
-      `/api/bundles/export/ready?save_id=${encodeURIComponent(activeSaveId!)}`,
-      signal,
-    ),
+    queryFn: async ({ signal }) => {
+      const ready = await apiRead<{
+        active: boolean;
+        export: ChatBundleExportResult | null;
+      }>(
+        `/api/bundles/export/ready?save_id=${encodeURIComponent(activeSaveId!)}`,
+        signal,
+      );
+      if (ready.active) {
+        saveExportRecoveryDeadlineRef.current = Date.now() + SAVE_EXPORT_RECOVERY_WINDOW_MS;
+      }
+      return ready;
+    },
     enabled: Boolean(
       model
       && activeSaveId
       && canUseChildRestrictedControls(currentUser)
     ),
     refetchInterval: (query) => (
-      saveExportStates[activeSaveId ?? ""] === "pending"
-      || activeJobs.data?.jobs?.some((job) => job.type === "chat_bundle_export")
-      || (
-        !query.state.data?.export
-        && Date.now() < saveExportRecoveryDeadlineRef.current
-      )
+      !query.state.data?.export
+      && Date.now() < saveExportRecoveryDeadlineRef.current
     ) ? 3_000 : false,
     retry: false,
   });

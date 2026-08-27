@@ -20038,11 +20038,15 @@ def test_bundle_export_ready_recovers_download_after_registry_loss(
     tmp_path: Path,
 ) -> None:
     class ExportRuntime(_RuntimeDouble):
-        def export_active_save(self, bundle_path: Path) -> SimpleNamespace:
-            bundle_path.write_bytes(b"recovered bundle")
-            return SimpleNamespace(error=None)
+        error: str | None = None
 
-    state = _repository_state_double(tmp_path, ExportRuntime())
+        def export_active_save(self, bundle_path: Path) -> SimpleNamespace:
+            if self.error is None:
+                bundle_path.write_bytes(b"recovered bundle")
+            return SimpleNamespace(error=self.error)
+
+    runtime = ExportRuntime()
+    state = _repository_state_double(tmp_path, runtime)
     scenario = state.repositories.create_scenario(
         type="full_roleplay",
         title="Lantern Keep",
@@ -20068,6 +20072,7 @@ def test_bundle_export_ready_recovers_download_after_registry_loss(
         ready = client.get("/api/bundles/export/ready?save_id=save-1")
         assert ready.status_code == 200
         assert ready.json() == {
+            "active": False,
             "export": {
                 "kind": "chat_bundle_export",
                 "filename": f"bragi-export-{job_id}.bragi-chat",
@@ -20084,7 +20089,28 @@ def test_bundle_export_ready_recovers_download_after_registry_loss(
         assert downloaded.content == b"recovered bundle"
         assert client.get(
             "/api/bundles/export/ready?save_id=save-1"
-        ).json() == {"export": None}
+        ).json() == {"active": False, "export": None}
+
+        runtime.error = "Export could not be prepared"
+        failed_start = client.post(
+            "/api/bundles/export",
+            json={"save_id": "save-1"},
+        )
+        assert failed_start.status_code == 200
+        failed_job_id = failed_start.json()["id"]
+        failed = _wait_for_terminal_job(
+            client,
+            failed_job_id,
+            save_id="save-1",
+        )
+        assert failed["status"] == "failed"
+        state.jobs._jobs.clear()  # noqa: SLF001 - simulate registry loss
+
+        failed_download = client.get(
+            f"/api/bundles/export/{failed_job_id}/download?save_id=save-1"
+        )
+        assert failed_download.status_code == 400
+        assert failed_download.json()["detail"] == "Export could not be prepared"
 
 
 def test_bundle_export_rejects_duplicate_active_export(tmp_path: Path) -> None:
@@ -20105,6 +20131,9 @@ def test_bundle_export_rejects_duplicate_active_export(tmp_path: Path) -> None:
         first = client.post("/api/bundles/export", json={"save_id": "save-1"})
         assert first.status_code == 200
         assert started.wait(timeout=5)
+        ready = client.get("/api/bundles/export/ready?save_id=save-1")
+        assert ready.status_code == 200
+        assert ready.json() == {"active": True, "export": None}
         second = client.post("/api/bundles/export", json={"save_id": "save-1"})
         assert second.status_code == 429
         release.set()

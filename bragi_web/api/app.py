@@ -80,6 +80,7 @@ from bragi_web.jobs import (
     PublicJobError,
     job_event_payload,
     job_summary,
+    public_job_error,
 )
 from bragi_web.maintenance_diagnostics import maintenance_job_diagnostics
 from bragi_web.observability import (
@@ -6575,7 +6576,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 record.type == "chat_bundle_export"
                 for record in state.jobs.list_active(save_id=resolved_save_id)
             ):
-                return {"export": None}
+                return {"active": True, "export": None}
             records = state.repositories.list_recent_jobs(
                 save_id=resolved_save_id,
                 types=("chat_bundle_export",),
@@ -6589,13 +6590,14 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 bundle_path = _save_export_bundle_path(state, record.id)
                 if bundle_path.is_file():
                     return {
+                        "active": False,
                         "export": _save_export_download_result(
                             record.id,
                             resolved_save_id,
                             bundle_path,
                         )
                     }
-        return {"export": None}
+        return {"active": False, "export": None}
 
     @app.get("/api/bundles/export/{job_id}/download")
     def download_bundle_export(
@@ -6621,7 +6623,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             if record.status != "succeeded":
                 raise HTTPException(
                     status_code=400,
-                    detail=(job_summary(record).get("error") or "Save export failed"),
+                    detail=(public_job_error(record) or "Save export failed"),
                 )
             bundle_path = _save_export_bundle_path(state, job_id)
             if not bundle_path.is_file():
