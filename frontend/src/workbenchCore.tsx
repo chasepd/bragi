@@ -258,6 +258,7 @@ type SaveExportState = string | ChatBundleExportResult;
 type SaveExportStates = Record<string, SaveExportState>;
 type SetSaveExportStates = React.Dispatch<React.SetStateAction<SaveExportStates>>;
 type SaveExports = [SaveExportStates, SetSaveExportStates];
+const SAVE_EXPORT_RECOVERY_WINDOW_MS = 15_000;
 function setSaveExportState(setStates: SetSaveExportStates, saveId: string, state?: SaveExportState) {
   setStates((current) => {
     if (state !== undefined) return { ...current, [saveId]: state };
@@ -2954,6 +2955,7 @@ function Workbench({
   const [narratorDrafts, setNarratorDrafts] = useState<Record<string, NarratorDraft>>({});
   const [scenarioRefreshVersion, setScenarioRefreshVersion] = useState(0);
   const [saveExportStates, setSaveExportStates] = useState<SaveExportStates>({});
+  const saveExportRecoveryDeadlineRef = useRef(Date.now() + SAVE_EXPORT_RECOVERY_WINDOW_MS);
   const jobWatchers = useRef<Record<string, () => void>>({});
   const jobRunOptionsRef = useRef<Record<string, RunJobOptions>>({});
   const queuedRefreshesRef = useRef<Map<string, QueuedWorkbenchRefresh>>(new Map());
@@ -3000,6 +3002,9 @@ function Workbench({
   const model = runtime.data;
   const runtimeLoadError = runtime.error instanceof Error ? runtime.error.message : "";
   const activeSaveId = model?.active_save_id ?? selectedSaveId ?? null;
+  useEffect(() => {
+    saveExportRecoveryDeadlineRef.current = Date.now() + SAVE_EXPORT_RECOVERY_WINDOW_MS;
+  }, [activeSaveId]);
   const activeSave = model?.saves?.find((save) => save.save_id === activeSaveId);
   const activeSaveSupported = activeSave?.supported !== false;
   useEffect(() => {
@@ -3032,9 +3037,13 @@ function Workbench({
       && activeSaveId
       && canUseChildRestrictedControls(currentUser)
     ),
-    refetchInterval: (
+    refetchInterval: (query) => (
       saveExportStates[activeSaveId ?? ""] === "pending"
       || activeJobs.data?.jobs?.some((job) => job.type === "chat_bundle_export")
+      || (
+        !query.state.data?.export
+        && Date.now() < saveExportRecoveryDeadlineRef.current
+      )
     ) ? 3_000 : false,
     retry: false,
   });

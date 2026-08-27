@@ -18907,6 +18907,51 @@ describe("frontend helpers", () => {
     expect(screen.getByText("Save export ready.")).toBeInTheDocument();
   });
 
+  it("keeps polling through the export completion persistence window", async () => {
+    vi.useFakeTimers();
+    installEventSourceDouble();
+    stubWorkbenchMedia(false);
+    const model = runtimeModel({
+      saves: [{ save_id: "save-1", title: "Lantern Keep", active: true }]
+    });
+    const baseFetch = workbenchFetch([], model);
+    let readyCalls = 0;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/api/bundles/export/ready?save_id=save-1") {
+        readyCalls += 1;
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            export: readyCalls === 1 ? null : {
+              kind: "chat_bundle_export",
+              filename: "persisted.bragi-chat",
+              download_url: "/api/bundles/export/job-persisted/download?save_id=save-1"
+            }
+          })
+        });
+      }
+      return baseFetch(path, init);
+    }));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(readyCalls).toBe(1);
+    expect(screen.queryByRole("link", { name: "Download completed save export" })).not.toBeInTheDocument();
+
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+
+    expect(readyCalls).toBe(2);
+    expect(screen.getByRole("link", { name: "Download completed save export" })).toHaveAttribute(
+      "download",
+      "persisted.bragi-chat"
+    );
+  });
+
   it("imports and exports active save bundles from the saves section", async () => {
     const openMock = vi.fn();
     vi.stubGlobal("open", openMock);
