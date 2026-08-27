@@ -19008,6 +19008,43 @@ describe("frontend helpers", () => {
     expect(readyCalls).toBe(callsAtDeadline);
   });
 
+  it("caps export recovery polling when the server stays active", async () => {
+    vi.useFakeTimers();
+    installEventSourceDouble();
+    stubWorkbenchMedia(false);
+    const model = runtimeModel({
+      saves: [{ save_id: "save-1", title: "Lantern Keep", active: true }]
+    });
+    const baseFetch = workbenchFetch([], model);
+    let readyCalls = 0;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/api/bundles/export/ready?save_id=save-1") {
+        readyCalls += 1;
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ active: true, export: null })
+        });
+      }
+      return baseFetch(path, init);
+    }));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(0));
+    expect(readyCalls).toBe(1);
+    await act(async () => vi.advanceTimersByTimeAsync(10 * 60_000));
+    const callsAtMaximum = readyCalls;
+
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+
+    expect(callsAtMaximum).toBeGreaterThan(1);
+    expect(readyCalls).toBe(callsAtMaximum);
+  });
+
   it("imports and exports active save bundles from the saves section", async () => {
     const openMock = vi.fn();
     vi.stubGlobal("open", openMock);

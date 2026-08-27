@@ -260,6 +260,7 @@ type SetSaveExportStates = React.Dispatch<React.SetStateAction<SaveExportStates>
 type ClearSaveExportRecovery = (saveId: string) => void;
 type SaveExports = [SaveExportStates, SetSaveExportStates, ClearSaveExportRecovery?];
 const SAVE_EXPORT_RECOVERY_WINDOW_MS = 15_000;
+const SAVE_EXPORT_RECOVERY_MAX_WINDOW_MS = 10 * 60_000;
 function setSaveExportState(setStates: SetSaveExportStates, saveId: string, state?: SaveExportState) {
   setStates((current) => {
     if (state !== undefined) return { ...current, [saveId]: state };
@@ -2957,6 +2958,7 @@ function Workbench({
   const [scenarioRefreshVersion, setScenarioRefreshVersion] = useState(0);
   const [saveExportStates, setSaveExportStates] = useState<SaveExportStates>({});
   const saveExportRecoveryDeadlineRef = useRef(Date.now() + SAVE_EXPORT_RECOVERY_WINDOW_MS);
+  const saveExportRecoveryMaxDeadlineRef = useRef(Date.now() + SAVE_EXPORT_RECOVERY_MAX_WINDOW_MS);
   const jobWatchers = useRef<Record<string, () => void>>({});
   const jobRunOptionsRef = useRef<Record<string, RunJobOptions>>({});
   const queuedRefreshesRef = useRef<Map<string, QueuedWorkbenchRefresh>>(new Map());
@@ -3004,11 +3006,15 @@ function Workbench({
   const runtimeLoadError = runtime.error instanceof Error ? runtime.error.message : "";
   const activeSaveId = model?.active_save_id ?? selectedSaveId ?? null;
   useEffect(() => {
-    saveExportRecoveryDeadlineRef.current = Date.now() + SAVE_EXPORT_RECOVERY_WINDOW_MS;
+    const now = Date.now();
+    saveExportRecoveryDeadlineRef.current = now + SAVE_EXPORT_RECOVERY_WINDOW_MS;
+    saveExportRecoveryMaxDeadlineRef.current = now + SAVE_EXPORT_RECOVERY_MAX_WINDOW_MS;
   }, [activeSaveId]);
   useEffect(() => {
     if (activeSaveId && saveExportStates[activeSaveId] === "pending") {
-      saveExportRecoveryDeadlineRef.current = Date.now() + SAVE_EXPORT_RECOVERY_WINDOW_MS;
+      const now = Date.now();
+      saveExportRecoveryDeadlineRef.current = now + SAVE_EXPORT_RECOVERY_WINDOW_MS;
+      saveExportRecoveryMaxDeadlineRef.current = now + SAVE_EXPORT_RECOVERY_MAX_WINDOW_MS;
     }
   }, [activeSaveId, saveExportStates]);
   const activeSave = model?.saves?.find((save) => save.save_id === activeSaveId);
@@ -3043,7 +3049,10 @@ function Workbench({
         signal,
       );
       if (ready.active) {
-        saveExportRecoveryDeadlineRef.current = Date.now() + SAVE_EXPORT_RECOVERY_WINDOW_MS;
+        saveExportRecoveryDeadlineRef.current = Math.min(
+          Date.now() + SAVE_EXPORT_RECOVERY_WINDOW_MS,
+          saveExportRecoveryMaxDeadlineRef.current,
+        );
       }
       return ready;
     },
