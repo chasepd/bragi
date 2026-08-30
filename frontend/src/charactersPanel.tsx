@@ -100,6 +100,7 @@ import {
   MarkdownView,
   mediaAssetPath,
   mediaAssetThumbnailPath,
+  mergeReferenceUploadLocks,
   ModalBackdrop,
   ModelPricingLine,
   modelOptionLabel,
@@ -554,18 +555,28 @@ function CharacterReferenceField({
   activeSaveId,
   disabled,
   generationDisabled,
-  runJob
+  runJob,
+  onUpload,
+  busy,
+  setBusy,
+  error,
+  setError,
+  enhancementBusy
 }: {
   row: Record<string, unknown>;
   activeSaveId: string | null;
   disabled: boolean;
   generationDisabled: boolean;
   runJob: RunJob;
+  onUpload: (model: CharacterRegistryModel, lockBaseline: string[]) => void;
+  busy: "generate" | "upload" | "remove" | null;
+  setBusy: (busy: "generate" | "upload" | "remove" | null) => void;
+  error: string;
+  setError: (error: string) => void;
+  enhancementBusy: boolean;
 }) {
   const client = useQueryClient();
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const [busy, setBusy] = useState<"generate" | "upload" | "remove" | null>(null);
-  const [error, setError] = useState("");
   const characterId = typeof row.character_id === "string" && row.character_id ? row.character_id : null;
   const reference = characterReferenceImage(row.reference_image);
   const hasReference = Boolean(reference);
@@ -577,13 +588,14 @@ function CharacterReferenceField({
     invalidateScenePresenceQueries(client, activeSaveId);
   };
   const uploadFile = async (file: File) => {
-    if (!activeSaveId || !characterId) return;
+    if (!activeSaveId || !characterId || enhancementBusy) return;
     setBusy("upload");
     setError("");
     const form = new FormData();
     form.append("file", file);
     form.append("save_id", activeSaveId);
     form.append("replace_existing", hasReference ? "true" : "false");
+    const lockBaseline = characterLockedFields(row.locked_fields);
     try {
       const job = await api<Job>(
         `/api/characters/${encodeURIComponent(characterId)}/reference-image/upload`,
@@ -592,10 +604,17 @@ function CharacterReferenceField({
           body: form
         }
       );
-      runJob(job, { onSucceeded: () => refreshCharacters() });
+      runJob(job, {
+        onSucceeded: (result) => {
+          const model = result as CharacterRegistryModel;
+          onUpload(model, lockBaseline);
+          refreshCharacters(model);
+        },
+        onFailed: setError,
+        onFinished: () => setBusy(null)
+      });
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : "Could not upload reference image");
-    } finally {
       setBusy(null);
     }
   };
@@ -626,9 +645,10 @@ function CharacterReferenceField({
               || !activeSaveId
               || !characterId
               || busy !== null
+              || enhancementBusy
             }
             onClick={async () => {
-              if (!activeSaveId || !characterId) return;
+              if (!activeSaveId || !characterId || enhancementBusy) return;
               setBusy("generate");
               setError("");
               try {
@@ -651,7 +671,7 @@ function CharacterReferenceField({
           </button>
           <button
             type="button"
-            disabled={disabled || !activeSaveId || !characterId || busy !== null}
+            disabled={disabled || !activeSaveId || !characterId || busy !== null || enhancementBusy}
             onClick={() => inputRef.current?.click()}
           >
             {busy === "upload" ? <Loader2 className="spin" size={15} /> : <Upload size={15} />}
@@ -661,9 +681,9 @@ function CharacterReferenceField({
             <button
               type="button"
               className="danger-command"
-              disabled={disabled || !activeSaveId || !characterId || busy !== null}
+              disabled={disabled || !activeSaveId || !characterId || busy !== null || enhancementBusy}
               onClick={async () => {
-                if (!activeSaveId || !characterId) return;
+                if (!activeSaveId || !characterId || enhancementBusy) return;
                 setBusy("remove");
                 setError("");
                 try {
@@ -692,6 +712,7 @@ function CharacterReferenceField({
         aria-label={hasReference ? "Replace character reference image" : "Upload character reference image"}
         type="file"
         accept="image/png,image/jpeg,image/webp"
+        disabled={enhancementBusy}
         onChange={(event) => {
           const file = event.target.files?.[0];
           event.target.value = "";
@@ -1023,20 +1044,23 @@ function CharacterEditor({
   const [activeTab, setActiveTab] = useState<CharacterEditorTab>("profile");
   const [deleteText, setDeleteText] = useState("");
   const [error, setError] = useState("");
+  const [referenceError, setReferenceError] = useState("");
+  const [referenceBusy, setReferenceBusy] = useState<"generate" | "upload" | "remove" | null>(null);
   const [notice, setNotice] = useState("");
   const [enhancingField, setEnhancingField] = useState<CharacterEnhanceField | null>(null);
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   const selectedCharacterId = typeof character.character_id === "string" ? character.character_id : "";
-  useEffect(() => {
-    setRow(character);
-    setSavedRow(character);
-    setDiscardConfirmOpen(false);
-  }, [character]);
-  useEffect(() => setNotice(""), [selectedCharacterId]);
   const currentSnapshot = useMemo(() => stableEditorSnapshot(row), [row]);
   const savedSnapshot = useMemo(() => stableEditorSnapshot(savedRow), [savedRow]);
-  const isDraftCharacter = row.__draft_character === true;
   const hasDraftChanges = currentSnapshot !== savedSnapshot;
+  useEffect(() => {
+    setRow((current) => current.character_id === selectedCharacterId
+      && hasDraftChanges ? current : character);
+    setSavedRow(character);
+    setDiscardConfirmOpen(false);
+  }, [character, selectedCharacterId]);
+  useEffect(() => setNotice(""), [selectedCharacterId]);
+  const isDraftCharacter = row.__draft_character === true;
   const hasUnsavedChanges = isDraftCharacter || hasDraftChanges;
   const update = (key: string, value: unknown) => {
     setNotice("");
@@ -1047,8 +1071,8 @@ function CharacterEditor({
   const characterId = typeof row.character_id === "string" ? row.character_id : "";
   const nameBlank = !String(row.name ?? "").trim();
   const nameError = nameBlank ? "Character name must not be blank" : "";
-  const saveDisabled = disabled || nameBlank || (!isDraftCharacter && !hasDraftChanges);
-  const enhanceDisabled = disabled || nameBlank || !activeSaveId || !characterId || enhancingField !== null;
+  const saveDisabled = disabled || nameBlank || referenceBusy === "upload" || (!isDraftCharacter && !hasDraftChanges);
+  const enhanceDisabled = disabled || nameBlank || referenceBusy !== null || !activeSaveId || !characterId || enhancingField !== null;
   const lockedFields = new Set(characterLockedFields(row.locked_fields));
   const updateLockedField = (field: string, locked: boolean) => {
     const next = new Set(characterLockedFields(row.locked_fields));
@@ -1060,6 +1084,10 @@ function CharacterEditor({
     update("locked_fields", CHARACTER_LOCK_FIELDS.map(([id]) => id).filter((id) => next.has(id)));
   };
   const save = async (next: Record<string, unknown>) => {
+    if (referenceBusy === "upload") {
+      setError("Wait for reference image analysis to finish before saving");
+      return;
+    }
     if (!String(next.name ?? "").trim() && !next.archived) {
       return;
     }
@@ -1184,11 +1212,35 @@ function CharacterEditor({
             />
           </label>
           <CharacterReferenceField
-            row={character}
+            row={row}
             activeSaveId={activeSaveId}
             disabled={disabled}
             generationDisabled={mediaGenerationDisabled}
             runJob={runJob}
+            busy={referenceBusy}
+            setBusy={setReferenceBusy}
+            error={referenceError}
+            setError={setReferenceError}
+            enhancementBusy={enhancingField !== null}
+            onUpload={(model, lockBaseline) => {
+              const updated = model.characters!.find(
+                (candidate) => candidate.character_id === characterId
+              )!;
+              const { appearance, visual_notes, locked_fields, reference_image } = updated;
+              const savedPatch = {
+                appearance, visual_notes, locked_fields, reference_image
+              };
+              setRow((current) => ({
+                ...current,
+                ...savedPatch,
+                locked_fields: mergeReferenceUploadLocks(
+                  characterLockedFields(locked_fields),
+                  lockBaseline,
+                  characterLockedFields(current.locked_fields)
+                )
+              }));
+              setSavedRow((current) => ({ ...current, ...savedPatch }));
+            }}
           />
           <label className="field-label">
             <span>Aliases</span>

@@ -3064,16 +3064,22 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         except _CharacterReferenceUploadTooLarge as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
         try:
-            async with state.lock.async_access():
-                model = state.runtime.upload_scenario_starter_reference_image(
-                    scenario_id=scenario_id,
-                    image_bytes=image_bytes,
-                    filename=file.filename,
-                    starter_id=starter_id,
-                    starter_name=starter_name,
-                    replace_existing=replace_existing,
-                )
-                payload_dict = _json_dict(model)
+            upload_kwargs: dict[str, Any] = {}
+            if _call_accepts_keyword(
+                state.runtime.upload_scenario_starter_reference_image,
+                "mutation_context",
+            ):
+                upload_kwargs["mutation_context"] = state.lock.async_access
+            model = await state.runtime.upload_scenario_starter_reference_image(
+                scenario_id=scenario_id,
+                image_bytes=image_bytes,
+                filename=file.filename,
+                starter_id=starter_id,
+                starter_name=starter_name,
+                replace_existing=replace_existing,
+                **upload_kwargs,
+            )
+            payload_dict = _json_dict(model)
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         _publish_save_event(
@@ -4729,21 +4735,41 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
 
         async def worker(handle: JobHandle) -> Any:
-            await handle.event("progress", {"label": "Uploading reference image"})
+            await handle.event("progress", {"label": "Analyzing reference image"})
+            failure_phase = "upload"
+
+            def record_failure_phase(phase: str) -> None:
+                nonlocal failure_phase
+                failure_phase = phase
+
+            kwargs: dict[str, Any] = {}
+            if character_id is not None:
+                kwargs["character_id"] = character_id
+            if _call_accepts_keyword(
+                state.runtime.upload_character_reference_image,
+                "mutation_context",
+            ):
+                kwargs["mutation_context"] = state.lock.async_access
+            if _call_accepts_keyword(
+                state.runtime.upload_character_reference_image,
+                "failure_phase_callback",
+            ):
+                kwargs["failure_phase_callback"] = record_failure_phase
+            model = await state.runtime.upload_character_reference_image(
+                image_bytes=image_bytes,
+                filename=file.filename,
+                replace_existing=replace_existing,
+                active_save_id=resolved_save_id,
+                **kwargs,
+            )
+            error = _runtime_model_error(model)
+            if error:
+                raise _character_reference_public_job_error(failure_phase)
+            await handle.event(
+                "progress",
+                {"label": "Reference image and character details saved"},
+            )
             async with state.lock.async_access():
-                kwargs: dict[str, Any] = {}
-                if character_id is not None:
-                    kwargs["character_id"] = character_id
-                model = state.runtime.upload_character_reference_image(
-                    image_bytes=image_bytes,
-                    filename=file.filename,
-                    replace_existing=replace_existing,
-                    active_save_id=resolved_save_id,
-                    **kwargs,
-                )
-                error = _runtime_model_error(model)
-                if error:
-                    raise RuntimeError(error)
                 payload = _runtime_json_dict(state, model)
             _publish_runtime_changed_from_model_result(
                 state,
@@ -5474,18 +5500,40 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
 
         async def worker(handle: JobHandle) -> Any:
-            await handle.event("progress", {"label": "Uploading reference image"})
+            await handle.event("progress", {"label": "Analyzing reference image"})
+            failure_phase = "upload"
+
+            def record_failure_phase(phase: str) -> None:
+                nonlocal failure_phase
+                failure_phase = phase
+
+            upload_kwargs: dict[str, Any] = {}
+            if _call_accepts_keyword(
+                state.runtime.upload_character_reference_image,
+                "mutation_context",
+            ):
+                upload_kwargs["mutation_context"] = state.lock.async_access
+            if _call_accepts_keyword(
+                state.runtime.upload_character_reference_image,
+                "failure_phase_callback",
+            ):
+                upload_kwargs["failure_phase_callback"] = record_failure_phase
+            model = await state.runtime.upload_character_reference_image(
+                image_bytes=image_bytes,
+                filename=file.filename,
+                character_id=character_id,
+                replace_existing=replace_existing,
+                active_save_id=resolved_save_id,
+                **upload_kwargs,
+            )
+            error = _runtime_model_error(model)
+            if error:
+                raise _character_reference_public_job_error(failure_phase)
+            await handle.event(
+                "progress",
+                {"label": "Reference image and character details saved"},
+            )
             async with state.lock.async_access():
-                model = state.runtime.upload_character_reference_image(
-                    image_bytes=image_bytes,
-                    filename=file.filename,
-                    character_id=character_id,
-                    replace_existing=replace_existing,
-                    active_save_id=resolved_save_id,
-                )
-                error = _runtime_model_error(model)
-                if error:
-                    raise RuntimeError(error)
                 payload_dict = _character_registry_json_or_raise(
                     state,
                     save_id=resolved_save_id,
@@ -11039,6 +11087,13 @@ def _runtime_model_error(model: object) -> str | None:
     if isinstance(error, str) and error:
         return error
     return None
+
+
+def _character_reference_public_job_error(phase: str) -> PublicJobError:
+    phase = "analysis" if phase == "analysis" else "upload"
+    return PublicJobError(
+        f"Reference image {phase} failed. Try again or check diagnostics for details."
+    )
 
 
 def _is_runtime_chat_cancelled(model: object) -> bool:

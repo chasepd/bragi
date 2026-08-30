@@ -152,6 +152,7 @@ class RecordingImageProvider:
         self._image_reference_limit = image_reference_limit
         self.chat_requests: list[ChatRequest] = []
         self.image_requests: list[ImageRequest] = []
+        self.image_description_requests: list[ImageDescriptionRequest] = []
 
     async def validate_config(self) -> ProviderConfigStatus:
         return ProviderConfigStatus(
@@ -179,6 +180,12 @@ class RecordingImageProvider:
                 model_id="fake-image",
                 display_name="Fake Image",
                 capabilities=frozenset({ProviderCapability.IMAGE_GENERATION}),
+            ),
+            ProviderModel(
+                provider=self.provider_name,
+                model_id="fake-vision",
+                display_name="Fake Vision",
+                capabilities=frozenset({ProviderCapability.VISION}),
             ),
         ]
 
@@ -215,6 +222,22 @@ class RecordingImageProvider:
             model_id=request.model_id,
             image_bytes=self.image_bytes,
             revised_prompt=f"revised: {request.prompt}",
+        )
+
+    async def describe_image(
+        self,
+        request: ImageDescriptionRequest,
+    ) -> ImageDescriptionResponse:
+        self.image_description_requests.append(request)
+        description = (
+            "Tall with silver eyes, white hair, and angular features."
+            if "appearance" in request.prompt.lower()
+            else "Blue glass robes and a composed ceremonial bearing."
+        )
+        return ImageDescriptionResponse(
+            description=description,
+            provider=request.provider,
+            model_id=request.model_id,
         )
 
     def image_reference_limit(self, model_id: str) -> int:
@@ -273,9 +296,11 @@ class ConcurrentEditClothingProvider(ClothingRecordingImageProvider):
 
 
 class RecordingVisionProvider(RecordingImageProvider):
-    def __init__(self, description: str) -> None:
+    def __init__(self, description: str | list[str | Exception]) -> None:
         super().__init__(image_bytes=_VALID_PNG_BYTES)
-        self.description = description
+        self.descriptions = (
+            list(description) if isinstance(description, list) else [description]
+        )
         self.image_description_requests: list[ImageDescriptionRequest] = []
 
     async def list_models(self) -> list[ProviderModel]:
@@ -299,8 +324,13 @@ class RecordingVisionProvider(RecordingImageProvider):
         request: ImageDescriptionRequest,
     ) -> ImageDescriptionResponse:
         self.image_description_requests.append(request)
+        if not self.descriptions:
+            raise AssertionError("unexpected image description request")
+        description = self.descriptions.pop(0)
+        if isinstance(description, Exception):
+            raise description
         return ImageDescriptionResponse(
-            description=self.description,
+            description=description,
             provider=request.provider,
             model_id=request.model_id,
             token_usage={"total": 23},
@@ -7939,6 +7969,600 @@ def test_character_image_generation_rejects_failed_linked_reference_without_fall
     assert _media_jobs(repositories, save.id, "character_reference_image") == []
 
 
+def test_upload_character_reference_analyzes_image_and_replaces_locked_visual_fields(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, _opening_message, character_id = _full_roleplay_save(repositories)
+    character = repositories.get_character(character_id)
+    assert character is not None
+    repositories.update_character(
+        replace(
+            character,
+            appearance="Old appearance.",
+            visual_notes="Old visual notes.",
+            role="Oracle and keeper of the mirrored hall.",
+            locked_fields=["role"],
+        )
+    )
+    _configure_vision_model(
+        repositories,
+        model_id="global-vision",
+    )
+    _configure_vision_model(
+        repositories,
+        model_id="save-vision",
+        save_id=save.id,
+    )
+    provider = RecordingVisionProvider(
+        [
+            "Deep brown skin, a long angular face, silver eyes, and white braids.",
+            "Layered blue-glass robes, a mirrored circlet, and a still formal bearing.",
+        ]
+    )
+    media_dir = tmp_path / "media"
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=media_dir,
+    )
+
+    asset = asyncio.run(
+        service.upload_character_reference_image(
+            save_id=save.id,
+            character_id=character_id,
+            image_bytes=_VALID_PNG_BYTES,
+            filename="private-portrait.png",
+        )
+    )
+
+    updated = repositories.get_character(character_id)
+    assert updated is not None
+    assert updated.appearance == (
+        "Deep brown skin, a long angular face, silver eyes, and white braids."
+    )
+    assert updated.visual_notes == (
+        "Layered blue-glass robes, a mirrored circlet, and a still formal bearing."
+    )
+    assert updated.role == "Oracle and keeper of the mirrored hall."
+    assert updated.locked_fields == ["appearance", "role", "visual_notes"]
+    assert [request.model_id for request in provider.image_description_requests] == [
+        "save-vision",
+        "save-vision",
+    ]
+    appearance_request, notes_request = provider.image_description_requests
+    assert appearance_request.image_url.startswith("data:image/png;base64,")
+    assert appearance_request.system_prompt is not None
+    assert notes_request.system_prompt is not None
+    assert "stable physical appearance" in appearance_request.system_prompt.lower()
+    assert "reusable visual notes" in notes_request.system_prompt.lower()
+    assert "json" not in appearance_request.prompt.lower()
+    assert "json" not in notes_request.prompt.lower()
+    assert _asset_path(media_dir, asset.path).read_bytes() == _VALID_PNG_BYTES
+    assert [
+        link.target_id
+        for link in repositories.list_entity_links(save.id)
+        if link.relation == "reference_image"
+    ] == [asset.id]
+
+
+def test_upload_character_reference_analysis_failure_preserves_prior_state(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, _opening_message, character_id = _full_roleplay_save(repositories)
+    _configure_vision_model(repositories, model_id="fake-vision")
+    media_dir = tmp_path / "media"
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": RecordingImageProvider(_VALID_PNG_BYTES)},
+        media_dir=media_dir,
+    )
+    prior_reference = asyncio.run(
+        service.upload_character_reference_image(
+            save_id=save.id,
+            character_id=character_id,
+            image_bytes=_VALID_PNG_BYTES,
+        )
+    )
+    before = repositories.get_character(character_id)
+    assert before is not None
+    files_before = sorted(
+        path.relative_to(media_dir)
+        for path in media_dir.rglob("*")
+        if path.is_file()
+    )
+    service.providers["fake"] = RecordingVisionProvider(
+        ["A complete replacement appearance.", "   "]
+    )
+
+    with pytest.raises(ValueError, match="empty visual notes"):
+        asyncio.run(
+            service.upload_character_reference_image(
+                save_id=save.id,
+                character_id=character_id,
+                image_bytes=_VALID_PNG_BYTES,
+                replace_existing=True,
+            )
+        )
+
+    assert repositories.get_character(character_id) == before
+    assert [asset.id for asset in repositories.list_media_assets(save.id)] == [
+        prior_reference.id
+    ]
+    assert [
+        link.target_id
+        for link in repositories.list_entity_links(save.id)
+        if link.relation == "reference_image"
+    ] == [prior_reference.id]
+    assert sorted(
+        path.relative_to(media_dir)
+        for path in media_dir.rglob("*")
+        if path.is_file()
+    ) == files_before
+
+
+def test_upload_character_reference_requires_configured_vision_model(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, _opening_message, character_id = _full_roleplay_save(repositories)
+    repositories.clear_model_preference("character_image_description")
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    media_dir = tmp_path / "media"
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=media_dir,
+    )
+    before = repositories.get_character(character_id)
+
+    with pytest.raises(ValueError, match="No Image Details vision model configured"):
+        asyncio.run(
+            service.upload_character_reference_image(
+                save_id=save.id,
+                character_id=character_id,
+                image_bytes=_VALID_PNG_BYTES,
+            )
+        )
+
+    assert provider.image_description_requests == []
+    assert repositories.get_character(character_id) == before
+    assert repositories.list_media_assets(save.id) == []
+    assert not media_dir.exists()
+
+
+def test_upload_character_reference_rejects_unavailable_or_nonvision_model(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, _opening_message, character_id = _full_roleplay_save(repositories)
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": RecordingImageProvider(_VALID_PNG_BYTES)},
+        media_dir=tmp_path / "media",
+    )
+    repositories.set_model_preference(
+        task="character_image_description",
+        provider="missing",
+        model_id="missing-vision",
+    )
+
+    with pytest.raises(ValueError, match="provider is unavailable"):
+        asyncio.run(
+            service.upload_character_reference_image(
+                save_id=save.id,
+                character_id=character_id,
+                image_bytes=_VALID_PNG_BYTES,
+            )
+        )
+
+    repositories.set_model_preference(
+        task="character_image_description",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    with pytest.raises(ValueError, match="does not support vision"):
+        asyncio.run(
+            service.upload_character_reference_image(
+                save_id=save.id,
+                character_id=character_id,
+                image_bytes=_VALID_PNG_BYTES,
+            )
+        )
+
+    assert repositories.list_media_assets(save.id) == []
+    assert not (tmp_path / "media").exists()
+
+
+def test_upload_character_reference_persistence_failure_rolls_back_everything(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save, _opening_message, character_id = _full_roleplay_save(repositories)
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    media_dir = tmp_path / "media"
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=media_dir,
+    )
+    before = repositories.get_character(character_id)
+
+    def fail_update(_character: CharacterRecord) -> CharacterRecord:
+        raise sqlite3.OperationalError("simulated character update failure")
+
+    monkeypatch.setattr(repositories, "update_character", fail_update)
+
+    with pytest.raises(sqlite3.OperationalError, match="simulated character"):
+        asyncio.run(
+            service.upload_character_reference_image(
+                save_id=save.id,
+                character_id=character_id,
+                image_bytes=_VALID_PNG_BYTES,
+            )
+        )
+
+    assert repositories.get_character(character_id) == before
+    assert repositories.list_media_assets(save.id) == []
+    assert repositories.list_entity_links(save.id) == []
+    assert [path for path in media_dir.rglob("*") if path.is_file()] == []
+
+
+def test_upload_scenario_starter_reference_analyzes_and_locks_visual_fields(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower above a fog harbor.",
+        player_role="Keeper",
+        content={
+            "character_starters": [
+                {
+                    "starter_id": "starter-ilyra",
+                    "name": "Captain Ilyra",
+                    "role": "Watch captain",
+                    "appearance": "Old appearance.",
+                    "visual_notes": "Old notes.",
+                    "locked_fields": ["role"],
+                }
+            ]
+        },
+    )
+    _configure_vision_model(repositories, model_id="global-vision")
+    provider = RecordingVisionProvider(
+        [
+            "Warm brown skin, close-cropped curls, broad shoulders, and hazel eyes.",
+            "A bronze cloak clasp, salt-weathered coat, and an alert upright stance.",
+        ]
+    )
+    media_dir = tmp_path / "media"
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=media_dir,
+    )
+
+    reference = asyncio.run(
+        service.upload_scenario_starter_reference_image(
+            scenario_id=scenario.id,
+            starter_id="starter-ilyra",
+            image_bytes=_VALID_PNG_BYTES,
+        )
+    )
+
+    updated = repositories.get_scenario(scenario.id)
+    assert updated is not None
+    starter = json.loads(updated.content_json)["character_starters"][0]
+    assert starter["appearance"] == (
+        "Warm brown skin, close-cropped curls, broad shoulders, and hazel eyes."
+    )
+    assert starter["visual_notes"] == (
+        "A bronze cloak clasp, salt-weathered coat, and an alert upright stance."
+    )
+    assert starter["locked_fields"] == ["appearance", "role", "visual_notes"]
+    assert starter["reference_image"]["id"] == reference.id
+    assert [request.model_id for request in provider.image_description_requests] == [
+        "global-vision",
+        "global-vision",
+    ]
+
+    old_path = media_dir / reference.path
+    assert reference.thumbnail_path is not None
+    old_thumbnail = media_dir / reference.thumbnail_path
+    replacement_provider = RecordingVisionProvider(
+        [
+            "Dark brown skin, long silver braids, a square jaw, and gray eyes.",
+            "A navy watch coat, brass insignia, and a steady commanding posture.",
+        ]
+    )
+    service.providers["fake"] = replacement_provider
+    replacement = asyncio.run(
+        service.upload_scenario_starter_reference_image(
+            scenario_id=scenario.id,
+            starter_id="starter-ilyra",
+            image_bytes=_VALID_PNG_BYTES,
+            replace_existing=True,
+        )
+    )
+
+    replaced_scenario = repositories.get_scenario(scenario.id)
+    assert replaced_scenario is not None
+    replaced_starter = json.loads(replaced_scenario.content_json)[
+        "character_starters"
+    ][0]
+    assert replaced_starter["appearance"].startswith("Dark brown skin")
+    assert replaced_starter["visual_notes"].startswith("A navy watch coat")
+    assert replaced_starter["reference_image"]["id"] == replacement.id
+    assert not old_path.exists()
+    assert not old_thumbnail.exists()
+
+
+def test_upload_scenario_starter_analysis_failure_is_atomic(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower above a fog harbor.",
+        player_role="Keeper",
+        content={
+            "character_starters": [
+                {
+                    "starter_id": "starter-ilyra",
+                    "name": "Captain Ilyra",
+                    "appearance": "Existing appearance.",
+                    "visual_notes": "Existing notes.",
+                }
+            ]
+        },
+    )
+    _configure_vision_model(repositories, model_id="global-vision")
+    media_dir = tmp_path / "media"
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": RecordingImageProvider(_VALID_PNG_BYTES)},
+        media_dir=media_dir,
+    )
+    prior_reference = asyncio.run(
+        service.upload_scenario_starter_reference_image(
+            scenario_id=scenario.id,
+            starter_id="starter-ilyra",
+            image_bytes=_VALID_PNG_BYTES,
+        )
+    )
+    persisted = repositories.get_scenario(scenario.id)
+    assert persisted is not None
+    before = persisted.content_json
+    files_before = sorted(
+        path.relative_to(media_dir)
+        for path in media_dir.rglob("*")
+        if path.is_file()
+    )
+    service.providers["fake"] = RecordingVisionProvider(
+        [
+            "Replacement appearance.",
+            ProviderError(
+                ProviderErrorCategory.PROVIDER_ERROR,
+                "vision backend unavailable",
+            ),
+        ]
+    )
+
+    with pytest.raises(ProviderError, match="vision backend unavailable"):
+        asyncio.run(
+            service.upload_scenario_starter_reference_image(
+                scenario_id=scenario.id,
+                starter_id="starter-ilyra",
+                image_bytes=_VALID_PNG_BYTES,
+                replace_existing=True,
+            )
+        )
+
+    updated = repositories.get_scenario(scenario.id)
+    assert updated is not None
+    assert updated.content_json == before
+    assert json.loads(updated.content_json)["character_starters"][0][
+        "reference_image"
+    ]["id"] == prior_reference.id
+    assert sorted(
+        path.relative_to(media_dir)
+        for path in media_dir.rglob("*")
+        if path.is_file()
+    ) == files_before
+
+
+def test_upload_scenario_starter_persistence_failure_preserves_replacement_state(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower above a fog harbor.",
+        player_role="Keeper",
+        content={
+            "character_starters": [
+                {"starter_id": "starter-ilyra", "name": "Captain Ilyra"}
+            ]
+        },
+    )
+    _configure_vision_model(repositories, model_id="global-vision")
+    media_dir = tmp_path / "media"
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": RecordingImageProvider(_VALID_PNG_BYTES)},
+        media_dir=media_dir,
+    )
+    prior = asyncio.run(
+        service.upload_scenario_starter_reference_image(
+            scenario_id=scenario.id,
+            starter_id="starter-ilyra",
+            image_bytes=_VALID_PNG_BYTES,
+        )
+    )
+    persisted = repositories.get_scenario(scenario.id)
+    assert persisted is not None
+    content_before = persisted.content_json
+    files_before = sorted(
+        path.relative_to(media_dir)
+        for path in media_dir.rglob("*")
+        if path.is_file()
+    )
+
+    def fail_update(**_kwargs: object) -> NoReturn:
+        raise sqlite3.OperationalError("simulated scenario update failure")
+
+    monkeypatch.setattr(repositories, "update_scenario", fail_update)
+
+    with pytest.raises(sqlite3.OperationalError, match="simulated scenario"):
+        asyncio.run(
+            service.upload_scenario_starter_reference_image(
+                scenario_id=scenario.id,
+                starter_id="starter-ilyra",
+                image_bytes=_VALID_PNG_BYTES,
+                replace_existing=True,
+            )
+        )
+
+    unchanged = repositories.get_scenario(scenario.id)
+    assert unchanged is not None
+    assert unchanged.content_json == content_before
+    assert json.loads(unchanged.content_json)["character_starters"][0][
+        "reference_image"
+    ]["id"] == prior.id
+    assert sorted(
+        path.relative_to(media_dir)
+        for path in media_dir.rglob("*")
+        if path.is_file()
+    ) == files_before
+
+
+def test_upload_scenario_starter_rejects_changed_no_id_target(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower above a fog harbor.",
+        player_role="Keeper",
+        content={
+            "character_starters": [
+                {"name": "Captain Ilyra", "role": "Original watch captain"}
+            ]
+        },
+    )
+    _configure_vision_model(repositories, model_id="global-vision")
+    media_dir = tmp_path / "media"
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": RecordingImageProvider(_VALID_PNG_BYTES)},
+        media_dir=media_dir,
+    )
+    prepared = asyncio.run(
+        service.prepare_scenario_starter_reference_image_upload(
+            scenario_id=scenario.id,
+            starter_name="Captain Ilyra",
+            image_bytes=_VALID_PNG_BYTES,
+        )
+    )
+    repositories.update_scenario(
+        scenario_id=scenario.id,
+        title=scenario.title,
+        premise=scenario.premise,
+        player_role=scenario.player_role,
+        content={
+            "character_starters": [
+                {"name": "Captain Ilyra", "role": "Replacement harbor captain"}
+            ]
+        },
+    )
+
+    with pytest.raises(ValueError, match="Starter changed while the upload"):
+        service.commit_scenario_starter_reference_image_upload(prepared)
+
+    unchanged = repositories.get_scenario(scenario.id)
+    assert unchanged is not None
+    starter = json.loads(unchanged.content_json)["character_starters"][0]
+    assert starter["role"] == "Replacement harbor captain"
+    assert "reference_image" not in starter
+    assert [path for path in media_dir.rglob("*") if path.is_file()] == []
+
+
+def test_upload_scenario_starter_rejects_stale_reference_replacement(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Lantern Keep",
+        premise="A watchtower above a fog harbor.",
+        player_role="Keeper",
+        content={
+            "character_starters": [
+                {"starter_id": "starter-ilyra", "name": "Captain Ilyra"}
+            ]
+        },
+    )
+    _configure_vision_model(repositories, model_id="global-vision")
+    media_dir = tmp_path / "media"
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": RecordingImageProvider(_VALID_PNG_BYTES)},
+        media_dir=media_dir,
+    )
+    first = asyncio.run(
+        service.upload_scenario_starter_reference_image(
+            scenario_id=scenario.id,
+            starter_id="starter-ilyra",
+            image_bytes=_VALID_PNG_BYTES,
+        )
+    )
+    stale = asyncio.run(
+        service.prepare_scenario_starter_reference_image_upload(
+            scenario_id=scenario.id,
+            starter_id="starter-ilyra",
+            image_bytes=_VALID_PNG_BYTES,
+            replace_existing=True,
+        )
+    )
+    current = asyncio.run(
+        service.upload_scenario_starter_reference_image(
+            scenario_id=scenario.id,
+            starter_id="starter-ilyra",
+            image_bytes=_VALID_PNG_BYTES,
+            replace_existing=True,
+        )
+    )
+    files_before_stale_commit = sorted(
+        path.relative_to(media_dir)
+        for path in media_dir.rglob("*")
+        if path.is_file()
+    )
+
+    with pytest.raises(ValueError, match="changed while the upload was being analyzed"):
+        service.commit_scenario_starter_reference_image_upload(stale)
+
+    persisted = repositories.get_scenario(scenario.id)
+    assert persisted is not None
+    reference = json.loads(persisted.content_json)["character_starters"][0][
+        "reference_image"
+    ]
+    assert reference["id"] == current.id
+    assert current.id != first.id
+    assert sorted(
+        path.relative_to(media_dir)
+        for path in media_dir.rglob("*")
+        if path.is_file()
+    ) == files_before_stale_commit
+
+
 def test_upload_character_reference_persists_private_media_and_link(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -7952,10 +8576,12 @@ def test_upload_character_reference_persists_private_media_and_link(
         media_dir=media_dir,
     )
 
-    asset = service.upload_character_reference_image(
-        save_id=save.id,
-        image_bytes=_VALID_PNG_BYTES,
-        filename="private-portrait.png",
+    asset = asyncio.run(
+        service.upload_character_reference_image(
+            save_id=save.id,
+            image_bytes=_VALID_PNG_BYTES,
+            filename="private-portrait.png",
+        )
     )
 
     assert provider.image_requests == []
@@ -8008,11 +8634,13 @@ def test_upload_character_reference_allows_full_roleplay_character(
         media_dir=tmp_path / "media",
     )
 
-    asset = service.upload_character_reference_image(
-        save_id=save.id,
-        character_id=character.id,
-        image_bytes=_VALID_PNG_BYTES,
-        filename="reference.png",
+    asset = asyncio.run(
+        service.upload_character_reference_image(
+            save_id=save.id,
+            character_id=character.id,
+            image_bytes=_VALID_PNG_BYTES,
+            filename="reference.png",
+        )
     )
 
     assert json.loads(asset.metadata_json)["character_id"] == character.id
@@ -8038,11 +8666,13 @@ def test_upload_scoped_reference_does_not_create_retired_save_compat_link(
         media_dir=tmp_path / "media",
     )
 
-    asset = service.upload_character_reference_image(
-        save_id=save.id,
-        character_id=character_id,
-        image_bytes=_VALID_PNG_BYTES,
-        filename="primary-reference.png",
+    asset = asyncio.run(
+        service.upload_character_reference_image(
+            save_id=save.id,
+            character_id=character_id,
+            image_bytes=_VALID_PNG_BYTES,
+            filename="primary-reference.png",
+        )
     )
 
     links = [
@@ -8066,10 +8696,12 @@ def test_upload_character_reference_replaces_link_without_archiving_old_source(
         providers={"fake": RecordingImageProvider(_VALID_PNG_BYTES)},
         media_dir=media_dir,
     )
-    old_reference = service.upload_character_reference_image(
-        save_id=save.id,
-        image_bytes=_VALID_PNG_BYTES,
-        filename="old.png",
+    old_reference = asyncio.run(
+        service.upload_character_reference_image(
+            save_id=save.id,
+            image_bytes=_VALID_PNG_BYTES,
+            filename="old.png",
+        )
     )
     scene_asset = repositories.create_media_asset(
         save_id=save.id,
@@ -8086,16 +8718,20 @@ def test_upload_character_reference_replaces_link_without_archiving_old_source(
     )
 
     with pytest.raises(ValueError, match="already exists"):
+        asyncio.run(
+            service.upload_character_reference_image(
+                save_id=save.id,
+                image_bytes=_VALID_PNG_BYTES,
+                filename="new.png",
+            )
+        )
+    new_reference = asyncio.run(
         service.upload_character_reference_image(
             save_id=save.id,
             image_bytes=_VALID_PNG_BYTES,
             filename="new.png",
+            replace_existing=True,
         )
-    new_reference = service.upload_character_reference_image(
-        save_id=save.id,
-        image_bytes=_VALID_PNG_BYTES,
-        filename="new.png",
-        replace_existing=True,
     )
 
     assert repositories.list_media_assets(save.id)[0].archived_at is None
@@ -8111,6 +8747,63 @@ def test_upload_character_reference_replaces_link_without_archiving_old_source(
     ] == [("character", character_id, new_reference.id)]
 
 
+def test_upload_character_reference_rejects_stale_reference_replacement(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save, _opening_message, character_id = _full_roleplay_save(repositories)
+    media_dir = tmp_path / "media"
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": RecordingImageProvider(_VALID_PNG_BYTES)},
+        media_dir=media_dir,
+    )
+    first = asyncio.run(
+        service.upload_character_reference_image(
+            save_id=save.id,
+            character_id=character_id,
+            image_bytes=_VALID_PNG_BYTES,
+        )
+    )
+    stale = asyncio.run(
+        service.prepare_character_reference_image_upload(
+            save_id=save.id,
+            character_id=character_id,
+            image_bytes=_VALID_PNG_BYTES,
+            replace_existing=True,
+        )
+    )
+    current = asyncio.run(
+        service.upload_character_reference_image(
+            save_id=save.id,
+            character_id=character_id,
+            image_bytes=_VALID_PNG_BYTES,
+            replace_existing=True,
+        )
+    )
+    files_before_stale_commit = sorted(
+        path.relative_to(media_dir)
+        for path in media_dir.rglob("*")
+        if path.is_file()
+    )
+
+    with pytest.raises(ValueError, match="changed while the upload was being analyzed"):
+        service.commit_character_reference_image_upload(stale)
+
+    links = [
+        link
+        for link in repositories.list_entity_links(save.id)
+        if link.relation == "reference_image"
+    ]
+    assert [link.target_id for link in links] == [current.id]
+    assert current.id != first.id
+    assert sorted(
+        path.relative_to(media_dir)
+        for path in media_dir.rglob("*")
+        if path.is_file()
+    ) == files_before_stale_commit
+
+
 def test_remove_character_reference_only_unlinks_active_reference(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -8122,10 +8815,12 @@ def test_remove_character_reference_only_unlinks_active_reference(
         providers={"fake": RecordingImageProvider(_VALID_PNG_BYTES)},
         media_dir=media_dir,
     )
-    reference = service.upload_character_reference_image(
-        save_id=save.id,
-        image_bytes=_VALID_PNG_BYTES,
-        filename="reference.webp",
+    reference = asyncio.run(
+        service.upload_character_reference_image(
+            save_id=save.id,
+            image_bytes=_VALID_PNG_BYTES,
+            filename="reference.webp",
+        )
     )
 
     removed = service.remove_character_reference_image(save_id=save.id)
@@ -8148,10 +8843,12 @@ def test_remove_scoped_reference_clears_character_link(
         providers={"fake": RecordingImageProvider(_VALID_PNG_BYTES)},
         media_dir=tmp_path / "media",
     )
-    reference = service.upload_character_reference_image(
-        save_id=save.id,
-        image_bytes=_VALID_PNG_BYTES,
-        filename="reference.webp",
+    reference = asyncio.run(
+        service.upload_character_reference_image(
+            save_id=save.id,
+            image_bytes=_VALID_PNG_BYTES,
+            filename="reference.webp",
+        )
     )
 
     removed = service.remove_character_reference_image(
@@ -8181,28 +8878,36 @@ def test_upload_character_reference_validates_type_size_and_save(
     )
 
     with pytest.raises(ValueError, match="Unsupported image upload type"):
-        service.upload_character_reference_image(
-            save_id=save.id,
-            image_bytes=b"not an image",
-            filename="notes.txt",
+        asyncio.run(
+            service.upload_character_reference_image(
+                save_id=save.id,
+                image_bytes=b"not an image",
+                filename="notes.txt",
+            )
         )
     with pytest.raises(ValueError, match="Uploaded image exceeded"):
-        service.upload_character_reference_image(
-            save_id=save.id,
-            image_bytes=b"\x89PNG\r\n\x1a\n" + (b"x" * (25 * 1024 * 1024)),
-            filename="huge.png",
+        asyncio.run(
+            service.upload_character_reference_image(
+                save_id=save.id,
+                image_bytes=b"\x89PNG\r\n\x1a\n" + (b"x" * (25 * 1024 * 1024)),
+                filename="huge.png",
+            )
         )
     with pytest.raises(ValueError, match="Unknown save id"):
-        service.upload_character_reference_image(
-            save_id="missing-save",
-            image_bytes=_VALID_PNG_BYTES,
-            filename="reference.png",
+        asyncio.run(
+            service.upload_character_reference_image(
+                save_id="missing-save",
+                image_bytes=_VALID_PNG_BYTES,
+                filename="reference.png",
+            )
         )
     with pytest.raises(ValueError, match="No character is available"):
-        service.upload_character_reference_image(
-            save_id=full_roleplay_save.id,
-            image_bytes=_VALID_PNG_BYTES,
-            filename="reference.png",
+        asyncio.run(
+            service.upload_character_reference_image(
+                save_id=full_roleplay_save.id,
+                image_bytes=_VALID_PNG_BYTES,
+                filename="reference.png",
+            )
         )
 
 
@@ -8358,10 +9063,12 @@ def test_uploaded_character_reference_is_reused_for_character_image_generation(
         providers={"fake": provider},
         media_dir=media_dir,
     )
-    reference = service.upload_character_reference_image(
-        save_id=save.id,
-        image_bytes=_VALID_PNG_BYTES,
-        filename="reference.png",
+    reference = asyncio.run(
+        service.upload_character_reference_image(
+            save_id=save.id,
+            image_bytes=_VALID_PNG_BYTES,
+            filename="reference.png",
+        )
     )
     _mark_character_present(
         repositories,
@@ -8538,6 +9245,40 @@ def _media_service(
     return MediaService(**kwargs)
 
 
+def _configure_vision_model(
+    repositories: PersistenceRepositories,
+    *,
+    model_id: str,
+    save_id: str | None = None,
+) -> None:
+    repositories.save_provider_model(
+        provider="fake",
+        model_id=model_id,
+        display_name=model_id,
+        capabilities=[ProviderCapability.VISION.value],
+    )
+    if save_id is None:
+        repositories.set_model_preference(
+            task="character_image_description",
+            provider="fake",
+            model_id=model_id,
+        )
+        return
+    repositories.set_scoped_setting(
+        scope="save",
+        scope_id=save_id,
+        key=SAVE_MODEL_OVERRIDES_SETTING,
+        value={
+            "preferences": {
+                "character_image_description": {
+                    "provider": "fake",
+                    "model_id": model_id,
+                }
+            }
+        },
+    )
+
+
 def _save_with_image_preference(
     repositories: PersistenceRepositories,
 ) -> tuple[SaveRecord, list[MessageRecord]]:
@@ -8597,6 +9338,7 @@ def _save_with_image_preference(
         provider="fake",
         model_id="fake-image",
     )
+    _configure_vision_model(repositories, model_id="fake-vision")
     return save, messages
 
 
@@ -8701,6 +9443,7 @@ def _full_roleplay_save(
         provider="fake",
         model_id="fake-image",
     )
+    _configure_vision_model(repositories, model_id="fake-vision")
     return save, opening_message, character.id
 
 
@@ -8895,6 +9638,39 @@ def _media_jobs(
             }
         )
     return jobs
+
+
+def test_persist_thumbnail_removes_partial_file_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_dir = tmp_path / "media"
+    image_relative_path = Path("save-1/uploads/reference.png")
+    image_path = media_dir / image_relative_path
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(_VALID_PNG_BYTES)
+    thumbnail_path = media_dir / "save-1/uploads/thumbnails/reference.png"
+
+    def fail_after_write(*, image_path: Path, thumbnail_path: Path) -> NoReturn:
+        del image_path
+        thumbnail_path.parent.mkdir(parents=True, exist_ok=True)
+        thumbnail_path.write_bytes(b"partial private image")
+        raise OSError("simulated thumbnail permission failure")
+
+    monkeypatch.setattr(
+        media_service_module,
+        "_write_scaled_thumbnail",
+        fail_after_write,
+    )
+
+    with pytest.raises(OSError, match="simulated thumbnail"):
+        media_service_module._persist_thumbnail(
+            media_dir=media_dir,
+            image_relative_path=image_relative_path,
+            image_path=image_path,
+        )
+
+    assert not thumbnail_path.exists()
 
 
 def _asset_path(media_dir: Path, persisted_path: str) -> Path:

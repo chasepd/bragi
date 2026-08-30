@@ -532,7 +532,7 @@ type ScenarioEditorStarter = {
 };
 type ScenarioStarterReferencePatch = Pick<
   ScenarioEditorStarter,
-  "starter_id" | "reference_image"
+  "starter_id" | "appearance" | "visual_notes" | "locked_fields_text" | "reference_image"
 >;
 type ScenarioStarterTextField =
   | "aliases_text"
@@ -1135,6 +1135,20 @@ const CHARACTER_LOCK_FIELDS = [
   ["present", "Present"]
 ] as const;
 const CHARACTER_LOCK_FIELD_IDS: ReadonlySet<string> = new Set(CHARACTER_LOCK_FIELDS.map(([id]) => id));
+export function mergeReferenceUploadLocks(server: string[], baseline: string[], current: string[]): string[] {
+  const merged = new Set(server);
+  for (const field of CHARACTER_LOCK_FIELD_IDS) {
+    if (field === "appearance" || field === "visual_notes") merged.add(field);
+    else if (baseline.includes(field) !== current.includes(field)) {
+      if (current.includes(field)) merged.add(field);
+      else merged.delete(field);
+    }
+  }
+  return [
+    ...CHARACTER_LOCK_FIELDS.map(([id]) => id).filter((id) => merged.has(id)),
+    ...server.filter((field) => !CHARACTER_LOCK_FIELD_IDS.has(field))
+  ];
+}
 const CHARACTER_LOCK_FIELD_ALIASES: Record<string, string> = {
   aliases_text: "aliases",
   relationships_json: "relationships"
@@ -8214,9 +8228,9 @@ function scenarioEditorStarterIndex(id: string): number | null {
 function scenarioStarterReferencePatchFor(
   starter: ScenarioEditorStarter
 ): ScenarioStarterReferencePatch {
+  const { starter_id, appearance, visual_notes, locked_fields_text, reference_image } = starter;
   return {
-    starter_id: starter.starter_id,
-    reference_image: starter.reference_image
+    starter_id, appearance, visual_notes, locked_fields_text, reference_image
   };
 }
 
@@ -8533,7 +8547,15 @@ function ScenarioStructuredEditor({
     if (!patch) return;
     setStarters((current) => current.map((starter) => (
       starter.id === targetStarter.id
-        ? { ...starter, ...patch }
+        ? {
+            ...starter,
+            ...patch,
+            locked_fields_text: mergeReferenceUploadLocks(
+              csvValues(patch.locked_fields_text),
+              csvValues(targetStarter.locked_fields_text),
+              csvValues(starter.locked_fields_text)
+            ).join(", ")
+          }
         : starter
     )));
     setSavedDraft((current) => ({
