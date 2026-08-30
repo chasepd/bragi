@@ -18,7 +18,7 @@ from collections.abc import (
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from bragi.app_logging import exception_log_fields, log_error_event, log_event
 from bragi.application.chat_history import ChatHistoryModel, build_chat_history_model
@@ -2738,7 +2738,7 @@ class BragiRuntime:
             active_save_id=save_id,
         )
 
-    def upload_character_reference_image(
+    async def upload_character_reference_image(
         self,
         *,
         image_bytes: bytes,
@@ -2746,6 +2746,12 @@ class BragiRuntime:
         character_id: str | None = None,
         replace_existing: bool = False,
         active_save_id: str | None | object = ...,
+        mutation_context: (
+            Callable[[], AbstractAsyncContextManager[None]] | None
+        ) = None,
+        failure_phase_callback: (
+            Callable[[Literal["analysis", "upload"]], None] | None
+        ) = None,
     ) -> RuntimeModel:
         save_id = (
             self.active_save_id
@@ -2759,16 +2765,53 @@ class BragiRuntime:
             )
             return self.build_model(error="No save loaded", active_save_id=save_id)
 
+        failure_phase: Literal["analysis", "upload"] = "upload"
+
+        def analysis_started() -> None:
+            nonlocal failure_phase
+            failure_phase = "analysis"
+
         try:
-            with self._thread_save_operation_lock(save_id):
-                asset = self._media_service().upload_character_reference_image(
-                    save_id=save_id,
-                    image_bytes=image_bytes,
-                    filename=filename,
-                    character_id=character_id,
-                    replace_existing=replace_existing,
-                )
+            media_service = self._media_service()
+            prepared = await media_service.prepare_character_reference_image_upload(
+                save_id=save_id,
+                image_bytes=image_bytes,
+                filename=filename,
+                character_id=character_id,
+                replace_existing=replace_existing,
+                analysis_started_callback=analysis_started,
+            )
+            failure_phase = "upload"
+            if mutation_context is not None:
+                async with mutation_context():
+                    async with self._save_operation_lock(save_id):
+                        asset = media_service.commit_character_reference_image_upload(
+                            prepared
+                        )
+                        model = self.build_model(
+                            status=(
+                                "Character reference image replaced"
+                                if replace_existing
+                                else "Character reference image uploaded"
+                            ),
+                            active_save_id=save_id,
+                        )
+            else:
+                async with self._save_operation_lock(save_id):
+                    asset = media_service.commit_character_reference_image_upload(
+                        prepared
+                    )
+                    model = self.build_model(
+                        status=(
+                            "Character reference image replaced"
+                            if replace_existing
+                            else "Character reference image uploaded"
+                        ),
+                        active_save_id=save_id,
+                    )
         except Exception as exc:
+            if failure_phase_callback is not None:
+                failure_phase_callback(failure_phase)
             log_error_event(
                 "runtime.character_reference_upload_failed",
                 save_id=save_id,
@@ -2787,14 +2830,7 @@ class BragiRuntime:
             media_asset_id=asset.id,
             replaced=replace_existing,
         )
-        return self.build_model(
-            status=(
-                "Character reference image replaced"
-                if replace_existing
-                else "Character reference image uploaded"
-            ),
-            active_save_id=save_id,
-        )
+        return model
 
     def remove_character_reference_image(
         self,
@@ -2848,7 +2884,7 @@ class BragiRuntime:
             active_save_id=save_id,
         )
 
-    def upload_scenario_starter_reference_image(
+    async def upload_scenario_starter_reference_image(
         self,
         *,
         scenario_id: str,
@@ -2857,18 +2893,45 @@ class BragiRuntime:
         starter_id: str | None = None,
         starter_name: str = "",
         replace_existing: bool = False,
+        mutation_context: (
+            Callable[[], AbstractAsyncContextManager[None]] | None
+        ) = None,
     ) -> WorldDataModel:
-        self._media_service().upload_scenario_starter_reference_image(
-            scenario_id=scenario_id,
-            image_bytes=image_bytes,
-            filename=filename,
-            starter_id=starter_id,
-            starter_name=starter_name,
-            replace_existing=replace_existing,
-        )
-        return WorldDataService(self.repositories).build_scenario_definition_model(
-            scenario_id
-        )
+        try:
+            media_service = self._media_service()
+            prepared = (
+                await media_service.prepare_scenario_starter_reference_image_upload(
+                    scenario_id=scenario_id,
+                    image_bytes=image_bytes,
+                    filename=filename,
+                    starter_id=starter_id,
+                    starter_name=starter_name,
+                    replace_existing=replace_existing,
+                )
+            )
+            if mutation_context is not None:
+                async with mutation_context():
+                    media_service.commit_scenario_starter_reference_image_upload(
+                        prepared
+                    )
+                    model = WorldDataService(
+                        self.repositories
+                    ).build_scenario_definition_model(scenario_id)
+            else:
+                media_service.commit_scenario_starter_reference_image_upload(prepared)
+                model = WorldDataService(
+                    self.repositories
+                ).build_scenario_definition_model(scenario_id)
+        except Exception as exc:
+            log_error_event(
+                "runtime.scenario_starter_reference_upload_failed",
+                scenario_id=scenario_id,
+                starter_id=starter_id,
+                starter_name=starter_name,
+                **exception_log_fields(exc),
+            )
+            raise ValueError(_user_visible_error(exc)) from exc
+        return model
 
     def remove_scenario_starter_reference_image(
         self,

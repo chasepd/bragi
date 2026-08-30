@@ -12741,6 +12741,9 @@ describe("frontend helpers", () => {
         definitionPayload.scenario.character_starters[0] = {
           ...definitionPayload.scenario.character_starters[0],
           starter_id: "starter-ilyra",
+          appearance: "Warm brown skin, hazel eyes, and close-cropped curls.",
+          visual_notes: "A bronze cloak clasp and an alert upright stance.",
+          locked_fields: ["appearance", "visual_notes"],
           reference_image: {
             id: "starter-ref-1",
             path: "scenario-starters/scenario-1/starter-ref-1.png",
@@ -12789,6 +12792,12 @@ describe("frontend helpers", () => {
 
     await userEvent.upload(within(dialog).getByLabelText("Upload Captain Ilyra reference image file"), file);
     expect(await within(dialog).findByAltText("Uploaded character reference image")).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Starter Captain Ilyra appearance")).toHaveValue(
+      "Warm brown skin, hazel eyes, and close-cropped curls."
+    );
+    expect(within(dialog).getByLabelText("Starter Captain Ilyra visual notes")).toHaveValue(
+      "A bronze cloak clasp and an alert upright stance."
+    );
     const uploadCall = fetchMock.mock.calls.find(([path]) => path === "/api/scenarios/scenario-1/character-starters/reference-image/upload");
     const uploadForm = uploadCall?.[1]?.body as FormData;
     expect(uploadForm.get("starter_name")).toBe("Captain Ilyra");
@@ -12843,7 +12852,7 @@ describe("frontend helpers", () => {
             boundaries: "",
             status: "",
             met: true,
-            locked_fields: [],
+            locked_fields: ["role"],
             reference_image: null
           }
         ]
@@ -12858,6 +12867,9 @@ describe("frontend helpers", () => {
             ...definitionPayload.scenario.character_starters[0],
             starter_id: "starter-ilyra",
             role: "Watch captain",
+            appearance: "Warm brown skin, hazel eyes, and close-cropped curls.",
+            visual_notes: "A bronze cloak clasp and an alert upright stance.",
+            locked_fields: ["appearance", "role", "visual_notes"],
             reference_image: {
               id: "starter-ref-1",
               path: "scenario-starters/scenario-1/starter-ref-1.png",
@@ -12916,6 +12928,9 @@ describe("frontend helpers", () => {
     fireEvent.change(within(dialog).getByLabelText("Starter Captain Ilyra role"), {
       target: { value: "Harbor captain" }
     });
+    fireEvent.change(within(dialog).getByLabelText("Starter Captain Ilyra locked fields"), {
+      target: { value: "personality" }
+    });
     const saveButton = within(dialog).getByRole("button", { name: "Save scenario" });
     await waitFor(() => expect(saveButton).toBeDisabled());
     expect(fetchMock.mock.calls.some(([path, init]) => (
@@ -12932,6 +12947,15 @@ describe("frontend helpers", () => {
 
     expect(await within(dialog).findByAltText("Uploaded character reference image")).toBeInTheDocument();
     expect(within(dialog).getByLabelText("Starter Captain Ilyra role")).toHaveValue("Harbor captain");
+    expect(within(dialog).getByLabelText("Starter Captain Ilyra appearance")).toHaveValue(
+      "Warm brown skin, hazel eyes, and close-cropped curls."
+    );
+    expect(within(dialog).getByLabelText("Starter Captain Ilyra visual notes")).toHaveValue(
+      "A bronze cloak clasp and an alert upright stance."
+    );
+    expect(within(dialog).getByLabelText("Starter Captain Ilyra locked fields")).toHaveValue(
+      "appearance, visual_notes, personality"
+    );
     await waitFor(() => expect(saveButton).toBeEnabled());
 
     await userEvent.click(saveButton);
@@ -12942,6 +12966,9 @@ describe("frontend helpers", () => {
     expect(savedBody.edit.character_starters[0]).toMatchObject({
       starter_id: "starter-ilyra",
       role: "Harbor captain",
+      appearance: "Warm brown skin, hazel eyes, and close-cropped curls.",
+      visual_notes: "A bronze cloak clasp and an alert upright stance.",
+      locked_fields: ["appearance", "visual_notes", "personality"],
       reference_image: expect.objectContaining({ id: "starter-ref-1" })
     });
   });
@@ -19222,24 +19249,20 @@ describe("frontend helpers", () => {
         ilyra
       ]
     });
-    const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
-      ok: true,
-      json: async () => {
-        if (path === "/api/characters/character-1/enhance-field") {
-          latestPayload = enhancedPayload;
-          return {
-            model: enhancedPayload,
-            character_id: "character-1",
-            field_name: "appearance",
-            created_count: 0,
-            updated_count: 1,
-            archived_count: 0,
-            error: null
-          };
-        }
-        return latestPayload;
+    const enhanceResponse = deferred<{
+      ok: boolean;
+      json: () => Promise<Record<string, unknown>>;
+    }>();
+    const fetchMock = vi.fn().mockImplementation((path: string) => {
+      if (path === "/api/characters/character-1/enhance-field") {
+        latestPayload = enhancedPayload;
+        return enhanceResponse.promise;
       }
-    }));
+      return Promise.resolve({
+        ok: true,
+        json: async () => latestPayload
+      });
+    });
     vi.stubGlobal("fetch", fetchMock);
     const { CharactersPanel } = await import("./main");
 
@@ -19258,6 +19281,8 @@ describe("frontend helpers", () => {
     await userEvent.click(screen.getByRole("button", { name: "Auto-enhance Appearance" }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/characters/character-1/enhance-field", expect.anything()));
+    expect(screen.getByRole("button", { name: "Upload" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
     const enhanceCall = fetchMock.mock.calls.find(([path]) => path === "/api/characters/character-1/enhance-field");
     expect(JSON.parse(String(enhanceCall?.[1].body))).toMatchObject({
       active_save_id: "save-1",
@@ -19268,7 +19293,24 @@ describe("frontend helpers", () => {
         appearance: "Ash-dusted cloak."
       }
     });
-    expect(screen.getByLabelText("Appearance")).toHaveValue("Ash-dusted cloak.\n\nCopper lens-key on a black cord.");
+    act(() => {
+      enhanceResponse.resolve({
+        ok: true,
+        json: async () => ({
+          model: enhancedPayload,
+          character_id: "character-1",
+          field_name: "appearance",
+          created_count: 0,
+          updated_count: 1,
+          archived_count: 0,
+          error: null
+        })
+      });
+    });
+    await waitFor(() => expect(screen.getByLabelText("Appearance")).toHaveValue(
+      "Ash-dusted cloak.\n\nCopper lens-key on a black cord."
+    ));
+    expect(screen.getByRole("button", { name: "Upload" })).toBeEnabled();
     expect(screen.queryByText("Unsaved changes")).not.toBeInTheDocument();
   });
 
@@ -20328,6 +20370,7 @@ describe("frontend helpers", () => {
           linked_memory_ids: [],
           linked_state_ids: [],
           linked_summary_ids: [],
+          locked_fields: ["role"],
           reference_image: null
         }
       ],
@@ -20341,6 +20384,9 @@ describe("frontend helpers", () => {
       characters: [
         {
           ...baseCharacter,
+          appearance: "Warm brown skin, hazel eyes, and close-cropped curls.",
+          visual_notes: "A weathered field jacket and an alert upright stance.",
+          locked_fields: ["appearance", "role", "visual_notes"],
           reference_image: {
             media_asset_id: "media-reference-1",
             mime_type: "image/png",
@@ -20388,14 +20434,25 @@ describe("frontend helpers", () => {
       }
     }));
     vi.stubGlobal("fetch", fetchMock);
-    const runJob = vi.fn((_: unknown, options?: { onSucceeded?: (result: unknown) => void }) => {
-      options?.onSucceeded?.({});
+    let uploadOptions: {
+      onSucceeded?: (result: unknown) => void;
+      onFailed?: (error: string, job: Job) => void;
+      onFinished?: (job: Job) => void;
+    } | undefined;
+    const runJob = vi.fn((submitted: Job, options?: {
+      onSucceeded?: (result: unknown) => void;
+      onFailed?: (error: string, job: Job) => void;
+      onFinished?: (job: Job) => void;
+    }) => {
+      if (submitted.id === uploadJob.id) uploadOptions = options;
+      else options?.onSucceeded?.({});
       return vi.fn();
     });
     const { CharactersPanel } = await import("./main");
 
+    const queryClient = new QueryClient();
     render(
-      <QueryClientProvider client={new QueryClient()}>
+      <QueryClientProvider client={queryClient}>
         <CharactersPanel activeSaveId="save-1" runJob={runJob} />
       </QueryClientProvider>
     );
@@ -20411,9 +20468,59 @@ describe("frontend helpers", () => {
 
     const file = new File([new Uint8Array([137, 80, 78, 71])], "mara.png", { type: "image/png" });
     await userEvent.upload(screen.getByLabelText("Upload character reference image"), file);
+    expect(screen.getByRole("button", { name: "Upload" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Auto-enhance Appearance" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Role"), {
+      target: { value: "Harbor scout" }
+    });
+    await userEvent.click(screen.getByRole("tab", { name: "Locks" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "Lock Role" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "Lock Personality" }));
+    expect(screen.getByRole("button", { name: "Save character" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("tab", { name: "Profile" }));
+    expect(screen.getByRole("button", { name: "Upload" })).toBeDisabled();
+    act(() => uploadOptions?.onSucceeded?.(withReference));
+    act(() => uploadOptions?.onFinished?.({ ...uploadJob, status: "succeeded", result: withReference }));
     await screen.findByAltText("Uploaded character reference image");
+    expect(screen.getByLabelText("Role")).toHaveValue("Harbor scout");
+    expect(screen.getByLabelText("Appearance")).toHaveValue(
+      "Warm brown skin, hazel eyes, and close-cropped curls."
+    );
+    expect(screen.getByLabelText("Visual notes")).toHaveValue(
+      "A weathered field jacket and an alert upright stance."
+    );
+    await waitFor(() => expect(queryClient.getQueryData(["characters", "save-1"])).toEqual(withReference));
+    await userEvent.click(screen.getByRole("tab", { name: "Locks" }));
+    expect(screen.getByRole("checkbox", { name: "Lock Role" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Lock Personality" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Lock Appearance" })).toBeChecked();
+    expect(screen.getByRole("button", { name: "Save character" })).toBeEnabled();
+    await userEvent.click(screen.getByRole("tab", { name: "Profile" }));
     const uploadCall = fetchMock.mock.calls.find(([path]) => path === "/api/characters/character-1/reference-image/upload");
     expect(uploadCall?.[1].body).toBeInstanceOf(FormData);
+
+    await userEvent.upload(screen.getByLabelText("Replace character reference image"), file);
+    await userEvent.click(screen.getByRole("tab", { name: "Locks" }));
+    expect(screen.getByRole("button", { name: "Save character" })).toBeDisabled();
+    await userEvent.click(screen.getByRole("tab", { name: "Profile" }));
+    expect(screen.getByRole("button", { name: "Replace" })).toBeDisabled();
+    act(() => uploadOptions?.onFailed?.("Vision analysis failed", {
+      ...uploadJob,
+      status: "failed",
+      error: "Vision analysis failed"
+    }));
+    expect(screen.getByRole("button", { name: "Replace" })).toBeDisabled();
+    act(() => uploadOptions?.onFinished?.({
+      ...uploadJob,
+      status: "failed",
+      error: "Vision analysis failed"
+    }));
+    expect(await screen.findByText("Vision analysis failed")).toBeInTheDocument();
+    expect(screen.getByLabelText("Role")).toHaveValue("Harbor scout");
+    expect(screen.getByLabelText("Appearance")).toHaveValue(
+      "Warm brown skin, hazel eyes, and close-cropped curls."
+    );
 
     await userEvent.click(screen.getByRole("button", { name: "Remove" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/characters/character-1/reference-image/remove", expect.anything()));

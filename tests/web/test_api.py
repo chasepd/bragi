@@ -15167,6 +15167,9 @@ def test_scenario_starter_reference_image_upload_and_remove(
         )
         assert uploaded.status_code == 200
         starter = uploaded.json()["scenario"]["character_starters"][0]
+        assert starter["appearance"]
+        assert starter["visual_notes"]
+        assert {"appearance", "visual_notes"}.issubset(starter["locked_fields"])
         reference = starter["reference_image"]
         reference_path = state.paths.media_dir / reference["path"]
         thumbnail_path = state.paths.media_dir / reference["thumbnail_path"]
@@ -16947,7 +16950,8 @@ def test_media_set_character_reference_passes_asset_and_save_to_runtime(
             json={"save_id": "save-1"},
         )
         assert response.status_code == 200
-        job = _wait_for_terminal_job(client, response.json()["id"], save_id="save-1")
+        job_id = response.json()["id"]
+        job = _wait_for_terminal_job(client, job_id, save_id="save-1")
 
     assert job["status"] == "succeeded"
     assert job["result"]["status"] == "Character reference image updated"
@@ -17152,7 +17156,7 @@ def test_media_upload_character_reference_passes_file_and_save_to_runtime(
             super().__init__()
             self.uploads: list[tuple[bytes, str | None, bool, str | None]] = []
 
-        def upload_character_reference_image(
+        async def upload_character_reference_image(
             self,
             *,
             image_bytes: bytes,
@@ -17191,10 +17195,14 @@ def test_media_upload_character_reference_passes_file_and_save_to_runtime(
             files={"file": ("portrait.png", b"\x89PNG\r\n\x1a\nimage", "image/png")},
         )
         assert response.status_code == 200
-        job = _wait_for_terminal_job(client, response.json()["id"], save_id="save-1")
+        job_id = response.json()["id"]
+        job = _wait_for_terminal_job(client, job_id, save_id="save-1")
+        events = client.get(f"/api/jobs/{job_id}/events?save_id=save-1")
 
     assert job["status"] == "succeeded"
     assert job["result"]["status"] == "Character reference image uploaded"
+    assert "Analyzing reference image" in events.text
+    assert "Reference image and character details saved" in events.text
     assert runtime.uploads == [
         (b"\x89PNG\r\n\x1a\nimage", "portrait.png", True, "save-1")
     ]
@@ -17229,19 +17237,60 @@ def test_rated_reference_upload_is_rejected_before_persistence(
     )
 
 
+@pytest.mark.parametrize(
+    ("runtime_error", "failure_phase", "expected_error"),
+    [
+        (
+            "Unsupported image upload type; use PNG, JPEG, or WebP",
+            "upload",
+            "Reference image upload failed. Try again or check diagnostics "
+            "for details.",
+        ),
+        (
+            "No Image Details vision model configured",
+            "analysis",
+            "Reference image analysis failed. Try again or check diagnostics "
+            "for details.",
+        ),
+        (
+            "network_error: provider unavailable",
+            "analysis",
+            "Reference image analysis failed. Try again or check diagnostics "
+            "for details.",
+        ),
+        (
+            "authentication_failed: credentials rejected",
+            "analysis",
+            "Reference image analysis failed. Try again or check diagnostics "
+            "for details.",
+        ),
+        (
+            "model_not_found: configured model is missing",
+            "analysis",
+            "Reference image analysis failed. Try again or check diagnostics "
+            "for details.",
+        ),
+    ],
+)
 def test_media_upload_character_reference_maps_runtime_errors(
     tmp_path: Path,
+    runtime_error: str,
+    failure_phase: str,
+    expected_error: str,
 ) -> None:
     class FailingUploadRuntime(_RuntimeDouble):
-        def upload_character_reference_image(
+        async def upload_character_reference_image(
             self,
             *,
             image_bytes: bytes,
             filename: str | None,
             replace_existing: bool,
             active_save_id: str | None,
+            failure_phase_callback: Callable[[str], None] | None = None,
         ) -> dict[str, object]:
-            return {"error": "Unsupported image upload type; use PNG, JPEG, or WebP"}
+            if failure_phase_callback is not None:
+                failure_phase_callback(failure_phase)
+            return {"error": runtime_error}
 
     state = _state_double(tmp_path, FailingUploadRuntime())
     state.repositories.get_effective_setting = (
@@ -17259,7 +17308,7 @@ def test_media_upload_character_reference_maps_runtime_errors(
         job = _wait_for_terminal_job(client, response.json()["id"], save_id="save-1")
 
     assert job["status"] == "failed"
-    assert job["error"] == SAFE_JOB_ERROR
+    assert job["error"] == expected_error
 
 
 def test_media_remove_character_reference_calls_runtime(tmp_path: Path) -> None:

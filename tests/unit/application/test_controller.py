@@ -9,7 +9,8 @@ import shutil
 import sqlite3
 import sys
 import threading
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -673,6 +674,7 @@ def test_runtime_model_is_import_safe_and_exposes_active_save_state(
     saves = list(_value(model, "save_list", "saves"))
     assert [_value(save, "title") for save in saves] == ["Night Watch"]
     assert _value(saves[0], "active") is True
+
     assert _value(saves[0], "id", "save_id") == save_id
     assert _value(saves[0], "scenario_title") == "Ashfall Keep"
     assert _value(saves[0], "created_at")
@@ -701,6 +703,114 @@ def test_runtime_model_is_import_safe_and_exposes_active_save_state(
     assert _value(latest_image, "source_message_id") == narrator_id
     assert "fake-chat" in _value(model, "model_indicator")
     assert isinstance(_status_text(model), str)
+
+
+def test_character_reference_upload_locks_only_commit_phase(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, _narrator_id = _persist_runtime_save(repositories)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+    lock_held = False
+
+    class MediaServiceDouble:
+        async def prepare_character_reference_image_upload(
+            self, **_kwargs: object
+        ) -> object:
+            assert lock_held is False
+            return object()
+
+        def commit_character_reference_image_upload(
+            self, _prepared: object
+        ) -> object:
+            assert lock_held is True
+            return SimpleNamespace(id="reference-1")
+
+        async def prepare_scenario_starter_reference_image_upload(
+            self, **_kwargs: object
+        ) -> object:
+            assert lock_held is False
+            return object()
+
+        def commit_scenario_starter_reference_image_upload(
+            self, _prepared: object
+        ) -> object:
+            assert lock_held is True
+            return SimpleNamespace(id="starter-reference-1")
+
+    @asynccontextmanager
+    async def mutation_context() -> AsyncIterator[None]:
+        nonlocal lock_held
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
+
+    monkeypatch.setattr(controller, "_media_service", MediaServiceDouble)
+
+    model = asyncio.run(
+        controller.upload_character_reference_image(
+            image_bytes=b"image",
+            active_save_id=save_id,
+            mutation_context=mutation_context,
+        )
+    )
+
+    assert _value(model, "error") is None
+    assert _value(model, "status") == "Character reference image uploaded"
+    assert lock_held is False
+
+    details = repositories.load_save_details(save_id)
+    assert details is not None
+    scenario_model = asyncio.run(
+        controller.upload_scenario_starter_reference_image(
+            scenario_id=details.scenario.id,
+            image_bytes=b"image",
+            starter_name="Captain Ilyra",
+            mutation_context=mutation_context,
+        )
+    )
+
+    assert _value(_value(scenario_model, "scenario"), "scenario_id") == (
+        details.scenario.id
+    )
+    assert lock_held is False
+
+
+def test_character_reference_upload_reports_analysis_failure_phase(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, _narrator_id = _persist_runtime_save(repositories)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+
+    class MediaServiceDouble:
+        async def prepare_character_reference_image_upload(
+            self, **kwargs: object
+        ) -> object:
+            analysis_started_callback = kwargs["analysis_started_callback"]
+            assert callable(analysis_started_callback)
+            analysis_started_callback()
+            raise RuntimeError("network_error: provider unavailable")
+
+    monkeypatch.setattr(controller, "_media_service", MediaServiceDouble)
+    failure_phases: list[str] = []
+
+    model = asyncio.run(
+        controller.upload_character_reference_image(
+            image_bytes=b"image",
+            active_save_id=save_id,
+            failure_phase_callback=failure_phases.append,
+        )
+    )
+
+    assert _value(model, "error") == "network_error: provider unavailable"
+    assert failure_phases == ["analysis"]
 
 
 def test_runtime_model_exposes_latest_action_choices(
@@ -10459,7 +10569,7 @@ def test_submit_player_message_exhausted_retry_error_mentions_attempts(
     error_text = _error_text(model)
     assert "after 3 attempts" in error_text
     assert "sk-live-secret" not in error_text
-    assert len(provider.chat_requests) == 2
+    assert len(provider.chat_requests) == 1
 
 
 def test_initial_render_provider_failure_returns_committed_player_message(

@@ -54,7 +54,10 @@ from bragi.retry_policy import (  # noqa: F401 - test compatibility
     MODEL_OUTPUT_MAX_ATTEMPTS,
     configured_max_attempts,
 )
-from bragi.services.character_locks import character_field_is_locked
+from bragi.services.character_locks import (
+    character_field_is_locked,
+    normalize_character_locked_fields,
+)
 from bragi.services.character_profile_completion import (
     ScenarioCharacterStarter,
     ScenarioStarterReferenceImage,
@@ -148,6 +151,7 @@ _CHARACTER_REFERENCE_CANDIDATE_KINDS = frozenset(
 _UPLOADED_CHARACTER_REFERENCE_PROMPT = "Uploaded character reference image"
 _UPLOADED_CHARACTER_TEXT_PHOTO_PROMPT = "Uploaded text photo"
 _CHARACTER_TEXT_UPLOADED_PHOTO_TASK = "character_image_description"
+_CHARACTER_REFERENCE_ANALYSIS_TASK = "character_image_description"
 _LOCAL_UPLOAD_PROVIDER = "local"
 _LOCAL_UPLOAD_MODEL = "upload"
 _REQUESTED_MODEL_METADATA_KEY = "requested_model_id"
@@ -192,6 +196,41 @@ class _SelectedImageReference:
     character_name: str
     media_asset_id: str
     media_path: Path
+
+
+@dataclass(frozen=True)
+class _CharacterReferenceAnalysis:
+    appearance: str
+    visual_notes: str
+    provider: str
+    model_id: str
+
+
+@dataclass(frozen=True)
+class PreparedCharacterReferenceUpload:
+    save_id: str
+    character_id: str
+    image_bytes: bytes
+    mime_type: str
+    extension: str
+    replace_existing: bool
+    expected_reference_asset_id: str | None
+    analysis: _CharacterReferenceAnalysis
+
+
+@dataclass(frozen=True)
+class PreparedScenarioStarterReferenceUpload:
+    scenario_id: str
+    starter_id: str | None
+    starter_name: str
+    image_bytes: bytes
+    filename: str | None
+    mime_type: str
+    extension: str
+    replace_existing: bool
+    expected_reference_image_id: str | None
+    expected_scenario_content_json: str | None
+    analysis: _CharacterReferenceAnalysis
 
 
 @dataclass(frozen=True)
@@ -331,7 +370,7 @@ class MediaService:
         )
         self.jobs = JobLifecycleService(repositories=repositories)
 
-    def upload_scenario_starter_reference_image(
+    async def upload_scenario_starter_reference_image(
         self,
         *,
         scenario_id: str,
@@ -341,6 +380,26 @@ class MediaService:
         starter_name: str = "",
         replace_existing: bool = False,
     ) -> ScenarioStarterReferenceImage:
+        prepared = await self.prepare_scenario_starter_reference_image_upload(
+            scenario_id=scenario_id,
+            image_bytes=image_bytes,
+            filename=filename,
+            starter_id=starter_id,
+            starter_name=starter_name,
+            replace_existing=replace_existing,
+        )
+        return self.commit_scenario_starter_reference_image_upload(prepared)
+
+    async def prepare_scenario_starter_reference_image_upload(
+        self,
+        *,
+        scenario_id: str,
+        image_bytes: bytes,
+        filename: str | None = None,
+        starter_id: str | None = None,
+        starter_name: str = "",
+        replace_existing: bool = False,
+    ) -> PreparedScenarioStarterReferenceUpload:
         scenario = self.repositories.get_scenario(scenario_id)
         if scenario is None:
             raise ValueError(f"Unknown scenario id: {scenario_id}")
@@ -359,21 +418,90 @@ class MediaService:
             raise ValueError(
                 "Starter reference image already exists; replace it explicitly"
             )
-        replaced_reference = starter.reference_image
-
         _assert_uploaded_image_size(len(image_bytes))
         mime_type, extension = _uploaded_image_mime_type(image_bytes)
+        analysis = await self._analyze_character_reference_image(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            character=starter,
+            save_id=None,
+        )
+        return PreparedScenarioStarterReferenceUpload(
+            scenario_id=scenario_id,
+            starter_id=starter.starter_id or starter_id,
+            starter_name=starter.name,
+            image_bytes=image_bytes,
+            filename=filename,
+            mime_type=mime_type,
+            extension=extension,
+            replace_existing=replace_existing,
+            expected_reference_image_id=(
+                starter.reference_image.id
+                if starter.reference_image is not None
+                else None
+            ),
+            expected_scenario_content_json=(
+                scenario.content_json
+                if not (starter.starter_id or starter_id)
+                else None
+            ),
+            analysis=analysis,
+        )
+
+    def commit_scenario_starter_reference_image_upload(
+        self,
+        prepared: PreparedScenarioStarterReferenceUpload,
+    ) -> ScenarioStarterReferenceImage:
         image_id = uuid4().hex
         relative_path = (
             Path("scenario-starters")
-            / _safe_path_segment(scenario_id)
-            / f"{_safe_path_segment(image_id)}{extension}"
+            / _safe_path_segment(prepared.scenario_id)
+            / f"{_safe_path_segment(image_id)}{prepared.extension}"
         )
         output_path = self.media_dir / relative_path
         _assert_within_media_dir(media_dir=self.media_dir, output_path=output_path)
         thumbnail_path: str | None = None
+        transaction_started = False
         try:
-            write_private_bytes(output_path, image_bytes)
+            self.repositories.begin_immediate_transaction()
+            transaction_started = True
+            scenario = self.repositories.get_scenario(prepared.scenario_id)
+            if scenario is None:
+                raise ValueError(f"Unknown scenario id: {prepared.scenario_id}")
+            if (
+                prepared.expected_scenario_content_json is not None
+                and scenario.content_json != prepared.expected_scenario_content_json
+            ):
+                raise ValueError(
+                    "Starter changed while the upload was being analyzed; try again"
+                )
+            content = _scenario_content(scenario.content_json)
+            starters = scenario_character_starters_for_content(
+                scenario_type=scenario.type,
+                content=content,
+            )
+            index = _scenario_starter_index(
+                starters,
+                starter_id=prepared.starter_id,
+                starter_name=prepared.starter_name,
+            )
+            starter = starters[index]
+            current_reference_id = (
+                starter.reference_image.id
+                if starter.reference_image is not None
+                else None
+            )
+            if current_reference_id != prepared.expected_reference_image_id:
+                raise ValueError(
+                    "Starter reference image changed while the upload was being "
+                    "analyzed; try again"
+                )
+            if starter.reference_image is not None and not prepared.replace_existing:
+                raise ValueError(
+                    "Starter reference image already exists; replace it explicitly"
+                )
+            replaced_reference = starter.reference_image
+            write_private_bytes(output_path, prepared.image_bytes)
             thumbnail_path = _persist_thumbnail(
                 media_dir=self.media_dir,
                 image_relative_path=relative_path,
@@ -383,22 +511,25 @@ class MediaService:
                 id=image_id,
                 path=relative_path.as_posix(),
                 thumbnail_path=thumbnail_path,
-                mime_type=mime_type,
+                mime_type=prepared.mime_type,
                 prompt_preview=_UPLOADED_CHARACTER_REFERENCE_PROMPT,
                 source="uploaded",
                 created_at=datetime.now(UTC).isoformat(),
             )
-        except Exception:
-            self._delete_persisted_files(relative_path.as_posix(), thumbnail_path)
-            raise
-
-        updated_starters = list(starters)
-        updated_starters[index] = replace(
-            starter,
-            starter_id=starter.starter_id or f"starter-{uuid4().hex}",
-            reference_image=reference,
-        )
-        try:
+            updated_starters = list(starters)
+            updated_starters[index] = replace(
+                starter,
+                starter_id=starter.starter_id or f"starter-{uuid4().hex}",
+                appearance=prepared.analysis.appearance,
+                visual_notes=prepared.analysis.visual_notes,
+                locked_fields=tuple(
+                    normalize_character_locked_fields(
+                        (*starter.locked_fields, "appearance", "visual_notes"),
+                        preserve_unknown=False,
+                    )
+                ),
+                reference_image=reference,
+            )
             self.repositories.update_scenario(
                 scenario_id=scenario.id,
                 title=scenario.title,
@@ -410,7 +541,11 @@ class MediaService:
                     starters=updated_starters,
                 ),
             )
+            self.repositories.commit_transaction()
+            transaction_started = False
         except Exception:
+            if transaction_started:
+                self.repositories.rollback_transaction()
             self._delete_persisted_files(relative_path.as_posix(), thumbnail_path)
             raise
         self._delete_scenario_starter_reference_files_if_unreferenced(
@@ -423,9 +558,13 @@ class MediaService:
             starter_id=updated_starters[index].starter_id,
             starter_name=updated_starters[index].name,
             reference_image_id=reference.id,
-            mime_type=mime_type,
-            byte_count=len(image_bytes),
-            filename=filename,
+            mime_type=prepared.mime_type,
+            byte_count=len(prepared.image_bytes),
+            filename=prepared.filename,
+            vision_provider=prepared.analysis.provider,
+            vision_model=prepared.analysis.model_id,
+            appearance_chars=len(prepared.analysis.appearance),
+            visual_notes_chars=len(prepared.analysis.visual_notes),
         )
         return reference
 
@@ -1107,7 +1246,7 @@ class MediaService:
         )
         return asset
 
-    def upload_character_reference_image(
+    async def upload_character_reference_image(
         self,
         *,
         save_id: str,
@@ -1116,6 +1255,25 @@ class MediaService:
         character_id: str | None = None,
         replace_existing: bool = False,
     ) -> MediaAssetRecord:
+        prepared = await self.prepare_character_reference_image_upload(
+            save_id=save_id,
+            image_bytes=image_bytes,
+            filename=filename,
+            character_id=character_id,
+            replace_existing=replace_existing,
+        )
+        return self.commit_character_reference_image_upload(prepared)
+
+    async def prepare_character_reference_image_upload(
+        self,
+        *,
+        save_id: str,
+        image_bytes: bytes,
+        filename: str | None = None,
+        character_id: str | None = None,
+        replace_existing: bool = False,
+        analysis_started_callback: Callable[[], None] | None = None,
+    ) -> PreparedCharacterReferenceUpload:
         if self.repositories.get_save(save_id) is None:
             raise ValueError(f"Unknown save id: {save_id}")
 
@@ -1140,24 +1298,75 @@ class MediaService:
 
         _assert_uploaded_image_size(len(image_bytes))
         mime_type, extension = _uploaded_image_mime_type(image_bytes)
+        if analysis_started_callback is not None:
+            analysis_started_callback()
+        analysis = await self._analyze_character_reference_image(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            character=character,
+            save_id=save_id,
+        )
+        return PreparedCharacterReferenceUpload(
+            save_id=save_id,
+            character_id=character.id,
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            extension=extension,
+            replace_existing=replace_existing,
+            expected_reference_asset_id=existing.id if existing is not None else None,
+            analysis=analysis,
+        )
+
+    def commit_character_reference_image_upload(
+        self,
+        prepared: PreparedCharacterReferenceUpload,
+    ) -> MediaAssetRecord:
         asset_id = uuid4().hex
         relative_path = (
-            Path(_safe_path_segment(save_id))
+            Path(_safe_path_segment(prepared.save_id))
             / "uploads"
-            / f"{_safe_path_segment(asset_id)}{extension}"
+            / f"{_safe_path_segment(asset_id)}{prepared.extension}"
         )
         output_path = self.media_dir / relative_path
         _assert_within_media_dir(media_dir=self.media_dir, output_path=output_path)
         thumbnail_path: str | None = None
+        transaction_started = False
         try:
-            write_private_bytes(output_path, image_bytes)
+            self.repositories.begin_immediate_transaction()
+            transaction_started = True
+            if self.repositories.get_save(prepared.save_id) is None:
+                raise ValueError(f"Unknown save id: {prepared.save_id}")
+            character = _character_for_reference(
+                repositories=self.repositories,
+                save_id=prepared.save_id,
+                character_id=prepared.character_id,
+            )
+            if character is None:
+                raise ValueError("No character is available for reference upload")
+            existing = _character_reference_asset(
+                repositories=self.repositories,
+                save_id=prepared.save_id,
+                character_id=character.id,
+                include_generated_fallback=False,
+            )
+            current_reference_id = existing.id if existing is not None else None
+            if current_reference_id != prepared.expected_reference_asset_id:
+                raise ValueError(
+                    "Character reference image changed while the upload was being "
+                    "analyzed; try again"
+                )
+            if existing is not None and not prepared.replace_existing:
+                raise ValueError(
+                    "Character reference image already exists; replace it explicitly"
+                )
+            write_private_bytes(output_path, prepared.image_bytes)
             thumbnail_path = _persist_thumbnail(
                 media_dir=self.media_dir,
                 image_relative_path=relative_path,
                 image_path=output_path,
             )
             asset = self.repositories.create_media_asset(
-                save_id=save_id,
+                save_id=prepared.save_id,
                 source_message_id=None,
                 type="image",
                 path=relative_path.as_posix(),
@@ -1166,7 +1375,7 @@ class MediaService:
                 provider=_LOCAL_UPLOAD_PROVIDER,
                 model=_LOCAL_UPLOAD_MODEL,
                 status="succeeded",
-                mime_type=mime_type,
+                mime_type=prepared.mime_type,
                 metadata={
                     "kind": "character_reference",
                     "source": "uploaded",
@@ -1174,26 +1383,119 @@ class MediaService:
                 },
                 asset_id=asset_id,
             )
+            _set_character_reference_link(
+                repositories=self.repositories,
+                save_id=prepared.save_id,
+                character_id=character.id,
+                media_asset_id=asset.id,
+            )
+            self.repositories.update_character(
+                replace(
+                    character,
+                    appearance=prepared.analysis.appearance,
+                    visual_notes=prepared.analysis.visual_notes,
+                    locked_fields=normalize_character_locked_fields(
+                        (*character.locked_fields, "appearance", "visual_notes"),
+                        preserve_unknown=True,
+                    ),
+                )
+            )
+            self.repositories.commit_transaction()
+            transaction_started = False
         except Exception:
+            if transaction_started:
+                self.repositories.rollback_transaction()
             self._delete_persisted_files(relative_path.as_posix(), thumbnail_path)
             raise
-
-        _set_character_reference_link(
-            repositories=self.repositories,
-            save_id=save_id,
-            character_id=character.id,
-            media_asset_id=asset.id,
-        )
         log_event(
             "media.character_reference_uploaded",
-            save_id=save_id,
+            save_id=prepared.save_id,
             character_id=character.id,
             media_asset_id=asset.id,
-            mime_type=mime_type,
-            byte_count=len(image_bytes),
+            mime_type=prepared.mime_type,
+            byte_count=len(prepared.image_bytes),
             replaced=existing is not None,
+            vision_provider=prepared.analysis.provider,
+            vision_model=prepared.analysis.model_id,
+            appearance_chars=len(prepared.analysis.appearance),
+            visual_notes_chars=len(prepared.analysis.visual_notes),
         )
         return asset
+
+    async def _analyze_character_reference_image(
+        self,
+        *,
+        image_bytes: bytes,
+        mime_type: str,
+        character: CharacterRecord | ScenarioCharacterStarter,
+        save_id: str | None,
+    ) -> _CharacterReferenceAnalysis:
+        preference = model_preference_for_selector(
+            self.repositories,
+            _CHARACTER_REFERENCE_ANALYSIS_TASK,
+            save_id=save_id,
+        )
+        if preference is None:
+            raise ValueError("No Image Details vision model configured")
+        provider = self.providers.get(preference.provider)
+        describe_image = getattr(provider, "describe_image", None)
+        if not callable(describe_image):
+            raise ValueError("Configured Image Details provider is unavailable")
+        if not model_supports_any_capability(
+            self.repositories,
+            provider=preference.provider,
+            model_id=preference.model_id,
+            required=VISION_CAPABILITIES,
+        ):
+            raise ValueError("Configured Image Details model does not support vision")
+
+        encoded = b64encode(image_bytes).decode("ascii")
+        image_url = f"data:{mime_type};base64,{encoded}"
+        responses: dict[str, str] = {}
+        response_provider = preference.provider
+        response_model = preference.model_id
+        for field_name, system_prompt in (
+            ("appearance", _character_reference_appearance_system_prompt()),
+            ("visual_notes", _character_reference_visual_notes_system_prompt()),
+        ):
+            request = ImageDescriptionRequest(
+                provider=preference.provider,
+                model_id=preference.model_id,
+                image_url=image_url,
+                system_prompt=system_prompt,
+                prompt=_character_reference_analysis_prompt(
+                    character=character,
+                    field_name=field_name,
+                ),
+                temperature=0.1,
+                max_output_tokens=2_000,
+                openrouter_app_title=openrouter_app_title_for_task(
+                    _CHARACTER_REFERENCE_ANALYSIS_TASK
+                ),
+            )
+            request = request_with_openrouter_routing(
+                self.repositories,
+                request,
+                task=_CHARACTER_REFERENCE_ANALYSIS_TASK,
+                save_id=save_id,
+            )
+            response = await describe_image(request)
+            description = response.description.strip()
+            if not description:
+                label = "appearance" if field_name == "appearance" else "visual notes"
+                raise ValueError(
+                    f"Image Details vision model returned empty {label}"
+                )
+            responses[field_name] = description
+            response_provider = response.provider
+            response_model = response.model_id
+
+        return _CharacterReferenceAnalysis(
+            appearance=responses["appearance"],
+            visual_notes=responses["visual_notes"],
+            provider=response_provider,
+            model_id=response_model,
+        )
 
     def clone_character_reference_image(
         self,
@@ -5386,6 +5688,49 @@ def _character_reference_prompt(character: CharacterRecord) -> str:
     )
 
 
+def _character_reference_appearance_system_prompt() -> str:
+    return (
+        "Write concise natural prose describing only the character's stable physical "
+        "appearance visible in the uploaded reference image. Include useful identity "
+        "details such as skin tone and complexion, build, visible age cues, face "
+        "shape and features, hair color and texture, and eyes. Treat the image as the "
+        "visual source of truth. Do not describe the background, medium, composition, "
+        "momentary pose, personality, history, hidden traits, or current story state. "
+        "Return only the replacement appearance prose, without a label or formatting."
+    )
+
+
+def _character_reference_visual_notes_system_prompt() -> str:
+    return (
+        "Write concise natural prose containing reusable visual notes for the "
+        "character in the uploaded reference image. Capture distinctive grooming, "
+        "styling, garments, accessories, posture, silhouette, and overall visual "
+        "presence that should anchor future depictions. Do not describe the "
+        "background, medium, composition, momentary action, personality, history, "
+        "hidden traits, or current story state. Return only the replacement visual "
+        "notes prose, without a label or formatting."
+    )
+
+
+def _character_reference_analysis_prompt(
+    *,
+    character: CharacterRecord | ScenarioCharacterStarter,
+    field_name: str,
+) -> str:
+    context = [f"Character name: {character.name}"]
+    if character.age.strip():
+        context.append(f"Established age: {character.age.strip()}")
+    if character.role.strip():
+        context.append(f"Established role: {character.role.strip()}")
+    label = "appearance" if field_name == "appearance" else "visual notes"
+    context.append(
+        f"Use the image to write the complete replacement {label}. "
+        "Use the established context only to identify the subject; do not invent "
+        "details that are not visible."
+    )
+    return "\n".join(context)
+
+
 def _character_text_uploaded_photo_system_prompt() -> str:
     return (
         "Describe the uploaded photo as concise natural prose for an in-world "
@@ -6487,14 +6832,18 @@ def _persist_thumbnail(
     thumbnail_relative_path = _thumbnail_relative_path(image_relative_path)
     thumbnail_path = media_dir / thumbnail_relative_path
     _assert_within_media_dir(media_dir=media_dir, output_path=thumbnail_path)
-    ensure_private_dir(thumbnail_path.parent)
-    if not _write_scaled_thumbnail(
-        image_path=image_path,
-        thumbnail_path=thumbnail_path,
-    ):
+    try:
+        ensure_private_dir(thumbnail_path.parent)
+        if not _write_scaled_thumbnail(
+            image_path=image_path,
+            thumbnail_path=thumbnail_path,
+        ):
+            thumbnail_path.unlink(missing_ok=True)
+            return None
+        thumbnail_path.chmod(0o600)
+    except Exception:
         thumbnail_path.unlink(missing_ok=True)
-        return None
-    thumbnail_path.chmod(0o600)
+        raise
     return thumbnail_relative_path.as_posix()
 
 
