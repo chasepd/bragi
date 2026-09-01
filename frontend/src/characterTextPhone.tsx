@@ -198,8 +198,10 @@ export function CharacterTextPhone({
   }, [activeSaveId]);
   const selectedThreadId = selectedGroupThread?.id ?? selectedContact?.thread_id ?? null;
   const selectedThreadKey = selectedThreadId ?? (selectedContact ? localCharacterTextThreadKey(selectedContact.id) : null);
-  const draft = selectedThreadKey ? draftsByThread[selectedThreadKey] ?? "" : "";
-  const selectedPhoto = selectedThreadKey ? photosByThread[selectedThreadKey] : undefined;
+  const selectedDraftKey = selectedGroupThread?.id
+    ?? (selectedContact ? localCharacterTextThreadKey(selectedContact.id) : null);
+  const draft = selectedDraftKey ? draftsByThread[selectedDraftKey] ?? "" : "";
+  const selectedPhoto = selectedDraftKey ? photosByThread[selectedDraftKey] : undefined;
   const unreadContacts = incomingCharacterTextContacts(
     textModel,
     seenTextMessageIdsByThread,
@@ -394,11 +396,11 @@ export function CharacterTextPhone({
       }));
       setDraftsByThread((current) => ({
         ...current,
-        [variables.threadKey]: "",
+        [variables.draftKey]: "",
       }));
       setPhotosByThread((current) => ({
         ...current,
-        [variables.threadKey]: undefined,
+        [variables.draftKey]: undefined,
       }));
       if (photoInputRef.current) photoInputRef.current.value = "";
     },
@@ -525,6 +527,7 @@ export function CharacterTextPhone({
         saveId: activeSaveId,
         characterId: selectedContact?.id ?? null,
         threadKey: selectedThreadKey,
+        draftKey: selectedDraftKey ?? selectedThreadKey,
         threadId: selectedThreadId ?? selectedThreadKey,
         isGroupThread: Boolean(selectedGroupThread),
         body: draft.trim(),
@@ -766,7 +769,7 @@ export function CharacterTextPhone({
                 >
                   {canManageMedia && (
                     <input
-                      key={selectedThreadKey}
+                      key={selectedDraftKey}
                       ref={photoInputRef}
                       type="file"
                       aria-label="Photo"
@@ -774,11 +777,11 @@ export function CharacterTextPhone({
                       className="ct-photo"
                       disabled={composerUnavailable}
                       onChange={(event) => {
-                        if (!selectedThreadKey) return;
+                        if (!selectedDraftKey) return;
                         const photo = event.currentTarget.files?.[0];
                         setPhotosByThread((current) => ({
                           ...current,
-                          [selectedThreadKey]: photo,
+                          [selectedDraftKey]: photo,
                         }));
                       }}
                     />
@@ -789,11 +792,11 @@ export function CharacterTextPhone({
                     value={draft}
                     disabled={composerUnavailable}
                     onChange={(event) => {
-                      if (!selectedThreadKey) return;
+                      if (!selectedDraftKey) return;
                       const body = event.currentTarget.value;
                       setDraftsByThread((current) => ({
                         ...current,
-                        [selectedThreadKey]: body,
+                        [selectedDraftKey]: body,
                       }));
                     }}
                     onKeyDown={(event) => {

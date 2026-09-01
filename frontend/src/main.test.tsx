@@ -10994,6 +10994,7 @@ describe("frontend helpers", () => {
   it("shows player-sent character texts immediately while send acceptance is pending", async () => {
     installEventSourceDouble();
     const textPayload = characterTextsPayload();
+    textPayload.model.contacts[0].thread_id = null;
     const model = runtimeModel({ character_texts_enabled: true });
     let resolveSend: (response: { ok: boolean; json: () => Promise<Job> }) => void = () => undefined;
     const sendResponse = new Promise<{ ok: boolean; json: () => Promise<Job> }>((resolve) => {
@@ -11025,6 +11026,10 @@ describe("frontend helpers", () => {
     expect(composer.value).toBe("");
     expect(composer).not.toBeDisabled();
     await userEvent.type(composer, "Draft the follow-up.");
+    await userEvent.upload(
+      within(phone).getByLabelText("Photo"),
+      new File(["follow-up"], "follow-up.png", { type: "image/png" }),
+    );
     expect(composer.value).toBe("Draft the follow-up.");
     expect(within(phone).getByRole("button", { name: "Send text" })).toBeDisabled();
     expect(formDataTextEntries(fetchMock.mock.calls.find(([path]) => path === "/api/character-texts/send-image")?.[1]?.body)).toEqual({
@@ -11033,6 +11038,7 @@ describe("frontend helpers", () => {
       body: "Still free?"
     });
 
+    textPayload.model.contacts[0].thread_id = "thread-rowan";
     resolveSend({
       ok: true,
       json: async () => ({
@@ -11040,10 +11046,13 @@ describe("frontend helpers", () => {
         type: "character_text_send",
         save_id: "save-1",
         status: "queued",
+        scope: { kind: "character_text_thread", id: "thread-rowan" },
         result: null,
         error: null
       })
     });
+    await waitFor(() => expect(composer).toHaveValue("Draft the follow-up."));
+    expect(within(phone).getByText("follow-up.png")).toBeInTheDocument();
   });
 
   it("keeps a draft while a recovered character text job finishes its thread", async () => {

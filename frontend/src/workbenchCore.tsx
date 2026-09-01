@@ -493,6 +493,7 @@ type CharacterTextSendVariables = {
   saveId: string;
   characterId: string | null;
   threadKey: string;
+  draftKey: string;
   threadId: string;
   isGroupThread?: boolean;
   body: string;
