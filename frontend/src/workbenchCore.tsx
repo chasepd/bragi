@@ -414,7 +414,7 @@ function useJobActionRunner(runJob: RunJob) {
     setJobActionErrors({});
   }, []);
 
-  const startJobAction = useCallback(async (request: JobActionRequest, reportJobFailures = false) => {
+  const startJobAction = useCallback(async (request: JobActionRequest) => {
     if (pendingKeysRef.current.has(request.key)) return;
     const stateGeneration = stateGenerationRef.current;
     const reportError = (error: string) => setJobActionErrors((current) => ({
@@ -423,15 +423,10 @@ function useJobActionRunner(runJob: RunJob) {
     }));
     pendingKeysRef.current.add(request.key);
     setPendingJobActionKeys(new Set(pendingKeysRef.current));
-    setJobActionErrors((current) => {
-      const next = { ...current };
-      delete next[request.key];
-      return next;
-    });
+    setJobActionErrors((current) => ({ ...current, [request.key]: "" }));
     try {
       const job = await postJson<Job>(request.path, request.body);
-      if (reportJobFailures) runJob(job, { onFailed: reportError });
-      else runJob(job);
+      runJob(job, { onFailed: reportError });
     } catch (failure) {
       if (stateGeneration !== stateGenerationRef.current) return;
       reportError(failure instanceof Error ? failure.message : request.fallbackError);
@@ -3177,7 +3172,10 @@ function Workbench({
         };
       });
       if (terminal) {
-        stoppedWatcher = Object.prototype.hasOwnProperty.call(jobWatchers.current, changedJob.id);
+        stoppedWatcher = (
+          !jobRunOptionsRef.current[changedJob.id]?.onFailed
+          && Object.prototype.hasOwnProperty.call(jobWatchers.current, changedJob.id)
+        );
         if (stoppedWatcher) jobWatchers.current[changedJob.id]();
         delete jobWatchers.current[changedJob.id];
         delete jobRunOptionsRef.current[changedJob.id];
@@ -6080,8 +6078,8 @@ function Chronicle({
                 message_id: sourceMessageId,
                 save_id: activeSaveId
               },
-              fallbackError: "Could not fork save"
-            }, true);
+              fallbackError: "Background job failed."
+            });
             setForkFromHere(null);
           }}
         />

@@ -2533,7 +2533,10 @@ describe("frontend helpers", () => {
         message_id: "player-interrupted-1",
         save_id: "save-1"
       });
-      expect(runJob).toHaveBeenCalledWith(retryJob);
+      expect(runJob).toHaveBeenCalledWith(
+        retryJob,
+        expect.objectContaining({ onFailed: expect.any(Function) })
+      );
     }
   );
 
@@ -2930,7 +2933,10 @@ describe("frontend helpers", () => {
       message_id: "narrator-1",
       character_id: "character-oracle"
     });
-    expect(runJob).toHaveBeenCalledWith(expect.objectContaining({ id: "job-scene-image" }));
+    expect(runJob).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "job-scene-image" }),
+      expect.objectContaining({ onFailed: expect.any(Function) })
+    );
     expect(runJob).toHaveBeenCalledWith(
       expect.objectContaining({ id: "job-character-image" }),
       expect.objectContaining({ onSucceeded: expect.any(Function) })
@@ -4047,7 +4053,10 @@ describe("frontend helpers", () => {
 
     response.resolve({ ok: true, json: async () => job });
 
-    await waitFor(() => expect(runJob).toHaveBeenCalledWith(job));
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(
+      job,
+      expect.objectContaining({ onFailed: expect.any(Function) })
+    ));
     expect(regenerate).toBeEnabled();
   });
 
@@ -4849,7 +4858,10 @@ describe("frontend helpers", () => {
     expect(JSON.parse(String(call?.[1].body))).toMatchObject({
       save_id: "save-1"
     });
-    expect(runJob).toHaveBeenCalledWith(job);
+    expect(runJob).toHaveBeenCalledWith(
+      job,
+      expect.objectContaining({ onFailed: expect.any(Function) })
+    );
   });
 
   it("disables regular cleanup with no active save", async () => {
@@ -5285,8 +5297,14 @@ describe("frontend helpers", () => {
     await userEvent.click(await screen.findByRole("button", { name: /review suggestions/i }));
     await userEvent.click(screen.getByRole("button", { name: /run retention/i }));
 
-    await waitFor(() => expect(runJob).toHaveBeenCalledWith(reviewJob));
-    expect(runJob).toHaveBeenCalledWith(retentionJob);
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(
+      reviewJob,
+      expect.objectContaining({ onFailed: expect.any(Function) })
+    ));
+    expect(runJob).toHaveBeenCalledWith(
+      retentionJob,
+      expect.objectContaining({ onFailed: expect.any(Function) })
+    );
     expect(JSON.parse(String(fetchMock.mock.calls.find(([path]) => path === "/api/world-data/suggestion-review")?.[1].body))).toEqual({ save_id: "save-1" });
     expect(JSON.parse(String(fetchMock.mock.calls.find(([path]) => path === "/api/world-data/context-retention")?.[1].body))).toEqual({ save_id: "save-1" });
   });
@@ -8776,6 +8794,76 @@ describe("frontend helpers", () => {
     });
 
     expect(await screen.findByText("The direct result arrives.")).toBeInTheDocument();
+  });
+
+  it("keeps fork failure callbacks when the save event reports completion first", async () => {
+    const sources = installEventSourceDouble();
+    const createdJob: Job = {
+      id: "job-fork-failed",
+      type: "chat_fork_from_here",
+      save_id: "save-1",
+      status: "queued",
+      result: null,
+      error: null,
+      created_at: 1
+    };
+    const model = runtimeModel({
+      chronicle: {
+        messages: [{
+          message_id: "narrator-fork",
+          role: "narrator",
+          speaker_name: null,
+          body: "The beacon waits.",
+          actions: [{ action_id: "fork-from-here", label: "Fork from here" }]
+        }]
+      }
+    });
+    const baseFetch = workbenchFetch([], model);
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/chat/fork-from-here") {
+        return Promise.resolve({ ok: true, json: async () => createdJob });
+      }
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(await screen.findByTitle("Fork from here"));
+    await userEvent.click(within(screen.getByRole("dialog", { name: "Fork from here?" })).getByRole("button", { name: "Fork from here" }));
+    const jobSource = await waitFor(() => {
+      const source = sources.find((item) => item.url === "/api/jobs/job-fork-failed/events?save_id=save-1");
+      expect(source).toBeTruthy();
+      return source!;
+    });
+    const saveSource = sources.find((item) => item.url === "/api/saves/save-1/events");
+    expect(saveSource).toBeTruthy();
+    const failedJob = {
+      ...createdJob,
+      status: "failed" as const,
+      error: "Background job failed. Check diagnostics for details."
+    };
+
+    act(() => {
+      saveSource?.dispatch("job_changed", {
+        event_id: 1,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: { job: failedJob }
+      });
+    });
+    expect(jobSource.closed).toBe(false);
+
+    act(() => jobSource.dispatch("done", failedJob));
+
+    expect(await screen.findByText(
+      "Background job failed. Check diagnostics for details."
+    )).toHaveAttribute("role", "alert");
   });
 
   it("unblocks a completed chat when its job watcher misses the terminal event", async () => {
