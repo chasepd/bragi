@@ -2824,6 +2824,90 @@ def test_fork_heals_snapshot_with_unknown_message_references(
     assert presence_rows == []
 
 
+def test_fork_heals_snapshot_with_unknown_active_thread_provenance(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    service = TurnSnapshotService(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The tower settles into silence.",
+    )
+    seeded = _seed_active_thread_text_provenance(
+        repositories,
+        save_id=save.id,
+        source_message_id=message.id,
+    )
+    repositories.archive_active_thread(seeded["active_thread_id"])
+
+    tables: dict[str, list[dict[str, str]]] = {}
+    for table_name in (
+        "messages",
+        "characters",
+        "character_text_threads",
+        "character_text_messages",
+        "character_text_provenance",
+    ):
+        entries: list[dict[str, str]] = []
+        rows = repositories.connection.execute(
+            f"SELECT * FROM {table_name} WHERE save_id = ?",  # noqa: S608
+            (save.id,),
+        ).fetchall()
+        for row in rows:
+            value = dict(row)
+            object_hash = service._store_object(  # noqa: SLF001
+                kind=f"row:{table_name}",
+                value=value,
+            )
+            entries.append({"id": str(value["id"]), "object_hash": object_hash})
+        tables[table_name] = entries
+    manifest_hash = service._store_object(  # noqa: SLF001
+        kind="snapshot_manifest",
+        value={
+            "format": turn_snapshot_module.SNAPSHOT_FORMAT,
+            "save_id": save.id,
+            "message_id": message.id,
+            "active_message_ids": [message.id],
+            "context_revision": 1,
+            "tables": tables,
+        },
+    )
+    repositories.connection.execute(
+        """
+        INSERT INTO save_turn_snapshots(
+            id, save_id, message_id, parent_snapshot_id, root_manifest_hash,
+            context_revision, reason
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "broken-active-thread-provenance-snapshot",
+            save.id,
+            message.id,
+            None,
+            manifest_hash,
+            1,
+            "test_broken_active_thread_provenance",
+        ),
+    )
+    repositories.commit()
+
+    result = service.fork_snapshot_to_save(
+        source_save_id=save.id,
+        snapshot_id="broken-active-thread-provenance-snapshot",
+        title="Fork heals stale active-thread provenance",
+        media_dir=tmp_path / "media",
+    )
+
+    source_provenance = repositories.list_character_text_provenance(save_id=save.id)
+    assert [row.id for row in source_provenance] == [seeded["provenance_id"]]
+    assert repositories.list_character_text_provenance(save_id=result.save.id) == []
+    assert len(repositories.list_character_text_messages(save_id=result.save.id)) == 1
+
+
 def test_fork_snapshot_rejects_trailing_message_in_source_snapshot(
     repositories: PersistenceRepositories,
     tmp_path: Path,
@@ -3892,6 +3976,42 @@ def test_incremental_reference_validation_is_scoped_to_save(
         "world_state"
     ]
     assert captured["source_message_id"] is None
+
+
+def test_incremental_snapshot_drops_provenance_for_archived_active_thread(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    save = _create_save(repositories)
+    message = repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The tower settles into silence.",
+    )
+    seeded = _seed_active_thread_text_provenance(
+        repositories,
+        save_id=save.id,
+        source_message_id=message.id,
+    )
+    service = TurnSnapshotService(repositories)
+    service.capture_message_snapshot(save_id=save.id, message_id=message.id)
+
+    repositories.archive_active_thread(seeded["active_thread_id"])
+    changed = service.capture_current_head_if_dirty(save.id)
+    rows = service._rows_from_manifest(service._snapshot_manifest(changed))  # noqa: SLF001
+
+    assert rows["active_threads"] == ()
+    assert rows["character_text_provenance"] == ()
+    result = service.fork_snapshot_to_save(
+        source_save_id=save.id,
+        snapshot_id=changed.id,
+        title="Fork after resolved thread",
+        media_dir=tmp_path / "media",
+    )
+    assert repositories.list_character_text_provenance(save_id=result.save.id) == []
+    source_provenance = repositories.list_character_text_provenance(save_id=save.id)
+    assert [row.id for row in source_provenance] == [seeded["provenance_id"]]
 
 
 def test_incremental_reference_is_restored_when_target_reactivates(
@@ -5153,6 +5273,55 @@ def _seed_character_text_snapshot_state(
         "media_asset_id": media_asset.id,
         "media_path": media_path,
         "memory_id": memory.id,
+    }
+
+
+def _seed_active_thread_text_provenance(
+    repositories: PersistenceRepositories,
+    *,
+    save_id: str,
+    source_message_id: str,
+) -> dict[str, str]:
+    character = repositories.add_character(
+        character_id="rowan-provenance",
+        save_id=save_id,
+        name="Rowan",
+        role="Courier",
+        met=True,
+        source_message_id=source_message_id,
+    )
+    text_thread = repositories.get_or_create_character_text_thread(
+        save_id=save_id,
+        character_id=character.id,
+        title="Rowan",
+    )
+    text_message = repositories.append_character_text_message(
+        message_id="text-rowan-provenance",
+        save_id=save_id,
+        thread_id=text_thread.id,
+        character_id=character.id,
+        sender="character",
+        body="The old obligation is settled.",
+    )
+    active_thread = repositories.add_active_thread(
+        thread_id="active-thread-rowan-provenance",
+        save_id=save_id,
+        title="Answer Rowan's request",
+        source_message_id=source_message_id,
+    )
+    provenance = repositories.add_character_text_provenance(
+        provenance_id="provenance-rowan-active-thread",
+        save_id=save_id,
+        thread_id=text_thread.id,
+        text_message_id=text_message.id,
+        target_type="active_thread",
+        target_id=active_thread.id,
+        operation="updated",
+        field_path="*",
+    )
+    return {
+        "active_thread_id": active_thread.id,
+        "provenance_id": provenance.id,
     }
 
 

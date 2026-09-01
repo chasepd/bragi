@@ -4334,6 +4334,9 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     active_save_id=save_id,
                     **kwargs,
                 )
+                error = _runtime_model_error(model)
+                if error:
+                    raise RuntimeError(error)
                 payload_dict = _runtime_json_dict(state, model)
                 _remember_user_active_save_from_model_result(state, payload_dict)
             _publish_runtime_changed_from_model_result(
