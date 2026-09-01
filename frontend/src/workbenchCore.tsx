@@ -270,7 +270,7 @@ type JobActionRequest = {
   key: string;
   path: string;
   body: unknown;
-  fallbackError: string;
+  fallbackError?: string;
 };
 
 function saveEventPayloadRecord(event: SaveEvent): Record<string, unknown> {
@@ -429,7 +429,7 @@ function useJobActionRunner(runJob: RunJob) {
       runJob(job, { onFailed: reportError });
     } catch (failure) {
       if (stateGeneration !== stateGenerationRef.current) return;
-      reportError(failure instanceof Error ? failure.message : request.fallbackError);
+      reportError(failure instanceof Error ? failure.message : "Background job failed.");
     } finally {
       pendingKeysRef.current.delete(request.key);
       if (stateGeneration === stateGenerationRef.current) {
@@ -3172,13 +3172,12 @@ function Workbench({
         };
       });
       if (terminal) {
-        stoppedWatcher = (
-          !jobRunOptionsRef.current[changedJob.id]?.onFailed
-          && Object.prototype.hasOwnProperty.call(jobWatchers.current, changedJob.id)
-        );
-        if (stoppedWatcher) jobWatchers.current[changedJob.id]();
-        delete jobWatchers.current[changedJob.id];
-        delete jobRunOptionsRef.current[changedJob.id];
+        if (!jobRunOptionsRef.current[changedJob.id]?.onFailed) {
+          stoppedWatcher = Object.prototype.hasOwnProperty.call(jobWatchers.current, changedJob.id);
+          if (stoppedWatcher) jobWatchers.current[changedJob.id]();
+          delete jobWatchers.current[changedJob.id];
+          delete jobRunOptionsRef.current[changedJob.id];
+        }
         setTrackedJobs((current) => {
           if (!(changedJob.id in current)) return current;
           const next = { ...current };
@@ -5512,22 +5511,19 @@ function chronicleJobActionRequest(
   if (actionId === "regenerate-message") {
     return {
       path: "/api/chat/regenerate",
-      body,
-      fallbackError: "Could not regenerate message"
+      body
     };
   }
   if (actionId === "retry-interrupted-turn") {
     return {
       path: "/api/chat/retry",
-      body,
-      fallbackError: "Could not retry response"
+      body
     };
   }
   if (actionId === "generate-scene-image") {
     return {
       path: "/api/media/generate",
-      body,
-      fallbackError: "Could not generate scene image"
+      body
     };
   }
   return null;
@@ -6077,8 +6073,7 @@ function Chronicle({
               body: {
                 message_id: sourceMessageId,
                 save_id: activeSaveId
-              },
-              fallbackError: "Background job failed."
+              }
             });
             setForkFromHere(null);
           }}

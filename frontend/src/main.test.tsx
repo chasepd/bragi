@@ -8796,10 +8796,12 @@ describe("frontend helpers", () => {
     expect(await screen.findByText("The direct result arrives.")).toBeInTheDocument();
   });
 
-  it("keeps fork failure callbacks when the save event reports completion first", async () => {
+  it.each(["failed", "succeeded"] as const)(
+  "keeps recovered fork options when the save event reports %s first",
+  async (status) => {
     const sources = installEventSourceDouble();
     const createdJob: Job = {
-      id: "job-fork-failed",
+      id: `job-fork-${status}`,
       type: "chat_fork_from_here",
       save_id: "save-1",
       status: "queued",
@@ -8818,10 +8820,28 @@ describe("frontend helpers", () => {
         }]
       }
     });
-    const baseFetch = workbenchFetch([], model);
+    const forkedModel = runtimeModel({
+      active_save_id: "fork-1",
+      active_save_title: "Forked Beacon",
+      chronicle: {
+        messages: [{
+          message_id: "fork-result",
+          role: "narrator",
+          speaker_name: null,
+          body: "The forked beacon burns.",
+          actions: []
+        }]
+      }
+    });
+    const activeJobs: Job[] = [];
+    const forkResponse = deferred<{ ok: boolean; json: () => Promise<Job> }>();
+    const baseFetch = workbenchFetch(activeJobs, model);
     const fetchMock = vi.fn((path: string, init?: RequestInit) => {
       if (path === "/api/chat/fork-from-here") {
-        return Promise.resolve({ ok: true, json: async () => createdJob });
+        return forkResponse.promise;
+      }
+      if (path.startsWith("/api/runtime") && path.includes("fork-1")) {
+        return Promise.resolve({ ok: true, json: async () => forkedModel });
       }
       return baseFetch(path, init);
     });
@@ -8836,34 +8856,57 @@ describe("frontend helpers", () => {
 
     await userEvent.click(await screen.findByTitle("Fork from here"));
     await userEvent.click(within(screen.getByRole("dialog", { name: "Fork from here?" })).getByRole("button", { name: "Fork from here" }));
-    const jobSource = await waitFor(() => {
-      const source = sources.find((item) => item.url === "/api/jobs/job-fork-failed/events?save_id=save-1");
-      expect(source).toBeTruthy();
-      return source!;
-    });
+    activeJobs.push(createdJob);
     const saveSource = sources.find((item) => item.url === "/api/saves/save-1/events");
     expect(saveSource).toBeTruthy();
-    const failedJob = {
-      ...createdJob,
-      status: "failed" as const,
-      error: "Background job failed. Check diagnostics for details."
-    };
-
     act(() => {
       saveSource?.dispatch("job_changed", {
         event_id: 1,
         save_id: "save-1",
         type: "job_changed",
-        payload: { job: failedJob }
+        payload: { job: createdJob }
+      });
+    });
+    const jobSource = await waitFor(() => {
+      const source = sources.find((item) => item.url === `/api/jobs/${createdJob.id}/events?save_id=save-1`);
+      expect(source).toBeTruthy();
+      return source!;
+    });
+    forkResponse.resolve({ ok: true, json: async () => createdJob });
+    await waitFor(() => expect(
+      screen.queryByRole("dialog", { name: "Fork from here?" })
+    ).not.toBeInTheDocument());
+    const completedJob: Job = {
+      ...createdJob,
+      status,
+      result: status === "succeeded" ? forkedModel : null,
+      error: status === "failed"
+        ? "Background job failed. Check diagnostics for details."
+        : null
+    };
+
+    act(() => {
+      saveSource?.dispatch("job_changed", {
+        event_id: 2,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: { job: { ...completedJob, result: null } }
       });
     });
     expect(jobSource.closed).toBe(false);
 
-    act(() => jobSource.dispatch("done", failedJob));
+    act(() => jobSource.dispatch("done", completedJob));
 
-    expect(await screen.findByText(
-      "Background job failed. Check diagnostics for details."
-    )).toHaveAttribute("role", "alert");
+    if (status === "failed") {
+      expect(await screen.findByText(
+        "Background job failed. Check diagnostics for details."
+      )).toHaveAttribute("role", "alert");
+    } else {
+      expect(await screen.findByText("The forked beacon burns.")).toBeInTheDocument();
+      expect(screen.queryByText(
+        "Background job failed. Check diagnostics for details."
+      )).not.toBeInTheDocument();
+    }
   });
 
   it("unblocks a completed chat when its job watcher misses the terminal event", async () => {
