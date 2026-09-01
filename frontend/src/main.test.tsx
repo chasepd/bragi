@@ -3097,13 +3097,7 @@ describe("frontend helpers", () => {
     expect(onRuntimeChanged).not.toHaveBeenCalled();
   });
 
-  it("confirms fork-from-here actions before switching to the returned save", async () => {
-    const updated = runtimeModel({
-      active_save_id: "fork-1",
-      active_save_title: "Lantern Keep - fork after narrator 2",
-      chronicle: { messages: [] },
-      status: "Save forked"
-    });
+  it("confirms fork-from-here actions before starting the fork job", async () => {
     const job = { id: "job-fork", type: "chat_fork_from_here", save_id: "save-1", status: "queued", result: null, error: null };
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -3158,10 +3152,75 @@ describe("frontend helpers", () => {
       message_id: "narrator-2",
       save_id: "save-1"
     });
-    expect(runJob).toHaveBeenCalledWith(job, expect.objectContaining({ onSucceeded: expect.any(Function) }));
+    expect(runJob).toHaveBeenCalledWith(job, expect.objectContaining({ onFailed: expect.any(Function) }));
+    expect(onRuntimeChanged).not.toHaveBeenCalled();
+  });
+
+  it("shows failed fork jobs beside the originating message", async () => {
+    const job = { id: "job-fork", type: "chat_fork_from_here", save_id: "save-1", status: "queued", result: null, error: null };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => job
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onRuntimeChanged = vi.fn();
+    const runJob = vi.fn();
+    const { Chronicle } = await import("./main");
+    const model = runtimeModel({
+      active_save_id: "save-1",
+      chronicle: {
+        messages: [
+          {
+            message_id: "narrator-2",
+            role: "narrator",
+            speaker_name: null,
+            body: "The second answer.",
+            actions: [
+              {
+                action_id: "fork-from-here",
+                label: "Fork from here"
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    const { rerender } = render(
+      <Chronicle
+        model={model}
+        runJob={runJob}
+        pendingMessage={null}
+        onRuntimeChanged={onRuntimeChanged}
+      />
+    );
+
+    await userEvent.click(screen.getByTitle("Fork from here"));
+    await userEvent.click(within(screen.getByRole("dialog", { name: "Fork from here?" })).getByRole("button", { name: "Fork from here" }));
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(job, expect.objectContaining({ onFailed: expect.any(Function) })));
     const options = runJob.mock.calls[0][1];
-    options.onSucceeded(updated);
-    expect(onRuntimeChanged).toHaveBeenCalledWith(updated);
+    act(() => options.onFailed("Background job failed. Check diagnostics for details.", { ...job, status: "failed" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Background job failed. Check diagnostics for details.");
+    expect(onRuntimeChanged).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByTitle("Fork from here"));
+    await userEvent.click(within(screen.getByRole("dialog", { name: "Fork from here?" })).getByRole("button", { name: "Fork from here" }));
+    await waitFor(() => expect(screen.queryByText("Background job failed. Check diagnostics for details.")).not.toBeInTheDocument());
+
+    const retryOptions = runJob.mock.calls[1][1];
+    act(() => retryOptions.onFailed("Background job failed. Check diagnostics for details.", { ...job, status: "failed" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Background job failed. Check diagnostics for details.");
+
+    rerender(
+      <Chronicle
+        model={runtimeModel({ ...model, active_save_id: "save-2" })}
+        runJob={runJob}
+        pendingMessage={null}
+        onRuntimeChanged={onRuntimeChanged}
+      />
+    );
+    await waitFor(() => expect(screen.queryByText("Background job failed. Check diagnostics for details.")).not.toBeInTheDocument());
   });
 
   it("keeps player edit choices in the mobile-safe dialog footer", async () => {

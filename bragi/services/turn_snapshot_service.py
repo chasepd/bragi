@@ -4738,6 +4738,7 @@ _SNAPSHOT_MESSAGE_SCOPED_TABLES = frozenset(
         "scene_fact_sources",
         "narrator_phone_activity_cursors",
         "character_contact_states",
+        "character_text_provenance",
         "character_text_proactive_triggers",
     }
 )
@@ -4833,7 +4834,10 @@ def _snapshot_row_typed_entity_references_unresolved(
         typed_columns = (("subject_id", "subject_type"), ("target_id", "target_type"))
     elif table_name in {"context_update_suggestions", "context_update_audit"}:
         typed_columns = (("entity_id", "entity_type"),)
-    elif table_name == "character_knowledge_edges":
+    elif table_name in {
+        "character_knowledge_edges",
+        "character_text_provenance",
+    }:
         typed_columns = (("target_id", "target_type"),)
     elif table_name == "character_text_proactive_triggers":
         typed_columns = (("source_id", "source_type"),)
