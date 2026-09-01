@@ -79,6 +79,7 @@ type CharacterTextMessageRowProps = {
   activeSaveId: string | null;
   runJob: RunJob;
   canGenerateMedia: boolean;
+  mutationsDisabled: boolean;
   onAction: (actionId: string, message: CharacterTextMessage) => void;
 };
 
@@ -89,6 +90,7 @@ const CharacterTextMessageRow = React.memo(function CharacterTextMessageRow({
   activeSaveId,
   runJob,
   canGenerateMedia,
+  mutationsDisabled,
   onAction
 }: CharacterTextMessageRowProps) {
   const grouped = characterTextMessageGrouped(message, previousMessage);
@@ -106,6 +108,7 @@ const CharacterTextMessageRow = React.memo(function CharacterTextMessageRow({
         activeSaveId={activeSaveId}
         runJob={runJob}
         canGenerateMedia={canGenerateMedia}
+        mutationsDisabled={mutationsDisabled}
         grouped={grouped}
         onAction={onAction}
       />
@@ -116,6 +119,7 @@ const CharacterTextMessageRow = React.memo(function CharacterTextMessageRow({
 export function CharacterTextPhone({
   activeSaveId,
   disabled,
+  busyThreadIds,
   runJob,
   seenTextMessageIdsByThread,
   onThreadSeen,
@@ -124,6 +128,7 @@ export function CharacterTextPhone({
 }: {
   activeSaveId: string | null;
   disabled: boolean;
+  busyThreadIds: ReadonlySet<string>;
   runJob: RunJob;
   seenTextMessageIdsByThread: Record<string, string>;
   onThreadSeen: (threadId: string | null | undefined, messageId: string | null | undefined) => void;
@@ -135,7 +140,8 @@ export function CharacterTextPhone({
   const [selectedCharacterId, setSelectedCharacterId] = useState<string | null>(null);
   const [selectedGroupThreadId, setSelectedGroupThreadId] = useState<string | null>(null);
   const [mobileView, setMobileView] = useState<"contacts" | "thread">("contacts");
-  const [draft, setDraft] = useState("");
+  const [draftsByThread, setDraftsByThread] = useState<Record<string, string>>({});
+  const [photosByThread, setPhotosByThread] = useState<Record<string, File | undefined>>({});
   const [contactRepairOpen, setContactRepairOpen] = useState(false);
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [editingText, setEditingText] = useState<CharacterTextMessage | null>(null);
@@ -185,11 +191,17 @@ export function CharacterTextPhone({
   }, [groupThreads, selectedCharacterId, selectedContact, selectedGroupThread, selectedGroupThreadId]);
   useEffect(() => {
     setLocalTextMessagesByThread({});
+    setDraftsByThread({});
+    setPhotosByThread({});
     setTextActionError("");
     persistedReadKeysRef.current.clear();
   }, [activeSaveId]);
   const selectedThreadId = selectedGroupThread?.id ?? selectedContact?.thread_id ?? null;
   const selectedThreadKey = selectedThreadId ?? (selectedContact ? localCharacterTextThreadKey(selectedContact.id) : null);
+  const selectedDraftKey = selectedGroupThread?.id
+    ?? (selectedContact ? localCharacterTextThreadKey(selectedContact.id) : null);
+  const draft = selectedDraftKey ? draftsByThread[selectedDraftKey] ?? "" : "";
+  const selectedPhoto = selectedDraftKey ? photosByThread[selectedDraftKey] : undefined;
   const unreadContacts = incomingCharacterTextContacts(
     textModel,
     seenTextMessageIdsByThread,
@@ -204,6 +216,9 @@ export function CharacterTextPhone({
   const localThreadMessages = selectedThreadKey ? localTextMessagesByThread[selectedThreadKey] ?? [] : [];
   const threadMessages = characterTextMessagesWithLocalEchoes(serverThreadMessages, localThreadMessages);
   const threadHasActiveDelivery = threadMessages.some((message) => isActiveCharacterTextDelivery(message));
+  const selectedThreadHasActiveJob = Boolean(
+    selectedThreadId && busyThreadIds.has(selectedThreadId),
+  );
   const visibleThreadMessages = threadMessages.filter((message) => !isPlaceholderCharacterTextDelivery(message));
   const firstVisibleThreadMessage = visibleThreadMessages[0] ?? null;
   const latestVisibleThreadMessage = visibleThreadMessages[visibleThreadMessages.length - 1] ?? null;
@@ -379,7 +394,14 @@ export function CharacterTextPhone({
           localMessage,
         ],
       }));
-      setDraft("");
+      setDraftsByThread((current) => ({
+        ...current,
+        [variables.draftKey]: "",
+      }));
+      setPhotosByThread((current) => ({
+        ...current,
+        [variables.draftKey]: undefined,
+      }));
       if (photoInputRef.current) photoInputRef.current.value = "";
     },
     onSuccess: (job, variables) => {
@@ -463,24 +485,28 @@ export function CharacterTextPhone({
   const displayContactName = displayCharacterTextContactName;
   const selectedContactTextable = Boolean(selectedGroupThread || selectedContact?.player_has_character_number);
   const selectedContactCanTextPlayer = Boolean(selectedContact?.character_has_player_number);
-  const composerDisabled = Boolean(
+  const composerUnavailable = Boolean(
     !(selectedContact || selectedGroupThread)
     || !selectedContactTextable
     || disabled
+  );
+  const threadMutationDisabled = Boolean(
+    composerUnavailable
     || sendText.isPending
     || threadHasActiveDelivery
+    || selectedThreadHasActiveJob
   );
   const canSend = Boolean(
     activeSaveId
     && draft.trim()
-    && !composerDisabled
+    && !threadMutationDisabled
   );
   const canRequestSpontaneousText = Boolean(
     activeSaveId
     && selectedContact
     && !selectedGroupThread
     && selectedContactCanTextPlayer
-    && !composerDisabled
+    && !threadMutationDisabled
     && !requestSpontaneousText.isPending
   );
   const spontaneousTextLabel = selectedContact
@@ -501,21 +527,23 @@ export function CharacterTextPhone({
         saveId: activeSaveId,
         characterId: selectedContact?.id ?? null,
         threadKey: selectedThreadKey,
+        draftKey: selectedDraftKey ?? selectedThreadKey,
         threadId: selectedThreadId ?? selectedThreadKey,
         isGroupThread: Boolean(selectedGroupThread),
         body: draft.trim(),
-        photo: photoInputRef.current?.files?.[0],
+        photo: selectedPhoto,
         localId: `local-character-text-${localTextMessageCounter.current}`,
         afterMessageId: lastCharacterTextMessageId(serverThreadMessages)
       });
   };
   const handleCharacterTextAction = useCallback((actionId: string, selectedMessage: CharacterTextMessage) => {
+    if (threadMutationDisabled) return;
     if (actionId === "delete-text-messages-from-here") {
       setDeletingText(selectedMessage);
       return;
     }
     setEditingText(selectedMessage);
-  }, []);
+  }, [threadMutationDisabled]);
   return (
     <ModalBackdrop>
       <DialogPanel className="preview-dialog character-text-phone" titleId={titleId} onClose={onClose}>
@@ -660,7 +688,11 @@ export function CharacterTextPhone({
                     </div>
                   </div>
                   <div className="character-text-thread-header-actions">
-                    {threadHasActiveDelivery ? <span className="character-text-pending">Sending</span> : null}
+                    {threadHasActiveDelivery ? (
+                      <span className="character-text-pending">Sending</span>
+                    ) : selectedThreadHasActiveJob ? (
+                      <span className="character-text-pending">Finishing…</span>
+                    ) : null}
                     {!selectedGroupThread ? (
                       <button
                         type="button"
@@ -712,6 +744,7 @@ export function CharacterTextPhone({
                               activeSaveId={activeSaveId}
                               runJob={runJob}
                               canGenerateMedia={canGenerateMedia}
+                              mutationsDisabled={threadMutationDisabled}
                               onAction={handleCharacterTextAction}
                             />
                           </div>
@@ -736,19 +769,36 @@ export function CharacterTextPhone({
                 >
                   {canManageMedia && (
                     <input
+                      key={selectedDraftKey}
                       ref={photoInputRef}
                       type="file"
                       aria-label="Photo"
                       accept="image/*"
                       className="ct-photo"
-                      disabled={composerDisabled}
+                      disabled={composerUnavailable}
+                      onChange={(event) => {
+                        if (!selectedDraftKey) return;
+                        const photo = event.currentTarget.files?.[0];
+                        setPhotosByThread((current) => ({
+                          ...current,
+                          [selectedDraftKey]: photo,
+                        }));
+                      }}
                     />
                   )}
+                  {selectedPhoto ? <small className="muted">{selectedPhoto.name}</small> : null}
                   <textarea
                     aria-label={selectedConversationTitle ? `Message ${selectedConversationTitle}` : "Message"}
                     value={draft}
-                    disabled={composerDisabled}
-                    onChange={(event) => setDraft(event.currentTarget.value)}
+                    disabled={composerUnavailable}
+                    onChange={(event) => {
+                      if (!selectedDraftKey) return;
+                      const body = event.currentTarget.value;
+                      setDraftsByThread((current) => ({
+                        ...current,
+                        [selectedDraftKey]: body,
+                      }));
+                    }}
                     onKeyDown={(event) => {
                       if (event.key !== "Enter" || event.shiftKey) return;
                       event.preventDefault();
@@ -805,6 +855,7 @@ export function CharacterTextPhone({
             message={editingText}
             activeSaveId={activeSaveId}
             runJob={runJob}
+            disabled={threadMutationDisabled}
             onClose={() => setEditingText(null)}
             onStarted={() => {
               setTextActionError("");
@@ -822,8 +873,10 @@ export function CharacterTextPhone({
             body="This hides the selected text and every later text in this conversation from future phone context."
             confirmLabel="Delete from here"
             destructive
+            disabled={threadMutationDisabled}
             onCancel={() => setDeletingText(null)}
             onConfirm={async () => {
+              if (threadMutationDisabled) return;
               const job = await postJson<Job>("/api/character-texts/delete-from-here", {
                 save_id: activeSaveId,
                 text_message_id: deletingText.id
@@ -847,6 +900,7 @@ function EditCharacterTextModal({
   message,
   activeSaveId,
   runJob,
+  disabled,
   onClose,
   onStarted,
   onFailed
@@ -854,6 +908,7 @@ function EditCharacterTextModal({
   message: CharacterTextMessage;
   activeSaveId: string | null;
   runJob: RunJob;
+  disabled: boolean;
   onClose: () => void;
   onStarted: () => void;
   onFailed: (error: string) => void;
@@ -865,6 +920,7 @@ function EditCharacterTextModal({
   const isCharacterCorrection = message.sender === "character";
   const unchanged = body.trim() === message.body.trim();
   const submitEdit = async (mode: "save" | "resubmit") => {
+    if (disabled) return;
     setBusy(true);
     setError("");
     try {
@@ -914,15 +970,15 @@ function EditCharacterTextModal({
         <div className="command-row end message-edit-actions">
           <button type="button" onClick={onClose}>Cancel</button>
           {isCharacterCorrection ? (
-            <button type="submit" className="primary-command compact" disabled={busy || !body.trim() || unchanged}>
+            <button type="submit" className="primary-command compact" disabled={disabled || busy || !body.trim() || unchanged}>
               <Save size={15} /> Save
             </button>
           ) : (
             <>
-              <button type="button" className="primary-command compact" disabled={busy || !body.trim() || unchanged} onClick={() => submitEdit("save")}>
+              <button type="button" className="primary-command compact" disabled={disabled || busy || !body.trim() || unchanged} onClick={() => submitEdit("save")}>
                 <Save size={15} /> Edit without Resubmit
               </button>
-              <button type="submit" className="primary-command compact" disabled={busy || !body.trim() || unchanged}>
+              <button type="submit" className="primary-command compact" disabled={disabled || busy || !body.trim() || unchanged}>
                 <RefreshCw size={15} /> Resubmit
               </button>
             </>
@@ -1179,6 +1235,7 @@ const CharacterTextBubble = React.memo(function CharacterTextBubble({
   activeSaveId,
   runJob,
   canGenerateMedia,
+  mutationsDisabled,
   grouped,
   onAction
 }: {
@@ -1187,6 +1244,7 @@ const CharacterTextBubble = React.memo(function CharacterTextBubble({
   activeSaveId: string | null;
   runJob: RunJob;
   canGenerateMedia: boolean;
+  mutationsDisabled: boolean;
   grouped?: boolean;
   onAction?: (actionId: string, message: CharacterTextMessage) => void;
 }) {
@@ -1232,6 +1290,7 @@ const CharacterTextBubble = React.memo(function CharacterTextBubble({
                 className={touchActionClassName(action.action_id === "delete-text-messages-from-here" && "destructive-action")}
                 title={action.label}
                 aria-label={action.label}
+                disabled={mutationsDisabled}
                 onClick={() => onAction(action.action_id, message)}
               >
                 <TouchActionContents icon={actionIcon(action.action_id)} label={action.label} />

@@ -384,10 +384,17 @@ function jobFromSaveEvent(event: SaveEvent): Job | null {
   ) return null;
   const saveId = typeof record.save_id === "string" ? record.save_id : event.save_id;
   if (!saveId || (event.save_id && saveId !== event.save_id)) return null;
+  const scope = record.scope as Job["scope"];
+  const validScope = scope
+    && typeof scope.kind === "string"
+    && typeof scope.id === "string"
+    ? scope
+    : null;
   return {
     id: record.id,
     type: record.type,
     save_id: saveId,
+    scope: validScope,
     status: record.status as Job["status"],
     completion_level: typeof record.completion_level === "string"
       ? record.completion_level as Job["completion_level"]
@@ -482,6 +489,7 @@ type CharacterTextSendVariables = {
   saveId: string;
   characterId: string | null;
   threadKey: string;
+  draftKey: string;
   threadId: string;
   isGroupThread?: boolean;
   body: string;
@@ -3793,6 +3801,15 @@ function Workbench({
     .filter((tracked) => jobBelongsToActiveSave(tracked.job, activeSaveId))
     .filter((tracked) => tracked.job.type !== "character_text_send")
     .sort((left, right) => (left.job.created_at ?? 0) - (right.job.created_at ?? 0));
+  const busyCharacterTextThreadIds = new Set([
+    ...(activeJobs.data?.jobs ?? []),
+    ...Object.values(trackedJobs).map(({ job }) => job),
+  ].flatMap((job) => (
+    ["queued", "running"].includes(job.status)
+      && job.scope?.kind === "character_text_thread"
+      ? [job.scope.id]
+      : []
+  )));
   const sceneArrivalMessageIds = new Set(
     pendingJobs
       .map(({ job }) => sceneArrivalSourceMessageId(job))
@@ -4101,6 +4118,7 @@ function Workbench({
           <LazyCharacterTextPhone
             activeSaveId={activeSaveId}
             disabled={!activeSaveSupported}
+            busyThreadIds={busyCharacterTextThreadIds}
             runJob={runJob}
             currentUser={currentUser}
             seenTextMessageIdsByThread={seenTextMessageIdsByThread}
@@ -9621,6 +9639,7 @@ function ConfirmModal({
   body,
   confirmLabel,
   destructive = false,
+  disabled = false,
   onCancel,
   onConfirm
 }: {
@@ -9628,6 +9647,7 @@ function ConfirmModal({
   body: string;
   confirmLabel: string;
   destructive?: boolean;
+  disabled?: boolean;
   onCancel: () => void;
   onConfirm: () => Promise<void>;
 }) {
@@ -9647,7 +9667,7 @@ function ConfirmModal({
           <button type="button" onClick={onCancel}>Cancel</button>
           <button
             className={destructive ? "danger-command compact" : "primary-command compact"}
-            disabled={busy}
+            disabled={busy || disabled}
             onClick={async () => {
               setBusy(true);
               setError("");

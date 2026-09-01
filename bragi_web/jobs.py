@@ -35,6 +35,7 @@ _TURN_COMPLETION_LEVEL_ORDER = {
 PUBLIC_JOB_FAILURE_ERROR = "Background job failed. Check diagnostics for details."
 _PUBLIC_PROVIDER_FAILURE_PREFIX = "Provider request failed"
 _PUBLIC_JOB_ERROR_PREFIX = "Public job error: "
+_CHARACTER_TEXT_THREAD_EXCLUSIVE_PREFIX = "character_text_thread:"
 
 
 @dataclass(frozen=True)
@@ -198,6 +199,12 @@ class JobRegistry:
                 ),
                 key=lambda record: record.created_at,
             )
+
+    def active_for_exclusive_key(self, exclusive_key: str) -> JobRecord | None:
+        with self._condition:
+            self._prune_completed_locked(time())
+            record = self._active_exclusive_job_locked(exclusive_key)
+            return self._snapshot_locked(record) if record is not None else None
 
     async def cancel(self, job_id: str) -> bool:
         queued_cancel: tuple[
@@ -873,7 +880,7 @@ def _complete_waiter(waiter: asyncio.Future[None]) -> None:
 
 
 def job_summary(record: JobRecord) -> dict[str, Any]:
-    return {
+    payload = {
         "id": record.id,
         "type": record.type,
         "save_id": record.save_id,
@@ -886,6 +893,21 @@ def job_summary(record: JobRecord) -> dict[str, Any]:
         "latest_progress": _latest_progress_event(record),
         "event_cursor": record.event_offset + len(record.events),
     }
+    if (scope := job_scope(record)) is not None:
+        payload["scope"] = scope
+    return payload
+
+
+def job_scope(record: JobRecord) -> dict[str, str] | None:
+    exclusive_key = record.exclusive_key
+    if not exclusive_key or not exclusive_key.startswith(
+        _CHARACTER_TEXT_THREAD_EXCLUSIVE_PREFIX
+    ):
+        return None
+    thread_id = exclusive_key.removeprefix(_CHARACTER_TEXT_THREAD_EXCLUSIVE_PREFIX)
+    if not thread_id:
+        return None
+    return {"kind": "character_text_thread", "id": thread_id}
 
 
 def job_event_payload(record: JobRecord, event: dict[str, Any]) -> Any:

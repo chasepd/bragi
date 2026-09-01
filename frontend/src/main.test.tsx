@@ -10588,6 +10588,7 @@ describe("frontend helpers", () => {
         <CharacterTextPhone
           activeSaveId="save-1"
           disabled={false}
+          busyThreadIds={new Set()}
           runJob={runJob}
           seenTextMessageIdsByThread={{}}
           onThreadSeen={vi.fn()}
@@ -10941,7 +10942,10 @@ describe("frontend helpers", () => {
     expect(within(phone).getByText("Failed")).toBeInTheDocument();
     expect(within(phone).getByText("Provider request failed")).toBeInTheDocument();
     expect(within(phone).getByText("Rowan is typing...")).toBeInTheDocument();
-    expect(within(phone).getByRole("textbox", { name: "Message Rowan" })).toBeDisabled();
+    const composer = within(phone).getByRole("textbox", { name: "Message Rowan" });
+    expect(composer).not.toBeDisabled();
+    await userEvent.type(composer, "Draft while waiting");
+    expect(within(phone).getByRole("button", { name: "Send text" })).toBeDisabled();
     expect(within(phone).getByRole("button", { name: "Ask Rowan to text you" })).toBeDisabled();
   });
 
@@ -11180,6 +11184,7 @@ describe("frontend helpers", () => {
   it("shows player-sent character texts immediately while send acceptance is pending", async () => {
     installEventSourceDouble();
     const textPayload = characterTextsPayload();
+    textPayload.model.contacts[0].thread_id = null;
     const model = runtimeModel({ character_texts_enabled: true });
     let resolveSend: (response: { ok: boolean; json: () => Promise<Job> }) => void = () => undefined;
     const sendResponse = new Promise<{ ok: boolean; json: () => Promise<Job> }>((resolve) => {
@@ -11209,6 +11214,13 @@ describe("frontend helpers", () => {
     expect(await within(phone).findByText("Still free?")).toBeInTheDocument();
     expect(within(phone).getByText("Pending")).toBeInTheDocument();
     expect(composer.value).toBe("");
+    expect(composer).not.toBeDisabled();
+    await userEvent.type(composer, "Draft the follow-up.");
+    await userEvent.upload(
+      within(phone).getByLabelText("Photo"),
+      new File(["follow-up"], "follow-up.png", { type: "image/png" }),
+    );
+    expect(composer.value).toBe("Draft the follow-up.");
     expect(within(phone).getByRole("button", { name: "Send text" })).toBeDisabled();
     expect(formDataTextEntries(fetchMock.mock.calls.find(([path]) => path === "/api/character-texts/send-image")?.[1]?.body)).toEqual({
       save_id: "save-1",
@@ -11216,6 +11228,7 @@ describe("frontend helpers", () => {
       body: "Still free?"
     });
 
+    textPayload.model.contacts[0].thread_id = "thread-rowan";
     resolveSend({
       ok: true,
       json: async () => ({
@@ -11223,10 +11236,164 @@ describe("frontend helpers", () => {
         type: "character_text_send",
         save_id: "save-1",
         status: "queued",
+        scope: { kind: "character_text_thread", id: "thread-rowan" },
         result: null,
         error: null
       })
     });
+    await waitFor(() => expect(composer).toHaveValue("Draft the follow-up."));
+    expect(within(phone).getByText("follow-up.png")).toBeInTheDocument();
+  });
+
+  it("keeps a draft while a recovered character text job finishes its thread", async () => {
+    const sources = installEventSourceDouble();
+    const textPayload = characterTextsPayload();
+    textPayload.threads["thread-rowan"].messages[0] = {
+      ...textPayload.threads["thread-rowan"].messages[0],
+      actions: [
+        { action_id: "edit-and-resubmit-text-message", label: "Edit text" },
+        { action_id: "delete-text-messages-from-here", label: "Delete from here" }
+      ]
+    };
+    const activeJobs = [{
+      id: "job-text-send",
+      type: "character_text_send",
+      save_id: "save-1",
+      status: "running",
+      scope: { kind: "character_text_thread", id: "thread-rowan" },
+      result: null,
+      error: null
+    } satisfies Job];
+    const model = runtimeModel({ character_texts_enabled: true });
+    vi.stubGlobal("fetch", workbenchFetch(activeJobs, model, [], undefined, {}, textPayload));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: /Open phone/ }));
+    const phone = await screen.findByRole("dialog", { name: "Phone" });
+    expect(await within(phone).findByText("Finishing…")).toBeInTheDocument();
+    const composer = within(phone).getByRole("textbox", { name: "Message Rowan" }) as HTMLTextAreaElement;
+    const photoInput = within(phone).getByLabelText("Photo");
+    await userEvent.type(composer, "Keep this draft ready.");
+    await userEvent.upload(photoInput, new File(["photo"], "draft.png", { type: "image/png" }));
+
+    expect(composer).not.toBeDisabled();
+    expect(composer.value).toBe("Keep this draft ready.");
+    expect(photoInput).not.toBeDisabled();
+    expect((photoInput as HTMLInputElement).files?.[0]?.name).toBe("draft.png");
+    expect(within(phone).getByRole("button", { name: "Send text" })).toBeDisabled();
+    expect(within(phone).getByRole("button", { name: "Ask Rowan to text you" })).toBeDisabled();
+    expect(within(phone).getByRole("button", { name: "Edit text" })).toBeDisabled();
+    expect(within(phone).getByRole("button", { name: "Delete from here" })).toBeDisabled();
+
+    await waitFor(() => expect(sources.some((source) => (
+      source.url === "/api/jobs/job-text-send/events?save_id=save-1"
+    ))).toBe(true));
+    activeJobs.splice(0);
+    act(() => {
+      for (const source of sources) {
+        source.dispatch("done", {
+          id: "job-text-send",
+          type: "character_text_send",
+          save_id: "save-1",
+          status: "succeeded",
+          scope: { kind: "character_text_thread", id: "thread-rowan" },
+          result: null,
+          error: null
+        });
+      }
+    });
+
+    await waitFor(() => expect(within(phone).queryByText("Finishing…")).not.toBeInTheDocument());
+    expect(composer.value).toBe("Keep this draft ready.");
+    expect((photoInput as HTMLInputElement).files?.[0]?.name).toBe("draft.png");
+    expect(within(phone).getByRole("button", { name: "Send text" })).toBeEnabled();
+    expect(within(phone).getByRole("button", { name: "Edit text" })).toBeEnabled();
+    expect(within(phone).getByRole("button", { name: "Delete from here" })).toBeEnabled();
+  });
+
+  it("does not block a character text thread for another thread's active job", async () => {
+    const textPayload = characterTextsPayload();
+    const model = runtimeModel({ character_texts_enabled: true });
+    const activeJobs = [{
+      id: "job-maya-text",
+      type: "character_text_send",
+      save_id: "save-1",
+      status: "running",
+      scope: { kind: "character_text_thread", id: "thread-maya" },
+      result: null,
+      error: null
+    } satisfies Job];
+    vi.stubGlobal("fetch", workbenchFetch(activeJobs, model, [], undefined, {}, textPayload));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: /Open phone/ }));
+    const phone = await screen.findByRole("dialog", { name: "Phone" });
+    const composer = within(phone).getByRole("textbox", { name: "Message Rowan" });
+    await userEvent.type(composer, "Rowan remains available.");
+
+    expect(within(phone).queryByText("Finishing…")).not.toBeInTheDocument();
+    expect(within(phone).getByRole("button", { name: "Send text" })).toBeEnabled();
+  });
+
+  it("keeps prepared drafts and photos scoped to their conversation", async () => {
+    const textPayload = characterTextsPayload();
+    const maya = {
+      ...textPayload.model.repair_contacts[1],
+      player_has_character_number: true,
+      character_has_player_number: true,
+    };
+    textPayload.model.contacts.push(maya);
+    const activeJobs = [{
+      id: "job-rowan-text",
+      type: "character_text_send",
+      save_id: "save-1",
+      status: "running",
+      scope: { kind: "character_text_thread", id: "thread-rowan" },
+      result: null,
+      error: null
+    } satisfies Job];
+    const model = runtimeModel({ character_texts_enabled: true });
+    vi.stubGlobal("fetch", workbenchFetch(activeJobs, model, [], undefined, {}, textPayload));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: /Open phone/ }));
+    const phone = await screen.findByRole("dialog", { name: "Phone" });
+    const rowanComposer = within(phone).getByRole("textbox", { name: "Message Rowan" });
+    await userEvent.type(rowanComposer, "Rowan follow-up");
+    await userEvent.upload(
+      within(phone).getByLabelText("Photo"),
+      new File(["photo"], "rowan.png", { type: "image/png" }),
+    );
+
+    await userEvent.click(within(phone).getByRole("button", { name: "Open text thread for Maya" }));
+    const mayaComposer = within(phone).getByRole("textbox", { name: "Message Maya" });
+    expect(mayaComposer).toHaveValue("");
+    expect(within(phone).queryByText("rowan.png")).not.toBeInTheDocument();
+    await userEvent.type(mayaComposer, "Maya draft");
+    expect(within(phone).getByRole("button", { name: "Send text" })).toBeEnabled();
+
+    await userEvent.click(within(phone).getByRole("button", { name: "Open text thread for Rowan" }));
+    expect(within(phone).getByRole("textbox", { name: "Message Rowan" })).toHaveValue("Rowan follow-up");
+    expect(within(phone).getByText("rowan.png")).toBeInTheDocument();
+    expect(within(phone).getByRole("button", { name: "Send text" })).toBeDisabled();
   });
 
   it("replaces the optimistic character text with the refreshed server message", async () => {

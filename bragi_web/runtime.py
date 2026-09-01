@@ -17,7 +17,7 @@ from typing import Any, cast
 
 from bragi_web.auth_throttle import AuthAttemptThrottle
 from bragi_web.bragi_adapter import bragi_runtime_bindings
-from bragi_web.jobs import JobRecord, JobRegistry
+from bragi_web.jobs import JobRecord, JobRegistry, job_scope
 from bragi_web.serialization import to_jsonable
 from bragi_web.storage import WebStoragePaths, resolve_web_storage_paths
 
@@ -555,7 +555,7 @@ def _save_event_job_summary(record: JobRecord) -> dict[str, object]:
         ),
         None,
     )
-    return {
+    payload: dict[str, object] = {
         "id": record.id,
         "type": record.type,
         "save_id": record.save_id,
@@ -567,6 +567,9 @@ def _save_event_job_summary(record: JobRecord) -> dict[str, object]:
         "latest_progress": latest_progress,
         "event_cursor": record.event_offset + len(record.events),
     }
+    if (scope := job_scope(record)) is not None:
+        payload["scope"] = scope
+    return payload
 
 
 def _safe_job_progress_summary(progress: object) -> dict[str, object] | None:

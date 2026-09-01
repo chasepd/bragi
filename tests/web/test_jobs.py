@@ -176,6 +176,31 @@ def test_active_exclusive_job_rejects_same_key_until_terminal() -> None:
     asyncio.run(run_test())
 
 
+def test_character_text_job_summary_exposes_semantic_thread_scope() -> None:
+    scoped = job_summary(
+        JobRecord(
+            id="text-job",
+            type="character_text_send",
+            save_id="save-1",
+            exclusive_key="character_text_thread:thread-1",
+        )
+    )
+    unrelated = job_summary(
+        JobRecord(
+            id="chat-job",
+            type="chat_turn",
+            save_id="save-1",
+            exclusive_key="chat_turn:save-1",
+        )
+    )
+
+    assert scoped["scope"] == {
+        "kind": "character_text_thread",
+        "id": "thread-1",
+    }
+    assert "scope" not in unrelated
+
+
 def test_pre_persisted_job_is_durable_before_worker_starts() -> None:
     async def run_test() -> None:
         registry = JobRegistry()
