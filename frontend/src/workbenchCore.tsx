@@ -270,7 +270,7 @@ type JobActionRequest = {
   key: string;
   path: string;
   body: unknown;
-  fallbackError: string;
+  fallbackError?: string;
 };
 
 function saveEventPayloadRecord(event: SaveEvent): Record<string, unknown> {
@@ -417,23 +417,19 @@ function useJobActionRunner(runJob: RunJob) {
   const startJobAction = useCallback(async (request: JobActionRequest) => {
     if (pendingKeysRef.current.has(request.key)) return;
     const stateGeneration = stateGenerationRef.current;
+    const reportError = (error: string) => setJobActionErrors((current) => ({
+      ...current,
+      [request.key]: error
+    }));
     pendingKeysRef.current.add(request.key);
     setPendingJobActionKeys(new Set(pendingKeysRef.current));
-    setJobActionErrors((current) => {
-      if (!(request.key in current)) return current;
-      const next = { ...current };
-      delete next[request.key];
-      return next;
-    });
+    setJobActionErrors((current) => ({ ...current, [request.key]: "" }));
     try {
       const job = await postJson<Job>(request.path, request.body);
-      runJob(job);
+      runJob(job, { onFailed: reportError });
     } catch (failure) {
       if (stateGeneration !== stateGenerationRef.current) return;
-      setJobActionErrors((current) => ({
-        ...current,
-        [request.key]: failure instanceof Error ? failure.message : request.fallbackError
-      }));
+      reportError(failure instanceof Error ? failure.message : "Background job failed.");
     } finally {
       pendingKeysRef.current.delete(request.key);
       if (stateGeneration === stateGenerationRef.current) {
@@ -3176,10 +3172,12 @@ function Workbench({
         };
       });
       if (terminal) {
-        stoppedWatcher = Object.prototype.hasOwnProperty.call(jobWatchers.current, changedJob.id);
-        if (stoppedWatcher) jobWatchers.current[changedJob.id]();
-        delete jobWatchers.current[changedJob.id];
-        delete jobRunOptionsRef.current[changedJob.id];
+        if (!jobRunOptionsRef.current[changedJob.id]?.onFailed) {
+          stoppedWatcher = Object.prototype.hasOwnProperty.call(jobWatchers.current, changedJob.id);
+          if (stoppedWatcher) jobWatchers.current[changedJob.id]();
+          delete jobWatchers.current[changedJob.id];
+          delete jobRunOptionsRef.current[changedJob.id];
+        }
         setTrackedJobs((current) => {
           if (!(changedJob.id in current)) return current;
           const next = { ...current };
@@ -5509,25 +5507,23 @@ function chronicleJobActionRequest(
   messageId: string,
   activeSaveId: string | null
 ): Omit<JobActionRequest, "key"> | null {
+  const body = { message_id: messageId, save_id: activeSaveId };
   if (actionId === "regenerate-message") {
     return {
       path: "/api/chat/regenerate",
-      body: { message_id: messageId, save_id: activeSaveId },
-      fallbackError: "Could not regenerate message"
+      body
     };
   }
   if (actionId === "retry-interrupted-turn") {
     return {
       path: "/api/chat/retry",
-      body: { message_id: messageId, save_id: activeSaveId },
-      fallbackError: "Could not retry response"
+      body
     };
   }
   if (actionId === "generate-scene-image") {
     return {
       path: "/api/media/generate",
-      body: { message_id: messageId, save_id: activeSaveId },
-      fallbackError: "Could not generate scene image"
+      body
     };
   }
   return null;
@@ -5736,7 +5732,6 @@ function Chronicle({
   pendingMessage,
   pendingMessages,
   narratorPaintMeasurement = null,
-  onRuntimeChanged,
   currentUser = null,
   mutationsDisabled = false,
   sceneArrivalMessageIds = new Set<string>(),
@@ -5975,8 +5970,7 @@ function Chronicle({
       });
       return;
     }
-    if (actionId === "edit-and-resubmit-message") setEditing(message);
-    if (actionId === "edit-narrator-message") setEditing(message);
+    if (actionId === "edit-and-resubmit-message" || actionId === "edit-narrator-message") setEditing(message);
     if (actionId === "regenerate-message-with-feedback") setFeedbackMessage(message);
     if (actionId === "fork-from-here") setForkFromHere(message);
     if (actionId === "delete-messages-from-here") setDeleteFromHere(message);
@@ -6045,8 +6039,8 @@ function Chronicle({
       ) : (
         <EmptyState icon={<MessageSquare size={34} />} title="No chronicle loaded" body="Create, import, or start a saved scenario to begin." />
       )}
-      {editing ? <EditMessageModal message={editing} activeSaveId={model?.active_save_id ?? null} onClose={() => setEditing(null)} runJob={runJob} /> : null}
-      {feedbackMessage ? <RegenerateFeedbackModal message={feedbackMessage} activeSaveId={model?.active_save_id ?? null} onClose={() => setFeedbackMessage(null)} runJob={runJob} /> : null}
+      {editing ? <EditMessageModal message={editing} activeSaveId={activeSaveId} onClose={() => setEditing(null)} runJob={runJob} /> : null}
+      {feedbackMessage ? <RegenerateFeedbackModal message={feedbackMessage} activeSaveId={activeSaveId} onClose={() => setFeedbackMessage(null)} runJob={runJob} /> : null}
       {presenceMessage ? (
         <ScenePresenceDialog
           message={presenceMessage}
@@ -6072,16 +6066,16 @@ function Chronicle({
           confirmLabel="Fork from here"
           onCancel={() => setForkFromHere(null)}
           onConfirm={async () => {
-            const job = await postJson<Job>("/api/chat/fork-from-here", {
-              message_id: forkFromHere.message_id,
-              save_id: model?.active_save_id ?? null
-            });
-            setForkFromHere(null);
-            runJob(job, {
-              onSucceeded: (result) => {
-                if (isRuntimeModel(result)) onRuntimeChanged?.(result);
+            const sourceMessageId = forkFromHere.message_id;
+            await startJobAction({
+              key: chronicleJobActionKey(sourceMessageId, "fork-from-here"),
+              path: "/api/chat/fork-from-here",
+              body: {
+                message_id: sourceMessageId,
+                save_id: activeSaveId
               }
             });
+            setForkFromHere(null);
           }}
         />
       ) : null}
@@ -6095,7 +6089,7 @@ function Chronicle({
           onConfirm={async () => {
             const job = await postJson<Job>("/api/chat/delete-from-here", {
               message_id: deleteFromHere.message_id,
-              save_id: model?.active_save_id ?? null
+              save_id: activeSaveId
             });
             setDeleteFromHere(null);
             runJob(job);

@@ -2533,7 +2533,10 @@ describe("frontend helpers", () => {
         message_id: "player-interrupted-1",
         save_id: "save-1"
       });
-      expect(runJob).toHaveBeenCalledWith(retryJob);
+      expect(runJob).toHaveBeenCalledWith(
+        retryJob,
+        expect.objectContaining({ onFailed: expect.any(Function) })
+      );
     }
   );
 
@@ -2930,7 +2933,10 @@ describe("frontend helpers", () => {
       message_id: "narrator-1",
       character_id: "character-oracle"
     });
-    expect(runJob).toHaveBeenCalledWith(expect.objectContaining({ id: "job-scene-image" }));
+    expect(runJob).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "job-scene-image" }),
+      expect.objectContaining({ onFailed: expect.any(Function) })
+    );
     expect(runJob).toHaveBeenCalledWith(
       expect.objectContaining({ id: "job-character-image" }),
       expect.objectContaining({ onSucceeded: expect.any(Function) })
@@ -3097,13 +3103,7 @@ describe("frontend helpers", () => {
     expect(onRuntimeChanged).not.toHaveBeenCalled();
   });
 
-  it("confirms fork-from-here actions before switching to the returned save", async () => {
-    const updated = runtimeModel({
-      active_save_id: "fork-1",
-      active_save_title: "Lantern Keep - fork after narrator 2",
-      chronicle: { messages: [] },
-      status: "Save forked"
-    });
+  it("confirms fork-from-here actions before starting the fork job", async () => {
     const job = { id: "job-fork", type: "chat_fork_from_here", save_id: "save-1", status: "queued", result: null, error: null };
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -3158,10 +3158,75 @@ describe("frontend helpers", () => {
       message_id: "narrator-2",
       save_id: "save-1"
     });
-    expect(runJob).toHaveBeenCalledWith(job, expect.objectContaining({ onSucceeded: expect.any(Function) }));
+    expect(runJob).toHaveBeenCalledWith(job, expect.objectContaining({ onFailed: expect.any(Function) }));
+    expect(onRuntimeChanged).not.toHaveBeenCalled();
+  });
+
+  it("shows failed fork jobs beside the originating message", async () => {
+    const job = { id: "job-fork", type: "chat_fork_from_here", save_id: "save-1", status: "queued", result: null, error: null };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => job
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onRuntimeChanged = vi.fn();
+    const runJob = vi.fn();
+    const { Chronicle } = await import("./main");
+    const model = runtimeModel({
+      active_save_id: "save-1",
+      chronicle: {
+        messages: [
+          {
+            message_id: "narrator-2",
+            role: "narrator",
+            speaker_name: null,
+            body: "The second answer.",
+            actions: [
+              {
+                action_id: "fork-from-here",
+                label: "Fork from here"
+              }
+            ]
+          }
+        ]
+      }
+    });
+
+    const { rerender } = render(
+      <Chronicle
+        model={model}
+        runJob={runJob}
+        pendingMessage={null}
+        onRuntimeChanged={onRuntimeChanged}
+      />
+    );
+
+    await userEvent.click(screen.getByTitle("Fork from here"));
+    await userEvent.click(within(screen.getByRole("dialog", { name: "Fork from here?" })).getByRole("button", { name: "Fork from here" }));
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(job, expect.objectContaining({ onFailed: expect.any(Function) })));
     const options = runJob.mock.calls[0][1];
-    options.onSucceeded(updated);
-    expect(onRuntimeChanged).toHaveBeenCalledWith(updated);
+    act(() => options.onFailed("Background job failed. Check diagnostics for details.", { ...job, status: "failed" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Background job failed. Check diagnostics for details.");
+    expect(onRuntimeChanged).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByTitle("Fork from here"));
+    await userEvent.click(within(screen.getByRole("dialog", { name: "Fork from here?" })).getByRole("button", { name: "Fork from here" }));
+    await waitFor(() => expect(screen.queryByText("Background job failed. Check diagnostics for details.")).not.toBeInTheDocument());
+
+    const retryOptions = runJob.mock.calls[1][1];
+    act(() => retryOptions.onFailed("Background job failed. Check diagnostics for details.", { ...job, status: "failed" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Background job failed. Check diagnostics for details.");
+
+    rerender(
+      <Chronicle
+        model={runtimeModel({ ...model, active_save_id: "save-2" })}
+        runJob={runJob}
+        pendingMessage={null}
+        onRuntimeChanged={onRuntimeChanged}
+      />
+    );
+    await waitFor(() => expect(screen.queryByText("Background job failed. Check diagnostics for details.")).not.toBeInTheDocument());
   });
 
   it("keeps player edit choices in the mobile-safe dialog footer", async () => {
@@ -3988,7 +4053,10 @@ describe("frontend helpers", () => {
 
     response.resolve({ ok: true, json: async () => job });
 
-    await waitFor(() => expect(runJob).toHaveBeenCalledWith(job));
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(
+      job,
+      expect.objectContaining({ onFailed: expect.any(Function) })
+    ));
     expect(regenerate).toBeEnabled();
   });
 
@@ -4790,7 +4858,10 @@ describe("frontend helpers", () => {
     expect(JSON.parse(String(call?.[1].body))).toMatchObject({
       save_id: "save-1"
     });
-    expect(runJob).toHaveBeenCalledWith(job);
+    expect(runJob).toHaveBeenCalledWith(
+      job,
+      expect.objectContaining({ onFailed: expect.any(Function) })
+    );
   });
 
   it("disables regular cleanup with no active save", async () => {
@@ -5226,8 +5297,14 @@ describe("frontend helpers", () => {
     await userEvent.click(await screen.findByRole("button", { name: /review suggestions/i }));
     await userEvent.click(screen.getByRole("button", { name: /run retention/i }));
 
-    await waitFor(() => expect(runJob).toHaveBeenCalledWith(reviewJob));
-    expect(runJob).toHaveBeenCalledWith(retentionJob);
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith(
+      reviewJob,
+      expect.objectContaining({ onFailed: expect.any(Function) })
+    ));
+    expect(runJob).toHaveBeenCalledWith(
+      retentionJob,
+      expect.objectContaining({ onFailed: expect.any(Function) })
+    );
     expect(JSON.parse(String(fetchMock.mock.calls.find(([path]) => path === "/api/world-data/suggestion-review")?.[1].body))).toEqual({ save_id: "save-1" });
     expect(JSON.parse(String(fetchMock.mock.calls.find(([path]) => path === "/api/world-data/context-retention")?.[1].body))).toEqual({ save_id: "save-1" });
   });
@@ -8717,6 +8794,119 @@ describe("frontend helpers", () => {
     });
 
     expect(await screen.findByText("The direct result arrives.")).toBeInTheDocument();
+  });
+
+  it.each(["failed", "succeeded"] as const)(
+  "keeps recovered fork options when the save event reports %s first",
+  async (status) => {
+    const sources = installEventSourceDouble();
+    const createdJob: Job = {
+      id: `job-fork-${status}`,
+      type: "chat_fork_from_here",
+      save_id: "save-1",
+      status: "queued",
+      result: null,
+      error: null,
+      created_at: 1
+    };
+    const model = runtimeModel({
+      chronicle: {
+        messages: [{
+          message_id: "narrator-fork",
+          role: "narrator",
+          speaker_name: null,
+          body: "The beacon waits.",
+          actions: [{ action_id: "fork-from-here", label: "Fork from here" }]
+        }]
+      }
+    });
+    const forkedModel = runtimeModel({
+      active_save_id: "fork-1",
+      active_save_title: "Forked Beacon",
+      chronicle: {
+        messages: [{
+          message_id: "fork-result",
+          role: "narrator",
+          speaker_name: null,
+          body: "The forked beacon burns.",
+          actions: []
+        }]
+      }
+    });
+    const activeJobs: Job[] = [];
+    const forkResponse = deferred<{ ok: boolean; json: () => Promise<Job> }>();
+    const baseFetch = workbenchFetch(activeJobs, model);
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/chat/fork-from-here") {
+        return forkResponse.promise;
+      }
+      if (path.startsWith("/api/runtime") && path.includes("fork-1")) {
+        return Promise.resolve({ ok: true, json: async () => forkedModel });
+      }
+      return baseFetch(path, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(await screen.findByTitle("Fork from here"));
+    await userEvent.click(within(screen.getByRole("dialog", { name: "Fork from here?" })).getByRole("button", { name: "Fork from here" }));
+    activeJobs.push(createdJob);
+    const saveSource = sources.find((item) => item.url === "/api/saves/save-1/events");
+    expect(saveSource).toBeTruthy();
+    act(() => {
+      saveSource?.dispatch("job_changed", {
+        event_id: 1,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: { job: createdJob }
+      });
+    });
+    const jobSource = await waitFor(() => {
+      const source = sources.find((item) => item.url === `/api/jobs/${createdJob.id}/events?save_id=save-1`);
+      expect(source).toBeTruthy();
+      return source!;
+    });
+    forkResponse.resolve({ ok: true, json: async () => createdJob });
+    await waitFor(() => expect(
+      screen.queryByRole("dialog", { name: "Fork from here?" })
+    ).not.toBeInTheDocument());
+    const completedJob: Job = {
+      ...createdJob,
+      status,
+      result: status === "succeeded" ? forkedModel : null,
+      error: status === "failed"
+        ? "Background job failed. Check diagnostics for details."
+        : null
+    };
+
+    act(() => {
+      saveSource?.dispatch("job_changed", {
+        event_id: 2,
+        save_id: "save-1",
+        type: "job_changed",
+        payload: { job: { ...completedJob, result: null } }
+      });
+    });
+    expect(jobSource.closed).toBe(false);
+
+    act(() => jobSource.dispatch("done", completedJob));
+
+    if (status === "failed") {
+      expect(await screen.findByText(
+        "Background job failed. Check diagnostics for details."
+      )).toHaveAttribute("role", "alert");
+    } else {
+      expect(await screen.findByText("The forked beacon burns.")).toBeInTheDocument();
+      expect(screen.queryByText(
+        "Background job failed. Check diagnostics for details."
+      )).not.toBeInTheDocument();
+    }
   });
 
   it("unblocks a completed chat when its job watcher misses the terminal event", async () => {

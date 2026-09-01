@@ -12532,6 +12532,49 @@ def test_chat_fork_from_here_rejects_missing_save_id(
     assert len(runtime.calls) == 1
 
 
+def test_chat_fork_from_here_runtime_error_marks_job_failed_without_success_events(
+    tmp_path: Path,
+) -> None:
+    class FailingForkRuntime(_RuntimeDouble):
+        def fork_save_from_message(
+            self,
+            *,
+            message_id: str,
+            active_save_id: str | None | object = ...,
+        ) -> dict[str, object]:
+            return {
+                "active_save_id": active_save_id,
+                "active_save_title": "Lantern Keep",
+                "chronicle": {"messages": []},
+                "composer_enabled": True,
+                "custom_instructions": "",
+                "error": f"Snapshot cannot fork from {message_id}",
+                "failed_save": False,
+                "failure_text": None,
+                "media": None,
+                "model_indicator": "fake / chat",
+                "saves": [],
+                "status": None,
+            }
+
+    state = _state_double(tmp_path, FailingForkRuntime())
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        created = client.post(
+            "/api/chat/fork-from-here",
+            json={"message_id": "narrator-2", "save_id": "save-2"},
+        )
+        job = _wait_for_terminal_job(
+            client,
+            created.json()["id"],
+            save_id="save-2",
+        )
+
+    assert created.status_code == 200
+    assert job["status"] == "failed"
+    assert job["error"] == SAFE_JOB_ERROR
+    assert state.save_events.events_after("save-2", 0) == []
+
+
 def test_save_scenario_draft_awaits_async_runtime(tmp_path: Path) -> None:
     class ScenarioDraftRuntime(_RuntimeDouble):
         def __init__(self) -> None:
