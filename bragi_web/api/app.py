@@ -1573,6 +1573,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         async with state.lock.async_access():
+            _raise_if_character_text_thread_busy(
+                state,
+                save_id=submitted_save_id,
+                thread_id=thread_id,
+            )
             try:
                 queued = service.queue_thread_text_send(
                     save_id=submitted_save_id,
@@ -1594,147 +1599,22 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     status_code = 404
                 raise HTTPException(status_code=status_code, detail=detail) from exc
             queued_payload = _json_dict(queued)
-        _publish_save_event(
-            state,
-            submitted_save_id,
-            "character_texts_changed",
-            queued_payload,
-        )
-        job_marked = asyncio.Event()
-
-        async def worker(handle: JobHandle) -> Any:
-            await job_marked.wait()
-            await handle.event("progress", {"label": "Sending group text"})
-            retry_callback, flush_retry_progress = _retry_progress_callback(
-                handle,
-                task_label="character text",
-            )
-
-            def delivery_retry_callback(progress: object) -> None:
-                retry_callback(progress)
-                _publish_save_event(
-                    state,
-                    submitted_save_id,
-                    "character_texts_changed",
-                    {"message_id": queued.player_message.id, "status": "retrying"},
-                )
-
-            from bragi.services.character_text_service import CharacterTextService
-            from bragi.services.media_service import MediaService
-
-            service = CharacterTextService(
-                repositories=state.repositories,
-                providers=state.providers,
-                media_service=MediaService(
-                    repositories=state.repositories,
-                    providers=state.providers,
-                    media_dir=state.paths.media_dir,
-                ),
-                prompt_inspection_store=_prompt_inspection_store_if_enabled(state),
-            )
-            try:
-                result = await service.complete_queued_thread_text_send(
-                    save_id=submitted_save_id,
-                    player_message_id=queued.player_message.id,
-                    retry_progress_callback=delivery_retry_callback,
-                    current_user_id=actor_user_id,
-                )
-                await flush_retry_progress()
-            except ValueError as exc:
-                _publish_save_event(
-                    state,
-                    submitted_save_id,
-                    "character_texts_changed",
-                    {"message_id": queued.player_message.id, "status": "failed"},
-                )
-                raise RuntimeError(str(exc)) from exc
-            except Exception:
-                _publish_save_event(
-                    state,
-                    submitted_save_id,
-                    "character_texts_changed",
-                    {"message_id": queued.player_message.id, "status": "failed"},
-                )
-                raise
             _publish_save_event(
                 state,
                 submitted_save_id,
                 "character_texts_changed",
-                result,
+                queued_payload,
             )
-            return result
-
-        text_queue_key = _character_text_thread_job_key(queued.thread.id)
-        try:
-            created = await state.jobs.create(
-                "character_text_send",
-                worker,
+            return await _start_queued_character_text_send_job_while_locked(
+                state=state,
                 save_id=submitted_save_id,
-                creator_user_id=_owner_user_id_for_request(state),
-                exclusive_key=text_queue_key,
-                operation_queue_key=text_queue_key,
+                queued=queued,
+                complete_thread=True,
+                progress_label="Sending group text",
+                current_user_id=actor_user_id,
             )
-        except JobRegistryExclusiveKeyError as exc:
-            async with state.lock.async_access():
-                service = CharacterTextService(
-                    repositories=state.repositories,
-                    providers=state.providers,
-                )
-                service.repositories.update_character_text_delivery(
-                    save_id=submitted_save_id,
-                    message_id=queued.player_message.id,
-                    status="failed",
-                    error="Text delivery could not start",
-                )
-            _publish_save_event(
-                state,
-                submitted_save_id,
-                "character_texts_changed",
-                {"message_id": queued.player_message.id, "status": "failed"},
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=_CHARACTER_TEXT_BUSY_DETAIL,
-            ) from exc
-        except JobRegistryFullError as exc:
-            async with state.lock.async_access():
-                service = CharacterTextService(
-                    repositories=state.repositories,
-                    providers=state.providers,
-                )
-                service.repositories.update_character_text_delivery(
-                    save_id=submitted_save_id,
-                    message_id=queued.player_message.id,
-                    status="failed",
-                    error="Text delivery could not start",
-                )
-            _publish_save_event(
-                state,
-                submitted_save_id,
-                "character_texts_changed",
-                {"message_id": queued.player_message.id, "status": "failed"},
-            )
-            raise HTTPException(status_code=429, detail=str(exc)) from exc
-        async with state.lock.async_access():
-            service = CharacterTextService(
-                repositories=state.repositories,
-                providers=state.providers,
-            )
-            service.mark_text_send_job(
-                save_id=submitted_save_id,
-                player_message_id=queued.player_message.id,
-                job_id=created.id,
-            )
-        job_marked.set()
-        _publish_save_event(
-            state,
-            submitted_save_id,
-            "character_texts_changed",
-            {"message_id": queued.player_message.id, "job_id": created.id},
-        )
-        return _job_summary_for_request(state, created)
 
-    async def _start_queued_character_text_send_job(
+    async def _start_queued_character_text_send_job_while_locked(
         *,
         state: WebAppState,
         save_id: str,
@@ -1744,8 +1624,34 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         uploaded_photo_bytes: bytes | None = None,
         uploaded_photo_filename: str | None = None,
         current_user_id: str | None = None,
+        spontaneous: bool = False,
     ) -> dict[str, Any]:
         job_marked = asyncio.Event()
+        message = queued.message if spontaneous else queued.player_message
+
+        def mark_delivery_failed() -> None:
+            service = _character_text_service_for_delivery_failure(state)
+            service.repositories.update_character_text_delivery(
+                save_id=save_id,
+                message_id=message.id,
+                status="failed",
+                error="Text delivery could not start",
+            )
+
+        def mark_job(job_id: str) -> None:
+            service = _character_text_service_for_delivery_failure(state)
+            if spontaneous:
+                service.mark_spontaneous_text_job(
+                    save_id=save_id,
+                    text_message_id=message.id,
+                    job_id=job_id,
+                )
+            else:
+                service.mark_text_send_job(
+                    save_id=save_id,
+                    player_message_id=message.id,
+                    job_id=job_id,
+                )
 
         async def worker(handle: JobHandle) -> Any:
             await job_marked.wait()
@@ -1761,7 +1667,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     state,
                     save_id,
                     "character_texts_changed",
-                    {"message_id": queued.player_message.id, "status": "retrying"},
+                    {"message_id": message.id, "status": "retrying"},
                 )
 
             from bragi.services.character_text_service import CharacterTextService
@@ -1779,10 +1685,17 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             )
             try:
                 result: Any
-                if complete_thread:
+                if spontaneous:
+                    result = await service.complete_queued_spontaneous_text(
+                        save_id=save_id,
+                        text_message_id=message.id,
+                        retry_progress_callback=delivery_retry_callback,
+                        current_user_id=current_user_id,
+                    )
+                elif complete_thread:
                     result = await service.complete_queued_thread_text_send(
                         save_id=save_id,
-                        player_message_id=queued.player_message.id,
+                        player_message_id=message.id,
                         uploaded_photo_bytes=uploaded_photo_bytes,
                         uploaded_photo_filename=uploaded_photo_filename,
                         retry_progress_callback=delivery_retry_callback,
@@ -1791,7 +1704,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 else:
                     result = await service.complete_queued_text_send(
                         save_id=save_id,
-                        player_message_id=queued.player_message.id,
+                        player_message_id=message.id,
                         uploaded_photo_bytes=uploaded_photo_bytes,
                         uploaded_photo_filename=uploaded_photo_filename,
                         retry_progress_callback=delivery_retry_callback,
@@ -1803,7 +1716,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     state,
                     save_id,
                     "character_texts_changed",
-                    {"message_id": queued.player_message.id, "status": "failed"},
+                    {"message_id": message.id, "status": "failed"},
                 )
                 raise RuntimeError(str(exc)) from exc
             except Exception:
@@ -1811,7 +1724,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     state,
                     save_id,
                     "character_texts_changed",
-                    {"message_id": queued.player_message.id, "status": "failed"},
+                    {"message_id": message.id, "status": "failed"},
                 )
                 raise
             _publish_save_event(
@@ -1825,7 +1738,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         text_queue_key = _character_text_thread_job_key(queued.thread.id)
         try:
             created = await state.jobs.create(
-                "character_text_send",
+                "character_text_spontaneous" if spontaneous else "character_text_send",
                 worker,
                 save_id=save_id,
                 creator_user_id=_owner_user_id_for_request(state),
@@ -1833,53 +1746,33 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 operation_queue_key=text_queue_key,
             )
         except JobRegistryExclusiveKeyError as exc:
-            async with state.lock.async_access():
-                service = _character_text_service_for_delivery_failure(state)
-                service.repositories.update_character_text_delivery(
-                    save_id=save_id,
-                    message_id=queued.player_message.id,
-                    status="failed",
-                    error="Text delivery could not start",
-                )
+            mark_delivery_failed()
             _publish_save_event(
                 state,
                 save_id,
                 "character_texts_changed",
-                {"message_id": queued.player_message.id, "status": "failed"},
+                {"message_id": message.id, "status": "failed"},
             )
             raise HTTPException(
                 status_code=409,
                 detail=_CHARACTER_TEXT_BUSY_DETAIL,
             ) from exc
         except JobRegistryFullError as exc:
-            async with state.lock.async_access():
-                service = _character_text_service_for_delivery_failure(state)
-                service.repositories.update_character_text_delivery(
-                    save_id=save_id,
-                    message_id=queued.player_message.id,
-                    status="failed",
-                    error="Text delivery could not start",
-                )
+            mark_delivery_failed()
             _publish_save_event(
                 state,
                 save_id,
                 "character_texts_changed",
-                {"message_id": queued.player_message.id, "status": "failed"},
+                {"message_id": message.id, "status": "failed"},
             )
             raise HTTPException(status_code=429, detail=str(exc)) from exc
-        async with state.lock.async_access():
-            service = _character_text_service_for_delivery_failure(state)
-            service.mark_text_send_job(
-                save_id=save_id,
-                player_message_id=queued.player_message.id,
-                job_id=created.id,
-            )
+        mark_job(created.id)
         job_marked.set()
         _publish_save_event(
             state,
             save_id,
             "character_texts_changed",
-            {"message_id": queued.player_message.id, "job_id": created.id},
+            {"message_id": message.id, "job_id": created.id},
         )
         return _job_summary_for_request(state, created)
 
@@ -1939,6 +1832,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         async with state.lock.async_access():
+            _raise_if_character_text_thread_busy(
+                state,
+                save_id=submitted_save_id,
+                thread_id=thread_id,
+            )
             try:
                 queued = service.queue_thread_text_send(
                     save_id=submitted_save_id,
@@ -1960,22 +1858,22 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     status_code = 404
                 raise HTTPException(status_code=status_code, detail=detail) from exc
             queued_payload = _json_dict(queued)
-        _publish_save_event(
-            state,
-            submitted_save_id,
-            "character_texts_changed",
-            queued_payload,
-        )
-        return await _start_queued_character_text_send_job(
-            state=state,
-            save_id=submitted_save_id,
-            queued=queued,
-            complete_thread=True,
-            progress_label="Sending group text",
-            uploaded_photo_bytes=image_bytes,
-            uploaded_photo_filename=uploaded_filename,
-            current_user_id=actor_user_id,
-        )
+            _publish_save_event(
+                state,
+                submitted_save_id,
+                "character_texts_changed",
+                queued_payload,
+            )
+            return await _start_queued_character_text_send_job_while_locked(
+                state=state,
+                save_id=submitted_save_id,
+                queued=queued,
+                complete_thread=True,
+                progress_label="Sending group text",
+                uploaded_photo_bytes=image_bytes,
+                uploaded_photo_filename=uploaded_filename,
+                current_user_id=actor_user_id,
+            )
 
     @app.post("/api/character-texts/contacts/{character_id}")
     def update_character_text_contact(
@@ -2051,6 +1949,17 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         async with state.lock.async_access():
+            existing_thread_id = _existing_direct_character_text_thread_id(
+                state,
+                save_id=submitted_save_id,
+                character_id=payload.character_id,
+            )
+            if existing_thread_id is not None:
+                _raise_if_character_text_thread_busy(
+                    state,
+                    save_id=submitted_save_id,
+                    thread_id=existing_thread_id,
+                )
             try:
                 queued = service.queue_text_send(
                     save_id=submitted_save_id,
@@ -2072,145 +1981,20 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     status_code = 404
                 raise HTTPException(status_code=status_code, detail=detail) from exc
             queued_payload = _json_dict(queued)
-        _publish_save_event(
-            state,
-            submitted_save_id,
-            "character_texts_changed",
-            queued_payload,
-        )
-        job_marked = asyncio.Event()
-
-        async def worker(handle: JobHandle) -> Any:
-            await job_marked.wait()
-            await handle.event("progress", {"label": "Sending text"})
-            retry_callback, flush_retry_progress = _retry_progress_callback(
-                handle,
-                task_label="character text",
-            )
-
-            def delivery_retry_callback(progress: object) -> None:
-                retry_callback(progress)
-                _publish_save_event(
-                    state,
-                    submitted_save_id,
-                    "character_texts_changed",
-                    {"message_id": queued.player_message.id, "status": "retrying"},
-                )
-
-            from bragi.services.character_text_service import CharacterTextService
-            from bragi.services.media_service import MediaService
-
-            service = CharacterTextService(
-                repositories=state.repositories,
-                providers=state.providers,
-                media_service=MediaService(
-                    repositories=state.repositories,
-                    providers=state.providers,
-                    media_dir=state.paths.media_dir,
-                ),
-                prompt_inspection_store=_prompt_inspection_store_if_enabled(state),
-            )
-            try:
-                result = await service.complete_queued_text_send(
-                    save_id=submitted_save_id,
-                    player_message_id=queued.player_message.id,
-                    retry_progress_callback=delivery_retry_callback,
-                    current_user_id=actor_user_id,
-                )
-                await flush_retry_progress()
-            except ValueError as exc:
-                _publish_save_event(
-                    state,
-                    submitted_save_id,
-                    "character_texts_changed",
-                    {"message_id": queued.player_message.id, "status": "failed"},
-                )
-                raise RuntimeError(str(exc)) from exc
-            except Exception:
-                _publish_save_event(
-                    state,
-                    submitted_save_id,
-                    "character_texts_changed",
-                    {"message_id": queued.player_message.id, "status": "failed"},
-                )
-                raise
             _publish_save_event(
                 state,
                 submitted_save_id,
                 "character_texts_changed",
-                result,
+                queued_payload,
             )
-            return result
-
-        text_queue_key = _character_text_thread_job_key(queued.thread.id)
-        try:
-            created = await state.jobs.create(
-                "character_text_send",
-                worker,
+            return await _start_queued_character_text_send_job_while_locked(
+                state=state,
                 save_id=submitted_save_id,
-                creator_user_id=_owner_user_id_for_request(state),
-                exclusive_key=text_queue_key,
-                operation_queue_key=text_queue_key,
+                queued=queued,
+                complete_thread=False,
+                progress_label="Sending text",
+                current_user_id=actor_user_id,
             )
-        except JobRegistryExclusiveKeyError as exc:
-            async with state.lock.async_access():
-                service = CharacterTextService(
-                    repositories=state.repositories,
-                    providers=state.providers,
-                )
-                service.repositories.update_character_text_delivery(
-                    save_id=submitted_save_id,
-                    message_id=queued.player_message.id,
-                    status="failed",
-                    error="Text delivery could not start",
-                )
-            _publish_save_event(
-                state,
-                submitted_save_id,
-                "character_texts_changed",
-                {"message_id": queued.player_message.id, "status": "failed"},
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=_CHARACTER_TEXT_BUSY_DETAIL,
-            ) from exc
-        except JobRegistryFullError as exc:
-            async with state.lock.async_access():
-                service = CharacterTextService(
-                    repositories=state.repositories,
-                    providers=state.providers,
-                )
-                service.repositories.update_character_text_delivery(
-                    save_id=submitted_save_id,
-                    message_id=queued.player_message.id,
-                    status="failed",
-                    error="Text delivery could not start",
-                )
-            _publish_save_event(
-                state,
-                submitted_save_id,
-                "character_texts_changed",
-                {"message_id": queued.player_message.id, "status": "failed"},
-            )
-            raise HTTPException(status_code=429, detail=str(exc)) from exc
-        async with state.lock.async_access():
-            service = CharacterTextService(
-                repositories=state.repositories,
-                providers=state.providers,
-            )
-            service.mark_text_send_job(
-                save_id=submitted_save_id,
-                player_message_id=queued.player_message.id,
-                job_id=created.id,
-            )
-        job_marked.set()
-        _publish_save_event(
-            state,
-            submitted_save_id,
-            "character_texts_changed",
-            {"message_id": queued.player_message.id, "job_id": created.id},
-        )
-        return _job_summary_for_request(state, created)
 
     @app.post("/api/character-texts/send-image")
     async def send_character_text_with_image(
@@ -2264,6 +2048,17 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         async with state.lock.async_access():
+            existing_thread_id = _existing_direct_character_text_thread_id(
+                state,
+                save_id=submitted_save_id,
+                character_id=character_id,
+            )
+            if existing_thread_id is not None:
+                _raise_if_character_text_thread_busy(
+                    state,
+                    save_id=submitted_save_id,
+                    thread_id=existing_thread_id,
+                )
             try:
                 queued = service.queue_text_send(
                     save_id=submitted_save_id,
@@ -2285,22 +2080,22 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     status_code = 404
                 raise HTTPException(status_code=status_code, detail=detail) from exc
             queued_payload = _json_dict(queued)
-        _publish_save_event(
-            state,
-            submitted_save_id,
-            "character_texts_changed",
-            queued_payload,
-        )
-        return await _start_queued_character_text_send_job(
-            state=state,
-            save_id=submitted_save_id,
-            queued=queued,
-            complete_thread=False,
-            progress_label="Sending text",
-            uploaded_photo_bytes=image_bytes,
-            uploaded_photo_filename=uploaded_filename,
-            current_user_id=actor_user_id,
-        )
+            _publish_save_event(
+                state,
+                submitted_save_id,
+                "character_texts_changed",
+                queued_payload,
+            )
+            return await _start_queued_character_text_send_job_while_locked(
+                state=state,
+                save_id=submitted_save_id,
+                queued=queued,
+                complete_thread=False,
+                progress_label="Sending text",
+                uploaded_photo_bytes=image_bytes,
+                uploaded_photo_filename=uploaded_filename,
+                current_user_id=actor_user_id,
+            )
 
     @app.post("/api/character-texts/spontaneous")
     async def send_spontaneous_character_text(
@@ -2350,145 +2145,21 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                     status_code = 404
                 raise HTTPException(status_code=status_code, detail=detail) from exc
             queued_payload = _json_dict(queued)
-        _publish_save_event(
-            state,
-            submitted_save_id,
-            "character_texts_changed",
-            queued_payload,
-        )
-        job_marked = asyncio.Event()
-
-        async def worker(handle: JobHandle) -> Any:
-            await job_marked.wait()
-            await handle.event("progress", {"label": "Sending character text"})
-            retry_callback, flush_retry_progress = _retry_progress_callback(
-                handle,
-                task_label="character text",
-            )
-
-            def delivery_retry_callback(progress: object) -> None:
-                retry_callback(progress)
-                _publish_save_event(
-                    state,
-                    submitted_save_id,
-                    "character_texts_changed",
-                    {"message_id": queued.message.id, "status": "retrying"},
-                )
-
-            from bragi.services.character_text_service import CharacterTextService
-            from bragi.services.media_service import MediaService
-
-            service = CharacterTextService(
-                repositories=state.repositories,
-                providers=state.providers,
-                media_service=MediaService(
-                    repositories=state.repositories,
-                    providers=state.providers,
-                    media_dir=state.paths.media_dir,
-                ),
-                prompt_inspection_store=_prompt_inspection_store_if_enabled(state),
-            )
-            try:
-                result = await service.complete_queued_spontaneous_text(
-                    save_id=submitted_save_id,
-                    text_message_id=queued.message.id,
-                    retry_progress_callback=delivery_retry_callback,
-                    current_user_id=actor_user_id,
-                )
-                await flush_retry_progress()
-            except ValueError as exc:
-                _publish_save_event(
-                    state,
-                    submitted_save_id,
-                    "character_texts_changed",
-                    {"message_id": queued.message.id, "status": "failed"},
-                )
-                raise RuntimeError(str(exc)) from exc
-            except Exception:
-                _publish_save_event(
-                    state,
-                    submitted_save_id,
-                    "character_texts_changed",
-                    {"message_id": queued.message.id, "status": "failed"},
-                )
-                raise
             _publish_save_event(
                 state,
                 submitted_save_id,
                 "character_texts_changed",
-                result,
+                queued_payload,
             )
-            return result
-
-        text_queue_key = _character_text_thread_job_key(queued.thread.id)
-        try:
-            created = await state.jobs.create(
-                "character_text_spontaneous",
-                worker,
+            return await _start_queued_character_text_send_job_while_locked(
+                state=state,
                 save_id=submitted_save_id,
-                creator_user_id=_owner_user_id_for_request(state),
-                exclusive_key=text_queue_key,
-                operation_queue_key=text_queue_key,
+                queued=queued,
+                complete_thread=False,
+                progress_label="Sending character text",
+                current_user_id=actor_user_id,
+                spontaneous=True,
             )
-        except JobRegistryExclusiveKeyError as exc:
-            async with state.lock.async_access():
-                service = CharacterTextService(
-                    repositories=state.repositories,
-                    providers=state.providers,
-                )
-                service.repositories.update_character_text_delivery(
-                    save_id=submitted_save_id,
-                    message_id=queued.message.id,
-                    status="failed",
-                    error="Text delivery could not start",
-                )
-            _publish_save_event(
-                state,
-                submitted_save_id,
-                "character_texts_changed",
-                {"message_id": queued.message.id, "status": "failed"},
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=_CHARACTER_TEXT_BUSY_DETAIL,
-            ) from exc
-        except JobRegistryFullError as exc:
-            async with state.lock.async_access():
-                service = CharacterTextService(
-                    repositories=state.repositories,
-                    providers=state.providers,
-                )
-                service.repositories.update_character_text_delivery(
-                    save_id=submitted_save_id,
-                    message_id=queued.message.id,
-                    status="failed",
-                    error="Text delivery could not start",
-                )
-            _publish_save_event(
-                state,
-                submitted_save_id,
-                "character_texts_changed",
-                {"message_id": queued.message.id, "status": "failed"},
-            )
-            raise HTTPException(status_code=429, detail=str(exc)) from exc
-        async with state.lock.async_access():
-            service = CharacterTextService(
-                repositories=state.repositories,
-                providers=state.providers,
-            )
-            service.mark_spontaneous_text_job(
-                save_id=submitted_save_id,
-                text_message_id=queued.message.id,
-                job_id=created.id,
-            )
-        job_marked.set()
-        _publish_save_event(
-            state,
-            submitted_save_id,
-            "character_texts_changed",
-            {"message_id": queued.message.id, "job_id": created.id},
-        )
-        return _job_summary_for_request(state, created)
 
     @app.post("/api/character-texts/message-edit")
     async def edit_character_text_message(

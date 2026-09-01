@@ -2414,6 +2414,98 @@ def test_character_text_send_preflights_active_thread_before_persisting(
     assert state.repositories.list_character_text_messages(save_id=save_id) == []
 
 
+def test_character_text_send_rechecks_thread_after_classification(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    state = _auth_state(tmp_path)
+    user = state.auth_service().create_user(
+        username="Mira",
+        password="correct horse",
+        role="user",
+    )
+    save_id, npc_id, thread_id = _seed_textable_character_thread(
+        state.repositories,
+        owner_user_id=user.id,
+    )
+    state.repositories.set_model_preference(
+        task="chat_dating_sim",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    state.providers = {"fake": _RecordingCharacterTextProvider()}
+    responses: list[Any] = []
+    classification_entered = threading.Event()
+    release_classification = threading.Event()
+    from bragi.services.character_text_service import CharacterTextService
+
+    original_classify = CharacterTextService.classify_player_text
+
+    async def classify_after_release(
+        service: CharacterTextService,
+        *,
+        save_id: str,
+        body: str,
+        current_user_id: str | None,
+    ) -> str:
+        classification_entered.set()
+        await asyncio.to_thread(release_classification.wait)
+        return await original_classify(
+            service,
+            save_id=save_id,
+            body=body,
+            current_user_id=current_user_id,
+        )
+
+    monkeypatch.setattr(
+        CharacterTextService,
+        "classify_player_text",
+        classify_after_release,
+    )
+
+    with TestClient(create_app(cast(WebAppState, state)), authenticate=False) as client:
+        assert client.post(
+            "/api/auth/login",
+            json={"username": "Mira", "password": "correct horse"},
+        ).status_code == 200
+
+        request_thread = threading.Thread(
+            target=lambda: responses.append(
+                client.post(
+                    "/api/character-texts/send",
+                    json={
+                        "save_id": save_id,
+                        "character_id": npc_id,
+                        "body": "Are you there?",
+                    },
+                )
+            )
+        )
+        request_thread.start()
+        try:
+            assert classification_entered.wait(timeout=2.0)
+            with state.jobs._condition:  # noqa: SLF001 - race regression fixture
+                state.jobs._jobs["active-text"] = JobRecord(  # noqa: SLF001
+                    id="active-text",
+                    type="character_text_message_edit",
+                    save_id=save_id,
+                    exclusive_key=f"character_text_thread:{thread_id}",
+                    status="running",
+                )
+            release_classification.set()
+            request_thread.join(timeout=2.0)
+        finally:
+            release_classification.set()
+            request_thread.join(timeout=2.0)
+
+    assert not request_thread.is_alive()
+    assert len(responses) == 1
+    response = responses[0]
+    assert response.status_code == 409
+    assert response.json()["detail"] == CHARACTER_TEXT_BUSY_DETAIL
+    assert state.repositories.list_character_text_messages(save_id=save_id) == []
+
+
 def test_character_text_resubmit_conflict_uses_friendly_409(
     tmp_path: Path,
 ) -> None:

@@ -140,7 +140,8 @@ export function CharacterTextPhone({
   const [selectedCharacterId, setSelectedCharacterId] = useState<string | null>(null);
   const [selectedGroupThreadId, setSelectedGroupThreadId] = useState<string | null>(null);
   const [mobileView, setMobileView] = useState<"contacts" | "thread">("contacts");
-  const [draft, setDraft] = useState("");
+  const [draftsByThread, setDraftsByThread] = useState<Record<string, string>>({});
+  const [photosByThread, setPhotosByThread] = useState<Record<string, File | undefined>>({});
   const [contactRepairOpen, setContactRepairOpen] = useState(false);
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [editingText, setEditingText] = useState<CharacterTextMessage | null>(null);
@@ -190,11 +191,15 @@ export function CharacterTextPhone({
   }, [groupThreads, selectedCharacterId, selectedContact, selectedGroupThread, selectedGroupThreadId]);
   useEffect(() => {
     setLocalTextMessagesByThread({});
+    setDraftsByThread({});
+    setPhotosByThread({});
     setTextActionError("");
     persistedReadKeysRef.current.clear();
   }, [activeSaveId]);
   const selectedThreadId = selectedGroupThread?.id ?? selectedContact?.thread_id ?? null;
   const selectedThreadKey = selectedThreadId ?? (selectedContact ? localCharacterTextThreadKey(selectedContact.id) : null);
+  const draft = selectedThreadKey ? draftsByThread[selectedThreadKey] ?? "" : "";
+  const selectedPhoto = selectedThreadKey ? photosByThread[selectedThreadKey] : undefined;
   const unreadContacts = incomingCharacterTextContacts(
     textModel,
     seenTextMessageIdsByThread,
@@ -387,7 +392,14 @@ export function CharacterTextPhone({
           localMessage,
         ],
       }));
-      setDraft("");
+      setDraftsByThread((current) => ({
+        ...current,
+        [variables.threadKey]: "",
+      }));
+      setPhotosByThread((current) => ({
+        ...current,
+        [variables.threadKey]: undefined,
+      }));
       if (photoInputRef.current) photoInputRef.current.value = "";
     },
     onSuccess: (job, variables) => {
@@ -516,7 +528,7 @@ export function CharacterTextPhone({
         threadId: selectedThreadId ?? selectedThreadKey,
         isGroupThread: Boolean(selectedGroupThread),
         body: draft.trim(),
-        photo: photoInputRef.current?.files?.[0],
+        photo: selectedPhoto,
         localId: `local-character-text-${localTextMessageCounter.current}`,
         afterMessageId: lastCharacterTextMessageId(serverThreadMessages)
       });
@@ -754,19 +766,36 @@ export function CharacterTextPhone({
                 >
                   {canManageMedia && (
                     <input
+                      key={selectedThreadKey}
                       ref={photoInputRef}
                       type="file"
                       aria-label="Photo"
                       accept="image/*"
                       className="ct-photo"
                       disabled={composerUnavailable}
+                      onChange={(event) => {
+                        if (!selectedThreadKey) return;
+                        const photo = event.currentTarget.files?.[0];
+                        setPhotosByThread((current) => ({
+                          ...current,
+                          [selectedThreadKey]: photo,
+                        }));
+                      }}
                     />
                   )}
+                  {selectedPhoto ? <small className="muted">{selectedPhoto.name}</small> : null}
                   <textarea
                     aria-label={selectedConversationTitle ? `Message ${selectedConversationTitle}` : "Message"}
                     value={draft}
                     disabled={composerUnavailable}
-                    onChange={(event) => setDraft(event.currentTarget.value)}
+                    onChange={(event) => {
+                      if (!selectedThreadKey) return;
+                      const body = event.currentTarget.value;
+                      setDraftsByThread((current) => ({
+                        ...current,
+                        [selectedThreadKey]: body,
+                      }));
+                    }}
                     onKeyDown={(event) => {
                       if (event.key !== "Enter" || event.shiftKey) return;
                       event.preventDefault();

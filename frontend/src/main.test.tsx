@@ -11148,6 +11148,55 @@ describe("frontend helpers", () => {
     expect(within(phone).getByRole("button", { name: "Send text" })).toBeEnabled();
   });
 
+  it("keeps prepared drafts and photos scoped to their conversation", async () => {
+    const textPayload = characterTextsPayload();
+    const maya = {
+      ...textPayload.model.repair_contacts[1],
+      player_has_character_number: true,
+      character_has_player_number: true,
+    };
+    textPayload.model.contacts.push(maya);
+    const activeJobs = [{
+      id: "job-rowan-text",
+      type: "character_text_send",
+      save_id: "save-1",
+      status: "running",
+      scope: { kind: "character_text_thread", id: "thread-rowan" },
+      result: null,
+      error: null
+    } satisfies Job];
+    const model = runtimeModel({ character_texts_enabled: true });
+    vi.stubGlobal("fetch", workbenchFetch(activeJobs, model, [], undefined, {}, textPayload));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: /Open phone/ }));
+    const phone = await screen.findByRole("dialog", { name: "Phone" });
+    const rowanComposer = within(phone).getByRole("textbox", { name: "Message Rowan" });
+    await userEvent.type(rowanComposer, "Rowan follow-up");
+    await userEvent.upload(
+      within(phone).getByLabelText("Photo"),
+      new File(["photo"], "rowan.png", { type: "image/png" }),
+    );
+
+    await userEvent.click(within(phone).getByRole("button", { name: "Open text thread for Maya" }));
+    const mayaComposer = within(phone).getByRole("textbox", { name: "Message Maya" });
+    expect(mayaComposer).toHaveValue("");
+    expect(within(phone).queryByText("rowan.png")).not.toBeInTheDocument();
+    await userEvent.type(mayaComposer, "Maya draft");
+    expect(within(phone).getByRole("button", { name: "Send text" })).toBeEnabled();
+
+    await userEvent.click(within(phone).getByRole("button", { name: "Open text thread for Rowan" }));
+    expect(within(phone).getByRole("textbox", { name: "Message Rowan" })).toHaveValue("Rowan follow-up");
+    expect(within(phone).getByText("rowan.png")).toBeInTheDocument();
+    expect(within(phone).getByRole("button", { name: "Send text" })).toBeDisabled();
+  });
+
   it("replaces the optimistic character text with the refreshed server message", async () => {
     const sources = installEventSourceDouble();
     const textPayload = characterTextsPayload();
