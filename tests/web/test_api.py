@@ -102,6 +102,10 @@ EXPECTED_IMAGE_STYLE_PRESETS = [
 _BRAGI_WRITE_HEADER = "X-Bragi-Api-Request"
 _SAVE_ID_REQUIRED_DETAIL = "save_id is required for this save-scoped operation"
 SAFE_JOB_ERROR = "Background job failed. Check diagnostics for details."
+CHARACTER_TEXT_BUSY_DETAIL = (
+    "This conversation is still finishing another action. "
+    "Wait for it to finish and try again."
+)
 VALID_PNG_BYTES = bytes.fromhex(
     "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
     "1f15c4890000000b49444154789c6360000200000500017a5eab3f"
@@ -2354,6 +2358,116 @@ def test_character_text_send_is_not_blocked_by_active_chat_turn(
         ("player", "sent"),
         ("character", "sent"),
     ]
+
+
+def test_character_text_send_preflights_active_thread_before_persisting(
+    tmp_path: Path,
+) -> None:
+    state = _auth_state(tmp_path)
+    user = state.auth_service().create_user(
+        username="Mira",
+        password="correct horse",
+        role="user",
+    )
+    save_id, npc_id, thread_id = _seed_textable_character_thread(
+        state.repositories,
+        owner_user_id=user.id,
+    )
+    state.repositories.set_model_preference(
+        task="chat_dating_sim",
+        provider="fake",
+        model_id="fake-chat",
+    )
+    state.providers = {"fake": _RecordingCharacterTextProvider()}
+    state.jobs._jobs = {  # noqa: SLF001 - active-job regression fixture
+        "active-text": JobRecord(
+            id="active-text",
+            type="character_text_send",
+            save_id=save_id,
+            exclusive_key=f"character_text_thread:{thread_id}",
+            status="running",
+        )
+    }
+
+    with TestClient(create_app(cast(WebAppState, state)), authenticate=False) as client:
+        assert client.post(
+            "/api/auth/login",
+            json={"username": "Mira", "password": "correct horse"},
+        ).status_code == 200
+        active = client.get(f"/api/jobs?status=active&save_id={save_id}")
+        response = client.post(
+            "/api/character-texts/send",
+            json={
+                "save_id": save_id,
+                "character_id": npc_id,
+                "body": "Are you there?",
+            },
+        )
+
+    assert active.status_code == 200
+    assert active.json()["jobs"][0]["scope"] == {
+        "kind": "character_text_thread",
+        "id": thread_id,
+    }
+    assert response.status_code == 409
+    assert response.json()["detail"] == CHARACTER_TEXT_BUSY_DETAIL
+    assert state.repositories.list_character_text_messages(save_id=save_id) == []
+
+
+def test_character_text_resubmit_conflict_uses_friendly_409(
+    tmp_path: Path,
+) -> None:
+    state = _auth_state(tmp_path)
+    user = state.auth_service().create_user(
+        username="Mira",
+        password="correct horse",
+        role="user",
+    )
+    save_id, npc_id, thread_id = _seed_textable_character_thread(
+        state.repositories,
+        owner_user_id=user.id,
+    )
+    message = state.repositories.append_character_text_message(
+        save_id=save_id,
+        thread_id=thread_id,
+        character_id=npc_id,
+        sender="player",
+        body="Original text",
+        delivery_status="sent",
+        content_rating="g",
+    )
+    state.jobs._jobs = {  # noqa: SLF001 - active-job regression fixture
+        "active-text": JobRecord(
+            id="active-text",
+            type="character_text_send",
+            save_id=save_id,
+            exclusive_key=f"character_text_thread:{thread_id}",
+            status="running",
+        )
+    }
+
+    with TestClient(create_app(cast(WebAppState, state)), authenticate=False) as client:
+        assert client.post(
+            "/api/auth/login",
+            json={"username": "Mira", "password": "correct horse"},
+        ).status_code == 200
+        response = client.post(
+            "/api/character-texts/edit",
+            json={
+                "save_id": save_id,
+                "text_message_id": message.id,
+                "body": "Revised text",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == CHARACTER_TEXT_BUSY_DETAIL
+    persisted = state.repositories.get_character_text_message(
+        save_id=save_id,
+        message_id=message.id,
+    )
+    assert persisted is not None
+    assert persisted.body == "Original text"
 
 
 def test_character_text_spontaneous_send_queues_character_message(
@@ -7116,6 +7230,34 @@ def test_job_sse_summarizes_failed_job_error_events(tmp_path: Path) -> None:
         assert "Mara" not in repr(chunks)
         assert "live-secret" not in repr(chunks)
         assert "api_key" not in repr(chunks)
+
+    asyncio.run(run_test())
+
+
+def test_character_text_job_sse_done_payload_exposes_thread_scope(
+    tmp_path: Path,
+) -> None:
+    async def run_test() -> None:
+        state = _state_double(tmp_path)
+        succeeded = JobRecord(
+            id="text-job",
+            type="character_text_send",
+            save_id="save-1",
+            exclusive_key="character_text_thread:thread-1",
+            status="succeeded",
+        )
+        state.jobs._jobs = {succeeded.id: succeeded}  # noqa: SLF001 - fixture
+
+        chunks = [
+            chunk
+            async for chunk in api_app._event_stream(  # noqa: SLF001
+                cast(WebAppState, state),
+                succeeded.id,
+            )
+        ]
+
+        done = next(chunk for chunk in chunks if "event: done" in chunk)
+        assert '"scope": {"kind": "character_text_thread", "id": "thread-1"}' in done
 
     asyncio.run(run_test())
 
@@ -18424,6 +18566,40 @@ def _create_dating_auth_save(
         met=True,
     )
     return save.id
+
+
+def _seed_textable_character_thread(
+    repositories: PersistenceRepositories,
+    *,
+    owner_user_id: str,
+) -> tuple[str, str, str]:
+    save_id = _create_dating_auth_save(
+        repositories,
+        owner_user_id=owner_user_id,
+    )
+    player = next(
+        character
+        for character in repositories.list_characters(save_id)
+        if character.is_player_character
+    )
+    npc = next(
+        character
+        for character in repositories.list_characters(save_id)
+        if not character.is_player_character
+    )
+    repositories.upsert_character_contact_state(
+        save_id=save_id,
+        player_character_id=player.id,
+        character_id=npc.id,
+        player_has_character_number=True,
+        character_has_player_number=True,
+    )
+    thread = repositories.get_or_create_character_text_thread(
+        save_id=save_id,
+        character_id=npc.id,
+        title=npc.name,
+    )
+    return save_id, npc.id, thread.id
 
 
 async def _collect_save_event_chunks(

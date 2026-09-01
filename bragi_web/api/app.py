@@ -98,6 +98,10 @@ from bragi_web.scheduler import WebMaintenanceScheduler
 from bragi_web.serialization import to_jsonable
 
 _CHAT_TURN_ACTIVE_DETAIL = "A chat turn is already being processed for this save."
+_CHARACTER_TEXT_BUSY_DETAIL = (
+    "This conversation is still finishing another action. "
+    "Wait for it to finish and try again."
+)
 _JOB_CANCELLATION_FAILED_DETAIL = "Job cancellation could not be requested"
 _SAVE_ID_REQUIRED_DETAIL = "save_id is required for this save-scoped operation"
 _RETIRED_SCENARIO_TYPE = "character_interaction"
@@ -1549,6 +1553,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             submitted_save_id = _require_save_id(payload.save_id)
             _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
             actor_user_id = _owner_user_id_for_request(state)
+            _raise_if_character_text_thread_busy(
+                state,
+                save_id=submitted_save_id,
+                thread_id=thread_id,
+            )
             from bragi.services.character_text_service import CharacterTextService
 
             service = CharacterTextService(
@@ -1573,7 +1582,12 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 )
             except ValueError as exc:
                 detail = str(exc)
-                status_code = 409 if "already pending" in detail else 400
+                if "already pending" in detail:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=_CHARACTER_TEXT_BUSY_DETAIL,
+                    ) from exc
+                status_code = 400
                 if detail == "Player does not have every character's number":
                     status_code = 403
                 if detail.startswith("Unknown character text thread id"):
@@ -1678,7 +1692,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "character_texts_changed",
                 {"message_id": queued.player_message.id, "status": "failed"},
             )
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=409,
+                detail=_CHARACTER_TEXT_BUSY_DETAIL,
+            ) from exc
         except JobRegistryFullError as exc:
             async with state.lock.async_access():
                 service = CharacterTextService(
@@ -1830,7 +1847,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "character_texts_changed",
                 {"message_id": queued.player_message.id, "status": "failed"},
             )
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=409,
+                detail=_CHARACTER_TEXT_BUSY_DETAIL,
+            ) from exc
         except JobRegistryFullError as exc:
             async with state.lock.async_access():
                 service = _character_text_service_for_delivery_failure(state)
@@ -1885,6 +1905,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             submitted_save_id = _require_save_id(save_id)
             _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
             actor_user_id = _owner_user_id_for_request(state)
+            _raise_if_character_text_thread_busy(
+                state,
+                save_id=submitted_save_id,
+                thread_id=thread_id,
+            )
             if file is not None:
                 _raise_unless_save_action_allowed(
                     state,
@@ -1923,7 +1948,12 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 )
             except ValueError as exc:
                 detail = str(exc)
-                status_code = 409 if "already pending" in detail else 400
+                if "already pending" in detail:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=_CHARACTER_TEXT_BUSY_DETAIL,
+                    ) from exc
+                status_code = 400
                 if detail == "Player does not have every character's number":
                     status_code = 403
                 if detail.startswith("Unknown character text thread id"):
@@ -1995,6 +2025,17 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             submitted_save_id = _require_save_id(payload.save_id)
             _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
             actor_user_id = _owner_user_id_for_request(state)
+            existing_thread_id = _existing_direct_character_text_thread_id(
+                state,
+                save_id=submitted_save_id,
+                character_id=payload.character_id,
+            )
+            if existing_thread_id is not None:
+                _raise_if_character_text_thread_busy(
+                    state,
+                    save_id=submitted_save_id,
+                    thread_id=existing_thread_id,
+                )
             from bragi.services.character_text_service import CharacterTextService
 
             service = CharacterTextService(
@@ -2019,7 +2060,12 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 )
             except ValueError as exc:
                 detail = str(exc)
-                status_code = 409 if "already pending" in detail else 400
+                if "already pending" in detail:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=_CHARACTER_TEXT_BUSY_DETAIL,
+                    ) from exc
+                status_code = 400
                 if detail == "Player does not have this character's number":
                     status_code = 403
                 if detail.startswith("Unknown textable character id"):
@@ -2124,7 +2170,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "character_texts_changed",
                 {"message_id": queued.player_message.id, "status": "failed"},
             )
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=409,
+                detail=_CHARACTER_TEXT_BUSY_DETAIL,
+            ) from exc
         except JobRegistryFullError as exc:
             async with state.lock.async_access():
                 service = CharacterTextService(
@@ -2175,6 +2224,17 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             submitted_save_id = _require_save_id(save_id)
             _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
             actor_user_id = _owner_user_id_for_request(state)
+            existing_thread_id = _existing_direct_character_text_thread_id(
+                state,
+                save_id=submitted_save_id,
+                character_id=character_id,
+            )
+            if existing_thread_id is not None:
+                _raise_if_character_text_thread_busy(
+                    state,
+                    save_id=submitted_save_id,
+                    thread_id=existing_thread_id,
+                )
             if file is not None:
                 _raise_unless_save_action_allowed(
                     state,
@@ -2213,7 +2273,12 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 )
             except ValueError as exc:
                 detail = str(exc)
-                status_code = 409 if "already pending" in detail else 400
+                if "already pending" in detail:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=_CHARACTER_TEXT_BUSY_DETAIL,
+                    ) from exc
+                status_code = 400
                 if detail == "Player does not have this character's number":
                     status_code = 403
                 if detail.startswith("Unknown textable character id"):
@@ -2246,6 +2311,17 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             submitted_save_id = _require_save_id(payload.save_id)
             _raise_unless_save_action_allowed(state, submitted_save_id, "chat")
             actor_user_id = _owner_user_id_for_request(state)
+            existing_thread_id = _existing_direct_character_text_thread_id(
+                state,
+                save_id=submitted_save_id,
+                character_id=payload.character_id,
+            )
+            if existing_thread_id is not None:
+                _raise_if_character_text_thread_busy(
+                    state,
+                    save_id=submitted_save_id,
+                    thread_id=existing_thread_id,
+                )
             from bragi.services.character_text_service import CharacterTextService
 
             service = CharacterTextService(
@@ -2259,7 +2335,12 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 )
             except ValueError as exc:
                 detail = str(exc)
-                status_code = 409 if "already pending" in detail else 400
+                if "already pending" in detail:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=_CHARACTER_TEXT_BUSY_DETAIL,
+                    ) from exc
+                status_code = 400
                 if detail in {
                     "Player does not have this character's number",
                     "Character does not have the player's number",
@@ -2367,7 +2448,10 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 "character_texts_changed",
                 {"message_id": queued.message.id, "status": "failed"},
             )
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=409,
+                detail=_CHARACTER_TEXT_BUSY_DETAIL,
+            ) from exc
         except JobRegistryFullError as exc:
             async with state.lock.async_access():
                 service = CharacterTextService(
@@ -2426,6 +2510,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                         f"{payload.text_message_id}"
                     ),
                 )
+            _raise_if_character_text_thread_busy(
+                state,
+                save_id=submitted_save_id,
+                thread_id=selected.thread_id,
+            )
             text_queue_key = _character_text_thread_job_key(selected.thread_id)
             actor_user_id = _owner_user_id_for_request(state)
 
@@ -2511,6 +2600,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                         f"{payload.text_message_id}"
                     ),
                 )
+            _raise_if_character_text_thread_busy(
+                state,
+                save_id=submitted_save_id,
+                thread_id=selected.thread_id,
+            )
             text_queue_key = _character_text_thread_job_key(selected.thread_id)
 
         async def worker(handle: JobHandle) -> Any:
@@ -2572,6 +2666,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                         f"{payload.text_message_id}"
                     ),
                 )
+            _raise_if_character_text_thread_busy(
+                state,
+                save_id=submitted_save_id,
+                thread_id=selected.thread_id,
+            )
             replacement = payload.body.strip()
             if not replacement:
                 raise HTTPException(status_code=400, detail="Text message is empty")
@@ -2583,7 +2682,7 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
             if selected.delivery_status in {"pending", "retrying"}:
                 raise HTTPException(
                     status_code=409,
-                    detail="Character text send is already pending",
+                    detail=_CHARACTER_TEXT_BUSY_DETAIL,
                 )
             if selected.body.strip() == replacement:
                 raise HTTPException(
@@ -9966,6 +10065,35 @@ def _character_text_thread_job_key(thread_id: str) -> str:
     return f"character_text_thread:{thread_id}"
 
 
+def _raise_if_character_text_thread_busy(
+    state: WebAppState,
+    *,
+    save_id: str,
+    thread_id: str,
+) -> None:
+    blocking = state.jobs.active_for_exclusive_key(
+        _character_text_thread_job_key(thread_id)
+    )
+    if blocking is not None and blocking.save_id == save_id:
+        raise HTTPException(status_code=409, detail=_CHARACTER_TEXT_BUSY_DETAIL)
+
+
+def _existing_direct_character_text_thread_id(
+    state: WebAppState,
+    *,
+    save_id: str,
+    character_id: str,
+) -> str | None:
+    return next(
+        (
+            thread.id
+            for thread in state.repositories.list_character_text_threads(save_id)
+            if thread.kind == "direct" and thread.character_id == character_id
+        ),
+        None,
+    )
+
+
 def _web_maintenance_scheduler_enabled(*, provided_state: bool) -> bool:
     if os.environ.get("BRAGI_WEB_DISABLE_SCHEDULER") == "1":
         return False
@@ -10016,6 +10144,11 @@ async def _create_job_summary(
             raise HTTPException(
                 status_code=409,
                 detail=_CHAT_TURN_ACTIVE_DETAIL,
+            ) from exc
+        if exc.exclusive_key.startswith("character_text_thread:"):
+            raise HTTPException(
+                status_code=409,
+                detail=_CHARACTER_TEXT_BUSY_DETAIL,
             ) from exc
         raise HTTPException(status_code=429, detail=str(exc)) from exc
     except JobRegistryFullError as exc:

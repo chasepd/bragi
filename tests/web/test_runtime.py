@@ -13,7 +13,25 @@ from bragi.providers.http_client import (
 )
 from bragi.retry_policy import RetryExecutionClass, retry_execution_context
 from bragi_web import runtime as runtime_module
+from bragi_web.jobs import JobRecord
 from bragi_web.runtime import RuntimeAccessLock, SaveEventHub
+
+
+def test_job_change_event_summary_preserves_character_text_thread_scope() -> None:
+    summary = runtime_module._save_event_job_summary(  # noqa: SLF001
+        JobRecord(
+            id="text-job",
+            type="character_text_edit",
+            save_id="save-1",
+            exclusive_key="character_text_thread:thread-1",
+            status="running",
+        )
+    )
+
+    assert summary["scope"] == {
+        "kind": "character_text_thread",
+        "id": "thread-1",
+    }
 
 
 def test_provider_clients_resolve_retry_budget_from_execution_context(

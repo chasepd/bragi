@@ -959,6 +959,10 @@ export type Job = {
   id: string;
   type: string;
   save_id?: string | null;
+  scope?: {
+    kind: string;
+    id: string;
+  } | null;
   status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
   completion_level?: "response_committed" | "continuity_ready" | "optional_enrichments_complete" | null;
   result: unknown;
