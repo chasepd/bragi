@@ -375,6 +375,40 @@ class ScenarioSectionSelectingProvider(RecordingStructuredContextProvider):
         )
 
 
+class RawScenarioSectionSelectingProvider(RecordingStructuredContextProvider):
+    def __init__(self, *, selected_text: str) -> None:
+        super().__init__()
+        self.selected_text = selected_text
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        if request.schema_name == "context_retrieval_expansion":
+            return await super().generate_structured_output(request)
+        self.structured_output_requests.append(request)
+        prompt = "\n".join(message.body for message in request.messages)
+        source_id = _candidate_source_id(
+            prompt,
+            source_type="scenario_section",
+            expected_text=self.selected_text,
+        )
+        return StructuredOutputResponse(
+            data={
+                "selections": [
+                    {
+                        "source_type": "scenario_section",
+                        "source_id": source_id,
+                        "relevance_note": "The reviewed scenario text is relevant.",
+                    },
+                ],
+            },
+            provider=request.provider,
+            model_id=request.model_id,
+            token_usage={"total": 17},
+        )
+
+
 class StateChangeSelectingProvider(RecordingStructuredContextProvider):
     async def generate_structured_output(
         self,
@@ -3195,6 +3229,59 @@ def test_context_search_exposes_scenario_sections_as_selectable_context(
 
     jobs = _context_search_jobs(repositories, save.id)
     assert "selected_scenario_sections" in jobs[-1]["result_json"]
+
+
+def test_context_search_uses_reviewed_sections_without_compiling_canon(
+    repositories: PersistenceRepositories,
+) -> None:
+    reviewed_lore = "The east tower lens is cracked."
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"lore": reviewed_lore},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="Ash claws at the beacon lens.",
+    )
+    player_message = repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Mara",
+        body="I inspect the tower lens for cracks.",
+    )
+    repositories.set_model_preference(
+        task="context_search",
+        provider="fake",
+        model_id="fake-context",
+    )
+    repositories.save_provider_model(
+        provider="fake",
+        model_id="fake-context",
+        display_name="Fake Context",
+        capabilities=[ProviderCapability.STRUCTURED_OUTPUT.value],
+    )
+    provider = RawScenarioSectionSelectingProvider(selected_text=reviewed_lore)
+
+    result = asyncio.run(
+        ContextSearchService(
+            repositories=repositories,
+            providers={"fake": provider},
+        ).search(save_id=save.id, player_message_id=player_message.id)
+    )
+
+    assert [request.schema_name for request in provider.structured_output_requests] == [
+        "context_selection",
+    ]
+    assert [item.source_type for item in result.selected_scenario_sections] == [
+        "scenario_section",
+    ]
+    assert result.selected_scenario_sections[0].text == reviewed_lore
 
 
 def test_scenario_start_claim_is_superseded_by_matching_accepted_state(

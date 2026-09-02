@@ -26,6 +26,7 @@ from bragi_web.scheduler import (
     CONTEXT_UPDATE_RETRY_DRAIN_TASK,
     MEMORY_CONSOLIDATION_TASK,
     OBSERVATION_CURATION_DRAIN_TASK,
+    SCENARIO_CANON_INDEX_TASK,
     STATE_EXTRACTION_RETRY_DRAIN_TASK,
     STATE_PRUNING_TASK,
     WEB_MAINTENANCE_CHARACTER_REGISTRY_MAINTENANCE_JOB,
@@ -63,6 +64,46 @@ def test_context_precompute_warm_due_requires_continuity_ready() -> None:
         SimpleNamespace(),
         save_id="save-1",
     )
+
+
+def test_scheduler_queues_canon_index_for_uncompiled_active_scenario(
+    tmp_path: Path,
+) -> None:
+    repositories = _repositories(tmp_path)
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"lore": "The east tower lens is cracked."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    repositories.set_model_preference(
+        task="context_update",
+        provider="fake",
+        model_id="fake-context",
+    )
+    runtime = _ReviewRuntime(active_save_id=save.id)
+    state = _scheduler_state(repositories, runtime)
+
+    async def run() -> None:
+        scheduler = WebMaintenanceScheduler(
+            state,
+            poll_interval_seconds=999,
+            startup_delay_seconds=0,
+        )
+        await scheduler.run_once()
+        await _wait_for_jobs_to_finish(state.jobs)
+
+    asyncio.run(run())
+
+    assert runtime.scenario_canon_index_calls == [save.id]
+    task = repositories.get_scheduled_task(
+        task_type=SCENARIO_CANON_INDEX_TASK,
+        save_id=save.id,
+    )
+    assert task is not None
+    assert task.failure_count == 0
 
 
 def test_world_suggestion_scheduler_queues_review_for_active_save(
@@ -1723,6 +1764,11 @@ class _ReviewRuntime:
         self.character_maintenance_calls: list[str] = []
         self.world_context_retention_calls: list[str] = []
         self.dating_route_profile_calls: list[str] = []
+        self.scenario_canon_index_calls: list[str] = []
+
+    async def run_scenario_canon_index(self, *, active_save_id: str) -> object:
+        self.scenario_canon_index_calls.append(active_save_id)
+        return {"active_save_id": active_save_id, "status": "indexed", "error": None}
 
     async def run_world_suggestion_review(
         self,
