@@ -1,16 +1,52 @@
 import asyncio
 import json
+import logging
+import sqlite3
+from pathlib import Path
 
 import pytest
 
+from bragi.persistence.migrations import migrate_database
+from bragi.persistence.repositories import PersistenceRepositories
+from bragi.providers.contracts import StructuredOutputRequest, StructuredOutputResponse
 from bragi.providers.fake import FakeProviderClient
 from bragi.services.scenario_canon import (
     CANON_CONTENT_KEY,
     ScenarioCanonCompiler,
+    ensure_scenario_canon_for_save,
     scenario_canon_claims,
     scenario_canon_is_current,
     scenario_canon_source_sections,
 )
+
+
+class ScenarioEditingCanonProvider(FakeProviderClient):
+    def __init__(
+        self,
+        *,
+        repositories: PersistenceRepositories,
+        scenario_id: str,
+        structured_output: dict[str, object],
+    ) -> None:
+        super().__init__(structured_output=structured_output)
+        self.repositories = repositories
+        self.scenario_id = scenario_id
+
+    async def generate_structured_output(
+        self,
+        request: StructuredOutputRequest,
+    ) -> StructuredOutputResponse:
+        scenario = self.repositories.get_scenario(self.scenario_id)
+        assert scenario is not None
+        self.repositories.update_scenario(
+            scenario_id=scenario.id,
+            title=scenario.title,
+            premise=scenario.premise,
+            player_role=scenario.player_role,
+            interaction_mode=scenario.interaction_mode,
+            content={"lore": "The new beacon burns blue."},
+        )
+        return await super().generate_structured_output(request)
 
 
 def _output() -> dict[str, object]:
@@ -95,6 +131,171 @@ def test_compiler_preserves_source_and_builds_atomic_grounded_claims() -> None:
     request = provider.structured_output_requests[0]
     assert request.schema_name == "scenario_canon_claims"
     assert json.loads(json.dumps(request.schema))["additionalProperties"] is False
+
+
+def test_background_compilation_does_not_overwrite_newer_scenario_text(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(sqlite3.connect(database_path))
+    original_lore = "The old beacon burns red."
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Last Beacon",
+        premise="A keeper guards the final light.",
+        player_role="Keeper",
+        content={"lore": original_lore},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Beacon Watch")
+    output: dict[str, object] = {
+        "sections": [
+            {
+                "section_id": "lore",
+                "claims": [
+                    {
+                        "claim": original_lore,
+                        "evidence_quote": original_lore,
+                        "entity_anchors": [
+                            {
+                                "entity_type": "object",
+                                "entity_key": "beacon",
+                                "display_name": "the old beacon",
+                            },
+                        ],
+                        "fact_type": "state",
+                        "fact_key": "beacon-color",
+                        "authority": "canonical",
+                        "temporal_status": "current_at_scenario_start",
+                        "reveal_policy": "open",
+                        "known_by": [],
+                    },
+                ],
+            },
+        ],
+    }
+    provider = ScenarioEditingCanonProvider(
+        repositories=repositories,
+        scenario_id=scenario.id,
+        structured_output=output,
+    )
+    repositories.set_model_preference(
+        task="context_update",
+        provider="fake",
+        model_id="canon-model",
+    )
+
+    with caplog.at_level(logging.INFO, logger="bragi"):
+        compiled = asyncio.run(
+            ensure_scenario_canon_for_save(
+                repositories=repositories,
+                providers={"fake": provider},
+                save_id=save.id,
+            )
+        )
+
+    refreshed = repositories.get_scenario(scenario.id)
+    assert refreshed is not None
+    assert compiled is False
+    assert json.loads(refreshed.content_json) == {
+        "lore": "The new beacon burns blue.",
+    }
+    assert any(
+        record.getMessage() == "scenario_canon.index_result_discarded"
+        and getattr(record, "bragi_fields", None) == {
+            "save_id": save.id,
+            "reason": "source_changed",
+        }
+        for record in caplog.records
+    )
+
+
+def test_background_compilation_rejects_edit_between_check_and_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(sqlite3.connect(database_path))
+    original_lore = "The old beacon burns red."
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Last Beacon",
+        premise="A keeper guards the final light.",
+        player_role="Keeper",
+        content={"lore": original_lore},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Beacon Watch")
+    provider = FakeProviderClient(
+        structured_output={
+            "sections": [
+                {
+                    "section_id": "lore",
+                    "claims": [
+                        {
+                            "claim": original_lore,
+                            "evidence_quote": original_lore,
+                            "entity_anchors": [
+                                {
+                                    "entity_type": "object",
+                                    "entity_key": "beacon",
+                                    "display_name": "the old beacon",
+                                },
+                            ],
+                            "fact_type": "state",
+                            "fact_key": "beacon-color",
+                            "authority": "canonical",
+                            "temporal_status": "current_at_scenario_start",
+                            "reveal_policy": "open",
+                            "known_by": [],
+                        },
+                    ],
+                },
+            ],
+        }
+    )
+    repositories.set_model_preference(
+        task="context_update",
+        provider="fake",
+        model_id="canon-model",
+    )
+
+    def concurrent_edit(**kwargs: object) -> bool:
+        del kwargs
+        current = repositories.get_scenario(scenario.id)
+        assert current is not None
+        repositories.update_scenario(
+            scenario_id=current.id,
+            title=current.title,
+            premise=current.premise,
+            player_role=current.player_role,
+            interaction_mode=current.interaction_mode,
+            content={"lore": "The new beacon burns blue."},
+        )
+        return False
+
+    monkeypatch.setattr(
+        repositories,
+        "compare_and_set_scenario_content",
+        concurrent_edit,
+        raising=False,
+    )
+
+    compiled = asyncio.run(
+        ensure_scenario_canon_for_save(
+            repositories=repositories,
+            providers={"fake": provider},
+            save_id=save.id,
+        )
+    )
+
+    refreshed = repositories.get_scenario(scenario.id)
+    assert refreshed is not None
+    assert compiled is False
+    assert json.loads(refreshed.content_json) == {
+        "lore": "The new beacon burns blue.",
+    }
 
 
 def test_compiler_normalizes_punctuated_evidence_into_atomic_claim() -> None:

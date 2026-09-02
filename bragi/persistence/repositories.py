@@ -1163,6 +1163,36 @@ class PersistenceRepositories:
             raise ValueError(f"Unknown scenario id: {scenario_id}")
         return scenario
 
+    def compare_and_set_scenario_content(
+        self,
+        *,
+        scenario_id: str,
+        save_id: str,
+        expected_content_json: str,
+        content: dict[str, object],
+    ) -> bool:
+        cursor = self.connection.execute(
+            """
+            UPDATE scenarios
+            SET content_json = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND content_json = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM save_scenario_updates
+                  WHERE save_id = ? AND archived_at IS NULL
+              )
+            """,
+            (
+                _dump_json(content),
+                scenario_id,
+                expected_content_json,
+                save_id,
+            ),
+        )
+        self.commit()
+        return cursor.rowcount == 1
+
     def delete_scenario(self, scenario_id: str) -> bool:
         if self.count_saves_for_scenario(scenario_id) > 0:
             raise ValueError("Cannot delete a scenario with existing saves")
@@ -1754,6 +1784,41 @@ class PersistenceRepositories:
         if refreshed is None:
             raise ValueError(f"Save has no active scenario update: {save_id}")
         return refreshed
+
+    def compare_and_set_active_save_scenario_content(
+        self,
+        *,
+        save_id: str,
+        update_id: str,
+        expected_content_json: str,
+        content: dict[str, object],
+    ) -> bool:
+        cursor = self.connection.execute(
+            """
+            UPDATE save_scenario_updates
+            SET content_json = ?
+            WHERE id = ?
+              AND save_id = ?
+              AND archived_at IS NULL
+              AND content_json = ?
+              AND id = (
+                  SELECT latest.id
+                  FROM save_scenario_updates AS latest
+                  WHERE latest.save_id = ? AND latest.archived_at IS NULL
+                  ORDER BY latest.created_at DESC, latest.rowid DESC
+                  LIMIT 1
+              )
+            """,
+            (
+                _dump_json(content),
+                update_id,
+                save_id,
+                expected_content_json,
+                save_id,
+            ),
+        )
+        self.commit()
+        return cursor.rowcount == 1
 
     def list_save_scenario_updates(
         self,

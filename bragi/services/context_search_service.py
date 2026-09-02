@@ -115,7 +115,6 @@ from bragi.services.responsive_turn_pipeline import (
     character_references_are_resolved,
     responsive_fast_path_eligibility,
 )
-from bragi.services.scenario_canon import ensure_scenario_canon_for_save
 from bragi.services.tool_call_helpers import (
     CONTEXT_SEARCH_TOOL_RETRY_INSTRUCTION,
     accepted_tool_result,
@@ -562,19 +561,6 @@ class ContextSearchService:
             )
             if details is None:
                 raise ValueError(f"Unknown save id: {save_id}")
-            scenario_compiled = await ensure_scenario_canon_for_save(
-                repositories=self.repositories,
-                providers=self.providers,
-                save_id=save_id,
-                details=details,
-            )
-            if scenario_compiled:
-                details = self.repositories.load_save_details(
-                    save_id,
-                    message_limit=CONTEXT_SEARCH_MESSAGE_LOAD_LIMIT,
-                )
-                if details is None:
-                    raise ValueError(f"Unknown save id: {save_id}")
             messages = (
                 details.messages
                 if focus_message is None
@@ -2411,7 +2397,7 @@ def _context_candidate_set(
     scenario_candidates = tuple(
         candidate
         for candidate in indexed_candidates
-        if candidate.source_type == "scenario_claim"
+        if candidate.source_type in {"scenario_claim", "scenario_section"}
     )
     raw_state_candidates = _state_candidates(
         world_state,

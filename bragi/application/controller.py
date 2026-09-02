@@ -210,8 +210,7 @@ from bragi.services.scenario_bundle_service import (
     ScenarioBundleService,
 )
 from bragi.services.scenario_canon import (
-    ScenarioCanonCompiler,
-    scenario_canon_source_sections,
+    ensure_scenario_canon_for_save,
 )
 from bragi.services.scenario_content_rating import (
     metadata_with_scenario_content_ratings,
@@ -1689,10 +1688,6 @@ class BragiRuntime:
                 character_starters=normalized_starters,
             )
             sections_for_persist, scenario_content = _scenario_draft_content(draft)
-            scenario_content = await self._compile_scenario_canon(
-                scenario_type=draft.type.value,
-                content=scenario_content,
-            )
             scenario = self.repositories.create_scenario(
                 type=draft.type.value,
                 title=sections_for_persist["title"],
@@ -1866,36 +1861,6 @@ class BragiRuntime:
         return self.build_model(
             status=f"Created save: {save.title}",
             active_save_id=save.id,
-        )
-
-    async def _compile_scenario_canon(
-        self,
-        *,
-        scenario_type: str,
-        content: Mapping[str, object],
-    ) -> dict[str, object]:
-        if not scenario_canon_source_sections(content):
-            return dict(content)
-        preference = _context_update_preference_for_scenario_type(
-            repositories=self.repositories,
-            scenario_type=scenario_type,
-        )
-        if preference is None:
-            raise ValueError(
-                "A Context Update model is required to compile scenario canon"
-            )
-        provider: object = self.providers.get(preference.provider)
-        if not isinstance(provider, StructuredOutputProvider):
-            raise ValueError(
-                "The Context Update provider must support structured output"
-            )
-        return await ScenarioCanonCompiler(
-            provider=provider,
-            provider_name=preference.provider,
-            model_id=preference.model_id,
-        ).compile(
-            scenario_type=scenario_type,
-            content=content,
         )
 
     def create_manual_scenario(
@@ -4653,6 +4618,47 @@ class BragiRuntime:
                 f"{result.archived_count} archived, "
                 f"{result.rejected_count} rejected."
             )
+        return self.build_model(status=status, active_save_id=save_id)
+
+    async def run_scenario_canon_index(
+        self,
+        *,
+        active_save_id: str | None | object = ...,
+    ) -> RuntimeModel:
+        save_id = (
+            self.active_save_id
+            if active_save_id is ...
+            else cast(str | None, active_save_id)
+        )
+        if save_id is None:
+            return self.build_model(error="No active save selected")
+        try:
+            indexed = await ensure_scenario_canon_for_save(
+                repositories=self.repositories,
+                providers=self.providers,
+                save_id=save_id,
+                apply_guard=lambda: self._save_operation_lock(save_id),
+            )
+        except Exception as exc:
+            log_error_event(
+                "runtime.scenario_canon_index_failed",
+                save_id=save_id,
+                **exception_log_fields(exc),
+            )
+            return self.build_model(
+                error=_user_visible_error(exc),
+                active_save_id=save_id,
+            )
+        status = (
+            "Scenario canon indexed"
+            if indexed
+            else "Scenario canon indexing deferred"
+        )
+        log_event(
+            "runtime.scenario_canon_index_succeeded",
+            save_id=save_id,
+            indexed=indexed,
+        )
         return self.build_model(status=status, active_save_id=save_id)
 
     async def run_character_registry_maintenance(

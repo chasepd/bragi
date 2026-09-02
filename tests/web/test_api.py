@@ -12854,10 +12854,13 @@ def test_save_scenario_draft_awaits_async_runtime(tmp_path: Path) -> None:
             }
 
     runtime = ScenarioDraftRuntime()
+    state = _state_double(tmp_path, runtime)
+    scheduled_tasks: list[dict[str, object]] = []
+    state.repositories.upsert_scheduled_task = lambda **kwargs: scheduled_tasks.append(
+        kwargs
+    )
 
-    with TestClient(
-        create_app(cast(WebAppState, _state_double(tmp_path, runtime)))
-    ) as client:
+    with TestClient(create_app(cast(WebAppState, state))) as client:
         response = client.post(
             "/api/scenarios/draft/save",
             json={
@@ -12892,6 +12895,19 @@ def test_save_scenario_draft_awaits_async_runtime(tmp_path: Path) -> None:
             "action_choices_enabled": True,
             "save_title": "Lantern Keep",
             "source_metadata": {"origin": "generated"},
+        }
+    ]
+    assert [
+        task
+        for task in scheduled_tasks
+        if task.get("task_type") == "scenario_canon_index"
+    ] == [
+        {
+            "task_type": "scenario_canon_index",
+            "save_id": "save-1",
+            "interval_seconds": 60,
+            "payload": {"active_save_only": False},
+            "due_now": True,
         }
     ]
 
