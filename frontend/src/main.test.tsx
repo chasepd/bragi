@@ -18916,6 +18916,117 @@ describe("frontend helpers", () => {
     });
   });
 
+  it("does not rediscover a consumed export while its download finishes", async () => {
+    installEventSourceDouble();
+    stubWorkbenchMedia(false);
+    const model = runtimeModel({
+      saves: [{ save_id: "save-1", title: "Lantern Keep", active: true }]
+    });
+    const baseFetch = workbenchFetch([], model);
+    let readyCalls = 0;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/api/bundles/export/ready?save_id=save-1") {
+        readyCalls += 1;
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            active: false,
+            export: {
+              kind: "chat_bundle_export",
+              filename: "recovered.bragi-chat",
+              download_url: "/api/bundles/export/job-recovered/download?save_id=save-1"
+            }
+          })
+        });
+      }
+      return baseFetch(path, init);
+    }));
+    const { Workbench } = await import("./main");
+    const client = new QueryClient();
+
+    render(
+      <QueryClientProvider client={client}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+    const downloadLink = await screen.findByRole("link", { name: "Download completed save export" });
+    downloadLink.addEventListener("click", (event) => event.preventDefault(), { once: true });
+
+    vi.useFakeTimers();
+    fireEvent.click(downloadLink);
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+
+    expect(readyCalls).toBe(1);
+    expect(client.getQueryData(["export-ready", "save-1"])).toEqual({
+      active: false,
+      export: null
+    });
+    expect(screen.queryByRole("link", { name: "Download completed save export" })).not.toBeInTheDocument();
+  });
+
+  it("ignores a late export recovery response after download starts", async () => {
+    installEventSourceDouble();
+    stubWorkbenchMedia(false);
+    const model = runtimeModel({
+      saves: [{ save_id: "save-1", title: "Lantern Keep", active: true }]
+    });
+    const recovered = {
+      active: false,
+      export: {
+        kind: "chat_bundle_export",
+        filename: "recovered.bragi-chat",
+        download_url: "/api/bundles/export/job-recovered/download?save_id=save-1"
+      }
+    };
+    const baseFetch = workbenchFetch([], model);
+    let readyCalls = 0;
+    let resolveLateReady!: (response: {
+      ok: boolean;
+      json: () => Promise<typeof recovered>;
+    }) => void;
+    const lateReady = new Promise<{
+      ok: boolean;
+      json: () => Promise<typeof recovered>;
+    }>((resolve) => {
+      resolveLateReady = resolve;
+    });
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/api/bundles/export/ready?save_id=save-1") {
+        readyCalls += 1;
+        if (readyCalls > 1) return lateReady;
+        return Promise.resolve({ ok: true, json: async () => recovered });
+      }
+      return baseFetch(path, init);
+    }));
+    const { Workbench } = await import("./main");
+    const client = new QueryClient();
+
+    render(
+      <QueryClientProvider client={client}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+    const downloadLink = await screen.findByRole("link", { name: "Download completed save export" });
+    downloadLink.addEventListener("click", (event) => event.preventDefault(), { once: true });
+    const refetch = client.refetchQueries({ queryKey: ["export-ready", "save-1"], exact: true });
+    await waitFor(() => expect(readyCalls).toBe(2));
+
+    fireEvent.click(downloadLink);
+    resolveLateReady({ ok: true, json: async () => recovered });
+    await act(async () => {
+      await refetch;
+      await Promise.resolve();
+    });
+
+    expect(client.getQueryData(["export-ready", "save-1"])).toEqual({
+      active: false,
+      export: null
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("link", { name: "Download completed save export" })).not.toBeInTheDocument();
+    });
+  });
+
   it("keeps polling through the export completion persistence window", async () => {
     vi.useFakeTimers();
     installEventSourceDouble();
