@@ -1,7 +1,7 @@
 import React, { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import ReactDOM from "react-dom/client";
-import { QueryClient, QueryClientProvider, keepPreviousData, useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, keepPreviousData, useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Archive,
@@ -257,7 +257,16 @@ type RunJob = (job: Job, options?: RunJobOptions) => () => void;
 type SaveExportState = string | ChatBundleExportResult;
 type SaveExportStates = Record<string, SaveExportState>;
 type SetSaveExportStates = React.Dispatch<React.SetStateAction<SaveExportStates>>;
-type SaveExports = [SaveExportStates, SetSaveExportStates];
+type SaveExportStore = {
+  states: SaveExportStates;
+  recoveredUrls: Map<string, string>;
+};
+type SaveExportReady = { active: boolean; export: ChatBundleExportResult | null };
+type SaveExportRecoveryAction = "consume" | "prepare" | "restart";
+type ClearSaveExportRecovery = (saveId: string, action: SaveExportRecoveryAction) => void;
+type SaveExports = [SaveExportStates, SetSaveExportStates, ClearSaveExportRecovery?];
+const SAVE_EXPORT_RECOVERY_WINDOW_MS = 15_000;
+const SAVE_EXPORT_RECOVERY_MAX_WINDOW_MS = 10 * 60_000;
 function setSaveExportState(setStates: SetSaveExportStates, saveId: string, state?: SaveExportState) {
   setStates((current) => {
     if (state !== undefined) return { ...current, [saveId]: state };
@@ -2953,7 +2962,21 @@ function Workbench({
   const [trackedJobs, setTrackedJobs] = useState<Record<string, TrackedJob>>({});
   const [narratorDrafts, setNarratorDrafts] = useState<Record<string, NarratorDraft>>({});
   const [scenarioRefreshVersion, setScenarioRefreshVersion] = useState(0);
-  const saveExports = useState<SaveExportStates>({});
+  const [saveExportStore, setSaveExportStore] = useState<SaveExportStore>({
+    states: {},
+    recoveredUrls: new Map(),
+  });
+  const saveExportStates = saveExportStore.states;
+  const setSaveExportStates = useCallback<SetSaveExportStates>((update) => {
+    setSaveExportStore((current) => {
+      const states = typeof update === "function" ? update(current.states) : update;
+      return states === current.states ? current : { ...current, states };
+    });
+  }, []);
+  const saveExportRecoveryDeadlineRef = useRef<Map<string, number>>(new Map());
+  const saveExportRecoveryMaxDeadlineRef = useRef<Map<string, number>>(new Map());
+  const consumedSaveExportRecoveryRef = useRef<Set<string>>(new Set());
+  const saveExportRecoveryGenerationRef = useRef<Map<string, number>>(new Map());
   const jobWatchers = useRef<Record<string, () => void>>({});
   const jobRunOptionsRef = useRef<Record<string, RunJobOptions>>({});
   const queuedRefreshesRef = useRef<Map<string, QueuedWorkbenchRefresh>>(new Map());
@@ -3000,6 +3023,38 @@ function Workbench({
   const model = runtime.data;
   const runtimeLoadError = runtime.error instanceof Error ? runtime.error.message : "";
   const activeSaveId = model?.active_save_id ?? selectedSaveId ?? null;
+  const saveExportRecoveryIds = useMemo(() => {
+    const ids = (model?.saves ?? []).map((save) => save.save_id);
+    if (activeSaveId && !ids.includes(activeSaveId)) ids.unshift(activeSaveId);
+    return ids;
+  }, [activeSaveId, model?.saves]);
+  useEffect(() => {
+    const now = Date.now();
+    const retainedIds = new Set(saveExportRecoveryIds);
+    for (const saveId of saveExportRecoveryIds) {
+      if (!saveExportRecoveryDeadlineRef.current.has(saveId)) {
+        saveExportRecoveryDeadlineRef.current.set(saveId, now + SAVE_EXPORT_RECOVERY_WINDOW_MS);
+      }
+      if (!saveExportRecoveryMaxDeadlineRef.current.has(saveId)) {
+        saveExportRecoveryMaxDeadlineRef.current.set(saveId, now + SAVE_EXPORT_RECOVERY_MAX_WINDOW_MS);
+      }
+    }
+    for (const saveId of saveExportRecoveryDeadlineRef.current.keys()) {
+      if (!retainedIds.has(saveId)) {
+        saveExportRecoveryDeadlineRef.current.delete(saveId);
+        saveExportRecoveryMaxDeadlineRef.current.delete(saveId);
+      }
+    }
+    setSaveExportStore((current) => {
+      let recoveredUrls = current.recoveredUrls;
+      for (const saveId of current.recoveredUrls.keys()) {
+        if (retainedIds.has(saveId)) continue;
+        if (recoveredUrls === current.recoveredUrls) recoveredUrls = new Map(recoveredUrls);
+        recoveredUrls.delete(saveId);
+      }
+      return recoveredUrls === current.recoveredUrls ? current : { ...current, recoveredUrls };
+    });
+  }, [saveExportRecoveryIds]);
   const activeSave = model?.saves?.find((save) => save.save_id === activeSaveId);
   const activeSaveSupported = activeSave?.supported !== false;
   useEffect(() => {
@@ -3021,6 +3076,109 @@ function Workbench({
     enabled: Boolean(model),
     retry: false
   });
+  const readySaveExports = useQueries({
+    queries: saveExportRecoveryIds.map((saveId) => ({
+      queryKey: ["export-ready", saveId],
+      queryFn: async ({ signal }: { signal: AbortSignal }) => {
+        const generation = saveExportRecoveryGenerationRef.current.get(saveId) ?? 0;
+        const ready = await apiRead<SaveExportReady>(
+          `/api/bundles/export/ready?save_id=${encodeURIComponent(saveId)}`,
+          signal,
+        );
+        if (
+          (saveExportRecoveryGenerationRef.current.get(saveId) ?? 0) !== generation
+          || consumedSaveExportRecoveryRef.current.has(saveId)
+        ) {
+          return { active: false, export: null };
+        }
+        if (ready.active) {
+          const now = Date.now();
+          const maximum = saveExportRecoveryMaxDeadlineRef.current.get(saveId)
+            ?? now + SAVE_EXPORT_RECOVERY_MAX_WINDOW_MS;
+          saveExportRecoveryMaxDeadlineRef.current.set(saveId, maximum);
+          saveExportRecoveryDeadlineRef.current.set(
+            saveId,
+            Math.min(now + SAVE_EXPORT_RECOVERY_WINDOW_MS, maximum),
+          );
+        }
+        return ready;
+      },
+      enabled: Boolean(model && canUseChildRestrictedControls(currentUser)),
+      refetchInterval: (query: { state: { data?: SaveExportReady } }) => (
+        !query.state.data?.export
+        && (
+          saveId === activeSaveId
+          || saveExportStates[saveId] === "pending"
+          || query.state.data?.active === true
+        )
+        && !consumedSaveExportRecoveryRef.current.has(saveId)
+        && Date.now() < (saveExportRecoveryDeadlineRef.current.get(saveId) ?? 0)
+      ) ? 3_000 : false,
+      retry: false,
+    })),
+  });
+  const clearSaveExportRecovery = useCallback((saveId: string, action: SaveExportRecoveryAction) => {
+    const generation = saveExportRecoveryGenerationRef.current.get(saveId) ?? 0;
+    saveExportRecoveryGenerationRef.current.set(saveId, generation + 1);
+    setSaveExportStore((current) => {
+      if (!current.recoveredUrls.has(saveId)) return current;
+      const recoveredUrls = new Map(current.recoveredUrls);
+      recoveredUrls.delete(saveId);
+      return { ...current, recoveredUrls };
+    });
+    const now = Date.now();
+    if (action !== "restart") {
+      consumedSaveExportRecoveryRef.current.add(saveId);
+      saveExportRecoveryDeadlineRef.current.set(saveId, now);
+      saveExportRecoveryMaxDeadlineRef.current.set(saveId, now);
+    } else {
+      consumedSaveExportRecoveryRef.current.delete(saveId);
+      saveExportRecoveryDeadlineRef.current.set(saveId, now + SAVE_EXPORT_RECOVERY_WINDOW_MS);
+      saveExportRecoveryMaxDeadlineRef.current.set(saveId, now + SAVE_EXPORT_RECOVERY_MAX_WINDOW_MS);
+    }
+    void client.cancelQueries({ queryKey: ["export-ready", saveId], exact: true });
+    client.setQueryData(["export-ready", saveId], { active: false, export: null });
+  }, [client]);
+  useEffect(() => {
+    setSaveExportStore((current) => {
+      let states = current.states;
+      let recoveredUrls = current.recoveredUrls;
+      for (const [index, saveId] of saveExportRecoveryIds.entries()) {
+        const ready = readySaveExports[index]?.data;
+        if (!ready) continue;
+        const recovered = ready.export;
+        const existing = states[saveId];
+        if (!isChatBundleExportResult(recovered)) {
+          const recoveredUrl = recoveredUrls.get(saveId);
+          if (
+            !isChatBundleExportResult(existing)
+            || existing.download_url !== recoveredUrl
+          ) continue;
+          if (states === current.states) states = { ...states };
+          if (recoveredUrls === current.recoveredUrls) recoveredUrls = new Map(recoveredUrls);
+          delete states[saveId];
+          recoveredUrls.delete(saveId);
+          continue;
+        }
+        const priorRecoveredUrl = recoveredUrls.get(saveId);
+        if (isChatBundleExportResult(existing)) {
+          if (
+            existing.download_url !== priorRecoveredUrl
+            || existing.download_url === recovered.download_url
+          ) continue;
+        } else if (existing !== undefined && existing !== "pending") {
+          continue;
+        }
+        if (states === current.states) states = { ...states };
+        if (recoveredUrls === current.recoveredUrls) recoveredUrls = new Map(recoveredUrls);
+        states[saveId] = recovered;
+        recoveredUrls.set(saveId, recovered.download_url);
+      }
+      return states === current.states && recoveredUrls === current.recoveredUrls
+        ? current
+        : { states, recoveredUrls };
+    });
+  }, [readySaveExports, saveExportRecoveryIds]);
   const chatSubmissionStatus = useQuery({
     queryKey: ["chat", "submission-status", activeSaveId],
     queryFn: ({ signal }) => apiRead<ChatSubmissionStatus>(chatSubmissionStatusPath(activeSaveId), signal),
@@ -3912,7 +4070,7 @@ function Workbench({
             compactLibrary={isStackedDesktopWorkbench}
             onOpenLibrary={() => setMobileSheet("library")}
             runJob={runJob}
-            saveExports={saveExports}
+            saveExports={[saveExportStates, setSaveExportStates, clearSaveExportRecovery]}
           />
           {!isStackedWorkbench ? (
             <WorkbenchResizeHandle
@@ -4109,7 +4267,7 @@ function Workbench({
             onReuseScenarioPrompt={reuseScenarioPrompt}
             onAfterAction={closeMobileSheet}
             runJob={runJob}
-            saveExports={saveExports}
+            saveExports={[saveExportStates, setSaveExportStates, clearSaveExportRecovery]}
           />
         </MobileSheet>
       ) : null}
@@ -4261,6 +4419,7 @@ function LibraryControls(props: {
   const [reusingScenarioId, setReusingScenarioId] = useState("");
   const localSaveExports = useState<SaveExportStates>({});
   const [saveExportStates, setSaveExportStates] = props.saveExports ?? localSaveExports;
+  const clearSaveExportRecovery = props.saveExports?.[2];
   const libraryUserId = props.currentUser?.id ?? null;
   const [scopedLibraryState, setScopedLibraryState] = useState<ScopedLibraryControlsState>(() => ({
     userId: libraryUserId,
@@ -4515,7 +4674,7 @@ function LibraryControls(props: {
                   props.onAfterAction?.();
                 }}
                 runJob={props.runJob}
-                saveExports={[saveExportStates, setSaveExportStates]}
+                saveExports={[saveExportStates, setSaveExportStates, clearSaveExportRecovery]}
               />
             ) : null}
             <button
@@ -4614,6 +4773,7 @@ function LibraryControls(props: {
                           title="Download save bundle"
                           aria-label={`Download ${save.title} export`}
                           onClick={() => {
+                            clearSaveExportRecovery?.(save.save_id, "consume");
                             window.setTimeout(() => {
                               setSaveExportState(setSaveExportStates, save.save_id);
                             }, 0);
@@ -4635,11 +4795,13 @@ function LibraryControls(props: {
                           onClick={() => {
                             if (!props.runJob) return;
                             if (saveExportStates[save.save_id] === "pending") return;
+                            clearSaveExportRecovery?.(save.save_id, "prepare");
                             setSaveExportState(setSaveExportStates, save.save_id, "pending");
                             void postJson<Job>("/api/bundles/export", {
                               save_id: save.save_id,
                               include_revision_history: false
                             }).then((job) => {
+                              clearSaveExportRecovery?.(save.save_id, "restart");
                               props.runJob?.(job, {
                                 allowInactiveSave: true,
                                 allowCrossSaveCompletion: true,
@@ -7828,7 +7990,7 @@ function SaveBundleControls({
   runJob?: RunJob;
   saveExports: SaveExports;
 }) {
-  const [saveExportStates, setSaveExportStates] = saveExports;
+  const [saveExportStates, setSaveExportStates, clearSaveExportRecovery] = saveExports;
   const exportState = activeSaveId ? saveExportStates[activeSaveId] : undefined;
   const exporting = exportEnabled && exportState === "pending";
   const exportDownload = exportEnabled && isChatBundleExportResult(exportState) ? exportState : null;
@@ -7840,12 +8002,14 @@ function SaveBundleControls({
     : "/api/story-logs/export";
   const startExport = async () => {
     if (!runJob || !hasActiveSave || !exportEnabled || !activeSaveId || exporting) return;
+    clearSaveExportRecovery?.(activeSaveId, "prepare");
     setSaveExportState(setSaveExportStates, activeSaveId, "pending");
     try {
       const created = await postJson<Job>("/api/bundles/export", {
         save_id: activeSaveId,
         include_revision_history: false
       });
+      clearSaveExportRecovery?.(activeSaveId, "restart");
       runJob(created, {
         allowInactiveSave: true,
         allowCrossSaveCompletion: true,
@@ -7883,6 +8047,7 @@ function SaveBundleControls({
           title="Download completed save export"
           aria-label="Download completed save export"
           onClick={() => {
+            if (activeSaveId) clearSaveExportRecovery?.(activeSaveId, "consume");
             window.setTimeout(() => {
               if (activeSaveId) setSaveExportState(setSaveExportStates, activeSaveId);
             }, 0);

@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from time import time
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 from bragi_web.bragi_adapter import bragi_runtime_bindings
@@ -36,6 +36,11 @@ PUBLIC_JOB_FAILURE_ERROR = "Background job failed. Check diagnostics for details
 _PUBLIC_PROVIDER_FAILURE_PREFIX = "Provider request failed"
 _PUBLIC_JOB_ERROR_PREFIX = "Public job error: "
 _CHARACTER_TEXT_THREAD_EXCLUSIVE_PREFIX = "character_text_thread:"
+
+
+class _JobErrorRecord(Protocol):
+    status: str
+    error: str | None
 
 
 @dataclass(frozen=True)
@@ -205,6 +210,19 @@ class JobRegistry:
             self._prune_completed_locked(time())
             record = self._active_exclusive_job_locked(exclusive_key)
             return self._snapshot_locked(record) if record is not None else None
+
+    def list_for_save(self, save_id: str) -> list[JobRecord]:
+        with self._condition:
+            self._prune_completed_locked(time())
+            return sorted(
+                (
+                    self._snapshot_locked(record)
+                    for record in self._jobs.values()
+                    if record.save_id == save_id
+                ),
+                key=lambda record: record.created_at,
+                reverse=True,
+            )
 
     async def cancel(self, job_id: str) -> bool:
         queued_cancel: tuple[
@@ -887,7 +905,7 @@ def job_summary(record: JobRecord) -> dict[str, Any]:
         "status": record.status,
         "completion_level": record.completion_level,
         "result": to_jsonable(record.result),
-        "error": _public_job_error_for_record(record),
+        "error": public_job_error(record),
         "created_at": record.created_at,
         "updated_at": record.updated_at,
         "latest_progress": _latest_progress_event(record),
@@ -912,7 +930,7 @@ def job_scope(record: JobRecord) -> dict[str, str] | None:
 
 def job_event_payload(record: JobRecord, event: dict[str, Any]) -> Any:
     if event.get("event") == "error" and record.status == "failed":
-        return {"error": _public_job_error_for_record(record)}
+        return {"error": public_job_error(record)}
     return to_jsonable(event.get("payload"))
 
 
@@ -966,7 +984,7 @@ def _public_job_error_for_exception(exc: Exception) -> str:
     return PUBLIC_JOB_FAILURE_ERROR
 
 
-def _public_job_error_for_record(record: JobRecord) -> str | None:
+def public_job_error(record: _JobErrorRecord) -> str | None:
     if record.status != "failed":
         return record.error
     error = record.error
