@@ -5819,7 +5819,7 @@ function Chronicle({
   const scrollRef = useRef<HTMLElement | null>(null);
   const reportedPaintMeasurementsRef = useRef(new Set<string>());
   const bottomRef = useRef<HTMLDivElement | null>(null);
-  const scrollMetricsRef = useRef<{ activeSaveId: string | null; scrollHeight: number } | null>(null);
+  const scrollMetricsRef = useRef<{ activeSaveId: string | null; nearBottom: boolean } | null>(null);
   const chronicleAnchorFrameRef = useRef<number | null>(null);
   const [hasNewContentBelow, setHasNewContentBelow] = useState(false);
   const [olderChronicleLoading, setOlderChronicleLoading] = useState(false);
@@ -5895,6 +5895,7 @@ function Chronicle({
     }
   });
   const virtualChronicleRows = chronicleVirtualizer.getVirtualItems();
+  const chronicleTotalSize = chronicleVirtualizer.getTotalSize();
   const chronicleIsNearBottom = useCallback((node: HTMLElement, scrollHeight = node.scrollHeight) => {
     return scrollHeight - node.scrollTop - node.clientHeight <= 96;
   }, []);
@@ -5912,7 +5913,7 @@ function Chronicle({
     const scrollHeight = Math.max(node.scrollHeight, chronicleVirtualizer.getTotalSize());
     bottomRef.current?.scrollIntoView?.({ block: "end" });
     setScrollTopAndNotify(node, scrollHeight);
-    scrollMetricsRef.current = { activeSaveId, scrollHeight };
+    scrollMetricsRef.current = { activeSaveId, nearBottom: true };
     setHasNewContentBelow(false);
   }, [activeSaveId, chronicleVirtualizer, messages.length]);
   useLayoutEffect(() => {
@@ -5920,7 +5921,7 @@ function Chronicle({
     if (!node) return;
     const previousMetrics = scrollMetricsRef.current;
     const activeSaveChanged = previousMetrics?.activeSaveId !== activeSaveId;
-    const wasNearBottom = previousMetrics ? chronicleIsNearBottom(node, previousMetrics.scrollHeight) : true;
+    const wasNearBottom = previousMetrics?.nearBottom ?? true;
     if (activeSaveChanged || wasNearBottom) {
       scrollToChronicleBottom();
       const frame = window.requestAnimationFrame(() => {
@@ -5935,19 +5936,20 @@ function Chronicle({
         }
       };
     }
-    scrollMetricsRef.current = { activeSaveId, scrollHeight: node.scrollHeight };
+    scrollMetricsRef.current = { activeSaveId, nearBottom: false };
     setHasNewContentBelow(true);
     return undefined;
-  }, [activeSaveId, chronicleIsNearBottom, messageWindowSignal, scrollToChronicleBottom]);
+  }, [activeSaveId, chronicleIsNearBottom, chronicleTotalSize, messageWindowSignal, scrollToChronicleBottom]);
   const onChronicleScroll = () => {
     const node = scrollRef.current;
     if (!node) return;
-    if (chronicleIsNearBottom(node)) {
+    const nearBottom = chronicleIsNearBottom(node);
+    if (nearBottom) {
       setHasNewContentBelow(false);
     } else {
       cancelPendingChronicleAnchor();
     }
-    scrollMetricsRef.current = { activeSaveId, scrollHeight: node.scrollHeight };
+    scrollMetricsRef.current = { activeSaveId, nearBottom };
   };
   const loadOlderChronicle = useCallback(async () => {
     if (!activeSaveId || !oldestMessageId || olderChronicleLoading) return;
@@ -5968,7 +5970,7 @@ function Chronicle({
         setScrollTopAndNotify(node, node.scrollTop + nextScrollHeight - previousScrollHeight);
         scrollMetricsRef.current = {
           activeSaveId,
-          scrollHeight: nextScrollHeight
+          nearBottom: false
         };
       });
     } catch (failure) {
@@ -6026,7 +6028,7 @@ function Chronicle({
       {messages.length ? (
         <div
           className="chronicle-virtual-list"
-          style={{ height: `${chronicleVirtualizer.getTotalSize()}px` }}
+          style={{ height: `${chronicleTotalSize}px` }}
         >
           {virtualChronicleRows.map((virtualRow) => {
             const message = messages[virtualRow.index];
