@@ -2,9 +2,9 @@
   "generatedAssets": {
     "javascript": {
       "extensions": [".js"],
-      "totalRawBytes": 681000,
-      "totalGzipBytes": 189000,
-      "totalBrotliBytes": 163000,
+      "totalRawBytes": 685000,
+      "totalGzipBytes": 190500,
+      "totalBrotliBytes": 164000,
       "maxFileRawBytes": 260000,
       "minFileCount": 11,
       "requiredFilePatterns": [
