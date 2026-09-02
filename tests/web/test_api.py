@@ -20324,6 +20324,8 @@ def test_bundle_export_download_enforces_save_access(tmp_path: Path) -> None:
         assert job["status"] == "succeeded"
         job_id = started.json()["id"]
 
+    state.jobs._jobs.clear()  # noqa: SLF001 - force persisted authorization path
+
     with TestClient(app, authenticate=False) as rook_client:
         assert rook_client.post(
             "/api/auth/login",

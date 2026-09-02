@@ -4709,6 +4709,7 @@ function LibraryControls(props: {
                           title="Download save bundle"
                           aria-label={`Download ${save.title} export`}
                           onClick={() => {
+                            clearSaveExportRecovery?.(save.save_id, "consume");
                             window.setTimeout(() => {
                               setSaveExportState(setSaveExportStates, save.save_id);
                             }, 0);
@@ -4730,6 +4731,7 @@ function LibraryControls(props: {
                           onClick={() => {
                             if (!props.runJob) return;
                             if (saveExportStates[save.save_id] === "pending") return;
+                            clearSaveExportRecovery?.(save.save_id, "restart");
                             setSaveExportState(setSaveExportStates, save.save_id, "pending");
                             void postJson<Job>("/api/bundles/export", {
                               save_id: save.save_id,
