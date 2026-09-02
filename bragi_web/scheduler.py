@@ -388,7 +388,9 @@ class WebMaintenanceScheduler:
                 save_id=save_id,
                 exclusive_key=_task_exclusive_key(definition.task_type, save_id),
                 operation_queue_key=(
-                    save_id if definition.serialize_with_save_operations else None
+                    save_id
+                    if definition.serialize_with_save_operations
+                    else _task_exclusive_key(definition.task_type, save_id)
                 ),
             )
         except JobRegistryExclusiveKeyError as exc:
@@ -1155,6 +1157,7 @@ _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
         event_reason="scenario_canon_index",
         should_schedule=_scenario_canon_index_due,
         cache_policy_checks=True,
+        serialize_with_save_operations=False,
     ),
     _MaintenanceTaskDefinition(
         task_type=STATE_EXTRACTION_RETRY_DRAIN_TASK,

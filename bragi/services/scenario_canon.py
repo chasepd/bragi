@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -258,6 +259,7 @@ async def ensure_scenario_canon_for_save(
     providers: Mapping[str, ProviderClient],
     save_id: str,
     details: Any | None = None,
+    apply_guard: Callable[[], AbstractAsyncContextManager[None]] | None = None,
 ) -> bool:
     """Compile a legacy or changed effective scenario before retrieval."""
 
@@ -291,45 +293,46 @@ async def ensure_scenario_canon_for_save(
         provider_name=preference.provider,
         model_id=preference.model_id,
     ).compile(scenario_type=details.scenario.type, content=content)
-    refreshed_details = repositories.load_save_details(save_id, message_limit=1)
-    if refreshed_details is None:
-        raise ValueError(f"Unknown save id: {save_id}")
-    refreshed_content = _loaded_content(refreshed_details.scenario.content_json)
-    if scenario_canon_is_current(refreshed_content):
-        return False
-    if _source_digest(scenario_canon_source_sections(refreshed_content)) != (
-        _source_digest(scenario_canon_source_sections(content))
-    ):
-        log_event(
-            "scenario_canon.index_result_discarded",
-            save_id=save_id,
-            reason="source_changed",
-        )
-        return False
-    compiled_payload = compiled.get(CANON_CONTENT_KEY)
-    if not isinstance(compiled_payload, Mapping):
-        raise ValueError("Scenario canon compilation did not return canon claims")
-    compiled = {
-        **refreshed_content,
-        CANON_CONTENT_KEY: dict(compiled_payload),
-    }
-    if repositories.get_active_save_scenario_update(save_id) is not None:
-        repositories.update_active_save_scenario_content(
-            save_id=save_id,
-            content=compiled,
-        )
-    else:
-        scenario = repositories.get_scenario(details.save.scenario_id)
-        if scenario is None:
-            raise ValueError(f"Unknown scenario id: {details.save.scenario_id}")
-        repositories.update_scenario(
-            scenario_id=scenario.id,
-            title=scenario.title,
-            premise=scenario.premise,
-            player_role=scenario.player_role,
-            interaction_mode=scenario.interaction_mode,
-            content=compiled,
-        )
+    async with apply_guard() if apply_guard is not None else nullcontext():
+        refreshed_details = repositories.load_save_details(save_id, message_limit=1)
+        if refreshed_details is None:
+            raise ValueError(f"Unknown save id: {save_id}")
+        refreshed_content = _loaded_content(refreshed_details.scenario.content_json)
+        if scenario_canon_is_current(refreshed_content):
+            return False
+        if _source_digest(scenario_canon_source_sections(refreshed_content)) != (
+            _source_digest(scenario_canon_source_sections(content))
+        ):
+            log_event(
+                "scenario_canon.index_result_discarded",
+                save_id=save_id,
+                reason="source_changed",
+            )
+            return False
+        compiled_payload = compiled.get(CANON_CONTENT_KEY)
+        if not isinstance(compiled_payload, Mapping):
+            raise ValueError("Scenario canon compilation did not return canon claims")
+        compiled = {
+            **refreshed_content,
+            CANON_CONTENT_KEY: dict(compiled_payload),
+        }
+        if repositories.get_active_save_scenario_update(save_id) is not None:
+            repositories.update_active_save_scenario_content(
+                save_id=save_id,
+                content=compiled,
+            )
+        else:
+            scenario = repositories.get_scenario(details.save.scenario_id)
+            if scenario is None:
+                raise ValueError(f"Unknown scenario id: {details.save.scenario_id}")
+            repositories.update_scenario(
+                scenario_id=scenario.id,
+                title=scenario.title,
+                premise=scenario.premise,
+                player_role=scenario.player_role,
+                interaction_mode=scenario.interaction_mode,
+                content=compiled,
+            )
     return True
 
 

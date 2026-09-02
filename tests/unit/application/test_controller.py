@@ -4220,6 +4220,66 @@ def test_run_scenario_canon_index_compiles_saved_reviewed_sections(
     assert _status_text(model) == "Scenario canon indexed"
 
 
+def test_scenario_canon_provider_does_not_hold_foreground_save_lock(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class SuspendedCanonProvider(RuntimeCanonProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def generate_structured_output(
+            self,
+            request: StructuredOutputRequest,
+        ) -> StructuredOutputResponse:
+            self.started.set()
+            await self.release.wait()
+            return await super().generate_structured_output(request)
+
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    provider = SuspendedCanonProvider()
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        providers={"canon": provider, "fake": RuntimeFakeProvider()},
+    )
+    repositories.set_model_preference(
+        task="context_update",
+        provider="canon",
+        model_id="fake-canon",
+    )
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"lore": "The harbour bell rings at dusk."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+
+    async def run() -> object:
+        indexing = asyncio.create_task(
+            controller.run_scenario_canon_index(active_save_id=save.id)
+        )
+        await asyncio.wait_for(provider.started.wait(), timeout=1.0)
+        try:
+            async with asyncio.timeout(0.25):
+                async with controller._save_operation_lock(save.id):  # noqa: SLF001
+                    pass
+        finally:
+            provider.release.set()
+        return await asyncio.wait_for(indexing, timeout=1.0)
+
+    model = asyncio.run(run())
+
+    assert _error_text(model) == ""
+    assert _status_text(model) == "Scenario canon indexed"
+
+
 def test_save_scenario_draft_ignores_legacy_loss_condition_metadata(
     repositories: PersistenceRepositories,
     tmp_path: Path,

@@ -4633,12 +4633,12 @@ class BragiRuntime:
         if save_id is None:
             return self.build_model(error="No active save selected")
         try:
-            async with self._save_operation_lock(save_id):
-                indexed = await ensure_scenario_canon_for_save(
-                    repositories=self.repositories,
-                    providers=self.providers,
-                    save_id=save_id,
-                )
+            indexed = await ensure_scenario_canon_for_save(
+                repositories=self.repositories,
+                providers=self.providers,
+                save_id=save_id,
+                apply_guard=lambda: self._save_operation_lock(save_id),
+            )
         except Exception as exc:
             log_error_event(
                 "runtime.scenario_canon_index_failed",

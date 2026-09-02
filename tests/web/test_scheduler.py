@@ -104,6 +104,10 @@ def test_scheduler_queues_canon_index_for_uncompiled_active_scenario(
     )
     assert task is not None
     assert task.failure_count == 0
+    assert task.last_job_id is not None
+    job = state.jobs.get(task.last_job_id)
+    assert job is not None
+    assert job.operation_queue_key == f"scenario_canon_index:{save.id}"
 
 
 def test_world_suggestion_scheduler_queues_review_for_active_save(
@@ -229,7 +233,7 @@ def test_dating_route_profile_scheduler_does_not_join_foreground_queue(
     assert task.last_job_id is not None
     job = state.jobs.get(task.last_job_id)
     assert job is not None
-    assert job.operation_queue_key is None
+    assert job.operation_queue_key == f"dating_route_profile_enrichment:{save.id}"
 
 
 def test_scheduler_marks_web_job_failed_when_runtime_result_has_error(
