@@ -9562,6 +9562,82 @@ def test_repository_updates_scenario_records(
     )
 
 
+def test_repository_conditionally_updates_scenario_content(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"lore": "The beacon burns red."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+
+    assert repositories.compare_and_set_scenario_content(
+        scenario_id=scenario.id,
+        save_id=save.id,
+        expected_content_json=scenario.content_json,
+        content={"lore": "The beacon burns red.", "_canon_claims": {}},
+    )
+    assert not repositories.compare_and_set_scenario_content(
+        scenario_id=scenario.id,
+        save_id=save.id,
+        expected_content_json=scenario.content_json,
+        content={"lore": "Stale overwrite."},
+    )
+
+    refreshed = repositories.get_scenario(scenario.id)
+    assert refreshed is not None
+    assert _load_content(refreshed.content_json) == {
+        "lore": "The beacon burns red.",
+        "_canon_claims": {},
+    }
+
+
+def test_repository_conditionally_updates_active_save_scenario_content(
+    repositories: PersistenceRepositories,
+) -> None:
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"lore": "The beacon burns red."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+    update = repositories.add_save_scenario_update(
+        save_id=save.id,
+        title=scenario.title,
+        premise=scenario.premise,
+        player_role=scenario.player_role,
+        content={"lore": "The beacon burns blue."},
+        reason="The lens changed.",
+        provider="fake",
+        model="fake-context",
+    )
+
+    assert repositories.compare_and_set_active_save_scenario_content(
+        save_id=save.id,
+        update_id=update.id,
+        expected_content_json=update.content_json,
+        content={"lore": "The beacon burns blue.", "_canon_claims": {}},
+    )
+    assert not repositories.compare_and_set_active_save_scenario_content(
+        save_id=save.id,
+        update_id=update.id,
+        expected_content_json=update.content_json,
+        content={"lore": "Stale overwrite."},
+    )
+
+    refreshed = repositories.get_active_save_scenario_update(save.id)
+    assert refreshed is not None
+    assert _load_content(refreshed.content_json) == {
+        "lore": "The beacon burns blue.",
+        "_canon_claims": {},
+    }
+
+
 def test_save_scenario_evolution_overrides_prompt_details_without_mutating_base(
     repositories: PersistenceRepositories,
 ) -> None:

@@ -316,23 +316,28 @@ async def ensure_scenario_canon_for_save(
             **refreshed_content,
             CANON_CONTENT_KEY: dict(compiled_payload),
         }
-        if repositories.get_active_save_scenario_update(save_id) is not None:
-            repositories.update_active_save_scenario_content(
+        active_update = repositories.get_active_save_scenario_update(save_id)
+        if active_update is not None:
+            stored = repositories.compare_and_set_active_save_scenario_content(
                 save_id=save_id,
+                update_id=active_update.id,
+                expected_content_json=refreshed_details.scenario.content_json,
                 content=compiled,
             )
         else:
-            scenario = repositories.get_scenario(details.save.scenario_id)
-            if scenario is None:
-                raise ValueError(f"Unknown scenario id: {details.save.scenario_id}")
-            repositories.update_scenario(
-                scenario_id=scenario.id,
-                title=scenario.title,
-                premise=scenario.premise,
-                player_role=scenario.player_role,
-                interaction_mode=scenario.interaction_mode,
+            stored = repositories.compare_and_set_scenario_content(
+                scenario_id=refreshed_details.save.scenario_id,
+                save_id=save_id,
+                expected_content_json=refreshed_details.scenario.content_json,
                 content=compiled,
             )
+        if not stored:
+            log_event(
+                "scenario_canon.index_result_discarded",
+                save_id=save_id,
+                reason="concurrent_write",
+            )
+            return False
     return True
 
 

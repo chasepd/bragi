@@ -211,6 +211,93 @@ def test_background_compilation_does_not_overwrite_newer_scenario_text(
     )
 
 
+def test_background_compilation_rejects_edit_between_check_and_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "bragi.sqlite3"
+    migrate_database(database_path)
+    repositories = PersistenceRepositories(sqlite3.connect(database_path))
+    original_lore = "The old beacon burns red."
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="The Last Beacon",
+        premise="A keeper guards the final light.",
+        player_role="Keeper",
+        content={"lore": original_lore},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Beacon Watch")
+    provider = FakeProviderClient(
+        structured_output={
+            "sections": [
+                {
+                    "section_id": "lore",
+                    "claims": [
+                        {
+                            "claim": original_lore,
+                            "evidence_quote": original_lore,
+                            "entity_anchors": [
+                                {
+                                    "entity_type": "object",
+                                    "entity_key": "beacon",
+                                    "display_name": "the old beacon",
+                                },
+                            ],
+                            "fact_type": "state",
+                            "fact_key": "beacon-color",
+                            "authority": "canonical",
+                            "temporal_status": "current_at_scenario_start",
+                            "reveal_policy": "open",
+                            "known_by": [],
+                        },
+                    ],
+                },
+            ],
+        }
+    )
+    repositories.set_model_preference(
+        task="context_update",
+        provider="fake",
+        model_id="canon-model",
+    )
+
+    def concurrent_edit(**kwargs: object) -> bool:
+        del kwargs
+        current = repositories.get_scenario(scenario.id)
+        assert current is not None
+        repositories.update_scenario(
+            scenario_id=current.id,
+            title=current.title,
+            premise=current.premise,
+            player_role=current.player_role,
+            interaction_mode=current.interaction_mode,
+            content={"lore": "The new beacon burns blue."},
+        )
+        return False
+
+    monkeypatch.setattr(
+        repositories,
+        "compare_and_set_scenario_content",
+        concurrent_edit,
+        raising=False,
+    )
+
+    compiled = asyncio.run(
+        ensure_scenario_canon_for_save(
+            repositories=repositories,
+            providers={"fake": provider},
+            save_id=save.id,
+        )
+    )
+
+    refreshed = repositories.get_scenario(scenario.id)
+    assert refreshed is not None
+    assert compiled is False
+    assert json.loads(refreshed.content_json) == {
+        "lore": "The new beacon burns blue.",
+    }
+
+
 def test_compiler_normalizes_punctuated_evidence_into_atomic_claim() -> None:
     output = _output()
     sections = output["sections"]
