@@ -94,7 +94,11 @@ from bragi_web.runtime import (
     WebAppState,
     create_state,
 )
-from bragi_web.scheduler import WebMaintenanceScheduler
+from bragi_web.scheduler import (
+    SCENARIO_CANON_INDEX_INTERVAL_SECONDS,
+    SCENARIO_CANON_INDEX_TASK,
+    WebMaintenanceScheduler,
+)
 from bragi_web.serialization import to_jsonable
 
 _CHAT_TURN_ACTIVE_DETAIL = "A chat turn is already being processed for this save."
@@ -3218,6 +3222,22 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         _publish_save_event(state, None, "saves_changed", {"reason": "save_created"})
         action_choices = payload_dict.get("action_choices")
         save_id = payload_dict.get("active_save_id")
+        if not payload_dict.get("error") and isinstance(save_id, str):
+            try:
+                state.repositories.upsert_scheduled_task(
+                    task_type=SCENARIO_CANON_INDEX_TASK,
+                    save_id=save_id,
+                    interval_seconds=SCENARIO_CANON_INDEX_INTERVAL_SECONDS,
+                    payload={"active_save_only": False},
+                    due_now=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - save already committed
+                observe(
+                    "runtime.scenario_canon_index_schedule_failed",
+                    level="error",
+                    save_id=save_id,
+                    **error_fields(exc),
+                )
         narrator_message_id = (
             action_choices.get("narrator_message_id")
             if isinstance(action_choices, dict)

@@ -8,6 +8,7 @@ from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from typing import Any, cast
 
+from bragi.services.scenario_canon import scenario_canon_index_needed
 from bragi_web.jobs import (
     JobHandle,
     JobRegistryExclusiveKeyError,
@@ -30,6 +31,7 @@ CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_TASK = (
 WORLD_CONTEXT_RETENTION_TASK = "world_context_retention"
 MEMORY_CONSOLIDATION_TASK = "memory_consolidation"
 CHARACTER_REGISTRY_MAINTENANCE_TASK = "character_registry_maintenance"
+SCENARIO_CANON_INDEX_TASK = "scenario_canon_index"
 WEB_MAINTENANCE_STATE_PRUNING_JOB = "web_maintenance_state_pruning"
 WEB_MAINTENANCE_WORLD_CONTEXT_RETENTION_JOB = (
     "web_maintenance_world_context_retention"
@@ -58,6 +60,7 @@ CHARACTER_TEXT_WORLD_UPDATE_RETRY_DRAIN_INTERVAL_SECONDS = 60
 WORLD_CONTEXT_RETENTION_INTERVAL_SECONDS = 15 * 60
 MEMORY_CONSOLIDATION_INTERVAL_SECONDS = 10 * 60
 CHARACTER_REGISTRY_MAINTENANCE_INTERVAL_SECONDS = 5 * 60
+SCENARIO_CANON_INDEX_INTERVAL_SECONDS = 60
 _SCHEDULER_DEFAULT_LEASE_SECONDS = 10 * 60
 _SCHEDULER_STARTUP_DELAY_SECONDS = 0.25
 _SCHEDULER_RETRY_SECONDS = 30
@@ -574,7 +577,10 @@ def _scheduled_task_payload(
     retry_job_type = _RETRY_DRAIN_JOB_TYPES.get(definition.task_type)
     if retry_job_type is not None:
         return {"active_save_only": False, "queued_job_type": retry_job_type}
-    if definition.task_type == OBSERVATION_CURATION_DRAIN_TASK:
+    if definition.task_type in {
+        OBSERVATION_CURATION_DRAIN_TASK,
+        SCENARIO_CANON_INDEX_TASK,
+    }:
         return {"active_save_only": False}
     return {"active_save_only": True}
 
@@ -812,6 +818,19 @@ def _context_precompute_warm_due(repositories: Any, save_id: str) -> bool:
         if incomplete:
             return False
     return True
+
+
+def _scenario_canon_index_due(repositories: Any, save_id: str) -> bool:
+    if not _model_preference_configured(
+        repositories,
+        save_id=save_id,
+        purpose="context_update",
+    ):
+        return False
+    return scenario_canon_index_needed(
+        repositories=repositories,
+        save_id=save_id,
+    )
 
 
 def _observation_curation_drain_due(repositories: Any, save_id: str) -> bool:
@@ -1127,6 +1146,15 @@ _MAINTENANCE_TASKS: tuple[_MaintenanceTaskDefinition, ...] = (
         should_schedule=_context_precompute_warm_due,
         publish_save_event=False,
         serialize_with_save_operations=False,
+    ),
+    _MaintenanceTaskDefinition(
+        task_type=SCENARIO_CANON_INDEX_TASK,
+        interval_seconds=SCENARIO_CANON_INDEX_INTERVAL_SECONDS,
+        progress_label="Indexing scenario canon",
+        runtime_method="run_scenario_canon_index",
+        event_reason="scenario_canon_index",
+        should_schedule=_scenario_canon_index_due,
+        cache_policy_checks=True,
     ),
     _MaintenanceTaskDefinition(
         task_type=STATE_EXTRACTION_RETRY_DRAIN_TASK,

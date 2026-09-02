@@ -36,7 +36,10 @@ from bragi.services.character_text_context import (
 from bragi.services.character_text_world_update_service import (
     character_text_source_ref,
 )
-from bragi.services.context_assembly import scenario_claim_candidates
+from bragi.services.context_assembly import (
+    scenario_claim_candidates,
+    scenario_section_candidates,
+)
 from bragi.services.open_threads import (
     OPEN_THREAD_AGGREGATE_KEYS,
     has_active_thread_records,
@@ -184,12 +187,20 @@ class ContinuityIndexService:
             self.repositories.archive_continuity_sources_by_type_except(
                 save_id,
                 source_type="scenario_claim",
-                active_source_ids={record.source_id for record in records},
+                active_source_ids={
+                    record.source_id
+                    for record in records
+                    if record.source_type == "scenario_claim"
+                },
             )
             self.repositories.archive_continuity_sources_by_type_except(
                 save_id,
                 source_type="scenario_section",
-                active_source_ids=set(),
+                active_source_ids={
+                    record.source_id
+                    for record in records
+                    if record.source_type == "scenario_section"
+                },
             )
             return len(records)
         if source_kind == "memory":
@@ -351,9 +362,8 @@ class ContinuityIndexService:
         scenario: ScenarioRecord,
     ) -> list[ContextSourceRecord]:
         records: list[ContextSourceRecord] = []
-        for source_id, section_id, text, claim_metadata in scenario_claim_candidates(
-            scenario
-        ):
+        claims = scenario_claim_candidates(scenario)
+        for source_id, section_id, text, claim_metadata in claims:
             records.append(
                 self.repositories.upsert_context_source(
                     save_id=save_id,
@@ -364,6 +374,23 @@ class ContinuityIndexService:
                     metadata={
                         "indexed_by": "continuity_index",
                         **claim_metadata,
+                    },
+                    token_estimate=_estimate_tokens(text),
+                )
+            )
+        if claims:
+            return records
+        for source_id, section_id, text in scenario_section_candidates(scenario):
+            records.append(
+                self.repositories.upsert_context_source(
+                    save_id=save_id,
+                    source_type="scenario_section",
+                    source_id=source_id,
+                    title=section_id,
+                    body=text,
+                    metadata={
+                        "indexed_by": "continuity_index",
+                        "fallback_uncompiled": True,
                     },
                     token_estimate=_estimate_tokens(text),
                 )

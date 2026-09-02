@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -134,6 +135,7 @@ def test_compiler_preserves_source_and_builds_atomic_grounded_claims() -> None:
 
 def test_background_compilation_does_not_overwrite_newer_scenario_text(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)
@@ -147,7 +149,7 @@ def test_background_compilation_does_not_overwrite_newer_scenario_text(
         content={"lore": original_lore},
     )
     save = repositories.create_save(scenario_id=scenario.id, title="Beacon Watch")
-    output = {
+    output: dict[str, object] = {
         "sections": [
             {
                 "section_id": "lore",
@@ -184,13 +186,14 @@ def test_background_compilation_does_not_overwrite_newer_scenario_text(
         model_id="canon-model",
     )
 
-    compiled = asyncio.run(
-        ensure_scenario_canon_for_save(
-            repositories=repositories,
-            providers={"fake": provider},
-            save_id=save.id,
+    with caplog.at_level(logging.INFO, logger="bragi"):
+        compiled = asyncio.run(
+            ensure_scenario_canon_for_save(
+                repositories=repositories,
+                providers={"fake": provider},
+                save_id=save.id,
+            )
         )
-    )
 
     refreshed = repositories.get_scenario(scenario.id)
     assert refreshed is not None
@@ -198,6 +201,14 @@ def test_background_compilation_does_not_overwrite_newer_scenario_text(
     assert json.loads(refreshed.content_json) == {
         "lore": "The new beacon burns blue.",
     }
+    assert any(
+        record.getMessage() == "scenario_canon.index_result_discarded"
+        and getattr(record, "bragi_fields", None) == {
+            "save_id": save.id,
+            "reason": "source_changed",
+        }
+        for record in caplog.records
+    )
 
 
 def test_compiler_normalizes_punctuated_evidence_into_atomic_claim() -> None:

@@ -4090,10 +4090,15 @@ class RuntimeInvalidCanonProvider(RuntimeCanonProvider):
     ``ValueError("Scenario canon claim adds facts absent from its evidence")``.
     """
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.structured_requests: list[StructuredOutputRequest] = []
+
     async def generate_structured_output(
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        self.structured_requests.append(request)
         payload = json.loads(request.messages[-1].body)
         sections = payload["sections"]
         return StructuredOutputResponse(

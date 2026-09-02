@@ -3276,7 +3276,7 @@ def test_context_search_uses_reviewed_sections_without_compiling_canon(
     )
 
     assert [request.schema_name for request in provider.structured_output_requests] == [
-        "context_selection",
+        "context_search_selection",
     ]
     assert [item.source_type for item in result.selected_scenario_sections] == [
         "scenario_section",
