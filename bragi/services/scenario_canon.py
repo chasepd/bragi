@@ -261,7 +261,7 @@ async def ensure_scenario_canon_for_save(
     details: Any | None = None,
     apply_guard: Callable[[], AbstractAsyncContextManager[None]] | None = None,
 ) -> bool:
-    """Compile a legacy or changed effective scenario before retrieval."""
+    """Best-effort compilation of a saved scenario into retrieval claims."""
 
     if details is None:
         details = repositories.load_save_details(save_id, message_limit=1)
