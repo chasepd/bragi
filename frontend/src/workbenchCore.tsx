@@ -257,6 +257,10 @@ type RunJob = (job: Job, options?: RunJobOptions) => () => void;
 type SaveExportState = string | ChatBundleExportResult;
 type SaveExportStates = Record<string, SaveExportState>;
 type SetSaveExportStates = React.Dispatch<React.SetStateAction<SaveExportStates>>;
+type SaveExportStore = {
+  states: SaveExportStates;
+  recoveredUrls: Map<string, string>;
+};
 type SaveExportReady = { active: boolean; export: ChatBundleExportResult | null };
 type SaveExportRecoveryAction = "consume" | "prepare" | "restart";
 type ClearSaveExportRecovery = (saveId: string, action: SaveExportRecoveryAction) => void;
@@ -2958,12 +2962,21 @@ function Workbench({
   const [trackedJobs, setTrackedJobs] = useState<Record<string, TrackedJob>>({});
   const [narratorDrafts, setNarratorDrafts] = useState<Record<string, NarratorDraft>>({});
   const [scenarioRefreshVersion, setScenarioRefreshVersion] = useState(0);
-  const [saveExportStates, setSaveExportStates] = useState<SaveExportStates>({});
+  const [saveExportStore, setSaveExportStore] = useState<SaveExportStore>({
+    states: {},
+    recoveredUrls: new Map(),
+  });
+  const saveExportStates = saveExportStore.states;
+  const setSaveExportStates = useCallback<SetSaveExportStates>((update) => {
+    setSaveExportStore((current) => {
+      const states = typeof update === "function" ? update(current.states) : update;
+      return states === current.states ? current : { ...current, states };
+    });
+  }, []);
   const saveExportRecoveryDeadlineRef = useRef<Map<string, number>>(new Map());
   const saveExportRecoveryMaxDeadlineRef = useRef<Map<string, number>>(new Map());
   const consumedSaveExportRecoveryRef = useRef<Set<string>>(new Set());
   const saveExportRecoveryGenerationRef = useRef<Map<string, number>>(new Map());
-  const recoveredSaveExportUrlsRef = useRef<Map<string, string>>(new Map());
   const jobWatchers = useRef<Record<string, () => void>>({});
   const jobRunOptionsRef = useRef<Record<string, RunJobOptions>>({});
   const queuedRefreshesRef = useRef<Map<string, QueuedWorkbenchRefresh>>(new Map());
@@ -3030,9 +3043,17 @@ function Workbench({
       if (!retainedIds.has(saveId)) {
         saveExportRecoveryDeadlineRef.current.delete(saveId);
         saveExportRecoveryMaxDeadlineRef.current.delete(saveId);
-        recoveredSaveExportUrlsRef.current.delete(saveId);
       }
     }
+    setSaveExportStore((current) => {
+      let recoveredUrls = current.recoveredUrls;
+      for (const saveId of current.recoveredUrls.keys()) {
+        if (retainedIds.has(saveId)) continue;
+        if (recoveredUrls === current.recoveredUrls) recoveredUrls = new Map(recoveredUrls);
+        recoveredUrls.delete(saveId);
+      }
+      return recoveredUrls === current.recoveredUrls ? current : { ...current, recoveredUrls };
+    });
   }, [saveExportRecoveryIds]);
   const activeSave = model?.saves?.find((save) => save.save_id === activeSaveId);
   const activeSaveSupported = activeSave?.supported !== false;
@@ -3099,7 +3120,12 @@ function Workbench({
   const clearSaveExportRecovery = useCallback((saveId: string, action: SaveExportRecoveryAction) => {
     const generation = saveExportRecoveryGenerationRef.current.get(saveId) ?? 0;
     saveExportRecoveryGenerationRef.current.set(saveId, generation + 1);
-    recoveredSaveExportUrlsRef.current.delete(saveId);
+    setSaveExportStore((current) => {
+      if (!current.recoveredUrls.has(saveId)) return current;
+      const recoveredUrls = new Map(current.recoveredUrls);
+      recoveredUrls.delete(saveId);
+      return { ...current, recoveredUrls };
+    });
     const now = Date.now();
     if (action !== "restart") {
       consumedSaveExportRecoveryRef.current.add(saveId);
@@ -3114,26 +3140,27 @@ function Workbench({
     client.setQueryData(["export-ready", saveId], { active: false, export: null });
   }, [client]);
   useEffect(() => {
-    setSaveExportStates((current) => {
-      let next = current;
+    setSaveExportStore((current) => {
+      let states = current.states;
+      let recoveredUrls = current.recoveredUrls;
       for (const [index, saveId] of saveExportRecoveryIds.entries()) {
         const ready = readySaveExports[index]?.data;
         if (!ready) continue;
         const recovered = ready.export;
-        const existing = next[saveId];
+        const existing = states[saveId];
         if (!isChatBundleExportResult(recovered)) {
-          const recoveredUrl = recoveredSaveExportUrlsRef.current.get(saveId);
+          const recoveredUrl = recoveredUrls.get(saveId);
           if (
-            ready.active
-            || !isChatBundleExportResult(existing)
+            !isChatBundleExportResult(existing)
             || existing.download_url !== recoveredUrl
           ) continue;
-          recoveredSaveExportUrlsRef.current.delete(saveId);
-          if (next === current) next = { ...current };
-          delete next[saveId];
+          if (states === current.states) states = { ...states };
+          if (recoveredUrls === current.recoveredUrls) recoveredUrls = new Map(recoveredUrls);
+          delete states[saveId];
+          recoveredUrls.delete(saveId);
           continue;
         }
-        const priorRecoveredUrl = recoveredSaveExportUrlsRef.current.get(saveId);
+        const priorRecoveredUrl = recoveredUrls.get(saveId);
         if (isChatBundleExportResult(existing)) {
           if (
             existing.download_url !== priorRecoveredUrl
@@ -3142,11 +3169,14 @@ function Workbench({
         } else if (existing !== undefined && existing !== "pending") {
           continue;
         }
-        recoveredSaveExportUrlsRef.current.set(saveId, recovered.download_url);
-        if (next === current) next = { ...current };
-        next[saveId] = recovered;
+        if (states === current.states) states = { ...states };
+        if (recoveredUrls === current.recoveredUrls) recoveredUrls = new Map(recoveredUrls);
+        states[saveId] = recovered;
+        recoveredUrls.set(saveId, recovered.download_url);
       }
-      return next;
+      return states === current.states && recoveredUrls === current.recoveredUrls
+        ? current
+        : { states, recoveredUrls };
     });
   }, [readySaveExports, saveExportRecoveryIds]);
   const chatSubmissionStatus = useQuery({

@@ -18916,6 +18916,57 @@ describe("frontend helpers", () => {
     });
   });
 
+  it("clears a recovered export when a newer export becomes active", async () => {
+    installEventSourceDouble();
+    stubWorkbenchMedia(false);
+    const model = runtimeModel({
+      saves: [{ save_id: "save-1", title: "Lantern Keep", active: true }]
+    });
+    const baseFetch = workbenchFetch([], model);
+    let newerExportActive = false;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/api/bundles/export/ready?save_id=save-1") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => !newerExportActive ? {
+            active: false,
+            export: {
+              kind: "chat_bundle_export",
+              filename: "recovered.bragi-chat",
+              download_url: "/api/bundles/export/job-recovered/download?save_id=save-1"
+            }
+          } : { active: true, export: null }
+        });
+      }
+      return baseFetch(path, init);
+    }));
+    const { Workbench } = await import("./main");
+    const client = new QueryClient();
+
+    render(
+      <QueryClientProvider client={client}>
+        <React.StrictMode>
+          <Workbench />
+        </React.StrictMode>
+      </QueryClientProvider>
+    );
+    expect(await screen.findByRole("link", { name: "Download completed save export" })).toHaveAttribute(
+      "download",
+      "recovered.bragi-chat"
+    );
+
+    newerExportActive = true;
+    await client.refetchQueries({ queryKey: ["export-ready", "save-1"], exact: true });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("link", { name: "Download completed save export" })).not.toBeInTheDocument();
+    });
+    expect(client.getQueryData(["export-ready", "save-1"])).toEqual({
+      active: true,
+      export: null
+    });
+  });
+
   it("does not rediscover a consumed export while its download finishes", async () => {
     installEventSourceDouble();
     stubWorkbenchMedia(false);
