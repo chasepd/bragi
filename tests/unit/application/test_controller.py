@@ -49,6 +49,7 @@ from bragi.services.chat_history_settings import (
 from bragi.services.context_search_service import ContextSearchResult
 from bragi.services.continuation_scenario_service import CONTINUATION_SECTION_IDS
 from bragi.services.model_preferences import scenario_generation_section_model_task
+from bragi.services.scenario_canon import scenario_canon_is_current
 from bragi.services.sexual_content_safety import (
     CONTENT_FILTER_TRANSITION,
     FADE_TO_BLACK_TRANSITION,
@@ -4089,10 +4090,15 @@ class RuntimeInvalidCanonProvider(RuntimeCanonProvider):
     ``ValueError("Scenario canon claim adds facts absent from its evidence")``.
     """
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.structured_requests: list[StructuredOutputRequest] = []
+
     async def generate_structured_output(
         self,
         request: StructuredOutputRequest,
     ) -> StructuredOutputResponse:
+        self.structured_requests.append(request)
         payload = json.loads(request.messages[-1].body)
         sections = payload["sections"]
         return StructuredOutputResponse(
@@ -4128,7 +4134,7 @@ class RuntimeInvalidCanonProvider(RuntimeCanonProvider):
         )
 
 
-def test_save_scenario_draft_returns_runtime_model_error_when_canon_fails(
+def test_save_scenario_draft_does_not_wait_for_or_validate_canon(
     repositories: PersistenceRepositories,
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -4153,20 +4159,125 @@ def test_save_scenario_draft_returns_runtime_model_error_when_canon_fails(
         capabilities=["structured_output"],
     )
 
-    pre_existing_saves = list(repositories.list_saves())
     sections = _reviewed_full_roleplay_sections()
     sections["lore"] = "The harbour bell rings at dusk."
     model = asyncio.run(
         controller.save_scenario_draft(
             scenario_type="full_roleplay",
             sections=sections,
-            save_title="Rolled-back Save",
+            save_title="Immediate Save",
         )
     )
 
-    assert "adds facts absent" in _error_text(model)
-    assert list(repositories.list_saves()) == pre_existing_saves
-    assert _value(model, "active_save_id") is None
+    saves = repositories.list_saves()
+    assert len(saves) == 1
+    save = saves[0]
+    scenario = repositories.get_scenario(save.scenario_id)
+    assert scenario is not None
+    assert json.loads(scenario.content_json)["lore"] == sections["lore"]
+    assert "_canon_claims" not in json.loads(scenario.content_json)
+    assert provider.structured_requests == []
+    assert _error_text(model) == ""
+    assert _value(model, "active_save_id") == save.id
+    assert _status_text(model) == "Created save: Immediate Save"
+
+
+def test_run_scenario_canon_index_compiles_saved_reviewed_sections(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    provider = RuntimeCanonProvider()
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        providers={"canon": provider, "fake": RuntimeFakeProvider()},
+    )
+    repositories.set_model_preference(
+        task="context_update",
+        provider="canon",
+        model_id="fake-canon",
+    )
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"lore": "The harbour bell rings at dusk."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+
+    model = asyncio.run(
+        controller.run_scenario_canon_index(active_save_id=save.id)
+    )
+
+    refreshed = repositories.get_scenario(scenario.id)
+    assert refreshed is not None
+    assert scenario_canon_is_current(json.loads(refreshed.content_json))
+    assert _error_text(model) == ""
+    assert _status_text(model) == "Scenario canon indexed"
+
+
+def test_scenario_canon_provider_does_not_hold_foreground_save_lock(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class SuspendedCanonProvider(RuntimeCanonProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def generate_structured_output(
+            self,
+            request: StructuredOutputRequest,
+        ) -> StructuredOutputResponse:
+            self.started.set()
+            await self.release.wait()
+            return await super().generate_structured_output(request)
+
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    provider = SuspendedCanonProvider()
+    controller = _runtime_controller(
+        runtime,
+        repositories,
+        tmp_path,
+        providers={"canon": provider, "fake": RuntimeFakeProvider()},
+    )
+    repositories.set_model_preference(
+        task="context_update",
+        provider="canon",
+        model_id="fake-canon",
+    )
+    scenario = repositories.create_scenario(
+        type="full_roleplay",
+        title="Ashfall Keep",
+        premise="A border keep is cut off by ash storms.",
+        player_role="Signal warden",
+        content={"lore": "The harbour bell rings at dusk."},
+    )
+    save = repositories.create_save(scenario_id=scenario.id, title="Night Watch")
+
+    async def run() -> object:
+        indexing = asyncio.create_task(
+            controller.run_scenario_canon_index(active_save_id=save.id)
+        )
+        await asyncio.wait_for(provider.started.wait(), timeout=1.0)
+        try:
+            async with asyncio.timeout(0.25):
+                async with controller._save_operation_lock(save.id):  # noqa: SLF001
+                    pass
+        finally:
+            provider.release.set()
+        return await asyncio.wait_for(indexing, timeout=1.0)
+
+    model = asyncio.run(run())
+
+    assert _error_text(model) == ""
+    assert _status_text(model) == "Scenario canon indexed"
 
 
 def test_save_scenario_draft_ignores_legacy_loss_condition_metadata(
