@@ -21272,6 +21272,99 @@ describe("frontend helpers", () => {
     expect(within(log).queryByText("Chronicle message 20")).not.toBeInTheDocument();
   });
 
+  it("stays at the latest message when long chronicle rows finish measuring", async () => {
+    const resizeObservers: Array<{
+      callback: ResizeObserverCallback;
+      targets: Set<Element>;
+    }> = [];
+    class ResizeObserverDouble {
+      callback: ResizeObserverCallback;
+      targets = new Set<Element>();
+
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback;
+        resizeObservers.push(this);
+      }
+
+      observe(target: Element) {
+        this.targets.add(target);
+      }
+
+      unobserve(target: Element) {
+        this.targets.delete(target);
+      }
+
+      disconnect() {
+        this.targets.clear();
+      }
+    }
+    vi.stubGlobal("ResizeObserver", ResizeObserverDouble);
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get: function (this: HTMLElement) {
+        return this.classList.contains("chronicle-scroll") ? 360 : 0;
+      }
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get: function (this: HTMLElement) {
+        if (!this.classList.contains("chronicle-scroll")) return 0;
+        const virtualList = this.querySelector<HTMLElement>(".chronicle-virtual-list");
+        return Number.parseFloat(virtualList?.style.height ?? "0");
+      }
+    });
+    let latestRowHeight = 156;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      const height = this.getAttribute("data-index") === "79" ? latestRowHeight : 156;
+      return {
+        x: 0,
+        y: 0,
+        width: 390,
+        height,
+        top: 0,
+        right: 390,
+        bottom: height,
+        left: 0,
+        toJSON: () => ({})
+      };
+    });
+    const messages: RuntimeModel["chronicle"]["messages"] = Array.from({ length: 80 }, (_, index) => ({
+      message_id: `m${index + 1}`,
+      role: index % 2 ? "narrator" : "player",
+      speaker_name: index % 2 ? null : "Keeper",
+      body: index === 79 ? "Latest message" : `Chronicle message ${index + 1}`,
+      actions: []
+    }));
+    const { Chronicle } = await import("./main");
+
+    render(
+      <Chronicle
+        model={runtimeModel({ chronicle: { messages } })}
+        runJob={vi.fn()}
+        pendingMessage={null}
+      />
+    );
+
+    const log = screen.getByRole("log", { name: "Chronicle" });
+    await waitFor(() => expect(within(log).getByText("Latest message")).toBeInTheDocument());
+    const initialScrollTop = log.scrollTop;
+    const latestRow = screen.getByText("Latest message").closest(".chronicle-virtual-row");
+    expect(latestRow).not.toBeNull();
+
+    latestRowHeight = 936;
+    act(() => {
+      for (const observer of resizeObservers) {
+        if (!latestRow || !observer.targets.has(latestRow)) continue;
+        observer.callback(
+          [{ target: latestRow } as ResizeObserverEntry],
+          observer as unknown as ResizeObserver,
+        );
+      }
+    });
+
+    expect(log.scrollTop).toBe(initialScrollTop + 780);
+  });
+
   it("suppresses chronicle live announcements while loading earlier history", async () => {
     const { Chronicle } = await import("./main");
     const page = deferred<{ ok: boolean; json: () => Promise<{ messages: RuntimeModel["chronicle"]["messages"]; has_more_before: boolean; oldest_message_id: string }> }>();

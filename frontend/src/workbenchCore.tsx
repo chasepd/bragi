@@ -5895,6 +5895,7 @@ function Chronicle({
     }
   });
   const virtualChronicleRows = chronicleVirtualizer.getVirtualItems();
+  const chronicleTotalSize = chronicleVirtualizer.getTotalSize();
   const chronicleIsNearBottom = useCallback((node: HTMLElement, scrollHeight = node.scrollHeight) => {
     return scrollHeight - node.scrollTop - node.clientHeight <= 96;
   }, []);
@@ -5938,7 +5939,7 @@ function Chronicle({
     scrollMetricsRef.current = { activeSaveId, scrollHeight: node.scrollHeight };
     setHasNewContentBelow(true);
     return undefined;
-  }, [activeSaveId, chronicleIsNearBottom, messageWindowSignal, scrollToChronicleBottom]);
+  }, [activeSaveId, chronicleIsNearBottom, chronicleTotalSize, messageWindowSignal, scrollToChronicleBottom]);
   const onChronicleScroll = () => {
     const node = scrollRef.current;
     if (!node) return;
@@ -6026,7 +6027,7 @@ function Chronicle({
       {messages.length ? (
         <div
           className="chronicle-virtual-list"
-          style={{ height: `${chronicleVirtualizer.getTotalSize()}px` }}
+          style={{ height: `${chronicleTotalSize}px` }}
         >
           {virtualChronicleRows.map((virtualRow) => {
             const message = messages[virtualRow.index];
