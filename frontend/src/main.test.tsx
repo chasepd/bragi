@@ -21313,9 +21313,9 @@ describe("frontend helpers", () => {
         return Number.parseFloat(virtualList?.style.height ?? "0");
       }
     });
-    let latestRowHeight = 156;
+    const rowHeights = new Map<string, number>();
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
-      const height = this.getAttribute("data-index") === "79" ? latestRowHeight : 156;
+      const height = rowHeights.get(this.getAttribute("data-index") ?? "") ?? 156;
       return {
         x: 0,
         y: 0,
@@ -21351,7 +21351,7 @@ describe("frontend helpers", () => {
     const latestRow = screen.getByText("Latest message").closest(".chronicle-virtual-row");
     expect(latestRow).not.toBeNull();
 
-    latestRowHeight = 936;
+    rowHeights.set("79", 936);
     act(() => {
       for (const observer of resizeObservers) {
         if (!latestRow || !observer.targets.has(latestRow)) continue;
@@ -21363,6 +21363,26 @@ describe("frontend helpers", () => {
     });
 
     expect(log.scrollTop).toBe(initialScrollTop + 780);
+
+    log.scrollTop = 4000;
+    fireEvent.scroll(log);
+    const scrolledRow = log.querySelector<HTMLElement>(".chronicle-virtual-row");
+    const scrolledRowIndex = scrolledRow?.getAttribute("data-index");
+    expect(scrolledRowIndex).not.toBeNull();
+    const virtualizerAdjustedScrollTop = log.scrollHeight - log.clientHeight - 50;
+    log.scrollTop = virtualizerAdjustedScrollTop;
+    rowHeights.set(scrolledRowIndex ?? "", 936);
+    act(() => {
+      for (const observer of resizeObservers) {
+        if (!scrolledRow || !observer.targets.has(scrolledRow)) continue;
+        observer.callback(
+          [{ target: scrolledRow } as unknown as ResizeObserverEntry],
+          observer as unknown as ResizeObserver,
+        );
+      }
+    });
+
+    expect(log.scrollTop).toBe(virtualizerAdjustedScrollTop);
   });
 
   it("suppresses chronicle live announcements while loading earlier history", async () => {
@@ -21567,6 +21587,7 @@ describe("frontend helpers", () => {
     const { rerender } = render(<Chronicle model={firstModel} runJob={vi.fn()} pendingMessage={null} />);
     const scroll = screen.getByText("First").closest(".chronicle-scroll") as HTMLElement;
     scroll.scrollTop = 120;
+    fireEvent.scroll(scroll);
 
     rerender(<Chronicle model={secondModel} runJob={vi.fn()} pendingMessage={null} />);
 
