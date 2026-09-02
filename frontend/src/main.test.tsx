@@ -19223,6 +19223,92 @@ describe("frontend helpers", () => {
     });
   });
 
+  it("keeps a fast replacement export completion ahead of stale recovery state", async () => {
+    const sources = installEventSourceDouble();
+    stubWorkbenchMedia(false);
+    const model = runtimeModel({
+      active_save_id: "save-active",
+      saves: [
+        { save_id: "save-active", title: "Current Chronicle", active: true },
+        {
+          save_id: "save-retired",
+          title: "Retired Chronicle",
+          active: false,
+          supported: false,
+          unsupported_reason: "Retired scenario type."
+        }
+      ]
+    });
+    const exportJob = {
+      id: "job-replacement",
+      type: "chat_bundle_export",
+      save_id: "save-retired",
+      status: "queued",
+      result: null,
+      error: null
+    } satisfies Job;
+    const completedExport = {
+      kind: "chat_bundle_export",
+      filename: "replacement.bragi-chat",
+      download_url: "/api/bundles/export/job-replacement/download?save_id=save-retired"
+    } satisfies ChatBundleExportResult;
+    const baseFetch = workbenchFetch([], model);
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((path: string, init?: RequestInit) => {
+      if (path === "/api/bundles/export/ready?save_id=save-active") {
+        return Promise.resolve({ ok: true, json: async () => ({ active: false, export: null }) });
+      }
+      if (path === "/api/bundles/export/ready?save_id=save-retired") {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            active: false,
+            export: {
+              kind: "chat_bundle_export",
+              filename: "recovered.bragi-chat",
+              download_url: "/api/bundles/export/job-recovered/download?save_id=save-retired"
+            }
+          })
+        });
+      }
+      if (path === "/api/bundles/export") {
+        return Promise.resolve({ ok: true, json: async () => exportJob });
+      }
+      return baseFetch(path, init);
+    }));
+    const { Workbench } = await import("./main");
+
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Workbench currentUser={{ id: "admin-1", username: "Mira", role: "admin", status: "active" }} />
+      </QueryClientProvider>
+    );
+    const recoveredLink = await screen.findByRole("link", { name: "Download Retired Chronicle export" });
+    recoveredLink.addEventListener("click", (event) => event.preventDefault(), { once: true });
+    fireEvent.click(recoveredLink);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Export Retired Chronicle" })).toBeEnabled());
+
+    fireEvent.click(screen.getByRole("button", { name: "Export Retired Chronicle" }));
+    const jobSource = await waitFor(() => {
+      const source = sources.find((candidate) => (
+        candidate.url === "/api/jobs/job-replacement/events?save_id=save-retired"
+      ));
+      expect(source).toBeDefined();
+      return source!;
+    });
+    act(() => {
+      jobSource.dispatch("done", { ...exportJob, status: "succeeded", result: completedExport });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("link", { name: "Download Retired Chronicle export" })).toHaveAttribute(
+      "download",
+      "replacement.bragi-chat"
+    );
+  });
+
   it("keeps polling through the export completion persistence window", async () => {
     vi.useFakeTimers();
     installEventSourceDouble();

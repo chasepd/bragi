@@ -2963,6 +2963,7 @@ function Workbench({
   const saveExportRecoveryMaxDeadlineRef = useRef<Map<string, number>>(new Map());
   const consumedSaveExportRecoveryRef = useRef<Set<string>>(new Set());
   const saveExportRecoveryGenerationRef = useRef<Map<string, number>>(new Map());
+  const recoveredSaveExportUrlsRef = useRef<Map<string, string>>(new Map());
   const jobWatchers = useRef<Record<string, () => void>>({});
   const jobRunOptionsRef = useRef<Record<string, RunJobOptions>>({});
   const queuedRefreshesRef = useRef<Map<string, QueuedWorkbenchRefresh>>(new Map());
@@ -3029,6 +3030,7 @@ function Workbench({
       if (!retainedIds.has(saveId)) {
         saveExportRecoveryDeadlineRef.current.delete(saveId);
         saveExportRecoveryMaxDeadlineRef.current.delete(saveId);
+        recoveredSaveExportUrlsRef.current.delete(saveId);
       }
     }
   }, [saveExportRecoveryIds]);
@@ -3097,6 +3099,7 @@ function Workbench({
   const clearSaveExportRecovery = useCallback((saveId: string, action: SaveExportRecoveryAction) => {
     const generation = saveExportRecoveryGenerationRef.current.get(saveId) ?? 0;
     saveExportRecoveryGenerationRef.current.set(saveId, generation + 1);
+    recoveredSaveExportUrlsRef.current.delete(saveId);
     const now = Date.now();
     if (action !== "restart") {
       consumedSaveExportRecoveryRef.current.add(saveId);
@@ -3119,12 +3122,27 @@ function Workbench({
         const recovered = ready.export;
         const existing = next[saveId];
         if (!isChatBundleExportResult(recovered)) {
-          if (ready.active || !isChatBundleExportResult(existing)) continue;
+          const recoveredUrl = recoveredSaveExportUrlsRef.current.get(saveId);
+          if (
+            ready.active
+            || !isChatBundleExportResult(existing)
+            || existing.download_url !== recoveredUrl
+          ) continue;
+          recoveredSaveExportUrlsRef.current.delete(saveId);
           if (next === current) next = { ...current };
           delete next[saveId];
           continue;
         }
-        if (existing !== undefined && existing !== "pending") continue;
+        const priorRecoveredUrl = recoveredSaveExportUrlsRef.current.get(saveId);
+        if (isChatBundleExportResult(existing)) {
+          if (
+            existing.download_url !== priorRecoveredUrl
+            || existing.download_url === recovered.download_url
+          ) continue;
+        } else if (existing !== undefined && existing !== "pending") {
+          continue;
+        }
+        recoveredSaveExportUrlsRef.current.set(saveId, recovered.download_url);
         if (next === current) next = { ...current };
         next[saveId] = recovered;
       }
