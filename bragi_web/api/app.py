@@ -44,6 +44,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     UploadFile,
 )
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -121,6 +122,7 @@ _SSE_HEARTBEAT_SECONDS = 15.0
 _SAVE_EXPORT_FILE_TTL_SECONDS = 60 * 60
 _SAVE_EXPORT_FILE_PREFIX = "bragi-export-"
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+_RUNTIME_CACHE_CONTROL = "no-store"
 _COMPRESSIBLE_STATIC_SUFFIXES = frozenset({".css", ".js"})
 _DIAGNOSTIC_CATEGORIES = frozenset(
     {"signals", "jobs", "performance", "scheduler", "events", "save_health"}
@@ -1190,9 +1192,11 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
 
     @app.get("/api/runtime/shell")
     def runtime_shell_model(
+        response: Response,
         state: StateDep,
         save_id: str | None = None,
     ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = _RUNTIME_CACHE_CONTROL
         with state.lock:
             if save_id is not None:
                 _raise_if_save_retired(state, save_id)
@@ -2407,7 +2411,12 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
         )
 
     @app.post("/api/saves/{save_id}/load")
-    def load_save(save_id: str, state: StateDep) -> dict[str, Any]:
+    def load_save(
+        save_id: str,
+        response: Response,
+        state: StateDep,
+    ) -> dict[str, Any]:
+        response.headers["Cache-Control"] = _RUNTIME_CACHE_CONTROL
         with state.lock:
             _raise_unless_save_action_allowed(state, save_id, "read")
             _touch_save_last_opened_if_possible(state, save_id)

@@ -1,5 +1,5 @@
 import React from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
@@ -23,6 +23,10 @@ const EXPECTED_IMAGE_STYLE_PRESETS = [
   "three_d_render",
   "low_poly"
 ];
+const ELEMENT_SCROLL_TO_DESCRIPTOR = Object.getOwnPropertyDescriptor(
+  HTMLElement.prototype,
+  "scrollTo",
+);
 
 beforeEach(() => {
   vi.unstubAllGlobals();
@@ -34,6 +38,11 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.useRealTimers();
+  if (ELEMENT_SCROLL_TO_DESCRIPTOR) {
+    Object.defineProperty(HTMLElement.prototype, "scrollTo", ELEMENT_SCROLL_TO_DESCRIPTOR);
+  } else {
+    Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
+  }
 });
 
 type EventSourceDoubleInstance = {
@@ -1234,6 +1243,20 @@ describe("frontend helpers", () => {
     const nullBodyInit = fetchMock.mock.calls[1][1] as RequestInit;
     expect(init.headers).toBeUndefined();
     expect(nullBodyInit.headers).toBeUndefined();
+  });
+
+  it("bypasses the browser cache for runtime reads", async () => {
+    const { apiRead } = await import("./main");
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+
+    await apiRead("/api/runtime/shell?save_id=save-1", controller.signal);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/runtime/shell?save_id=save-1",
+      expect.objectContaining({ cache: "no-store", signal: controller.signal }),
+    );
   });
 
   it("logs failed API responses with metadata only", async () => {
@@ -9295,7 +9318,7 @@ describe("frontend helpers", () => {
     expect(screen.queryByText("Save A doomed turn.")).not.toBeInTheDocument();
   });
 
-  it("stores save selection locally and requests scoped runtime after switching saves", async () => {
+  it("stores save selection locally without replacing the load response", async () => {
     installEventSourceDouble();
     const saveOne = runtimeModel({
       saves: [
@@ -9324,7 +9347,16 @@ describe("frontend helpers", () => {
     const fetchMock = vi.fn().mockImplementation((path: string) => Promise.resolve({
       ok: true,
       json: async () => {
-        if (path === "/api/runtime/shell?save_id=save-2") return saveTwo;
+        if (path === "/api/runtime/shell?save_id=save-2") {
+          return runtimeModel({
+            ...saveTwo,
+            chronicle: {
+              messages: [
+                { message_id: "stale-save-2-message", role: "narrator", speaker_name: null, body: "Stale Save B text.", actions: [] }
+              ]
+            }
+          });
+        }
         if (path.startsWith("/api/runtime")) return saveOne;
         if (path === "/api/scenarios") return { scenarios: [] };
         if (path.startsWith("/api/jobs?status=active")) return { jobs: [] };
@@ -9356,7 +9388,85 @@ describe("frontend helpers", () => {
 
     await waitFor(() => expect(screen.getByText("Save B text.")).toBeInTheDocument());
     expect(window.localStorage.getItem("bragi-web:selected-save-id:v1")).toBe("save-2");
-    await waitFor(() => expect(fetchMock.mock.calls.some(([path]) => path === "/api/runtime/shell?save_id=save-2")).toBe(true));
+    await act(async () => Promise.resolve());
+    expect(fetchMock.mock.calls.some(([path]) => path === "/api/runtime/shell?save_id=save-2")).toBe(false);
+    expect(screen.queryByText("Stale Save B text.")).not.toBeInTheDocument();
+  });
+
+  it("keeps a completed save load authoritative over an older runtime request", async () => {
+    installEventSourceDouble();
+    window.localStorage.setItem("bragi-web:selected-save-id:v1", "save-1");
+    const initial = runtimeModel({
+      saves: [{ save_id: "save-1", title: "Lantern Keep", active: true }],
+      chronicle: {
+        messages: [
+          { message_id: "initial", role: "narrator", speaker_name: null, body: "Initial text.", actions: [] }
+        ]
+      }
+    });
+    const loaded = runtimeModel({
+      saves: [{ save_id: "save-1", title: "Lantern Keep", active: true }],
+      chronicle: {
+        messages: [
+          { message_id: "latest", role: "narrator", speaker_name: null, body: "Latest loaded text.", actions: [] }
+        ]
+      }
+    });
+    const stale = runtimeModel({
+      saves: [{ save_id: "save-1", title: "Lantern Keep", active: true }],
+      chronicle: {
+        messages: [
+          { message_id: "stale", role: "narrator", speaker_name: null, body: "Older request text.", actions: [] }
+        ]
+      }
+    });
+    const olderRuntime = deferred<{ ok: boolean; json: () => Promise<RuntimeModel> }>();
+    let runtimeReads = 0;
+    const fetchMock = vi.fn().mockImplementation((path: string) => {
+      if (path === "/api/runtime/shell?save_id=save-1") {
+        runtimeReads += 1;
+        if (runtimeReads === 1) return Promise.resolve({ ok: true, json: async () => initial });
+        return olderRuntime.promise;
+      }
+      return Promise.resolve({
+        ok: true,
+        json: async () => {
+          if (path === "/api/saves/save-1/load") return loaded;
+          if (path === "/api/scenarios") return { scenarios: [] };
+          if (path.startsWith("/api/jobs?status=active")) return { jobs: [] };
+          if (path === "/api/settings") return modelSettingsPayload();
+          if (path.startsWith("/api/chat/submission-status")) return {
+            save_id: "save-1",
+            can_submit: true,
+            reason: null,
+            blocking_job_id: null,
+            blocking_job_status: null
+          };
+          return {};
+        }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Workbench } = await import("./main");
+    const client = new QueryClient();
+
+    render(
+      <QueryClientProvider client={client}>
+        <Workbench />
+      </QueryClientProvider>
+    );
+
+    await waitFor(() => expect(screen.getByText("Initial text.")).toBeInTheDocument());
+    void client.invalidateQueries({ queryKey: ["runtime", "save-1"], exact: true });
+    await waitFor(() => expect(runtimeReads).toBe(2));
+    await userEvent.click(screen.getByRole("button", { name: "Load Lantern Keep" }));
+    await waitFor(() => expect(screen.getByText("Latest loaded text.")).toBeInTheDocument());
+
+    olderRuntime.resolve({ ok: true, json: async () => stale });
+    await act(async () => Promise.resolve());
+
+    expect(screen.getByText("Latest loaded text.")).toBeInTheDocument();
+    expect(screen.queryByText("Older request text.")).not.toBeInTheDocument();
   });
 
   it("uses user-scoped stored save selections when authenticated", async () => {
@@ -21935,6 +22045,12 @@ describe("frontend helpers", () => {
         return Number.parseFloat(virtualList?.style.height ?? "0");
       }
     });
+    Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+      configurable: true,
+      value: function (this: HTMLElement, options: ScrollToOptions) {
+        if (typeof options.top === "number") this.scrollTop = options.top;
+      }
+    });
     const rowHeights = new Map<string, number>();
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
       const height = rowHeights.get(this.getAttribute("data-index") ?? "") ?? 156;
@@ -21986,13 +22102,28 @@ describe("frontend helpers", () => {
 
     expect(log.scrollTop).toBe(initialScrollTop + 780);
 
+    const nearBottomScrollTop = log.scrollHeight - log.clientHeight - 50;
+    log.scrollTop = nearBottomScrollTop;
+    fireEvent.scroll(log);
+    rowHeights.set("79", 1200);
+    act(() => {
+      for (const observer of resizeObservers) {
+        if (!latestRow || !observer.targets.has(latestRow)) continue;
+        observer.callback(
+          [{ target: latestRow } as ResizeObserverEntry],
+          observer as unknown as ResizeObserver,
+        );
+      }
+    });
+
+    expect(log.scrollTop).toBe(nearBottomScrollTop + 264);
+
     log.scrollTop = 4000;
     fireEvent.scroll(log);
+    const scrolledTop = log.scrollTop;
     const scrolledRow = log.querySelector<HTMLElement>(".chronicle-virtual-row");
     const scrolledRowIndex = scrolledRow?.getAttribute("data-index");
     expect(scrolledRowIndex).not.toBeNull();
-    const virtualizerAdjustedScrollTop = log.scrollHeight - log.clientHeight - 50;
-    log.scrollTop = virtualizerAdjustedScrollTop;
     rowHeights.set(scrolledRowIndex ?? "", 936);
     act(() => {
       for (const observer of resizeObservers) {
@@ -22004,7 +22135,7 @@ describe("frontend helpers", () => {
       }
     });
 
-    expect(log.scrollTop).toBe(virtualizerAdjustedScrollTop);
+    expect(log.scrollTop).toBe(scrolledTop + 780);
   });
 
   it("suppresses chronicle live announcements while loading earlier history", async () => {
@@ -22055,54 +22186,94 @@ describe("frontend helpers", () => {
   });
 
   it("keeps chronicle scroll position stable when older messages are prepended", async () => {
-    const { Chronicle } = await import("./main");
-    let scrollHeightValue = 900;
+    const { Chronicle, runtimeQueryKey, workbenchQueryClient } = await import("./main");
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get: function (this: HTMLElement) {
+        return this.classList.contains("chronicle-scroll") ? 360 : 0;
+      }
+    });
     Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
       configurable: true,
-      get: () => scrollHeightValue
+      get: function (this: HTMLElement) {
+        if (!this.classList.contains("chronicle-scroll")) return 0;
+        const virtualList = this.querySelector<HTMLElement>(".chronicle-virtual-list");
+        return Number.parseFloat(virtualList?.style.height ?? "0");
+      }
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollTo", {
+      configurable: true,
+      value: function (this: HTMLElement, options: ScrollToOptions) {
+        if (typeof options.top === "number") this.scrollTop = options.top;
+      }
     });
     const page = deferred<{ ok: boolean; json: () => Promise<{ messages: RuntimeModel["chronicle"]["messages"]; has_more_before: boolean; oldest_message_id: string }> }>();
     const fetchMock = vi.fn().mockImplementation((path: string) => (
-      path.startsWith("/api/saves/save-1/chronicle")
+      path.startsWith("/api/saves/prepend-save/chronicle")
         ? page.promise
         : Promise.resolve({ ok: true, json: async () => ({}) })
     ));
     vi.stubGlobal("fetch", fetchMock);
+    const initial = runtimeModel({
+      active_save_id: "prepend-save",
+      chronicle: {
+        has_more_before: true,
+        oldest_message_id: "m3",
+        messages: Array.from({ length: 20 }, (_, index) => ({
+          message_id: `m${index + 3}`,
+          role: index % 2 ? "narrator" : "player",
+          speaker_name: index % 2 ? null : "Keeper",
+          body: `Message ${index + 3}`,
+          actions: []
+        }))
+      }
+    });
+    const queryKey = runtimeQueryKey("prepend-save");
+    workbenchQueryClient.setQueryData(queryKey, initial);
+    function ChronicleHarness() {
+      const runtime = useQuery({
+        queryKey,
+        queryFn: async () => initial,
+        initialData: initial,
+        staleTime: Infinity
+      });
+      return (
+        <Chronicle
+          model={runtime.data}
+          runJob={vi.fn()}
+          pendingMessage={null}
+        />
+      );
+    }
 
     render(
-      <Chronicle
-        model={runtimeModel({
-          chronicle: {
-            has_more_before: true,
-            oldest_message_id: "m2",
-            messages: [
-              { message_id: "m2", role: "player", speaker_name: "Keeper", body: "Current top", actions: [] },
-              { message_id: "m3", role: "narrator", speaker_name: null, body: "Latest", actions: [] }
-            ]
-          }
-        })}
-        runJob={vi.fn()}
-        pendingMessage={null}
-      />
+      <QueryClientProvider client={workbenchQueryClient}>
+        <ChronicleHarness />
+      </QueryClientProvider>
     );
 
     const log = screen.getByRole("log", { name: "Chronicle" });
-    log.scrollTop = 240;
+    await waitFor(() => expect(screen.getByText("Message 22")).toBeInTheDocument());
+    log.scrollTop = 1000;
     fireEvent.scroll(log);
+    const previousScrollTop = log.scrollTop;
     await userEvent.click(screen.getByRole("button", { name: /Load earlier/i }));
-    scrollHeightValue = 1120;
     page.resolve({
       ok: true,
       json: async () => ({
         messages: [
-          { message_id: "m1", role: "narrator", speaker_name: null, body: "Older", actions: [] }
+          { message_id: "m1", role: "narrator", speaker_name: null, body: "Earlier one", actions: [] },
+          { message_id: "m2", role: "player", speaker_name: "Keeper", body: "Earlier two", actions: [] }
         ],
         has_more_before: false,
         oldest_message_id: "m1"
       })
     });
 
-    await waitFor(() => expect(log.scrollTop).toBe(460));
+    await waitFor(() => expect(
+      workbenchQueryClient.getQueryData<RuntimeModel>(queryKey)?.chronicle.messages[0]?.message_id,
+    ).toBe("m1"));
+    await waitFor(() => expect(log.scrollTop).toBe(previousScrollTop + (2 * (156 + 16))));
   });
 
   it("starts the chronicle at the latest message", async () => {

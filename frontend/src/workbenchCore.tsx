@@ -2682,7 +2682,7 @@ function activeJobsPath(activeSaveId: string | null) {
 }
 
 function apiRead<T>(path: string, signal?: AbortSignal): Promise<T> {
-  return api<T>(path, { signal });
+  return api<T>(path, { cache: "no-store", signal });
 }
 
 const SETTINGS_BACKGROUND_STALE_MS = 60_000;
@@ -3016,6 +3016,7 @@ function Workbench({
       }
     },
     placeholderData: keepPreviousData,
+    staleTime: RUNTIME_FRESH_SUPPRESS_MS,
     retry: (failureCount, failure) => (
       !(failure instanceof ApiError && failure.status < 500) && failureCount < 3
     )
@@ -3515,6 +3516,7 @@ function Workbench({
     setSaveSelectionError("");
     try {
       const nextModel = await postJson<RuntimeModel>(`/api/saves/${saveId}/load`, {});
+      await client.cancelQueries({ queryKey: runtimeQueryKey(saveId), exact: true });
       applyRuntimeModel(nextModel, saveId);
       return true;
     } catch (failure) {
@@ -3523,7 +3525,7 @@ function Workbench({
     } finally {
       setPendingSaveId((current) => (current === saveId ? null : current));
     }
-  }, [applyRuntimeModel]);
+  }, [applyRuntimeModel, client]);
 
   const setLayoutWidth = useCallback((side: ResizeSide, width: number) => {
     setLayout((current) => constrainWorkbenchLayout({
@@ -6050,6 +6052,8 @@ function Chronicle({
     observeElementOffset: (_instance, callback) => observeVirtualElementOffset(scrollRef.current, callback),
     observeElementRect: (_instance, callback) => observeVirtualElementRect(scrollRef.current, callback),
     overscan: CHRONICLE_ROW_OVERSCAN,
+    anchorTo: "end",
+    scrollEndThreshold: 96,
     useFlushSync: false,
     measureElement: (element) => {
       const height = element.getBoundingClientRect().height;
@@ -6101,7 +6105,7 @@ function Chronicle({
     scrollMetricsRef.current = { activeSaveId, nearBottom: false };
     setHasNewContentBelow(true);
     return undefined;
-  }, [activeSaveId, chronicleIsNearBottom, chronicleTotalSize, messageWindowSignal, scrollToChronicleBottom]);
+  }, [activeSaveId, messageWindowSignal, scrollToChronicleBottom]);
   const onChronicleScroll = () => {
     const node = scrollRef.current;
     if (!node) return;
@@ -6116,8 +6120,6 @@ function Chronicle({
   const loadOlderChronicle = useCallback(async () => {
     if (!activeSaveId || !oldestMessageId || olderChronicleLoading) return;
     cancelPendingChronicleAnchor();
-    const node = scrollRef.current;
-    const previousScrollHeight = node?.scrollHeight ?? 0;
     setOlderChronicleLoading(true);
     setOlderChronicleError("");
     try {
@@ -6126,15 +6128,6 @@ function Chronicle({
         runtimeQueryKey(activeSaveId),
         (current) => mergeChroniclePage(current, page),
       );
-      window.requestAnimationFrame(() => {
-        if (!node) return;
-        const nextScrollHeight = node.scrollHeight;
-        setScrollTopAndNotify(node, node.scrollTop + nextScrollHeight - previousScrollHeight);
-        scrollMetricsRef.current = {
-          activeSaveId,
-          nearBottom: false
-        };
-      });
     } catch (failure) {
       setOlderChronicleError(
         failure instanceof Error ? failure.message : "Could not load earlier chronicle",
