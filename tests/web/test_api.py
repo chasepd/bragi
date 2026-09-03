@@ -62,6 +62,10 @@ from bragi.services.turn_responsiveness import (
     TURN_RESPONSIVENESS_MODE_SETTING,
 )
 from bragi.services.world_data_service import ScenarioEdit
+from bragi_common.story_continuation import (
+    STORY_CONTINUATION_DIRECTION,
+    STORY_CONTINUATION_SPEAKER_NAME,
+)
 from bragi_web.api.app import create_app
 from bragi_web.auth_throttle import AuthAttemptThrottle
 from bragi_web.jobs import (
@@ -1034,6 +1038,7 @@ def test_user_cannot_access_another_users_save_by_direct_id(
         visible = client.get("/api/saves")
         own_runtime = client.get(f"/api/runtime?save_id={mira_save.id}")
         other_runtime = client.get(f"/api/runtime?save_id={rook_save.id}")
+        other_head = client.get(f"/api/saves/{rook_save.id}/chronicle/head")
         other_settings = client.get(f"/api/settings?save_id={rook_save.id}")
         other_load = client.post(f"/api/saves/{rook_save.id}/load")
 
@@ -1049,6 +1054,7 @@ def test_user_cannot_access_another_users_save_by_direct_id(
     assert own_runtime.status_code == 200
     assert own_runtime.json()["active_save_id"] == mira_save.id
     assert other_runtime.status_code == 404
+    assert other_head.status_code == 404
     assert other_settings.status_code == 404
     assert other_load.status_code == 404
 
@@ -4869,6 +4875,47 @@ def test_runtime_shell_omits_media_and_bounds_chronicle(
     assert chronicle_messages[-1]["revision_count"] == 1
     assert payload["chronicle"]["has_more_before"] is True
     assert payload["chronicle"]["oldest_message_id"] == messages[10].id
+
+
+def test_save_chronicle_head_reports_latest_visible_message(tmp_path: Path) -> None:
+    state = _repository_state_double(tmp_path)
+    save = _create_auth_save(
+        state.repositories,
+        title="Lantern Keep",
+        owner_user_id=None,
+    )
+    latest = state.repositories.append_message(
+        save_id=save.id,
+        role="narrator",
+        speaker_name="Narrator",
+        body="The beacon steadies.",
+        content_rating="g",
+    )
+    state.repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name=STORY_CONTINUATION_SPEAKER_NAME,
+        body=STORY_CONTINUATION_DIRECTION,
+        content_rating="g",
+    )
+    archived = state.repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name="Keeper",
+        body="A discarded path.",
+        content_rating="g",
+    )
+    state.repositories.archive_message(archived.id)
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.get(f"/api/saves/{save.id}/chronicle/head")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "save_id": save.id,
+        "latest_message_id": latest.id,
+    }
 
 
 def test_save_media_endpoint_is_save_scoped(
