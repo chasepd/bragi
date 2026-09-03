@@ -1334,6 +1334,7 @@ def test_load_save_api_refreshes_last_opened_timestamp(tmp_path: Path) -> None:
         loaded = client.post(f"/api/saves/{save.id}/load")
 
     assert loaded.status_code == 200
+    assert loaded.headers["cache-control"] == "no-store"
     persisted = state.repositories.get_save(save.id)
     assert persisted is not None
     assert persisted.updated_at == "2026-05-03 00:00:00"
@@ -4856,6 +4857,7 @@ def test_runtime_shell_omits_media_and_bounds_chronicle(
         response = client.get(f"/api/runtime/shell?save_id={save.id}")
 
     assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
     payload = response.json()
     chronicle_messages = payload["chronicle"]["messages"]
     assert payload["active_save_id"] == save.id
