@@ -1353,6 +1353,22 @@ def create_app(state: WebAppState | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
             return _chronicle_json_dict(state, model)
 
+    @app.get("/api/saves/{save_id}/chronicle/head")
+    def save_chronicle_head(
+        save_id: str,
+        response: Response,
+        state: StateDep,
+    ) -> dict[str, str | None]:
+        response.headers["Cache-Control"] = _RUNTIME_CACHE_CONTROL
+        with state.lock:
+            _raise_unless_save_action_allowed(state, save_id, "read")
+            return {
+                "save_id": save_id,
+                "latest_message_id": state.repositories.latest_chronicle_message_id(
+                    save_id
+                ),
+            }
+
     @app.get("/api/saves/{save_id}/engine-health")
     def save_engine_health(save_id: str, state: StateDep) -> dict[str, Any]:
         with state.lock:

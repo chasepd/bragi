@@ -74,6 +74,7 @@ import {
   ChatHistoryMessage,
   ChatHistoryModel,
   ChatBundleExportResult,
+  ChronicleHead,
   ChronicleModel,
   ChronicleMessage,
   deleteJson,
@@ -205,6 +206,7 @@ type QueuedWorkbenchRefresh = {
 };
 const WORKBENCH_REFRESH_DEBOUNCE_MS = 50;
 const RUNTIME_FRESH_SUPPRESS_MS = 5000;
+const CHRONICLE_HEAD_WATCHDOG_MS = 10_000;
 const ALL_WORKBENCH_REFRESH_TARGETS: readonly WorkbenchRefreshTarget[] = [
   "runtime",
   "scenarios",
@@ -2602,6 +2604,10 @@ function runtimeQueryKey(saveId: string | null) {
   return ["runtime", saveId] as const;
 }
 
+function chronicleHeadPath(saveId: string) {
+  return `/api/saves/${encodeURIComponent(saveId)}/chronicle/head`;
+}
+
 function chroniclePagePath(saveId: string, beforeMessageId: string, limit?: number) {
   const params = new URLSearchParams({ before_message_id: beforeMessageId });
   if (limit !== undefined) params.set("limit", String(limit));
@@ -4181,7 +4187,7 @@ function Workbench({
           runJob={runJob}
           pendingMessages={activePendingMessages}
           narratorPaintMeasurement={narratorPaintMeasurement}
-          onRuntimeChanged={applyRuntimeModel}
+          onChronicleStale={runtime.refetch}
           currentUser={currentUser}
           mutationsDisabled={!activeSaveSupported}
           sceneArrivalMessageIds={sceneArrivalMessageIds}
@@ -5918,13 +5924,14 @@ function Chronicle({
   mutationsDisabled = false,
   sceneArrivalMessageIds = new Set<string>(),
   onCancelNarrator,
+  onChronicleStale,
 }: {
   model?: RuntimeModel;
   runJob: RunJob;
   pendingMessage?: PendingChronicleMessage | null;
   pendingMessages?: PendingChronicleMessage[];
   narratorPaintMeasurement?: NarratorPaintMeasurement | null;
-  onRuntimeChanged?: (model: RuntimeModel) => void;
+  onChronicleStale?: () => unknown;
   currentUser?: CurrentUser | null;
   mutationsDisabled?: boolean;
   sceneArrivalMessageIds?: ReadonlySet<string>;
@@ -5984,12 +5991,19 @@ function Chronicle({
   const reportedPaintMeasurementsRef = useRef(new Set<string>());
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const scrollMetricsRef = useRef<{ activeSaveId: string | null; nearBottom: boolean } | null>(null);
+  const followsLatestRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
+  const readerScrollIntentRef = useRef<{ direction: "away" | "toward"; at: number } | null>(null);
+  const pointerScrollIntentRef = useRef(false);
+  const touchClientYRef = useRef<number | null>(null);
   const chronicleAnchorFrameRef = useRef<number | null>(null);
   const [hasNewContentBelow, setHasNewContentBelow] = useState(false);
   const [olderChronicleLoading, setOlderChronicleLoading] = useState(false);
   const [olderChronicleError, setOlderChronicleError] = useState("");
   const firstMessage = messages[0] ?? null;
   const latestMessage = messages[messages.length - 1] ?? null;
+  const persistedMessages = model?.chronicle?.messages ?? [];
+  const persistedLatestMessageId = persistedMessages[persistedMessages.length - 1]?.message_id ?? null;
   const messageWindowSignal = [
     activeSaveId ?? "",
     messages.length,
@@ -6079,16 +6093,67 @@ function Chronicle({
     const scrollHeight = Math.max(node.scrollHeight, chronicleVirtualizer.getTotalSize());
     bottomRef.current?.scrollIntoView?.({ block: "end" });
     setScrollTopAndNotify(node, scrollHeight);
+    followsLatestRef.current = true;
+    lastScrollTopRef.current = scrollHeight;
     scrollMetricsRef.current = { activeSaveId, nearBottom: true };
     setHasNewContentBelow(false);
   }, [activeSaveId, chronicleVirtualizer, messages.length]);
+  useEffect(() => {
+    if (!activeSaveId) return undefined;
+    const controller = new AbortController();
+    let timer = window.setTimeout(async function checkChronicleHead() {
+      try {
+        const head = await apiRead<ChronicleHead>(chronicleHeadPath(activeSaveId), controller.signal);
+        if (head.latest_message_id !== persistedLatestMessageId) {
+          logClientEvent("info", "client.chronicle.watchdog_data_stale", {
+            save_id: activeSaveId,
+            client_message_id: persistedLatestMessageId,
+            server_message_id: head.latest_message_id,
+          });
+          await onChronicleStale?.();
+        } else if (head.latest_message_id) {
+          const node = scrollRef.current;
+          const latestRow = node?.querySelector(
+            `[data-message-id="${CSS.escape(head.latest_message_id)}"]`,
+          );
+          const totalHeight = Math.max(node?.scrollHeight ?? 0, chronicleVirtualizer.getTotalSize());
+          const latestRowOffset = node && latestRow
+            ? latestRow.getBoundingClientRect().bottom - node.getBoundingClientRect().bottom
+            : 0;
+          const latestRowDisplaced = latestRowOffset > 96
+            || (latestRowOffset < -96 && totalHeight > (node?.clientHeight ?? 0));
+          if (node && followsLatestRef.current && (
+            !latestRow
+            || latestRowDisplaced
+            || !chronicleIsNearBottom(node, totalHeight)
+          )) {
+            logClientEvent("info", "client.chronicle.watchdog_view_stale", {
+              save_id: activeSaveId,
+              latest_message_id: head.latest_message_id,
+            });
+            chronicleVirtualizer.measure();
+            scrollToChronicleBottom();
+          }
+        }
+      } catch {
+        // The next watchdog pass retries transient head-check failures.
+      }
+      if (!controller.signal.aborted) {
+        timer = window.setTimeout(checkChronicleHead, CHRONICLE_HEAD_WATCHDOG_MS);
+      }
+    }, CHRONICLE_HEAD_WATCHDOG_MS);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [activeSaveId, chronicleIsNearBottom, chronicleVirtualizer, onChronicleStale, persistedLatestMessageId, scrollToChronicleBottom]);
   useLayoutEffect(() => {
     const node = scrollRef.current;
     if (!node) return;
     const previousMetrics = scrollMetricsRef.current;
     const activeSaveChanged = previousMetrics?.activeSaveId !== activeSaveId;
     const wasNearBottom = previousMetrics?.nearBottom ?? true;
-    if (activeSaveChanged || wasNearBottom) {
+    if (activeSaveChanged || (wasNearBottom && followsLatestRef.current)) {
       scrollToChronicleBottom();
       const frame = window.requestAnimationFrame(() => {
         chronicleAnchorFrameRef.current = null;
@@ -6110,15 +6175,35 @@ function Chronicle({
     const node = scrollRef.current;
     if (!node) return;
     const nearBottom = chronicleIsNearBottom(node);
+    const movingTowardLatest = node.scrollTop > lastScrollTopRef.current;
+    const movingAwayFromLatest = node.scrollTop < lastScrollTopRef.current;
+    const readerIntent = readerScrollIntentRef.current;
+    const recentTowardIntent = readerIntent?.direction === "toward"
+      && performance.now() - readerIntent.at <= 500;
+    if (pointerScrollIntentRef.current && movingAwayFromLatest) {
+      stopFollowingLatest();
+    } else if (nearBottom && movingTowardLatest && (pointerScrollIntentRef.current || recentTowardIntent)) {
+      followsLatestRef.current = true;
+    }
     if (nearBottom) {
       setHasNewContentBelow(false);
     } else {
       cancelPendingChronicleAnchor();
     }
+    lastScrollTopRef.current = node.scrollTop;
     scrollMetricsRef.current = { activeSaveId, nearBottom };
+  };
+  const stopFollowingLatest = () => {
+    followsLatestRef.current = false;
+    cancelPendingChronicleAnchor();
+  };
+  const noteReaderScrollIntent = (direction: "away" | "toward") => {
+    readerScrollIntentRef.current = { direction, at: performance.now() };
+    if (direction === "away") stopFollowingLatest();
   };
   const loadOlderChronicle = useCallback(async () => {
     if (!activeSaveId || !oldestMessageId || olderChronicleLoading) return;
+    followsLatestRef.current = false;
     cancelPendingChronicleAnchor();
     setOlderChronicleLoading(true);
     setOlderChronicleError("");
@@ -6162,11 +6247,45 @@ function Chronicle({
         className="chronicle-scroll"
         ref={scrollRef}
         role="log"
+        tabIndex={0}
         aria-label="Chronicle"
         aria-live={olderChronicleLoading ? "off" : "polite"}
         aria-relevant="additions text"
         aria-atomic="false"
         onScroll={onChronicleScroll}
+        onWheel={(event) => {
+          if (!event.currentTarget.contains(event.target as Node)) return;
+          noteReaderScrollIntent(event.deltaY < 0 ? "away" : "toward");
+        }}
+        onTouchStart={(event) => {
+          if (!event.currentTarget.contains(event.target as Node)) return;
+          touchClientYRef.current = event.touches[0]?.clientY ?? null;
+        }}
+        onTouchMove={(event) => {
+          if (!event.currentTarget.contains(event.target as Node)) return;
+          const clientY = event.touches[0]?.clientY;
+          const previousClientY = touchClientYRef.current;
+          if (clientY === undefined || previousClientY === null || clientY === previousClientY) return;
+          noteReaderScrollIntent(clientY < previousClientY ? "toward" : "away");
+          touchClientYRef.current = clientY;
+        }}
+        onTouchEnd={() => { touchClientYRef.current = null; }}
+        onTouchCancel={() => { touchClientYRef.current = null; }}
+        onPointerDown={(event) => {
+          if (event.target !== event.currentTarget) return;
+          pointerScrollIntentRef.current = true;
+          lastScrollTopRef.current = event.currentTarget.scrollTop;
+          stopFollowingLatest();
+        }}
+        onPointerUp={() => { pointerScrollIntentRef.current = false; }}
+        onPointerCancel={() => { pointerScrollIntentRef.current = false; }}
+        onPointerLeave={() => { pointerScrollIntentRef.current = false; }}
+        onKeyDown={(event) => {
+          if (!event.currentTarget.contains(event.target as Node)) return;
+          if (event.key === " ") noteReaderScrollIntent(event.shiftKey ? "away" : "toward");
+          if (["ArrowUp", "PageUp", "Home"].includes(event.key)) noteReaderScrollIntent("away");
+          if (["ArrowDown", "PageDown", "End"].includes(event.key)) noteReaderScrollIntent("toward");
+        }}
       >
       {model?.chronicle?.has_more_before ? (
         <button

@@ -265,6 +265,10 @@ export type ChronicleModel = {
   has_more_before?: boolean;
   oldest_message_id?: string | null;
 };
+export type ChronicleHead = {
+  save_id: string;
+  latest_message_id: string | null;
+};
 export type NarratorDraft = {
   kind: "narrator_draft";
   version: 1;

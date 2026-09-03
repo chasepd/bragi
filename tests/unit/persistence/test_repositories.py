@@ -687,6 +687,12 @@ def test_repositories_pages_chronicle_without_internal_story_continuations(
         speaker_name="Narrator",
         body="The rival steps into the aisle.",
     )
+    repositories.append_message(
+        save_id=save.id,
+        role="player",
+        speaker_name=STORY_CONTINUATION_SPEAKER_NAME,
+        body=STORY_CONTINUATION_DIRECTION,
+    )
 
     latest = repositories.list_message_page(
         save.id,
@@ -704,6 +710,7 @@ def test_repositories_pages_chronicle_without_internal_story_continuations(
     assert latest.has_more_before is True
     assert [message.id for message in previous.messages] == [first_narrator.id]
     assert previous.has_more_before is False
+    assert repositories.latest_chronicle_message_id(save.id) == second_narrator.id
 
 
 def test_chronicle_filters_keep_unnamed_player_with_continuation_text(

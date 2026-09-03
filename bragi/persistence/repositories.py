@@ -3118,6 +3118,25 @@ class PersistenceRepositories:
         )
         return str(row["id"]) if row is not None else None
 
+    def latest_chronicle_message_id(self, save_id: str) -> str | None:
+        row = self._fetch_one(
+            """
+            SELECT id
+            FROM messages
+            WHERE save_id = ?
+              AND deleted_at IS NULL
+              AND NOT (role = 'player' AND speaker_name IS ? AND body = ?)
+            ORDER BY rowid DESC
+            LIMIT 1
+            """,
+            (
+                save_id,
+                STORY_CONTINUATION_SPEAKER_NAME,
+                STORY_CONTINUATION_DIRECTION,
+            ),
+        )
+        return str(row["id"]) if row is not None else None
+
     def find_active_message_after_rowid(
         self,
         save_id: str,

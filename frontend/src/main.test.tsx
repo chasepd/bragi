@@ -3074,7 +3074,6 @@ describe("frontend helpers", () => {
       json: async () => job
     });
     vi.stubGlobal("fetch", fetchMock);
-    const onRuntimeChanged = vi.fn();
     const runJob = vi.fn();
     const { Chronicle } = await import("./main");
     const model = runtimeModel({
@@ -3102,7 +3101,6 @@ describe("frontend helpers", () => {
         model={model}
         runJob={runJob}
         pendingMessage={null}
-        onRuntimeChanged={onRuntimeChanged}
       />
     );
 
@@ -3123,7 +3121,6 @@ describe("frontend helpers", () => {
       save_id: "save-1"
     });
     expect(runJob).toHaveBeenCalledWith(job);
-    expect(onRuntimeChanged).not.toHaveBeenCalled();
   });
 
   it("confirms fork-from-here actions before starting the fork job", async () => {
@@ -3133,7 +3130,6 @@ describe("frontend helpers", () => {
       json: async () => job
     });
     vi.stubGlobal("fetch", fetchMock);
-    const onRuntimeChanged = vi.fn();
     const runJob = vi.fn();
     const { Chronicle } = await import("./main");
     const model = runtimeModel({
@@ -3161,7 +3157,6 @@ describe("frontend helpers", () => {
         model={model}
         runJob={runJob}
         pendingMessage={null}
-        onRuntimeChanged={onRuntimeChanged}
       />
     );
 
@@ -3182,7 +3177,6 @@ describe("frontend helpers", () => {
       save_id: "save-1"
     });
     expect(runJob).toHaveBeenCalledWith(job, expect.objectContaining({ onFailed: expect.any(Function) }));
-    expect(onRuntimeChanged).not.toHaveBeenCalled();
   });
 
   it("shows failed fork jobs beside the originating message", async () => {
@@ -3192,7 +3186,6 @@ describe("frontend helpers", () => {
       json: async () => job
     });
     vi.stubGlobal("fetch", fetchMock);
-    const onRuntimeChanged = vi.fn();
     const runJob = vi.fn();
     const { Chronicle } = await import("./main");
     const model = runtimeModel({
@@ -3220,7 +3213,6 @@ describe("frontend helpers", () => {
         model={model}
         runJob={runJob}
         pendingMessage={null}
-        onRuntimeChanged={onRuntimeChanged}
       />
     );
 
@@ -3231,7 +3223,6 @@ describe("frontend helpers", () => {
     act(() => options.onFailed("Background job failed. Check diagnostics for details.", { ...job, status: "failed" }));
 
     expect(screen.getByRole("alert")).toHaveTextContent("Background job failed. Check diagnostics for details.");
-    expect(onRuntimeChanged).not.toHaveBeenCalled();
 
     await userEvent.click(screen.getByTitle("Fork from here"));
     await userEvent.click(within(screen.getByRole("dialog", { name: "Fork from here?" })).getByRole("button", { name: "Fork from here" }));
@@ -3246,7 +3237,6 @@ describe("frontend helpers", () => {
         model={runtimeModel({ ...model, active_save_id: "save-2" })}
         runJob={runJob}
         pendingMessage={null}
-        onRuntimeChanged={onRuntimeChanged}
       />
     );
     await waitFor(() => expect(screen.queryByText("Background job failed. Check diagnostics for details.")).not.toBeInTheDocument());
@@ -22136,6 +22126,474 @@ describe("frontend helpers", () => {
     });
 
     expect(log.scrollTop).toBe(scrolledTop + 780);
+  });
+
+  it("checks the chronicle head every ten seconds and refreshes stale data", async () => {
+    vi.useFakeTimers();
+    const onChronicleStale = vi.fn().mockResolvedValue(undefined);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ save_id: "save-1", latest_message_id: "m2" })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Chronicle } = await import("./main");
+
+    render(
+      <Chronicle
+        model={runtimeModel({
+          chronicle: {
+            messages: [
+              { message_id: "m1", role: "narrator", speaker_name: null, body: "Older", actions: [] }
+            ]
+          }
+        })}
+        runJob={vi.fn()}
+        pendingMessage={null}
+        onChronicleStale={onChronicleStale}
+      />
+    );
+
+    await act(async () => vi.advanceTimersByTimeAsync(9_999));
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/saves/save-1/chronicle/head",
+      expect.objectContaining({ cache: "no-store" }),
+    );
+    expect(onChronicleStale).toHaveBeenCalledTimes(1);
+  });
+
+  it("repairs a missing latest row without overriding intentional scrolling", async () => {
+    vi.useFakeTimers();
+    const { flushFrame } = installAnimationFrameQueue();
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      value: 300
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      value: 1200
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ save_id: "save-1", latest_message_id: "m2" })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { Chronicle } = await import("./main");
+
+    render(
+      <Chronicle
+        model={runtimeModel({
+          chronicle: {
+            messages: [
+              { message_id: "m1", role: "player", speaker_name: "Keeper", body: "First", actions: [] },
+              { message_id: "m2", role: "narrator", speaker_name: null, body: "Latest", actions: [] }
+            ]
+          }
+        })}
+        runJob={vi.fn()}
+        pendingMessage={null}
+      />
+    );
+    flushFrame();
+    const log = screen.getByRole("log", { name: "Chronicle" });
+    log.scrollTop = 400;
+    fireEvent.scroll(log);
+    const nativeQuerySelector = log.querySelector.bind(log);
+    vi.spyOn(log, "querySelector").mockImplementation((selectors: string) => (
+      selectors.startsWith("[data-message-id=") ? null : nativeQuerySelector(selectors)
+    ));
+
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+
+    expect(log.scrollTop).toBe(1200);
+
+    log.scrollTop = 400;
+    fireEvent.wheel(log, { deltaY: -100 });
+    fireEvent.scroll(log);
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+
+    expect(log.scrollTop).toBe(400);
+
+    log.scrollTop = 900;
+    fireEvent.scroll(log);
+    log.scrollTop = 400;
+    log.focus();
+    expect(log).toHaveFocus();
+    fireEvent.keyDown(document.activeElement as Element, { key: "PageUp" });
+    fireEvent.scroll(log);
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+
+    expect(log.scrollTop).toBe(400);
+  });
+
+  it("preserves an upward reversal during a scrollbar drag", async () => {
+    vi.useFakeTimers();
+    const { flushFrame } = installAnimationFrameQueue();
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      value: 300
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      value: 1200
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ save_id: "save-1", latest_message_id: "m2" })
+    }));
+    const { Chronicle } = await import("./main");
+    const model = runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "m1", role: "player", speaker_name: "Keeper", body: "First", actions: [] },
+          { message_id: "m2", role: "narrator", speaker_name: null, body: "Latest", actions: [] }
+        ]
+      }
+    });
+
+    const { rerender } = render(
+      <Chronicle
+        model={model}
+        runJob={vi.fn()}
+        pendingMessage={null}
+      />
+    );
+    flushFrame();
+    const log = screen.getByRole("log", { name: "Chronicle" });
+    log.scrollTop = 700;
+    fireEvent.pointerDown(log);
+    log.scrollTop = 850;
+    fireEvent.scroll(log);
+    log.scrollTop = 820;
+    fireEvent.scroll(log);
+    fireEvent.pointerUp(log);
+    rerender(
+      <Chronicle
+        model={runtimeModel({
+          ...model,
+          chronicle: {
+            ...model.chronicle,
+            messages: model.chronicle.messages.map((message) => (
+              message.message_id === "m2" ? { ...message, body: "Latest revised" } : message
+            ))
+          }
+        })}
+        runJob={vi.fn()}
+        pendingMessage={null}
+      />
+    );
+
+    expect(log.scrollTop).toBe(820);
+
+    log.scrollTop = 400;
+    fireEvent.scroll(log);
+
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+
+    expect(log.scrollTop).toBe(400);
+  });
+
+  it("preserves explicit navigation away within the near-bottom threshold on updates", async () => {
+    const { flushFrame } = installAnimationFrameQueue();
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      value: 300
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      value: 1200
+    });
+    const { Chronicle } = await import("./main");
+    const firstModel = runtimeModel({
+      chronicle: {
+        messages: [
+          { message_id: "m1", role: "player", speaker_name: "Keeper", body: "First", actions: [] }
+        ]
+      }
+    });
+    const secondModel = runtimeModel({
+      chronicle: {
+        messages: [
+          ...firstModel.chronicle.messages,
+          { message_id: "m2", role: "narrator", speaker_name: null, body: "Latest", actions: [] }
+        ]
+      }
+    });
+    const { rerender } = render(<Chronicle model={firstModel} runJob={vi.fn()} pendingMessage={null} />);
+    flushFrame();
+    const log = screen.getByRole("log", { name: "Chronicle" });
+    log.scrollTop = 850;
+    log.focus();
+    fireEvent.keyDown(log, { key: " ", shiftKey: true });
+    fireEvent.scroll(log);
+
+    rerender(<Chronicle model={secondModel} runJob={vi.fn()} pendingMessage={null} />);
+
+    expect(log.scrollTop).toBe(850);
+
+    fireEvent.keyDown(log, { key: " " });
+    log.scrollTop = 900;
+    fireEvent.scroll(log);
+    rerender(
+      <Chronicle
+        model={runtimeModel({
+          ...secondModel,
+          chronicle: {
+            ...secondModel.chronicle,
+            messages: secondModel.chronicle.messages.map((message) => (
+              message.message_id === "m2" ? { ...message, body: "Latest revised" } : message
+            ))
+          }
+        })}
+        runJob={vi.fn()}
+        pendingMessage={null}
+      />
+    );
+
+    expect(log.scrollTop).toBe(1200);
+  });
+
+  it("resumes latest following when touch navigation returns to the bottom", async () => {
+    vi.useFakeTimers();
+    const { flushFrame } = installAnimationFrameQueue();
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      value: 300
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      value: 1200
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ save_id: "save-1", latest_message_id: "m2" })
+    }));
+    const { Chronicle } = await import("./main");
+
+    render(
+      <Chronicle
+        model={runtimeModel({
+          chronicle: {
+            messages: [
+              { message_id: "m1", role: "player", speaker_name: "Keeper", body: "First", actions: [] },
+              { message_id: "m2", role: "narrator", speaker_name: null, body: "Latest", actions: [] }
+            ]
+          }
+        })}
+        runJob={vi.fn()}
+        pendingMessage={null}
+      />
+    );
+    flushFrame();
+    const log = screen.getByRole("log", { name: "Chronicle" });
+    fireEvent.touchStart(log, { touches: [{ clientY: 100 }] });
+    fireEvent.touchMove(log, { touches: [{ clientY: 200 }] });
+    log.scrollTop = 400;
+    fireEvent.scroll(log);
+    fireEvent.touchStart(log, { touches: [{ clientY: 200 }] });
+    fireEvent.touchMove(log, { touches: [{ clientY: 100 }] });
+    log.scrollTop = 900;
+    fireEvent.scroll(log);
+    fireEvent.touchEnd(log);
+    log.scrollTop = 400;
+    fireEvent.scroll(log);
+    const nativeQuerySelector = log.querySelector.bind(log);
+    vi.spyOn(log, "querySelector").mockImplementation((selectors: string) => (
+      selectors.startsWith("[data-message-id=") ? null : nativeQuerySelector(selectors)
+    ));
+
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+
+    expect(log.scrollTop).toBe(1200);
+  });
+
+  it("repairs a present latest row whose geometry is displaced", async () => {
+    vi.useFakeTimers();
+    const { flushFrame } = installAnimationFrameQueue();
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      value: 300
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      value: 1200
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ save_id: "save-1", latest_message_id: "m2" })
+    }));
+    const { Chronicle } = await import("./main");
+
+    render(
+      <Chronicle
+        model={runtimeModel({
+          chronicle: {
+            messages: [
+              { message_id: "m1", role: "player", speaker_name: "Keeper", body: "First", actions: [] },
+              { message_id: "m2", role: "narrator", speaker_name: null, body: "Latest", actions: [] }
+            ]
+          }
+        })}
+        runJob={vi.fn()}
+        pendingMessage={null}
+      />
+    );
+    flushFrame();
+    const log = screen.getByRole("log", { name: "Chronicle" });
+    const latestRow = log.querySelector<HTMLElement>('[data-message-id="m2"]');
+    expect(latestRow).not.toBeNull();
+    vi.spyOn(log, "getBoundingClientRect").mockReturnValue({
+      top: 0,
+      right: 0,
+      bottom: 300,
+      left: 0,
+      width: 0,
+      height: 300,
+      x: 0,
+      y: 0,
+      toJSON: () => ({})
+    });
+    vi.spyOn(latestRow as HTMLElement, "getBoundingClientRect").mockReturnValue({
+      top: 500,
+      right: 0,
+      bottom: 700,
+      left: 0,
+      width: 0,
+      height: 200,
+      x: 0,
+      y: 500,
+      toJSON: () => ({})
+    });
+    log.scrollTop = 900;
+    fireEvent.scroll(log);
+
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+
+    expect(log.scrollTop).toBe(1200);
+  });
+
+  it("does not repair a naturally short chronicle", async () => {
+    vi.useFakeTimers();
+    const { flushFrame } = installAnimationFrameQueue();
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      value: 500
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      value: 500
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ save_id: "save-1", latest_message_id: "m1" })
+    }));
+    const { Chronicle } = await import("./main");
+
+    render(
+      <Chronicle
+        model={runtimeModel({
+          chronicle: {
+            messages: [
+              { message_id: "m1", role: "narrator", speaker_name: null, body: "A short opening.", actions: [] }
+            ]
+          }
+        })}
+        runJob={vi.fn()}
+        pendingMessage={null}
+      />
+    );
+    flushFrame();
+    const log = screen.getByRole("log", { name: "Chronicle" });
+    const latestRow = log.querySelector<HTMLElement>('[data-message-id="m1"]');
+    expect(latestRow).not.toBeNull();
+    vi.spyOn(log, "getBoundingClientRect").mockReturnValue({
+      top: 0,
+      right: 0,
+      bottom: 500,
+      left: 0,
+      width: 0,
+      height: 500,
+      x: 0,
+      y: 0,
+      toJSON: () => ({})
+    });
+    vi.spyOn(latestRow as HTMLElement, "getBoundingClientRect").mockReturnValue({
+      top: 0,
+      right: 0,
+      bottom: 100,
+      left: 0,
+      width: 0,
+      height: 100,
+      x: 0,
+      y: 0,
+      toJSON: () => ({})
+    });
+    log.scrollTop = 0;
+    fireEvent.scroll(log);
+
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+
+    expect(log.scrollTop).toBe(0);
+  });
+
+  it("ignores keyboard events from portaled chronicle dialogs", async () => {
+    vi.useFakeTimers();
+    const { flushFrame } = installAnimationFrameQueue();
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      value: 300
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      value: 1200
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ save_id: "save-1", latest_message_id: "m1" })
+    }));
+    const { Chronicle } = await import("./main");
+
+    render(
+      <Chronicle
+        model={runtimeModel({
+          chronicle: {
+            messages: [{
+              message_id: "m1",
+              role: "player",
+              speaker_name: "Keeper",
+              body: "First",
+              actions: [{ action_id: "edit-and-resubmit-message", label: "Edit this message" }]
+            }]
+          }
+        })}
+        runJob={vi.fn()}
+        pendingMessage={null}
+      />
+    );
+    flushFrame();
+    const log = screen.getByRole("log", { name: "Chronicle" });
+    fireEvent.click(screen.getByTitle("Edit this message"));
+    const dialog = screen.getByRole("dialog", { name: "Edit message" });
+    const editor = within(dialog).getByLabelText("Message");
+    fireEvent.keyDown(editor, { key: "ArrowUp" });
+    fireEvent.wheel(editor, { deltaY: -100 });
+    fireEvent.touchStart(editor, { touches: [{ clientY: 100 }] });
+    fireEvent.touchMove(editor, { touches: [{ clientY: 200 }] });
+    fireEvent.touchEnd(editor);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    log.scrollTop = 400;
+    fireEvent.scroll(log);
+    const nativeQuerySelector = log.querySelector.bind(log);
+    vi.spyOn(log, "querySelector").mockImplementation((selectors: string) => (
+      selectors.startsWith("[data-message-id=") ? null : nativeQuerySelector(selectors)
+    ));
+
+    await act(async () => vi.advanceTimersByTimeAsync(10_000));
+
+    expect(log.scrollTop).toBe(1200);
   });
 
   it("suppresses chronicle live announcements while loading earlier history", async () => {
