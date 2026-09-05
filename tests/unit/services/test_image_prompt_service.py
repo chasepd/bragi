@@ -463,3 +463,38 @@ def test_character_attachment_framing_follows_intent_instead_of_forcing_selfie(
     assert "When it asks for a selfie" in context
     assert "need not be a selfie" in context
     assert prompt == "Mira holds a large brass clock with both hands."
+
+
+@pytest.mark.parametrize("allowed", [True, False])
+def test_brief_preserves_captured_clothing_completion_eligibility(
+    allowed: bool,
+) -> None:
+    brief = ImagePromptBrief(subjects=(ImagePromptSubject(
+        "mira", "Mira", clothing_completion_allowed=allowed,
+    ),))
+
+    restored = ImagePromptBrief.from_json(json.loads(json.dumps(brief.to_json())))
+
+    assert restored == brief
+    assert restored.subjects[0].clothing_completion_allowed is allowed
+
+
+def test_legacy_brief_defaults_to_allowing_missing_clothing_completion() -> None:
+    restored = ImagePromptBrief.from_json({
+        "subjects": [{"character_id": "mira", "name": "Mira"}],
+    })
+
+    assert restored.subjects[0].clothing_completion_allowed is True
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_brief_rejects_nonboolean_clothing_completion_eligibility(
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="clothing_completion_allowed.*boolean"):
+        ImagePromptBrief.from_json({
+            "subjects": [{
+                "character_id": "mira", "name": "Mira",
+                "clothing_completion_allowed": value,
+            }],
+        })

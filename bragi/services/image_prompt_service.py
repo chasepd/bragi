@@ -43,6 +43,7 @@ class ImagePromptSubject:
     current_clothing: str = ""
     current_action: str = ""
     facial_expression: str = ""
+    clothing_completion_allowed: bool = True
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,9 @@ class ImagePromptBrief:
                 current_clothing=_text(item, "current_clothing"),
                 current_action=_text(item, "current_action"),
                 facial_expression=_text(item, "facial_expression"),
+                clothing_completion_allowed=_boolean(
+                    item, "clothing_completion_allowed", True,
+                ),
             )
             for item in _records(payload, "subjects")
         )
@@ -510,6 +514,13 @@ def _text(payload: Mapping[str, object], key: str, default: str = "") -> str:
     value = payload.get(key, default)
     if not isinstance(value, str):
         raise ValueError(f"Invalid image prompt brief: {key} must be text")
+    return value
+
+
+def _boolean(payload: Mapping[str, object], key: str, default: bool) -> bool:
+    value = payload.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"Invalid image prompt brief: {key} must be boolean")
     return value
 
 

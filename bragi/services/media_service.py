@@ -4590,17 +4590,20 @@ class MediaService:
     ) -> ImagePromptBrief:
         missing: list[CharacterRecord] = []
         for subject in brief.subjects:
-            if subject.current_clothing.strip():
+            if (
+                subject.current_clothing.strip()
+                or not subject.clothing_completion_allowed
+            ):
                 continue
             current = self.repositories.get_character(subject.character_id)
             if current is None or current.save_id != save_id:
                 continue
-            # Only locks/persistence identity come from live rows. The image moment
-            # and physical profile remain those captured before the job was queued.
+            # Inference eligibility and input come from the captured brief.
+            # The persistence compare-and-set still respects live clothing locks.
             missing.append(replace(
                 current, name=subject.name, appearance=subject.appearance,
                 visual_notes=subject.visual_notes, age=subject.age,
-                current_clothing="", role="",
+                current_clothing="", role="", locked_fields=[],
             ))
         completed = await self._ensure_current_clothing(
             save_id=save_id, characters=tuple(missing),
@@ -4866,6 +4869,9 @@ def _image_prompt_subject(
         appearance=character.appearance, visual_notes=character.visual_notes,
         age=character.age,
         current_clothing="" if reusable_reference else character.current_clothing,
+        clothing_completion_allowed=not character_field_is_locked(
+            character.locked_fields, "current_clothing",
+        ),
     )
 
 

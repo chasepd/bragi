@@ -669,6 +669,76 @@ def test_prepared_image_preserves_character_clothing_and_style(
     assert "LATER" not in _chat_request_context(provider.chat_requests[0])
 
 
+@pytest.mark.parametrize("locked_at_prepare", [False, True])
+def test_prepared_outfit_completion_uses_captured_lock_and_live_persistence_guard(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    locked_at_prepare: bool,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    character = repositories.add_character(
+        save_id=save.id, name="Mara", appearance="Braided brown hair.",
+        source_message_id=messages[-1].id,
+        locked_fields=["current_clothing"] if locked_at_prepare else [],
+    )
+    _mark_character_present(
+        repositories, save_id=save.id, message_id=messages[-1].id,
+        character_id=character.id,
+    )
+    repositories.set_app_setting(ROLEPLAY_SHARED_MODE_SETTING, False)
+    repositories.save_provider_model(
+        provider="fake", model_id="fake-structured", display_name="Fake Structured",
+        capabilities=["structured_output"],
+    )
+    repositories.set_model_preference(
+        task=roleplay_model_task(
+            roleplay_type="full_roleplay", purpose="response_planning",
+        ),
+        provider="fake", model_id="fake-structured",
+    )
+    provider = ClothingRecordingImageProvider([] if locked_at_prepare else [{
+        "characters": [{
+            "character_id": character.id,
+            "current_clothing": "a green raincoat over a linen shirt",
+        }],
+    }])
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider},
+        media_dir=tmp_path / "media", automatic_enabled=True, auto_frequency=2,
+    )
+    prepared = service.prepare_automatic_if_due(
+        save_id=save.id, source_message_id=messages[-1].id,
+    )
+    assert prepared is not None
+    prepared = type(prepared).from_json(prepared.to_json())
+    later = repositories.append_message(
+        save_id=save.id, role="narrator", body="LATER snow fills a different room.",
+    )
+    changed = repositories.update_character(replace(
+        character, appearance="LATER silver hair.", last_updated_message_id=later.id,
+        locked_fields=[] if locked_at_prepare else ["current_clothing"],
+    ))
+
+    asset = asyncio.run(service.generate_prepared_automatic(prepared))
+
+    assert asset is not None
+    assert len(provider.clothing_requests) == (0 if locked_at_prepare else 1)
+    assert ("Mara: a green raincoat over a linen shirt" in asset.prompt) is (
+        not locked_at_prepare
+    )
+    assert "LATER" not in _chat_request_context(provider.chat_requests[0])
+    assert "Braided brown hair." in _chat_request_context(provider.chat_requests[0])
+    if provider.clothing_requests:
+        clothing_context = "\n".join(
+            message.body for message in provider.clothing_requests[0].messages
+        )
+        assert "Braided brown hair." in clothing_context
+        assert "The echo answers from below." in clothing_context
+        assert "LATER" not in clothing_context
+    assert repositories.get_character(character.id) == changed
+    assert changed.current_clothing == ""
+
+
 def test_manually_edited_oversized_prompt_is_rejected_without_redrafting(
     repositories: PersistenceRepositories,
     tmp_path: Path,
