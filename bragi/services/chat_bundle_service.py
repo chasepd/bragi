@@ -5133,6 +5133,15 @@ def _remap_imported_media_reference_metadata(
             media_asset_id_map,
         )
         remapped = dict(metadata)
+        reference_character_ids = metadata.get(
+            "source_character_reference_character_ids"
+        )
+        if isinstance(reference_character_ids, list):
+            remapped["source_character_reference_character_ids"] = [
+                character_id_map[character_id]
+                for character_id in reference_character_ids
+                if isinstance(character_id, str) and character_id in character_id_map
+            ]
         if metadata.get("kind") in ("character_reference", "character_image"):
             character_id = metadata.get("character_id")
             if (
@@ -5159,7 +5168,7 @@ def _remap_imported_media_reference_metadata(
                 remapped["text_message_id"] = character_text_message_id_map[
                     text_message_id
                 ]
-        else:
+        elif remapped == metadata:
             continue
         connection.execute(
             """
