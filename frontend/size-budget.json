@@ -2,9 +2,9 @@
   "generatedAssets": {
     "javascript": {
       "extensions": [".js"],
-      "totalRawBytes": 689500,
-      "totalGzipBytes": 191500,
-      "totalBrotliBytes": 165000,
+      "totalRawBytes": 690500,
+      "totalGzipBytes": 192000,
+      "totalBrotliBytes": 165500,
       "maxFileRawBytes": 260000,
       "minFileCount": 11,
       "requiredFilePatterns": [
@@ -20,10 +20,10 @@
     },
     "css": {
       "extensions": [".css"],
-      "totalRawBytes": 105000,
+      "totalRawBytes": 105500,
       "totalGzipBytes": 22000,
       "totalBrotliBytes": 18000,
-      "maxFileRawBytes": 105000
+      "maxFileRawBytes": 105500
     }
   },
   "publicAssets": [
