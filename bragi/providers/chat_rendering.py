@@ -14,6 +14,7 @@ from bragi.providers.message_names import provider_message_name
 from bragi.providers.system_prompt import (
     DEFAULT_NPC_KNOWLEDGE_BOUNDARY_SECTION,
     DEFAULT_RESPONSE_STYLE_SECTION,
+    LYRICS_INTERPRETATION_SECTION,
     STORYTELLER_INTERACTION_SECTION,
     prose_safety_section,
 )
@@ -204,6 +205,7 @@ def _purpose_instruction_sections(request: ChatRequest) -> tuple[str, ...]:
             request.response_style_section or DEFAULT_RESPONSE_STYLE_SECTION,
             *mode_sections,
             DEFAULT_NPC_KNOWLEDGE_BOUNDARY_SECTION,
+            LYRICS_INTERPRETATION_SECTION,
             _narrator_prompt_mode_section(request),
         )
     if purpose is ChatPromptPurpose.CHARACTER_TEXT:
@@ -220,6 +222,7 @@ def _purpose_instruction_sections(request: ChatRequest) -> tuple[str, ...]:
             "Summary task:\n"
             "- Summarize only the supplied chronicle source.\n"
             "- Do not continue the scene or write narrator dialogue.",
+            LYRICS_INTERPRETATION_SECTION,
         )
     if purpose is ChatPromptPurpose.IMAGE_PROMPT:
         return (

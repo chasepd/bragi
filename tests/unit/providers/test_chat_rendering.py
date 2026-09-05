@@ -17,6 +17,29 @@ from bragi.providers.contracts import (
 from bragi.providers.system_prompt import DEFAULT_PROSE_SAFETY_SECTION
 
 
+@pytest.mark.parametrize(
+    "purpose", (ChatPromptPurpose.NARRATOR, ChatPromptPurpose.SUMMARY),
+)
+def test_lyrics_interpretation_survives_style_overrides_and_preserves_input(
+    purpose: ChatPromptPurpose,
+) -> None:
+    lyrics = "*I sing.*\n```lyrics\nI burned the kingdom down\n\nFor one more dawn\n```"
+    request = ChatRequest(
+        provider="fake",
+        model_id="fake-chat",
+        messages=(ChatMessage(role="player", body=lyrics),),
+        response_style_section="Keep a quiet tone.",
+        prompt_purpose=purpose,
+    )
+
+    messages = provider_chat_messages(request)
+
+    assert "Lyrics convention:" in messages[0]["content"]
+    assert "not evidence of literal events" in messages[0]["content"]
+    assert "private intent" in messages[0]["content"]
+    assert messages[-1]["content"] == lyrics
+
+
 def test_provider_chat_messages_include_npc_knowledge_boundary() -> None:
     request = ChatRequest(
         provider="fake",
@@ -541,4 +564,3 @@ def test_provider_chat_messages_caches_per_request() -> None:
     assert first is second
     assert request._provider_messages_cache is first
     assert request._rendered_text_cache is rendered
-

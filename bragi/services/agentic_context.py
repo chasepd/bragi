@@ -39,6 +39,7 @@ from bragi.providers.contracts import (
     StructuredOutputRequest,
     StructuredOutputResponse,
 )
+from bragi.providers.system_prompt import LYRICS_INTERPRETATION_SECTION
 from bragi.retry_policy import configured_max_attempts
 from bragi.services.evidence import (
     invalid_knowledge_metadata_field,
@@ -2044,7 +2045,7 @@ def _observation_messages(
     return (
         ChatMessage(
             role="system",
-            body=(
+            body=LYRICS_INTERPRETATION_SECTION + "\n\n" + (
                 "Extract high-recall candidate Bragi observations from the "
                 "completed turn. Use the enforced schema. Do not decide final "
                 "importance. Include only claims with explicit source evidence."
@@ -2232,7 +2233,7 @@ def _curation_messages(
     return (
         ChatMessage(
             role="system",
-            body=(
+            body=LYRICS_INTERPRETATION_SECTION + "\n\n" + (
                 "Curate candidate Bragi observations into durable memory, save "
                 "context, scene scratchpad, discard, or needs confirmation. Use "
                 "the enforced schema. Preserve provenance and do not treat "
@@ -3141,7 +3142,7 @@ def _planner_messages(request: ChatRequest) -> tuple[ChatMessage, ...]:
     return (
         ChatMessage(
             role="system",
-            body=(
+            body=LYRICS_INTERPRETATION_SECTION + "\n\n" + (
                 "Create a compact message spec for the next Bragi narrator "
                 "response. Decide what the response should accomplish, but do "
                 "not write final prose. Use the enforced schema. Include "
@@ -4215,7 +4216,7 @@ def _verifier_messages(
     return (
         ChatMessage(
             role="system",
-            body=(
+            body=LYRICS_INTERPRETATION_SECTION + "\n\n" + (
                 "Verify whether the narrator response follows the message spec. "
                 "Use the enforced schema. Flag unsupported additions, missed "
                 "must-say beats, tone drift, player-agency violations, and "
