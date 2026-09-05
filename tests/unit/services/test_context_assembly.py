@@ -2528,3 +2528,58 @@ def test_image_context_excludes_ineligible_scene_facts(
     )
 
     assert "ineligible physical detail" not in context
+
+
+@pytest.mark.parametrize("mara_present", [True, False])
+def test_historical_image_omits_outfit_inferred_without_message_provenance(
+    repositories: PersistenceRepositories,
+    mara_present: bool,
+) -> None:
+    _scenario, save, location = _create_context_save(
+        repositories, scenario_id="image-undated-outfit", save_id="image-undated-outfit"
+    )
+    first = repositories.append_message(
+        save_id=save.id, role="narrator", body="The watch studies Mara's report."
+    )
+    mara = repositories.add_character(
+        save_id=save.id, name="Mara", appearance="A silver braid and amber eyes",
+        source_message_id=first.id,
+    )
+    orro = repositories.add_character(
+        save_id=save.id, name="Orro", source_message_id=first.id,
+    )
+    participants = [mara.id] if mara_present else [orro.id]
+    repositories.upsert_scene_snapshot(
+        save_id=save.id, current_location_id=location.id,
+        present_character_ids=participants, source_message_id=first.id,
+    )
+    repositories.replace_message_scene_presence(save.id, first.id, participants)
+    second = repositories.append_message(
+        save_id=save.id, role="narrator", body="The watch reads Mara's next report."
+    )
+    repositories.replace_message_scene_presence(save.id, second.id, participants)
+    updated = repositories.set_character_current_clothing_if_blank_and_unlocked(
+        save_id=save.id, character_id=mara.id,
+        current_clothing="An orange raincoat with a blue belt",
+    )
+    assert updated is not None
+    assert updated.last_updated_message_id == first.id
+
+    old_characters = image_scene_characters(repositories, save.id, first.id)
+    latest_characters = image_scene_characters(repositories, save.id, second.id)
+    if mara_present:
+        assert old_characters[0].id == mara.id
+        assert old_characters[0].appearance == mara.appearance
+        assert old_characters[0].current_clothing == ""
+        assert latest_characters[0].current_clothing == updated.current_clothing
+    for source_id, outfit_expected in ((first.id, False), (second.id, True)):
+        sources = deterministic_context_sources(
+            repositories=repositories, save_id=save.id,
+            mode="image", source_message_id=source_id,
+        )
+        text = "\n".join(source.text for source in sources)
+        assert mara.appearance in text
+        assert (updated.current_clothing in text) is outfit_expected
+        if not mara_present:
+            assert "Discussed/background character profiles" in text
+    assert repositories.get_character(mara.id) == updated

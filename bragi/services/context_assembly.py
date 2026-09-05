@@ -318,7 +318,10 @@ def image_scene_characters(
     )
     return tuple(sorted(
         (
-            character for character in repositories.list_characters(save_id)
+            _image_character_profile(
+                character, details=details, source_message_id=source_message_id
+            )
+            for character in repositories.list_characters(save_id)
             if character.id in present_ids
             and _image_record_is_at_or_before(
                 character, source_message_id=source_message_id,
@@ -327,6 +330,23 @@ def image_scene_characters(
         ),
         key=lambda character: character.id,
     ))
+
+
+def _image_character_profile(
+    character: CharacterRecord,
+    *,
+    details: SaveDetailsRecord,
+    source_message_id: str | None,
+) -> CharacterRecord:
+    # Clothing inference can update this field without changing the character's
+    # source-message IDs. Its current value cannot establish a historical outfit.
+    if (
+        details.messages
+        and source_message_id is not None
+        and source_message_id != details.messages[-1].id
+    ):
+        return replace(character, current_clothing="")
+    return character
 
 
 def _image_present_character_ids(
@@ -1394,6 +1414,12 @@ def deterministic_context_sources(
         )
     }
     if mode == "image" and details is not None:
+        character_map = {
+            character_id: _image_character_profile(
+                character, details=details, source_message_id=source_message_id
+            )
+            for character_id, character in character_map.items()
+        }
         present_character_ids = _image_present_character_ids(
             repositories=repositories,
             details=details,
