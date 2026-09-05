@@ -44,6 +44,7 @@ from bragi.services.character_profile_completion import (
     ScenarioCharacterStarter,
     ScenarioStarterReferenceImage,
 )
+from bragi.services.character_registry_service import CharacterRegistryService
 from bragi.services.content_safety_service import (
     ContentSafetyAction,
     ContentSafetyResult,
@@ -7967,6 +7968,226 @@ def test_character_image_generation_rejects_failed_linked_reference_without_fall
         for link in links
     )
     assert _media_jobs(repositories, save.id, "character_reference_image") == []
+
+
+@pytest.mark.parametrize("has_reference", [False, True])
+def test_upload_character_image_preserves_profile_and_allows_reference_selection(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    has_reference: bool,
+) -> None:
+    save, _opening_message, character_id = _full_roleplay_save(repositories)
+    character = repositories.get_character(character_id)
+    assert character is not None
+    before = repositories.update_character(
+        replace(
+            character,
+            appearance="Short dark curls and hazel eyes.",
+            visual_notes="A weathered green cloak.",
+            locked_fields=["appearance", "role"],
+        )
+    )
+    generated = repositories.create_media_asset(
+        save_id=save.id,
+        source_message_id=None,
+        type="image",
+        path="generated/portrait.png",
+        thumbnail_path=None,
+        prompt="A character portrait",
+        provider="fake",
+        model="fake-image",
+        status="succeeded",
+        metadata={"kind": "character_image", "character_id": character_id},
+    )
+    if has_reference:
+        repositories.add_entity_link(
+            save_id=save.id,
+            entity_type="character",
+            entity_id=character_id,
+            target_type="media_asset",
+            target_id=generated.id,
+            relation="reference_image",
+        )
+    links_before = repositories.list_entity_links(save.id)
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    media_dir = tmp_path / "media"
+    service = MediaService(
+        repositories=repositories,
+        providers={"fake": provider},
+        media_dir=media_dir,
+    )
+
+    asset = service.upload_character_image(
+        save_id=save.id,
+        character_id=character_id,
+        image_bytes=_VALID_PNG_BYTES,
+        filename="../../private-portrait.jpg",
+    )
+
+    assert asset.source_message_id is None
+    assert asset.source_media_asset_id is None
+    assert asset.type == "image"
+    assert asset.mime_type == "image/png"
+    assert asset.provider == "local"
+    assert asset.model == "upload"
+    assert asset.status == "succeeded"
+    assert asset.prompt == "Uploaded character image"
+    assert json.loads(asset.metadata_json) == {
+        "kind": "character_image",
+        "source": "uploaded",
+        "character_id": character_id,
+    }
+    image_path = _asset_path(media_dir, asset.path)
+    assert image_path.read_bytes() == _VALID_PNG_BYTES
+    _assert_private_modes(image_path)
+    _assert_private_thumbnail_if_present(media_dir=media_dir, asset=asset)
+    assert "private-portrait" not in asset.path
+    assert repositories.get_character(character_id) == before
+    assert repositories.list_entity_links(save.id) == links_before
+    registry = CharacterRegistryService(repositories)
+    row = registry.build_model(active_save_id=save.id).characters[0]
+    assert {image.media_asset_id for image in row.generated_images} == (
+        {asset.id} if has_reference else {asset.id, generated.id}
+    )
+    uploaded = next(
+        image for image in row.generated_images if image.media_asset_id == asset.id
+    )
+    assert uploaded.source == "uploaded"
+    if has_reference:
+        assert row.reference_image is not None
+        assert row.reference_image.media_asset_id == generated.id
+    else:
+        assert row.reference_image is None
+        assert media_service_module._character_reference_asset(
+            repositories=repositories,
+            save_id=save.id,
+            character_id=character_id,
+        ) is None
+        assert repositories.list_entity_links(save.id) == links_before
+
+    selected = service.set_character_reference_image(
+        save_id=save.id,
+        character_id=character_id,
+        media_asset_id=asset.id,
+    )
+
+    assert selected.id == asset.id
+    assert repositories.get_character(character_id) == before
+    updated_row = registry.build_model(active_save_id=save.id).characters[0]
+    assert updated_row.reference_image is not None
+    assert updated_row.reference_image.media_asset_id == asset.id
+    assert {image.media_asset_id for image in updated_row.generated_images} == {
+        generated.id,
+    }
+    assert provider.chat_requests == []
+    assert provider.image_requests == []
+    assert provider.image_description_requests == []
+
+
+@pytest.mark.parametrize("invalid_image", [b"", b"not an image", b"\x89PNG\r\n\x1a\n"])
+def test_upload_character_image_rejects_invalid_bytes(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    invalid_image: bytes,
+) -> None:
+    save, _opening_message, character_id = _full_roleplay_save(repositories)
+    media_dir = tmp_path / "media"
+    service = MediaService(repositories=repositories, providers={}, media_dir=media_dir)
+
+    with pytest.raises(ValueError, match="Unsupported image upload type"):
+        service.upload_character_image(
+            save_id=save.id,
+            character_id=character_id,
+            image_bytes=invalid_image,
+            filename="portrait.png",
+        )
+
+    assert repositories.list_media_assets(save.id) == []
+    assert not media_dir.exists()
+
+
+def test_upload_character_image_rejects_oversized_bytes(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save, _opening_message, character_id = _full_roleplay_save(repositories)
+    media_dir = tmp_path / "media"
+    service = MediaService(repositories=repositories, providers={}, media_dir=media_dir)
+    monkeypatch.setattr(
+        media_service_module, "_MAX_PERSISTED_IMAGE_BYTES", len(_VALID_PNG_BYTES) - 1
+    )
+
+    with pytest.raises(ValueError, match="Uploaded image exceeded"):
+        service.upload_character_image(
+            save_id=save.id,
+            character_id=character_id,
+            image_bytes=_VALID_PNG_BYTES,
+        )
+
+    assert repositories.list_media_assets(save.id) == []
+    assert not media_dir.exists()
+
+
+@pytest.mark.parametrize("invalid_target", ["save", "character", "other_save", "blank"])
+def test_upload_character_image_requires_character_in_requested_save(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    invalid_target: str,
+) -> None:
+    save, _opening_message, character_id = _full_roleplay_save(repositories)
+    other_save, _messages = _save_with_image_preference(repositories)
+    media_dir = tmp_path / "media"
+    service = MediaService(repositories=repositories, providers={}, media_dir=media_dir)
+    requested_save_id = {
+        "save": "missing-save",
+        "other_save": other_save.id,
+    }.get(invalid_target, save.id)
+    requested_character_id = {
+        "character": "missing-character",
+        "blank": "",
+    }.get(invalid_target, character_id)
+
+    with pytest.raises(ValueError, match="Unknown (save|character) id"):
+        service.upload_character_image(
+            save_id=requested_save_id,
+            character_id=requested_character_id,
+            image_bytes=_VALID_PNG_BYTES,
+        )
+
+    assert repositories.list_media_assets(save.id) == []
+    assert repositories.list_media_assets(other_save.id) == []
+    assert not media_dir.exists()
+
+
+def test_upload_character_image_persistence_failure_rolls_back_files_and_asset(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save, _opening_message, character_id = _full_roleplay_save(repositories)
+    media_dir = tmp_path / "media"
+    service = MediaService(repositories=repositories, providers={}, media_dir=media_dir)
+    before = repositories.get_character(character_id)
+    create_asset = repositories.create_media_asset
+
+    def fail_after_create(**kwargs: Any) -> NoReturn:
+        create_asset(**kwargs)
+        raise sqlite3.OperationalError("simulated media persistence failure")
+
+    monkeypatch.setattr(repositories, "create_media_asset", fail_after_create)
+
+    with pytest.raises(sqlite3.OperationalError, match="simulated media persistence"):
+        service.upload_character_image(
+            save_id=save.id,
+            character_id=character_id,
+            image_bytes=_VALID_PNG_BYTES,
+        )
+
+    assert repositories.get_character(character_id) == before
+    assert repositories.list_media_assets(save.id) == []
+    assert repositories.list_entity_links(save.id) == []
+    assert [path for path in media_dir.rglob("*") if path.is_file()] == []
 
 
 def test_upload_character_reference_analyzes_image_and_replaces_locked_visual_fields(

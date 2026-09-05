@@ -149,6 +149,7 @@ _CHARACTER_REFERENCE_CANDIDATE_KINDS = frozenset(
     {"character_image", "scene_image", "character_reference"}
 )
 _UPLOADED_CHARACTER_REFERENCE_PROMPT = "Uploaded character reference image"
+_UPLOADED_CHARACTER_IMAGE_PROMPT = "Uploaded character image"
 _UPLOADED_CHARACTER_TEXT_PHOTO_PROMPT = "Uploaded text photo"
 _CHARACTER_TEXT_UPLOADED_PHOTO_TASK = "character_image_description"
 _CHARACTER_REFERENCE_ANALYSIS_TASK = "character_image_description"
@@ -1243,6 +1244,75 @@ class MediaService:
             save_id=save_id,
             character_id=character.id,
             media_asset_id=asset.id,
+        )
+        return asset
+
+    def upload_character_image(
+        self,
+        *,
+        save_id: str,
+        character_id: str,
+        image_bytes: bytes,
+        filename: str | None = None,
+    ) -> MediaAssetRecord:
+        _assert_uploaded_image_size(len(image_bytes))
+        mime_type, extension = _uploaded_image_mime_type(image_bytes)
+        asset_id = uuid4().hex
+        relative_path = (
+            Path(_safe_path_segment(save_id))
+            / "uploads"
+            / f"{_safe_path_segment(asset_id)}{extension}"
+        )
+        output_path = self.media_dir / relative_path
+        _assert_within_media_dir(media_dir=self.media_dir, output_path=output_path)
+        thumbnail_path: str | None = None
+        transaction_started = False
+        try:
+            self.repositories.begin_immediate_transaction()
+            transaction_started = True
+            if self.repositories.get_save(save_id) is None:
+                raise ValueError(f"Unknown save id: {save_id}")
+            character = self.repositories.get_character(character_id)
+            if character is None or character.save_id != save_id:
+                raise ValueError(f"Unknown character id: {character_id}")
+            write_private_bytes(output_path, image_bytes)
+            thumbnail_path = _persist_thumbnail(
+                media_dir=self.media_dir,
+                image_relative_path=relative_path,
+                image_path=output_path,
+            )
+            asset = self.repositories.create_media_asset(
+                save_id=save_id,
+                source_message_id=None,
+                type="image",
+                path=relative_path.as_posix(),
+                thumbnail_path=thumbnail_path,
+                prompt=_UPLOADED_CHARACTER_IMAGE_PROMPT,
+                provider=_LOCAL_UPLOAD_PROVIDER,
+                model=_LOCAL_UPLOAD_MODEL,
+                status="succeeded",
+                mime_type=mime_type,
+                metadata={
+                    "kind": "character_image",
+                    "source": "uploaded",
+                    "character_id": character.id,
+                },
+                asset_id=asset_id,
+            )
+            self.repositories.commit_transaction()
+            transaction_started = False
+        except Exception:
+            if transaction_started:
+                self.repositories.rollback_transaction()
+            self._delete_persisted_files(relative_path.as_posix(), thumbnail_path)
+            raise
+        log_event(
+            "media.character_image_uploaded",
+            save_id=save_id,
+            character_id=character.id,
+            media_asset_id=asset.id,
+            mime_type=mime_type,
+            byte_count=len(image_bytes),
         )
         return asset
 

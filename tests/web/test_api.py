@@ -10536,6 +10536,7 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
 def test_chat_turn_records_execution_stratum_after_preflight_settings_change(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     class StratumProvider:
         provider_name = "fake"
@@ -10570,10 +10571,13 @@ def test_chat_turn_records_execution_stratum_after_preflight_settings_change(
 
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)
-    repositories = PersistenceRepositories(
-        sqlite3.connect(database_path, check_same_thread=False)
+    repositories = ScopedPersistenceRepositories(database_path, PersistenceRepositories)
+    request.addfinalizer(repositories.close)
+    save = _create_auth_save(
+        cast(PersistenceRepositories, repositories),
+        title="Stratum Save",
+        owner_user_id=None,
     )
-    save = _create_auth_save(repositories, title="Stratum Save", owner_user_id=None)
     for model_id in ("fake-chat", "fake-next"):
         repositories.save_provider_model(
             provider="fake",
@@ -10594,14 +10598,17 @@ def test_chat_turn_records_execution_stratum_after_preflight_settings_change(
     )
     provider = cast(ProviderClient, StratumProvider())
     runtime = BragiRuntime(
-        repositories=repositories,
+        repositories=cast(PersistenceRepositories, repositories),
         providers={"fake": provider},
         media_dir=tmp_path / "media",
         active_save_id=save.id,
     )
     state = _state_double(tmp_path, runtime)
     state.repositories = repositories
-    state.jobs._repositories = repositories  # noqa: SLF001 - production wiring
+    state.jobs = JobRegistry(
+        repositories=repositories,
+        repository_scope=repositories.scope,
+    )
     state.providers = runtime.providers
     preflight_started = threading.Event()
     release_preflight = threading.Event()
@@ -10656,7 +10663,7 @@ def test_chat_turn_records_execution_stratum_after_preflight_settings_change(
             f"/api/chat/timing-summary?save_id={save.id}"
         ).json()
 
-    assert terminal["status"] == "succeeded"
+    assert terminal["status"] == "succeeded", terminal
     strata = [
         step
         for step in repositories.list_job_steps(job_id)
@@ -17488,6 +17495,121 @@ def test_media_set_character_reference_returns_unknown_media_404(
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Unknown media asset"
+
+
+def test_character_gallery_upload_returns_registry_and_can_be_promoted(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    state = _repository_state_double(tmp_path)
+    state.repositories.set_app_setting("content_filter_rating", "unrated")
+    save = _create_auth_save(state.repositories, title="Gallery", owner_user_id=None)
+    character = state.repositories.add_character(
+        save_id=save.id, name="Mara", appearance="Silver hair",
+        visual_notes="Blue cloak", locked_fields=("appearance",),
+    )
+    state.runtime = BragiRuntime(
+        repositories=state.repositories, providers={}, media_dir=state.paths.media_dir,
+    )
+    # The multipart image allowance must exceed the ordinary request-body limit.
+    monkeypatch.setattr(api_app, "MAX_JSON_REQUEST_BODY_BYTES", 64)
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.post(
+            f"/api/characters/{character.id}/image/upload",
+            data={"save_id": save.id},
+            files={"file": ("portrait.png", VALID_PNG_BYTES, "image/png")},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["active_save_id"] == save.id
+        [row] = response.json()["characters"]
+        assert row["reference_image"] is None
+        assert row["appearance"] == character.appearance
+        assert row["visual_notes"] == character.visual_notes
+        assert row["locked_fields"] == list(character.locked_fields)
+        [image] = row["generated_images"]
+        assert image["source"] == "uploaded"
+        assert client.get(
+            f"/api/media/{image['media_asset_id']}/thumbnail?save_id={save.id}"
+        ).status_code == 200
+        monkeypatch.setattr(api_app, "MAX_JSON_REQUEST_BODY_BYTES", 1024 * 1024)
+        # The app already captured the small limit, so use a separate client below.
+
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        promoted = client.post(
+            f"/api/characters/{character.id}/reference-image/set",
+            json={"save_id": save.id, "media_asset_id": image["media_asset_id"]},
+        )
+        assert promoted.status_code == 200
+        job = _wait_for_terminal_job(client, promoted.json()["id"], save_id=save.id)
+        assert job["status"] == "succeeded", job
+        [updated] = job["result"]["characters"]
+        assert updated["reference_image"]["media_asset_id"] == image["media_asset_id"]
+        assert updated["appearance"] == character.appearance
+        assert updated["visual_notes"] == character.visual_notes
+        assert state.repositories.get_character(character.id) == character
+
+
+@pytest.mark.parametrize("failure", ["missing_save", "rated", "oversized", "invalid"])
+def test_character_gallery_upload_rejects_invalid_requests(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    failure: str,
+) -> None:
+    state = _repository_state_double(tmp_path)
+    state.repositories.set_app_setting(
+        "content_filter_rating", "pg" if failure == "rated" else "unrated",
+    )
+    save = _create_auth_save(state.repositories, title="Gallery", owner_user_id=None)
+    character = state.repositories.add_character(save_id=save.id, name="Mara")
+    state.runtime = BragiRuntime(
+        repositories=state.repositories, providers={}, media_dir=state.paths.media_dir,
+    )
+    if failure == "oversized":
+        monkeypatch.setattr(api_app, "CHARACTER_REFERENCE_UPLOAD_MAX_BYTES", 8)
+    with TestClient(create_app(cast(WebAppState, state))) as client:
+        response = client.post(
+            f"/api/characters/{character.id}/image/upload",
+            data={} if failure == "missing_save" else {"save_id": save.id},
+            files={"file": (
+                "portrait.png", b"invalid" if failure == "invalid" else VALID_PNG_BYTES,
+                "image/png",
+            )},
+        )
+    assert response.status_code == (413 if failure == "oversized" else 400)
+    if failure == "rated":
+        assert "Unrated before uploading a character image" in response.json()["detail"]
+    assert state.repositories.list_media_assets(save.id) == []
+    assert state.repositories.get_character(character.id) == character
+
+
+@pytest.mark.parametrize("role,assigned", [("child", True), ("user", False)])
+def test_character_gallery_upload_enforces_save_media_permissions(
+    tmp_path: Path, role: str, assigned: bool,
+) -> None:
+    state = _auth_state(tmp_path)
+    admin = state.auth_service().create_user(
+        username="Admin", password="correct horse", role="admin",
+    )
+    user = state.auth_service().create_user(
+        username="Viewer", password="correct horse", role=role,
+    )
+    save = _create_auth_save(
+        state.repositories, title="Private Gallery", owner_user_id=admin.id,
+    )
+    character = state.repositories.add_character(save_id=save.id, name="Mara")
+    if assigned:
+        state.repositories.grant_save_access(save_id=save.id, user_id=user.id)
+    with TestClient(create_app(cast(WebAppState, state)), authenticate=False) as client:
+        assert client.post(
+            "/api/auth/login", json={"username": "Viewer", "password": "correct horse"},
+        ).status_code == 200
+        response = client.post(
+            f"/api/characters/{character.id}/image/upload",
+            data={"save_id": save.id},
+            files={"file": ("portrait.png", VALID_PNG_BYTES, "image/png")},
+        )
+    assert response.status_code == (403 if assigned else 404)
+    assert state.repositories.list_media_assets(save.id) == []
 
 
 def test_media_upload_character_reference_passes_file_and_save_to_runtime(

@@ -706,6 +706,80 @@ def test_runtime_model_is_import_safe_and_exposes_active_save_state(
     assert isinstance(_status_text(model), str)
 
 
+def test_character_gallery_upload_uses_scoped_mutation_lock(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, _ = _persist_runtime_save(repositories)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+    lock_held = False
+    uploads: list[dict[str, object]] = []
+
+    class MediaServiceDouble:
+        def upload_character_image(self, **kwargs: object) -> object:
+            assert lock_held
+            uploads.append(kwargs)
+            return SimpleNamespace(id="gallery-1")
+
+    @asynccontextmanager
+    async def mutation_context() -> AsyncIterator[None]:
+        nonlocal lock_held
+        lock_held = True
+        try:
+            yield
+        finally:
+            lock_held = False
+
+    monkeypatch.setattr(controller, "_media_service", MediaServiceDouble)
+    model = asyncio.run(controller.upload_character_image(
+        character_id="character-1",
+        image_bytes=b"image",
+        filename="portrait.png",
+        active_save_id=save_id,
+        mutation_context=mutation_context,
+    ))
+
+    assert _value(model, "error") is None
+    assert _value(model, "active_save_id") == save_id
+    assert _value(model, "status") == "Character image uploaded"
+    assert controller.active_save_id is None
+    assert not lock_held
+    assert uploads == [{
+        "save_id": save_id,
+        "character_id": "character-1",
+        "image_bytes": b"image",
+        "filename": "portrait.png",
+    }]
+
+
+def test_character_gallery_upload_reports_missing_save_and_failure(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    runtime = _import_runtime_without_gtk(monkeypatch)
+    save_id, _ = _persist_runtime_save(repositories)
+    controller = _runtime_controller(runtime, repositories, tmp_path)
+    model = asyncio.run(controller.upload_character_image(
+        character_id="character-1", image_bytes=b"image",
+    ))
+    assert _value(model, "error") == "No save loaded"
+
+    class MediaServiceDouble:
+        def upload_character_image(self, **_kwargs: object) -> object:
+            raise ValueError("Invalid character image")
+
+    monkeypatch.setattr(controller, "_media_service", MediaServiceDouble)
+    controller.load_save(save_id)
+    model = asyncio.run(controller.upload_character_image(
+        character_id="character-1", image_bytes=b"image",
+    ))
+    assert _value(model, "active_save_id") == save_id
+    assert _value(model, "error") == "Invalid character image"
+
+
 def test_character_reference_upload_locks_only_commit_phase(
     repositories: PersistenceRepositories,
     tmp_path: Path,
