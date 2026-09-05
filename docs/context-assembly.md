@@ -109,7 +109,13 @@ both use that latest-message fallback.
 Historical frames omit mutable character, location, and scene records with
 updates after the source, or without reliable message provenance. They also omit
 mutable linked lore and template world state rather than reconstructing old
-versions. The narrator's existing cutoff behavior is unchanged. Image profiles
+versions. Current character appearance, visual notes, clothing, and age are omitted
+for historical frames because registry edits and reference uploads can change
+these fields without advancing their message provenance. The selected text still
+supplies visible details. Historical reference images need eligible source-message
+provenance and a creation timestamp at or before the selected moment; a solo image
+reports an unavailable reference if the currently linked image cannot qualify.
+The narrator's existing cutoff behavior is unchanged. Image profiles
 keep appearance, visual notes, and current clothing in separate fields without
 short-field clipping. Locations fall back to their general description when the
 visual description is empty, explicitly asking the drafting model to extract

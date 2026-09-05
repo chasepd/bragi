@@ -338,14 +338,17 @@ def _image_character_profile(
     details: SaveDetailsRecord,
     source_message_id: str | None,
 ) -> CharacterRecord:
-    # Clothing inference can update this field without changing the character's
-    # source-message IDs. Its current value cannot establish a historical outfit.
+    # Registry edits and reference uploads can change visual fields without
+    # advancing message provenance. The selected text supplies historical details;
+    # current visual fields cannot establish how the character looked then.
     if (
         details.messages
         and source_message_id is not None
         and source_message_id != details.messages[-1].id
     ):
-        return replace(character, current_clothing="")
+        return replace(
+            character, appearance="", visual_notes="", current_clothing="", age="",
+        )
     return character
 
 

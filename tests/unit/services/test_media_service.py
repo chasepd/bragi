@@ -10185,3 +10185,140 @@ def test_historical_solo_image_omits_later_character_profile_changes(
     assert "The oracle studies your reflection" in _chat_request_context(
         provider.chat_requests[0]
     )
+
+
+@pytest.mark.parametrize("purpose", ["scene", "solo"])
+def test_historical_image_omits_undated_reference_upload(
+    repositories: PersistenceRepositories, tmp_path: Path, purpose: str,
+) -> None:
+    save, opening, character_id = _full_roleplay_save(repositories)
+    character = repositories.get_character(character_id)
+    assert character is not None
+    _mark_character_present(
+        repositories, save_id=save.id, message_id=opening.id, character_id=character_id,
+    )
+    later = repositories.append_message(
+        save_id=save.id, role="narrator", body="The next day dawns.",
+    )
+    _mark_character_present(
+        repositories, save_id=save.id, message_id=later.id, character_id=character_id,
+    )
+    _configure_vision_model(repositories, model_id="fake-vision")
+    repositories.set_model_preference(
+        task="image_to_image_generation", provider="fake", model_id="fake-edit",
+    )
+    provider = RecordingVisionProvider([
+        "LATER golden hair and violet eyes.", "LATER scarlet armor and a new crown.",
+    ])
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider},
+        media_dir=tmp_path / "media",
+    )
+    uploaded = asyncio.run(service.upload_character_reference_image(
+        save_id=save.id, character_id=character_id,
+        image_bytes=_VALID_PNG_BYTES, filename="reference.png",
+    ))
+    updated = repositories.get_character(character_id)
+    assert updated is not None
+    assert updated.last_updated_message_id == character.last_updated_message_id
+    assert uploaded.source_message_id is None
+
+    if purpose == "scene":
+        asyncio.run(service.generate_for_message(
+            save_id=save.id, source_message_id=opening.id,
+        ))
+        assert "LATER" not in _chat_request_context(provider.chat_requests[0])
+        assert provider.image_requests[0].source_media_asset_ids == ()
+    else:
+        with pytest.raises(ValueError, match="reference image.*selected moment"):
+            asyncio.run(service.generate_character_image_for_message(
+                save_id=save.id, source_message_id=opening.id,
+                character_id=character_id,
+            ))
+        assert provider.chat_requests == []
+        assert provider.image_requests == []
+
+    asyncio.run(service.generate_character_image_for_message(
+        save_id=save.id, source_message_id=later.id, character_id=character_id,
+    ))
+    assert "LATER golden hair" in _chat_request_context(provider.chat_requests[-1])
+    assert provider.image_requests[-1].source_media_asset_ids == (uploaded.id,)
+
+
+def test_manual_regeneration_discards_inherited_automatic_prompt_diagnostics(
+    repositories: PersistenceRepositories, tmp_path: Path,
+) -> None:
+    save, messages = _save_with_image_preference(repositories)
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider},
+        media_dir=tmp_path / "media",
+    )
+    original = asyncio.run(service.generate_for_message(
+        save_id=save.id, source_message_id=messages[-1].id,
+    ))
+    assert "image_prompt" in json.loads(original.metadata_json)
+    draft_count = len(provider.chat_requests)
+
+    replacement = asyncio.run(service.regenerate_asset_with_prompt(
+        save_id=save.id, media_asset_id=original.id, prompt="A blue glass key.",
+    ))
+
+    assert replacement.prompt == provider.image_requests[-1].prompt
+    assert replacement.prompt == "A blue glass key."
+    assert len(provider.chat_requests) == draft_count
+    assert "image_prompt" not in json.loads(replacement.metadata_json)
+
+
+@pytest.mark.parametrize(
+    "reference_timing", ["established", "future_source", "future_asset"],
+)
+def test_historical_scene_references_require_source_and_creation_cutoffs(
+    repositories: PersistenceRepositories, tmp_path: Path, reference_timing: str,
+) -> None:
+    save, opening, character_id = _full_roleplay_save(repositories)
+    selected = repositories.append_message(
+        save_id=save.id, role="narrator", body="The oracle lifts a blue key.",
+    )
+    latest = repositories.append_message(
+        save_id=save.id, role="narrator", body="Night falls.",
+    )
+    _mark_character_present(
+        repositories, save_id=save.id, message_id=selected.id,
+        character_id=character_id,
+    )
+    repositories.connection.execute(
+        "UPDATE messages SET created_at = ? WHERE id = ?",
+        ("2030-01-01 11:00:00", selected.id),
+    )
+    media_dir = tmp_path / "media"
+    reference = _persist_character_reference(
+        repositories, media_dir=media_dir, save_id=save.id,
+        source_message_id=(
+            latest.id if reference_timing == "future_source" else opening.id
+        ),
+        character_id=character_id,
+    )
+    repositories.connection.execute(
+        "UPDATE media_assets SET created_at = ? WHERE id = ?",
+        (
+            "2030-01-01 12:30:00" if reference_timing == "future_asset"
+            else "2030-01-01 10:30:00",
+            reference.id,
+        ),
+    )
+    repositories.commit()
+    repositories.set_model_preference(
+        task="image_to_image_generation", provider="fake", model_id="fake-edit",
+    )
+    provider = RecordingImageProvider(_VALID_PNG_BYTES)
+    service = MediaService(
+        repositories=repositories, providers={"fake": provider}, media_dir=media_dir,
+    )
+
+    asyncio.run(service.generate_for_message(
+        save_id=save.id, source_message_id=selected.id,
+    ))
+
+    expected_ids = (reference.id,) if reference_timing == "established" else ()
+    assert provider.image_requests[0].source_media_asset_ids == expected_ids

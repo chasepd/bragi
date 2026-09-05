@@ -1764,9 +1764,13 @@ class MediaService:
             repositories=self.repositories,
             save_id=save_id,
             character_id=character.id,
+            source_message_id=source_message_id,
         )
         if reference is None:
-            raise ValueError("Selected character does not have a reference image")
+            raise ValueError(
+                "Selected character does not have a reference image available at the "
+                "selected moment"
+            )
         request_context = self._character_image_request_context(
             preference=preference,
             reference=reference,
@@ -4986,6 +4990,7 @@ def _selected_scene_character_references(
             repositories=repositories,
             save_id=save_id,
             character_id=candidate_character.id,
+            source_message_id=source_message_id,
         )
         if asset is None or asset.id in seen_media_asset_ids:
             continue
@@ -5052,6 +5057,7 @@ def _linked_character_reference_asset(
     repositories: PersistenceRepositories,
     save_id: str,
     character_id: str | None = None,
+    source_message_id: str | None = None,
 ) -> MediaAssetRecord | None:
     media_assets = {
         asset.id: asset
@@ -5073,8 +5079,45 @@ def _linked_character_reference_asset(
         ):
             asset = media_assets.get(link.target_id)
             if _is_usable_character_reference_asset(asset):
+                if (
+                    asset is not None
+                    and source_message_id is not None
+                    and not _reference_is_at_selected_moment(
+                        asset, source_message_id=source_message_id,
+                        messages=repositories.list_messages(save_id),
+                    )
+                ):
+                    return None
                 return asset
     return None
+
+
+def _reference_is_at_selected_moment(
+    asset: MediaAssetRecord, *, source_message_id: str,
+    messages: list[MessageRecord],
+) -> bool:
+    if messages and messages[-1].id == source_message_id:
+        return True
+    positions = {message.id: index for index, message in enumerate(messages)}
+    selected = positions.get(source_message_id)
+    reference_source = positions.get(asset.source_message_id or "")
+    if selected is None or reference_source is None or reference_source > selected:
+        return False
+    # A reference generated later can still cite an older source message.
+    # Require its existing timestamp to establish that it predates this moment.
+    timestamps = (asset.created_at, messages[selected].created_at)
+    if any(value is None for value in timestamps):
+        return False
+    try:
+        created, cutoff = (
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            for value in timestamps if value is not None
+        )
+    except ValueError:
+        return False
+    created = created.replace(tzinfo=UTC) if created.tzinfo is None else created
+    cutoff = cutoff.replace(tzinfo=UTC) if cutoff.tzinfo is None else cutoff
+    return created <= cutoff
 
 
 def _set_character_reference_link(
@@ -5287,6 +5330,7 @@ def _image_asset_metadata(
     generation: _ImageGenerationResult,
 ) -> dict[str, object]:
     result = dict(metadata or {})
+    result.pop("image_prompt", None)
     if generation.request.allow_prompt_compression:
         result["image_prompt"] = {
             "version": 1,

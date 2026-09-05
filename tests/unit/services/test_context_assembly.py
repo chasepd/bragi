@@ -2569,7 +2569,7 @@ def test_historical_image_omits_outfit_inferred_without_message_provenance(
     latest_characters = image_scene_characters(repositories, save.id, second.id)
     if mara_present:
         assert old_characters[0].id == mara.id
-        assert old_characters[0].appearance == mara.appearance
+        assert old_characters[0].appearance == ""
         assert old_characters[0].current_clothing == ""
         assert latest_characters[0].current_clothing == updated.current_clothing
     for source_id, outfit_expected in ((first.id, False), (second.id, True)):
@@ -2578,7 +2578,7 @@ def test_historical_image_omits_outfit_inferred_without_message_provenance(
             mode="image", source_message_id=source_id,
         )
         text = "\n".join(source.text for source in sources)
-        assert mara.appearance in text
+        assert (mara.appearance in text) is outfit_expected
         assert (updated.current_clothing in text) is outfit_expected
         if not mara_present:
             assert "Discussed/background character profiles" in text
