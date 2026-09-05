@@ -86,6 +86,7 @@ VENICE_PROVIDER_NAME = "venice"
 VENICE_BASE_URL = "https://api.venice.ai/api/v1"
 VENICE_MODEL_LIST_PATH = "/models?type=all"
 VENICE_IMAGE_PROMPT_MAX_CHARS = 7500
+VENICE_IMAGE_EDIT_PROMPT_MAX_CHARS = 32768
 VENICE_VIDEO_PROMPT_MAX_CHARS = 2500
 VENICE_IMAGE_TIMEOUT_SECONDS = 180.0
 VENICE_VIDEO_POLL_INTERVAL_SECONDS = 5.0
@@ -144,6 +145,7 @@ class VeniceClient:
         self.video_timeout = max(0.0, video_timeout)
         self.retry_max_attempts = retry_max_attempts
         self.call_deadline_seconds = call_deadline_seconds
+        self._image_prompt_model_limits: dict[str, int] = {}
 
     def _configured_max_attempts(self) -> int:
         if self.retry_max_attempts is None:
@@ -194,6 +196,7 @@ class VeniceClient:
 
     async def list_models_with_metadata(self) -> ProviderModelListResponse:
         payload = await self._get_json(path=VENICE_MODEL_LIST_PATH)
+        self._image_prompt_model_limits = venice_image_prompt_model_limits(payload)
         return ProviderModelListResponse(
             models=normalize_venice_models(payload),
             raw_metadata=payload,
@@ -249,11 +252,33 @@ class VeniceClient:
             yield _parse_chat_stream_chunk(event)
 
     async def generate_image(self, request: ImageRequest) -> ImageResponse:
-        if _source_image_paths(request):
+        has_references = bool(_source_image_paths(request))
+        endpoint_limit = (
+            VENICE_IMAGE_EDIT_PROMPT_MAX_CHARS
+            if has_references
+            else VENICE_IMAGE_PROMPT_MAX_CHARS
+        )
+        max_chars = min(
+            endpoint_limit,
+            self._image_prompt_model_limits.get(request.model_id, endpoint_limit),
+        )
+        if len(request.prompt) > max_chars:
+            raise ProviderError(
+                ProviderErrorCategory.CONTEXT_LIMIT_EXCEEDED,
+                f"Image prompt has {len(request.prompt)} characters; Venice model "
+                f"{request.model_id} accepts at most {max_chars} characters for "
+                f"{'editing' if has_references else 'generation'}. Shorten the "
+                "prompt or select a model with a larger prompt limit.",
+                diagnostics={
+                    "prompt_characters": len(request.prompt),
+                    "prompt_max_characters": max_chars,
+                },
+            )
+        if has_references:
             return await self._edit_image(request)
         payload: dict[str, Any] = {
             "model": request.model_id,
-            "prompt": _compact_image_prompt(request.prompt),
+            "prompt": request.prompt,
             "format": "png",
             "return_binary": False,
             "safe_mode": _image_safe_mode(request),
@@ -282,7 +307,7 @@ class VeniceClient:
         if len(source_paths) > 1 or request.safe_mode is False:
             multi_edit_payload: dict[str, Any] = {
                 "modelId": request.model_id,
-                "prompt": _compact_image_prompt(request.prompt),
+                "prompt": request.prompt,
                 "images": [_source_image_base64(path) for path in source_paths[:3]],
                 "output_format": "png",
                 "safe_mode": _image_safe_mode(request),
@@ -310,7 +335,7 @@ class VeniceClient:
             )
         edit_payload: dict[str, Any] = {
             "model": request.model_id,
-            "prompt": _compact_image_prompt(request.prompt),
+            "prompt": request.prompt,
             "image": _source_image_base64(source_paths[0]),
             "output_format": "png",
             "safe_mode": _image_safe_mode(request),
@@ -1434,6 +1459,28 @@ def normalize_venice_models(payload: dict[str, Any]) -> list[ProviderModel]:
     return normalized
 
 
+def venice_image_prompt_model_limits(payload: dict[str, Any]) -> dict[str, int]:
+    """Read official model constraints without changing provider metadata."""
+    records = payload.get("data") or payload.get("models") or []
+    if not isinstance(records, list):
+        return {}
+    limits: dict[str, int] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        model_id = record.get("id")
+        model_spec = record.get("model_spec")
+        if not isinstance(model_id, str) or not isinstance(model_spec, dict):
+            continue
+        constraints = model_spec.get("constraints")
+        if not isinstance(constraints, dict):
+            continue
+        limit = constraints.get("promptCharacterLimit")
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            limits[model_id] = limit
+    return limits
+
+
 def _venice_model_pricing(record: dict[str, Any]) -> ProviderModelPricing | None:
     model_spec = record.get("model_spec")
     if not isinstance(model_spec, dict):
@@ -1980,14 +2027,6 @@ def _supports_vision(record: dict[str, Any]) -> bool:
     if not isinstance(capabilities, dict):
         return False
     return capabilities.get("supportsVision") is True
-
-
-def _compact_image_prompt(prompt: str) -> str:
-    return _compact_prompt(
-        prompt,
-        max_chars=VENICE_IMAGE_PROMPT_MAX_CHARS,
-        label="Venice image",
-    )
 
 
 def _compact_video_prompt(prompt: str) -> str:

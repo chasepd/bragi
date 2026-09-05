@@ -110,6 +110,7 @@ from bragi.services.generation_settings import (
     sanitize_openrouter_chat_reasoning_overrides,
     sanitize_thinking_level,
 )
+from bragi.services.image_prompt_limits import refresh_image_prompt_model_limits
 from bragi.services.image_style_settings import (
     DEFAULT_IMAGE_STYLE_PRESET,
     IMAGE_STYLE_PRESET_SETTING,
@@ -365,6 +366,11 @@ class SettingsService:
             self.repositories.begin_transaction()
             for model in models:
                 self._save_provider_model(model, client=client)
+            refresh_image_prompt_model_limits(
+                self.repositories,
+                provider=provider,
+                raw_metadata=listing.raw_metadata,
+            )
             self.repositories.mark_missing_provider_models_unavailable(
                 provider=provider,
                 available_model_ids={model.model_id for model in models},

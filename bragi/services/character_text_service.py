@@ -480,6 +480,8 @@ class CharacterTextAttachmentMediaRunner(Protocol):
         character: CharacterRecord,
         visual_prompt: str,
         scene_context: str,
+        current_action: str = "",
+        facial_expression: str = "",
         retry_progress_callback: ProviderRetryProgressCallback | None = None,
         current_user_id: str | None = None,
     ) -> MediaAssetRecord: ...
@@ -2391,10 +2393,7 @@ class CharacterTextService:
             history=history,
             repositories=self.repositories,
         )
-        visual_prompt = _attachment_visual_prompt(
-            decision,
-            character=character,
-        )
+        visual_prompt = decision.visual_prompt
         try:
             if decision.kind == "character_image":
                 asset = await media_service.generate_character_text_character_image(
@@ -2403,6 +2402,8 @@ class CharacterTextService:
                     character=character,
                     visual_prompt=visual_prompt,
                     scene_context=scene_context,
+                    current_action=decision.current_action,
+                    facial_expression=decision.facial_expression,
                     current_user_id=current_user_id,
                 )
             else:
@@ -4221,35 +4222,6 @@ def _attachment_decision_from_data(
         current_action=current_action,
         facial_expression=facial_expression,
     )
-
-
-def _attachment_visual_prompt(
-    decision: _AttachmentDecision,
-    *,
-    character: CharacterRecord,
-) -> str:
-    if decision.kind != "character_image":
-        return decision.visual_prompt
-    field_lines = [
-        _detail_line("Current action/pose", decision.current_action),
-        _detail_line("Facial expression", decision.facial_expression),
-    ]
-    field_lines = [line for line in field_lines if line]
-    if not field_lines:
-        return decision.visual_prompt
-    detail_lines = [
-        f"Character visual direction for {character.name}:",
-        *field_lines,
-    ]
-    details = "\n".join(line for line in detail_lines if line.strip())
-    return f"{decision.visual_prompt.strip()}\n\n{details}"
-
-
-def _detail_line(label: str, value: str) -> str:
-    text = _string_field(value)
-    if not text:
-        return ""
-    return f"{label}: {text}"
 
 
 def _string_field(value: object) -> str:

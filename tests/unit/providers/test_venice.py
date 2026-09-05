@@ -2928,7 +2928,7 @@ def test_venice_describe_image_posts_multimodal_chat_request() -> None:
     ]
 
 
-def test_venice_generate_image_caps_prompt_to_provider_limit() -> None:
+def test_venice_generate_image_rejects_oversized_prompt_without_truncating() -> None:
     image_bytes = b"fake-venice-image"
     transport = RecordingTransport(
         [
@@ -2949,6 +2949,77 @@ def test_venice_generate_image_caps_prompt_to_provider_limit() -> None:
         + "closing detail"
     )
 
+    with pytest.raises(ProviderError, match="7500 characters") as exc_info:
+        asyncio.run(
+            client.generate_image(
+                ImageRequest(
+                    provider="venice",
+                    model_id="hidream",
+                    prompt=prompt,
+                    source_save_id="save-1",
+                    source_message_id="message-1",
+                )
+            )
+        )
+
+    assert exc_info.value.category == ProviderErrorCategory.CONTEXT_LIMIT_EXCEEDED
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("safe_mode", [True, False])
+def test_venice_edit_accepts_complete_prompt_up_to_edit_endpoint_limit(
+    tmp_path: Path,
+    safe_mode: bool,
+) -> None:
+    reference_path = tmp_path / "reference.png"
+    reference_path.write_bytes(b"fake-reference")
+    transport = RecordingBinaryTransport(
+        [BinaryHttpResponse(status_code=200, body=b"image", headers={})]
+    )
+    secrets = InMemorySecretStore()
+    secrets.set_api_key("venice", "venice-secret")
+    client = VeniceClient(secret_store=secrets, binary_transport=transport)
+    prompt = " " + "x" * 32766 + " "
+    assert len(prompt) == 32768
+
+    asyncio.run(
+        client.generate_image(
+            ImageRequest(
+                provider="venice",
+                model_id="qwen-image-2-edit",
+                prompt=prompt,
+                source_save_id="save-1",
+                source_message_id="message-1",
+                source_media_path=reference_path,
+                safe_mode=safe_mode,
+                allow_prompt_compression=True,
+                prompt_required_text="ending",
+                image_prompt_brief={"reference_mappings": ["Mara"]},
+            )
+        )
+    )
+
+    payload = transport.calls[0]["payload"]
+    assert payload["prompt"] == prompt
+    assert "allow_prompt_compression" not in payload
+    assert "prompt_required_text" not in payload
+    assert "image_prompt_brief" not in payload
+
+
+def test_venice_generate_preserves_exact_prompt_at_endpoint_limit() -> None:
+    transport = RecordingTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                payload={"images": [base64.b64encode(b"image").decode("ascii")]},
+            )
+        ]
+    )
+    secrets = InMemorySecretStore()
+    secrets.set_api_key("venice", "venice-secret")
+    client = VeniceClient(secret_store=secrets, transport=transport)
+    prompt = " " + "x" * 7498 + " "
+
     asyncio.run(
         client.generate_image(
             ImageRequest(
@@ -2961,13 +3032,73 @@ def test_venice_generate_image_caps_prompt_to_provider_limit() -> None:
         )
     )
 
-    submitted_prompt = transport.calls[0]["payload"]["prompt"]
-    assert isinstance(submitted_prompt, str)
-    assert len(prompt) > VENICE_IMAGE_PROMPT_MAX_CHARS
-    assert len(submitted_prompt) <= VENICE_IMAGE_PROMPT_MAX_CHARS
-    assert submitted_prompt.startswith("opening detail")
-    assert submitted_prompt.endswith("closing detail")
-    assert transport.calls[0]["url"].endswith("/api/v1/image/generate")
+    assert transport.calls[0]["payload"]["prompt"] == prompt
+
+
+def test_venice_edit_rejects_oversized_prompt_before_reading_reference() -> None:
+    transport = RecordingBinaryTransport([])
+    client = VeniceClient(
+        secret_store=InMemorySecretStore(), binary_transport=transport
+    )
+
+    with pytest.raises(ProviderError, match="32768 characters"):
+        asyncio.run(
+            client.generate_image(
+                ImageRequest(
+                    provider="venice",
+                    model_id="qwen-image-2-edit",
+                    prompt="x" * 32769,
+                    source_save_id="save-1",
+                    source_message_id="message-1",
+                    source_media_path=Path("missing-reference.png"),
+                )
+            )
+        )
+
+    assert transport.calls == []
+
+
+def test_venice_image_honors_smaller_listed_model_prompt_limit() -> None:
+    transport = RecordingTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                payload={
+                    "data": [
+                        {
+                            "id": "hidream",
+                            "type": "image",
+                            "model_spec": {
+                                "constraints": {"promptCharacterLimit": 1000}
+                            },
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    secrets = InMemorySecretStore()
+    secrets.set_api_key("venice", "venice-secret")
+    client = VeniceClient(secret_store=secrets, transport=transport)
+    listing = asyncio.run(client.list_models_with_metadata())
+    assert listing.raw_metadata["data"][0]["model_spec"]["constraints"] == {
+        "promptCharacterLimit": 1000
+    }
+
+    with pytest.raises(ProviderError, match="1000 characters"):
+        asyncio.run(
+            client.generate_image(
+                ImageRequest(
+                    provider="venice",
+                    model_id="hidream",
+                    prompt="x" * 1001,
+                    source_save_id="save-1",
+                    source_message_id="message-1",
+                )
+            )
+        )
+
+    assert len(transport.calls) == 1
 
 
 @pytest.mark.parametrize(

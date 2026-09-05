@@ -256,6 +256,39 @@ class ContextAssemblyService:
                 else ()
             ),
         )
+        if (
+            source_message is not None and details.messages
+            and source_message.id != details.messages[-1].id
+        ):
+            # Effective scenario data includes later evolution and manual edits;
+            # it cannot establish the setting of a past frame.
+            sources = tuple(
+                source for source in sources
+                if source.tier not in {"scenario_header", "scenario_section"}
+            )
+        # Budget the selected frame before older supporting material. Essential
+        # visual context remains intact even when the diagnostic cap is tiny.
+        image_tier_priority = {
+            "selected_message": 0,
+            "present_characters": 1,
+            "current_scene": 2,
+            "current_location": 3,
+            "discussed_characters": 4,
+            "prior_image_continuity": 5,
+            "chronicle_before_selected": 6,
+            "recent_chronicle": 6,
+        }
+        sources = tuple(
+            replace(source, always_include=True)
+            if source.tier in {
+                "selected_message", "present_characters", "current_scene",
+                "current_location",
+            }
+            else source
+            for source in sorted(
+                sources, key=lambda source: image_tier_priority.get(source.tier, 7)
+            )
+        )
         selected_sources, breakdown = apply_context_budget(
             sources,
             settings=context_budget_settings(self.repositories, save_id=save_id),
@@ -264,6 +297,160 @@ class ContextAssemblyService:
             "\n".join(source.text for source in selected_sources if source.text),
             breakdown,
         )
+
+
+def image_scene_characters(
+    repositories: PersistenceRepositories,
+    save_id: str,
+    source_message_id: str | None = None,
+) -> tuple[CharacterRecord, ...]:
+    """Return confirmed, source-eligible image participants in stable ID order.
+
+    Presence is independent of name mentions. Historical identities confirmed
+    by per-message presence remain available with mutable visual fields removed.
+    """
+    details = repositories.load_save_details(save_id)
+    if details is None:
+        raise ValueError(f"Unknown save id: {save_id}")
+    source, _ = _image_context_messages(
+        messages=details.messages, source_message_id=source_message_id
+    )
+    source_message_id = source.id if source is not None else None
+    positions = {message.id: index for index, message in enumerate(details.messages)}
+    historical = bool(details.messages and source_message_id != details.messages[-1].id)
+    snapshot = repositories.get_scene_snapshot(save_id)
+    if not _image_record_is_at_or_before(
+        snapshot, source_message_id=source_message_id, message_positions=positions
+    ):
+        snapshot = None
+    present_ids = _image_present_character_ids(
+        repositories=repositories, details=details,
+        source_message_id=source_message_id, snapshot=snapshot,
+    )
+    return tuple(sorted(
+        (
+            _image_character_profile(
+                character, details=details, source_message_id=source_message_id
+            )
+            for character in repositories.list_characters(save_id)
+            if character.id in present_ids
+            and (
+                historical or _image_record_is_at_or_before(
+                    character, source_message_id=source_message_id,
+                    message_positions=positions,
+                )
+            )
+        ),
+        key=lambda character: character.id,
+    ))
+
+
+def _image_character_profile(
+    character: CharacterRecord,
+    *,
+    details: SaveDetailsRecord,
+    source_message_id: str | None,
+) -> CharacterRecord:
+    # Registry edits and reference uploads can change visual fields without
+    # advancing message provenance. The selected text supplies historical details;
+    # current visual fields cannot establish how the character looked then.
+    if (
+        details.messages
+        and source_message_id is not None
+        and source_message_id != details.messages[-1].id
+    ):
+        return replace(
+            character, appearance="", visual_notes="", current_clothing="", age="",
+            status="", location_id=None,
+        )
+    return character
+
+
+def _image_present_character_ids(
+    *,
+    repositories: PersistenceRepositories,
+    details: SaveDetailsRecord,
+    source_message_id: str | None,
+    snapshot: SceneSnapshotRecord | None,
+) -> set[str]:
+    if source_message_id is not None:
+        presence = repositories.list_message_scene_presence(
+            details.save.id, message_id=source_message_id,
+        )
+        if presence:
+            return {record.character_id for record in presence}
+    latest_id = details.messages[-1].id if details.messages else None
+    if source_message_id == latest_id and snapshot is not None:
+        return set(snapshot.present_character_ids)
+    return set()
+
+
+def _image_record_is_at_or_before(
+    record: object | None,
+    *,
+    source_message_id: str | None,
+    message_positions: dict[str, int] | None,
+) -> bool:
+    if record is None or source_message_id is None or message_positions is None:
+        return True
+    selected_position = message_positions.get(source_message_id)
+    if selected_position is None:
+        return False
+    latest_position = max(message_positions.values(), default=selected_position)
+    record_sources = tuple(
+        value for field in (
+            "first_seen_message_id", "source_message_id", "last_updated_message_id"
+        ) if isinstance((value := getattr(record, field, None)), str) and value
+    )
+    if not record_sources:
+        return selected_position == latest_position
+    return all(
+        message_positions.get(record_source, latest_position + 1) <= selected_position
+        for record_source in record_sources
+    )
+
+
+def _image_scene_facts(
+    facts: list[SceneFactRecord],
+    *,
+    details: SaveDetailsRecord | None,
+    source_message_id: str | None,
+    present_character_ids: set[str],
+) -> list[SceneFactRecord]:
+    if details is None or source_message_id is None:
+        return []
+    positions = {message.id: index for index, message in enumerate(details.messages)}
+    selected_position = positions.get(source_message_id)
+    if selected_position is None:
+        return []
+    selected_turn = sum(
+        message.role == "narrator"
+        for message in details.messages[:selected_position + 1]
+    )
+    return [
+        fact for fact in facts
+        if fact.fact_type != "pending_reaction"
+        and fact.archived_at is None
+        and fact.created_turn_number <= selected_turn
+        and (
+            fact.expires_after_turn_number is None
+            or fact.expires_after_turn_number > selected_turn
+        )
+        and fact.provenance
+        and all(
+            source.source_message_id in positions
+            and positions[source.source_message_id] <= selected_position
+            for source in fact.provenance
+        )
+        and (
+            fact.subject_type != "character"
+            or fact.subject_id in present_character_ids
+        )
+        and (
+            fact.target_type != "character"
+            or fact.target_id in present_character_ids
+        )
+    ]
 
 
 def _image_safe_scenario_section(value: str) -> bool:
@@ -1170,6 +1357,15 @@ def deterministic_context_sources(
         else repositories.load_save_details(save_id)
     )
     scenario = details.scenario if details is not None else None
+    if mode == "image" and source_message_id is None and details and details.messages:
+        source_message_id = details.messages[-1].id
+    historical_image = bool(
+        mode == "image" and details and details.messages
+        and source_message_id != details.messages[-1].id
+    )
+    record_is_eligible = (
+        _image_record_is_at_or_before if mode == "image" else _record_is_at_or_before
+    )
     message_positions = (
         {message.id: index for index, message in enumerate(details.messages)}
         if details is not None and source_message_id is not None
@@ -1180,7 +1376,10 @@ def deterministic_context_sources(
         if scene_snapshot is _MISSING
         else cast(SceneSnapshotRecord | None, scene_snapshot)
     )
-    if message_positions is not None and not _record_is_at_or_before(
+    # Keep the scene identity for independently dated physical facts even when
+    # its mutable snapshot text is ineligible for a historical image.
+    fact_snapshot = snapshot
+    if message_positions is not None and not record_is_eligible(
         snapshot,
         source_message_id=source_message_id,
         message_positions=message_positions,
@@ -1204,6 +1403,11 @@ def deterministic_context_sources(
     present_character_ids = (
         set(snapshot.present_character_ids) if snapshot is not None else set()
     )
+    if mode == "image" and details is not None:
+        present_character_ids = _image_present_character_ids(
+            repositories=repositories, details=details,
+            source_message_id=source_message_id, snapshot=snapshot,
+        )
     if message_visibility is not None:
         message_visibility_records = tuple(message_visibility)
     elif present_character_ids:
@@ -1223,7 +1427,7 @@ def deterministic_context_sources(
     location_map = {
         location.id: location
         for location in location_records
-        if _record_is_at_or_before(
+        if record_is_eligible(
             location,
             source_message_id=source_message_id,
             message_positions=message_positions,
@@ -1232,16 +1436,32 @@ def deterministic_context_sources(
     character_map = {
         character.id: character
         for character in character_records
-        if _record_is_at_or_before(
+        if (historical_image and character.id in present_character_ids)
+        or record_is_eligible(
             character,
             source_message_id=source_message_id,
             message_positions=message_positions,
         )
     }
+    if mode == "image" and details is not None:
+        character_map = {
+            character_id: _image_character_profile(
+                character, details=details, source_message_id=source_message_id
+            )
+            for character_id, character in character_map.items()
+        }
+        if historical_image:
+            # Fact labels are captured with their evidence; live location names
+            # and descriptions can be changed by undated accepted suggestions.
+            location_map = {}
+        if snapshot is not None:
+            snapshot = replace(
+                snapshot, present_character_ids=sorted(present_character_ids)
+            )
     raw_threads = [
         thread
         for thread in active_thread_records
-        if _record_is_at_or_before(
+        if record_is_eligible(
             thread,
             source_message_id=source_message_id,
             message_positions=message_positions,
@@ -1263,7 +1483,7 @@ def deterministic_context_sources(
         snapshot,
         include_legacy_detail=True,
     )
-    if snapshot is not None and world_time_text:
+    if snapshot is not None and world_time_text and not historical_image:
         sources.append(
             ContextSource(
                 tier="current_scene",
@@ -1291,22 +1511,33 @@ def deterministic_context_sources(
             always_include=mode == "narrator",
         )
     )
-    if snapshot is not None:
+    if snapshot is not None and not historical_image:
         sources.extend(
             _scene_snapshot_sources(snapshot, location_map, character_map, mode)
         )
-        if mode == "narrator":
-            sources.extend(
-                _scene_fact_sources(
-                    repositories.list_scene_facts(
-                        save_id,
-                        scene_snapshot_id=snapshot.id,
-                        scene_generation=snapshot.scene_generation,
-                    ),
-                    locations=location_map,
-                    characters=character_map,
-                )
+    scene_fact_snapshot = fact_snapshot if historical_image else snapshot
+    if scene_fact_snapshot is not None:
+        facts = repositories.list_scene_facts(
+            save_id,
+            scene_snapshot_id=scene_fact_snapshot.id,
+            scene_generation=scene_fact_snapshot.scene_generation,
+        )
+        if mode == "image":
+            facts = _image_scene_facts(
+                facts,
+                details=details,
+                source_message_id=source_message_id,
+                present_character_ids=present_character_ids,
             )
+        sources.extend(
+            _scene_fact_sources(
+                facts,
+                locations=location_map,
+                characters=character_map,
+                mode=mode,
+            )
+        )
+    if snapshot is not None:
         sources.extend(
             _dating_route_context_sources(
                 repositories=repositories,
@@ -1324,6 +1555,48 @@ def deterministic_context_sources(
                 always_include=mode == "narrator",
             )
         )
+    if mode == "image" and details is not None:
+        if snapshot is None or historical_image:
+            present = [
+                character_map[character_id]
+                for character_id in sorted(present_character_ids)
+                if character_id in character_map
+            ]
+            if present:
+                sources.append(ContextSource(
+                    tier="present_characters", source_type="character",
+                    source_id=",".join(character.id for character in present),
+                    text=_characters_text(present, "image"),
+                    reason="message scene presence", always_include=True,
+                ))
+        selected, _ = _image_context_messages(
+            messages=details.messages, source_message_id=source_message_id
+        )
+        if selected is not None:
+            discussed = [
+                character for character in character_map.values()
+                if character.id not in present_character_ids
+                and character_name_is_mentioned(
+                    name=character.name, aliases=character.aliases, text=selected.body
+                )
+            ]
+            if discussed:
+                sources.append(ContextSource(
+                    tier="discussed_characters", source_type="character",
+                    source_id=",".join(character.id for character in discussed),
+                    text=_characters_text(discussed, "image").replace(
+                        "Present characters: ",
+                        "Discussed/background character profiles "
+                        "(not confirmed present; "
+                        "a name mention does not place someone in the frame): ",
+                        1,
+                    ),
+                    reason="discussed characters, not scene participants",
+                ))
+        # Mutable linked lore and template world state have no field-level
+        # historical versions. Restrict past frames to reliably dated visuals.
+        if historical_image:
+            return _dedupe_context_sources(tuple(sources))
     sources.extend(
         _first_contact_exploration_context_sources(
             scenario,
@@ -2466,6 +2739,7 @@ def _scene_fact_sources(
     *,
     locations: dict[str, LocationRecord],
     characters: dict[str, CharacterRecord],
+    mode: str = "narrator",
 ) -> tuple[ContextSource, ...]:
     ordered = sorted(
         facts,
@@ -2484,7 +2758,10 @@ def _scene_fact_sources(
     )[:MAX_SCENE_FACT_CONTEXT]
     if not ordered:
         return ()
-    lines = ["Volatile current-scene facts (not durable lore):"]
+    lines = [
+        "Visible physical facts at the selected moment:"
+        if mode == "image" else "Volatile current-scene facts (not durable lore):"
+    ]
     for fact in ordered:
         subject = _scene_fact_reference_text(
             fact.subject_type,
@@ -3213,7 +3490,13 @@ def _active_thread_audience_character_ids(
 
 def _location_text(location: LocationRecord, mode: str) -> str:
     parts = [f"Current location: {location.name}"]
-    detail = location.visual_description if mode == "image" else location.description
+    detail = location.description
+    if mode == "image":
+        detail = location.visual_description.strip() or (
+            "Location description (extract visible details only): "
+            + location.description
+            if location.description else ""
+        )
     if detail:
         parts.append(detail)
     if location.status:
@@ -3232,9 +3515,12 @@ def _characters_text(characters: list[CharacterRecord], mode: str) -> str:
                 part
                 for part in (
                     f"age: {character.age}" if character.age else "",
-                    character.appearance,
-                    character.visual_notes,
-                    character.current_clothing,
+                    (f"physical appearance: {character.appearance}"
+                     if character.appearance else ""),
+                    (f"visual notes: {character.visual_notes}"
+                     if character.visual_notes else ""),
+                    (f"current clothing: {character.current_clothing}"
+                     if character.current_clothing else ""),
                     f"status: {character.status}" if character.status else "",
                 )
                 if part
@@ -3382,7 +3668,9 @@ def _image_context_messages(
     source_message_id: str | None,
 ) -> tuple[MessageRecord | None, tuple[MessageRecord, ...]]:
     if source_message_id is None:
-        return None, tuple(messages[-8:])
+        if not messages:
+            return None, ()
+        return messages[-1], tuple(messages[-8:-1])
     source_index = next(
         (
             index

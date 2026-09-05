@@ -104,7 +104,7 @@ class RuntimeFakeProvider:
     async def chat(self, request: ChatRequest) -> ChatResponse:
         self.chat_requests.append(request)
         first_message = request.messages[0].body
-        if "image" in first_message.casefold() and "prompt" in first_message.casefold():
+        if request.prompt_purpose == "image_prompt":
             body = "cinematic drafted image prompt"
         elif first_message.startswith("You are helping draft"):
             section_id = _requested_scenario_section(request.messages[-1].body)

@@ -5160,6 +5160,116 @@ def test_import_save_repairs_source_media_asset_when_source_is_snapshot_only(
     assert imported_metadata["source_character_reference_asset_ids"] == []
 
 
+def test_export_import_preserves_exact_image_prompt_and_reference_mapping(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+) -> None:
+    media_dir = tmp_path / "media"
+    save = _seed_bundle_save(repositories, media_dir)
+    characters = [
+        repositories.add_character(
+            save_id=save.id, name=name, character_id=f"character-{name.lower()}"
+        )
+        for name in ("Orro", "Mara")
+    ]
+    references = []
+    for character in characters:
+        reference = repositories.create_media_asset(
+            save_id=save.id,
+            type="image",
+            path=f"{save.id}/images/reference-{character.id}.png",
+            prompt=f"Reference portrait of {character.name}",
+            provider="fake-image-provider",
+            model="fake-image-model",
+            status="succeeded",
+            metadata={"kind": "character_reference", "character_id": character.id},
+        )
+        (media_dir / reference.path).write_bytes(character.name.encode())
+        references.append(reference)
+    exact_prompt = (
+        "  Orro kneels left of the brass console; Mara stands at the right window.\n"
+        "Mara's silver brooch reflects the warm lumière; Orro holds a folded map.\n"
+        "Reference image 1 anchors Orro; reference image 2 anchors Mara.\n"
+    ).ljust(1234)
+    prompt_metadata = {
+        "version": 1,
+        "submitted_chars": 1234,
+        "max_chars": 7500,
+        "fallback_compressed": True,
+    }
+    scene = repositories.create_media_asset(
+        save_id=save.id,
+        source_message_id=NARRATOR_MESSAGE_ID,
+        source_media_asset_id=references[0].id,
+        type="image",
+        path=f"{save.id}/images/detailed-scene.png",
+        prompt=exact_prompt,
+        provider="venice",
+        model="test-image-model",
+        status="succeeded",
+        metadata={
+            "kind": "scene_image",
+            "image_prompt": prompt_metadata,
+            "source_character_reference_asset_id": references[0].id,
+            "source_character_reference_asset_ids": [item.id for item in references],
+            "source_character_reference_character_ids": [
+                character.id for character in characters
+            ],
+            "source_character_reference_character_names": ["Orro", "Mara"],
+        },
+    )
+    (media_dir / scene.path).write_bytes(b"detailed scene image")
+    bundle_path = tmp_path / "detailed-scene.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(save.id, bundle_path)
+    with zipfile.ZipFile(bundle_path) as bundle:
+        data = json.loads(bundle.read("data.json"))
+    exported_scene = _media_asset_by_id(data["media_assets"], scene.id)
+    assert exported_scene["prompt"] == exact_prompt
+    exported_metadata = exported_scene["metadata_json"]
+    assert isinstance(exported_metadata, str)
+    assert json.loads(exported_metadata)["image_prompt"] == prompt_metadata
+    imported_save_id = _imported_save_id(service.import_save(bundle_path))
+
+    imported_characters = {
+        character.name: character
+        for character in repositories.list_characters(imported_save_id)
+    }
+    imported_assets = repositories.list_media_assets(imported_save_id)
+    imported_scene = next(
+        asset for asset in imported_assets
+        if json.loads(asset.metadata_json).get("kind") == "scene_image"
+    )
+    imported_references = {
+        json.loads(asset.metadata_json)["character_id"]: asset
+        for asset in imported_assets
+        if json.loads(asset.metadata_json).get("kind") == "character_reference"
+    }
+    expected_character_ids = [
+        imported_characters[name].id for name in ("Orro", "Mara")
+    ]
+    expected_reference_ids = [
+        imported_references[character_id].id for character_id in expected_character_ids
+    ]
+    metadata = json.loads(imported_scene.metadata_json)
+    assert imported_scene.prompt == exact_prompt
+    assert len(imported_scene.prompt) == metadata["image_prompt"]["submitted_chars"]
+    assert metadata["image_prompt"] == prompt_metadata
+    assert imported_scene.source_message_id != NARRATOR_MESSAGE_ID
+    assert imported_scene.source_media_asset_id == expected_reference_ids[0]
+    assert metadata["source_character_reference_asset_id"] == expected_reference_ids[0]
+    assert metadata["source_character_reference_asset_ids"] == expected_reference_ids
+    assert metadata["source_character_reference_character_ids"] == (
+        expected_character_ids
+    )
+    assert metadata["source_character_reference_character_names"] == ["Orro", "Mara"]
+    assert (media_dir / imported_scene.path).read_bytes() == b"detailed scene image"
+    for name in ("Orro", "Mara"):
+        reference = imported_references[imported_characters[name].id]
+        assert (media_dir / reference.path).read_bytes() == name.encode()
+
+
 def test_import_save_remaps_media_source_metadata(
     repositories: PersistenceRepositories,
     tmp_path: Path,

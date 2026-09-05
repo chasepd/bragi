@@ -81,9 +81,157 @@ ongoing actions, physical constraints, environment state, line of sight, and
 pending reactions. Physical facts remain active for the current scene; actions,
 line of sight, and pending reactions expire after the following narrator turn.
 Conflicting facts replace the prior value deterministically, while evidence and
-source-message provenance remain auditable. Active scene facts are included only
-in narrator context, never image prompts, and are preserved by snapshots,
-forking, and chat bundle export/import.
+source-message provenance remain auditable. Active scene facts are preserved by
+snapshots, forking, and chat bundle export/import. Image context includes grounded
+physical facts for the selected moment, excluding pending reactions, expired or
+archived records, other scene generations, and facts with missing, unknown, or
+future message provenance.
+
+## Image Scene Grounding
+
+Image context puts the selected message first, followed by confirmed participants,
+physical scene facts, the eligible snapshot and location, and then older supporting
+context. The selected message, complete relevant visual profiles, current scene
+facts, and location remain protected when the context character budget is small.
+Up to seven messages before the selected moment supply continuity; messages after
+that moment never enter the transcript. If no source is specified, the latest
+message becomes the selected moment.
+
+`image_scene_characters(repositories, save_id, source_message_id=None)` supplies
+one deterministic participant selection for image drafting, clothing, and
+reference mappings. Per-message presence records take precedence over the scene
+snapshot. Without presence records, the snapshot supplies participants only for
+the latest message (or a save with no messages). A mentioned name never establishes
+presence: other mentioned profiles are labeled as discussed/background context.
+Empty presence and absent presence currently share the same persisted shape, so
+both use that latest-message fallback.
+
+Historical frames retain character identities confirmed by per-message presence,
+even when their current profiles have later provenance. They omit current
+appearance, visual notes, clothing, age, status, and character location. They also
+omit all mutable snapshot details (including time, situation, weather, objects,
+and hazards), location descriptions/status, linked lore, template world state,
+and current effective scenario headers/selected sections that may reflect later
+evolution or manual edits.
+Registry edits, accepted suggestions, and reference uploads can change these
+values without advancing their message provenance. The selected text supplies
+historical visual details; no historical state is reconstructed. Eligible dated
+physical facts remain available through the snapshot's identity and generation,
+using their stored location labels rather than mutable location registry names.
+Historical reference images need eligible source-message
+provenance and a creation timestamp at or before the selected moment; a solo image
+reports an unavailable reference if the currently linked image cannot qualify.
+The narrator's existing cutoff behavior is unchanged. Image profiles
+keep appearance, visual notes, and current clothing in separate fields without
+short-field clipping. Locations fall back to their general description when the
+visual description is empty, explicitly asking the drafting model to extract
+visible details only.
+
+## Image prompt evaluation
+
+Use this synthetic scenario to compare actual drafted prompts and resulting
+images before and after changing prompt generation. The examples contain no
+personal roleplay data. Live evaluation is optional and stays outside CI; unit
+tests use fake providers returning ordinary prose.
+
+### Fixture: the rain observatory
+
+Create a disposable save with these adult characters:
+
+| Character | Stable appearance | Current clothing |
+| --- | --- | --- |
+| Mira | Short adult human with copper curls, dark brown eyes, freckles, and a narrow crescent scar below her left eye. | Forest-green wool coat with brass toggles, dark trousers, and rain-spotted brown boots. |
+| Oren | Tall adult humanoid with silver scales, a dark blue crest, amber eyes, and a chipped left horn. | Navy canvas coveralls with rolled sleeves and a leather tool belt. |
+| Vale | Adult human with straight black hair and round glasses. Vale is away from the observatory and is only discussed. | Rust-red sweater. |
+
+The observatory is a circular stone room. A barred east window overlooks rain.
+A brass chest stands on a waist-high oak bench. A lit oil lamp sits on a shelf
+behind the bench, leaving the foreground cooler than the background. A copper
+door is closed on the west wall. Keep the visual description of this location
+empty and put these details in its general description to exercise the fallback.
+
+Use this selected narrator message:
+
+> Mira kneels to the left of the bench and braces the open chest lid with her
+> right palm. Oren stands to the right, lifting a blue glass key out of the chest
+> with his left hand. His right hand rests flat on the bench. Mira watches the
+> hinge with a concentrated frown; Oren looks down at the key with a small smile.
+> Rain beads against the barred window. “Vale would recognize this,” Mira says.
+
+Record matching physical scene facts: Mira's kneeling position, Oren standing
+to the right, the key held in Oren's left hand, the closed west door, and the
+lamp's shelf position. Add an expired fact about the chest being closed and a
+pending reaction about Oren possibly turning toward the door. Neither belongs
+in the selected image. A private note that Mira worries about a future visitor
+must not create an additional figure.
+
+### Cases
+
+Run every case through the UI that normally invokes that image purpose. Keep
+the same image model, image dimensions, style, and character references between
+versions. Use a fixed image seed when the chosen provider supports one. Save
+actual submitted prompts from the image prompt details alongside the images.
+
+| Case | Input and setup | Required observations |
+| --- | --- | --- |
+| Manual scene | Generate an image from the selected narrator message. | Two subjects with distinct actions, correct key ownership, lid and bench interactions, and spatially coherent room details. Vale stays absent. |
+| Automatic scene | Enable automatic images, queue the same moment, then continue narration so Oren leaves and Mira changes into a yellow raincoat before the queued job executes. | The prepared image retains Oren, Mira's green coat, original objects, selected style, and reference order. |
+| Reference-assisted scene | Attach Oren's reference first and Mira's second; use references showing old outfits and different backgrounds. | Each input image anchors the correct identity; the new scene, actions, outfits, and lighting remain explicit. |
+| Reusable character reference | Generate Mira's reference from her profile. | Copper curls, freckles, eye color and left-eye scar remain identifiable against a simple background; the chest-opening action is absent. |
+| Solo character picture | Generate Oren's solo image while the scene contains both characters. | One visible character with silver scales, blue crest, chipped horn, and navy coveralls; Mira does not appear. |
+| Selfie attachment | Mira sends “The copper door is behind me; the rain finally stopped” with a selfie. | Plausible selfie perspective and hands, recognizable Mira, a copper door behind her, and relevant surroundings. |
+| Object attachment | Oren sends “Look at the blue glass key I found” with an object photo. | The key is the central subject with visible glass material and relevant supporting context; no replacement portrait or chat screenshot. |
+| Historical scene | After changing the cast, outfits and location, generate an image from the earlier chest-opening message. | Earlier message evidence determines the moment; unproven current state and later events stay absent. |
+| Long detail | Extend Oren's appearance with grounded descriptive prose and place the chipped horn detail at the end. | The distinctive detail reaches the drafting model and remains usable in the image prompt rather than disappearing at a short field cap. |
+| Edited prompt | Edit the saved prompt to a precise short description and generate again. | The submitted text preserves the edit without an additional drafting or compression call. |
+
+For a missing-outfit run, clear a character's clothing before preparing the
+image. Check that a coherent inferred outfit appears in the prompt and is saved
+only while the registry field remains blank and unlocked. Repeat after entering
+or locking clothing during generation; that later registry edit must survive.
+
+### Before and after review
+
+1. On the baseline version, create and export the synthetic save. Run the cases
+   and retain each actual submitted prompt and sample image in a local evaluation
+   directory outside the repository. Record application revision, image provider
+   and model, image-prompt model, dimensions, seed if available, and style.
+2. Import a fresh copy of that save into the upgraded version. Use the same
+   configuration and cases. Generate actual prompts with the configured Image
+   Prompt text model and sample images with the configured image provider. Do
+   not substitute fake-provider output or the prose in this document for the
+   actual evaluation results.
+3. Place baseline and upgraded prompts beside their corresponding images. For
+   nondeterministic image models, inspect three samples per case to distinguish
+   consistent prompt improvement from a single lucky image.
+4. Score each prompt and each image separately using the rubric below. Record
+   concrete evidence such as “Oren holds the key in his left hand” or “the image
+   adds Vale despite the absent status.” Keep failures even when the image is
+   visually attractive.
+
+| Dimension | 0 | 1 | 2 |
+| --- | --- | --- | --- |
+| Scene fidelity | Wrong moment, setting, or event | Correct main event with omitted visible detail | Correct selected moment and relevant environment |
+| Subject/action attribution | Missing, extra, or confused subjects and actions | Correct cast but ambiguous action ownership | Each subject's action, gaze, hands, and expression are distinct |
+| Spatial clarity | Impossible or contradictory placement | Plausible but underspecified placement | Coherent relative positions, object placement, and interactions |
+| Identity continuity | Wrong or inconsistent character identity | Some distinctive traits survive | Distinctive appearance and reference identities remain consistent |
+| Unsupported invention | Consequential invented figures, actions, or facts | Minor distracting unsupported detail | Only conservative camera placement and incidental staging |
+
+A successful prompt has no zero scores, no misplaced subject or owned object,
+and preserves authoritative clothing and reference identity. Compare totals as
+a secondary measure; extra words alone are not an improvement. Image failures
+with a correct prompt should be recorded separately from drafting failures.
+
+For provider-limit evaluation, choose a model with an advertised prompt limit
+and a smaller configured fallback. Verify that the final submitted prompt stays
+within the actual model's limit, authoritative instructions remain intact after
+the single permitted compression retry, and the saved prompt equals the
+successful request. Oversized manual prompts and failed compression should
+produce an explicit length error. Prepared briefs must retain serialization
+compatibility for queued workers; these transient inputs are not exported.
+Save export/import must preserve the submitted prompts, prompt metadata, and
+reference mappings. Never check in generated images,
+provider keys, save databases, or live request logs.
 
 ## Dating Route Pacing
 
