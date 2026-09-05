@@ -81,9 +81,39 @@ ongoing actions, physical constraints, environment state, line of sight, and
 pending reactions. Physical facts remain active for the current scene; actions,
 line of sight, and pending reactions expire after the following narrator turn.
 Conflicting facts replace the prior value deterministically, while evidence and
-source-message provenance remain auditable. Active scene facts are included only
-in narrator context, never image prompts, and are preserved by snapshots,
-forking, and chat bundle export/import.
+source-message provenance remain auditable. Active scene facts are preserved by
+snapshots, forking, and chat bundle export/import. Image context includes grounded
+physical facts for the selected moment, excluding pending reactions, expired or
+archived records, other scene generations, and facts with missing, unknown, or
+future message provenance.
+
+## Image Scene Grounding
+
+Image context puts the selected message first, followed by confirmed participants,
+physical scene facts, the eligible snapshot and location, and then older supporting
+context. The selected message, complete relevant visual profiles, current scene
+facts, and location remain protected when the context character budget is small.
+Up to seven messages before the selected moment supply continuity; messages after
+that moment never enter the transcript. If no source is specified, the latest
+message becomes the selected moment.
+
+`image_scene_characters(repositories, save_id, source_message_id=None)` supplies
+one deterministic participant selection for image drafting, clothing, and
+reference mappings. Per-message presence records take precedence over the scene
+snapshot. Without presence records, the snapshot supplies participants only for
+the latest message (or a save with no messages). A mentioned name never establishes
+presence: other mentioned profiles are labeled as discussed/background context.
+Empty presence and absent presence currently share the same persisted shape, so
+both use that latest-message fallback.
+
+Historical frames omit mutable character, location, and scene records with
+updates after the source, or without reliable message provenance. They also omit
+mutable linked lore and template world state rather than reconstructing old
+versions. The narrator's existing cutoff behavior is unchanged. Image profiles
+keep appearance, visual notes, and current clothing in separate fields without
+short-field clipping. Locations fall back to their general description when the
+visual description is empty, explicitly asking the drafting model to extract
+visible details only.
 
 ## Dating Route Pacing
 
