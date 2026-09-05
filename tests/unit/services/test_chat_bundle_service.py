@@ -21,6 +21,7 @@ from bragi.persistence.repositories import (
 )
 from bragi.services import chat_bundle_service as chat_bundle_module
 from bragi.services.agentic_context import RESPONSE_CHECKING_ENABLED_SETTING
+from bragi.services.character_registry_service import CharacterRegistryService
 from bragi.services.chat_bundle_service import (
     _coalesce_import_context_sources,
     _coalesce_import_entity_links,
@@ -34,6 +35,7 @@ from bragi.services.image_style_settings import (
     IMAGE_STYLE_PRESET_SETTING,
     save_image_style_preset_setting_key,
 )
+from bragi.services.media_service import MediaService
 from bragi.services.model_preferences import SAVE_MODEL_OVERRIDES_SETTING
 from bragi.services.post_turn_inference import (
     POST_TURN_INFERENCE_MODE_DEFAULT,
@@ -4856,6 +4858,132 @@ def test_export_import_preserves_uploaded_character_reference_metadata_and_files
         if link.relation == "reference_image"
     ]
     assert imported_links[0].target_id == imported_reference.id
+
+
+@pytest.mark.parametrize("has_reference", [False, True])
+@pytest.mark.parametrize("promoted_source", ["uploaded", "generated"])
+def test_export_import_restores_character_gallery_and_allows_reference_selection(
+    repositories: PersistenceRepositories,
+    tmp_path: Path,
+    has_reference: bool,
+    promoted_source: str,
+) -> None:
+    media_dir = tmp_path / "media"
+    original_save = _seed_bundle_save(repositories, media_dir)
+    character = repositories.add_character(
+        save_id=original_save.id,
+        character_id="character-mara",
+        name="Mara",
+        appearance="Short silver hair",
+        visual_notes="Blue cloak",
+        locked_fields=["appearance", "visual_notes"],
+    )
+    if has_reference:
+        repositories.add_entity_link(
+            save_id=original_save.id,
+            entity_type="character",
+            entity_id=character.id,
+            target_type="media_asset",
+            target_id=MEDIA_ASSET_ID,
+            relation="reference_image",
+        )
+    for source in ("uploaded", "generated"):
+        path = f"{original_save.id}/images/{source}.webp"
+        thumbnail_path = f"{original_save.id}/images/thumbnails/{source}.webp"
+        repositories.create_media_asset(
+            asset_id=f"media-gallery-{source}",
+            save_id=original_save.id,
+            source_message_id=None,
+            source_media_asset_id=(
+                MEDIA_ASSET_ID if has_reference and source == "generated" else None
+            ),
+            type="image",
+            mime_type="image/webp",
+            path=path,
+            thumbnail_path=thumbnail_path,
+            prompt=f"{source} character image",
+            provider="local" if source == "uploaded" else "fake-image-provider",
+            model="upload" if source == "uploaded" else "fake-image-model",
+            status="succeeded",
+            metadata={
+                "kind": "character_image",
+                "source": source,
+                "character_id": character.id,
+                "content_rating": "G",
+            },
+        )
+        (media_dir / path).write_bytes(f"{source} image".encode())
+        (media_dir / thumbnail_path).parent.mkdir(parents=True, exist_ok=True)
+        (media_dir / thumbnail_path).write_bytes(f"{source} thumbnail".encode())
+    bundle_path = tmp_path / "night-watch-character-gallery.bragi-chat"
+    service = _chat_bundle_service(repositories, media_dir)
+
+    service.export_save(original_save.id, bundle_path)
+    imported_save_id = _imported_save_id(service.import_save(bundle_path))
+
+    imported_character = repositories.list_characters(imported_save_id)[0]
+    assert imported_character.id != character.id
+    imported_gallery = {
+        json.loads(asset.metadata_json)["source"]: asset
+        for asset in repositories.list_media_assets(imported_save_id)
+        if json.loads(asset.metadata_json).get("kind") == "character_image"
+    }
+    assert set(imported_gallery) == {"uploaded", "generated"}
+    for source, asset in imported_gallery.items():
+        assert asset.id != f"media-gallery-{source}"
+        assert asset.save_id == imported_save_id
+        assert asset.source_message_id is None
+        assert asset.mime_type == "image/webp"
+        assert asset.provider == (
+            "local" if source == "uploaded" else "fake-image-provider"
+        )
+        assert asset.model == ("upload" if source == "uploaded" else "fake-image-model")
+        assert json.loads(asset.metadata_json) == {
+            "kind": "character_image",
+            "source": source,
+            "character_id": imported_character.id,
+            "content_rating": "unclassified",
+        }
+        assert (media_dir / asset.path).read_bytes() == f"{source} image".encode()
+        assert asset.thumbnail_path is not None
+        assert (media_dir / asset.thumbnail_path).read_bytes() == (
+            f"{source} thumbnail".encode()
+        )
+    registry = CharacterRegistryService(repositories, active_save_id=imported_save_id)
+    [row] = registry.build_model().characters
+    assert {image.media_asset_id for image in row.generated_images} == {
+        asset.id for asset in imported_gallery.values()
+    }
+    if has_reference:
+        assert row.reference_image is not None
+        assert row.reference_image.media_asset_id != MEDIA_ASSET_ID
+        assert imported_gallery["generated"].source_media_asset_id == (
+            row.reference_image.media_asset_id
+        )
+    else:
+        assert row.reference_image is None
+        assert imported_gallery["generated"].source_media_asset_id is None
+
+    selected = MediaService(
+        repositories=repositories,
+        providers={},
+        media_dir=media_dir,
+    ).set_character_reference_image(
+        save_id=imported_save_id,
+        character_id=imported_character.id,
+        media_asset_id=imported_gallery[promoted_source].id,
+    )
+
+    [updated_row] = registry.build_model().characters
+    assert updated_row.reference_image is not None
+    assert updated_row.reference_image.media_asset_id == selected.id
+    assert selected.id not in {
+        image.media_asset_id for image in updated_row.generated_images
+    }
+    assert updated_row.appearance == "Short silver hair"
+    assert updated_row.visual_notes == "Blue cloak"
+    assert updated_row.locked_fields == ("appearance", "visual_notes")
+    assert repositories.get_character(imported_character.id) == imported_character
 
 
 def test_export_save_omits_archived_media_assets(

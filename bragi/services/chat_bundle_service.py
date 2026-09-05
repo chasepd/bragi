@@ -5133,7 +5133,7 @@ def _remap_imported_media_reference_metadata(
             media_asset_id_map,
         )
         remapped = dict(metadata)
-        if metadata.get("kind") == "character_reference":
+        if metadata.get("kind") in ("character_reference", "character_image"):
             character_id = metadata.get("character_id")
             if (
                 not isinstance(character_id, str)
