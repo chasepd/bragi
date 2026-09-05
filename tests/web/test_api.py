@@ -10536,6 +10536,7 @@ def test_chat_turn_job_returns_delta_for_initial_render(tmp_path: Path) -> None:
 def test_chat_turn_records_execution_stratum_after_preflight_settings_change(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     class StratumProvider:
         provider_name = "fake"
@@ -10570,10 +10571,13 @@ def test_chat_turn_records_execution_stratum_after_preflight_settings_change(
 
     database_path = tmp_path / "bragi.sqlite3"
     migrate_database(database_path)
-    repositories = PersistenceRepositories(
-        sqlite3.connect(database_path, check_same_thread=False)
+    repositories = ScopedPersistenceRepositories(database_path, PersistenceRepositories)
+    request.addfinalizer(repositories.close)
+    save = _create_auth_save(
+        cast(PersistenceRepositories, repositories),
+        title="Stratum Save",
+        owner_user_id=None,
     )
-    save = _create_auth_save(repositories, title="Stratum Save", owner_user_id=None)
     for model_id in ("fake-chat", "fake-next"):
         repositories.save_provider_model(
             provider="fake",
@@ -10594,14 +10598,17 @@ def test_chat_turn_records_execution_stratum_after_preflight_settings_change(
     )
     provider = cast(ProviderClient, StratumProvider())
     runtime = BragiRuntime(
-        repositories=repositories,
+        repositories=cast(PersistenceRepositories, repositories),
         providers={"fake": provider},
         media_dir=tmp_path / "media",
         active_save_id=save.id,
     )
     state = _state_double(tmp_path, runtime)
     state.repositories = repositories
-    state.jobs._repositories = repositories  # noqa: SLF001 - production wiring
+    state.jobs = JobRegistry(
+        repositories=repositories,
+        repository_scope=repositories.scope,
+    )
     state.providers = runtime.providers
     preflight_started = threading.Event()
     release_preflight = threading.Event()
@@ -10656,7 +10663,7 @@ def test_chat_turn_records_execution_stratum_after_preflight_settings_change(
             f"/api/chat/timing-summary?save_id={save.id}"
         ).json()
 
-    assert terminal["status"] == "succeeded"
+    assert terminal["status"] == "succeeded", terminal
     strata = [
         step
         for step in repositories.list_job_steps(job_id)
