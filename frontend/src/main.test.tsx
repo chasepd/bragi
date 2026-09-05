@@ -21994,6 +21994,59 @@ describe("frontend helpers", () => {
     expect(within(log).queryByText("Chronicle message 20")).not.toBeInTheDocument();
   });
 
+  it("keeps rendered chronicle rows in document flow when virtual measurements are stale", async () => {
+    const { Chronicle } = await import("./main");
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      value: 360
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      value: 12000
+    });
+    const messages: RuntimeModel["chronicle"]["messages"] = Array.from({ length: 80 }, (_, index) => ({
+      message_id: `flow-${index + 1}`,
+      role: index % 2 ? "narrator" : "player",
+      speaker_name: index % 2 ? null : "Keeper",
+      body: index === 79 ? "Latest flowing message" : `Flowing message ${index + 1}`,
+      actions: []
+    }));
+
+    render(
+      <Chronicle
+        model={runtimeModel({ chronicle: { messages } })}
+        runJob={vi.fn()}
+        pendingMessage={null}
+      />
+    );
+
+    const log = screen.getByRole("log", { name: "Chronicle" });
+    await waitFor(() => expect(within(log).getByText("Latest flowing message")).toBeInTheDocument());
+    const virtualList = log.querySelector<HTMLElement>(".chronicle-virtual-list");
+    const virtualRows = Array.from(log.querySelectorAll<HTMLElement>(".chronicle-virtual-row"));
+    expect(virtualList).not.toBeNull();
+    expect(Number.parseFloat(virtualList?.style.minHeight ?? "0")).toBeGreaterThan(0);
+    expect(Number.parseFloat(virtualList?.style.paddingTop ?? "0")).toBeGreaterThan(0);
+    expect(virtualRows.length).toBeGreaterThan(1);
+    expect(virtualRows.every((row) => row.style.transform === "")).toBe(true);
+
+    const nodeFileSystem = "node:fs/promises";
+    const { readFile } = await import(/* @vite-ignore */ nodeFileSystem);
+    const processApi = (globalThis as typeof globalThis & {
+      process: { cwd(): string };
+    }).process;
+    const workspace = processApi.cwd().endsWith("/frontend")
+      ? processApi.cwd().slice(0, -"/frontend".length)
+      : processApi.cwd();
+    const stylesheet = await readFile(`${workspace}/frontend/src/styles.css`, "utf8");
+    expect(stylesheet).toMatch(
+      /\.chronicle-virtual-list\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;/s
+    );
+    expect(stylesheet).toMatch(
+      /\.chronicle-virtual-row\s*\{[^}]*position:\s*relative;/s
+    );
+  });
+
   it("stays at the latest message when long chronicle rows finish measuring", async () => {
     const resizeObservers: Array<{
       callback: ResizeObserverCallback;
